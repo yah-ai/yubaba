@@ -1,0 +1,37 @@
+[package]
+name = "almanac"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Push-rebuild engine: feed configs, ReleaseSource adapters (GH + R2), and axum webhook receiver"
+publish = false
+
+[lib]
+name = "almanac"
+path = "src/lib.rs"
+
+[[bin]]
+name = "almanac-serve"
+path = "src/bin/serve.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+thiserror = "1.0"
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "time", "macros", "io-util", "fs", "net"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+anyhow = "1.0"
+workload-spec = { path = "../workload-spec" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

@@ -1,0 +1,8 @@
+version: '3'
+services:
+  web:
+    image: nginx:1.25@sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd
+    ports:
+      - "8080:80"
+    environment:
+      - LOG_LEVEL=info

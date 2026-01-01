@@ -1,0 +1,28 @@
+{
+  "schema_version": "V1",
+  "name": "test-svc",
+  "image": {
+    "registry": "docker.io",
+    "repository": "library/alpine",
+    "tag": "3.19",
+    "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "tier": "private",
+  "replicas": 1,
+  "resources": {
+    "memory_mb": 64,
+    "cpu_shares": 256,
+    "ephemeral_storage_mb": 64
+  },
+  "restart_policy": {"type": "always"},
+  "stop_policy": {
+    "signal": 15,
+    "grace_period": 5000
+  },
+  "expose": {
+    "mesh": {
+      "identity": "-bad-ident",
+      "ports": [8080]
+    }
+  }
+}

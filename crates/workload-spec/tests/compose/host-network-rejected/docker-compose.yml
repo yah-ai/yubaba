@@ -1,0 +1,5 @@
+version: '3'
+services:
+  rogue:
+    image: alpine:3.19
+    network_mode: host

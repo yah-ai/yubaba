@@ -1,0 +1,25 @@
+{
+  "specs": [
+    {
+      "schema_version": "V1",
+      "name": "web",
+      "image": {
+        "registry": "docker.io",
+        "repository": "library/nginx",
+        "tag": "1.25",
+        "digest": "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+      },
+      "tier": "private",
+      "replicas": 1,
+      "env": [
+        { "name": "LOG_LEVEL", "value": { "type": "literal", "value": "info" } }
+      ],
+      "resources": { "memory_mb": 256, "cpu_shares": 512, "ephemeral_storage_mb": 512 },
+      "restart_policy": { "type": "always" },
+      "stop_policy": { "signal": 15, "grace_period": 10000 },
+      "expose": {
+        "mesh": { "identity": "web", "ports": [80] }
+      }
+    }
+  ]
+}

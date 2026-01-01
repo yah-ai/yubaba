@@ -1,0 +1,9 @@
+version: '3'
+services:
+  app:
+    image: ghcr.io/example/app:dev@sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"

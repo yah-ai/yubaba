@@ -1,0 +1,29 @@
+#:schema ../../../../.yah/schema/workload.toml.schema.json
+#
+# In-tree fixture: mesofact-static workload with build_mode = in_container.
+#
+# Loaded by the cloud crate's `in_container_fixture_roundtrips` unit test
+# (crates/yah/cloud/src/reconciler/mesofact_static.rs) to verify that:
+#   - `read_mesofact_build` deserializes the [build_mode] table correctly.
+#   - `BuildMode::InContainer { image }` carries a digest-pinned ImageRef.
+#   - The parsed shape lowers to `TaskRuntime::Container` via
+#     `lower_build_to_forge_spec` (R438-T7 golden tests cover the spec shape).
+#
+# No actual build runs in CI — parsing + lowering is purely local.
+# For an end-to-end run with real bun in docker, supply `YAH_LOCAL_SIM_E2E=1`
+# and run `cargo test -p cloud -- mesofact_in_container -- --include-ignored`.
+
+schema_version = 1
+kind = "mesofact-static"
+
+[build]
+command = "bun run build"
+out_dir = "dist"
+
+# build_mode = in_container: the reconciler spawns the build command inside the
+# pinned image instead of on the host. Digest pin ensures reproducibility
+# (same image version on every operator's machine). Tag is advisory; digest is
+# the source of truth (R438-T3 digest-pin enforcement).
+[build_mode]
+mode  = "in_container"
+image = "oven/bun:1.2.13@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

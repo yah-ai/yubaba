@@ -1,0 +1,87 @@
+[package]
+name = "cloud"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Enable the local-docker MachineProvider (tier 1 integration testing).
+# Requires a reachable containerd socket: Colima (`colima start --runtime containerd`)
+# on macOS, or the system socket on Linux.
+local-docker = ["dep:containerd-client", "dep:prost-types"]
+
+# Derive JsonSchema on the public config types so xtask can emit per-kind
+# JSON Schemas to .yah/schema/*.toml.schema.json (R222 B4). Off by default;
+# the cloud crate's runtime binary deps don't carry schemars.
+json-schema = ["dep:schemars", "workload-spec/json-schema"]
+
+[dependencies]
+# WorkloadSpec — typed wire format for warden workloads. Used by WorkloadConfig
+# to validate workload TOML against the schema (R092-F1).
+workload-spec = { path = "../workload-spec" }
+# Almanac feed configs + OnChangeConfig — dispatch_on_change maps on_change
+# to the correct reconciler (R330-F4).
+almanac = { path = "../almanac" }
+
+# Shared credential vault — HetznerDriver::from_default_sources() reads
+# hetzner-api-token / hetzner-s3-access-key / hetzner-s3-secret-key
+# from this vault, falling back to HETZNER_* env vars (R040-F9).
+keys = { path = "../keys" }
+# Shared Hetzner Cloud API client — transport, bearer auth, and server/SSH-key
+# operations. Cloud crate adds S3 bucket ops and MachineProvider trait impl on top.
+hetzner = { path = "../hetzner" }
+
+# Object-store trait + R2 impl — publish_to_r2 delegates PUT/GET ops here (R498-F5).
+yah-object-store = { path = "../object-store" }
+
+# Local-tier infrastructure primitives (docker-CLI driver + S3 SigV4 helpers).
+# Both cloud and warden depend on this — moved out of cloud in R374-F3 so
+# warden could own MinIO lifecycle without a reverse warden→cloud dep.
+local-driver = { path = "../local-driver" }
+
+# Forge executor + transform recipe loader. Cloud's static-asset reconciler
+# materializes derived assets (W164) by lowering recipes → ForgeSpec and
+# handing them to a `dyn ForgeExecutor`. The dep edge intentionally stops
+# here: no cloud → qed edge, only cloud → task (R438-T13 architectural rule).
+task = { version = "0.8.11" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+anyhow = "1.0"
+thiserror = "1.0"
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "net", "time", "sync", "fs", "io-util"] }
+tracing = "0.1"
+hmac = { version = "0.12", features = ["std"] }
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+base64 = "0.22"
+getrandom = "0.2"
+blake3 = "1"
+# Per-transform tmp output dir (W164 materialize step) — recipe writes to a
+# tmp file we BLAKE3-verify before renaming into .yah/cache/derive/transform/.
+tempfile = "3"
+
+# containerd gRPC client (optional — only with local-docker feature)
+containerd-client = { version = "0.4", optional = true }
+prost-types = { version = "0.11", optional = true }
+
+# JSON Schema derivation (optional — only with json-schema feature).
+# The xtask `emit-schemas` task enables this; runtime binaries don't.
+schemars = { version = "0.8", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util"] }
+# Axum drives the in-process warden-mock the R374-F2 adopt-path tests use to
+# verify pond.rs:adopt_only behaviour against each PondPhase response.
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }

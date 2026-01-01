@@ -1,0 +1,30 @@
+# @arch:see(.yah/docs/architecture/A053-yah-warden-integration-testing.md)
+
+[package]
+name = "warden-test-macros"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Proc macro #[test_with_provider(local, smoke)] — parameterized integration test expansion for warden's two-tier test harness."
+
+[lib]
+proc-macro = true
+path = "src/lib.rs"
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
+
+[dev-dependencies]
+# For golden-file macro expansion tests.
+# Run `MACROTEST=overwrite cargo test -p warden-test-macros expand_tests` to
+# regenerate .expanded.rs golden files after changing the macro output.
+macrotest = "1"
+# Traits and types the fixture files reference.
+cloud = { path = "../cloud", features = ["local-docker"] }
+warden = { path = "../warden", features = ["containerd-integration", "testing"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

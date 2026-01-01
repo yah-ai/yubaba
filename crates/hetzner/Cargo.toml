@@ -1,0 +1,15 @@
+[package]
+name = "hetzner"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared Hetzner Cloud API client: HTTP transport, bearer auth, wire DTOs, and server/SSH-key operations. Token-source policy is left to callers."
+publish = false
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"

@@ -1,0 +1,68 @@
+[package]
+name = "constable"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Constable — Warden's sibling process supervisor. Owns cgroups, pidfds, fork+exec of native workloads, and dispatches container workloads to containerd. R406-T2 ships the single-threaded tokio + UDS skeleton; backend drivers land in T4-T7."
+publish = false
+
+[lib]
+name = "constable"
+path = "src/lib.rs"
+
+[[bin]]
+name = "constable"
+path = "src/main.rs"
+
+[features]
+# R406-T9: production containerd backend. Required by the cloud-tier
+# constable.service unit so `Deploy { Workload::Container }` actually
+# starts containers. Excluded from the dev binary by default — non-Linux
+# hosts and pond's inner constable (which uses the docker socket via
+# a different backend) don't need it.
+containerd-integration = ["dep:containerd-client", "dep:prost-types"]
+
+[dependencies]
+constable-proto = { path = "../../../crates/yah/constable-proto" }
+workload-spec = { path = "../../../crates/yah/workload-spec" }
+
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "sync", "fs", "signal", "time", "process"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# R426-F2 — cheers JWT verifier surface. PASETO v4.public (matches cheers's
+# edge-verifiable-auth.md session-token envelope; W159 §Canonical claim schema).
+# reqwest fetches cheers's JWKS at boot and on refresh; base64ct decodes the
+# Ed25519 public key from the JWK `x` field. All MIT/Apache-2.0.
+pasetors = { version = "0.7", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+base64ct = { version = "1", features = ["alloc"] }
+
+# Containerd gRPC client (optional — only with containerd-integration feature).
+# Mirrors warden's optional dep so both processes can share crates.io artifacts.
+containerd-client = { version = "0.9", optional = true }
+prost-types = { version = "0.14", optional = true }
+
+# Linux-only syscall surface used by the native driver (R406-T5).
+# All three are permissive (MIT / Apache-2.0). The `landlock` crate is a thin
+# wrapper over the kernel API; `caps` is the standard cap-juggling crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["fs", "process", "user", "signal"] }
+landlock = "0.4"
+caps = "0.5"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "fs", "signal", "time", "test-util", "process"] }
+
+# R426-F5 — drives the production verifier path against the in-process mock
+# issuer end-to-end (boot → JWKS fetch → mint → verify).
+cheers-mock = { path = "../../../crates/yah/cheers-mock" }
+serde_json = "1.0"

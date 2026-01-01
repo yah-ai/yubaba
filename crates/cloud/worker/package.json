@@ -1,0 +1,14 @@
+{
+  "name": "@yah/cloud-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build router.ts --outfile router.bundle.js --format=esm --target=browser",
+    "typecheck": "bunx tsc --noEmit",
+    "test": "bun test tests/"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240529.0",
+    "miniflare": "^3.20240610.1"
+  }
+}

@@ -1,0 +1,102 @@
+#cloud-config
+# yah-cloud mirror bootstrap (R092-F2 — containerd + warden + cloudflared + tailscaled).
+#
+# Substitutions (written as {{ KEY }} with inner spaces so these docs survive rendering):
+#   {{ MACHINE_NAME }}           — machine name from .yah/cloud/machines/<name>.toml
+#   {{ YAH_WARDEN_URL }}         — HTTPS URL of the yah-warden release tar.gz
+#                                  (published by .github/workflows/release.yml per musl target;
+#                                  R406-T13: now also contains the constable binary +
+#                                  warden.service + constable.service + warden.slice)
+#   {{ YAH_WARDEN_SHA256 }}      — lowercase hex sha256 of the tar.gz at YAH_WARDEN_URL
+#   {{ WARDEN_CHANNEL }}         — release channel: stable | beta
+#   {{ CONTAINERD_VERSION }}     — containerd apt version pin (e.g. 1.7.2~3-0~debian-bookworm);
+#                                  use DEFAULT_CONTAINERD_VERSION constant for Phase 1 baseline
+#   {{ HEADSCALE_PREAUTH_KEY }}  — Tailscale/Headscale pre-auth key (consumed once at join)
+#   {{ MESH_LOGIN_SERVER_ARG }}  — expands to ` --login-server <url>` when a custom Headscale
+#                                  coordinator is configured; empty string for Tailscale SaaS
+#   {{ TAGS }}                   — comma-joined machine.mesh_tags for Tailscale advertise-tags
+#   {{ CLOUDFLARED_BLOCK }}      — cloudflared apt-repo install + `cloudflared service install
+#                                  --token <tok>` + `systemctl enable --now cloudflared` when
+#                                  machine.cloudflared is set; empty string otherwise
+#   {{ OPERATOR_BRIDGE_BLOCK }}  — tailscaled install + `tailscale up` + ufw allow on tailscale0
+#                                  when machine.hosts_operator_bridge = true; empty otherwise
+#   {{ COSIGN_VERIFY_BLOCK }}    — cosign install + `cosign verify-blob` of the warden tarball
+#                                  against a pinned GitHub-OIDC identity-regexp when
+#                                  warden_cosign_identity_regexp is set (R330-F19/F20); empty
+#                                  string otherwise (sha256 verify stays as the trust gate)
+#
+# The warden tarball is curl-fetched at boot (not base64-embedded) because Hetzner caps
+# user_data at 32 KiB (R040-F11). The runcmd verifies sha256, extracts, and installs
+# /usr/local/bin/yah-warden + /usr/local/bin/constable + three systemd units under
+# /etc/systemd/system/ before the systemd hand-off.
+#
+# Supervision model (W154, R406-T13): warden.service and constable.service are sibling
+# units, both pinned to warden.slice (created by the slice unit, owned by constable via
+# Slice= directive). Constable starts first (UDS server up before warden's first Hello);
+# warden joins on After=constable.service. systemd's role is reduced to supervising the
+# two siblings — it does NOT see individual workloads, which constable owns directly via
+# pidfds + cgroup-v2 syscalls under warden.slice.
+#
+# Containerd is the container runtime warden drives via gRPC. Podman/podman-compose
+# were removed in R092-F2 (warden is now the workload lifecycle owner; see yah-warden-
+# integration-testing.md for the ContainerRuntime abstraction).
+#
+# Tailscale (operator-bridge) is optional: only installed when machine.hosts_operator_bridge
+# is true. The warden cluster mesh uses its own WireGuard plane (yah-cluster-mesh.md) and
+# does not depend on Tailscale for cluster-internal traffic.
+
+hostname: {{MACHINE_NAME}}
+preserve_hostname: false
+
+package_update: true
+package_upgrade: true
+packages:
+  - wireguard-tools
+  - chrony
+  - curl
+  - ca-certificates
+  - openssh-server
+
+runcmd:
+  # containerd — constable's container backend (version-pinned for reproducibility).
+  - apt-get install -y containerd={{CONTAINERD_VERSION}}
+  - systemctl enable --now containerd
+  # Warden + constable bundle — fetch + verify + install (R406-T13).
+  # The tarball contains: yah-warden, constable, warden.service, constable.service,
+  # warden.slice. cloud-init lays the binaries under /usr/local/bin and the units
+  # under /etc/systemd/system/ before systemctl daemon-reload.
+  - curl -fsSL -o /tmp/yah-warden.tar.gz {{YAH_WARDEN_URL}}
+  # cosign verify-blob — primary trust gate when warden_cosign_identity_regexp is
+  # set (R330-F19/F20). sha256 line below stays as a redundant integrity check.
+{{COSIGN_VERIFY_BLOCK}}
+  - sh -c 'echo "{{YAH_WARDEN_SHA256}}  /tmp/yah-warden.tar.gz" | sha256sum -c -'
+  - tar -xzf /tmp/yah-warden.tar.gz -C /tmp
+  - sh -c 'cp /tmp/warden-*/yah-warden /usr/local/bin/yah-warden'
+  - sh -c 'cp /tmp/warden-*/constable /usr/local/bin/constable'
+  - chmod +x /usr/local/bin/yah-warden /usr/local/bin/constable
+  - sh -c 'cp /tmp/warden-*/warden.slice /etc/systemd/system/warden.slice'
+  - sh -c 'cp /tmp/warden-*/constable.service /etc/systemd/system/constable.service'
+  - sh -c 'cp /tmp/warden-*/warden.service /etc/systemd/system/warden.service'
+  - chmod 0644 /etc/systemd/system/warden.slice /etc/systemd/system/constable.service /etc/systemd/system/warden.service
+  - sh -c 'rm -rf /tmp/yah-warden.tar.gz /tmp/warden-*'
+  # Channel goes into a drop-in (warden.service's ExecStart bakes the default args;
+  # the channel is operator-tunable per node).
+  - mkdir -p /etc/systemd/system/warden.service.d
+  - sh -c 'printf "[Service]\nEnvironment=WARDEN_CHANNEL={{WARDEN_CHANNEL}}\n" > /etc/systemd/system/warden.service.d/channel.conf'
+  # Cloudflare Tunnel — public ingress (when machine.cloudflared is set)
+{{CLOUDFLARED_BLOCK}}
+  # Operator-bridge — Tailscale mesh access (when machine.hosts_operator_bridge = true)
+{{OPERATOR_BRIDGE_BLOCK}}
+  # Firewall — restrict warden RPC to mesh interfaces; allow SSH
+  - ufw --force enable
+  - ufw allow 22/tcp
+  - ufw deny 7443
+  # Bring up the supervision tree (W154 ordering): slice → constable → warden.
+  # constable.service has After=warden.slice + PartOf=warden.slice; warden.service
+  # has After=constable.service + Wants=constable.service, so enabling warden
+  # transitively starts the other two — but enabling each explicitly here makes
+  # the bring-up order deterministic and surfaces failure on the right unit.
+  - systemctl daemon-reload
+  - systemctl enable --now warden.slice
+  - systemctl enable --now constable.service
+  - systemctl enable --now warden.service

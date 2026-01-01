@@ -1,0 +1,21 @@
+/sessions
+/cache
+/jit
+/cloud
+/db
+/forms
+/operator-state.json
+/clipboard/
+/pending-payloads/
+/claude-spawn-settings.json
+/working-set
+.DS_Store
+# Pond tier transient state: MinIO data, Worker JS, miniflare shim, credentials.
+# Renamed from infra/state/local-sim/ (R368-F3); both paths are ephemeral.
+/infra/pond/
+/infra/state/local-sim/
+# Reconciler-written observable state (R330-F15): provider id, public IPv4,
+# last_adopted_at. Changes on every `yah cloud machine provision` — would
+# merge-conflict if tracked. Declared config stays in /infra/machines/<n>.toml.
+/infra/state/machines/
+/summaries/summary-*.md

@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/workload-spec",
+    "crates/keys",
+    "crates/hetzner",
+    "crates/local-driver",
+    "crates/constable-proto",
+    "crates/constable",
+    "crates/object-store",
+    "crates/almanac",
+    "crates/cloud",
+    "crates/constable-bin",
+    "crates/warden",
+    "crates/warden-test-harness",
+    "crates/warden-test-macros",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.8.11"
+edition = "2021"
+authors = ["yah Dev <human@yah.dev>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yah-ai/warden"
+
+# qed crates that warden/cloud depends on during local development
+[patch.crates-io]
+task           = { path = "../qed/crates/task" }
+task-runs      = { path = "../qed/crates/task-runs" }
+task-sessions  = { path = "../qed/crates/task-sessions" }
+observation    = { path = "../qed/crates/observation" }
+scryer         = { path = "../qed/crates/scryer" }

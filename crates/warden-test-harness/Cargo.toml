@@ -1,0 +1,34 @@
+# @arch:see(.yah/docs/architecture/A053-yah-warden-integration-testing.md)
+
+[package]
+name = "warden-test-harness"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Cluster harness for warden integration tests — test_cluster(), WardenHandle, NetworkDegrade, and the auto-teardown Drop impl."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+cloud = { path = "../cloud" }
+# openraft: needed to call raft.initialize(members) during multi-node bootstrap.
+# Version must match warden's openraft dependency exactly.
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1.0"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tracing = "0.1"
+workload-spec = { path = "../workload-spec" }
+warden = { path = "../warden" }
+constable-core = { path = "../constable" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

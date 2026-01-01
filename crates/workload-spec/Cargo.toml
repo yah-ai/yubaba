@@ -1,0 +1,46 @@
+# @yah:relay(R223, "Fix export-ts binary name collision: workload-spec and tower-rules")
+# @yah:assignee(agent:claude)
+# @yah:at(2026-05-18T16:35:03Z)
+# @yah:status(review)
+# @yah:next("Rename one of the export-ts binary targets to avoid cargo hard error (currently a warning)")
+# @yah:verify("cargo check -p tower-rules -p workload-spec 2>&1 | grep -v 'failed to parse serde' | grep -v '^  =' | grep -v 'ts-rs failed'")
+
+[package]
+name = "workload-spec"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WorkloadSpec — typed wire format for warden workloads. Schema crate with zero deps on warden; warden depends on this, not the other way around."
+
+[lib]
+name = "workload_spec"
+path = "src/lib.rs"
+
+[features]
+# Derive JsonSchema on WorkloadSpec + nested types so xtask can emit
+# .yah/schema/workload.toml.schema.json (R222 B4). Off by default;
+# runtime callers don't pull schemars in.
+json-schema = ["dep:schemars"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+thiserror = "1.0"
+regex = "1.0"
+ts-rs = { version = "12.0", features = ["serde-compat"] }
+schemars = { version = "0.8", optional = true }
+async-trait = "0.1"
+anyhow = "1.0"
+
+[dev-dependencies]
+serde_json = "1.0"
+toml = "0.8"
+
+# `cargo run -p workload-spec --bin export-ts` regenerates
+# packages/yah/workload-spec/index.ts from the Rust source of truth.
+[[bin]]
+name = "export-ts"
+path = "src/bin/export-ts.rs"

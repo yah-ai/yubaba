@@ -1,0 +1,20 @@
+[package]
+name = "keys"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "yah credential vault: AES-256-GCM at-rest encryption keyed by a per-host machine key. Shared by yah CLI, yah-agentd, and the cloud crate's Hetzner driver."
+publish = false
+
+[dependencies]
+aes-gcm = "0.10"
+anyhow = "1.0"
+argon2 = "0.5"
+directories = "6.0"
+rand = "0.8"
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.23"
