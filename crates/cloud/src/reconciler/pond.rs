@@ -164,25 +164,9 @@
 //! @yah:gotcha("yubaba::pond::PondPhase has Pending/Running/Degraded/Failed variants but F2 never transitions to Degraded — that's F3's reconciler-loop work. Today phase goes Pending → (Running | Failed) once and stays.")
 //! @yah:gotcha("Camp's embedded yubaba writes a hostkey at <camp_root>/.yah/jit/yubaba-camp-state.json on first boot (ServerState::load auto-generates one). Inert at pond tier but the file is written; gitignored under .yah/jit/.")
 //!
-//! @yah:ticket(R374-F3, "Migrate MinIO lifecycle from up_pond into yubaba's reconciler")
-//! @yah:assignee(agent:claude)
-//! @yah:at(2026-06-01T17:25:54Z)
-//! @yah:status(review)
-//! @yah:parent(R374)
-//! @yah:handoff("F3 lands the MinIO half under yubaba. Five changes: (1) NEW crate crates/yah/local-driver/ extracts cloud::local_runtime + cloud::provider::s3_sign + a new pond_minio module (MinioSpec, MinioRunning, ensure_minio_running, ensure_bucket_public). Both cloud and yubaba depend on it — no dep cycle. (2) cloud::local_runtime / cloud::provider::s3_sign re-export from local-driver for backward compat; from_provider_config moved to a free fn cloud::local_container_spec_from_provider. (3) yubaba::pond gains MinioSpec on PondDeployReq; deploy handler brings MinIO up via local_driver::pond_minio::ensure_minio_running, invokes the embedder's handler with the live MinioRunning, registers both lifecycles + spawns a MinioReconciler tokio task (probe MinIO health every 5s; restart on failure; mark Failed after 3 consecutive restart failures; tear down properly on shutdown). (4) yubaba::ServerState gains pond_local_runtime + with_pond_local_runtime. (5) Camp detects LocalRuntime once at startup + passes to yubaba; camp's PondHandler shrinks to spawn_miniflare_workload (the miniflare-only half). cloud::reconciler::pond::up_pond's non-adopt branch keeps working via the same shared local_driver::pond_minio primitives (for pond_smoke + yah cloud mirror up); production lifecycles run through yubaba.")
-//! @yah:handoff("Tests: 29 local-driver lib tests (canonical_name, runtime_pref, detect_*, build_cascade, expand_tilde, container_state, workload_spec_to_crs, MinioSpec serde, public_read_bucket_policy, s3_sign sigv4). 85 yubaba lib tests including 7 PondRegistry tests (pending_then_running, failed_carries_error, missing_ident, shutdown_all_drains, redeploy_replaces, insert_full_populates_endpoint_and_console_url, mark_phase_does_not_disturb_endpoints, mark_phase_on_missing_ident_is_a_noop). 212 cloud lib tests; cargo check --workspace clean.")
-//! @yah:handoff("Architecture: cloud → local-driver ← yubaba. local-driver carries the docker-CLI driver + S3 SigV4 + pond_minio bring-up primitives (no yubaba state). yubaba adds MinioReconciler (probe + restart loop). cloud's reconciler invokes the same primitives directly for cloud-tier tests; yubaba invokes them under reconciler supervision for production. The half-alive bug R374 fixes is structurally impossible on yubaba's path because the reconciler flips PondPhase to Degraded the first time a probe fails, with a restart attempt before the desktop adopts.")
-//! @yah:verify("cargo test -p local-driver --lib  # 29 pass")
-//! @yah:verify("cargo test -p yubaba --lib  # 85 pass incl. PondRegistry insert_full + mark_phase")
-//! @yah:verify("cargo test -p cloud --lib  # 212 pass incl. R374-F2 adopt-path tests")
-//! @yah:verify("cargo check --workspace  # clean (warnings only)")
-//! @yah:verify("YAH_LOCAL_SIM_E2E=1 cargo test -p yubaba --test pond_reconciler_smoke -- --nocapture  # LIVE — first observed: Running at deploy, docker kill, Degraded at 5.0s, Running again at 5.5s. Total recovery 5.5s. Half-alive structurally impossible.")
-//! @yah:verify("Cold-start of pond stays within S1's measured budget (cold ~1.2s / warm ~500ms). Smoke via `YAH_LOCAL_SIM_E2E=1 cargo test -p cloud --release --test pond_smoke -- --nocapture`. Both smokes are bundled in the .yah/qed/pond-smoke.toml pipeline — `yah qed run pond-smoke` (or the desktop Run tab once wired).")
-//! @yah:gotcha("pond_smoke.rs:99 still references the stale 'dev-yah' service id — pre-existing from R374-S1, orthogonal to F3.")
-//! @yah:gotcha("yubaba's MinioReconciler probe runs every 5 s; after 3 consecutive restart failures it marks the workload Failed and exits the loop. PondPhase Failed is terminal — operator action required (restart the camp daemon).")
-//! @yah:gotcha("Camp passes Arc<LocalRuntime> to yubaba once at startup. If orbstack/colima/docker isn't running when camp starts, pond mirrors are skipped with a clear warning; restart yah-camp after the runtime is up.")
-//! @arch:see(.yah/docs/working/W142-pond.md)
-//! @yah:depends_on(R374-F2)
+//! Note: R374-F3's canonical annotation lives in
+//! oss/yah-base/crates/local-driver/src/lib.rs (where the extracted crate
+//! landed). This file participates but carries no @yah: block for it.
 //!
 //! @yah:ticket(R374-F4, "Migrate miniflare lifecycle into yubaba (shape from S1)")
 //! @yah:assignee(agent:claude)

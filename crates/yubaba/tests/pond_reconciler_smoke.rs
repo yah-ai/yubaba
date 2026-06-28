@@ -48,10 +48,15 @@ const DEPLOY_BUDGET: Duration = Duration::from_secs(90);
 const RECOVER_BUDGET: Duration = Duration::from_secs(30);
 
 fn workspace_root() -> PathBuf {
+    // The camp root owns `.yah/infra/providers/` (where the local-container
+    // provider is declared). Walk up from this crate to find it rather than
+    // hard-coding an ancestor depth — the depth shifted when yubaba moved into
+    // the oss/yubaba workspace and the old nth(3) silently pointed at oss/,
+    // which has no `.yah`, disarming this regression bar.
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
-        .nth(3)
-        .expect("workspace root three dirs above CARGO_MANIFEST_DIR")
+        .find(|dir| dir.join(".yah/infra/providers").is_dir())
+        .expect("camp root with .yah/infra/providers above CARGO_MANIFEST_DIR")
         .to_path_buf()
 }
 
@@ -163,6 +168,28 @@ async fn fetch_phase(port: u16, ident: &str) -> Option<PondPhase> {
     }
 }
 
+/// Raw `/pond/state` body — carries the `Failed` reason and per-slot probe
+/// outcomes that `fetch_phase` discards. Used to make restart-failure panics
+/// self-explanatory instead of "last seen: Some(Failed)".
+async fn fetch_state_raw(port: u16, ident: &str) -> String {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return format!("<client build failed: {e}>"),
+    };
+    match client
+        .get(format!("http://127.0.0.1:{port}/pond/state"))
+        .query(&[("ident", ident)])
+        .send()
+        .await
+    {
+        Ok(resp) => resp.text().await.unwrap_or_else(|e| format!("<body read failed: {e}>")),
+        Err(e) => format!("<request failed: {e}>"),
+    }
+}
+
 async fn wait_for_phase<F: Fn(PondPhase) -> bool>(
     port: u16,
     ident: &str,
@@ -209,23 +236,27 @@ async fn warden_reconciler_restarts_minio_and_miniflare() {
     let minio_spec = unique_minio_spec(&workspace);
     let miniflare_spec = unique_miniflare_spec(&workspace, &minio_spec);
     let container_name = minio_spec.container_name.clone();
-    let miniflare_port = miniflare_spec.port;
+    let miniflare_container = miniflare_spec.container_name.clone();
 
+    // Remove every container this run created — both MinIO and (since R455-F1
+    // made miniflare a container too) the miniflare slot. Previously only the
+    // MinIO container was reaped, leaking the miniflare container per run.
     struct Cleanup {
-        container_name: String,
+        container_names: Vec<String>,
     }
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            let name = self.container_name.clone();
-            let _ = std::process::Command::new("docker")
-                .args(["rm", "-f", &name])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            for name in &self.container_names {
+                let _ = std::process::Command::new("docker")
+                    .args(["rm", "-f", name])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
         }
     }
     let _cleanup = Cleanup {
-        container_name: container_name.clone(),
+        container_names: vec![container_name.clone(), miniflare_container.clone()],
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -324,18 +355,21 @@ async fn warden_reconciler_restarts_minio_and_miniflare() {
         t_kill.elapsed()
     );
 
-    // ── Kill miniflare process, verify reconciler restarts it ───────────────
-    // Find the bun/node process listening on the miniflare port and kill it.
+    // ── Kill miniflare container, verify reconciler restarts it ─────────────
+    // R455-F1 made miniflare a container, so kill it the same way as MinIO
+    // (`docker kill`). The old lsof-by-port kill only took down the host
+    // port-forwarder, leaving the container running — the probe could still
+    // pass and the restart path was never genuinely exercised.
     let t_kill2 = Instant::now();
-    let killed_mf = kill_miniflare_by_port(miniflare_port).await;
+    let killed_mf = docker_kill(&miniflare_container).await;
     if !killed_mf {
         eprintln!(
-            "[reconciler-smoke] WARNING: could not find/kill miniflare process on port {}; \
+            "[reconciler-smoke] WARNING: could not docker kill miniflare container {}; \
              skipping miniflare restart assertion",
-            miniflare_port
+            miniflare_container
         );
     } else {
-        eprintln!("[reconciler-smoke] killed miniflare process on port {miniflare_port}");
+        eprintln!("[reconciler-smoke] docker killed miniflare container {miniflare_container}");
         let _degraded2 = wait_for_phase(
             port,
             &ident,
@@ -343,19 +377,21 @@ async fn warden_reconciler_restarts_minio_and_miniflare() {
             RECOVER_BUDGET,
         )
         .await;
-        wait_for_phase(
+        let restart_result = wait_for_phase(
             port,
             &ident,
             |p| matches!(p, PondPhase::Running),
             RECOVER_BUDGET,
         )
-        .await
-        .unwrap_or_else(|last| {
+        .await;
+        if let Err(last) = restart_result {
+            let state = fetch_state_raw(port, &ident).await;
             panic!(
-                "yubaba did not restart miniflare within {:?} after kill; last seen: {:?}",
-                RECOVER_BUDGET, last
-            )
-        });
+                "yubaba did not restart miniflare within {:?} after kill; last seen: {:?}\n\
+                 /pond/state: {state}",
+                RECOVER_BUDGET, last,
+            );
+        }
         eprintln!(
             "[reconciler-smoke] miniflare recovered after {:.1?}",
             t_kill2.elapsed()
@@ -366,32 +402,4 @@ async fn warden_reconciler_restarts_minio_and_miniflare() {
     server_handle.abort();
     docker_force_rm(&container_name).await;
     let _ = std::fs::remove_file(&state_path);
-}
-
-/// Kill the process listening on `port` via `lsof` + `kill`. Returns `true`
-/// when a process was found and signalled.
-async fn kill_miniflare_by_port(port: u16) -> bool {
-    let out = tokio::process::Command::new("lsof")
-        .args(["-ti", &format!("tcp:{port}")])
-        .output()
-        .await
-        .ok();
-    let Some(out) = out else { return false };
-    if !out.status.success() {
-        return false;
-    }
-    let pids: Vec<_> = String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .filter_map(|s| s.parse::<u32>().ok())
-        .collect();
-    if pids.is_empty() {
-        return false;
-    }
-    for pid in &pids {
-        let _ = tokio::process::Command::new("kill")
-            .arg(pid.to_string())
-            .status()
-            .await;
-    }
-    true
 }

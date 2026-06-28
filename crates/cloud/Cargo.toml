@@ -24,7 +24,7 @@ json-schema = ["dep:schemars", "workload-spec/json-schema"]
 [dependencies]
 # WorkloadSpec — typed wire format for yubaba workloads. Used by WorkloadConfig
 # to validate workload TOML against the schema (R092-F1).
-workload-spec = { path = "../workload-spec" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.16" }
 # Almanac feed configs + OnChangeConfig — dispatch_on_change maps on_change
 # to the correct reconciler (R330-F4).
 yah-almanac = { path = "../almanac" }
@@ -32,24 +32,24 @@ yah-almanac = { path = "../almanac" }
 # Shared credential vault — HetznerDriver::from_default_sources() reads
 # hetzner-api-token / hetzner-s3-access-key / hetzner-s3-secret-key
 # from this vault, falling back to HETZNER_* env vars (R040-F9).
-fob = { path = "../keys" }
+fob = { version = "0.8.16" }
 # Shared Hetzner Cloud API client — transport, bearer auth, and server/SSH-key
 # operations. Cloud crate adds S3 bucket ops and MachineProvider trait impl on top.
 yah-hetzner = { path = "../hetzner" }
 
 # Object-store trait + R2 impl — publish_to_r2 delegates PUT/GET ops here (R498-F5).
-yah-object-store = { path = "../object-store" }
+yah-object-store = { version = "0.8.16" }
 
 # Local-tier infrastructure primitives (docker-CLI driver + S3 SigV4 helpers).
 # Both cloud and yubaba depend on this — moved out of cloud in R374-F3 so
 # yubaba could own MinIO lifecycle without a reverse yubaba→cloud dep.
-local-driver = { path = "../local-driver" }
+local-driver = { package = "yah-local-driver", version = "0.8.16" }
 
 # Kamaji supervisor — the mesofact-static local-static arm spawns
 # mesofact-dev as a host binary through the Native fork+exec backend
 # (R490-F2; W199's "ideal native-backend case"). Replaces the reconciler's
 # direct Command::spawn so dev-tier workloads share the supervision primitive.
-kamaji = { path = "../kamaji", features = ["native-integration"] }
+kamaji = { version = "0.8.16", features = ["native-integration"] }
 
 # Forge executor + transform recipe loader. Cloud's static-asset reconciler
 # materializes derived assets (W164) by lowering recipes → ForgeSpec and

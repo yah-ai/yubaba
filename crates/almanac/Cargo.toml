@@ -29,8 +29,8 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 anyhow = "1.0"
-workload-spec = { path = "../workload-spec" }
-yah-object-store = { path = "../object-store" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.16" }
+yah-object-store = { version = "0.8.16" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

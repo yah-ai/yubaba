@@ -1,16 +1,8 @@
 [workspace]
 members = [
-    "crates/workload-spec",
-    "crates/keys",
     "crates/hetzner",
-    "crates/local-driver",
-    "crates/kamaji-proto",
-    "crates/kamaji",
-    "crates/object-store",
     "crates/almanac",
     "crates/cloud",
-    "crates/cheers-mock",
-    "crates/kamaji-bin",
     "crates/yubaba",
     "crates/yubaba-client",
     "crates/yubaba-test-harness",
@@ -25,16 +17,7 @@ authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yah-ai/yubaba"
 
-# qed crates that yubaba/cloud depends on during local development
-[patch.crates-io]
-# Self-patches: qed's crates (patched in below) depend on these by version;
-# patches don't transit workspaces, so this workspace must supply its own.
-workload-spec    = { path = "crates/workload-spec" }
-fob              = { path = "crates/keys" }
-yah-object-store = { path = "crates/object-store" }
-local-driver     = { path = "crates/local-driver" }
-velveteen      = { path = "../qed/crates/task" }
-task-runs      = { path = "../qed/crates/task-runs" }
-task-sessions  = { path = "../qed/crates/task-sessions" }
-observation    = { path = "../qed/crates/observation" }
-yah-scryer     = { path = "../qed/crates/scryer" }
+# Cross-workspace deps yubaba/cloud pulls from the sibling oss repos during
+# local development. Redirects the version-based deps to their local paths for
+# atomic monorepo dev; stripped on export (scripts/export-oss.sh) so the
+# standalone mirror resolves yah-base/kamaji/qed crates from crates.io.

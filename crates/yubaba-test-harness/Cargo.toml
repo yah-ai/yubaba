@@ -26,9 +26,9 @@ serde_json = "1.0"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tracing = "0.1"
-workload-spec = { path = "../workload-spec" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.16" }
 yubaba = { path = "../yubaba" }
-kamaji = { path = "../kamaji" }
+kamaji = { version = "0.8.16" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

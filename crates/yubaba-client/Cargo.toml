@@ -17,5 +17,5 @@ path = "src/lib.rs"
 # only needs the serde types, not the runtime. local-driver is lean — it shells
 # out to the `docker` CLI and pulls no axum/openraft/russh/portable-pty — so a
 # crate that talks to a yubaba can link it without dragging the server stack.
-local-driver = { path = "../local-driver" }
+local-driver = { package = "yah-local-driver", version = "0.8.16" }
 serde = { version = "1.0", features = ["derive"] }
