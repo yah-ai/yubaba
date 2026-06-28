@@ -1,0 +1,30 @@
+[package]
+name = "cheers-mock"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-process mock cheers AS for yah dev builds (W159 §Development mode — Mode 1). Ephemeral Ed25519 keypair, JWKS over a random localhost port, PASETO v4.public minting. Stands in for cheers so the verifier can exercise the wire end-to-end without standing up a real issuer."
+publish = false
+
+[lib]
+name = "cheers_mock"
+path = "src/lib.rs"
+
+[dependencies]
+# Same envelope as kamaji's verifier (PASETO v4.public, low-level
+# PublicToken::sign — see app/yah/kamaji/src/auth/verifier.rs for the
+# rationale on bypassing the high-level Claims wrapper).
+pasetors = { version = "0.7", features = ["serde"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "sync"] }
+base64ct = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "sync", "time", "test-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

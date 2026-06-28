@@ -33,12 +33,7 @@ pub struct LocalIdentity {
 ///
 /// Path: `<cloud_dir>/identities/<machine>.json`.
 /// Uses a write-tmp + rename so the file is never left in a partial state.
-pub fn register(
-    cloud_dir: &Path,
-    machine: &str,
-    fingerprint: &str,
-    algorithm: &str,
-) -> Result<()> {
+pub fn register(cloud_dir: &Path, machine: &str, fingerprint: &str, algorithm: &str) -> Result<()> {
     let dir = cloud_dir.join("identities");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating identity dir {}", dir.display()))?;
@@ -54,8 +49,7 @@ pub fn register(
     let path = dir.join(format!("{machine}.json"));
     let tmp = path.with_extension("json.tmp");
     let content = serde_json::to_string_pretty(&id).context("serializing local identity")?;
-    std::fs::write(&tmp, &content)
-        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::write(&tmp, &content).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("renaming {} → {}", tmp.display(), path.display()))?;
     Ok(())
@@ -68,8 +62,8 @@ pub fn lookup(cloud_dir: &Path, machine: &str) -> Result<Option<LocalIdentity>> 
     if !path.exists() {
         return Ok(None);
     }
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&content)
         .map(Some)
         .with_context(|| format!("parsing {}", path.display()))
@@ -130,7 +124,10 @@ mod tests {
         assert!(!cloud_dir.join("identities").exists());
         register(cloud_dir, MACHINE, FP, ALGO).unwrap();
         assert!(cloud_dir.join("identities").is_dir());
-        assert!(cloud_dir.join("identities").join(format!("{MACHINE}.json")).exists());
+        assert!(cloud_dir
+            .join("identities")
+            .join(format!("{MACHINE}.json"))
+            .exists());
     }
 
     #[test]

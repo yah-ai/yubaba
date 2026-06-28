@@ -20,19 +20,19 @@
 //! 5. Return a [`RunningWorkload`] whose supervisor tears down both
 //!    containers on shutdown.
 //!
-//! @yah:ticket(R256-F6, "sim tier = camp drives the shared Runtime backed by orbstack (not the warden binary, not a bespoke docker-CLI path)")
+//! @yah:ticket(R256-F6, "sim tier = camp drives the shared Runtime backed by orbstack (not the yubaba binary, not a bespoke docker-CLI path)")
 //! @yah:assignee(agent:claude)
 //! @yah:at(2026-05-25T20:08:22Z)
 //! @yah:status(review)
 //! @yah:parent(R256)
 //! @yah:depends_on(R256-F10)
-//! @yah:next("SUPERSEDED by R374 — carveout retracted; reconcile/liveness moves into sim dogfood scope. Camp no longer drives container lifecycle in pond; warden does. The trait-routing intent below stands, but the camp-as-lifecycle-authority part is gone. See W142 §Liveness + readiness.")
-//! @yah:next("sim host = camp embedding the shared Runtime trait pointed at orbstack's docker socket; warden hosts the SAME trait on containerd for cloud/ha. orbstack stays the sim backend — this UPHOLDS the dev-yah-static-demo locked decision; the only change is routing it through the shared trait (R256-F10) instead of a bespoke docker-CLI shortcut")
-//! @yah:next("shared trinity that makes sim==cloud-at-container-level real: (1) one Runtime trait talking orbstack-docker OR containerd, (2) scheduler/almanac-precondition layer, (3) xlb-net discovery. camp embeds it for dev+sim; warden for cloud+ha")
+//! @yah:next("SUPERSEDED by R374 — carveout retracted; reconcile/liveness moves into sim dogfood scope. Camp no longer drives container lifecycle in pond; yubaba does. The trait-routing intent below stands, but the camp-as-lifecycle-authority part is gone. See W142 §Liveness + readiness.")
+//! @yah:next("sim host = camp embedding the shared Runtime trait pointed at orbstack's docker socket; yubaba hosts the SAME trait on containerd for cloud/ha. orbstack stays the sim backend — this UPHOLDS the dev-yah-static-demo locked decision; the only change is routing it through the shared trait (R256-F10) instead of a bespoke docker-CLI shortcut")
+//! @yah:next("shared trinity that makes sim==cloud-at-container-level real: (1) one Runtime trait talking orbstack-docker OR containerd, (2) scheduler/almanac-precondition layer, (3) xlb-net discovery. camp embeds it for dev+sim; yubaba for cloud+ha")
 //! @yah:next("dogfood at sim: the workload contract + xlb-net discovery. NOT dogfooded at sim: WG mesh + raft — correct, since those only exist at the ha tier")
 //! @yah:gotcha("build profile (debug+telemetry for sim, release for cloud) is an OVERRIDABLE DEFAULT per tier, not a tier property — sim-in-release and an ha-in-debug+telemetry 'analysis cluster' are both legal")
 //! @yah:assumes("sim's 'mesh' is just orbstack's bridge with xlb-net discovery on top; a real WG mesh only appears at cloud/ha")
-//! @yah:handoff("Camp is now the lifecycle authority for sim-tier containers, mirroring how R274-F1 made camp the authority for dev-tier. spawn_local_sim + find_local_sim_mirrors in camp.rs scan CloudConfig for mesofact-static components with local-sim mirrors (caddy-container) and call up_pond at camp startup. CampSocketHandle gains a sim task alongside mesofact and almanac. Desktop mirror_run.rs sets adopt_only: true on PondOptions — the reconciler's up_pond does a TCP probe and either adopts running Caddy or returns 'camp not running' error. PondOptions.adopt_only: bool added (default false); camp always uses false, desktop always true. Architecture doc updated with the camp-embedded-sim section. All paths use cloud::local_runtime::LocalRuntime (orbstack-docker-CLI) — no bespoke docker path. The R256-F10 keystone (shared Runtime trait for camp+warden) is the follow-on; the camp/desktop adopt contract established here is trait-agnostic and will route through F10 without interface changes.")
+//! @yah:handoff("Camp is now the lifecycle authority for sim-tier containers, mirroring how R274-F1 made camp the authority for dev-tier. spawn_local_sim + find_local_sim_mirrors in camp.rs scan CloudConfig for mesofact-static components with local-sim mirrors (caddy-container) and call up_pond at camp startup. CampSocketHandle gains a sim task alongside mesofact and almanac. Desktop mirror_run.rs sets adopt_only: true on PondOptions — the reconciler's up_pond does a TCP probe and either adopts running Caddy or returns 'camp not running' error. PondOptions.adopt_only: bool added (default false); camp always uses false, desktop always true. Architecture doc updated with the camp-embedded-sim section. All paths use cloud::local_runtime::LocalRuntime (orbstack-docker-CLI) — no bespoke docker path. The R256-F10 keystone (shared Runtime trait for camp+yubaba) is the follow-on; the camp/desktop adopt contract established here is trait-agnostic and will route through F10 without interface changes.")
 //! @yah:verify("cargo check -p cloud -p yah -p desktop --locked  # expect zero errors")
 //! @yah:verify("cargo test -p cloud --locked --lib reconciler::pond::tests  # 8/8 pass including adopt_only_errors_when_miniflare_not_running")
 //! @yah:verify("cargo test -p cloud --locked --lib  # 165 passed")
@@ -120,100 +120,100 @@
 //! @yah:handoff("Audited W142 §MinIO license caveat and updated in place. Pinned tag is RELEASE.2025-04-22T22-12-26Z (post-AGPL relicense, Jan 2021). Verdict: fine for current usage — AGPL §13 requires modification + hosted network service; we have neither. The permissive-only CLAUDE.md rule targets linked/vendored code deps, not external container runtime deps. No action needed today. Revisit trigger is clearly stated: if yah ever hosts pond as a service.")
 //! @yah:verify("Read W142 §MinIO license caveat — contains pinned tag, post-relicense verdict, and revisit trigger")
 //!
-//! @yah:relay(R374, "Warden owns liveness in pond — retract R256-F6 camp-direct carveout")
+//! @yah:relay(R374, "Yubaba owns liveness in pond — retract R256-F6 camp-direct carveout")
 //! @yah:at(2026-06-01T17:25:26Z)
 //! @yah:status(open)
 //! @yah:assignee(agent:claude)
 //! @yah:next("Frame: in pond today, camp directly drives container lifecycle and desktop adopts via a bare TCP probe of the miniflare port. Half-alive states (miniflare orphaned to launchd ppid=1, MinIO gone) get silently adopted, surfacing as 'Network connection lost' from entry.worker.js. R362-B1 patched two narrow symptoms but the shape keeps inviting the same bug class.")
-//! @yah:next("Direction: warden becomes the liveness/readiness authority in pond too. Camp's job shrinks to 'ensure ONE warden is up'; desktop's job shrinks to 'ask warden for the workload's status'. Half-alive becomes structurally impossible because warden's reconciler only reports Ready when every slot's probe passes.")
+//! @yah:next("Direction: yubaba becomes the liveness/readiness authority in pond too. Camp's job shrinks to 'ensure ONE yubaba is up'; desktop's job shrinks to 'ask yubaba for the workload's status'. Half-alive becomes structurally impossible because yubaba's reconciler only reports Ready when every slot's probe passes.")
 //! @yah:next("Reframe of R256-F6: that carveout excluded WG mesh + raft from sim's dogfood scope (correct — multi-node concerns) but quietly excluded reconcile/liveness too (wrong — single-node, and exactly what broke). Reconcile/liveness moves INTO sim's dogfood scope; mesh + raft stay out.")
 //! @yah:next("Realizes the R256-F10 keystone (one Runtime trait spanning sim+cloud+ha) instead of leaving sim on a parallel track. Removes ~500 LOC of container-lifecycle duplication between up_pond and the cloud/ha path. Gives desktop a single source of truth for workload health (matches the Services-tab live-state ambition).")
-//! @yah:next("Cost surface: warden bootstrap adds to pond cold-start. S1 measures it vs the W142 'few-second cold / sub-second warm' budget before F3/F4 commit. If it doesn't fit, optimize warden — do NOT retreat to camp-owns-lifecycle.")
-//! @yah:next("Adjacent: R256-F6 superseded (carveout retracted); R256-F10 realized; R362-F4 'orphan reconciliation on boot' folds into warden's reconciler; R362-B1's narrow fixes stay landed but the structural fix supersedes their preventive intent.")
-//! @yah:next("Bootstrap: camp starts warden in pond (only candidate — warden can't bootstrap itself). Same shape as systemd-starts-warden in ha, substituted at the lowest layer.")
-//! @yah:verify("End-to-end half-alive smoke: while pond is up, externally stop the MinIO container. Within one reconcile interval warden reports Degraded; desktop ServiceCard flips off Ready; warden restarts MinIO; status returns to Ready. No 'Network connection lost' during the transition.")
+//! @yah:next("Cost surface: yubaba bootstrap adds to pond cold-start. S1 measures it vs the W142 'few-second cold / sub-second warm' budget before F3/F4 commit. If it doesn't fit, optimize yubaba — do NOT retreat to camp-owns-lifecycle.")
+//! @yah:next("Adjacent: R256-F6 superseded (carveout retracted); R256-F10 realized; R362-F4 'orphan reconciliation on boot' folds into yubaba's reconciler; R362-B1's narrow fixes stay landed but the structural fix supersedes their preventive intent.")
+//! @yah:next("Bootstrap: camp starts yubaba in pond (only candidate — yubaba can't bootstrap itself). Same shape as systemd-starts-yubaba in ha, substituted at the lowest layer.")
+//! @yah:verify("End-to-end half-alive smoke: while pond is up, externally stop the MinIO container. Within one reconcile interval yubaba reports Degraded; desktop ServiceCard flips off Ready; yubaba restarts MinIO; status returns to Ready. No 'Network connection lost' during the transition.")
 //! @yah:verify("Adopt-path correctness: with miniflare orphaned and MinIO dead (today's repro), desktop's adopt returns a clear slot-level error, not silent green.")
 //! @yah:verify("Spinup budget held: cold and warm numbers captured by S1; remain inside W142's bar.")
 //! @arch:see(.yah/docs/working/W142-pond.md)
 //!
 //! @arch:see(.yah/docs/working/W142-pond.md)
 //!
-//! @yah:ticket(R374-F2, "Warden workload-status API + camp/desktop become clients")
+//! @yah:ticket(R374-F2, "Yubaba workload-status API + camp/desktop become clients")
 //! @yah:assignee(agent:claude)
 //! @yah:at(2026-06-01T17:25:46Z)
 //! @yah:status(review)
 //! @yah:parent(R374)
-//! @yah:next("Define the workload-status surface warden serves: per-workload phase (Pending|Running|Degraded|Failed), per-slot health (probe state, last error, restart count), endpoint info for clients. HTTP+JSON is the obvious first cut unless S1 surfaces a reason for gRPC.")
-//! @yah:next("Camp's pond bring-up: start warden → POST the WorkloadSpec → poll status until Ready or timeout. Drop the direct LocalRuntime calls from up_pond.")
-//! @yah:next("Desktop's adopt path (today's TCP probe on miniflare port 4322): replace with a warden status GET. Adopt only on Ready; surface slot-level error on Degraded/Failed; clear 'warden unreachable' error when warden itself is down.")
+//! @yah:next("Define the workload-status surface yubaba serves: per-workload phase (Pending|Running|Degraded|Failed), per-slot health (probe state, last error, restart count), endpoint info for clients. HTTP+JSON is the obvious first cut unless S1 surfaces a reason for gRPC.")
+//! @yah:next("Camp's pond bring-up: start yubaba → POST the WorkloadSpec → poll status until Ready or timeout. Drop the direct LocalRuntime calls from up_pond.")
+//! @yah:next("Desktop's adopt path (today's TCP probe on miniflare port 4322): replace with a yubaba status GET. Adopt only on Ready; surface slot-level error on Degraded/Failed; clear 'yubaba unreachable' error when yubaba itself is down.")
 //! @yah:next("This is the smallest reasonable seam that lets F3/F4 move lifecycle code without breaking camp+desktop in flight.")
-//! @yah:verify("up_pond no longer calls runtime.run / runtime.ensure_image / wait_for_port directly — those move behind the warden API.")
+//! @yah:verify("up_pond no longer calls runtime.run / runtime.ensure_image / wait_for_port directly — those move behind the yubaba API.")
 //! @yah:verify("Stop MinIO container externally; desktop ServiceCard reflects Degraded within the readiness-probe interval, not silently Ready.")
 //! @yah:verify("cargo test -p cloud reconciler::pond passes.")
 //! @arch:see(.yah/docs/working/W142-pond.md)
 //! @yah:depends_on(R374-S1)
-//! @yah:handoff("F2 lands the warden workload-status seam. Five changes: (1) new module crates/yah/warden/src/pond.rs with PondHandler callback type, PondLifecycle trait, PondRegistry, and 3 axum routes (POST /pond/deploy, GET /pond/state?ident=..., GET /pond). (2) warden::ServerState gains pond_handler + pond_registry fields + with_pond_handler() builder; lib.rs registers the routes + a serve_on_listener() fn so embedders can pre-bind on port 0. (3) app/yah/cli adds warden as a dep; spawn_pond rewritten to bind warden's listener on 127.0.0.1:0, write the port to <camp_root>/.yah/jit/warden-pond-port.json, build ServerState with a pond handler wrapping cloud::reconciler::pond::up_pond, then POST /pond/deploy for each declared miniflare-container mirror. (4) crates/yah/cloud/src/reconciler/pond.rs adopt_only branch now reads the warden-pond-port file + GETs /pond/state instead of TCP-probing miniflare's port — the half-alive bug R374 was filed against is structurally impossible on this path because warden only reports Running when the deploy handler returned Ok and the lifecycle is held. (5) cloud's dev-deps grow axum to drive in-process warden mocks for the adopt-path tests.")
-//! @yah:handoff("What F2 ships vs defers: warden is the STATUS SURFACE in F2, but it does not yet ACTIVELY PROBE slot health — phase transitions to Running on a successful POST and never to Degraded. The 'Stop MinIO container externally; desktop ServiceCard reflects Degraded' verify line is F3's job (warden's reconciler loop). Lifecycle code physically still lives in cloud::reconciler::pond::up_pond; the change is that it's invoked through the warden API instead of from camp directly. F3 migrates the MinIO half into warden::runtime; F4 migrates miniflare via a process-shaped slot per S1's heterogeneity decision (option C).")
-//! @yah:handoff("Tests: 5 new warden pond unit tests (PondRegistry mark_pending/insert_running/mark_failed/shutdown_all/redeploy). 4 new cloud adopt-path tests (missing port file, 404 from warden, Running adopts with dev_url + console_url, Failed bails with reason carried through). Existing R256-F6 test 'adopt_only_errors_when_miniflare_not_running' rewritten to 'adopt_only_errors_when_no_warden_port_file' — same intent, new shape. pond_smoke cold 1.18s / warm 503 ms (W142 budgets 15 s / 3 s) confirms F2 didn't regress the cold path.")
-//! @yah:handoff("Verification commands: cargo test -p warden --lib (82 pass); cargo test -p cloud --lib (239 pass incl. 11 pond tests); cargo check -p warden -p cloud -p yah -p desktop (clean, warnings only). YAH_LOCAL_SIM_E2E=1 cargo test -p cloud --release --test pond_smoke after temporarily patching .get(\"dev-yah\") → .get(\"yah-marketing\") (the stale-service-name gotcha S1 flagged) reproduces the green run with the cold/warm numbers above.")
-//! @yah:verify("cargo test -p warden --lib  # 82 pass incl. 5 pond_::tests")
+//! @yah:handoff("F2 lands the yubaba workload-status seam. Five changes: (1) new module crates/yah/yubaba/src/pond.rs with PondHandler callback type, PondLifecycle trait, PondRegistry, and 3 axum routes (POST /pond/deploy, GET /pond/state?ident=..., GET /pond). (2) yubaba::ServerState gains pond_handler + pond_registry fields + with_pond_handler() builder; lib.rs registers the routes + a serve_on_listener() fn so embedders can pre-bind on port 0. (3) app/yah/cli adds yubaba as a dep; spawn_pond rewritten to bind yubaba's listener on 127.0.0.1:0, write the port to <camp_root>/.yah/jit/yubaba-pond-port.json, build ServerState with a pond handler wrapping cloud::reconciler::pond::up_pond, then POST /pond/deploy for each declared miniflare-container mirror. (4) crates/yah/cloud/src/reconciler/pond.rs adopt_only branch now reads the yubaba-pond-port file + GETs /pond/state instead of TCP-probing miniflare's port — the half-alive bug R374 was filed against is structurally impossible on this path because yubaba only reports Running when the deploy handler returned Ok and the lifecycle is held. (5) cloud's dev-deps grow axum to drive in-process yubaba mocks for the adopt-path tests.")
+//! @yah:handoff("What F2 ships vs defers: yubaba is the STATUS SURFACE in F2, but it does not yet ACTIVELY PROBE slot health — phase transitions to Running on a successful POST and never to Degraded. The 'Stop MinIO container externally; desktop ServiceCard reflects Degraded' verify line is F3's job (yubaba's reconciler loop). Lifecycle code physically still lives in cloud::reconciler::pond::up_pond; the change is that it's invoked through the yubaba API instead of from camp directly. F3 migrates the MinIO half into yubaba::runtime; F4 migrates miniflare via a process-shaped slot per S1's heterogeneity decision (option C).")
+//! @yah:handoff("Tests: 5 new yubaba pond unit tests (PondRegistry mark_pending/insert_running/mark_failed/shutdown_all/redeploy). 4 new cloud adopt-path tests (missing port file, 404 from yubaba, Running adopts with dev_url + console_url, Failed bails with reason carried through). Existing R256-F6 test 'adopt_only_errors_when_miniflare_not_running' rewritten to 'adopt_only_errors_when_no_warden_port_file' — same intent, new shape. pond_smoke cold 1.18s / warm 503 ms (W142 budgets 15 s / 3 s) confirms F2 didn't regress the cold path.")
+//! @yah:handoff("Verification commands: cargo test -p yubaba --lib (82 pass); cargo test -p cloud --lib (239 pass incl. 11 pond tests); cargo check -p yubaba -p cloud -p yah -p desktop (clean, warnings only). YAH_LOCAL_SIM_E2E=1 cargo test -p cloud --release --test pond_smoke after temporarily patching .get(\"dev-yah\") → .get(\"yah-marketing\") (the stale-service-name gotcha S1 flagged) reproduces the green run with the cold/warm numbers above.")
+//! @yah:verify("cargo test -p yubaba --lib  # 82 pass incl. 5 pond_::tests")
 //! @yah:verify("cargo test -p cloud --lib reconciler::pond  # 11 pass incl. 4 new adopt-path tests")
-//! @yah:verify("cargo check -p warden -p cloud -p yah -p desktop  # clean (warnings only)")
+//! @yah:verify("cargo check -p yubaba -p cloud -p yah -p desktop  # clean (warnings only)")
 //! @yah:verify("YAH_LOCAL_SIM_E2E=1 cargo test -p cloud --release --test pond_smoke -- --nocapture  # cold + warm inside W142 budget (after patching the stale 'dev-yah' service id to 'yah-marketing')")
 //! @yah:gotcha("pond_smoke.rs:99 still references the stale 'dev-yah' service id and needs renaming before F3/F4 lean on it as a regression bar (carried over from S1).")
-//! @yah:gotcha("warden::pond::PondPhase has Pending/Running/Degraded/Failed variants but F2 never transitions to Degraded — that's F3's reconciler-loop work. Today phase goes Pending → (Running | Failed) once and stays.")
-//! @yah:gotcha("Camp's embedded warden writes a hostkey at <camp_root>/.yah/jit/warden-camp-state.json on first boot (ServerState::load auto-generates one). Inert at pond tier but the file is written; gitignored under .yah/jit/.")
+//! @yah:gotcha("yubaba::pond::PondPhase has Pending/Running/Degraded/Failed variants but F2 never transitions to Degraded — that's F3's reconciler-loop work. Today phase goes Pending → (Running | Failed) once and stays.")
+//! @yah:gotcha("Camp's embedded yubaba writes a hostkey at <camp_root>/.yah/jit/yubaba-camp-state.json on first boot (ServerState::load auto-generates one). Inert at pond tier but the file is written; gitignored under .yah/jit/.")
 //!
-//! @yah:ticket(R374-F3, "Migrate MinIO lifecycle from up_pond into warden's reconciler")
+//! @yah:ticket(R374-F3, "Migrate MinIO lifecycle from up_pond into yubaba's reconciler")
 //! @yah:assignee(agent:claude)
 //! @yah:at(2026-06-01T17:25:54Z)
 //! @yah:status(review)
 //! @yah:parent(R374)
-//! @yah:handoff("F3 lands the MinIO half under warden. Five changes: (1) NEW crate crates/yah/local-driver/ extracts cloud::local_runtime + cloud::provider::s3_sign + a new pond_minio module (MinioSpec, MinioRunning, ensure_minio_running, ensure_bucket_public). Both cloud and warden depend on it — no dep cycle. (2) cloud::local_runtime / cloud::provider::s3_sign re-export from local-driver for backward compat; from_provider_config moved to a free fn cloud::local_container_spec_from_provider. (3) warden::pond gains MinioSpec on PondDeployReq; deploy handler brings MinIO up via local_driver::pond_minio::ensure_minio_running, invokes the embedder's handler with the live MinioRunning, registers both lifecycles + spawns a MinioReconciler tokio task (probe MinIO health every 5s; restart on failure; mark Failed after 3 consecutive restart failures; tear down properly on shutdown). (4) warden::ServerState gains pond_local_runtime + with_pond_local_runtime. (5) Camp detects LocalRuntime once at startup + passes to warden; camp's PondHandler shrinks to spawn_miniflare_workload (the miniflare-only half). cloud::reconciler::pond::up_pond's non-adopt branch keeps working via the same shared local_driver::pond_minio primitives (for pond_smoke + yah cloud mirror up); production lifecycles run through warden.")
-//! @yah:handoff("Tests: 29 local-driver lib tests (canonical_name, runtime_pref, detect_*, build_cascade, expand_tilde, container_state, workload_spec_to_crs, MinioSpec serde, public_read_bucket_policy, s3_sign sigv4). 85 warden lib tests including 7 PondRegistry tests (pending_then_running, failed_carries_error, missing_ident, shutdown_all_drains, redeploy_replaces, insert_full_populates_endpoint_and_console_url, mark_phase_does_not_disturb_endpoints, mark_phase_on_missing_ident_is_a_noop). 212 cloud lib tests; cargo check --workspace clean.")
-//! @yah:handoff("Architecture: cloud → local-driver ← warden. local-driver carries the docker-CLI driver + S3 SigV4 + pond_minio bring-up primitives (no warden state). warden adds MinioReconciler (probe + restart loop). cloud's reconciler invokes the same primitives directly for cloud-tier tests; warden invokes them under reconciler supervision for production. The half-alive bug R374 fixes is structurally impossible on warden's path because the reconciler flips PondPhase to Degraded the first time a probe fails, with a restart attempt before the desktop adopts.")
+//! @yah:handoff("F3 lands the MinIO half under yubaba. Five changes: (1) NEW crate crates/yah/local-driver/ extracts cloud::local_runtime + cloud::provider::s3_sign + a new pond_minio module (MinioSpec, MinioRunning, ensure_minio_running, ensure_bucket_public). Both cloud and yubaba depend on it — no dep cycle. (2) cloud::local_runtime / cloud::provider::s3_sign re-export from local-driver for backward compat; from_provider_config moved to a free fn cloud::local_container_spec_from_provider. (3) yubaba::pond gains MinioSpec on PondDeployReq; deploy handler brings MinIO up via local_driver::pond_minio::ensure_minio_running, invokes the embedder's handler with the live MinioRunning, registers both lifecycles + spawns a MinioReconciler tokio task (probe MinIO health every 5s; restart on failure; mark Failed after 3 consecutive restart failures; tear down properly on shutdown). (4) yubaba::ServerState gains pond_local_runtime + with_pond_local_runtime. (5) Camp detects LocalRuntime once at startup + passes to yubaba; camp's PondHandler shrinks to spawn_miniflare_workload (the miniflare-only half). cloud::reconciler::pond::up_pond's non-adopt branch keeps working via the same shared local_driver::pond_minio primitives (for pond_smoke + yah cloud mirror up); production lifecycles run through yubaba.")
+//! @yah:handoff("Tests: 29 local-driver lib tests (canonical_name, runtime_pref, detect_*, build_cascade, expand_tilde, container_state, workload_spec_to_crs, MinioSpec serde, public_read_bucket_policy, s3_sign sigv4). 85 yubaba lib tests including 7 PondRegistry tests (pending_then_running, failed_carries_error, missing_ident, shutdown_all_drains, redeploy_replaces, insert_full_populates_endpoint_and_console_url, mark_phase_does_not_disturb_endpoints, mark_phase_on_missing_ident_is_a_noop). 212 cloud lib tests; cargo check --workspace clean.")
+//! @yah:handoff("Architecture: cloud → local-driver ← yubaba. local-driver carries the docker-CLI driver + S3 SigV4 + pond_minio bring-up primitives (no yubaba state). yubaba adds MinioReconciler (probe + restart loop). cloud's reconciler invokes the same primitives directly for cloud-tier tests; yubaba invokes them under reconciler supervision for production. The half-alive bug R374 fixes is structurally impossible on yubaba's path because the reconciler flips PondPhase to Degraded the first time a probe fails, with a restart attempt before the desktop adopts.")
 //! @yah:verify("cargo test -p local-driver --lib  # 29 pass")
-//! @yah:verify("cargo test -p warden --lib  # 85 pass incl. PondRegistry insert_full + mark_phase")
+//! @yah:verify("cargo test -p yubaba --lib  # 85 pass incl. PondRegistry insert_full + mark_phase")
 //! @yah:verify("cargo test -p cloud --lib  # 212 pass incl. R374-F2 adopt-path tests")
 //! @yah:verify("cargo check --workspace  # clean (warnings only)")
-//! @yah:verify("YAH_LOCAL_SIM_E2E=1 cargo test -p warden --test pond_reconciler_smoke -- --nocapture  # LIVE — first observed: Running at deploy, docker kill, Degraded at 5.0s, Running again at 5.5s. Total recovery 5.5s. Half-alive structurally impossible.")
+//! @yah:verify("YAH_LOCAL_SIM_E2E=1 cargo test -p yubaba --test pond_reconciler_smoke -- --nocapture  # LIVE — first observed: Running at deploy, docker kill, Degraded at 5.0s, Running again at 5.5s. Total recovery 5.5s. Half-alive structurally impossible.")
 //! @yah:verify("Cold-start of pond stays within S1's measured budget (cold ~1.2s / warm ~500ms). Smoke via `YAH_LOCAL_SIM_E2E=1 cargo test -p cloud --release --test pond_smoke -- --nocapture`. Both smokes are bundled in the .yah/qed/pond-smoke.toml pipeline — `yah qed run pond-smoke` (or the desktop Run tab once wired).")
 //! @yah:gotcha("pond_smoke.rs:99 still references the stale 'dev-yah' service id — pre-existing from R374-S1, orthogonal to F3.")
-//! @yah:gotcha("warden's MinioReconciler probe runs every 5 s; after 3 consecutive restart failures it marks the workload Failed and exits the loop. PondPhase Failed is terminal — operator action required (restart the camp daemon).")
-//! @yah:gotcha("Camp passes Arc<LocalRuntime> to warden once at startup. If orbstack/colima/docker isn't running when camp starts, pond mirrors are skipped with a clear warning; restart yah-camp after the runtime is up.")
+//! @yah:gotcha("yubaba's MinioReconciler probe runs every 5 s; after 3 consecutive restart failures it marks the workload Failed and exits the loop. PondPhase Failed is terminal — operator action required (restart the camp daemon).")
+//! @yah:gotcha("Camp passes Arc<LocalRuntime> to yubaba once at startup. If orbstack/colima/docker isn't running when camp starts, pond mirrors are skipped with a clear warning; restart yah-camp after the runtime is up.")
 //! @arch:see(.yah/docs/working/W142-pond.md)
 //! @yah:depends_on(R374-F2)
 //!
-//! @yah:ticket(R374-F4, "Migrate miniflare lifecycle into warden (shape from S1)")
+//! @yah:ticket(R374-F4, "Migrate miniflare lifecycle into yubaba (shape from S1)")
 //! @yah:assignee(agent:claude)
 //! @yah:at(2026-06-01T17:26:03Z)
 //! @yah:status(review)
 //! @yah:parent(R374)
-//! @yah:next("Implement per S1's decision: either WorkloadSpec gains a process-shaped slot (warden manages bun/node + workerd PIDs) or miniflare gets containerized (warden manages it identically to MinIO).")
-//! @yah:next("Either way, warden owns: spawn, stdout-ready signal (today's [miniflare-sim] ready oneshot), supervised teardown with the SIGTERM→SIGKILL pattern from R362-B1, restart-on-failure.")
-//! @yah:next("Kill the orphan path: warden tracks miniflare so a camp/desktop crash can never leave a bun/workerd hanging on launchd. Today's repro (5+ day-old workerd at pid 92928) becomes impossible.")
+//! @yah:next("Implement per S1's decision: either WorkloadSpec gains a process-shaped slot (yubaba manages bun/node + workerd PIDs) or miniflare gets containerized (yubaba manages it identically to MinIO).")
+//! @yah:next("Either way, yubaba owns: spawn, stdout-ready signal (today's [miniflare-sim] ready oneshot), supervised teardown with the SIGTERM→SIGKILL pattern from R362-B1, restart-on-failure.")
+//! @yah:next("Kill the orphan path: yubaba tracks miniflare so a camp/desktop crash can never leave a bun/workerd hanging on launchd. Today's repro (5+ day-old workerd at pid 92928) becomes impossible.")
 //! @yah:next("Drop the R256-F6 adopt_only=true TCP probe completely — that path was the half-alive entry point.")
-//! @yah:verify("Kill camp/desktop mid-pond (SIGKILL the parent); restart camp; no orphaned bun/workerd. Warden restarts cleanly and re-converges the workload.")
-//! @yah:verify("miniflare-sim.mjs ready-line oneshot path is preserved or replaced by an equivalent warden-side readiness probe — not regressed.")
+//! @yah:verify("Kill camp/desktop mid-pond (SIGKILL the parent); restart camp; no orphaned bun/workerd. Yubaba restarts cleanly and re-converges the workload.")
+//! @yah:verify("miniflare-sim.mjs ready-line oneshot path is preserved or replaced by an equivalent yubaba-side readiness probe — not regressed.")
 //! @yah:verify("cargo test -p cloud reconciler::pond + the cross-mirror reject + spinup-budget smoke all green.")
 //! @arch:see(.yah/docs/working/W142-pond.md)
 //! @yah:depends_on(R374-F3)
-//! @yah:handoff("F4 complete. Miniflare lifecycle is now fully owned by warden. Removed PondHandler/PondLifecycle/PondDeployResult from warden; removed make_pond_handler from camp. New path: camp builds MiniflareSpec + MinioSpec and sends both in PondDeployReq; warden's deploy handler spawns miniflare via local_driver::pond_miniflare::spawn_miniflare and starts a MiniflareReconciler alongside the MinioReconciler. Both reconcilers run independent probe loops and restart their slot on failure. kill_on_drop(true) prevents orphans on abrupt warden exit. SIGTERM→SIGKILL pattern from R362-B1 preserved in kill_child().")
-//! @yah:verify("cargo check -p local-driver -p cloud -p warden -p yah → clean (0 warnings from F4 changes)")
+//! @yah:handoff("F4 complete. Miniflare lifecycle is now fully owned by yubaba. Removed PondHandler/PondLifecycle/PondDeployResult from yubaba; removed make_pond_handler from camp. New path: camp builds MiniflareSpec + MinioSpec and sends both in PondDeployReq; yubaba's deploy handler spawns miniflare via local_driver::pond_miniflare::spawn_miniflare and starts a MiniflareReconciler alongside the MinioReconciler. Both reconcilers run independent probe loops and restart their slot on failure. kill_on_drop(true) prevents orphans on abrupt yubaba exit. SIGTERM→SIGKILL pattern from R362-B1 preserved in kill_child().")
+//! @yah:verify("cargo check -p local-driver -p cloud -p yubaba -p yah → clean (0 warnings from F4 changes)")
 //! @yah:verify("cargo test -p local-driver --lib → 29/29 ok")
-//! @yah:verify("cargo test -p warden --lib → 86/86 ok (includes pond::miniflare::tests::kill_child_terminates_sleeping_process)")
+//! @yah:verify("cargo test -p yubaba --lib → 86/86 ok (includes pond::miniflare::tests::kill_child_terminates_sleeping_process)")
 //! @yah:verify("cargo test -p cloud --lib reconciler::pond → 25/25 ok")
-//! @yah:verify("YAH_LOCAL_SIM_E2E=1 cargo test -p warden --test pond_reconciler_smoke -- --nocapture → warden_reconciler_restarts_minio_and_miniflare (requires docker+bun; skipped in CI without env var)")
+//! @yah:verify("YAH_LOCAL_SIM_E2E=1 cargo test -p yubaba --test pond_reconciler_smoke -- --nocapture → warden_reconciler_restarts_minio_and_miniflare (requires docker+bun; skipped in CI without env var)")
 //!
 //! @yah:ticket(R374-T5, "Docs: W142 rewrite + R256-F6 retraction + R256-F10 supersession markers")
 //! @yah:assignee(agent:claude)
 //! @yah:at(2026-06-01T17:26:13Z)
 //! @yah:status(review)
 //! @yah:parent(R374)
-//! @yah:next("Rewrite W142-pond.md: replace the camp-drives-LocalRuntime topology diagram with the warden-mediated one (camp → warden → {MinIO container, miniflare process/container}). Move the 'Persistent volume' + 'Spinup budget' sections under the new shape.")
+//! @yah:next("Rewrite W142-pond.md: replace the camp-drives-LocalRuntime topology diagram with the yubaba-mediated one (camp → yubaba → {MinIO container, miniflare process/container}). Move the 'Persistent volume' + 'Spinup budget' sections under the new shape.")
 //! @yah:next("Add a 'Liveness + readiness' section to W142 documenting: workload-status surface, slot-level probes, restart policy, how desktop reflects state. Cite the half-alive failure mode this prevents.")
 //! @yah:next("Edit R256-F6's annotations in pond.rs (file header) to add @yah:next('SUPERSEDED by R374 — carveout retracted; reconcile/liveness moves into sim dogfood scope') and a status note. Same for R256-F10 with 'Realized by R374'.")
-//! @yah:next("Update A024 vocabulary doc to add a one-liner under the pond tier: 'pond runs warden as its liveness/readiness authority.'")
+//! @yah:next("Update A024 vocabulary doc to add a one-liner under the pond tier: 'pond runs yubaba as its liveness/readiness authority.'")
 //! @yah:verify("W142 reads as canonical for the new shape — the topology diagram + 'Liveness + readiness' section match the code merged under F3/F4.")
 //! @yah:verify("rg 'camp drives.*shared Runtime' in pond.rs returns either zero hits or hits inside an explicit SUPERSEDED marker.")
 //! @yah:verify("R256-F6 board_show output carries the supersession note.")
@@ -221,33 +221,33 @@
 //! @arch:see(.yah/docs/architecture/A024-vocabulary.md)
 //! @yah:depends_on(R374-F3)
 //! @yah:depends_on(R374-F4)
-//! @yah:handoff("T5 complete (docs-only). Four edits: (1) W142-pond.md rewritten — topology diagram shows camp → warden(embedded) → {MinIO, miniflare} with the two reconcilers; new 'Liveness + readiness' section documents PondPhase, slot probes, restart policy, desktop reflection, and half-alive prevention. Persistent volume + Spinup budget sections preserved under the new shape (cold ~1.2s / warm ~500ms numbers from F3's pond_smoke). (2) Crate layout section added to W142 explaining cloud/local-driver/warden dep shape (R374-F3). (3) R256-F6's annotation block in pond.rs gains a leading @yah:next('SUPERSEDED by R374 — carveout retracted; reconcile/liveness moves into sim dogfood scope') — board_show confirms it surfaces as the first bullet. (4) R256-F10 in warden/src/runtime/mod.rs gains a @yah:next('REALIZED by R374 — keystone shipped end-to-end in pond …'). (5) A024 vocabulary tier-relationship list gains a one-liner: 'sim (pond) runs warden as its liveness/readiness authority.' Verify: rg 'camp drives.*shared Runtime' pond.rs hits the original ticket title (line 23); the SUPERSEDED marker is on line 29 in the same annotation block — satisfies 'hits inside an explicit SUPERSEDED marker'.")
+//! @yah:handoff("T5 complete (docs-only). Four edits: (1) W142-pond.md rewritten — topology diagram shows camp → yubaba(embedded) → {MinIO, miniflare} with the two reconcilers; new 'Liveness + readiness' section documents PondPhase, slot probes, restart policy, desktop reflection, and half-alive prevention. Persistent volume + Spinup budget sections preserved under the new shape (cold ~1.2s / warm ~500ms numbers from F3's pond_smoke). (2) Crate layout section added to W142 explaining cloud/local-driver/yubaba dep shape (R374-F3). (3) R256-F6's annotation block in pond.rs gains a leading @yah:next('SUPERSEDED by R374 — carveout retracted; reconcile/liveness moves into sim dogfood scope') — board_show confirms it surfaces as the first bullet. (4) R256-F10 in yubaba/src/runtime/mod.rs gains a @yah:next('REALIZED by R374 — keystone shipped end-to-end in pond …'). (5) A024 vocabulary tier-relationship list gains a one-liner: 'sim (pond) runs yubaba as its liveness/readiness authority.' Verify: rg 'camp drives.*shared Runtime' pond.rs hits the original ticket title (line 23); the SUPERSEDED marker is on line 29 in the same annotation block — satisfies 'hits inside an explicit SUPERSEDED marker'.")
 //!
-//! @yah:relay(R408, "Pond: dual-process warden-container adaptation")
+//! @yah:relay(R408, "Pond: dual-process yubaba-container adaptation")
 //! @yah:at(2026-06-02T03:25:42Z)
 //! @yah:status(open)
 //! @yah:phase(P3)
 //! @yah:parent(Q405)
-//! @arch:see(.yah/docs/working/W154-warden-dual-runtime.md)
+//! @arch:see(.yah/docs/working/W154-yubaba-dual-runtime.md)
 //!
-//! @yah:ticket(R408-T1, "Pond warden-container image: tini PID 1 + install Warden+Constable binaries + cgroupns config")
+//! @yah:ticket(R408-T1, "Pond yubaba-container image: tini PID 1 + install Yubaba+Kamaji binaries + cgroupns config")
 //! @yah:assignee(agent:claude)
 //! @yah:at(2026-06-02T03:27:49Z)
 //! @yah:status(review)
 //! @yah:phase(P1)
 //! @yah:parent(R408)
-//! @arch:see(.yah/docs/working/W154-warden-dual-runtime.md)
+//! @arch:see(.yah/docs/working/W154-yubaba-dual-runtime.md)
 //! @yah:depends_on(R406-T2,R406-T6)
-//! @yah:handoff("Pond warden-container image landed as a bundled qed catalog entry. Three files: (1) crates/yah/qed/images/yah-warden/Dockerfile — multi-stage build (rust:1-slim-bookworm builder compiles --bin yah-warden + --bin constable with warden/containerd-integration feature; debian:bookworm-slim runtime ships tini + ca-certificates + iproute2 + procps + the two binaries + supervisor). tini installed via apt is wired as ENTRYPOINT ['/usr/bin/tini', '--']. Build context MUST be the workspace root (header documents this). (2) crates/yah/qed/images/yah-warden/pond-supervise.sh — bash launcher: cleans stale UDS, starts constable with --socket $CONSTABLE_SOCK (default /run/constable/constable.sock), waits up to 5s for the socket to bind, then starts yah-warden with that env var. wait -n on both pids; SIGTERM trap forwards to both. First-sibling-to-die-exits-the-container is acceptable pond-tier policy (systemd siblings handle independent restart at cloud tier per R406-T13). (3) crates/yah/qed/images/catalog.toml + crates/yah/qed/src/images/catalog.rs — added yah-warden as the 8th bundled entry (base = debian:bookworm-slim; description references W154); EXPECTED_BUNDLED test array and the file docstring extended to match. Pre-existing per_camp_produces_* tests already use 'yah-warden' as the override name — upsert semantics keep them passing.")
-//! @yah:handoff("Required docker run flags surfaced in the Dockerfile header (acceptance contract for T2): --cgroupns=private (cgroup namespace isolation so Constable can create child cgroups), --cap-add=SYS_ADMIN (cgroup/mount/unshare ops), -v /var/run/docker.sock:/var/run/docker.sock (T2 — sibling-container workloads), -v <state>:/var/lib/yah-warden (raft state per W105). The image itself does not enforce these — that's T2's pond reconciler wiring.")
-//! @yah:handoff("Verification: cargo test -p qed --lib images::catalog::tests → 16/16 pass. cargo check -p qed → clean. bash -n on the supervisor script → ok. Image not yet built locally — that's release-pipeline territory (R381-T7 builds yah-base/yah-rust/yah-rust-bun today; adding image-yah-warden to .github/workflows/release.yml is the next concrete step, mirroring those jobs).")
-//! @yah:next("T2 picks up here: pond reconciler must (a) pull/build yah-warden image, (b) docker run it with --cgroupns=private, --cap-add=SYS_ADMIN, -v /var/run/docker.sock:/var/run/docker.sock, -v <state>:/var/lib/yah-warden, (c) replace today's embedded warden in camp with a connection to the warden-container instance. The current camp-embedded warden path stays as a fallback until T2 lands the container-backed path.")
-//! @yah:next("Release-pipeline wiring (separate ticket worthwhile): add image-yah-warden GHA job to .github/workflows/release.yml mirroring image-yah-rust-bun (context = workspace root, file = crates/yah/qed/images/yah-warden/Dockerfile, cosign sign, inject YAH_WARDEN_DIGEST). The W148 phase plan in release.yml's header comments lists yah-python/yah-bun/yah-node/yah-cuda as the P2/P3 backlog — yah-warden belongs in that growth queue.")
-//! @yah:verify("cargo test -p qed --lib images::catalog::tests  # 16/16 pass; bundled_catalog_loads_with_all_entries now requires yah-warden")
+//! @yah:handoff("Pond yubaba-container image landed as a bundled qed catalog entry. Three files: (1) crates/yah/qed/images/yah-yubaba/Dockerfile — multi-stage build (rust:1-slim-bookworm builder compiles --bin yah-yubaba + --bin kamaji with yubaba/containerd-integration feature; debian:bookworm-slim runtime ships tini + ca-certificates + iproute2 + procps + the two binaries + supervisor). tini installed via apt is wired as ENTRYPOINT ['/usr/bin/tini', '--']. Build context MUST be the workspace root (header documents this). (2) crates/yah/qed/images/yah-yubaba/pond-supervise.sh — bash launcher: cleans stale UDS, starts kamaji with --socket $CONSTABLE_SOCK (default /run/kamaji/kamaji.sock), waits up to 5s for the socket to bind, then starts yah-yubaba with that env var. wait -n on both pids; SIGTERM trap forwards to both. First-sibling-to-die-exits-the-container is acceptable pond-tier policy (systemd siblings handle independent restart at cloud tier per R406-T13). (3) crates/yah/qed/images/catalog.toml + crates/yah/qed/src/images/catalog.rs — added yah-yubaba as the 8th bundled entry (base = debian:bookworm-slim; description references W154); EXPECTED_BUNDLED test array and the file docstring extended to match. Pre-existing per_camp_produces_* tests already use 'yah-yubaba' as the override name — upsert semantics keep them passing.")
+//! @yah:handoff("Required docker run flags surfaced in the Dockerfile header (acceptance contract for T2): --cgroupns=private (cgroup namespace isolation so Kamaji can create child cgroups), --cap-add=SYS_ADMIN (cgroup/mount/unshare ops), -v /var/run/docker.sock:/var/run/docker.sock (T2 — sibling-container workloads), -v <state>:/var/lib/yah-yubaba (raft state per W105). The image itself does not enforce these — that's T2's pond reconciler wiring.")
+//! @yah:handoff("Verification: cargo test -p qed --lib images::catalog::tests → 16/16 pass. cargo check -p qed → clean. bash -n on the supervisor script → ok. Image not yet built locally — that's release-pipeline territory (R381-T7 builds yah-base/yah-rust/yah-rust-bun today; adding image-yah-yubaba to .github/workflows/release.yml is the next concrete step, mirroring those jobs).")
+//! @yah:next("T2 picks up here: pond reconciler must (a) pull/build yah-yubaba image, (b) docker run it with --cgroupns=private, --cap-add=SYS_ADMIN, -v /var/run/docker.sock:/var/run/docker.sock, -v <state>:/var/lib/yah-yubaba, (c) replace today's embedded yubaba in camp with a connection to the yubaba-container instance. The current camp-embedded yubaba path stays as a fallback until T2 lands the container-backed path.")
+//! @yah:next("Release-pipeline wiring (separate ticket worthwhile): add image-yah-yubaba GHA job to .github/workflows/release.yml mirroring image-yah-rust-bun (context = workspace root, file = crates/yah/qed/images/yah-yubaba/Dockerfile, cosign sign, inject YAH_WARDEN_DIGEST). The W148 phase plan in release.yml's header comments lists yah-python/yah-bun/yah-node/yah-cuda as the P2/P3 backlog — yah-yubaba belongs in that growth queue.")
+//! @yah:verify("cargo test -p qed --lib images::catalog::tests  # 16/16 pass; bundled_catalog_loads_with_all_entries now requires yah-yubaba")
 //! @yah:verify("cargo check -p qed  # clean")
-//! @yah:verify("bash -n crates/yah/qed/images/yah-warden/pond-supervise.sh  # syntax ok")
-//! @yah:verify("docker buildx build --file crates/yah/qed/images/yah-warden/Dockerfile .  # builds from workspace root (heavy; not run in CI yet)")
-//! @yah:gotcha("containerd-integration feature is pulled in unconditionally for the release stage (warden's own Cargo.toml note: stub mode without it). If pond ever wants the stub-mode warden for faster local rebuilds, add a build-arg to toggle the feature.")
+//! @yah:verify("bash -n crates/yah/qed/images/yah-yubaba/pond-supervise.sh  # syntax ok")
+//! @yah:verify("docker buildx build --file crates/yah/qed/images/yah-yubaba/Dockerfile .  # builds from workspace root (heavy; not run in CI yet)")
+//! @yah:gotcha("containerd-integration feature is pulled in unconditionally for the release stage (yubaba's own Cargo.toml note: stub mode without it). If pond ever wants the stub-mode yubaba for faster local rebuilds, add a build-arg to toggle the feature.")
 //! @yah:gotcha("tini is installed via `apt install tini` rather than copied from krallin/tini-static — keeps the image purely debian-managed at the cost of glibc tini instead of musl. Fine for pond-tier; cloud-tier uses systemd anyway.")
 //! @yah:gotcha("The supervisor exits as soon as either sibling dies — pond-tier 'whole container restarts' policy. Cloud-tier independent restart lives at R406-T13 (systemd sibling units).")
 //!
@@ -257,20 +257,20 @@
 //! @yah:status(review)
 //! @yah:phase(P1)
 //! @yah:parent(R408)
-//! @arch:see(.yah/docs/working/W154-warden-dual-runtime.md)
+//! @arch:see(.yah/docs/working/W154-yubaba-dual-runtime.md)
 //! @yah:depends_on(R408-T1)
-//! @yah:handoff("T2 lands the docker socket mount + permission model contract for the pond warden-container as a typed builder, no runtime behavior changes yet. Three pieces: (1) ContainerRunSpec gains cap_add: Vec<String> + cgroupns: Option<String>. argv emission factored into ContainerRunSpec::docker_run_args() so callers and tests can inspect the wiring without a live docker socket. All four existing struct-literal sites (pond_minio.rs, local_runtime.rs workload_spec_to_crs, local_runtime.rs run-test fixture, cloud/local_driver_glue.rs test fixture) extended with cap_add: vec![] / cgroupns: None. ContainerRunSpec::new() initializes both to empty. (2) NEW local-driver module crates/yah/local-driver/src/pond_warden.rs: WardenContainerSpec carrying image/service/env/http_port/docker_socket_path/state_dir/extra_env; build_warden_run_spec(&WardenContainerSpec) -> ContainerRunSpec encoding the W154 contract (--cgroupns=private, --cap-add=SYS_ADMIN, -v <docker.sock>:/var/run/docker.sock, -v <state>:/var/lib/yah-warden, port mapping, canonical name yah-pond-<svc>-<env>-warden). Constants DEFAULT_WARDEN_IMAGE (ghcr.io/yah-ai/yah-warden:latest), DEFAULT_DOCKER_SOCKET_PATH (/var/run/docker.sock), WARDEN_STATE_CONTAINER_PATH (/var/lib/yah-warden), DEFAULT_WARDEN_HTTP_PORT (8800), WARDEN_SLOT (warden). looks_like_docker_socket() helper for early-failure path classification (OrbStack + Linux + colima patterns). (3) Module-level doc block in pond_warden.rs documents the permission model exhaustively: container runs as root, host docker.sock is the trust boundary, OrbStack auto-proxies, Linux relies on root bypassing the docker group, NO --privileged (least-privilege), no host /proc or /sys mount. pond.rs imports the new module behind #[allow(unused_imports)] as a forward-pointer for the future containerise-warden-in-pond ticket.")
-//! @yah:handoff("Tests: 8 new pond_warden unit tests (run_spec_has_canonical_name_and_label, run_spec_mounts_docker_socket, run_spec_mounts_state_dir, run_spec_requests_private_cgroupns_and_sys_admin, run_spec_exposes_http_port, run_spec_forwards_extra_env, docker_run_argv_carries_cgroupns_and_cap_add (exercises the new ContainerRunSpec::docker_run_args end-to-end), looks_like_docker_socket_classifies_common_paths). local-driver 37/37 lib tests pass (was 29 before T2 — 8 new pond_warden + 0 regression). cloud reconciler::pond 25/25 pass; warden pond 9/9 pass; cargo check -p local-driver -p cloud -p warden clean.")
-//! @yah:handoff("Out of scope for T2 (and explicitly NOT implemented): the bring-up + reconciler lifecycle that consumes WardenContainerSpec to actually run the yah-warden image in pond. That's the 'replace embedded warden with warden-container' lift — a much bigger change that crosses camp + pond.rs + warden's PondHandler. T2's contract gives that ticket a typed handle to consume instead of a tribal-knowledge checklist.")
-//! @yah:next("Wire the future 'containerise warden in pond' ticket: camp's pond bring-up (today: spawn_pond in app/yah/cli/src/camp.rs embeds warden in-process) replaces the embedded ServerState builder with: (a) WardenContainerSpec::new(...) + state_dir under .yah/infra/pond/<svc>-<env>/warden-state/, (b) local_driver::pond_warden::build_warden_run_spec, (c) LocalRuntime::ensure_image + run, (d) read the bound http_port via `docker port` and write it to .yah/jit/warden-pond-port.json. Desktop's adopt path (R374-F2) keeps working unchanged because it already reads that port file and GETs warden's /pond/state — the container-vs-embedded distinction is invisible at the desktop seam.")
+//! @yah:handoff("T2 lands the docker socket mount + permission model contract for the pond yubaba-container as a typed builder, no runtime behavior changes yet. Three pieces: (1) ContainerRunSpec gains cap_add: Vec<String> + cgroupns: Option<String>. argv emission factored into ContainerRunSpec::docker_run_args() so callers and tests can inspect the wiring without a live docker socket. All four existing struct-literal sites (pond_minio.rs, local_runtime.rs workload_spec_to_crs, local_runtime.rs run-test fixture, cloud/local_driver_glue.rs test fixture) extended with cap_add: vec![] / cgroupns: None. ContainerRunSpec::new() initializes both to empty. (2) NEW local-driver module crates/yah/local-driver/src/pond_warden.rs: WardenContainerSpec carrying image/service/env/http_port/docker_socket_path/state_dir/extra_env; build_warden_run_spec(&WardenContainerSpec) -> ContainerRunSpec encoding the W154 contract (--cgroupns=private, --cap-add=SYS_ADMIN, -v <docker.sock>:/var/run/docker.sock, -v <state>:/var/lib/yah-yubaba, port mapping, canonical name yah-pond-<svc>-<env>-yubaba). Constants DEFAULT_WARDEN_IMAGE (ghcr.io/yah-ai/yah-yubaba:latest), DEFAULT_DOCKER_SOCKET_PATH (/var/run/docker.sock), WARDEN_STATE_CONTAINER_PATH (/var/lib/yah-yubaba), DEFAULT_WARDEN_HTTP_PORT (8800), WARDEN_SLOT (yubaba). looks_like_docker_socket() helper for early-failure path classification (OrbStack + Linux + colima patterns). (3) Module-level doc block in pond_warden.rs documents the permission model exhaustively: container runs as root, host docker.sock is the trust boundary, OrbStack auto-proxies, Linux relies on root bypassing the docker group, NO --privileged (least-privilege), no host /proc or /sys mount. pond.rs imports the new module behind #[allow(unused_imports)] as a forward-pointer for the future containerise-yubaba-in-pond ticket.")
+//! @yah:handoff("Tests: 8 new pond_warden unit tests (run_spec_has_canonical_name_and_label, run_spec_mounts_docker_socket, run_spec_mounts_state_dir, run_spec_requests_private_cgroupns_and_sys_admin, run_spec_exposes_http_port, run_spec_forwards_extra_env, docker_run_argv_carries_cgroupns_and_cap_add (exercises the new ContainerRunSpec::docker_run_args end-to-end), looks_like_docker_socket_classifies_common_paths). local-driver 37/37 lib tests pass (was 29 before T2 — 8 new pond_warden + 0 regression). cloud reconciler::pond 25/25 pass; yubaba pond 9/9 pass; cargo check -p local-driver -p cloud -p yubaba clean.")
+//! @yah:handoff("Out of scope for T2 (and explicitly NOT implemented): the bring-up + reconciler lifecycle that consumes WardenContainerSpec to actually run the yah-yubaba image in pond. That's the 'replace embedded yubaba with yubaba-container' lift — a much bigger change that crosses camp + pond.rs + yubaba's PondHandler. T2's contract gives that ticket a typed handle to consume instead of a tribal-knowledge checklist.")
+//! @yah:next("Wire the future 'containerise yubaba in pond' ticket: camp's pond bring-up (today: spawn_pond in app/yah/cli/src/camp.rs embeds yubaba in-process) replaces the embedded ServerState builder with: (a) WardenContainerSpec::new(...) + state_dir under .yah/infra/pond/<svc>-<env>/yubaba-state/, (b) local_driver::pond_warden::build_warden_run_spec, (c) LocalRuntime::ensure_image + run, (d) read the bound http_port via `docker port` and write it to .yah/jit/yubaba-pond-port.json. Desktop's adopt path (R374-F2) keeps working unchanged because it already reads that port file and GETs yubaba's /pond/state — the container-vs-embedded distinction is invisible at the desktop seam.")
 //! @yah:next("T3 (W142-pond.md doc update) consumes T1+T2 together: outer container shape, internal supervisor split, docker socket mount + permission model section pointing at pond_warden's module docstring as the canonical contract source.")
 //! @yah:verify("cargo test -p local-driver --lib  # 37/37 incl. 8 pond_warden::tests")
 //! @yah:verify("cargo test -p cloud --lib reconciler::pond  # 25/25 — ContainerRunSpec extension didn't regress existing pond paths")
-//! @yah:verify("cargo test -p warden --lib pond  # 9/9")
-//! @yah:verify("cargo check -p local-driver -p cloud -p warden --tests  # clean")
+//! @yah:verify("cargo test -p yubaba --lib pond  # 9/9")
+//! @yah:verify("cargo check -p local-driver -p cloud -p yubaba --tests  # clean")
 //! @yah:gotcha("ContainerRunSpec field additions (cap_add, cgroupns) are not behind a feature flag — every struct-literal caller must populate them. The four existing sites are updated; future call-sites should prefer ContainerRunSpec::new() + assignment so adding more fields stays one-line.")
-//! @yah:gotcha("pond_warden does not run a uid-gid mapping for the docker socket. macOS/OrbStack works because OrbStack proxies the socket as-is and root inside the container can use it. Linux dev boxes also work because container root bypasses the docker group check on connect. A future ticket that wants to run the warden-container as non-root must add --group-add <docker-gid> wiring — the module docstring calls this out as the extension point.")
-//! @yah:gotcha("DEFAULT_WARDEN_IMAGE is ghcr.io/yah-ai/yah-warden:latest, but the release pipeline does NOT yet build this image (T1's handoff queues the image-yah-warden GHA job as next step). Local pond bring-up that consumes this default will fail to pull until the GHA job lands; operators can override the image field to a locally-built tag in the interim.")
+//! @yah:gotcha("pond_warden does not run a uid-gid mapping for the docker socket. macOS/OrbStack works because OrbStack proxies the socket as-is and root inside the container can use it. Linux dev boxes also work because container root bypasses the docker group check on connect. A future ticket that wants to run the yubaba-container as non-root must add --group-add <docker-gid> wiring — the module docstring calls this out as the extension point.")
+//! @yah:gotcha("DEFAULT_WARDEN_IMAGE is ghcr.io/yah-ai/yah-yubaba:latest, but the release pipeline does NOT yet build this image (T1's handoff queues the image-yah-yubaba GHA job as next step). Local pond bring-up that consumes this default will fail to pull until the GHA job lands; operators can override the image field to a locally-built tag in the interim.")
 //!
 //! @yah:ticket(R456-T2, "Carry slot probes through cloud::AdoptPondRecord → desktop MirrorRuntimeView → UI cell disclosure")
 //! @yah:at(2026-06-05T08:25:02Z)
@@ -302,11 +302,11 @@ use crate::local_container_spec_from_provider;
 use crate::MirrorProviderSlot;
 use local_driver::pond_minio::{ensure_minio_running, MinioRunning, MinioSpec};
 use local_driver::{canonical_label, canonical_name, LocalContainerSpec, LocalRuntime};
-// R408-T2: docker socket mount + permission model for the pond warden-container
+// R408-T2: docker socket mount + permission model for the pond yubaba-container
 // is encoded as a builder in `local_driver::pond_warden`. The future
-// "containerise warden in pond bring-up" ticket consumes
+// "containerise yubaba in pond bring-up" ticket consumes
 // `pond_warden::build_warden_run_spec` to produce the ContainerRunSpec for
-// the yah-warden image landed in R408-T1.
+// the yah-yubaba image landed in R408-T1.
 #[allow(unused_imports)]
 use local_driver::pond_warden::{build_warden_run_spec, WardenContainerSpec};
 
@@ -424,20 +424,20 @@ pub async fn up_pond(
     worker_script: &str,
 ) -> Result<RunningWorkload> {
     // ── Adopt-only path (R374-F2, desktop) ───────────────────────────────────
-    // Camp embeds warden as the pond workload-status authority. Desktop reads
-    // `<camp_root>/.yah/jit/warden-pond-port.json` and GETs `/pond/state` for
+    // Camp embeds yubaba as the pond workload-status authority. Desktop reads
+    // `<camp_root>/.yah/jit/yubaba-pond-port.json` and GETs `/pond/state` for
     // the (service, env, component) tuple. Pre-R374 the desktop did a bare
     // TCP probe on the miniflare port — that probe could silently adopt a
     // half-alive workerd orphaned to launchd while MinIO was already gone,
     // surfacing later as "Network connection lost" from entry.worker.js. The
-    // warden status surface makes that shape structurally impossible: warden
+    // yubaba status surface makes that shape structurally impossible: yubaba
     // only reports Running when the deploy handler returned successfully and
     // its supervisor still holds the lifecycle.
     if options.adopt_only {
         let ident = pond_workload_ident(&ctx.service.name, ctx.env, &ctx.component.id);
         let port = read_warden_pond_port(ctx.workspace_root).with_context(|| {
             format!(
-                "component {}: cannot read .yah/jit/warden-pond-port.json — \
+                "component {}: cannot read .yah/jit/yubaba-pond-port.json — \
                  ensure yah-camp is started with a service that declares a \
                  pond mirror (providers.static.kind = miniflare-container)",
                 ctx.component.id,
@@ -447,7 +447,7 @@ pub async fn up_pond(
             Some(r) => r,
             None => anyhow::bail!(
                 "component {}: pond workload {:?} is not registered with the \
-                 camp-embedded warden (GET http://127.0.0.1:{}/pond/state → 404)",
+                 camp-embedded yubaba (GET http://127.0.0.1:{}/pond/state → 404)",
                 ctx.component.id,
                 ident,
                 port,
@@ -456,14 +456,14 @@ pub async fn up_pond(
         match record.phase {
             AdoptPondPhase::Running => {
                 let dev_url = record.dev_url.unwrap_or_else(|| {
-                    let sim_port = slot_field_u16(static_fields, "port")
-                        .unwrap_or(DEFAULT_MINIFLARE_PORT);
+                    let sim_port =
+                        slot_field_u16(static_fields, "port").unwrap_or(DEFAULT_MINIFLARE_PORT);
                     format!("http://localhost:{sim_port}")
                 });
                 info!(
                     dev_url = %dev_url,
                     ident = %ident,
-                    "pond Running per warden; adopting",
+                    "pond Running per yubaba; adopting",
                 );
                 let mut adopted =
                     RunningWorkload::adopted("mesofact-static", "static", Some(dev_url));
@@ -473,40 +473,34 @@ pub async fn up_pond(
                 return Ok(adopted);
             }
             AdoptPondPhase::Pending => anyhow::bail!(
-                "component {}: pond workload {:?} is Pending in warden — \
+                "component {}: pond workload {:?} is Pending in yubaba — \
                  deploy still in flight; retry shortly",
                 ctx.component.id,
                 ident,
             ),
             AdoptPondPhase::Degraded => anyhow::bail!(
-                "component {}: pond workload {:?} is Degraded per warden{}",
+                "component {}: pond workload {:?} is Degraded per yubaba{}",
                 ctx.component.id,
                 ident,
-                record
-                    .error
-                    .map(|e| format!(": {e}"))
-                    .unwrap_or_default(),
+                record.error.map(|e| format!(": {e}")).unwrap_or_default(),
             ),
             AdoptPondPhase::Failed => anyhow::bail!(
-                "component {}: pond workload {:?} Failed per warden{}",
+                "component {}: pond workload {:?} Failed per yubaba{}",
                 ctx.component.id,
                 ident,
-                record
-                    .error
-                    .map(|e| format!(": {e}"))
-                    .unwrap_or_default(),
+                record.error.map(|e| format!(": {e}")).unwrap_or_default(),
             ),
         }
     }
 
     // ── Non-adopt path (R374-F3) ─────────────────────────────────────────────
-    // The pond bring-up shape became: bring MinIO up via warden's shared
+    // The pond bring-up shape became: bring MinIO up via yubaba's shared
     // primitives (`local_driver::pond_minio::ensure_minio_running`), then
-    // spawn miniflare against that. Warden's HTTP path additionally wires
-    // restart-on-failure via `warden::pond::minio::MinioReconciler`; this
+    // spawn miniflare against that. Yubaba's HTTP path additionally wires
+    // restart-on-failure via `yubaba::pond::minio::MinioReconciler`; this
     // direct-call entry point does not — it's only used by `pond_smoke` and
     // `yah cloud mirror up`. Production lifecycles run through
-    // `warden::pond::deploy` and get reconciler-managed MinIO.
+    // `yubaba::pond::deploy` and get reconciler-managed MinIO.
     let store_fields = require_object_store_slot(ctx)?;
     let sim_port = slot_field_u16(static_fields, "port").unwrap_or(DEFAULT_MINIFLARE_PORT);
     let bucket = resolve_bucket(static_fields, store_fields);
@@ -549,15 +543,15 @@ pub async fn up_pond(
         &ssr_prefixes,
     )
     .await
-        .map_err(|e| {
-            // Tear down MinIO so we don't leak a half-up workload.
-            let runtime = runtime.clone();
-            let name = minio_running.container_name.clone();
-            tokio::spawn(async move {
-                let _ = runtime.stop_and_remove(&name, Duration::from_secs(2)).await;
-            });
-            e
-        })?;
+    .map_err(|e| {
+        // Tear down MinIO so we don't leak a half-up workload.
+        let runtime = runtime.clone();
+        let name = minio_running.container_name.clone();
+        tokio::spawn(async move {
+            let _ = runtime.stop_and_remove(&name, Duration::from_secs(2)).await;
+        });
+        e
+    })?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let supervisor = supervise_miniflare_and_minio(
@@ -589,7 +583,7 @@ pub async fn up_pond(
 
 /// Build a [`MinioSpec`] from the canonical pond options + the
 /// `providers.object_store` slot fields. Used by both the direct-call path
-/// (cloud's `up_pond`) and the warden-deploy path (camp's handler).
+/// (cloud's `up_pond`) and the yubaba-deploy path (camp's handler).
 pub fn build_minio_spec(
     ctx: &ReconcileCtx<'_>,
     options: &PondOptions,
@@ -603,7 +597,7 @@ pub fn build_minio_spec(
     // R455-F1: every pond MinIO joins the per-cell bridge with alias `minio`
     // so siblings on the bridge (miniflare, mesofact-dev) reach S3 via DNS
     // (`http://minio:9000/<bucket>`). The API + console ports still publish
-    // to the host so the embedded warden + cloud-tier publisher can probe
+    // to the host so the embedded yubaba + cloud-tier publisher can probe
     // without joining the bridge themselves.
     Ok(MinioSpec {
         image: options.minio_image.clone(),
@@ -616,10 +610,7 @@ pub fn build_minio_spec(
         container_name: canonical_name(&ctx.service.name, ctx.env, OBJECT_STORE_SLOT),
         container_label: canonical_label(&ctx.service.name, ctx.env, OBJECT_STORE_SLOT),
         ready_timeout: options.ready_timeout,
-        network: Some(local_driver::pond_network_name(
-            &ctx.service.name,
-            ctx.env,
-        )),
+        network: Some(local_driver::pond_network_name(&ctx.service.name, ctx.env)),
         network_alias: Some(MINIO_NETWORK_ALIAS.into()),
     })
 }
@@ -641,9 +632,9 @@ pub fn require_object_store_slot<'a>(
             kind: Provider::MinioContainer,
             fields,
         } => Ok(fields),
-        MirrorProviderSlot::Inline { kind, .. } => bail!(
-            "providers.object_store.kind = {kind:?}, expected minio-container for pond",
-        ),
+        MirrorProviderSlot::Inline { kind, .. } => {
+            bail!("providers.object_store.kind = {kind:?}, expected minio-container for pond",)
+        }
         MirrorProviderSlot::Reference { provider_id, .. } => bail!(
             "providers.object_store.use = {provider_id:?} — pond requires an inline \
              minio-container slot, not a reference",
@@ -694,22 +685,17 @@ fn prepare_state_dir(ctx: &ReconcileCtx<'_>, state: &PondState) -> Result<()> {
 /// Lower a [`super::mesofact_static::WorkerMode`] to the three Worker
 /// binding strings (`WORKER_MODE`, `SSR_ORIGIN`, `SSR_PREFIXES` as a Vec for
 /// later JSON-encoding). Used by both the cloud-direct pond path and the
-/// warden-side miniflare spec builder.
+/// yubaba-side miniflare spec builder.
 pub fn worker_mode_triple(
     mode: &super::mesofact_static::WorkerMode,
 ) -> (String, String, Vec<String>) {
     match mode {
-        super::mesofact_static::WorkerMode::Static => {
-            ("static".to_string(), String::new(), vec![])
-        }
-        super::mesofact_static::WorkerMode::Spa => {
-            ("spa".to_string(), String::new(), vec![])
-        }
-        super::mesofact_static::WorkerMode::Ssr { origin_url, prefixes } => (
-            "ssr".to_string(),
-            origin_url.clone(),
-            prefixes.clone(),
-        ),
+        super::mesofact_static::WorkerMode::Static => ("static".to_string(), String::new(), vec![]),
+        super::mesofact_static::WorkerMode::Spa => ("spa".to_string(), String::new(), vec![]),
+        super::mesofact_static::WorkerMode::Ssr {
+            origin_url,
+            prefixes,
+        } => ("ssr".to_string(), origin_url.clone(), prefixes.clone()),
     }
 }
 
@@ -737,8 +723,8 @@ async fn spawn_miniflare_child(
     // domain).
     let asset_origin = format!("{}/{}", minio_running.endpoint, minio_running.bucket);
     let node_binary = resolve_js_binary(options.js_binary.as_deref());
-    let miniflare_import = resolve_miniflare_import(ctx.workspace_root)
-        .unwrap_or_else(|| "miniflare".to_string());
+    let miniflare_import =
+        resolve_miniflare_import(ctx.workspace_root).unwrap_or_else(|| "miniflare".to_string());
     let workerd_binary = resolve_workerd_binary(ctx.workspace_root);
 
     info!(
@@ -757,6 +743,11 @@ async fn spawn_miniflare_child(
         .env("MF_SCRIPT", &state.worker_js)
         .env("MF_MINIFLARE_IMPORT", &miniflare_import)
         .env("ASSET_ORIGIN", &asset_origin)
+        // Reserved upload seam (R490-T8): pond points UPLOAD_ORIGIN at the same
+        // MinIO bucket as ASSET_ORIGIN, so /uploads/* keys resolve in-bucket
+        // once a writer exists. No upload writer today — the binding just wires
+        // the seam so the dev path mirrors the prefix split.
+        .env("UPLOAD_ORIGIN", &asset_origin)
         .env("WORKER_MODE", worker_mode)
         .env("SSR_ORIGIN", ssr_origin)
         .env("SSR_PREFIXES", &ssr_prefixes_json)
@@ -895,7 +886,10 @@ fn supervise_miniflare_and_minio(
 ) -> tokio::task::JoinHandle<Result<()>> {
     tokio::spawn(async move {
         run_miniflare_supervisor(miniflare, shutdown_rx).await;
-        if let Err(e) = runtime.stop_and_remove(&minio_name, Duration::from_secs(3)).await {
+        if let Err(e) = runtime
+            .stop_and_remove(&minio_name, Duration::from_secs(3))
+            .await
+        {
             warn!(container = %minio_name, error = %e, "pond minio teardown");
         }
         Ok(())
@@ -975,8 +969,8 @@ pub fn which_bun_on_path() -> bool {
 /// the yah source tree get zero-download spinup; those who don't fall back to
 /// the bare `"miniflare"` specifier (which requires a lazy npm install).
 pub fn resolve_miniflare_import(workspace_root: &std::path::Path) -> Option<String> {
-    let index = workspace_root
-        .join("crates/yah/cloud/worker/node_modules/miniflare/dist/src/index.js");
+    let index =
+        workspace_root.join("crates/yah/cloud/worker/node_modules/miniflare/dist/src/index.js");
     if index.exists() {
         Some(index.to_string_lossy().into_owned())
     } else {
@@ -994,20 +988,24 @@ pub fn resolve_workerd_binary(workspace_root: &std::path::Path) -> Option<PathBu
     } else {
         "crates/yah/cloud/worker/node_modules/workerd/bin/workerd"
     });
-    if bin.exists() { Some(bin) } else { None }
+    if bin.exists() {
+        Some(bin)
+    } else {
+        None
+    }
 }
 
-// ── R374-F2: warden status query (desktop adopt path) ────────────────────────
+// ── R374-F2: yubaba status query (desktop adopt path) ────────────────────────
 
 /// Workload identity convention shared between camp (the producer) and
-/// desktop (the consumer). Kept short to fit the warden `MeshIdent` regex.
+/// desktop (the consumer). Kept short to fit the yubaba `MeshIdent` regex.
 pub fn pond_workload_ident(service: &str, env: &str, component_id: &str) -> String {
     format!("{service}-{env}-{component_id}")
 }
 
 /// Per-workload phase reported by `GET /pond/state`. Mirrors
-/// `warden::pond::PondPhase` on the wire — kept local to avoid taking a
-/// runtime dep on the warden crate from cloud.
+/// `yubaba::pond::PondPhase` on the wire — kept local to avoid taking a
+/// runtime dep on the yubaba crate from cloud.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdoptPondPhase {
@@ -1018,7 +1016,7 @@ pub enum AdoptPondPhase {
 }
 
 /// Liveness/readiness outcome for one slot — mirrors
-/// `warden::pond::ProbeOutcome` without a direct crate dependency.
+/// `yubaba::pond::ProbeOutcome` without a direct crate dependency.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
 pub enum AdoptProbeOutcome {
@@ -1027,9 +1025,9 @@ pub enum AdoptProbeOutcome {
     Pending,
 }
 
-/// Per-slot probe snapshot — mirrors `warden::pond::SlotProbe`.
+/// Per-slot probe snapshot — mirrors `yubaba::pond::SlotProbe`.
 /// `#[serde(default)]` on `url` keeps deserialization lenient for
-/// pre-E warden responses that omit the field.
+/// pre-E yubaba responses that omit the field.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct AdoptSlotProbe {
     pub slot: String,
@@ -1040,15 +1038,15 @@ pub struct AdoptSlotProbe {
     pub url: Option<String>,
 }
 
-/// Subset of `warden::pond::PondStateRecord` the desktop adopt path and
+/// Subset of `yubaba::pond::PondStateRecord` the desktop adopt path and
 /// the observation seam (`desktop::mirror_observation`) need. Field set
-/// kept narrow to avoid taking a runtime dep on the warden crate from
-/// cloud — extend it (and add a matching field to warden's record) when
+/// kept narrow to avoid taking a runtime dep on the yubaba crate from
+/// cloud — extend it (and add a matching field to yubaba's record) when
 /// a new bit of state needs to ride to the desktop.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct AdoptPondRecord {
     pub phase: AdoptPondPhase,
-    /// Identity fields — populated by warden so list-all consumers can
+    /// Identity fields — populated by yubaba so list-all consumers can
     /// correlate without re-deriving the ident scheme. `#[serde(default)]`
     /// because the per-ident `GET /pond/state` response is canonical only
     /// for `phase`, `dev_url`, `console_url`, and `error` today; adding
@@ -1065,47 +1063,39 @@ pub struct AdoptPondRecord {
     pub console_url: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
-    /// Per-slot probe snapshots from warden (R456-F1 Phase E). Empty for
-    /// pre-E warden responses — callers treat an empty vec as "no probe
+    /// Per-slot probe snapshots from yubaba (R456-F1 Phase E). Empty for
+    /// pre-E yubaba responses — callers treat an empty vec as "no probe
     /// data yet" rather than "all slots failed".
     #[serde(default)]
     pub slots: Vec<AdoptSlotProbe>,
 }
 
-/// Read the embedded warden's bound port from
-/// `<camp_root>/.yah/jit/warden-pond-port.json`. The file is written by
+/// Read the embedded yubaba's bound port from
+/// `<camp_root>/.yah/jit/yubaba-pond-port.json`. The file is written by
 /// `ensure_pond_running` in `app/yah/cli/src/camp.rs` (camp startup AND the
 /// `pond.ensure_running` RPC recovery path).
 pub fn read_warden_pond_port(workspace_root: &std::path::Path) -> Result<u16> {
-    let path = workspace_root.join(".yah/jit/warden-pond-port.json");
-    let body = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let v: serde_json::Value = serde_json::from_str(&body)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let path = workspace_root.join(".yah/jit/yubaba-pond-port.json");
+    let body =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()))?;
     let port = v
         .get("port")
         .and_then(|x| x.as_u64())
         .and_then(|p| u16::try_from(p).ok())
-        .with_context(|| {
-            format!(
-                "{}: missing or invalid 'port' field",
-                path.display()
-            )
-        })?;
+        .with_context(|| format!("{}: missing or invalid 'port' field", path.display()))?;
     Ok(port)
 }
 
 /// `GET http://127.0.0.1:{port}/pond/state?ident=...`. Returns `Ok(None)`
-/// when warden replies 404 (no registration for that ident — clear "pond
+/// when yubaba replies 404 (no registration for that ident — clear "pond
 /// not running" signal). Bails on connection errors / non-404 non-2xx.
-pub async fn query_warden_pond_state(
-    port: u16,
-    ident: &str,
-) -> Result<Option<AdoptPondRecord>> {
+pub async fn query_warden_pond_state(port: u16, ident: &str) -> Result<Option<AdoptPondRecord>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
-        .context("building reqwest client for warden status query")?;
+        .context("building reqwest client for yubaba status query")?;
     let url = format!("http://127.0.0.1:{port}/pond/state");
     let resp = client
         .get(&url)
@@ -1118,19 +1108,19 @@ pub async fn query_warden_pond_state(
             let record: AdoptPondRecord = resp
                 .json()
                 .await
-                .context("parsing warden /pond/state response")?;
+                .context("parsing yubaba /pond/state response")?;
             Ok(Some(record))
         }
         StatusCode::NOT_FOUND => Ok(None),
         s => {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("warden /pond/state returned {s}: {body}")
+            anyhow::bail!("yubaba /pond/state returned {s}: {body}")
         }
     }
 }
 
-/// `GET http://127.0.0.1:{port}/pond` — list every pond workload warden
-/// is currently tracking. Always 200 from warden (empty `workloads` when
+/// `GET http://127.0.0.1:{port}/pond` — list every pond workload yubaba
+/// is currently tracking. Always 200 from yubaba (empty `workloads` when
 /// nothing is registered). Used by the desktop observation seam so a
 /// single GET answers "what's up?" across every declared pond cell,
 /// instead of one GET per ident.
@@ -1143,7 +1133,7 @@ pub async fn query_warden_pond_list(port: u16) -> Result<Vec<AdoptPondRecord>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
-        .context("building reqwest client for warden list query")?;
+        .context("building reqwest client for yubaba list query")?;
     let url = format!("http://127.0.0.1:{port}/pond");
     let resp = client
         .get(&url)
@@ -1155,12 +1145,12 @@ pub async fn query_warden_pond_list(port: u16) -> Result<Vec<AdoptPondRecord>> {
             let body: WardenPondListResponse = resp
                 .json()
                 .await
-                .context("parsing warden /pond list response")?;
+                .context("parsing yubaba /pond list response")?;
             Ok(body.workloads)
         }
         s => {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("warden /pond returned {s}: {body}")
+            anyhow::bail!("yubaba /pond returned {s}: {body}")
         }
     }
 }
@@ -1175,7 +1165,10 @@ mod tests {
         let mut s = BTreeMap::new();
         s.insert("bucket".into(), toml::Value::String("from-static".into()));
         let mut o = BTreeMap::new();
-        o.insert("bucket".into(), toml::Value::String("from-object-store".into()));
+        o.insert(
+            "bucket".into(),
+            toml::Value::String("from-object-store".into()),
+        );
         assert_eq!(resolve_bucket(&s, &o), "from-static");
     }
 
@@ -1183,7 +1176,10 @@ mod tests {
     fn resolve_bucket_falls_back_to_either_set_field() {
         let s = BTreeMap::new();
         let mut o = BTreeMap::new();
-        o.insert("bucket".into(), toml::Value::String("from-object-store".into()));
+        o.insert(
+            "bucket".into(),
+            toml::Value::String("from-object-store".into()),
+        );
         assert_eq!(resolve_bucket(&s, &o), "from-object-store");
 
         let mut s = BTreeMap::new();
@@ -1215,6 +1211,7 @@ mod tests {
             role: "static".into(),
             publishes: None,
             wave: 0,
+            git: None,
         };
         let mirror = crate::MirrorConfig {
             schema_version: 1,
@@ -1230,11 +1227,7 @@ mod tests {
             env: "pond",
         };
         let state = PondState::for_ctx(&ctx);
-        assert_eq!(
-            state.dir,
-            tmp.path()
-                .join(".yah/infra/pond/dev-yah-pond"),
-        );
+        assert_eq!(state.dir, tmp.path().join(".yah/infra/pond/dev-yah-pond"),);
         assert_eq!(state.worker_js, state.dir.join("worker.js"));
         assert_eq!(state.miniflare_shim, state.dir.join("miniflare-sim.mjs"));
         assert_eq!(state.minio_data, state.dir.join("minio-data"));
@@ -1247,16 +1240,25 @@ mod tests {
         // Image refs must carry a `:tag` for cache determinism — schemars
         // schemas don't enforce this, so the default contract is the load-
         // bearing piece.
-        assert!(opts.minio_image.contains(':'), "minio image must be tag-pinned");
+        assert!(
+            opts.minio_image.contains(':'),
+            "minio image must be tag-pinned"
+        );
         assert!(opts.ready_timeout >= Duration::from_secs(10));
-        assert!(!opts.adopt_only, "default must not be adopt_only; camp uses false");
-        assert!(opts.js_binary.is_none(), "default js_binary is None (resolved at spawn time)");
+        assert!(
+            !opts.adopt_only,
+            "default must not be adopt_only; camp uses false"
+        );
+        assert!(
+            opts.js_binary.is_none(),
+            "default js_binary is None (resolved at spawn time)"
+        );
     }
 
     #[tokio::test]
     async fn adopt_only_errors_when_no_warden_port_file() {
         // R374-F2: adopt_only now requires camp to have written the embedded
-        // warden's port to .yah/jit/warden-pond-port.json. With no file the
+        // yubaba's port to .yah/jit/yubaba-pond-port.json. With no file the
         // adopt path returns a clear "start yah-camp" error — the pre-R374
         // TCP probe (which could silently adopt half-alive workerd orphans)
         // is gone.
@@ -1274,6 +1276,7 @@ mod tests {
             role: "static".into(),
             publishes: None,
             wave: 0,
+            git: None,
         };
         let mirror = crate::MirrorConfig {
             schema_version: 1,
@@ -1290,12 +1293,15 @@ mod tests {
         };
         let mut fields = BTreeMap::new();
         fields.insert("port".into(), toml::Value::Integer(19423));
-        let opts = PondOptions { adopt_only: true, ..PondOptions::default() };
+        let opts = PondOptions {
+            adopt_only: true,
+            ..PondOptions::default()
+        };
         let err = up_pond(&ctx, &opts, &fields, "").await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("warden-pond-port.json"),
-            "expected 'warden-pond-port.json' in error, got: {msg}"
+            msg.contains("yubaba-pond-port.json"),
+            "expected 'yubaba-pond-port.json' in error, got: {msg}"
         );
         assert!(
             msg.contains("yah-camp"),
@@ -1305,12 +1311,12 @@ mod tests {
 
     #[tokio::test]
     async fn adopt_only_returns_404_signal_when_warden_has_no_record() {
-        // R374-F2: when the port file exists but warden returns 404 for the
+        // R374-F2: when the port file exists but yubaba returns 404 for the
         // workload ident, the adopt path bails with "not registered with the
-        // camp-embedded warden" — a different (and more informative) error
+        // camp-embedded yubaba" — a different (and more informative) error
         // than the no-port-file case above.
         let tmp = tempfile::TempDir::new().unwrap();
-        // Stand up a mini warden-like server that always returns 404 on
+        // Stand up a mini yubaba-like server that always returns 404 on
         // /pond/state.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1329,7 +1335,7 @@ mod tests {
         // Write the port file so read_warden_pond_port succeeds.
         std::fs::create_dir_all(tmp.path().join(".yah/jit")).unwrap();
         std::fs::write(
-            tmp.path().join(".yah/jit/warden-pond-port.json"),
+            tmp.path().join(".yah/jit/yubaba-pond-port.json"),
             serde_json::json!({ "port": port }).to_string(),
         )
         .unwrap();
@@ -1347,6 +1353,7 @@ mod tests {
             role: "static".into(),
             publishes: None,
             wave: 0,
+            git: None,
         };
         let mirror = crate::MirrorConfig {
             schema_version: 1,
@@ -1362,19 +1369,22 @@ mod tests {
             env: "pond",
         };
         let fields = BTreeMap::new();
-        let opts = PondOptions { adopt_only: true, ..PondOptions::default() };
+        let opts = PondOptions {
+            adopt_only: true,
+            ..PondOptions::default()
+        };
         let err = up_pond(&ctx, &opts, &fields, "").await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("not registered with the camp-embedded warden"),
-            "expected 'not registered with the camp-embedded warden' in error, got: {msg}"
+            msg.contains("not registered with the camp-embedded yubaba"),
+            "expected 'not registered with the camp-embedded yubaba' in error, got: {msg}"
         );
         server.abort();
     }
 
     #[tokio::test]
     async fn adopt_only_adopts_on_running_phase() {
-        // R374-F2: warden returns phase=running with dev_url → up_pond returns
+        // R374-F2: yubaba returns phase=running with dev_url → up_pond returns
         // a RunningWorkload::adopted carrying that URL.
         let tmp = tempfile::TempDir::new().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1401,7 +1411,7 @@ mod tests {
         });
         std::fs::create_dir_all(tmp.path().join(".yah/jit")).unwrap();
         std::fs::write(
-            tmp.path().join(".yah/jit/warden-pond-port.json"),
+            tmp.path().join(".yah/jit/yubaba-pond-port.json"),
             serde_json::json!({ "port": port }).to_string(),
         )
         .unwrap();
@@ -1418,6 +1428,7 @@ mod tests {
             role: "static".into(),
             publishes: None,
             wave: 0,
+            git: None,
         };
         let mirror = crate::MirrorConfig {
             schema_version: 1,
@@ -1433,7 +1444,10 @@ mod tests {
             env: "pond",
         };
         let fields = BTreeMap::new();
-        let opts = PondOptions { adopt_only: true, ..PondOptions::default() };
+        let opts = PondOptions {
+            adopt_only: true,
+            ..PondOptions::default()
+        };
         let result = up_pond(&ctx, &opts, &fields, "").await.unwrap();
         assert_eq!(result.dev_url.as_deref(), Some("http://localhost:4322"));
         assert_eq!(result.console_url.as_deref(), Some("http://localhost:9001"));
@@ -1466,7 +1480,7 @@ mod tests {
         });
         std::fs::create_dir_all(tmp.path().join(".yah/jit")).unwrap();
         std::fs::write(
-            tmp.path().join(".yah/jit/warden-pond-port.json"),
+            tmp.path().join(".yah/jit/yubaba-pond-port.json"),
             serde_json::json!({ "port": port }).to_string(),
         )
         .unwrap();
@@ -1483,6 +1497,7 @@ mod tests {
             role: "static".into(),
             publishes: None,
             wave: 0,
+            git: None,
         };
         let mirror = crate::MirrorConfig {
             schema_version: 1,
@@ -1498,16 +1513,19 @@ mod tests {
             env: "pond",
         };
         let fields = BTreeMap::new();
-        let opts = PondOptions { adopt_only: true, ..PondOptions::default() };
+        let opts = PondOptions {
+            adopt_only: true,
+            ..PondOptions::default()
+        };
         let err = up_pond(&ctx, &opts, &fields, "").await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("Failed per warden"),
-            "expected 'Failed per warden' in error, got: {msg}"
+            msg.contains("Failed per yubaba"),
+            "expected 'Failed per yubaba' in error, got: {msg}"
         );
         assert!(
             msg.contains("MinIO did not bind port"),
-            "expected error reason from warden carried through, got: {msg}"
+            "expected error reason from yubaba carried through, got: {msg}"
         );
         server.abort();
     }
@@ -1515,7 +1533,10 @@ mod tests {
     #[test]
     fn miniflare_sim_script_is_embedded_and_contains_key_landmarks() {
         // Verify the compile-time include_str! picked up the shim.
-        assert!(!MINIFLARE_SIM_SCRIPT.is_empty(), "MINIFLARE_SIM_SCRIPT must not be empty");
+        assert!(
+            !MINIFLARE_SIM_SCRIPT.is_empty(),
+            "MINIFLARE_SIM_SCRIPT must not be empty"
+        );
         assert!(
             MINIFLARE_SIM_SCRIPT.contains("MF_MINIFLARE_IMPORT"),
             "shim must support absolute import override for out-of-tree deploys",
@@ -1533,7 +1554,7 @@ mod tests {
     #[tokio::test]
     async fn query_warden_pond_list_parses_workloads_envelope() {
         // Phase A: the desktop observation seam reads `GET /pond` once and
-        // matches records to declared cells. Mirror warden's actual response
+        // matches records to declared cells. Mirror yubaba's actual response
         // shape — { "workloads": [PondStateRecord, ...] } — and verify
         // identity fields, phase, and the optional URLs round-trip.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1574,15 +1595,24 @@ mod tests {
         let records = query_warden_pond_list(port).await.unwrap();
         assert_eq!(records.len(), 2);
 
-        let marketing = records.iter().find(|r| r.service == "yah-marketing").unwrap();
+        let marketing = records
+            .iter()
+            .find(|r| r.service == "yah-marketing")
+            .unwrap();
         assert_eq!(marketing.env, "pond");
         assert_eq!(marketing.component_id, "site");
         assert!(matches!(marketing.phase, AdoptPondPhase::Running));
         assert_eq!(marketing.dev_url.as_deref(), Some("http://127.0.0.1:4322"));
-        assert_eq!(marketing.console_url.as_deref(), Some("http://localhost:9001"));
+        assert_eq!(
+            marketing.console_url.as_deref(),
+            Some("http://localhost:9001")
+        );
         assert!(marketing.error.is_none());
 
-        let dashboard = records.iter().find(|r| r.service == "yah-dashboard").unwrap();
+        let dashboard = records
+            .iter()
+            .find(|r| r.service == "yah-dashboard")
+            .unwrap();
         assert!(matches!(dashboard.phase, AdoptPondPhase::Degraded));
         assert_eq!(dashboard.error.as_deref(), Some("miniflare probe timeout"));
         assert!(dashboard.dev_url.is_none());
@@ -1622,8 +1652,14 @@ mod tests {
         // Only assert the path shape when the dir is present; CI without
         // node_modules will get None, which is the correct fallback.
         if let Some(path) = result {
-            assert!(path.ends_with("index.js"), "import path should end with index.js: {path}");
-            assert!(std::path::Path::new(&path).exists(), "resolved path must exist: {path}");
+            assert!(
+                path.ends_with("index.js"),
+                "import path should end with index.js: {path}"
+            );
+            assert!(
+                std::path::Path::new(&path).exists(),
+                "resolved path must exist: {path}"
+            );
         }
     }
 }

@@ -167,5 +167,8 @@ async fn local_static_reconciler_brings_up_app_yah_web() {
     // After shutdown the port should free up; give it a beat.
     tokio::time::sleep(Duration::from_millis(250)).await;
     let connect = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await;
-    assert!(connect.is_err(), "port {port} still accepting connections after shutdown");
+    assert!(
+        connect.is_err(),
+        "port {port} still accepting connections after shutdown"
+    );
 }

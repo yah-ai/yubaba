@@ -198,8 +198,14 @@ mod tests {
 
     #[test]
     fn webhook_dispatch_output_ok_reflects_status() {
-        let ok = MessagingWebhookDispatchOutput { status_code: 200, ok: true };
-        let err = MessagingWebhookDispatchOutput { status_code: 503, ok: false };
+        let ok = MessagingWebhookDispatchOutput {
+            status_code: 200,
+            ok: true,
+        };
+        let err = MessagingWebhookDispatchOutput {
+            status_code: 503,
+            ok: false,
+        };
         assert_eq!(serde_json::to_value(&ok).unwrap()["ok"], true);
         assert_eq!(serde_json::to_value(&err).unwrap()["status_code"], 503);
     }

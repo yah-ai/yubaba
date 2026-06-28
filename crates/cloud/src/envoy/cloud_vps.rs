@@ -202,7 +202,8 @@ mod tests {
 
     #[test]
     fn create_input_defaults_ssh_keys_empty() {
-        let wire = r#"{"name":"n","server_type":"t","image":"i","location":"na-west","user_data":""}"#;
+        let wire =
+            r#"{"name":"n","server_type":"t","image":"i","location":"na-west","user_data":""}"#;
         let parsed: CloudVpsCreateInput = serde_json::from_str(wire).unwrap();
         assert!(parsed.ssh_keys.is_empty());
     }

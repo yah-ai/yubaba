@@ -1,11 +1,11 @@
 //! Pond MinIO bring-up primitives (R374-F3).
 //!
-//! Container-tier MinIO lifecycle without warden state: pull image, run
+//! Container-tier MinIO lifecycle without yubaba state: pull image, run
 //! container with bind-mounted data dir, port + HTTP probe, bucket
 //! auto-create with public-read policy. Used by:
 //!
-//! - `warden::pond::minio::MinioReconciler` — the supervisor + restart loop
-//!   that owns running MinIO slots in the camp-embedded warden.
+//! - `yubaba::pond::minio::MinioReconciler` — the supervisor + restart loop
+//!   that owns running MinIO slots in the camp-embedded yubaba.
 //! - `cloud::reconciler::pond::up_pond` — the cloud-tier reconciler path
 //!   exercised by `pond_smoke` and `yah cloud mirror up`.
 //!
@@ -21,16 +21,16 @@
 //! @yah:parent(R455)
 //! @arch:see(.yah/docs/working/W180-pond-richer-topology.md)
 //! @arch:see(.yah/docs/working/W142-pond.md)
-//! @yah:next("Live smoke under YAH_LOCAL_SIM_E2E=1: warden::tests::pond_reconciler_smoke (now drives the per-cell bridge end-to-end — verifies workerd reaches MinIO via http://minio:9000 instead of loopback)")
-//! @yah:next("image-yah-miniflare GHA job in .github/workflows/release.yml (mirror image-yah-warden once it lands; DEFAULT_MINIFLARE_IMAGE = ghcr.io/yah-ai/yah-miniflare:latest)")
+//! @yah:next("Live smoke under YAH_LOCAL_SIM_E2E=1: yubaba::tests::pond_reconciler_smoke (now drives the per-cell bridge end-to-end — verifies workerd reaches MinIO via http://minio:9000 instead of loopback)")
+//! @yah:next("image-yah-miniflare GHA job in .github/workflows/release.yml (mirror image-yah-yubaba once it lands; DEFAULT_MINIFLARE_IMAGE = ghcr.io/yah-ai/yah-miniflare:latest)")
 //! @yah:next("Two services' ponds coexist verify: yah-marketing + yah-dashboard up simultaneously with per-cell networks yah-pond-<svc>-<env>")
-//! @yah:handoff("Substrate landed across local-driver + warden + cloud + camp + qed. (1) LocalRuntime::ensure_network (idempotent docker network create) + ContainerRunSpec.network/network_aliases + pond_network_name(svc, env). (2) MinioSpec gained network/network_alias; siblings reach via MinioRunning.bridge_endpoint = http://<alias>:9000. (3) New yah-miniflare qed image (Dockerfile + bun base + tini + baked miniflare; Worker bundle bind-mounted at /work/worker.js) + catalog.toml entry + EXPECTED_BUNDLED test. (4) local_driver::pond_miniflare rewritten: spawn_miniflare → ensure_miniflare_running container path; MiniflareSpec carries image/container_name/network/network_alias. (5) warden::pond::miniflare::MiniflareReconciler now container-shaped (runtime + container_name + cancel); deploy() ensures the per-cell network before bring-up and rewrites asset_origin to the bridge endpoint when camp sent a host-loopback string. (6) Camp's build_miniflare_deploy_spec emits the new shape; SSR runtime joins the bridge with alias 'ssr' and miniflare's ssr_origin auto-flips to http://ssr:<port> on bridge. (7) cloud::reconciler::pond::build_minio_spec always sets the bridge + MINIO_NETWORK_ALIAS const; cloud-direct (pond_smoke + yah cloud mirror up) keeps using its in-process bun shim because that path doesn't go through local_driver::pond_miniflare.")
+//! @yah:handoff("Substrate landed across local-driver + yubaba + cloud + camp + qed. (1) LocalRuntime::ensure_network (idempotent docker network create) + ContainerRunSpec.network/network_aliases + pond_network_name(svc, env). (2) MinioSpec gained network/network_alias; siblings reach via MinioRunning.bridge_endpoint = http://<alias>:9000. (3) New yah-miniflare qed image (Dockerfile + bun base + tini + baked miniflare; Worker bundle bind-mounted at /work/worker.js) + catalog.toml entry + EXPECTED_BUNDLED test. (4) local_driver::pond_miniflare rewritten: spawn_miniflare → ensure_miniflare_running container path; MiniflareSpec carries image/container_name/network/network_alias. (5) yubaba::pond::miniflare::MiniflareReconciler now container-shaped (runtime + container_name + cancel); deploy() ensures the per-cell network before bring-up and rewrites asset_origin to the bridge endpoint when camp sent a host-loopback string. (6) Camp's build_miniflare_deploy_spec emits the new shape; SSR runtime joins the bridge with alias 'ssr' and miniflare's ssr_origin auto-flips to http://ssr:<port> on bridge. (7) cloud::reconciler::pond::build_minio_spec always sets the bridge + MINIO_NETWORK_ALIAS const; cloud-direct (pond_smoke + yah cloud mirror up) keeps using its in-process bun shim because that path doesn't go through local_driver::pond_miniflare.")
 //! @yah:verify("cargo check --workspace # clean (warnings only)")
 //! @yah:verify("cargo test -p local-driver --lib # pond_network_name + docker_run_args emit --network/--network-alias + ensure_network logic (1 pre-existing failure: workload_spec_to_crs digest test, owned by R438-T3)")
-//! @yah:verify("cargo test -p warden --lib # 91/91 pass incl. pond fixtures upgraded to bridge fields")
+//! @yah:verify("cargo test -p yubaba --lib # 91/91 pass incl. pond fixtures upgraded to bridge fields")
 //! @yah:verify("cargo test -p cloud --lib reconciler::pond # 27/27 pass incl. adopt-path tests with bridge_endpoint field on MinioRunning")
 //! @yah:verify("cargo test -p qed --lib images::catalog::tests # 16/16 — bundled_catalog_loads_with_all_entries now requires yah-miniflare")
-//! @yah:gotcha("BREAKING for operators who curl localhost:9000 directly is NOT applied yet — to keep the embedded warden's host-side probe working without joining the bridge, MinIO's API port still publishes (and console too). Unpublishing the API port is gated on warden-in-container (R454-T*); the bridge_endpoint + network are otherwise wired end-to-end.")
+//! @yah:gotcha("BREAKING for operators who curl localhost:9000 directly is NOT applied yet — to keep the embedded yubaba's host-side probe working without joining the bridge, MinIO's API port still publishes (and console too). Unpublishing the API port is gated on yubaba-in-container (R454-T*); the bridge_endpoint + network are otherwise wired end-to-end.")
 //! @yah:gotcha("yah-miniflare image must be available locally or built before pond bring-up succeeds (release-pipeline image-yah-miniflare GHA job is the follow-up). Local override: set providers.static.image in mirror.toml to a hand-built tag.")
 //! @yah:gotcha("MiniflareSpec lost js_binary/miniflare_shim/miniflare_import/workerd_binary — the container bakes them in. Any out-of-tree code constructing MiniflareSpec needs to switch to image/container_name/network shape.")
 //! @yah:gotcha("MiniflareSupervision now carries runtime+container_name (was cancel-only) — registry teardown paths in pond.rs (insert_full prior-replace, mark_failed, shutdown_all) call stop_and_remove on it now.")
@@ -112,7 +112,7 @@ pub struct MinioRunning {
     /// Host-side S3 endpoint — `http://127.0.0.1:<api_port>` when the API
     /// port is published, used by host-side probes + the cloud-tier
     /// publisher. Always set today (R455-F1 keeps the API port published
-    /// even on the bridge so the embedded warden reconciler can probe
+    /// even on the bridge so the embedded yubaba reconciler can probe
     /// without joining the bridge).
     pub endpoint: String,
     pub console_url: String,
@@ -150,7 +150,7 @@ pub async fn ensure_minio_running(
     env.insert("MINIO_ROOT_USER".into(), spec.user.clone());
     env.insert("MINIO_ROOT_PASSWORD".into(), spec.password.clone());
     // Per W180: even on the per-cell bridge, keep MinIO's API + console
-    // ports published. The embedded warden reconciler probes the host-side
+    // ports published. The embedded yubaba reconciler probes the host-side
     // endpoint; the cloud-tier publisher (`yah cloud mirror up`) likewise
     // talks to the host port. Siblings on the bridge use `bridge_endpoint`
     // (DNS alias → 9000 inside the container) instead of the host port.
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn minio_spec_round_trips_without_bridge_fields() {
         // serde(default + skip_if_none) keeps the wire shape backward-compatible
-        // with pre-R455-F1 camp + warden peers.
+        // with pre-R455-F1 camp + yubaba peers.
         let legacy = r#"{
             "image": "minio/minio:RELEASE.2025-04-22T22-12-26Z",
             "user": "yahsim",

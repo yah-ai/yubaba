@@ -293,7 +293,7 @@ pub enum TunnelDriftState {
 pub struct TunnelDriftRow {
     /// Human-readable tunnel name as entered in Cloudflare.
     pub tunnel_name: String,
-    /// Hostname from the tunnel's ingress rule, e.g. `warden.yah.dev`.
+    /// Hostname from the tunnel's ingress rule, e.g. `yubaba.yah.dev`.
     pub hostname: String,
     /// CNAME target the DNS record should point at: `{tunnel_id}.cfargotunnel.com`.
     pub expected_target: String,
@@ -352,13 +352,41 @@ pub struct TokenGrant {
 /// Fallback IDs sourced from the global permission-groups catalog
 /// (validated 2026-05-26); catalog resolution at create-time takes precedence.
 pub const MESOFACT_STATIC_GRANTS: &[TokenGrant] = &[
-    TokenGrant { group_name: "Account Settings Read",     scope: GrantScope::Account, fallback_id: "c1fde68c7bcc44588cbb6ddbc16d6480" },
-    TokenGrant { group_name: "Workers R2 Storage Write",  scope: GrantScope::Account, fallback_id: "bf7481a1826f439697cb59a20b22293e" },
-    TokenGrant { group_name: "Workers Scripts Write",     scope: GrantScope::Account, fallback_id: "e086da7e2179491d91ee5f35b3ca210a" },
-    TokenGrant { group_name: "Zone Read",                 scope: GrantScope::Zone,    fallback_id: "c8fed203ed3043cba015a93ad1616f1f" },
-    TokenGrant { group_name: "Zone Transform Rules Write", scope: GrantScope::Zone,   fallback_id: "0ac90a90249747bca6b047d97f0803e9" },
-    TokenGrant { group_name: "Workers Routes Write",      scope: GrantScope::Zone,    fallback_id: "28f4b596e7d643029c524985477ae49a" },
-    TokenGrant { group_name: "Cache Purge",               scope: GrantScope::Zone,    fallback_id: "e17beae8b8cb423a99b1730f21238bed" },
+    TokenGrant {
+        group_name: "Account Settings Read",
+        scope: GrantScope::Account,
+        fallback_id: "c1fde68c7bcc44588cbb6ddbc16d6480",
+    },
+    TokenGrant {
+        group_name: "Workers R2 Storage Write",
+        scope: GrantScope::Account,
+        fallback_id: "bf7481a1826f439697cb59a20b22293e",
+    },
+    TokenGrant {
+        group_name: "Workers Scripts Write",
+        scope: GrantScope::Account,
+        fallback_id: "e086da7e2179491d91ee5f35b3ca210a",
+    },
+    TokenGrant {
+        group_name: "Zone Read",
+        scope: GrantScope::Zone,
+        fallback_id: "c8fed203ed3043cba015a93ad1616f1f",
+    },
+    TokenGrant {
+        group_name: "Zone Transform Rules Write",
+        scope: GrantScope::Zone,
+        fallback_id: "0ac90a90249747bca6b047d97f0803e9",
+    },
+    TokenGrant {
+        group_name: "Workers Routes Write",
+        scope: GrantScope::Zone,
+        fallback_id: "28f4b596e7d643029c524985477ae49a",
+    },
+    TokenGrant {
+        group_name: "Cache Purge",
+        scope: GrantScope::Zone,
+        fallback_id: "e17beae8b8cb423a99b1730f21238bed",
+    },
 ];
 
 /// Result of minting an account-owned API token. `value` is the secret and is
@@ -386,7 +414,10 @@ pub struct CloudflareClient {
 impl CloudflareClient {
     /// Create a client for the given API token.
     pub fn new(token: String) -> Self {
-        Self { token, http: reqwest::Client::new() }
+        Self {
+            token,
+            http: reqwest::Client::new(),
+        }
     }
 
     /// List accounts the token can access.
@@ -403,7 +434,10 @@ impl CloudflareClient {
             .result
             .unwrap_or_default()
             .into_iter()
-            .map(|a| CfAccountInfo { id: a.id, name: a.name })
+            .map(|a| CfAccountInfo {
+                id: a.id,
+                name: a.name,
+            })
             .collect())
     }
 
@@ -411,7 +445,9 @@ impl CloudflareClient {
     /// Requires: `Cloudflare Tunnel: Read`.
     async fn list_tunnels_meta(&self, account_id: &str) -> Result<Vec<TunnelMeta>> {
         let resp: CfPage<CfTunnel> = self
-            .cf_get(&format!("/accounts/{account_id}/cfd_tunnel?is_deleted=false"))
+            .cf_get(&format!(
+                "/accounts/{account_id}/cfd_tunnel?is_deleted=false"
+            ))
             .await?;
         self.ok(&resp.success, &resp.errors)?;
         Ok(resp
@@ -601,11 +637,7 @@ impl CloudflareClient {
 
     /// Create a new Named Tunnel under `account_id` and return the connector token.
     /// Requires: `Cloudflare Tunnel: Edit`.
-    pub async fn create_tunnel(
-        &self,
-        account_id: &str,
-        name: &str,
-    ) -> Result<CreateTunnelResult> {
+    pub async fn create_tunnel(&self, account_id: &str, name: &str) -> Result<CreateTunnelResult> {
         use base64::Engine as _;
 
         let mut secret_bytes = [0u8; 32];
@@ -626,7 +658,10 @@ impl CloudflareClient {
         let create_resp: CfSingle<CreatedTunnel> = self
             .cf_post(
                 &format!("/accounts/{account_id}/cfd_tunnel"),
-                &CreateBody { name, tunnel_secret },
+                &CreateBody {
+                    name,
+                    tunnel_secret,
+                },
             )
             .await?;
         self.ok(&create_resp.success, &create_resp.errors)?;
@@ -642,7 +677,10 @@ impl CloudflareClient {
             errors: Option<Vec<serde_json::Value>>,
         }
         let token_resp: TokenResp = self
-            .cf_get(&format!("/accounts/{account_id}/cfd_tunnel/{}/token", created.id))
+            .cf_get(&format!(
+                "/accounts/{account_id}/cfd_tunnel/{}/token",
+                created.id
+            ))
             .await?;
         self.ok(&token_resp.success, &token_resp.errors)?;
         let connector_token = token_resp
@@ -690,9 +728,7 @@ impl CloudflareClient {
             id: String,
             name: String,
         }
-        let resp: CfPage<ZoneEntry> = self
-            .cf_get(&format!("/zones?name={zone_name}"))
-            .await?;
+        let resp: CfPage<ZoneEntry> = self.cf_get(&format!("/zones?name={zone_name}")).await?;
         self.ok(&resp.success, &resp.errors)?;
         resp.result
             .unwrap_or_default()
@@ -735,9 +771,7 @@ impl CloudflareClient {
     /// Requires: `Zone: Transform Rules: Edit`.
     pub async fn upsert_index_rewrite(&self, zone_id: &str) -> Result<()> {
         const RULE_DESC: &str = "yah:static-index";
-        let path = format!(
-            "/zones/{zone_id}/rulesets/phases/http_request_transform/entrypoint"
-        );
+        let path = format!("/zones/{zone_id}/rulesets/phases/http_request_transform/entrypoint");
 
         // Fetch existing rules; a missing entrypoint is not an error.
         let existing: Vec<serde_json::Value> = {
@@ -746,9 +780,7 @@ impl CloudflareClient {
                 rules: Option<Vec<serde_json::Value>>,
             }
             match self.cf_get::<CfSingle<Rs>>(&path).await {
-                Ok(resp) if resp.success => {
-                    resp.result.and_then(|r| r.rules).unwrap_or_default()
-                }
+                Ok(resp) if resp.success => resp.result.and_then(|r| r.rules).unwrap_or_default(),
                 _ => Vec::new(),
             }
         };
@@ -768,8 +800,9 @@ impl CloudflareClient {
             "enabled": true
         }));
 
-        let resp: CfSingle<serde_json::Value> =
-            self.cf_put(&path, &serde_json::json!({ "rules": rules })).await?;
+        let resp: CfSingle<serde_json::Value> = self
+            .cf_put(&path, &serde_json::json!({ "rules": rules }))
+            .await?;
         self.ok(&resp.success, &resp.errors)
     }
 
@@ -807,7 +840,9 @@ impl CloudflareClient {
             .await
             .map_err(|e| anyhow!("PUT {url} parse: {e}"))?;
         self.ok(&result.success, &result.errors)?;
-        result.result.ok_or_else(|| anyhow!("deploy worker: no result in response"))
+        result
+            .result
+            .ok_or_else(|| anyhow!("deploy worker: no result in response"))
     }
 
     /// Upsert a Worker route for `pattern` on `zone_id`, pointing at `script_name`.
@@ -849,13 +884,22 @@ impl CloudflareClient {
             let resp: CfSingle<serde_json::Value> = self
                 .cf_put(
                     &format!("/zones/{zone_id}/workers/routes/{}", existing.id),
-                    &RouteBody { pattern, script: script_name },
+                    &RouteBody {
+                        pattern,
+                        script: script_name,
+                    },
                 )
                 .await?;
             self.ok(&resp.success, &resp.errors)
         } else {
             let resp: CfSingle<serde_json::Value> = self
-                .cf_post(&list_path, &RouteBody { pattern, script: script_name })
+                .cf_post(
+                    &list_path,
+                    &RouteBody {
+                        pattern,
+                        script: script_name,
+                    },
+                )
                 .await?;
             self.ok(&resp.success, &resp.errors)
         }
@@ -962,7 +1006,13 @@ impl CloudflareClient {
             ttl: u32,
             proxied: bool,
         }
-        let body = RecordBody { name, record_type, content, ttl, proxied };
+        let body = RecordBody {
+            name,
+            record_type,
+            content,
+            ttl,
+            proxied,
+        };
 
         #[derive(Deserialize)]
         struct RecordResult {
@@ -1046,7 +1096,12 @@ impl CloudflareClient {
             ))
             .await?;
         self.ok(&resp.success, &resp.errors)?;
-        Ok(resp.result.unwrap_or_default().into_iter().next().map(|r| r.id))
+        Ok(resp
+            .result
+            .unwrap_or_default()
+            .into_iter()
+            .next()
+            .map(|r| r.id))
     }
 
     /// List R2 buckets in `account_id`.
@@ -1118,7 +1173,10 @@ impl CloudflareClient {
             .map(|r| r.domains)
             .unwrap_or_default()
             .into_iter()
-            .map(|d| R2CustomDomain { domain: d.domain, enabled: d.enabled })
+            .map(|d| R2CustomDomain {
+                domain: d.domain,
+                enabled: d.enabled,
+            })
             .collect())
     }
 
@@ -1151,10 +1209,12 @@ impl CloudflareClient {
         }
         let resp: CfSingle<serde_json::Value> = self
             .cf_post(
-                &format!(
-                    "/accounts/{account_id}/r2/buckets/{bucket_name}/domains/custom"
-                ),
-                &AddBody { domain, enabled: true, zone_id },
+                &format!("/accounts/{account_id}/r2/buckets/{bucket_name}/domains/custom"),
+                &AddBody {
+                    domain,
+                    enabled: true,
+                    zone_id,
+                },
             )
             .await?;
         self.ok(&resp.success, &resp.errors)
@@ -1342,7 +1402,10 @@ fn build_worker_multipart(script_js: &str, bindings: &[WorkerBinding<'_>]) -> (S
     let push = |v: &mut Vec<u8>, s: &str| v.extend_from_slice(s.as_bytes());
     // metadata part
     push(&mut body, &format!("--{BOUNDARY}\r\n"));
-    push(&mut body, "Content-Disposition: form-data; name=\"metadata\"\r\n");
+    push(
+        &mut body,
+        "Content-Disposition: form-data; name=\"metadata\"\r\n",
+    );
     push(&mut body, "Content-Type: application/json\r\n\r\n");
     push(&mut body, &metadata.to_string());
     push(&mut body, "\r\n");
@@ -1351,7 +1414,10 @@ fn build_worker_multipart(script_js: &str, bindings: &[WorkerBinding<'_>]) -> (S
     push(&mut body, &format!(
         "Content-Disposition: form-data; name=\"{SCRIPT_FILENAME}\"; filename=\"{SCRIPT_FILENAME}\"\r\n"
     ));
-    push(&mut body, "Content-Type: application/javascript+module\r\n\r\n");
+    push(
+        &mut body,
+        "Content-Type: application/javascript+module\r\n\r\n",
+    );
     push(&mut body, script_js);
     push(&mut body, &format!("\r\n--{BOUNDARY}--\r\n"));
     (format!("multipart/form-data; boundary={BOUNDARY}"), body)
@@ -1459,7 +1525,10 @@ fn classify_tunnel_drift(
     if matching.iter().any(|r| norm_dns(&r.content) == want) {
         return (TunnelDriftState::Synced, None);
     }
-    (TunnelDriftState::Mismatch, Some(matching[0].content.clone()))
+    (
+        TunnelDriftState::Mismatch,
+        Some(matching[0].content.clone()),
+    )
 }
 
 #[cfg(test)]
@@ -1467,14 +1536,17 @@ mod tests {
     use super::*;
 
     fn rec(name: &str, content: &str) -> CfDnsRecord {
-        CfDnsRecord { name: name.into(), content: content.into() }
+        CfDnsRecord {
+            name: name.into(),
+            content: content.into(),
+        }
     }
 
     #[test]
     fn drift_synced_when_live_matches() {
-        let live = vec![rec("warden.yah.dev", "9e4d.cfargotunnel.com")];
+        let live = vec![rec("yubaba.yah.dev", "9e4d.cfargotunnel.com")];
         let (state, target) =
-            classify_tunnel_drift("warden.yah.dev", "9e4d.cfargotunnel.com", &live);
+            classify_tunnel_drift("yubaba.yah.dev", "9e4d.cfargotunnel.com", &live);
         assert_eq!(state, TunnelDriftState::Synced);
         assert!(target.is_none());
     }
@@ -1483,22 +1555,22 @@ mod tests {
     fn drift_missing_when_no_matching_record() {
         let live = vec![rec("other.yah.dev", "x.cfargotunnel.com")];
         let (state, target) =
-            classify_tunnel_drift("warden.yah.dev", "9e4d.cfargotunnel.com", &live);
+            classify_tunnel_drift("yubaba.yah.dev", "9e4d.cfargotunnel.com", &live);
         assert_eq!(state, TunnelDriftState::Missing);
         assert!(target.is_none());
     }
 
     #[test]
     fn drift_missing_when_zone_empty() {
-        let (state, _) = classify_tunnel_drift("warden.yah.dev", "9e4d.cfargotunnel.com", &[]);
+        let (state, _) = classify_tunnel_drift("yubaba.yah.dev", "9e4d.cfargotunnel.com", &[]);
         assert_eq!(state, TunnelDriftState::Missing);
     }
 
     #[test]
     fn drift_mismatch_surfaces_live_target() {
-        let live = vec![rec("warden.yah.dev", "stale.cfargotunnel.com")];
+        let live = vec![rec("yubaba.yah.dev", "stale.cfargotunnel.com")];
         let (state, target) =
-            classify_tunnel_drift("warden.yah.dev", "9e4d.cfargotunnel.com", &live);
+            classify_tunnel_drift("yubaba.yah.dev", "9e4d.cfargotunnel.com", &live);
         assert_eq!(state, TunnelDriftState::Mismatch);
         assert_eq!(target.as_deref(), Some("stale.cfargotunnel.com"));
     }
@@ -1507,8 +1579,8 @@ mod tests {
     fn drift_normalises_trailing_dot_and_case() {
         // Cloudflare returns FQDNs and CNAME content with/without trailing dots
         // and arbitrary case; normalisation must treat these as synced.
-        let live = vec![rec("Warden.YAH.dev.", "9E4D.cfargotunnel.com.")];
-        let (state, _) = classify_tunnel_drift("warden.yah.dev", "9e4d.cfargotunnel.com", &live);
+        let live = vec![rec("Yubaba.YAH.dev.", "9E4D.cfargotunnel.com.")];
+        let (state, _) = classify_tunnel_drift("yubaba.yah.dev", "9e4d.cfargotunnel.com", &live);
         assert_eq!(state, TunnelDriftState::Synced);
     }
 
@@ -1518,7 +1590,7 @@ mod tests {
             ("z_apex".to_string(), "dev".to_string()),
             ("z_zone".to_string(), "yah.dev".to_string()),
         ];
-        assert_eq!(best_zone_for("warden.yah.dev", &zones), Some("z_zone"));
+        assert_eq!(best_zone_for("yubaba.yah.dev", &zones), Some("z_zone"));
         assert_eq!(best_zone_for("yah.dev", &zones), Some("z_zone"));
     }
 
@@ -1562,14 +1634,20 @@ mod tests {
         assert!(acct_ids.contains(&"e086da7e2179491d91ee5f35b3ca210a")); // Workers Scripts Write
 
         let zone = &policies[1];
-        assert_eq!(zone["resources"]["com.cloudflare.api.account.zone.ZONE"], "*");
+        assert_eq!(
+            zone["resources"]["com.cloudflare.api.account.zone.ZONE"],
+            "*"
+        );
         let zone_ids: Vec<&str> = zone["permission_groups"]
             .as_array()
             .unwrap()
             .iter()
             .map(|g| g["id"].as_str().unwrap())
             .collect();
-        assert!(zone_ids.contains(&"CATALOG_ZONE_READ"), "catalog id wins over fallback");
+        assert!(
+            zone_ids.contains(&"CATALOG_ZONE_READ"),
+            "catalog id wins over fallback"
+        );
         assert!(zone_ids.contains(&"0ac90a90249747bca6b047d97f0803e9")); // Zone Transform Rules Write
         assert!(zone_ids.contains(&"28f4b596e7d643029c524985477ae49a")); // Workers Routes Write
         assert!(zone_ids.contains(&"e17beae8b8cb423a99b1730f21238bed")); // Cache Purge
@@ -1586,7 +1664,10 @@ mod tests {
         let body = build_token_body("t", "A", "Z", only_zone, &BTreeMap::new());
         let policies = body["policies"].as_array().unwrap();
         assert_eq!(policies.len(), 1, "no account block when no account grants");
-        assert_eq!(policies[0]["resources"]["com.cloudflare.api.account.zone.Z"], "*");
+        assert_eq!(
+            policies[0]["resources"]["com.cloudflare.api.account.zone.Z"],
+            "*"
+        );
     }
 
     /// Decode the multipart `metadata` part and return its parsed JSON.
@@ -1595,8 +1676,12 @@ mod tests {
         let (_, after) = s
             .split_once("name=\"metadata\"")
             .expect("metadata part present");
-        let (_, after) = after.split_once("\r\n\r\n").expect("metadata body delimited");
-        let (json, _) = after.split_once("\r\n--").expect("metadata terminated by boundary");
+        let (_, after) = after
+            .split_once("\r\n\r\n")
+            .expect("metadata body delimited");
+        let (json, _) = after
+            .split_once("\r\n--")
+            .expect("metadata terminated by boundary");
         serde_json::from_str(json).expect("metadata JSON parses")
     }
 
@@ -1625,8 +1710,14 @@ mod tests {
     #[test]
     fn multipart_mixes_plain_text_and_r2_bindings() {
         let bindings = [
-            WorkerBinding::PlainText { name: "MODE", text: "cache" },
-            WorkerBinding::R2Bucket { name: "CACHE", bucket_name: "yah-cr-cache" },
+            WorkerBinding::PlainText {
+                name: "MODE",
+                text: "cache",
+            },
+            WorkerBinding::R2Bucket {
+                name: "CACHE",
+                bucket_name: "yah-cr-cache",
+            },
         ];
         let (_, body) = build_worker_multipart("export default {}", &bindings);
 

@@ -83,7 +83,7 @@ type OnChangeFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 /// logs the event for observability and is otherwise a no-op in dev.
 ///
 /// # Cloud / pond tier
-/// The caller (issue-tracker's `main.rs` or a warden workload) constructs the
+/// The caller (issue-tracker's `main.rs` or a yubaba workload) constructs the
 /// `OnChange` closure to invoke `cloud::almanac_dispatch::dispatch_on_change`
 /// with the workspace root and target env. That function calls
 /// `MesofactStaticReconciler::rebuild_static` on the named service mirror.

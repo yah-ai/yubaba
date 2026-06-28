@@ -1,0 +1,45 @@
+# `cross` pre-build hooks for the yubaba / kamaji / almanac musl release
+# builds. These crates live in the independent `oss/yubaba` workspace (excluded
+# from the yah root workspace), so `cross` run from here resolves THIS config —
+# not the yah-root Cross.toml. Keep the protoc hook in sync with the root one.
+#
+# protoc: containerd-client's build script (pulled in via yubaba + kamaji
+# under `--features containerd-integration`) shells out to `protoc` with
+# `--experimental_allow_proto3_optional`, requiring protoc >= 3.12. The cross
+# images' apt protoc is too old, so download a prebuilt release binary. Build
+# scripts always run on the x86_64 build host regardless of target triple, so
+# both targets fetch the linux-x86_64 archive.
+#
+# (No nasm hook here — unlike the yah-root build, nothing in oss/yubaba pulls
+# rav1e/`all-image`.)
+#
+# Repo-root volume: oss/yubaba's [patch.crates-io] redirects task / task-runs /
+# task-sessions / observation / scryer to ../qed/crates/* — crates in the SIBLING
+# oss/qed workspace. cross mounts only the oss/yubaba workspace dir into the build
+# container by default, so those ../qed path deps (and oss/qed/Cargo.toml, which
+# they inherit `edition`/`version` from) fall outside the mount → "failed to find
+# a workspace root". Bind-mounting the whole repo (via the YAH_REPO_ROOT env var,
+# set to the repo root in release.yml) at its real path makes oss/qed visible.
+[build.env]
+volumes = ["YAH_REPO_ROOT"]
+#
+# Image pins: Rust >= 1.96 needs glibc 2.28+; the version-derived 0.2.5 images
+# (Ubuntu 18.04) can't run the toolchain's build-script binaries. The `main`
+# images (Ubuntu 20.04, glibc 2.31) stay compatible with current stable Rust.
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:main"
+pre-build = [
+    "apt-get update && apt-get install -y --no-install-recommends curl ca-certificates unzip",
+    "curl -fsSL https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip -o /tmp/protoc.zip",
+    "unzip -o /tmp/protoc.zip -d /usr/local",
+    "protoc --version",
+]
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
+pre-build = [
+    "apt-get update && apt-get install -y --no-install-recommends curl ca-certificates unzip",
+    "curl -fsSL https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip -o /tmp/protoc.zip",
+    "unzip -o /tmp/protoc.zip -d /usr/local",
+    "protoc --version",
+]

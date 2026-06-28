@@ -71,11 +71,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::process::Child;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
-use tracing::warn;
 
-use crate::{MirrorConfig, MirrorProviderSlot, ServiceComponent, ServiceConfig};
+use crate::{GitSource, MirrorConfig, MirrorProviderSlot, ServiceComponent, ServiceConfig};
 
 pub mod cloudflare_worker;
 pub mod derive_cache_prune;
@@ -98,23 +96,23 @@ pub use derive_cache_prune::{
     DeriveCacheLiveHashes, DerivePruneCandidate,
 };
 pub use domain::ensure_r2_custom_domain;
+pub use mesofact_runner::{resolve_runner_machine, MesofactRunnerReconciler};
+pub use mesofact_static::{LocalStaticOptions, MesofactStaticReconciler};
+pub use pond::{PondOptions, PondState};
+pub use pond_publish::{derive_minio_key, publish_to_pond, PondPublishReport};
+pub use r2_publish::{
+    publish_to_r2, R2PublishReport, R2PurgeOpts, R2_ACCESS_KEY_ENV, R2_ACCESS_KEY_SLOT,
+    R2_SECRET_KEY_ENV, R2_SECRET_KEY_SLOT,
+};
 pub use static_asset::StaticAssetReconciler;
 pub use static_asset_prune::{
     compute_live_set, compute_prune_candidates, execute_prune, load_service_and_mirror,
     PruneCandidate, PruneOutcome, PruneReport,
 };
-pub use mesofact_runner::{resolve_runner_machine, MesofactRunnerReconciler};
-pub use mesofact_static::{LocalStaticOptions, MesofactStaticReconciler};
-pub use pond::{PondOptions, PondState};
-pub use pond_publish::{derive_minio_key, publish_to_pond, PondPublishReport};
 pub use sync_status::{
     compute_cell, compute_service, new_sync_id, summarize, CellStatus, DriftEntry, HealthState,
     MirrorObservation, Runtime, ServiceStatus, StatusSummary, SyncHistoryEntry, SyncOutcome,
     SyncState, WireContainerStatus,
-};
-pub use r2_publish::{
-    publish_to_r2, R2PublishReport, R2PurgeOpts, R2_ACCESS_KEY_ENV, R2_ACCESS_KEY_SLOT,
-    R2_SECRET_KEY_ENV, R2_SECRET_KEY_SLOT,
 };
 
 // ─── Log buffer ─────────────────────────────────────────────────────────────
@@ -180,8 +178,52 @@ pub struct ReconcileCtx<'a> {
 impl<'a> ReconcileCtx<'a> {
     /// Absolute path to the component's workload directory (the parent of
     /// `workload.toml`).
+    ///
+    /// In-tree components resolve to `<workspace_root>/<path>`. For
+    /// `git`-sourced components (R561-F1, "BYO git") this points into the
+    /// local clone — `<source_cache>/<subdir>/<path>` — which is empty until
+    /// [`materialize`](Self::materialize) runs (approach A: clone-at-reconcile,
+    /// so config load + validation stay offline).
     pub fn workload_dir(&self) -> PathBuf {
-        self.workspace_root.join(&self.component.path)
+        match &self.component.git {
+            None => self.workspace_root.join(&self.component.path),
+            Some(git) => {
+                let mut dir = self.source_cache_dir();
+                if let Some(subdir) = &git.subdir {
+                    dir = dir.join(subdir);
+                }
+                dir.join(&self.component.path)
+            }
+        }
+    }
+
+    /// Root of the local clone for a `git`-sourced component:
+    /// `<workspace_root>/.yah/infra/state/sources/<service>/<component_id>`.
+    fn source_cache_dir(&self) -> PathBuf {
+        self.workspace_root
+            .join(".yah/infra/state/sources")
+            .join(&self.service.name)
+            .join(&self.component.id)
+    }
+
+    /// Ensure a `git`-sourced component's code is present locally before build
+    /// (R561-F1, approach A). No-op for in-tree components. Idempotent: clones
+    /// on the first call, fetches + re-checks-out the pinned ref thereafter.
+    ///
+    /// Reconcilers MUST call this at the top of [`up`](Reconciler::up) before
+    /// reading [`workload_dir`](Self::workload_dir) for a remote component.
+    pub async fn materialize(&self) -> Result<()> {
+        let Some(git) = &self.component.git else {
+            return Ok(());
+        };
+        materialize_git_source(git, &self.source_cache_dir())
+            .await
+            .with_context(|| {
+                format!(
+                    "materializing git source {}@{} for {}/{}",
+                    git.repo, git.r#ref, self.service.name, self.component.id
+                )
+            })
     }
 
     /// Read `<workload_dir>/workload.toml` and extract just the `kind`
@@ -310,8 +352,8 @@ pub trait Reconciler: Send + Sync {
 /// the strong types yet.
 pub fn workload_kind(workload_dir: &Path) -> Result<String> {
     let path = workload_dir.join("workload.toml");
-    let src = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let src =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let value: toml::Value =
         toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
     let kind = value
@@ -321,32 +363,76 @@ pub fn workload_kind(workload_dir: &Path) -> Result<String> {
     Ok(kind.to_string())
 }
 
-/// Spawn a supervisor task that owns a child process. Sends () on
-/// `shutdown_rx` (or closes it) → start_kill + wait. If the child exits
-/// on its own first, log and exit Ok.
-pub(crate) fn supervise_child(
-    label: &'static str,
-    mut child: Child,
-    mut shutdown_rx: oneshot::Receiver<()>,
-) -> tokio::task::JoinHandle<Result<()>> {
-    tokio::spawn(async move {
-        tokio::select! {
-            res = child.wait() => {
-                let status = res.context("waiting on child")?;
-                if !status.success() {
-                    warn!(label, ?status, "child exited non-zero");
-                }
-                Ok(())
-            }
-            _ = &mut shutdown_rx => {
-                if let Err(e) = child.start_kill() {
-                    warn!(label, error = %e, "start_kill failed");
-                }
-                let _ = child.wait().await;
-                Ok(())
-            }
+/// Shallow-clone (or update) a [`GitSource`] into `dir` (R561-F1). Idempotent:
+/// clones when `dir/.git` is absent, otherwise fetches the pinned ref and
+/// force-checks-it-out. Uses the system `git` so it inherits the operator's
+/// credential helpers / SSH agent — no in-process git library.
+async fn materialize_git_source(git: &GitSource, dir: &Path) -> Result<()> {
+    use tokio::process::Command;
+
+    async fn run_git(args: &[&std::ffi::OsStr]) -> Result<()> {
+        let out = Command::new("git")
+            .args(args)
+            .output()
+            .await
+            .context("spawning git")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git {} failed: {}",
+                args.iter()
+                    .map(|a| a.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
-    })
+        Ok(())
+    }
+
+    use std::ffi::OsStr;
+    let dir_os = dir.as_os_str();
+    let r#ref = git.r#ref.as_str();
+
+    if dir.join(".git").is_dir() {
+        // Existing checkout — update to the pinned ref.
+        run_git(&[
+            OsStr::new("-C"),
+            dir_os,
+            OsStr::new("fetch"),
+            OsStr::new("--depth"),
+            OsStr::new("1"),
+            OsStr::new("origin"),
+            OsStr::new(r#ref),
+        ])
+        .await?;
+        run_git(&[
+            OsStr::new("-C"),
+            dir_os,
+            OsStr::new("checkout"),
+            OsStr::new("--force"),
+            OsStr::new("FETCH_HEAD"),
+        ])
+        .await?;
+    } else {
+        if let Some(parent) = dir.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        // `--branch` accepts a branch or tag. Pinning to a bare commit SHA is a
+        // follow-up (needs clone-then-fetch); the common case is a branch/tag.
+        run_git(&[
+            OsStr::new("clone"),
+            OsStr::new("--depth"),
+            OsStr::new("1"),
+            OsStr::new("--branch"),
+            OsStr::new(r#ref),
+            OsStr::new(git.repo.as_str()),
+            dir_os,
+        ])
+        .await?;
+    }
+    Ok(())
 }
 
 /// Build a `RunningWorkload` from the pieces a reconciler produces.
@@ -393,16 +479,13 @@ pub(crate) async fn wait_for_port(
 
 // `wait_for_http_ready` lived here pre-R374-F3 to back the MinIO health
 // probe in pond's bring-up path. That logic moved to
-// `local_driver::pond_minio::wait_for_http_ready` so warden + cloud share
+// `local_driver::pond_minio::wait_for_http_ready` so yubaba + cloud share
 // it. The mesofact-static reconciler arm uses [`wait_for_port`] for
 // dev-tier port readiness; nothing else needs an HTTP-level probe today.
 
 /// Pluck a `u16` out of a [`MirrorProviderSlot`]'s inline `fields` map.
 /// Returns `None` if the key is absent or out of range.
-pub(crate) fn slot_field_u16(
-    fields: &BTreeMap<String, toml::Value>,
-    key: &str,
-) -> Option<u16> {
+pub(crate) fn slot_field_u16(fields: &BTreeMap<String, toml::Value>, key: &str) -> Option<u16> {
     fields
         .get(key)
         .and_then(|v| v.as_integer())
@@ -430,5 +513,131 @@ impl From<&RunningWorkload> for RunningWorkloadSummary {
             public_url: r.public_url.clone(),
             console_url: r.console_url.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod source_seam_tests {
+    //! R561-F1 — the BYO-git source seam: path resolution + materialization.
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn component(git: Option<GitSource>) -> ServiceComponent {
+        ServiceComponent {
+            id: "site".into(),
+            kind: "mesofact-static".into(),
+            path: "site".into(),
+            role: "static".into(),
+            publishes: None,
+            wave: 0,
+            git,
+        }
+    }
+
+    fn service(comp: ServiceComponent) -> ServiceConfig {
+        ServiceConfig {
+            schema_version: 1,
+            name: "scrabcake".into(),
+            domain: "scrabcake.example".into(),
+            components: vec![comp],
+        }
+    }
+
+    fn mirror() -> MirrorConfig {
+        MirrorConfig {
+            schema_version: 1,
+            shape: crate::MirrorShape::Local,
+            providers: BTreeMap::new(),
+            asset_aliases: BTreeMap::new(),
+        }
+    }
+
+    fn ctx<'a>(ws: &'a Path, svc: &'a ServiceConfig, mir: &'a MirrorConfig) -> ReconcileCtx<'a> {
+        ReconcileCtx {
+            workspace_root: ws,
+            service: svc,
+            component: &svc.components[0],
+            mirror: mir,
+            env: "dev",
+        }
+    }
+
+    #[test]
+    fn workload_dir_in_tree_joins_workspace_root() {
+        let svc = service(component(None));
+        let mir = mirror();
+        assert_eq!(
+            ctx(Path::new("/ws"), &svc, &mir).workload_dir(),
+            Path::new("/ws/site")
+        );
+    }
+
+    #[test]
+    fn workload_dir_git_resolves_into_source_cache_with_subdir() {
+        let git = GitSource {
+            repo: "https://example.com/r.git".into(),
+            r#ref: "main".into(),
+            subdir: Some("apps".into()),
+        };
+        let svc = service(component(Some(git)));
+        let mir = mirror();
+        assert_eq!(
+            ctx(Path::new("/ws"), &svc, &mir).workload_dir(),
+            Path::new("/ws/.yah/infra/state/sources/scrabcake/site/apps/site")
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_is_noop_for_in_tree_component() {
+        let svc = service(component(None));
+        let mir = mirror();
+        // No git source → Ok, and nothing is written under the workspace.
+        ctx(Path::new("/nonexistent-ws"), &svc, &mir)
+            .materialize()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn materialize_clones_git_source_offline() {
+        fn git(args: &[&str], cwd: &Path) {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src-repo");
+        std::fs::create_dir_all(&src).unwrap();
+        git(&["init", "-b", "main"], &src);
+        std::fs::write(src.join("hello.txt"), "hi").unwrap();
+        git(&["add", "."], &src);
+        git(&["commit", "-m", "init"], &src);
+
+        let source = GitSource {
+            repo: format!("file://{}", src.display()),
+            r#ref: "main".into(),
+            subdir: None,
+        };
+        let dest = tmp.path().join("cache");
+
+        // First call clones.
+        materialize_git_source(&source, &dest).await.unwrap();
+        assert!(dest.join("hello.txt").is_file());
+
+        // Second call takes the update path and stays green (idempotent).
+        materialize_git_source(&source, &dest).await.unwrap();
+        assert!(dest.join("hello.txt").is_file());
     }
 }

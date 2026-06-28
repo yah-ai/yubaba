@@ -101,7 +101,7 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
                     match runner.run().await {
                         Ok(result) => tracing::info!(
                             %feed_name,
-                            path = %result.artifact_path.display(),
+                            destination = %result.destination,
                             "almanac: feed rebuilt"
                         ),
                         Err(e) => {

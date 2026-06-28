@@ -40,8 +40,8 @@ use cloud::{
     MirrorConfig, MirrorProviderSlot, MirrorShape, Provider, ReconcileCtx, Reconciler,
     ServiceComponent, ServiceConfig, StaticAssetReconciler,
 };
-use task::executor::{ExecContext, ExecEvent, ExecOutcome, ForgeExecutor, ForgeExecutorError};
-use task::{ForgeCommand, ForgeStatus};
+use velveteen::executor::{ExecContext, ExecEvent, ExecOutcome, ForgeExecutor, ForgeExecutorError};
+use velveteen::{ForgeCommand, ForgeStatus};
 use tempfile::tempdir;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
@@ -72,7 +72,9 @@ struct MockCopyExecutor {
 impl MockCopyExecutor {
     fn new() -> (Arc<Self>, Arc<Mutex<u32>>) {
         let inv = Arc::new(Mutex::new(0u32));
-        let me = Arc::new(Self { invocations: inv.clone() });
+        let me = Arc::new(Self {
+            invocations: inv.clone(),
+        });
         (me, inv)
     }
 }
@@ -81,25 +83,30 @@ impl MockCopyExecutor {
 impl ForgeExecutor for MockCopyExecutor {
     async fn execute(
         &self,
-        spec: task::ForgeSpec,
+        spec: velveteen::ForgeSpec,
         _ctx: ExecContext,
         _sink: Option<UnboundedSender<ExecEvent>>,
     ) -> Result<ExecOutcome, ForgeExecutorError> {
         *self.invocations.lock().await += 1;
         let ForgeCommand::Subprocess { argv, .. } = &spec.command else {
-            return Err(ForgeExecutorError::Unsupported("mock handles Subprocess only"));
+            return Err(ForgeExecutorError::Unsupported(
+                "mock handles Subprocess only",
+            ));
         };
         // Test recipe format: ["./copy", "<in>", "<out>"]
-        let in_path = argv
-            .get(1)
-            .ok_or(ForgeExecutorError::Unsupported("argv[1] missing — expected input path"))?;
-        let out_path = argv
-            .get(2)
-            .ok_or(ForgeExecutorError::Unsupported("argv[2] missing — expected output path"))?;
+        let in_path = argv.get(1).ok_or(ForgeExecutorError::Unsupported(
+            "argv[1] missing — expected input path",
+        ))?;
+        let out_path = argv.get(2).ok_or(ForgeExecutorError::Unsupported(
+            "argv[2] missing — expected output path",
+        ))?;
         let bytes = std::fs::read(in_path).map_err(ForgeExecutorError::Io)?;
         std::fs::write(out_path, &bytes).map_err(ForgeExecutorError::Io)?;
         Ok(ExecOutcome {
-            status: ForgeStatus::Done { exit_code: 0, ended_at: 0 },
+            status: ForgeStatus::Done {
+                exit_code: 0,
+                ended_at: 0,
+            },
             stderr_tail: String::new(),
         })
     }
@@ -198,7 +205,10 @@ impl TestWorkspace {
 
         let mut fields = BTreeMap::new();
         fields.insert("api_port".to_string(), toml::Value::Integer(s3_port as i64));
-        fields.insert("bucket".to_string(), toml::Value::String("test-bucket".to_string()));
+        fields.insert(
+            "bucket".to_string(),
+            toml::Value::String("test-bucket".to_string()),
+        );
         let mut providers = BTreeMap::new();
         providers.insert(
             "object_store".to_string(),
@@ -331,7 +341,11 @@ async fn derive_pipeline_upload_skip_prune_reproducibility() {
         .await
         .expect("run 1 must succeed");
 
-    assert_eq!(*inv.lock().await, 1, "executor invoked exactly once on cold MISS");
+    assert_eq!(
+        *inv.lock().await,
+        1,
+        "executor invoked exactly once on cold MISS"
+    );
     {
         let s = s3_store.lock().await;
         let keys: Vec<_> = s.keys().collect();
@@ -371,7 +385,11 @@ async fn derive_pipeline_upload_skip_prune_reproducibility() {
         .await
         .expect("post-prune run must succeed");
 
-    assert_eq!(*inv3.lock().await, 1, "executor re-invoked after prune (fresh cold MISS)");
+    assert_eq!(
+        *inv3.lock().await,
+        1,
+        "executor re-invoked after prune (fresh cold MISS)"
+    );
     {
         let s = s3_store.lock().await;
         let re_uploaded = s

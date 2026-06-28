@@ -80,7 +80,10 @@ pub struct AssetStatusJournal {
 impl AssetStatusJournal {
     pub fn new(path: PathBuf) -> Self {
         let (tx, _) = broadcast::channel(256);
-        Self { path, tx: Arc::new(tx) }
+        Self {
+            path,
+            tx: Arc::new(tx),
+        }
     }
 
     /// Create a journal rooted at `<workspace_root>/.yah/cloud/status.jsonl`.
@@ -248,9 +251,18 @@ mod tests {
     fn event_skips_none_fields_in_json() {
         let event = sample_event("svc:file.bin", AssetState::PlaceholderOutput);
         let json = serde_json::to_string(&event).unwrap();
-        assert!(!json.contains("\"from\""), "None from should be omitted: {json}");
-        assert!(!json.contains("\"bytes\""), "None bytes should be omitted: {json}");
-        assert!(!json.contains("\"blake3\""), "None blake3 should be omitted: {json}");
+        assert!(
+            !json.contains("\"from\""),
+            "None from should be omitted: {json}"
+        );
+        assert!(
+            !json.contains("\"bytes\""),
+            "None bytes should be omitted: {json}"
+        );
+        assert!(
+            !json.contains("\"blake3\""),
+            "None blake3 should be omitted: {json}"
+        );
     }
 
     #[tokio::test]
@@ -269,7 +281,10 @@ mod tests {
         journal.append(&event).await;
 
         let content = tokio::fs::read_to_string(journal.path()).await.unwrap();
-        assert!(!content.is_empty(), "journal file must be non-empty after append");
+        assert!(
+            !content.is_empty(),
+            "journal file must be non-empty after append"
+        );
         let parsed: AssetStatusEvent = serde_json::from_str(content.trim()).unwrap();
         assert_eq!(parsed.asset, event.asset);
         assert_eq!(parsed.to, AssetState::Published);
@@ -319,9 +334,15 @@ mod tests {
         let dir = tempdir().unwrap();
         let journal = AssetStatusJournal::new(dir.path().join("cloud/status.jsonl"));
 
-        journal.append(&sample_event("svc:a.bin", AssetState::Published)).await;
-        journal.append(&sample_event("svc:b.bin", AssetState::PinnedNotPublished)).await;
-        journal.append(&sample_event("svc:a.bin", AssetState::DriftBucket)).await;
+        journal
+            .append(&sample_event("svc:a.bin", AssetState::Published))
+            .await;
+        journal
+            .append(&sample_event("svc:b.bin", AssetState::PinnedNotPublished))
+            .await;
+        journal
+            .append(&sample_event("svc:a.bin", AssetState::DriftBucket))
+            .await;
 
         let map = journal.last_state_per_asset().await;
         assert_eq!(map.get("svc:a.bin"), Some(&AssetState::DriftBucket));
@@ -336,7 +357,9 @@ mod tests {
         let valid = serde_json::to_string(&sample_event("svc:x.bin", AssetState::Published))
             .unwrap()
             + "\n";
-        tokio::fs::write(&path, format!("{valid}\n{valid}")).await.unwrap();
+        tokio::fs::write(&path, format!("{valid}\n{valid}"))
+            .await
+            .unwrap();
         let journal = AssetStatusJournal::new(path);
         let map = journal.last_state_per_asset().await;
         assert_eq!(map.get("svc:x.bin"), Some(&AssetState::Published));

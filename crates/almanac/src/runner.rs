@@ -1,44 +1,56 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use thiserror::Error;
 
 use crate::config::{FeedConfig, OnChangeConfig, SourceConfig};
 use crate::feed::ReleaseFeed;
 use crate::gh::GhReleases;
 use crate::r2::R2Channel;
+use crate::sink::{FeedSink, SinkError, SinkTarget};
 use crate::sources::{ReleaseSource, SourceError};
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
     #[error("source fetch failed: {0}")]
     Source(#[from] SourceError),
-    #[error("I/O error writing artifact {path}: {source}")]
-    Io { path: PathBuf, #[source] source: std::io::Error },
     #[error("JSON serialization failed: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("tokio I/O error: {0}")]
-    TokioIo(#[from] tokio::io::Error),
+    #[error(transparent)]
+    Sink(#[from] SinkError),
 }
 
 /// Result of a single feed run.
 #[derive(Debug)]
 pub struct RunResult {
-    /// Absolute path to the written artifact.
-    pub artifact_path: PathBuf,
+    /// Where the artifact landed (local file or tenant object key).
+    pub destination: SinkTarget,
     /// The feed that was written.
     pub feed: ReleaseFeed,
     /// Downstream action to fire (caller's responsibility to dispatch).
     pub on_change: Option<OnChangeConfig>,
 }
 
-/// Fetches a feed from its source adapter and writes the artifact.
+/// Fetches a feed from its source adapter and writes the artifact to a sink.
+///
+/// The sink decouples *what* is written from *where*: the single-tenant /
+/// dev path writes a local file ([`FeedRunner::new`]); the cloud multi-tenant
+/// path writes into a tenant's object store ([`FeedRunner::with_sink`] with a
+/// [`FeedSink::Object`]).
 pub struct FeedRunner {
     config: FeedConfig,
-    project_root: PathBuf,
+    sink: FeedSink,
 }
 
 impl FeedRunner {
-    pub fn new(config: FeedConfig, project_root: impl Into<PathBuf>) -> Self {
-        Self { config, project_root: project_root.into() }
+    /// Local-file sink rooted at `project_root` joined with the feed's
+    /// `emit.artifact` (the historical single-tenant behaviour).
+    pub fn new(config: FeedConfig, project_root: impl AsRef<Path>) -> Self {
+        let sink = crate::sink::local_file(project_root.as_ref(), &config.feed.emit.artifact);
+        Self { config, sink }
+    }
+
+    /// Run the feed into an explicit sink — e.g. a tenant's object store.
+    pub fn with_sink(config: FeedConfig, sink: FeedSink) -> Self {
+        Self { config, sink }
     }
 
     pub async fn run(&self) -> Result<RunResult, RunnerError> {
@@ -46,23 +58,17 @@ impl FeedRunner {
         tracing::info!(source = source.source_id(), feed = %self.config.feed.name, "fetching feed");
         let feed = source.fetch().await?;
 
-        let artifact_path = self.project_root.join(&self.config.feed.emit.artifact);
-        if let Some(parent) = artifact_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
         let json = serde_json::to_string_pretty(&feed)?;
-        tokio::fs::write(&artifact_path, json.as_bytes())
-            .await
-            .map_err(|source| RunnerError::Io { path: artifact_path.clone(), source })?;
+        let destination = self.sink.write(json.into_bytes()).await?;
 
         tracing::info!(
-            path = %artifact_path.display(),
+            destination = %destination,
             releases = feed.releases.len(),
             "artifact written"
         );
 
         Ok(RunResult {
-            artifact_path,
+            destination,
             feed,
             on_change: self.config.feed.emit.on_change.clone(),
         })
@@ -72,8 +78,8 @@ impl FeedRunner {
         &self.config
     }
 
-    pub fn project_root(&self) -> &Path {
-        &self.project_root
+    pub fn sink(&self) -> &FeedSink {
+        &self.sink
     }
 }
 

@@ -223,9 +223,7 @@ impl DigitalOceanEnvoy {
             .create_droplet(&spec)
             .await
             .context("cloud.vps.create: create_droplet")?;
-        Ok(CloudVpsCreateOutput {
-            id: id.to_string(),
-        })
+        Ok(CloudVpsCreateOutput { id: id.to_string() })
     }
 
     /// Typed handler for `cloud.vps.destroy`. Idempotent.
@@ -274,20 +272,20 @@ impl EnvoyAdapter for DigitalOceanEnvoy {
     async fn dispatch(&self, verb_id: &str, input: Value) -> Result<Value> {
         match verb_id {
             id if id == CloudVpsCreate::ID => {
-                let args: CloudVpsCreateInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: CloudVpsCreateInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.cloud_vps_create(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
             id if id == CloudVpsDestroy::ID => {
-                let args: CloudVpsDestroyInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: CloudVpsDestroyInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.cloud_vps_destroy(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
             id if id == CloudVpsStatus::ID => {
-                let args: CloudVpsStatusInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: CloudVpsStatusInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.cloud_vps_status(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
@@ -356,7 +354,10 @@ mod tests {
         // caller updates their input to the new coarse region tag.
         for legacy in ["pdx", "iad", "fsn"] {
             let err = do_region(legacy).unwrap_err();
-            assert!(err.to_string().contains(legacy), "expected error to name {legacy}");
+            assert!(
+                err.to_string().contains(legacy),
+                "expected error to name {legacy}"
+            );
         }
     }
 

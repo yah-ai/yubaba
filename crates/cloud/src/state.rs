@@ -64,8 +64,9 @@ impl MachineState {
     pub fn load(workspace_root: &Path, name: &str) -> Result<Self> {
         let p = Self::path(workspace_root, name);
         match std::fs::read(&p) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("parsing {}", p.display())),
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", p.display()))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),
         }
@@ -80,8 +81,7 @@ impl MachineState {
         }
         let json = serde_json::to_vec_pretty(self)
             .with_context(|| format!("serializing state for {name}"))?;
-        std::fs::write(&p, json)
-            .with_context(|| format!("writing {}", p.display()))
+        std::fs::write(&p, json).with_context(|| format!("writing {}", p.display()))
     }
 }
 

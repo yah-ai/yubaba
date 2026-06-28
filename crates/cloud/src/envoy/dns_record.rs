@@ -28,7 +28,7 @@ pub struct DnsRecordUpsertInput {
     /// Zone apex name, e.g. `"yah.dev"`. The adapter resolves it to a
     /// provider-issued zone ID.
     pub zone: String,
-    /// Fully-qualified record name, e.g. `"warden.yah.dev"`. Apex records
+    /// Fully-qualified record name, e.g. `"yubaba.yah.dev"`. Apex records
     /// may also be passed as `"@"` — adapters normalise as needed.
     pub name: String,
     /// DNS record type (`"A"`, `"AAAA"`, `"CNAME"`, `"TXT"`, `"MX"`, …).
@@ -80,7 +80,7 @@ pub struct DnsRecordDelete;
 pub struct DnsRecordDeleteInput {
     /// Zone apex name, e.g. `"yah.dev"`.
     pub zone: String,
-    /// Record name to delete, e.g. `"warden.yah.dev"`.
+    /// Record name to delete, e.g. `"yubaba.yah.dev"`.
     pub name: String,
     /// Filter by record type. When absent, all records matching `name` are
     /// deleted regardless of type. Pass `"CNAME"` to delete only CNAME
@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn upsert_input_defaults_ttl_to_auto_and_proxied_false() {
-        let wire = r#"{"zone":"yah.dev","name":"warden.yah.dev","type":"CNAME","content":"t.cfargotunnel.com"}"#;
+        let wire = r#"{"zone":"yah.dev","name":"yubaba.yah.dev","type":"CNAME","content":"t.cfargotunnel.com"}"#;
         let parsed: DnsRecordUpsertInput = serde_json::from_str(wire).unwrap();
         assert_eq!(parsed.ttl, 1, "default TTL should be 1 (automatic)");
         assert!(!parsed.proxied, "default proxied should be false");
@@ -179,7 +179,10 @@ mod tests {
         // Verify the Rust field serializes back as "type".
         let back = serde_json::to_value(&parsed).unwrap();
         assert!(back.get("type").is_some(), "should serialize as 'type'");
-        assert!(back.get("record_type").is_none(), "should not serialize as 'record_type'");
+        assert!(
+            back.get("record_type").is_none(),
+            "should not serialize as 'record_type'"
+        );
     }
 
     #[test]
@@ -195,7 +198,11 @@ mod tests {
 
     #[test]
     fn delete_input_omits_type_when_absent() {
-        let input = DnsRecordDeleteInput { zone: "z".into(), name: "n".into(), record_type: None };
+        let input = DnsRecordDeleteInput {
+            zone: "z".into(),
+            name: "n".into(),
+            record_type: None,
+        };
         let wire = serde_json::to_value(&input).unwrap();
         assert!(!wire.as_object().unwrap().contains_key("type"));
     }
@@ -217,8 +224,14 @@ mod tests {
     fn zone_list_output_round_trips() {
         let out = DnsZoneListOutput {
             zones: vec![
-                DnsZoneEntry { id: "z1".into(), name: "yah.dev".into() },
-                DnsZoneEntry { id: "z2".into(), name: "noisetable.com".into() },
+                DnsZoneEntry {
+                    id: "z1".into(),
+                    name: "yah.dev".into(),
+                },
+                DnsZoneEntry {
+                    id: "z2".into(),
+                    name: "noisetable.com".into(),
+                },
             ],
         };
         let wire = serde_json::to_string(&out).unwrap();

@@ -1,7 +1,7 @@
 //! `payments.*` verb signatures — billing surface catalog (R409-T12).
 //!
-//! Three verbs for the payments plane. Per W144, this is a warden-side
-//! category — the fractal puts payments verbs on the warden host, not the
+//! Three verbs for the payments plane. Per W144, this is a yubaba-side
+//! category — the fractal puts payments verbs on the yubaba host, not the
 //! yah camp host. The shapes are designed for Stripe, Lemon Squeezy, and
 //! Paddle as exemplar providers.
 //!
@@ -192,7 +192,10 @@ mod tests {
 
     #[test]
     fn webhook_verify_output_omits_event_type_on_failure() {
-        let out = PaymentsWebhookVerifyOutput { valid: false, event_type: None };
+        let out = PaymentsWebhookVerifyOutput {
+            valid: false,
+            event_type: None,
+        };
         let wire = serde_json::to_value(&out).unwrap();
         assert_eq!(wire["valid"], false);
         assert!(!wire.as_object().unwrap().contains_key("event_type"));

@@ -17,12 +17,8 @@
 
 use std::path::PathBuf;
 
-use task::transforms::{
-    RecipeLocation, RecipePlacement, RecipeStep, TransformRecipe,
-};
-use task::{
-    ForgeCommand, ForgeSpec, Initiator, MeshAccess, TaskLocation, TaskRuntime,
-};
+use velveteen::transforms::{RecipeLocation, RecipePlacement, RecipeStep, TransformRecipe};
+use velveteen::{ForgeCommand, ForgeSpec, Initiator, MeshAccess, TaskLocation, TaskRuntime};
 use workload_spec::{BuildConfig, BuildMode, ImageRef};
 
 use super::mesofact_static::lower_build_to_forge_spec;
@@ -71,7 +67,9 @@ fn golden_build_in_container() -> (BuildConfig, BuildMode) {
             command: "bun run build".into(),
             out_dir: PathBuf::from("dist"),
         },
-        BuildMode::InContainer { image: golden_image() },
+        BuildMode::InContainer {
+            image: golden_image(),
+        },
     )
 }
 
@@ -107,7 +105,9 @@ fn assert_subprocess_local_container_pinned(spec: &ForgeSpec) {
     );
     match &spec.command {
         ForgeCommand::Subprocess { image, .. } => {
-            let image = image.as_ref().expect("container quadrant requires an image");
+            let image = image
+                .as_ref()
+                .expect("container quadrant requires an image");
             assert!(
                 image.digest.starts_with("sha256:"),
                 "image digest must be content-addressed; got {:?}",
@@ -145,7 +145,10 @@ fn golden_recipe_step_lowers_to_pinned_local_container_subprocess() {
 
     // Command
     match spec.command {
-        ForgeCommand::Subprocess { argv: spec_argv, image } => {
+        ForgeCommand::Subprocess {
+            argv: spec_argv,
+            image,
+        } => {
             assert_eq!(spec_argv, argv);
             let image = image.unwrap();
             assert_eq!(image.registry, "ghcr.io");
@@ -290,8 +293,7 @@ fn parity_recipe_and_build_in_container_share_quadrant() {
         _ => unreachable!(),
     };
     assert!(
-        recipe_image.digest.starts_with("sha256:")
-            && build_image.digest.starts_with("sha256:"),
+        recipe_image.digest.starts_with("sha256:") && build_image.digest.starts_with("sha256:"),
         "both lowerings must emit sha256-pinned images"
     );
 

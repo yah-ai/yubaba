@@ -242,7 +242,10 @@ mod tests {
     fn derive_key_strips_html_prefix() {
         assert_eq!(derive_minio_key("html/index.html", None), "index.html");
         assert_eq!(derive_minio_key("html/404.html", None), "404.html");
-        assert_eq!(derive_minio_key("html/nested/page.html", None), "nested/page.html");
+        assert_eq!(
+            derive_minio_key("html/nested/page.html", None),
+            "nested/page.html"
+        );
     }
 
     #[test]
@@ -254,23 +257,38 @@ mod tests {
 
     #[test]
     fn derive_key_does_not_strip_html_prefix_on_non_html_dir() {
-        assert_eq!(derive_minio_key("html-extras/foo.html", None), "html-extras/foo.html");
+        assert_eq!(
+            derive_minio_key("html-extras/foo.html", None),
+            "html-extras/foo.html"
+        );
     }
 
     #[test]
     fn derive_key_prepends_prefix() {
-        assert_eq!(derive_minio_key("html/index.html", Some("dev-yah/cloud")), "dev-yah/cloud/index.html");
-        assert_eq!(derive_minio_key("assets/main.js", Some("dev-yah/cloud")), "dev-yah/cloud/assets/main.js");
+        assert_eq!(
+            derive_minio_key("html/index.html", Some("dev-yah/cloud")),
+            "dev-yah/cloud/index.html"
+        );
+        assert_eq!(
+            derive_minio_key("assets/main.js", Some("dev-yah/cloud")),
+            "dev-yah/cloud/assets/main.js"
+        );
     }
 
     #[test]
     fn derive_key_prefix_trailing_slash_stripped() {
-        assert_eq!(derive_minio_key("index.html", Some("svc/env/")), "svc/env/index.html");
+        assert_eq!(
+            derive_minio_key("index.html", Some("svc/env/")),
+            "svc/env/index.html"
+        );
     }
 
     #[test]
     fn content_type_html() {
-        assert_eq!(content_type_for(Path::new("index.html")), "text/html; charset=utf-8");
+        assert_eq!(
+            content_type_for(Path::new("index.html")),
+            "text/html; charset=utf-8"
+        );
     }
 
     #[test]
@@ -287,12 +305,18 @@ mod tests {
 
     #[test]
     fn content_type_json() {
-        assert_eq!(content_type_for(Path::new("manifest.json")), "application/json");
+        assert_eq!(
+            content_type_for(Path::new("manifest.json")),
+            "application/json"
+        );
     }
 
     #[test]
     fn content_type_unknown_falls_back_to_octet_stream() {
-        assert_eq!(content_type_for(Path::new("data.bin")), "application/octet-stream");
+        assert_eq!(
+            content_type_for(Path::new("data.bin")),
+            "application/octet-stream"
+        );
     }
 
     #[tokio::test]
@@ -343,7 +367,9 @@ mod tests {
     #[tokio::test]
     async fn walk_files_collects_files_recursively() {
         let tmp = TempDir::new().unwrap();
-        tokio::fs::create_dir(tmp.path().join("html")).await.unwrap();
+        tokio::fs::create_dir(tmp.path().join("html"))
+            .await
+            .unwrap();
         tokio::fs::write(tmp.path().join("html/index.html"), b"<h1>hi</h1>")
             .await
             .unwrap();

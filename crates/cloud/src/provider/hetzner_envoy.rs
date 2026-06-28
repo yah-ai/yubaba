@@ -133,20 +133,20 @@ impl EnvoyAdapter for HetznerEnvoy {
     async fn dispatch(&self, verb_id: &str, input: Value) -> Result<Value> {
         match verb_id {
             id if id == CloudVpsCreate::ID => {
-                let args: CloudVpsCreateInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: CloudVpsCreateInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.cloud_vps_create(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
             id if id == CloudVpsDestroy::ID => {
-                let args: CloudVpsDestroyInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: CloudVpsDestroyInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.cloud_vps_destroy(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
             id if id == CloudVpsStatus::ID => {
-                let args: CloudVpsStatusInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: CloudVpsStatusInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.cloud_vps_status(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
@@ -163,14 +163,11 @@ fn parse_ssh_keys(raw: &[String]) -> Result<Vec<u64>> {
     raw.iter()
         .map(|s| {
             s.parse::<u64>().with_context(|| {
-                format!(
-                    "cloud.vps.create: hetzner ssh_keys entry {s:?} is not a numeric key id"
-                )
+                format!("cloud.vps.create: hetzner ssh_keys entry {s:?} is not a numeric key id")
             })
         })
         .collect()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -225,7 +222,11 @@ mod tests {
             ServerStatus::Deleting,
         ] {
             let out = server_status_to_output(s);
-            assert!(out.detail.is_none(), "phase {:?} should not carry detail", out.phase);
+            assert!(
+                out.detail.is_none(),
+                "phase {:?} should not carry detail",
+                out.phase
+            );
         }
     }
 }

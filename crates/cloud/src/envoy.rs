@@ -81,7 +81,7 @@ pub enum VerbCategory {
     Observability,
     /// `ci.*` — pipelines, artifacts (external CI; yah's own scheduler is qed).
     Ci,
-    /// `payments.*` — charges, subscriptions, webhook verify (warden-side).
+    /// `payments.*` — charges, subscriptions, webhook verify (yubaba-side).
     Payments,
     /// `messaging.*` — email, SMS, webhook dispatch.
     Messaging,
@@ -240,11 +240,7 @@ pub trait EnvoyAdapter: Send + Sync {
     /// Unsupported ids should return `Err` — they are a programmer error
     /// (the host shouldn't dispatch unsupported verbs), not a runtime
     /// vendor failure.
-    async fn dispatch(
-        &self,
-        verb_id: &str,
-        input: serde_json::Value,
-    ) -> Result<serde_json::Value>;
+    async fn dispatch(&self, verb_id: &str, input: serde_json::Value) -> Result<serde_json::Value>;
 }
 
 #[cfg(test)]

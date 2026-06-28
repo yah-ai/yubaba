@@ -1,17 +1,17 @@
-//! Rollout policy schema — the typed form of `.warden/rollout.toml`.
+//! Rollout policy schema — the typed form of `.yubaba/rollout.toml`.
 //!
 //! Policy files live in the release bundle alongside the `WorkloadSpec` they
-//! govern. Warden deserialises the policy and drives the rollout according to
+//! govern. Yubaba deserialises the policy and drives the rollout according to
 //! the declared strategy, gates, and steps.
 //!
-//! Corresponds to §"Rollout policy" in `.yah/docs/working/W140-yah-warden-ci-cd.md`.
+//! Corresponds to §"Rollout policy" in `.yah/docs/working/W140-yah-yubaba-ci-cd.md`.
 
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "json-schema")]
 use schemars::JsonSchema;
 
-/// Top-level wrapper when reading `.warden/rollout.toml` from disk.
+/// Top-level wrapper when reading `.yubaba/rollout.toml` from disk.
 ///
 /// TOML files have a `[rollout]` section; when the policy is inlined in JSON
 /// (e.g. in the `POST /v1/rollouts` request body), use [`RolloutPolicy`] directly.
@@ -25,7 +25,7 @@ pub struct RolloutFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(JsonSchema))]
 pub struct RolloutPolicy {
-    /// Deployment strategy. Only `linear` is implemented in warden v1.
+    /// Deployment strategy. Only `linear` is implemented in yubaba v1.
     pub strategy: RolloutStrategy,
     /// Maximum wall-clock seconds for the entire rollout before it times out.
     pub window_seconds: u64,
@@ -55,7 +55,7 @@ pub enum RolloutStrategy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(JsonSchema))]
 pub struct RolloutGate {
-    /// Metric name. v1 warden supports `http_5xx_rate` and `p95_latency_ms`;
+    /// Metric name. v1 yubaba supports `http_5xx_rate` and `p95_latency_ms`;
     /// arbitrary PromQL expressions are also accepted.
     pub metric: String,
     /// Comparison condition, e.g. `"< 0.01"` or `"< 200"`.

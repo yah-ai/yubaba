@@ -9,7 +9,7 @@
 //!   command then call [`MesofactStaticReconciler::rebuild_static`] on the
 //!   named service's mirror for `env`.
 
-use almanac::OnChangeConfig;
+use yah_almanac::OnChangeConfig;
 use anyhow::{Context, Result};
 use std::path::Path;
 
@@ -38,29 +38,24 @@ async fn rebuild_mesofact(
     workspace_root: &Path,
     env: &str,
 ) -> Result<()> {
-    let config = CloudConfig::load(workspace_root).with_context(|| {
-        format!(
-            "loading cloud config from {}",
-            workspace_root.display()
-        )
-    })?;
+    let config = CloudConfig::load(workspace_root)
+        .with_context(|| format!("loading cloud config from {}", workspace_root.display()))?;
 
-    let svc = config.service(service_name).with_context(|| {
-        format!("service {service_name:?} not found in .yah/services/")
-    })?;
+    let svc = config
+        .service(service_name)
+        .with_context(|| format!("service {service_name:?} not found in .yah/services/"))?;
 
     let component = svc
         .service
         .components
         .iter()
         .find(|c| c.kind == "mesofact-static")
-        .with_context(|| {
-            format!("service {service_name:?} has no mesofact-static component")
-        })?;
+        .with_context(|| format!("service {service_name:?} has no mesofact-static component"))?;
 
-    let mirror = svc.mirrors.get(env).with_context(|| {
-        format!("service {service_name:?} has no mirror for env {env:?}")
-    })?;
+    let mirror = svc
+        .mirrors
+        .get(env)
+        .with_context(|| format!("service {service_name:?} has no mirror for env {env:?}"))?;
 
     let ctx = ReconcileCtx {
         workspace_root,
@@ -103,7 +98,9 @@ mod tests {
             service: "no-such-svc".to_string(),
             route: "/releases".to_string(),
         };
-        let err = dispatch_on_change(&on_change, root, "prod").await.unwrap_err();
+        let err = dispatch_on_change(&on_change, root, "prod")
+            .await
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("no-such-svc"), "got: {msg}");
     }
@@ -131,7 +128,9 @@ wave = 0
             service: "dev-yah".to_string(),
             route: "/releases".to_string(),
         };
-        let err = dispatch_on_change(&on_change, root, "prod").await.unwrap_err();
+        let err = dispatch_on_change(&on_change, root, "prod")
+            .await
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("no mirror"), "got: {msg}");
     }

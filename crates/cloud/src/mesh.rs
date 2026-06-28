@@ -62,7 +62,11 @@ impl HeadscaleClient {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .context("building Headscale HTTP client")?;
-        Ok(Self { base_url, api_key: api_key.into(), http })
+        Ok(Self {
+            base_url,
+            api_key: api_key.into(),
+            http,
+        })
     }
 
     /// Open a client from the vault (slot `headscale-api-key` + `mesh-url`)
@@ -71,11 +75,11 @@ impl HeadscaleClient {
     /// Returns `Ok(None)` when either credential is absent — callers can
     /// decide whether that's fatal.
     pub fn from_vault_or_env() -> Result<Option<Self>> {
-        let api_key = match keys::get_or_env("headscale-api-key", "HEADSCALE_API_KEY")? {
+        let api_key = match fob::get_or_env("headscale-api-key", "HEADSCALE_API_KEY")? {
             Some(k) => k,
             None => return Ok(None),
         };
-        let url = match keys::get_or_env("mesh-url", "HEADSCALE_URL")? {
+        let url = match fob::get_or_env("mesh-url", "HEADSCALE_URL")? {
             Some(u) => u,
             None => return Ok(None),
         };
@@ -87,11 +91,7 @@ impl HeadscaleClient {
     /// The key expires in 1 hour and is non-reusable — suitable for one-shot
     /// machine onboarding via cloud-init. Each `yah cloud machine provision`
     /// call that uses Headscale mesh should request its own key.
-    pub async fn create_preauth_key(
-        &self,
-        user: &str,
-        tags: &[String],
-    ) -> Result<PreauthKey> {
+    pub async fn create_preauth_key(&self, user: &str, tags: &[String]) -> Result<PreauthKey> {
         let expiration = chrono::Utc::now()
             + chrono::TimeDelta::try_hours(1)
                 .ok_or_else(|| anyhow::anyhow!("overflow computing 1-hour expiry"))?;
@@ -120,7 +120,10 @@ impl HeadscaleClient {
         let key = resp_json["preAuthKey"]["key"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing preAuthKey.key in response: {resp_json}"))?;
-        Ok(PreauthKey { key: key.to_string(), acl_tags: tags.to_vec() })
+        Ok(PreauthKey {
+            key: key.to_string(),
+            acl_tags: tags.to_vec(),
+        })
     }
 
     /// List all nodes currently in the tailnet.
@@ -137,10 +140,11 @@ impl HeadscaleClient {
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("Headscale API {status} on GET /api/v1/machine: {text}");
         }
-        let resp_json: serde_json::Value =
-            resp.json().await.context("parsing machine list")?;
-        let machines =
-            resp_json["machines"].as_array().cloned().unwrap_or_default();
+        let resp_json: serde_json::Value = resp.json().await.context("parsing machine list")?;
+        let machines = resp_json["machines"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         Ok(machines
             .iter()
             .filter_map(|m| {
@@ -163,12 +167,20 @@ impl HeadscaleClient {
 
     /// Light health check — HEAD or GET the Headscale root, no auth required.
     pub async fn health(&self) -> HeadscaleHealth {
-        match self.http.get(format!("{}/health", self.base_url)).send().await {
+        match self
+            .http
+            .get(format!("{}/health", self.base_url))
+            .send()
+            .await
+        {
             Ok(r) => HeadscaleHealth {
                 reachable: r.status().is_success(),
                 status_code: r.status().as_u16(),
             },
-            Err(_) => HeadscaleHealth { reachable: false, status_code: 0 },
+            Err(_) => HeadscaleHealth {
+                reachable: false,
+                status_code: 0,
+            },
         }
     }
 }
@@ -202,13 +214,15 @@ metrics_listen_addr: 127.0.0.1:9090
 private_key_path: {private_key}
 noise:
   private_key_path: {noise_key}
-db_type: sqlite
-db_path: {db_path}
+database:
+  type: sqlite
+  sqlite:
+    path: {db_path}
 unix_socket: {socket_path}
 unix_socket_permission: "0770"
 dns:
   magic_dns: true
-  base_domain: mesh.yah
+  base_domain: mesh.internal
   nameservers:
     global:
       - 1.1.1.1
@@ -219,18 +233,31 @@ prefixes:
   v4: 100.64.0.0/10
   v6: fd7a:115c:a1e0::/48
   allocation: sequential
-acl_policy_path: {acl_path}
+policy:
+  mode: file
+  path: {acl_path}
+derp:
+  server:
+    enabled: false
+  urls:
+    - https://controlplane.tailscale.com/derpmap/default
+  auto_update_enabled: false
+  update_frequency: 24h
 "#
     )
 }
 
 /// A permissive ACL policy that allows all nodes to communicate.
 /// Can be refined later with `yah mesh acl edit`.
-pub const DEFAULT_ACL_POLICY: &str = r#"---
-acls:
-  - action: accept
-    src: ["*"]
-    dst: ["*:*"]
+///
+/// Headscale's file-based policy loader parses HuJSON (JSON-with-comments),
+/// NOT YAML — a leading `---` fails with "invalid literal: ---". Keep this
+/// JSON.
+pub const DEFAULT_ACL_POLICY: &str = r#"{
+  "acls": [
+    { "action": "accept", "src": ["*"], "dst": ["*:*"] }
+  ]
+}
 "#;
 
 // ---------------------------------------------------------------------------
@@ -288,9 +315,7 @@ pub async fn update_cloudflare_dns(
         .build()
         .context("building Cloudflare HTTP client")?;
 
-    let list_url = format!(
-        "https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records"
-    );
+    let list_url = format!("https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records");
 
     let resp = http
         .get(&list_url)
@@ -305,16 +330,44 @@ pub async fn update_cloudflare_dns(
         anyhow::bail!("Cloudflare list DNS records failed: {text}");
     }
 
-    let body: serde_json::Value = resp.json().await.context("parsing Cloudflare records list")?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .context("parsing Cloudflare records list")?;
     let records = body["result"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("unexpected Cloudflare response shape: missing 'result'"))?;
 
     let record_id = match records.len() {
-        0 => anyhow::bail!(
-            "no A record named '{record_name}' in Cloudflare zone {zone_id} — \
-             create the record manually first, then re-run promote"
-        ),
+        // Create-if-missing (R330-T9 follow-up b): on a fresh zone the A record
+        // won't exist yet. POST a new one instead of bailing, so `yah mesh
+        // bootstrap` is self-sufficient — no manual one-time DNS step. Same
+        // endpoint as the list (POST /zones/{zone}/dns_records), same body shape
+        // as the PATCH below. DNS-only (proxied: false) so Let's Encrypt HTTP-01
+        // can reach the node directly.
+        0 => {
+            println!("  A record '{record_name}' absent — creating it (→ {new_ip}) ...");
+            let create_body = serde_json::json!({
+                "type": "A",
+                "name": record_name,
+                "content": new_ip,
+                "ttl": 120,
+                "proxied": false
+            });
+            let resp = http
+                .post(&list_url)
+                .bearer_auth(api_token)
+                .json(&create_body)
+                .send()
+                .await
+                .context("POST Cloudflare DNS record (create-if-missing)")?;
+            if !resp.status().is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Cloudflare create DNS record failed: {text}");
+            }
+            println!("  DNS record created.");
+            return Ok(());
+        }
         1 => records[0]["id"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("missing 'id' in Cloudflare record"))?
@@ -359,8 +412,8 @@ pub async fn update_cloudflare_dns(
 /// Returns `Ok(None)` when either credential is absent so callers can decide
 /// whether to proceed with manual-DNS instructions or bail.
 pub fn cloudflare_credentials() -> Result<Option<(String, String)>> {
-    let token = keys::get_or_env("cloudflare-api-token", "CLOUDFLARE_API_TOKEN")?;
-    let zone_id = keys::get_or_env("cloudflare-zone-id", "CLOUDFLARE_ZONE_ID")?;
+    let token = fob::get_or_env("cloudflare-api-token", "CLOUDFLARE_API_TOKEN")?;
+    let zone_id = fob::get_or_env("cloudflare-zone-id", "CLOUDFLARE_ZONE_ID")?;
     match (token, zone_id) {
         (Some(t), Some(z)) => Ok(Some((t, z))),
         _ => Ok(None),
@@ -381,8 +434,14 @@ mod tests {
         let config = generate_headscale_config("https://mesh.example.com", &dir);
         assert!(config.contains("server_url: https://mesh.example.com"));
         assert!(config.contains("127.0.0.1:8080"));
-        assert!(config.contains("mesh.yah"));
+        assert!(config.contains("base_domain: mesh.internal"));
         assert!(config.contains("acls.yaml"));
+        // Regression (R330-T9): base_domain must not be a substring of the
+        // server_url host, or headscale 0.23+ refuses to start ("server_url
+        // cannot contain the base_domain"). mesh.internal is decoupled from
+        // any mesh.yah.dev-style coordinator hostname.
+        let cfg2 = generate_headscale_config("https://mesh.yah.dev", &dir);
+        assert!(!cfg2.contains("base_domain: mesh.yah\n"));
     }
 
     #[test]

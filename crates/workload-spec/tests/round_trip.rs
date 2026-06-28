@@ -43,7 +43,7 @@ fn full_spec() -> WorkloadSpec {
         secrets: vec![
             SecretMount {
                 source: SecretRef::LocalFile {
-                    path: PathBuf::from("/var/lib/yah/warden/secrets/tls.crt"),
+                    path: PathBuf::from("/var/lib/yah/yubaba/secrets/tls.crt"),
                 },
                 target: SecretTarget::File {
                     path: PathBuf::from("/etc/tls/cert.crt"),

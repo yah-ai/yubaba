@@ -26,4 +26,4 @@ percent-encoding = "2"
 local-driver = { path = "../local-driver" }
 
 # Vault-backed constructor pulls cloudflare-r2-* slots.
-keys = { path = "../keys" }
+fob = { path = "../keys" }

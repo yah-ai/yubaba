@@ -1,31 +1,31 @@
-//! Pond warden-container `ContainerRunSpec` builder + permission model (R408-T2).
+//! Pond yubaba-container `ContainerRunSpec` builder + permission model (R408-T2).
 //!
-//! Companion to the `yah-warden` image (R408-T1). Encodes the docker socket
+//! Companion to the `yah-yubaba` image (R408-T1). Encodes the docker socket
 //! mount, cgroup-namespace, capability, and bind-mount contract the
-//! warden-container expects when it's run on a pond host (OrbStack on macOS,
+//! yubaba-container expects when it's run on a pond host (OrbStack on macOS,
 //! plain docker on Linux dev boxes).
 //!
 //! ## Why a dedicated builder
 //!
-//! The yah-warden image inside pond is shaped differently from every other
+//! The yah-yubaba image inside pond is shaped differently from every other
 //! container [`LocalRuntime::run`] orchestrates today: it needs the host
 //! docker socket mounted in, the cgroup namespace privatised, and `SYS_ADMIN`
-//! capabilities so Constable can write child cgroups. Encoding that as a
+//! capabilities so Kamaji can write child cgroups. Encoding that as a
 //! per-call set of args in a future pond reconciler would scatter the
 //! knowledge across files; centralising it here means the contract is one
 //! place and the next agent picking up T-future-integration (containerise
-//! warden in pond bring-up) consumes a struct, not a tribal-knowledge
+//! yubaba in pond bring-up) consumes a struct, not a tribal-knowledge
 //! checklist.
 //!
 //! ## Permission model
 //!
-//! Pond runs the yah-warden container with sibling-container workloads
+//! Pond runs the yah-yubaba container with sibling-container workloads
 //! orchestrated through the **host's docker socket** rather than
 //! docker-in-docker. The model is intentionally narrow:
 //!
 //! - **Inside the container**: process runs as root (uid 0). The Dockerfile
-//!   does not declare a non-root `USER`. tini (PID 1) and the warden +
-//!   constable siblings expect to write `/run/constable/`, `/var/lib/yah-warden/`,
+//!   does not declare a non-root `USER`. tini (PID 1) and the yubaba +
+//!   kamaji siblings expect to write `/run/kamaji/`, `/var/lib/yah-yubaba/`,
 //!   and `/sys/fs/cgroup/*` — all of which require root on the standard image.
 //!
 //! - **Outside (host)**: the docker socket at `/var/run/docker.sock` is the
@@ -48,7 +48,7 @@
 //!   via `--group-add`. Not done today; documented as the extension point.
 //!
 //! - **Cgroup writes**: `--cgroupns=private` plus `--cap-add=SYS_ADMIN` are
-//!   the minimum for Constable to write child cgroups under the container's
+//!   the minimum for Kamaji to write child cgroups under the container's
 //!   own `/sys/fs/cgroup`. We do not grant `--privileged` — that's broader
 //!   than needed and would dilute the principle-of-least-privilege story for
 //!   the operator-trust review of pond.
@@ -62,8 +62,8 @@
 //!
 //! - It does not actually `docker run` the container — callers feed the
 //!   returned [`ContainerRunSpec`] to [`crate::LocalRuntime::run`]. The pond
-//!   reconciler integration (the "replace embedded-warden with
-//!   warden-container" lift) is the next ticket after T2/T3.
+//!   reconciler integration (the "replace embedded-yubaba with
+//!   yubaba-container" lift) is the next ticket after T2/T3.
 //! - It does not probe readiness — that lives next to the future lifecycle
 //!   wrapper, mirroring [`crate::pond_minio::ensure_minio_running`] shape.
 //! - It does not pull the image — callers use
@@ -74,12 +74,12 @@ use std::path::{Path, PathBuf};
 
 use crate::{canonical_label, canonical_name, ContainerRunSpec};
 
-/// Default tag of the `yah-warden` image. Per W148, the release pipeline
+/// Default tag of the `yah-yubaba` image. Per W148, the release pipeline
 /// injects a digest-pinned tag at build time; pond falls back to `:latest`
 /// for local-built images. T2 doesn't bake the published image ref because
-/// the release-pipeline wiring for `image-yah-warden` is still queued
+/// the release-pipeline wiring for `image-yah-yubaba` is still queued
 /// (T1's handoff calls this out).
-pub const DEFAULT_WARDEN_IMAGE: &str = "ghcr.io/yah-ai/yah-warden:latest";
+pub const DEFAULT_WARDEN_IMAGE: &str = "ghcr.io/yah-ai/yah-yubaba:latest";
 
 /// Canonical host path of the docker daemon's unix socket. Bind-mounted
 /// 1:1 into the container so container-backend workloads spawn as host
@@ -90,23 +90,23 @@ pub const DEFAULT_DOCKER_SOCKET_PATH: &str = "/var/run/docker.sock";
 /// so the docker CLI inside the container needs no `DOCKER_HOST` override.
 pub const DOCKER_SOCKET_CONTAINER_PATH: &str = "/var/run/docker.sock";
 
-/// Container-side mount target for warden's persistent state (raft log,
+/// Container-side mount target for yubaba's persistent state (raft log,
 /// identity, registry). The Dockerfile pre-creates this directory.
-pub const WARDEN_STATE_CONTAINER_PATH: &str = "/var/lib/yah-warden";
+pub const WARDEN_STATE_CONTAINER_PATH: &str = "/var/lib/yah-yubaba";
 
-/// Default operator-visible HTTP port for warden's pond status surface.
-/// Mirrors today's embedded-warden binding (R374-F2 wrote the port to
-/// `<camp_root>/.yah/jit/warden-pond-port.json`); the container path will
+/// Default operator-visible HTTP port for yubaba's pond status surface.
+/// Mirrors today's embedded-yubaba binding (R374-F2 wrote the port to
+/// `<camp_root>/.yah/jit/yubaba-pond-port.json`); the container path will
 /// expose the same file on the same shape.
 pub const DEFAULT_WARDEN_HTTP_PORT: u16 = 8800;
 
 /// Slot role used to scope `canonical_name` / `canonical_label` for the
-/// warden container. The full container name is
-/// `yah-pond-<service>-<env>-warden`, grep-friendly alongside the existing
+/// yubaba container. The full container name is
+/// `yah-pond-<service>-<env>-yubaba`, grep-friendly alongside the existing
 /// `yah-pond-<service>-<env>-object_store` MinIO containers.
-pub const WARDEN_SLOT: &str = "warden";
+pub const WARDEN_SLOT: &str = "yubaba";
 
-/// Bring-up parameters for the pond warden-container. Mirrors
+/// Bring-up parameters for the pond yubaba-container. Mirrors
 /// [`crate::pond_minio::MinioSpec`] in shape: callers (camp, cloud
 /// reconciler) build this from their own source of truth.
 #[derive(Debug, Clone)]
@@ -125,11 +125,11 @@ pub struct WardenContainerSpec {
     /// Defaults to [`DEFAULT_DOCKER_SOCKET_PATH`]; OrbStack callers may
     /// override when the operator points at a non-default runtime.
     pub docker_socket_path: PathBuf,
-    /// Host directory that holds warden's persistent state across container
+    /// Host directory that holds yubaba's persistent state across container
     /// life cycles. Bind-mounted to [`WARDEN_STATE_CONTAINER_PATH`].
     pub state_dir: PathBuf,
     /// Extra env vars layered on top of the image defaults (e.g.
-    /// `RUST_LOG=warden=debug`).
+    /// `RUST_LOG=yubaba=debug`).
     pub extra_env: BTreeMap<String, String>,
 }
 
@@ -149,12 +149,15 @@ impl WardenContainerSpec {
     }
 }
 
-/// `YAH_WARDEN_ARGS` injected into every pond warden container so
-/// `pond-supervise.sh` starts warden with the correct subcommand and binds to
-/// the expected pond HTTP port. Callers that need a different bind address or
-/// extra flags can override via [`WardenContainerSpec::extra_env`].
+/// `YAH_WARDEN_ARGS` injected into every pond yubaba container so yubaba binds
+/// to the expected pond HTTP port. These are the *flags* appended after the
+/// `serve` subcommand — `pond-supervise.sh` owns the `serve` token itself
+/// (`yah-yubaba serve $YAH_WARDEN_ARGS`), so this string must NOT repeat it or
+/// clap sees a doubled subcommand and the container crash-loops (R471 redux).
+/// Callers that need a different bind address or extra flags can override via
+/// [`WardenContainerSpec::extra_env`].
 pub const DEFAULT_WARDEN_ARGS: &str =
-    "serve --bind 0.0.0.0:8800 --state /var/lib/yah-warden/identity.json";
+    "--bind 0.0.0.0:8800 --state /var/lib/yah-yubaba/identity.json";
 
 /// Translate a [`WardenContainerSpec`] into the [`ContainerRunSpec`] that
 /// [`crate::LocalRuntime::run`] will emit as `docker run …`. Pure: builds
@@ -164,11 +167,12 @@ pub const DEFAULT_WARDEN_ARGS: &str =
 /// - `--cgroupns=private`
 /// - `--cap-add=SYS_ADMIN`
 /// - `-v <docker_socket_path>:/var/run/docker.sock`
-/// - `-v <state_dir>:/var/lib/yah-warden`
+/// - `-v <state_dir>:/var/lib/yah-yubaba`
 /// - `-p <http_port>:8800`
-/// - canonical label/name (`yah-pond-<svc>-<env>-warden`)
-/// - `YAH_WARDEN_ARGS=serve --bind 0.0.0.0:8800 --state …` (unless
-///   overridden via [`WardenContainerSpec::extra_env`])
+/// - canonical label/name (`yah-pond-<svc>-<env>-yubaba`)
+/// - `YAH_WARDEN_ARGS=--bind 0.0.0.0:8800 --state …` (flags only — the
+///   `serve` subcommand is supplied by `pond-supervise.sh`; unless overridden
+///   via [`WardenContainerSpec::extra_env`])
 pub fn build_warden_run_spec(spec: &WardenContainerSpec) -> ContainerRunSpec {
     let mut env = spec.extra_env.clone();
     env.entry("YAH_WARDEN_ARGS".into())
@@ -221,8 +225,8 @@ mod tests {
     #[test]
     fn run_spec_has_canonical_name_and_label() {
         let crs = build_warden_run_spec(&spec_for_test());
-        assert_eq!(crs.name, "yah-pond-dev-yah-pond-warden");
-        assert!(crs.label.contains("dev-yah:pond:warden"));
+        assert_eq!(crs.name, "yah-pond-dev-yah-pond-yubaba");
+        assert!(crs.label.contains("dev-yah:pond:yubaba"));
     }
 
     #[test]
@@ -265,7 +269,26 @@ mod tests {
             crs.env.get("YAH_WARDEN_ARGS").map(String::as_str),
             Some(DEFAULT_WARDEN_ARGS),
             "build_warden_run_spec must inject YAH_WARDEN_ARGS so pond-supervise.sh \
-             starts `yah-warden serve` on the expected port"
+             starts `yah-yubaba serve` on the expected port"
+        );
+    }
+
+    /// Regression guard for the R471-redux crash-loop: `pond-supervise.sh`
+    /// invokes `yah-yubaba serve $YAH_WARDEN_ARGS`, so the injected args must
+    /// carry flags ONLY. If this string ever leads with `serve` again the
+    /// container expands to `yah-yubaba serve serve …`, clap rejects the
+    /// doubled subcommand, and the pond yubaba restart-loops.
+    #[test]
+    fn default_warden_args_must_not_repeat_serve_subcommand() {
+        let crs = build_warden_run_spec(&spec_for_test());
+        let args = crs.env.get("YAH_WARDEN_ARGS").map(String::as_str).unwrap();
+        let first = args.split_whitespace().next();
+        assert_ne!(
+            first,
+            Some("serve"),
+            "YAH_WARDEN_ARGS must be flags-only; pond-supervise.sh owns the `serve` \
+             token. Leading `serve` here doubles the subcommand and crash-loops \
+             the container (R471 redux). Got: {args:?}"
         );
     }
 
@@ -273,25 +296,25 @@ mod tests {
     fn run_spec_extra_env_overrides_warden_args() {
         // Callers that need a non-standard bind can override via extra_env.
         let mut spec = spec_for_test();
-        spec.extra_env.insert("YAH_WARDEN_ARGS".into(), "serve --bind 0.0.0.0:9900".into());
+        spec.extra_env.insert("YAH_WARDEN_ARGS".into(), "--bind 0.0.0.0:9900".into());
         let crs = build_warden_run_spec(&spec);
         assert_eq!(
             crs.env.get("YAH_WARDEN_ARGS").map(String::as_str),
-            Some("serve --bind 0.0.0.0:9900"),
+            Some("--bind 0.0.0.0:9900"),
         );
     }
 
     #[test]
     fn run_spec_forwards_extra_env() {
         let mut spec = spec_for_test();
-        spec.extra_env.insert("RUST_LOG".into(), "warden=debug".into());
+        spec.extra_env.insert("RUST_LOG".into(), "yubaba=debug".into());
         let crs = build_warden_run_spec(&spec);
-        assert_eq!(crs.env.get("RUST_LOG").map(String::as_str), Some("warden=debug"));
+        assert_eq!(crs.env.get("RUST_LOG").map(String::as_str), Some("yubaba=debug"));
     }
 
     #[test]
     fn docker_run_argv_carries_cgroupns_and_cap_add() {
-        // Exercise ContainerRunSpec::docker_run_args via the warden spec so
+        // Exercise ContainerRunSpec::docker_run_args via the yubaba spec so
         // T2's contract is end-to-end visible in the argv that docker sees.
         let crs = build_warden_run_spec(&spec_for_test());
         let argv = crs.docker_run_args();

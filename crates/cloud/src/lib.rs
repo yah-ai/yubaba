@@ -1,9 +1,9 @@
-//! @yah:relay(R040, "yah-cloud Phase 1: mirror bootstrap (Hetzner driver, Podman runtime, yah-warden)")
+//! @yah:relay(R040, "yah-cloud Phase 1: mirror bootstrap (Hetzner driver, Podman runtime, yah-yubaba)")
 //! @yah:status(review)
 //! @yah:parent(Q058)
 //! @yah:next("yah-A track (8 tickets) — substrate for noisetable cloud + future managed camps; gates noisetable C6 (E2E) and D1–D5 (corpus migration)")
 //! @yah:next("Adjacent relays: R019 (SSH-RPC remote camps), R032 (yah-agentd), R034 (identity registry — hostkeys overlap)")
-//! @yah:next("Reparented under Q058 cloud quest 2026-05-07. Largely superseded by R091 (warden orchestration + integration testing) and R092 (managed-camps CLI + .yah/cloud/ schema) — net new work should land on those relays. Remaining unique R040 scope (Cloudflare Tunnel cookbook F15, pg-on-mesh recipe F16, mesh-promote phasing F18-F19) stays here as historical/operational reference; consider archiving once R091+R092 reach review.")
+//! @yah:next("Reparented under Q058 cloud quest 2026-05-07. Largely superseded by R091 (yubaba orchestration + integration testing) and R092 (managed-camps CLI + .yah/cloud/ schema) — net new work should land on those relays. Remaining unique R040 scope (Cloudflare Tunnel cookbook F15, pg-on-mesh recipe F16, mesh-promote phasing F18-F19) stays here as historical/operational reference; consider archiving once R091+R092 reach review.")
 //! @yah:next("Refinement open questions: subcommand framework alignment with yah arch/board, where hostkey fingerprints live, reverse proxy choice. Crate-layout question soft-answered by this stub being a sibling crate; A1 may still refactor into a sub-module of an existing crate if desired (move the //! block + delete this stub).")
 //! @arch:see(architecture/PHASE_1_MIRROR_BOOTSTRAP.md)
 //! @arch:see(architecture/yah-managed-camps-topology.md)
@@ -35,20 +35,20 @@
 //! @yah:handoff("MachineProvider trait + HetznerDriver impl complete in crates/yah/cloud/src/provider/. Cloud API (create_server, server_status, destroy_server) uses HETZNER_API_TOKEN via reqwest+bearer. create_bucket uses Hetzner Object Storage S3-compat with AWS Sig V4 signing (HETZNER_S3_ACCESS_KEY + HETZNER_S3_SECRET_KEY). Location enum maps pdx/iad/fsn to hetzner cloud IDs and S3 endpoints. 9 unit tests pass; 2 integration tests behind #[ignore] gate. .yah/cloud/SECRETS.md created documenting all three token types.")
 //! @yah:next("A2: wire yah cloud subcommand stub into CLI (yah board/arch pattern). All commands no-op except machine status + mirror show which dump parsed .yah/cloud/ config. Verify: yah cloud mirror show noisetable prints declared regions/services.")
 //!
-//! @yah:ticket(R040-F4, "A4: cloud-init YAML + yah cloud machine provision (Debian + Podman + Tailscale + yah-warden)")
+//! @yah:ticket(R040-F4, "A4: cloud-init YAML + yah cloud machine provision (Debian + Podman + Tailscale + yah-yubaba)")
 //! @yah:at(2026-05-05T00:29:11Z)
 //! @yah:status(review)
 //! @yah:phase(P1)
 //! @yah:parent(R040)
 //! @yah:next("Template at .yah/cloud/cloud-init/mirror.yml; renderer substitutes YAH_WARDEN_BASE64 + HEADSCALE_PREAUTH_KEY + TAGS per machine")
 //! @yah:next("Hostkey generated ON the machine (ssh-keygen in cloud-init); private half never touches dev machines")
-//! @yah:next("Provision command polls cloud-init done, reads back hostkey fingerprint via yah-warden /identity, writes back to machine.toml")
+//! @yah:next("Provision command polls cloud-init done, reads back hostkey fingerprint via yah-yubaba /identity, writes back to machine.toml")
 //! @yah:next("Surface /var/log/cloud-init.log and /var/log/cloud-init-output.log on failure")
 //! @yah:verify("yah cloud machine provision noisetable-pdx-1 --dry-run prints rendered cloud-init YAML")
 //! @arch:see(architecture/PHASE_1_MIRROR_BOOTSTRAP.md)
-//! @yah:handoff("Cloud-init template + renderer + provision command landed. Template at .yah/cloud/cloud-init/mirror.yml (canonical) with embedded copy at crates/yah/cloud/templates/mirror.yml (drift-test in cloud_init::tests::embedded_template_matches_workspace_canonical). Renderer at crates/yah/cloud/src/cloud_init.rs substitutes {{KEY}} (no-spaces) for MACHINE_NAME, YAH_WARDEN_BASE64, HEADSCALE_PREAUTH_KEY, TAGS; doc comments use {{ KEY }} (with spaces) so they survive rendering. find_unsubstituted() trips on any unsubstituted real placeholder. Provision orchestrator at crates/yah/cloud/src/provision.rs decoupled from concrete provider (takes &dyn MachineProvider). CLI wired in app/yah/cli/src/cloud.rs: yah cloud machine provision <name> [--dry-run] [--warden <path>]; --dry-run with no flags uses placeholders for the warden binary + preauth key (with NOTE lines explaining); live path requires --warden + HEADSCALE_PREAUTH_KEY + HETZNER_API_TOKEN. 20 unit tests pass (8 new for cloud_init + provision). Vocab: per-node infra daemon is yah-warden (was yah-mirror-agent — renamed 2026-05-01 because mirror is a deployment, not a node).")
-//! @yah:next("A8 yah-warden /identity endpoint: poll cloud-init done after Hetzner accepts the create_server call, GET /identity for hostkey fingerprint, write back to .yah/cloud/machines/<name>.toml via MachineConfig::save(). Wiring stub already in handle_provision after rt.block_on — replace the next: print with the real poll loop.")
-//! @yah:next("Optional polish: surface /var/log/cloud-init.log + /var/log/cloud-init-output.log on cloud-init failure (probably via the yah-warden /diagnostics endpoint when A8 lands, since direct SSH from the dev machine isn't part of Phase 1).")
+//! @yah:handoff("Cloud-init template + renderer + provision command landed. Template at .yah/cloud/cloud-init/mirror.yml (canonical) with embedded copy at crates/yah/cloud/templates/mirror.yml (drift-test in cloud_init::tests::embedded_template_matches_workspace_canonical). Renderer at crates/yah/cloud/src/cloud_init.rs substitutes {{KEY}} (no-spaces) for MACHINE_NAME, YAH_WARDEN_BASE64, HEADSCALE_PREAUTH_KEY, TAGS; doc comments use {{ KEY }} (with spaces) so they survive rendering. find_unsubstituted() trips on any unsubstituted real placeholder. Provision orchestrator at crates/yah/cloud/src/provision.rs decoupled from concrete provider (takes &dyn MachineProvider). CLI wired in app/yah/cli/src/cloud.rs: yah cloud machine provision <name> [--dry-run] [--yubaba <path>]; --dry-run with no flags uses placeholders for the yubaba binary + preauth key (with NOTE lines explaining); live path requires --yubaba + HEADSCALE_PREAUTH_KEY + HETZNER_API_TOKEN. 20 unit tests pass (8 new for cloud_init + provision). Vocab: per-node infra daemon is yah-yubaba (was yah-mirror-agent — renamed 2026-05-01 because mirror is a deployment, not a node).")
+//! @yah:next("A8 yah-yubaba /identity endpoint: poll cloud-init done after Hetzner accepts the create_server call, GET /identity for hostkey fingerprint, write back to .yah/cloud/machines/<name>.toml via MachineConfig::save(). Wiring stub already in handle_provision after rt.block_on — replace the next: print with the real poll loop.")
+//! @yah:next("Optional polish: surface /var/log/cloud-init.log + /var/log/cloud-init-output.log on cloud-init failure (probably via the yah-yubaba /diagnostics endpoint when A8 lands, since direct SSH from the dev machine isn't part of Phase 1).")
 //!
 //! @yah:ticket(R040-T5, "A5: yah cloud machine status — drift report (declared vs Hetzner vs agent health)")
 //! @yah:at(2026-05-05T00:29:11Z)
@@ -62,7 +62,7 @@
 //! @yah:verify("Post-A6+A7+A8: all three report 'in sync'")
 //! @arch:see(architecture/PHASE_1_MIRROR_BOOTSTRAP.md)
 //! @yah:handoff("Drift module landed at crates/yah/cloud/src/status.rs (DriftFinding + MachineReport + collect_machine_report). MachineProvider trait gained find_server_by_name (GET /servers?name=) + bucket_exists (S3 HEAD) — Hetzner impls share a refactored sign_s3_empty_body helper for PUT/HEAD signing. CLI: `yah cloud machine status [name] [--quiet]` queries Hetzner, prints declared+live state with per-finding [drift]/[note ] tags, and bails non-zero on real drift unless --quiet. Soft findings (missing creds, A8-not-landed, bucket-uncheckable) are surfaced as notes only. Pre-A6 verify: smoke-tested against this workspace's noisetable-pdx-1 declaration with no token — reports 'unknown' + provider-error note, exit 0. 7 new drift unit tests pass via in-memory FakeProvider; 27 total pass in crates/yah/cloud.")
-//! @yah:next("A8 will plug in real agent-ping (yah-warden /health + /identity). The HostkeyFingerprintMismatch + AgentUnreachable variants are wired through the report rendering — A8 just needs to flip the AgentUnreachable emit-site in collect_machine_report() from the always-emit pre-A8 stub to a live probe.")
+//! @yah:next("A8 will plug in real agent-ping (yah-yubaba /health + /identity). The HostkeyFingerprintMismatch + AgentUnreachable variants are wired through the report rendering — A8 just needs to flip the AgentUnreachable emit-site in collect_machine_report() from the always-emit pre-A8 stub to a live probe.")
 //!
 //! @yah:ticket(R040-T6, "A6: provision noisetable-{pdx,iad,fsn}-1 (operational; yah dogfoods on noisetable's mirror, no yah-cloud SaaS)")
 //! @yah:at(2026-05-05T00:29:11Z)
@@ -81,7 +81,7 @@
 //! @yah:status(review)
 //! @yah:phase(P3)
 //! @yah:parent(R040)
-//! @yah:next("Resolves service configs + mirror declarations → per-machine compose.yml → push via yah-warden (A8) → systemctl restart yah-cloud-services")
+//! @yah:next("Resolves service configs + mirror declarations → per-machine compose.yml → push via yah-yubaba (A8) → systemctl restart yah-cloud-services")
 //! @yah:next("Tier isolation at SOFTWARE layer: separate PG roles per service set, distinct Headscale tags (tier:t0 yah meta vs tier:t2 noisetable assets), mesh_only flag controls Cloudflare exposure")
 //! @yah:next("Cloudflare DNS records (manual, in SECRETS.md): pdx.cloud.noisetable.example etc. → public IPs via orange-cloud")
 //! @yah:next("Gotcha: Cloudflare free tier proxies HTTP/HTTPS but NOT raw TCP/UDP — Headscale mesh uses direct WireGuard between machines")
@@ -91,26 +91,26 @@
 //! @yah:verify("curl https://pdx.cloud.yah.example/healthz (yah meta-directory) returns 200")
 //! @yah:verify("yah cloud service status --all — all green on all 3 machines")
 //! @arch:see(architecture/PHASE_1_MIRROR_BOOTSTRAP.md)
-//! @yah:handoff("Compose generation + warden service deploy + CLI wiring landed. New file: crates/yah/cloud/src/compose.rs (generate_compose_bundle: tier-named networks, Caddy service for mesh_only:false, Caddyfile with hostname when cloud_domain is set in mirrors/*.toml). MirrorConfig gained cloud_domain: Option<String>. Warden: replaced 501 stubs with real /services (podman compose ps --format json; empty array when no compose.yml) and /compose (write compose.yml + Caddyfile + write yah-cloud-services.service unit + systemctl enable --now). ServerState gained compose_dir: PathBuf (default /etc/yah-cloud) + with_compose_dir() builder. cloud-client: added ComposeDeployRequest / ComposeDeployResponse wire types + deploy_compose() method. CLI: yah cloud service deploy <name> resolves machines via mirror→service lookup, generates per-machine bundle (using location+cloud_domain as public hostname when available), and POSTs to each machine's warden. yah cloud service status [name|--all] queries /services on each machine and prints [+]/[-] per container. All tests pass: 18 warden, 47 cloud, 8 cloud-client, 120 yah bin.")
+//! @yah:handoff("Compose generation + yubaba service deploy + CLI wiring landed. New file: crates/yah/cloud/src/compose.rs (generate_compose_bundle: tier-named networks, Caddy service for mesh_only:false, Caddyfile with hostname when cloud_domain is set in mirrors/*.toml). MirrorConfig gained cloud_domain: Option<String>. Yubaba: replaced 501 stubs with real /services (podman compose ps --format json; empty array when no compose.yml) and /compose (write compose.yml + Caddyfile + write yah-cloud-services.service unit + systemctl enable --now). ServerState gained compose_dir: PathBuf (default /etc/yah-cloud) + with_compose_dir() builder. cloud-client: added ComposeDeployRequest / ComposeDeployResponse wire types + deploy_compose() method. CLI: yah cloud service deploy <name> resolves machines via mirror→service lookup, generates per-machine bundle (using location+cloud_domain as public hostname when available), and POSTs to each machine's yubaba. yah cloud service status [name|--all] queries /services on each machine and prints [+]/[-] per container. All tests pass: 18 yubaba, 47 cloud, 8 cloud-client, 120 yah bin.")
 //! @yah:next("Caddy in compose needs a Cloudflare origin cert or Let's Encrypt config once real domains land — Caddyfile currently uses :port placeholders which work for testing. Operator action: set cloud_domain in mirrors/<camp>.toml then re-run yah cloud service deploy to regenerate with real hostnames.")
 //! @yah:next("Cloudflare Tunnel integration (R040-F15): add a cloudflared service to the compose stack — currently services are exposed via Caddy on public ports 80/443 (orange-cloud model). F15 will replace with no-public-port cloudflared tunnel approach.")
 //! @yah:next("podman compose ps --format json output format varies by podman-compose version — current implementation passes raw JSON through. If operators hit parse issues, add a normalization layer in get_services() that extracts Name+State from both podman-compose and Podman 4.x native formats.")
 //! @yah:next("yah cloud service rolling <name> not yet implemented — stub left in place. Compose rolling restarts are just podman compose up --no-deps <svc>; wire it when rolling deploys are needed.")
 //!
-//! @yah:ticket(R040-F8, "A8: yah-warden (Rust binary on machine) + yah-cloud-client + desktop Cloud panel")
+//! @yah:ticket(R040-F8, "A8: yah-yubaba (Rust binary on machine) + yah-cloud-client + desktop Cloud panel")
 //! @yah:at(2026-05-05T00:29:11Z)
 //! @yah:status(review)
 //! @yah:phase(P3)
 //! @yah:parent(R040)
-//! @yah:verify("cargo test -p warden -p cloud -p cloud-client + cargo test -p yah --bin yah cloud:: — 18 + 47 + 9 + 17 tests pass")
-//! @yah:verify("cargo run -p warden -- serve --bind 127.0.0.1:7450 --state /tmp/i.json then curl POST /register-hostkey with a real ssh-ed25519 pubkey, then `yah cloud machine attach <machine> --host 127.0.0.1:7450 --wait 5 --path <camp>` prints `attached: <machine> (fingerprint recorded: SHA256:…)` and writes the line into .yah/cloud/machines/<name>.toml")
+//! @yah:verify("cargo test -p yubaba -p cloud -p cloud-client + cargo test -p yah --bin yah cloud:: — 18 + 47 + 9 + 17 tests pass")
+//! @yah:verify("cargo run -p yubaba -- serve --bind 127.0.0.1:7450 --state /tmp/i.json then curl POST /register-hostkey with a real ssh-ed25519 pubkey, then `yah cloud machine attach <machine> --host 127.0.0.1:7450 --wait 5 --path <camp>` prints `attached: <machine> (fingerprint recorded: SHA256:…)` and writes the line into .yah/cloud/machines/<name>.toml")
 //! @arch:see(architecture/PHASE_1_MIRROR_BOOTSTRAP.md)
 //! @arch:see(architecture/yah-managed-camps-topology.md)
-//! @yah:handoff("Session 3 landed `yah cloud machine attach <name>` (the hostkey write-back follow-on). app/yah/cli/src/cloud.rs::handle_attach loads MachineConfig, polls cloud-client GET /identity until success or --wait seconds elapse (default 180s, retry every 3s on NotRegistered or Transport errors), then calls MachineConfig::save() with the fingerprint. Decision logic in `decide_attach_action` covers all four states: Write (no fingerprint on file), Idempotent (match — no-op write), Mismatch (bail with --force hint), Overwrite (mismatch + --force). Subcommand args harmonized with agent ping: --host (default http://<machine>:7443), --wait <seconds>, --force, --path. handle_provision's stale stub print (`next: hostkey fingerprint write-back lands with A8`) replaced with `next: once cloud-init finishes, run yah cloud machine attach <name>`. End-to-end smoke verified all four AttachAction paths against a live warden on 127.0.0.1:7450 — pre-registration polling + bail, fresh-write, idempotent re-run, mismatch refusal, --force overwrite. 5 new unit tests (decide_attach_action_{writes_when_no_declared,idempotent_on_match,bails_on_mismatch_without_force,overwrites_with_force,force_is_idempotent_when_match}) — total 9 cloud:: tests in the yah bin. Cumulative R040-F8 deliverables across sessions 1–3: warden binary (12 tests), cloud-client crate (6 tests + doctest), AgentProbe trait + drift wire-up (4 new in cloud, 29 total), `yah cloud agent {ping,services,logs}` CLI, `yah cloud machine attach`, provision next-step hint correctly points at attach. Out of scope still: Tailscale-mesh discovery, desktop Cloud panel, mTLS hardening.")
+//! @yah:handoff("Session 3 landed `yah cloud machine attach <name>` (the hostkey write-back follow-on). app/yah/cli/src/cloud.rs::handle_attach loads MachineConfig, polls cloud-client GET /identity until success or --wait seconds elapse (default 180s, retry every 3s on NotRegistered or Transport errors), then calls MachineConfig::save() with the fingerprint. Decision logic in `decide_attach_action` covers all four states: Write (no fingerprint on file), Idempotent (match — no-op write), Mismatch (bail with --force hint), Overwrite (mismatch + --force). Subcommand args harmonized with agent ping: --host (default http://<machine>:7443), --wait <seconds>, --force, --path. handle_provision's stale stub print (`next: hostkey fingerprint write-back lands with A8`) replaced with `next: once cloud-init finishes, run yah cloud machine attach <name>`. End-to-end smoke verified all four AttachAction paths against a live yubaba on 127.0.0.1:7450 — pre-registration polling + bail, fresh-write, idempotent re-run, mismatch refusal, --force overwrite. 5 new unit tests (decide_attach_action_{writes_when_no_declared,idempotent_on_match,bails_on_mismatch_without_force,overwrites_with_force,force_is_idempotent_when_match}) — total 9 cloud:: tests in the yah bin. Cumulative R040-F8 deliverables across sessions 1–3: yubaba binary (12 tests), cloud-client crate (6 tests + doctest), AgentProbe trait + drift wire-up (4 new in cloud, 29 total), `yah cloud agent {ping,services,logs}` CLI, `yah cloud machine attach`, provision next-step hint correctly points at attach. Out of scope still: Tailscale-mesh discovery, desktop Cloud panel, mTLS hardening.")
 //! @yah:next("Tailscale-mesh discovery for --host: `yah cloud agent ping/services/attach` defaults to http://<machine>:7443 which only resolves inside the mesh. Smart discovery would query `tailscale status --json` for the machine's mesh IP. Until then, operators pass --host explicitly. Add a TS_DEVICES env shortcut or `yah cloud agent ip <machine>` helper if the manual path stays painful.")
 //! @yah:next("Desktop Cloud panel (out of session, larger): packages/yah/ui/src/cloud/ — machines list, per-machine service list, log tail. Tauri command bridges in app/yah/desktop/src/. Pulls on the cloud-client crate (already in workspace). Defer until at least Hostkey write-back lands so the panel has something useful to display per-machine.")
 //! @yah:next("Hardening parking lot (post-Phase-1): mTLS (server cert from machine hostkey, client cert from desktop user identity); /metrics endpoint (Prometheus); streaming /logs from journald with heartbeat. None of these gate Phase 1 verify; cloud-client's CloudClient::with_timeout exists so log streaming has a hook.")
-//! @yah:gotcha("warden binds 0.0.0.0:7443 by default; cloud-init template adds ufw rules to restrict to tailscale0. If a future deployment skips ufw, public IP exposure is a real risk. Better long-term: bind to tailscale0 IP directly (cloud-init systemd unit can compute it via `ip -4 addr show tailscale0`).")
+//! @yah:gotcha("yubaba binds 0.0.0.0:7443 by default; cloud-init template adds ufw rules to restrict to tailscale0. If a future deployment skips ufw, public IP exposure is a real risk. Better long-term: bind to tailscale0 IP directly (cloud-init systemd unit can compute it via `ip -4 addr show tailscale0`).")
 //! @yah:gotcha("Re-running register-hostkey with a different pubkey replaces the stored identity (idempotent for same key, swaps for different). Probably what you want, but worth flagging if someone designs an audit log around 'first registration wins'.")
 //! @yah:gotcha("Default URL resolution (`http://<machine.name>:7443`) is shared between WardenHealthProbe (status drift), agent ping/services, and machine attach — outside Tailscale mesh every default-host call against a real Hetzner machine will fail. Status emits AgentUnreachable as a soft note; agent/attach surface the transport error directly. Once mesh discovery lands, all three call sites should resolve via Tailscale before falling back to plain hostname.")
 //!
@@ -132,7 +132,7 @@
 //! @yah:verify("tailscale status on the new machine shows it connected via the camp's tunnel; node-to-node ping works")
 //! @arch:see(.yah/docs/architecture/A041-yah-mesh-bootstrap.md)
 //! @yah:handoff("Phase 1a landed. New files: crates/yah/cloud/src/mesh.rs (HeadscaleClient + generate_headscale_config + headscale_download_url + DEFAULT_ACL_POLICY), app/yah/cli/src/mesh.rs (yah mesh start/status/stop/backup-stub/restore-stub). cloud_init::RenderInput gained mesh_url: Option<String>; renderer substitutes {{MESH_LOGIN_SERVER_ARG}} → ' --login-server <url>' or '' depending on field. provision::build_request now takes mesh_url: Option<String>. template mirror.yml updated with MESH_LOGIN_SERVER_ARG placeholder. cloud.rs::handle_provision now reads mesh-url from vault/HEADSCALE_URL env; when set, calls HeadscaleClient::from_vault_or_env() to auto-generate a single-use preauth key (falls back to static headscale-preauth-key when no API key is available). yah mesh start downloads headscale binary from GitHub (HEADSCALE_VERSION=0.23.0), writes config.yaml + acls.yaml, creates default user, spawns headscale serve in background, saves PID, stores mesh-url in vault, prints DNS/tunnel operator instructions. yah mesh status shows PID, mesh-url, node count + per-node online status. yah mesh stop does SIGTERM+SIGKILL with 5s grace. Cloud crate: 36 tests pass (+4 new: render_with_mesh_url_adds_login_server, render_without_mesh_url_no_login_server, provision::build_request_with_mesh_url_adds_login_server, mesh::config_contains_server_url, mesh::config_all_paths_in_data_dir, mesh::download_url_current_platform). yah lib: 116 unit tests pass (+4 new mesh:: tests). arch dogfood integration tests are pre-existing failures unrelated to this work.")
-//! @yah:next("Operator runbook for Phase 1a: (1) run yah mesh start --url https://mesh.<domain> on the camp; (2) set up DNS + cloudflared (or direct port-forward) for that URL; (3) headscale apikeys create to get an API key; (4) yah keys set headscale-api-key; (5) yah cloud machine provision <name> --warden-url <URL> --warden <PATH> --path /Users/user/ss/noisetable — provision now auto-generates a preauth key from Headscale.")
+//! @yah:next("Operator runbook for Phase 1a: (1) run yah mesh start --url https://mesh.<domain> on the camp; (2) set up DNS + cloudflared (or direct port-forward) for that URL; (3) headscale apikeys create to get an API key; (4) yah keys set headscale-api-key; (5) yah cloud machine provision <name> --yubaba-url <URL> --yubaba <PATH> --path /Users/user/ss/noisetable — provision now auto-generates a preauth key from Headscale.")
 //! @yah:next("Phase 1b (R040-F19): yah mesh promote <machine> — migrates Headscale from camp to first cluster machine. The stable-URL contract from this ticket means no node reconfiguration is needed; only DNS re-points.")
 //! @yah:next("Cloudflared bundling (R040-F15): cloud-init template needs cloudflared install + token. yah mesh start should detect reachability and auto-configure cloudflared when --url points through a Cloudflare Tunnel. The operator-instruction path this session is the MVP fallback.")
 //! @yah:next("Headscale API key auto-generation: currently the operator must manually run headscale apikeys create. A future improvement: yah mesh start can use the local UNIX socket (headscale.sock) to generate the API key and store it in the vault automatically without needing the binary in PATH.")
@@ -144,27 +144,27 @@
 //! @yah:phase(P2)
 //! @yah:parent(R040)
 //! @yah:next("Implements Phase 1b from .yah/docs/architecture/A041-yah-mesh-bootstrap.md. Depends on R040-F18 (Phase 1a) shipping the stable-URL contract and camp Headscale.")
-//! @yah:next("Subcommand: yah mesh promote <machine-name>. Refuses if target machine isn't healthy (warden /health) or hostkey not registered.")
-//! @yah:next("Migration sequence: (1) stop Headscale on camp, (2) copy SQLite DB + config + private keys to target via warden, (3) start Headscale on target as a systemd unit warden manages, (4) update Cloudflare DNS A/AAAA for mesh.<your-domain> to point at target, (5) tear down camp Headscale + (if used) cloudflared.")
-//! @yah:next("Single-member raft is the degenerate case at this point — warden runs on the target, no quorum partners yet. Acceptable; HA shows up in Phase 2. Mark cluster as 'single-machine' in mesh status output so the operator knows the SPOF is real.")
+//! @yah:next("Subcommand: yah mesh promote <machine-name>. Refuses if target machine isn't healthy (yubaba /health) or hostkey not registered.")
+//! @yah:next("Migration sequence: (1) stop Headscale on camp, (2) copy SQLite DB + config + private keys to target via yubaba, (3) start Headscale on target as a systemd unit yubaba manages, (4) update Cloudflare DNS A/AAAA for mesh.<your-domain> to point at target, (5) tear down camp Headscale + (if used) cloudflared.")
+//! @yah:next("Single-member raft is the degenerate case at this point — yubaba runs on the target, no quorum partners yet. Acceptable; HA shows up in Phase 2. Mark cluster as 'single-machine' in mesh status output so the operator knows the SPOF is real.")
 //! @yah:next("Atomicity / failure recovery: keep a snapshot of camp Headscale state until target is verified serving traffic. yah mesh promote --abort restores the camp coordinator if the new target proves unhealthy mid-migration. Dry-run mode prints the plan without executing.")
 //! @yah:next("Brief control-plane outage (~10s) is expected during DNS cutover. Data plane (existing WireGuard tunnels) is unaffected — verify by leaving a node-to-node ping running across the migration.")
 //! @yah:next("Out of scope: litestream replication, openraft, multi-member promotion. All of that lands in R040-F20/F21.")
 //! @yah:verify("yah mesh promote noisetable-pdx-1 migrates the coordinator; yah mesh status shows the new location; yah cloud machine provision <new-machine> against the migrated coordinator joins successfully")
 //! @yah:verify("Existing nodes' tailnet connectivity uninterrupted across the migration (continuous ping from one node to another stays green)")
 //! @arch:see(.yah/docs/architecture/A041-yah-mesh-bootstrap.md)
-//! @yah:handoff("Phase 1b landed. New command: yah mesh promote <machine> [--dry-run] [--abort] [--host <URL>] [--path <dir>]. Migration sequence: (1) verify warden health + hostkey registered, (2) stop camp headscale, (3) POST SQLite DB + WireGuard keys + ACL policy to warden POST /headscale/deploy (warden downloads headscale binary from GitHub, writes files to configurable headscale_dir, starts systemd unit), (4) poll GET /headscale/health until running (90s timeout), (5) update Cloudflare DNS A record via CF API (CLOUDFLARE_API_TOKEN + CLOUDFLARE_ZONE_ID) or print manual instructions, (6) persist coordinator type to vault (mesh-coordinator-type=cluster, mesh-coordinator-machine=<name>). --abort restarts camp headscale from existing local state. Rollback on mid-migration failure auto-restarts camp headscale. yah mesh status updated: shows 'cluster [<machine>] (single-machine — SPOF)' after promote, camp PID status before. New warden endpoints: POST /headscale/deploy (accepts base64-encoded state files, writes to configurable headscale_dir, curl-downloads binary, systemctl enable --now), GET /headscale/health (systemctl is-active + localhost:8080 HTTP probe). ServerSummary gained public_ipv4: Option<String> (parsed from Hetzner public_net.ipv4.ip). Cloudflare DNS helper: update_cloudflare_dns() + cloudflare_credentials() in cloud::mesh. cloud-client: deploy_headscale() + headscale_health() methods. Tests: +8 warden (15 total), +2 cloud-client (9 total), +4 yah mesh:: (120 total). All pass.")
-//! @yah:next("Operator runbook: (1) yah mesh start --url https://mesh.<domain> on camp, (2) provision a machine, (3) yah cloud machine attach <name>, (4) yah mesh promote <name> [--host <warden-ip>:7443 pre-mesh]. DNS update needs CLOUDFLARE_API_TOKEN + CLOUDFLARE_ZONE_ID or manual update.")
+//! @yah:handoff("Phase 1b landed. New command: yah mesh promote <machine> [--dry-run] [--abort] [--host <URL>] [--path <dir>]. Migration sequence: (1) verify yubaba health + hostkey registered, (2) stop camp headscale, (3) POST SQLite DB + WireGuard keys + ACL policy to yubaba POST /headscale/deploy (yubaba downloads headscale binary from GitHub, writes files to configurable headscale_dir, starts systemd unit), (4) poll GET /headscale/health until running (90s timeout), (5) update Cloudflare DNS A record via CF API (CLOUDFLARE_API_TOKEN + CLOUDFLARE_ZONE_ID) or print manual instructions, (6) persist coordinator type to vault (mesh-coordinator-type=cluster, mesh-coordinator-machine=<name>). --abort restarts camp headscale from existing local state. Rollback on mid-migration failure auto-restarts camp headscale. yah mesh status updated: shows 'cluster [<machine>] (single-machine — SPOF)' after promote, camp PID status before. New yubaba endpoints: POST /headscale/deploy (accepts base64-encoded state files, writes to configurable headscale_dir, curl-downloads binary, systemctl enable --now), GET /headscale/health (systemctl is-active + localhost:8080 HTTP probe). ServerSummary gained public_ipv4: Option<String> (parsed from Hetzner public_net.ipv4.ip). Cloudflare DNS helper: update_cloudflare_dns() + cloudflare_credentials() in cloud::mesh. cloud-client: deploy_headscale() + headscale_health() methods. Tests: +8 yubaba (15 total), +2 cloud-client (9 total), +4 yah mesh:: (120 total). All pass.")
+//! @yah:next("Operator runbook: (1) yah mesh start --url https://mesh.<domain> on camp, (2) provision a machine, (3) yah cloud machine attach <name>, (4) yah mesh promote <name> [--host <yubaba-ip>:7443 pre-mesh]. DNS update needs CLOUDFLARE_API_TOKEN + CLOUDFLARE_ZONE_ID or manual update.")
 //! @yah:next("Mesh URL connectivity: before Tailscale mesh is up, --host must be the machine's public IP (pre-mesh access). Once mesh is established, the default http://<machine>:7443 works. Consider yah cloud agent ip <machine> helper or mesh-discovery to auto-resolve (same gap as R040-F8 Tailscale discovery).")
 //! @yah:next("HEADSCALE_VERSION is pinned to 0.23.0. If the operator's local headscale.db was created by a different version, the remote headscale may reject the database. Add a version-mismatch warning to the deploy step.")
 //!
-//! @yah:relay(R085, "Infra-info MCP — warden / machine / mirror status read surface")
+//! @yah:relay(R085, "Infra-info MCP — yubaba / machine / mirror status read surface")
 //! @yah:assignee(agent:claude)
 //! @yah:status(review)
 //! @yah:parent(Q082)
-//! @yah:handoff("Four read-only cloud.* MCP tools landed in crates/yah/agent-tools/src/cloud_tools.rs. Registration: KgToolRegistry::with_cloud() in tools.rs (same builder pattern as with_board/with_scryer/with_task). cloud-client dep added to agent-tools Cargo.toml. Local-config tools (cloud.machines, cloud.mirror_state) read .yah/cloud/{machines,mirrors,services}/*.toml from ctx.camp_root with lightweight serde structs — no cloud crate dep, no network. Network tools (cloud.warden_status, cloud.service_ports) probe warden HTTP API via cloud_client::CloudClient and return reachable:false rather than error when unreachable. 14 unit tests, all pass. Total agent-tools tests: 140.")
+//! @yah:handoff("Four read-only cloud.* MCP tools landed in crates/yah/agent-tools/src/cloud_tools.rs. Registration: KgToolRegistry::with_cloud() in tools.rs (same builder pattern as with_board/with_scryer/with_task). cloud-client dep added to agent-tools Cargo.toml. Local-config tools (cloud.machines, cloud.mirror_state) read .yah/cloud/{machines,mirrors,services}/*.toml from ctx.camp_root with lightweight serde structs — no cloud crate dep, no network. Network tools (cloud.warden_status, cloud.service_ports) probe yubaba HTTP API via cloud_client::CloudClient and return reachable:false rather than error when unreachable. 14 unit tests, all pass. Total agent-tools tests: 140.")
 //! @yah:next("Wire with_cloud() into the agent session startup (camp.rs or agent.rs in app/yah/cli) alongside with_board() and with_scryer() so the tools appear in the agent's tool list automatically.")
-//! @yah:next("Feed cloud.warden_status into the drift detection surface (status.rs AgentProbe) so warden reachability populates machine status reports rather than being a separate probe path.")
+//! @yah:next("Feed cloud.warden_status into the drift detection surface (status.rs AgentProbe) so yubaba reachability populates machine status reports rather than being a separate probe path.")
 //! @yah:verify("cargo test -p agent-tools -- cloud 2>&1 | grep 'test result' shows 14 passed; 0 failed")
 //! @yah:verify("KgToolRegistry::standard_read_only(ctx).with_cloud().schemas() returns 4 tools all named cloud.*")
 //! @arch:see(.yah/quests.md)
@@ -230,7 +230,7 @@ pub mod config;
 pub mod envoy;
 pub mod identities;
 // R374-F3: `local_runtime` + `provider::s3_sign` moved to the `local-driver`
-// crate so warden can own MinIO lifecycle without a reverse warden→cloud dep.
+// crate so yubaba can own MinIO lifecycle without a reverse yubaba→cloud dep.
 // `local_driver_glue` carries the cloud-config adapter that used to live as
 // `LocalContainerSpec::from_provider_config`.
 pub mod local_driver_glue;
@@ -243,13 +243,17 @@ pub mod reconciler;
 pub mod release_manifest;
 pub mod state;
 pub mod status;
+pub mod tenant;
 pub mod validate;
 
+pub use almanac_dispatch::dispatch_on_change;
+pub use asset_journal::{AssetState, AssetStatusEvent, AssetStatusJournal};
 pub use compose::{generate_compose_bundle, ComposeBundle};
 pub use config::{
-    BucketLogEntry, CloudConfig, LegacyMirrorConfig, LegacyServiceConfig, MachineConfig,
-    MirrorAssignment, MirrorConfig, MirrorProviderSlot, MirrorShape, Provider, ProviderConfig,
-    ServiceComponent, ServiceConfig, TopologyConfig, WorkloadConfig, WorkloadConfigError,
+    BucketLogEntry, CloudConfig, ConnectSpec, GitSource, LegacyMirrorConfig, LegacyServiceConfig,
+    MachineConfig, MirrorAssignment, MirrorConfig, MirrorProviderSlot, MirrorShape, Provider,
+    ProviderConfig, ServiceComponent, ServiceConfig, TopologyConfig, WorkloadConfig,
+    WorkloadConfigError,
 };
 pub use local_driver::{
     canonical_label, canonical_name, ContainerRunSpec, ContainerState, CustomDockerHostProvider,
@@ -270,14 +274,15 @@ pub use reconciler::{
     collect_live_derive_hashes, compute_derive_cache_candidates, compute_live_set,
     compute_prune_candidates, compute_service, derive_minio_key, execute_derive_cache_prune,
     execute_prune, load_service_and_mirror, mesofact_static::WORKER_SCRIPT, new_sync_id,
-    pond::MINIFLARE_SIM_SCRIPT,
-    publish_to_pond, summarize, CellStatus, CloudflareWorkerReconciler, DeriveCacheLiveHashes,
-    WireContainerStatus,
-    DerivePruneCandidate, DriftEntry, HealthState, LocalStaticOptions, MesofactStaticReconciler,
+    pond::MINIFLARE_SIM_SCRIPT, publish_to_pond, resolve_runner_machine, summarize, CellStatus,
+    CloudflareWorkerReconciler, DeriveCacheLiveHashes, DerivePruneCandidate, DriftEntry,
+    HealthState, LocalStaticOptions, MesofactRunnerReconciler, MesofactStaticReconciler,
     MirrorObservation, PondOptions, PondPublishReport, PondState, PruneCandidate, PruneOutcome,
-    PruneReport, ReconcileCtx, Reconciler, Runtime, RunningWorkload, RunningWorkloadSummary,
+    PruneReport, ReconcileCtx, Reconciler, RunningWorkload, RunningWorkloadSummary, Runtime,
     ServiceStatus, StaticAssetReconciler, StatusSummary, SyncHistoryEntry, SyncOutcome, SyncState,
+    WireContainerStatus,
 };
-pub use almanac_dispatch::dispatch_on_change;
-pub use asset_journal::{AssetState, AssetStatusEvent, AssetStatusJournal};
 pub use status::{collect_machine_report, AgentProbe, DriftFinding, MachineReport};
+pub use tenant::{
+    load_tenants, TenantBinding, TenantConfig, TenantError, TenantFeed, TenantOutput,
+};

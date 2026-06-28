@@ -1,23 +1,28 @@
 //! Pond SSR runtime container bring-up primitives (R434-F4).
 //!
 //! Mirrors the shape of [`crate::pond_minio`] for a long-lived
-//! `mesofact-static.ssr_runtime` companion container — the bun (or similar)
-//! Fetch-handler origin that miniflare proxies SSR-prefix requests to.
+//! `mesofact-static.ssr_runtime` companion container — the Fetch-handler
+//! origin that miniflare proxies SSR-prefix requests to. The canonical image
+//! is now `mesofact-serve` (deno_core, W174 pillar 4 / R449-F3,
+//! `oss/mesofact/Dockerfile.ssr-runtime`), which replaces the prior
+//! `oven/bun:1` + `bun run src/ssr.ts` runtime; the bring-up below stays
+//! image-agnostic, so the workload's `ssr_runtime.image` / `.command` select
+//! the runtime.
 //!
 //! The companion is declared in `workload.toml`'s
 //! `MesofactStaticWorkload.ssr_runtime: Option<WorkloadSpec>` (R256-F7).
 //! Camp lowers the workload spec into the simpler shape this module accepts —
-//! see [`SsrRuntimeSpec`] — and warden owns the lifecycle alongside MinIO
+//! see [`SsrRuntimeSpec`] — and yubaba owns the lifecycle alongside MinIO
 //! + miniflare (R374-F3 / R374-F4 pattern).
 //!
 //! Bring-up: pull image, run container with port mapping + env + optional
 //! bind mounts, wait for HTTP readiness on the host-mapped port. Used by:
 //!
-//! - `warden::pond::ssr_runtime::SsrRuntimeReconciler` — supervisor + restart
+//! - `yubaba::pond::ssr_runtime::SsrRuntimeReconciler` — supervisor + restart
 //!   loop that owns the running container, kept in sync with the rest of the
 //!   pond registry.
 //! - `cloud::reconciler::pond::up_pond` — eventual cloud-direct path; today
-//!   only the warden path consumes this (camp builds the spec then POSTs).
+//!   only the yubaba path consumes this (camp builds the spec then POSTs).
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -38,7 +43,7 @@ use crate::{ContainerRunSpec, LocalRuntime};
 pub const DEFAULT_SSR_CONTAINER_PORT: u16 = 3000;
 
 /// Caller-supplied SSR-runtime bring-up parameters. Decoupled from
-/// `WorkloadSpec` so warden's HTTP body stays narrow — camp lowers the full
+/// `WorkloadSpec` so yubaba's HTTP body stays narrow — camp lowers the full
 /// spec to this struct before POSTing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SsrRuntimeSpec {
@@ -192,7 +197,7 @@ pub async fn ensure_ssr_runtime_running(
 /// the bring-up primitive consumes.
 ///
 /// The mapping is intentionally narrow: most `WorkloadSpec` fields (mesh
-/// identity, raft, depends_on, secrets, resource limits) are warden-cloud
+/// identity, raft, depends_on, secrets, resource limits) are yubaba-cloud
 /// concerns that don't apply to a single host-side companion. We pull:
 ///
 /// - `image` → composed `"{registry}/{repository}:{tag}"`
@@ -273,7 +278,7 @@ fn compose_image_ref(image: &workload_spec::ImageRef) -> String {
 
 /// Lower a workload-spec `EnvVar` to a literal `(key, value)` pair. Only
 /// `Literal` variants are accepted at this seam — `FromSecret` and `FromMesh`
-/// rely on warden's secret store + mesh registry, neither of which is wired
+/// rely on yubaba's secret store + mesh registry, neither of which is wired
 /// for pond. Reject with a clear error so misconfiguration surfaces at
 /// spec-build time rather than as a confusing container-side failure.
 fn lower_env_var(var: &workload_spec::EnvVar) -> Result<(String, String)> {
@@ -293,7 +298,7 @@ fn lower_env_var(var: &workload_spec::EnvVar) -> Result<(String, String)> {
 }
 
 /// Lower a workload-spec `VolumeMount` to a (host_path, container_path) pair.
-/// Returns `None` for non-`Bind` variants — Named volumes are warden-managed
+/// Returns `None` for non-`Bind` variants — Named volumes are yubaba-managed
 /// and Tmpfs is in-memory; neither maps cleanly to a host-side bind mount.
 fn lower_volume_mount(
     mount: &workload_spec::VolumeMount,

@@ -138,11 +138,9 @@ pub fn check_alias_collisions(workspace_root: &Path) -> anyhow::Result<Vec<Alias
 /// Load the `[aliases]` block from a `workload.toml` that must be a
 /// `static-asset` kind. Returns an empty map for non-static-asset workloads
 /// (so the caller skips them silently).
-fn load_static_asset_aliases(
-    path: &Path,
-) -> anyhow::Result<BTreeMap<String, String>> {
-    let src = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+fn load_static_asset_aliases(path: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+    let src =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let workload: workload_spec::Workload =
         toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
     match workload {
@@ -194,7 +192,10 @@ mod tests {
         );
 
         let collisions = check_alias_collisions(root).unwrap();
-        assert!(collisions.is_empty(), "expected no collisions: {collisions:?}");
+        assert!(
+            collisions.is_empty(),
+            "expected no collisions: {collisions:?}"
+        );
     }
 
     #[test]
@@ -215,7 +216,11 @@ mod tests {
         );
 
         let collisions = check_alias_collisions(root).unwrap();
-        assert_eq!(collisions.len(), 1, "expected one collision: {collisions:?}");
+        assert_eq!(
+            collisions.len(),
+            1,
+            "expected one collision: {collisions:?}"
+        );
         let c = &collisions[0];
         assert_eq!(c.alias, "whisper-default-ggml");
         assert_eq!(c.first.service, "svc-a");

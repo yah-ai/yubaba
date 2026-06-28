@@ -95,21 +95,21 @@ use tracing::{debug, info, warn};
 use super::{ReconcileCtx, Reconciler, RunningWorkload};
 use crate::asset_journal::{AssetState, AssetStatusEvent, AssetStatusJournal};
 use crate::provider::cloudflare::CloudflareClient;
+use crate::reconciler::pond::DEFAULT_MINIO_PASSWORD;
+use crate::reconciler::pond::DEFAULT_MINIO_USER;
 use crate::reconciler::r2_publish::{
     R2_ACCESS_KEY_ENV, R2_ACCESS_KEY_SLOT, R2_SECRET_KEY_ENV, R2_SECRET_KEY_SLOT,
 };
-use crate::reconciler::pond::DEFAULT_MINIO_USER;
-use crate::reconciler::pond::DEFAULT_MINIO_PASSWORD;
 use crate::{MirrorProviderSlot, Provider};
 
 use local_driver::s3_sign::{sign_s3_empty_body, sign_s3_put_object};
-use task::transforms::{
+use velveteen::transforms::{
     substitute_argv, RecipeStep, TransformRecipe, TransformRecipeLoader, ENV_TRANSFORM_IN_0,
     ENV_TRANSFORM_OUT,
 };
-use task::{
-    ExecContext, ForgeCommand, ForgeExecutor, ForgeSpec, Initiator, LocalForgeDriver,
-    MeshAccess, TaskLocation, TaskPlacement,
+use velveteen::{
+    ExecContext, ForgeCommand, ForgeExecutor, ForgeSpec, Initiator, LocalForgeDriver, MeshAccess,
+    TaskLocation, TaskPlacement,
 };
 use workload_spec::validate::shape_static_asset;
 use workload_spec::{AssetEntry, FetchSource, Millis, StaticAssetWorkload, TransformSpec};
@@ -135,12 +135,51 @@ const CATALOG_MANIFEST_KEY: &str = "_yah-asset-catalog.json";
 /// `blake3` field as the lockfile's *output*, not its precondition — first
 /// publish or disaster-recovery hydration just works.
 #[allow(dead_code)] // referenced by tests + serves as documentation of the sentinel literal
-const ZERO_SENTINEL_HEX: &str =
-    "0000000000000000000000000000000000000000000000000000000000000000";
+const ZERO_SENTINEL_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// True when `hex` is the 64-zero "not pinned yet" sentinel for `BlakeHash`.
 fn is_bootstrap_sentinel(hex: &str) -> bool {
     hex.len() == 64 && hex.bytes().all(|b| b == b'0')
+}
+
+/// W209/F4: per-bootstrap output key on `$YAH_OUTPUTS`. The filename is
+/// included so multi-asset workloads round-trip — each asset's bind in the
+/// publish-assets pipeline TOML references its own key. Key shape:
+///   - `discovered_asset_blake3:<filename>` for post-transform output
+///   - `discovered_fetch_blake3:<filename>` for upstream content pin
+fn bootstrap_output_key(b: &BootstrappedHash) -> String {
+    let prefix = match b.kind {
+        BootstrapHashKind::Output => "discovered_asset_blake3",
+        BootstrapHashKind::Fetch => "discovered_fetch_blake3",
+        // W212/R518: the derivation key for the in-tree `[asset.derive.lock]`.
+        BootstrapHashKind::Input => "discovered_input_hash",
+    };
+    format!("{prefix}:{}", b.filename)
+}
+
+/// Append discovered BLAKE3 values to `$YAH_OUTPUTS` so the QED runner's
+/// per-step output collector picks them up after `yah cloud apply` returns
+/// (W209/F4). No-op outside a QED pipeline (env var unset).
+fn write_bootstrap_outputs(bootstrapped: &[BootstrappedHash]) -> std::io::Result<()> {
+    let Some(path) = std::env::var_os("YAH_OUTPUTS") else {
+        return Ok(());
+    };
+    append_bootstrap_outputs(Path::new(&path), bootstrapped)
+}
+
+/// Inner write — extracted so unit tests can exercise the format without
+/// racing on the `YAH_OUTPUTS` env var (cargo's parallel test runner makes
+/// process-wide env mutation unsafe).
+fn append_bootstrap_outputs(path: &Path, bootstrapped: &[BootstrappedHash]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    for b in bootstrapped {
+        writeln!(file, "{}={}", bootstrap_output_key(b), b.hash)?;
+    }
+    Ok(())
 }
 
 /// Where a discovered BLAKE3 belongs in `workload.toml` for paste-back.
@@ -150,6 +189,10 @@ pub enum BootstrapHashKind {
     Output,
     /// `[asset.derive.fetch].blake3` — upstream content pin.
     Fetch,
+    /// W212/R518: `[asset.derive.lock].input_hash` — the input-addressed
+    /// derivation key. Emitted on every successful transform build so the bind
+    /// path refreshes the lock whenever the inputs change.
+    Input,
 }
 
 /// One BLAKE3 value discovered during a bootstrap-mode apply.
@@ -250,10 +293,19 @@ impl Reconciler for StaticAssetReconciler {
         let service_name = ctx.service.name.as_str();
 
         let report = match slot {
-            MirrorProviderSlot::Reference { provider_id, fields }
-                if provider_id == "cloudflare" =>
-            {
-                sync_to_r2(&ctx, &workload, fields, self.executor.clone(), service_name, &journal).await?
+            MirrorProviderSlot::Reference {
+                provider_id,
+                fields,
+            } if provider_id == "cloudflare" => {
+                sync_to_r2(
+                    &ctx,
+                    &workload,
+                    fields,
+                    self.executor.clone(),
+                    service_name,
+                    &journal,
+                )
+                .await?
             }
             MirrorProviderSlot::Reference { provider_id, .. } => {
                 anyhow::bail!(
@@ -264,7 +316,17 @@ impl Reconciler for StaticAssetReconciler {
             MirrorProviderSlot::Inline {
                 kind: Provider::MinioContainer,
                 fields,
-            } => sync_to_minio(&ctx, &workload, fields, self.executor.clone(), service_name, &journal).await?,
+            } => {
+                sync_to_minio(
+                    &ctx,
+                    &workload,
+                    fields,
+                    self.executor.clone(),
+                    service_name,
+                    &journal,
+                )
+                .await?
+            }
             MirrorProviderSlot::Inline { kind, .. } => {
                 anyhow::bail!(
                     "providers.object_store.kind = {kind:?} not supported for static-asset \
@@ -294,30 +356,30 @@ impl Reconciler for StaticAssetReconciler {
             );
         }
 
-        // Surface bootstrap-mode discoveries prominently — operator pastes
-        // these into workload.toml to pin the catalog. Without this block they
-        // would scroll past in the verbose log; with it they're the last thing
-        // the operator sees before the success line.
+        // Surface bootstrap-mode discoveries as pipeline outputs (W209 §
+        // Migration #1). When this reconciler runs inside a QED step, the
+        // runner sets `$YAH_OUTPUTS` to a per-step KEY=VALUE sidechannel;
+        // discovered BLAKE3s flow into the run's OutputMap and feed any
+        // `[[bind]]` declarations in the publish-assets pipeline TOML — the
+        // applier writes them back into workload.toml mid-pipeline. Key
+        // shape encodes the asset filename so multi-asset workloads round-
+        // trip: `discovered_asset_blake3:<filename>=<hex>`.
         if !report.bootstrapped.is_empty() {
+            if let Err(err) = write_bootstrap_outputs(&report.bootstrapped) {
+                // A write failure shouldn't poison the apply — the operator
+                // still has the summary info! line below for triage.
+                warn!(error = %err, "failed to write discovered BLAKE3s to $YAH_OUTPUTS");
+            }
             info!(
                 count = report.bootstrapped.len(),
-                "bootstrap mode discovered {} BLAKE3 value(s) — paste into workload.toml to pin:",
+                discoveries = ?report
+                    .bootstrapped
+                    .iter()
+                    .map(|b| format!("{}={}", bootstrap_output_key(b), b.hash))
+                    .collect::<Vec<_>>(),
+                "discovered {} BLAKE3 value(s) — surfaced via $YAH_OUTPUTS for pipeline bind",
                 report.bootstrapped.len(),
             );
-            for b in &report.bootstrapped {
-                let target = match b.kind {
-                    BootstrapHashKind::Output => "[[asset]].blake3",
-                    BootstrapHashKind::Fetch => "[asset.derive.fetch].blake3",
-                };
-                info!(
-                    filename = %b.filename,
-                    target,
-                    hash = %b.hash,
-                    "  → {}  {target} = {:?}",
-                    b.filename,
-                    b.hash,
-                );
-            }
         }
 
         info!(
@@ -328,7 +390,11 @@ impl Reconciler for StaticAssetReconciler {
             "static-asset sync complete",
         );
 
-        Ok(RunningWorkload::adopted(WORKLOAD_KIND, "object_store", None))
+        Ok(RunningWorkload::adopted(
+            WORKLOAD_KIND,
+            "object_store",
+            None,
+        ))
     }
 }
 
@@ -345,7 +411,9 @@ async fn sync_to_r2(
     use crate::config::ProviderConfig;
 
     // Cloudflare provider config supplies account_id.
-    let provider_path = ctx.workspace_root.join(".yah/infra/providers/cloudflare.toml");
+    let provider_path = ctx
+        .workspace_root
+        .join(".yah/infra/providers/cloudflare.toml");
     let provider_cfg = ProviderConfig::load(&provider_path).with_context(|| {
         format!(
             "loading Cloudflare provider config — expected at {}",
@@ -356,23 +424,16 @@ async fn sync_to_r2(
         .fields
         .get("account_id")
         .and_then(|v| v.as_str())
-        .with_context(|| {
-            format!(
-                "{}: missing `account_id` field",
-                provider_path.display()
-            )
-        })?
+        .with_context(|| format!("{}: missing `account_id` field", provider_path.display()))?
         .to_string();
 
     let bucket = slot_fields
         .get("bucket")
         .and_then(|v| v.as_str())
-        .context(
-            "providers.object_store missing `bucket` field for cloudflare static-asset sync",
-        )?
+        .context("providers.object_store missing `bucket` field for cloudflare static-asset sync")?
         .to_string();
 
-    let access_key = keys::get_or_env(R2_ACCESS_KEY_SLOT, R2_ACCESS_KEY_ENV)
+    let access_key = fob::get_or_env(R2_ACCESS_KEY_SLOT, R2_ACCESS_KEY_ENV)
         .context("resolving R2 S3 access key")?
         .with_context(|| {
             format!(
@@ -380,7 +441,7 @@ async fn sync_to_r2(
                  or export {R2_ACCESS_KEY_ENV}"
             )
         })?;
-    let secret_key = keys::get_or_env(R2_SECRET_KEY_SLOT, R2_SECRET_KEY_ENV)
+    let secret_key = fob::get_or_env(R2_SECRET_KEY_SLOT, R2_SECRET_KEY_ENV)
         .context("resolving R2 S3 secret key")?
         .with_context(|| {
             format!(
@@ -422,8 +483,7 @@ async fn sync_to_minio(
     use super::slot_field_u16;
     use crate::reconciler::pond::DEFAULT_MINIO_API_PORT;
 
-    let api_port =
-        slot_field_u16(slot_fields, "api_port").unwrap_or(DEFAULT_MINIO_API_PORT);
+    let api_port = slot_field_u16(slot_fields, "api_port").unwrap_or(DEFAULT_MINIO_API_PORT);
     let bucket = slot_fields
         .get("bucket")
         .and_then(|v| v.as_str())
@@ -476,8 +536,11 @@ async fn sync_assets(
         load_catalog_manifest(client, endpoint, bucket, region, access_key, secret_key).await;
 
     // Catalog set for prune detection: current catalog filenames.
-    let current_filenames: std::collections::HashSet<&str> =
-        workload.assets.iter().map(|a| a.filename.as_str()).collect();
+    let current_filenames: std::collections::HashSet<&str> = workload
+        .assets
+        .iter()
+        .map(|a| a.filename.as_str())
+        .collect();
 
     // Prune candidates: filenames in the stored manifest but not in current catalog.
     for prior_key in prior_manifest.keys() {
@@ -490,29 +553,48 @@ async fn sync_assets(
     let mut new_manifest = CatalogManifest::new();
 
     for entry in &workload.assets {
+        // W212/R518: substituter fast-path. When the committed `[asset.derive.lock]`
+        // still matches the inputs recomputed from the current pins (purely
+        // local — no fetch) AND the bucket already holds the output, skip the
+        // entire build: no model download, no Docker transform, no PUT. This is
+        // the Nix-substituter / Bazel-remote-cache behaviour, backed by the
+        // checked-in lock as the action cache and R2 as the CAS.
+        if let Some(out_hash) = lock_skip_hash(entry, workspace_root).await {
+            let object_url = format!("{endpoint}/{bucket}/{}", entry.filename);
+            if object_exists(client, &object_url, region, access_key, secret_key).await? {
+                debug!(
+                    filename = %entry.filename,
+                    "derivation lock in sync + object present — skipping build",
+                );
+                report.already_synced.push(entry.filename.clone());
+                new_manifest.insert(entry.filename.clone(), out_hash);
+                continue;
+            }
+        }
+
         // R438-T15: derive-mode assets materialize to a content-addressed cache
         // path (W164); legacy `source = "..."` assets read straight from disk.
         // Both arms return a real on-disk path that the existing BLAKE3 verify +
         // S3 PUT loop below treats uniformly.
-        let materialized = materialize_asset(
-            entry,
-            workspace_root,
-            workload_dir,
-            executor.as_ref(),
-        )
-        .await
-        .with_context(|| format!("materializing asset {:?}", entry.filename))?;
+        let materialized =
+            materialize_asset(entry, workspace_root, workload_dir, executor.as_ref())
+                .await
+                .with_context(|| format!("materializing asset {:?}", entry.filename))?;
         let source_path = materialized.path;
         // Capture before the discovered_fetch_hash is moved out below.
         let fetch_was_bootstrap = materialized.discovered_fetch_hash.is_some();
+        // W212/R518: derivation key for this build — emitted below so the bind
+        // path refreshes `[asset.derive.lock].input_hash`.
+        let build_derive_key = materialized.derive_key.clone();
 
         // Surface any discovered upstream BLAKE3 (bootstrap mode for
-        // `[asset.derive.fetch].blake3`). Operator pastes it back.
+        // `[asset.derive.fetch].blake3`). Collected into `report.bootstrapped`
+        // and emitted to `$YAH_OUTPUTS` by the summary block in `up` (W209/F4).
         if let Some(hash) = materialized.discovered_fetch_hash {
-            info!(
+            debug!(
                 filename = %entry.filename,
                 discovered = %hash,
-                "bootstrap mode — paste into [asset.derive.fetch].blake3",
+                "bootstrap discovered upstream blake3",
             );
             report.bootstrapped.push(BootstrappedHash {
                 filename: entry.filename.clone(),
@@ -537,10 +619,10 @@ async fn sync_assets(
         // *verified against* (strict) or *discovered* (bootstrap).
         let actual_hash = blake3_hex(&body);
         if is_bootstrap_sentinel(&entry.blake3.0) {
-            info!(
+            debug!(
                 filename = %entry.filename,
                 discovered = %actual_hash,
-                "bootstrap mode — paste into [[asset]].blake3",
+                "bootstrap discovered asset blake3",
             );
             report.bootstrapped.push(BootstrappedHash {
                 filename: entry.filename.clone(),
@@ -555,15 +637,30 @@ async fn sync_assets(
                 "BLAKE3 mismatch — source file doesn't match declared hash",
             );
             report.hash_mismatch.push(entry.filename.clone());
-            journal.append(&AssetStatusEvent {
-                at: Utc::now(),
-                asset: format!("{service_name}:{}", entry.filename),
-                from: None,
-                to: AssetState::DriftBucket,
-                bytes: None,
-                blake3: None,
-            }).await;
+            journal
+                .append(&AssetStatusEvent {
+                    at: Utc::now(),
+                    asset: format!("{service_name}:{}", entry.filename),
+                    from: None,
+                    to: AssetState::DriftBucket,
+                    bytes: None,
+                    blake3: None,
+                })
+                .await;
             continue;
+        }
+
+        // W212/R518: a verified build emits its derivation key so the bind path
+        // refreshes `[asset.derive.lock].input_hash`. Paired with the output
+        // hash above, this records the action-cache entry the next run's
+        // substituter fast-path consults. Only emitted when a build actually
+        // ran (the lock-skip path `continue`d before reaching here).
+        if let Some(dk) = &build_derive_key {
+            report.bootstrapped.push(BootstrappedHash {
+                filename: entry.filename.clone(),
+                kind: BootstrapHashKind::Input,
+                hash: dk.clone(),
+            });
         }
 
         let key = &entry.filename;
@@ -616,14 +713,16 @@ async fn sync_assets(
         } else {
             AssetState::PinnedNotPublished
         };
-        journal.append(&AssetStatusEvent {
-            at: Utc::now(),
-            asset: format!("{service_name}:{key}"),
-            from: Some(from_state),
-            to: AssetState::Published,
-            bytes: Some(content_length as u64),
-            blake3: Some(actual_hash),
-        }).await;
+        journal
+            .append(&AssetStatusEvent {
+                at: Utc::now(),
+                asset: format!("{service_name}:{key}"),
+                from: Some(from_state),
+                to: AssetState::Published,
+                bytes: Some(content_length as u64),
+                blake3: Some(actual_hash),
+            })
+            .await;
     }
 
     // Save the updated manifest (non-fatal: data is already in the bucket).
@@ -659,6 +758,49 @@ struct MaterializedAsset {
     /// `[asset.derive.fetch].blake3`. `None` in strict mode and for legacy
     /// `source = "..."` assets.
     discovered_fetch_hash: Option<String>,
+    /// W212/R518: the input-addressed derivation key for this build, emitted to
+    /// `$YAH_OUTPUTS` so the bind path refreshes `[asset.derive.lock].input_hash`.
+    /// `None` for `source` / no-transform assets.
+    derive_key: Option<String>,
+}
+
+/// BLAKE3 of a transform recipe's TOML bytes — an input to the derivation key
+/// (W212). The file carries the pinned container digest, steps, and placement,
+/// so hashing it captures every recipe-side input in one value. `None` when the
+/// recipe file is unreadable (the caller treats that as "can't memoize").
+async fn recipe_blake3(workspace_root: &Path, recipe: &str) -> Option<String> {
+    let path = workspace_root
+        .join(".yah/qed/transforms")
+        .join(format!("{recipe}.toml"));
+    let bytes = tokio::fs::read(&path).await.ok()?;
+    Some(blake3_hex(&bytes))
+}
+
+/// W212/R518: the substituter fast-path. Returns `Some(output_hash)` when the
+/// asset's committed `[asset.derive.lock]` is *current* — i.e. the derivation
+/// key recomputed from the COMMITTED pins (no network) equals `lock.input_hash`
+/// and the lock describes the currently-pinned output. The caller still
+/// confirms the bytes exist in the bucket before skipping the build. Returns
+/// `None` (→ build normally) for source assets, no-transform assets, bootstrap
+/// rows, a missing lock, or any input drift.
+async fn lock_skip_hash(entry: &AssetEntry, workspace_root: &Path) -> Option<String> {
+    let derive = entry.derive.as_ref()?;
+    let transform = derive.transform.as_ref()?;
+    let lock = derive.lock.as_ref()?;
+    // A sentinel pin means nothing has been pinned yet → must build.
+    if is_bootstrap_sentinel(&entry.blake3.0) || is_bootstrap_sentinel(&derive.fetch.blake3.0) {
+        return None;
+    }
+    // The lock must describe the currently-pinned output, else it's stale.
+    if !hashes_equal(&lock.output_blake3, &entry.blake3.0) {
+        return None;
+    }
+    // Recompute the derivation key from the committed pins — purely local, no
+    // fetch. The fetch pin is the declared input identity (a fixed-output
+    // derivation), so in strict mode it equals the bytes that fed the build.
+    let recipe_bk = recipe_blake3(workspace_root, &transform.recipe).await?;
+    let key = derivation_key(&derive.fetch.blake3.0, &recipe_bk, &transform.params);
+    (key == lock.input_hash).then(|| entry.blake3.0.clone())
 }
 
 /// Resolve an `[[asset]]` row to an on-disk path the upload loop can read.
@@ -690,23 +832,26 @@ async fn materialize_asset(
         return Ok(MaterializedAsset {
             path: workload_dir.join(source_rel),
             discovered_fetch_hash: None,
+            derive_key: None,
         });
     }
 
-    let derive = entry.derive.as_ref().expect(
-        "AssetEntry shape: exactly one of source/derive must be set (shape_static_asset)",
-    );
+    let derive = entry
+        .derive
+        .as_ref()
+        .expect("AssetEntry shape: exactly one of source/derive must be set (shape_static_asset)");
 
     let cache_root = workspace_root.join(".yah/cache/derive");
     let fetch_bootstrap = is_bootstrap_sentinel(&derive.fetch.blake3.0);
     let (fetched_path, fetched_hash) =
         materialize_fetch(&derive.fetch, &cache_root.join("fetch")).await?;
-    let discovered_fetch_hash = fetch_bootstrap.then_some(fetched_hash);
+    let discovered_fetch_hash = fetch_bootstrap.then(|| fetched_hash.clone());
 
     let path = if let Some(transform) = &derive.transform {
         materialize_transform(
             transform,
             &fetched_path,
+            &fetched_hash,
             &entry.blake3.0,
             &cache_root.join("transform"),
             workspace_root,
@@ -721,9 +866,20 @@ async fn materialize_asset(
         fetched_path
     };
 
+    // W212/R518: derivation key for this build — the same value the local action
+    // cache used (fetched-input hash ⊕ recipe-file hash ⊕ params). Surfaced so
+    // the bind path can refresh `[asset.derive.lock].input_hash`.
+    let derive_key = match &derive.transform {
+        Some(transform) => recipe_blake3(workspace_root, &transform.recipe)
+            .await
+            .map(|rb| derivation_key(&fetched_hash, &rb, &transform.params)),
+        None => None,
+    };
+
     Ok(MaterializedAsset {
         path,
         discovered_fetch_hash,
+        derive_key,
     })
 }
 
@@ -774,15 +930,12 @@ enum FetchOnceFail {
 ///   already-received bytes.
 /// - **Progress logging** — `info!()` every 100 MiB surfaces download progress
 ///   through the task-pane / QED log surface (W164 OQ#4).
-async fn materialize_fetch(
-    fetch: &FetchSource,
-    cache_dir: &Path,
-) -> Result<(PathBuf, String)> {
+async fn materialize_fetch(fetch: &FetchSource, cache_dir: &Path) -> Result<(PathBuf, String)> {
     let bootstrap = is_bootstrap_sentinel(&fetch.blake3.0);
 
-    tokio::fs::create_dir_all(cache_dir).await.with_context(|| {
-        format!("creating fetch cache dir {}", cache_dir.display())
-    })?;
+    tokio::fs::create_dir_all(cache_dir)
+        .await
+        .with_context(|| format!("creating fetch cache dir {}", cache_dir.display()))?;
 
     // Cache HIT — only meaningful when we know the expected hash. Bootstrap
     // mode has no stable cache key to look up; it always re-downloads on the
@@ -791,13 +944,15 @@ async fn materialize_fetch(
     if !bootstrap {
         let cache_path = cache_dir.join(format!("{}.bin", fetch.blake3.0));
         if tokio::fs::try_exists(&cache_path).await.unwrap_or(false) {
-            verify_blake3_path(&cache_path, &fetch.blake3.0).await.with_context(|| {
-                format!(
-                    "fetch cache HIT for {} but bytes don't match pinned BLAKE3 — \
+            verify_blake3_path(&cache_path, &fetch.blake3.0)
+                .await
+                .with_context(|| {
+                    format!(
+                        "fetch cache HIT for {} but bytes don't match pinned BLAKE3 — \
                      rm the cache entry or fix the pin",
-                    cache_path.display()
-                )
-            })?;
+                        cache_path.display()
+                    )
+                })?;
             debug!(url = %fetch.url, "fetch cache HIT");
             return Ok((cache_path, fetch.blake3.0.clone()));
         }
@@ -836,9 +991,9 @@ async fn materialize_fetch(
                 // Compute hash once — used for verify (strict) and cache
                 // naming (both modes; bootstrap mode names by the discovered
                 // value rather than the zero placeholder).
-                let bytes = tokio::fs::read(&partial_path).await.with_context(|| {
-                    format!("reading {} for BLAKE3", partial_path.display())
-                })?;
+                let bytes = tokio::fs::read(&partial_path)
+                    .await
+                    .with_context(|| format!("reading {} for BLAKE3", partial_path.display()))?;
                 let actual = blake3_hex(&bytes);
                 drop(bytes);
 
@@ -877,8 +1032,12 @@ async fn materialize_fetch(
         }
     }
 
-    Err(last_err)
-        .with_context(|| format!("GET {} failed after {FETCH_MAX_ATTEMPTS} attempts", fetch.url))
+    Err(last_err).with_context(|| {
+        format!(
+            "GET {} failed after {FETCH_MAX_ATTEMPTS} attempts",
+            fetch.url
+        )
+    })
 }
 
 /// Single download attempt: GET `url` (with `Range` if `partial_path` is non-empty),
@@ -951,13 +1110,14 @@ async fn fetch_once(
         .open(partial_path)
         .await
         .map_err(|e| {
-            FetchOnceFail::Transient(anyhow::anyhow!(
-                "opening {}: {e}",
-                partial_path.display()
-            ))
+            FetchOnceFail::Transient(anyhow::anyhow!("opening {}: {e}", partial_path.display()))
         })?;
 
-    let mut downloaded = if is_partial_response { resume_offset.unwrap_or(0) } else { 0 };
+    let mut downloaded = if is_partial_response {
+        resume_offset.unwrap_or(0)
+    } else {
+        0
+    };
     let mut resp = resp;
     loop {
         match resp.chunk().await {
@@ -1000,9 +1160,73 @@ async fn fetch_once(
 /// zero sentinel) the actual hash is accepted as-is and named accordingly.
 /// Cache HIT (file present + hash matches) skips recipe execution; bootstrap
 /// mode has no stable cache key and always re-runs the recipe.
+/// W212 schema version for the derivation key. Bump when the *way* we hash or
+/// lower inputs changes (not when an individual recipe changes — that's
+/// captured by the recipe-file hash). A bump invalidates every action-cache
+/// entry, forcing a clean rebuild under the new keying.
+const DERIVE_KEY_SCHEMA: u32 = 1;
+
+/// Compute the input-addressed action-cache key for a derive-mode transform
+/// (W212). A pure function of the complete declared input set:
+///
+/// - `input_hash` — BLAKE3 of the fetched transform input (the fixed-output /
+///   version anchor; for whisper this is `config.json`, which the model's repo
+///   version tracks).
+/// - `recipe_blake3` — BLAKE3 of the recipe TOML bytes. The file carries the
+///   pinned container digest, the steps, and the placement, so hashing it
+///   covers all three: a digest bump or a step edit flips the key.
+/// - `params` — the workload-side invocation params (`BTreeMap` is already
+///   sorted, so the encoding is deterministic).
+///
+/// **Hermeticity invariant:** every input that can change the output bytes MUST
+/// feed this key. A missing dimension reintroduces the W164/R438 silent-stale
+/// cache bug. The per-dimension unit test guards this.
+fn derivation_key(
+    input_hash: &str,
+    recipe_blake3: &str,
+    params: &BTreeMap<String, String>,
+) -> String {
+    let mut buf = String::new();
+    buf.push_str(&format!("derive-key-v{DERIVE_KEY_SCHEMA}\n"));
+    buf.push_str(&format!("input={input_hash}\n"));
+    buf.push_str(&format!("recipe={recipe_blake3}\n"));
+    for (k, v) in params {
+        buf.push_str(&format!("param.{k}={v}\n"));
+    }
+    blake3_hex(buf.as_bytes())
+}
+
+/// Read a recorded action-cache output hash, if present. A missing or
+/// unreadable / empty entry is a cache miss, never an error.
+async fn read_action_cache(ac_path: &Path) -> Option<String> {
+    let raw = tokio::fs::read_to_string(ac_path).await.ok()?;
+    let hash = raw.trim();
+    (!hash.is_empty()).then(|| hash.to_string())
+}
+
+/// Record an action-cache entry (`derive_key → output hash`). Written
+/// atomically via tmp + rename so a crashed run never leaves a half-written
+/// entry a later run would trust.
+async fn write_action_cache(ac_path: &Path, output_hash: &str) -> Result<()> {
+    if let Some(parent) = ac_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating action-cache dir {}", parent.display()))?;
+    }
+    let tmp = ac_path.with_extension("out.tmp");
+    tokio::fs::write(&tmp, format!("{output_hash}\n"))
+        .await
+        .with_context(|| format!("writing action-cache tmp {}", tmp.display()))?;
+    tokio::fs::rename(&tmp, ac_path)
+        .await
+        .with_context(|| format!("promoting action-cache entry {}", ac_path.display()))?;
+    Ok(())
+}
+
 async fn materialize_transform(
     transform: &TransformSpec,
     input_path: &Path,
+    input_hash: &str,
     output_blake3: &str,
     cache_dir: &Path,
     workspace_root: &Path,
@@ -1010,30 +1234,17 @@ async fn materialize_transform(
 ) -> Result<PathBuf> {
     let bootstrap = is_bootstrap_sentinel(output_blake3);
 
-    tokio::fs::create_dir_all(cache_dir).await.with_context(|| {
-        format!("creating transform cache dir {}", cache_dir.display())
-    })?;
+    tokio::fs::create_dir_all(cache_dir)
+        .await
+        .with_context(|| format!("creating transform cache dir {}", cache_dir.display()))?;
 
-    // Cache HIT — strict mode only. The bootstrap sentinel ("0000...") would
-    // collide across every bootstrap row; once the operator pins the discovered
-    // value, subsequent runs hit this path normally.
-    if !bootstrap {
-        let cache_path = cache_dir.join(format!("{output_blake3}.bin"));
-        if tokio::fs::try_exists(&cache_path).await.unwrap_or(false) {
-            verify_blake3_path(&cache_path, output_blake3).await.with_context(|| {
-                format!(
-                    "transform cache HIT for {} but bytes don't match pinned BLAKE3 — \
-                     rm the cache entry or fix the pin",
-                    cache_path.display()
-                )
-            })?;
-            debug!(recipe = %transform.recipe, "transform cache HIT");
-            return Ok(cache_path);
-        }
-    }
-
+    // Load + hash the recipe up front: the recipe TOML's bytes are an INPUT to
+    // the derivation key (W212), so the key — and therefore the cache decision —
+    // depends on them. The file carries the pinned container digest, steps, and
+    // placement, so a change to any of those flips the key and forces a rebuild.
     let transforms_dir = workspace_root.join(".yah/qed/transforms");
     let loader = TransformRecipeLoader::new(&transforms_dir);
+    let recipe_path = loader.recipe_path(&transform.recipe);
     let recipe = loader.load(&transform.recipe).with_context(|| {
         format!(
             "loading recipe {:?} from {}",
@@ -1041,25 +1252,43 @@ async fn materialize_transform(
             transforms_dir.display()
         )
     })?;
+    let recipe_bytes = tokio::fs::read(&recipe_path).await.with_context(|| {
+        format!(
+            "reading recipe {} for derivation key",
+            recipe_path.display()
+        )
+    })?;
+    let recipe_blake3 = blake3_hex(&recipe_bytes);
 
-    // Recipe writes to a tmp path inside `cache_dir` so a container-runtime
-    // step running under the workspace_root bind-mount can actually see it
-    // (an OS-temp path like /var/folders/... is invisible to the container).
-    // Rename into the final cache path only after BLAKE3 verification.
-    //
-    // In bootstrap mode the expected hash is the zero sentinel — using it as
-    // the tmp name would collide across every bootstrap row. Discriminate by
-    // recipe + input-path hash instead so concurrent bootstrap entries don't
-    // overwrite each other's tmp files.
-    let tmp_output = if bootstrap {
-        cache_dir.join(format!(
-            "bootstrap-{}-{}.tmp",
-            transform.recipe,
-            blake3_hex(input_path.to_string_lossy().as_bytes()),
-        ))
-    } else {
-        cache_dir.join(format!("{output_blake3}.tmp"))
-    };
+    // W212: input-addressed action cache. The skip decision is a pure function
+    // of the declared INPUTS (fetched input content ⊕ recipe definition ⊕
+    // invocation params ⊕ lowering-schema version), not of the expected output
+    // hash. A recipe / digest / param change flips `derive_key` → guaranteed
+    // miss → rebuild, eliminating the warm-cache silent-stale skip (the
+    // W164/R438 defect this fixes). Applies in bootstrap mode too: identical
+    // inputs surface the recorded output without re-running.
+    let derive_key = derivation_key(input_hash, &recipe_blake3, &transform.params);
+    let ac_path = cache_dir.join("ac").join(format!("{derive_key}.out"));
+
+    if let Some(recorded) = read_action_cache(&ac_path).await {
+        let cas_path = cache_dir.join(format!("{recorded}.bin"));
+        if tokio::fs::try_exists(&cas_path).await.unwrap_or(false)
+            && verify_blake3_path(&cas_path, &recorded).await.is_ok()
+        {
+            // The output pin (`entry.blake3`) is still enforced downstream by
+            // the upload loop's strict BLAKE3 verify, so a pin that has drifted
+            // from the inputs surfaces there even though we skip the transform.
+            debug!(recipe = %recipe.name, derive_key, "derivation cache HIT — skipping transform");
+            return Ok(cas_path);
+        }
+        // AC entry present but the CAS bytes are gone / corrupt → fall through
+        // and re-materialise (the AC records what the output should be; the CAS
+        // lost the bytes).
+    }
+
+    // Tmp output is named by the derivation key — unique per input set, so
+    // concurrent rows (and zero-sentinel bootstrap rows) never collide on it.
+    let tmp_output = cache_dir.join(format!("{derive_key}.tmp"));
 
     // Absolute workspace_root for the container bind-mount — docker rejects
     // `-w .` ("the working directory '.' is invalid"). Callers may pass a
@@ -1100,12 +1329,10 @@ async fn materialize_transform(
         if let Some(platform) = &recipe.placement.platform {
             ctx = ctx.with_platform(platform.clone());
         }
-        let outcome = executor.execute(spec, ctx, None).await.with_context(|| {
-            format!(
-                "executing recipe {:?} step {:?}",
-                recipe.name, step.name
-            )
-        })?;
+        let outcome = executor
+            .execute(spec, ctx, None)
+            .await
+            .with_context(|| format!("executing recipe {:?} step {:?}", recipe.name, step.name))?;
         if !outcome.succeeded() {
             anyhow::bail!(
                 "recipe {:?} step {:?} failed ({}): {}",
@@ -1140,9 +1367,21 @@ async fn materialize_transform(
 
     // tmp_output already lives in cache_dir — atomic publish is one rename.
     let cache_path = cache_dir.join(format!("{actual}.bin"));
-    tokio::fs::rename(&tmp_output, &cache_path).await.with_context(|| {
-        format!("renaming {} → {}", tmp_output.display(), cache_path.display())
-    })?;
+    tokio::fs::rename(&tmp_output, &cache_path)
+        .await
+        .with_context(|| {
+            format!(
+                "renaming {} → {}",
+                tmp_output.display(),
+                cache_path.display()
+            )
+        })?;
+
+    // W212: record the action-cache entry (derive_key → output hash) so the
+    // next run with identical inputs skips this transform entirely.
+    write_action_cache(&ac_path, &actual)
+        .await
+        .with_context(|| format!("recording action-cache entry {}", ac_path.display()))?;
 
     if bootstrap {
         info!(
@@ -1334,7 +1573,7 @@ fn content_type_for(path: &Path) -> &'static str {
 /// against a static-asset mirror provision its bucket without an out-of-band
 /// dashboard step.
 async fn ensure_r2_bucket(account_id: &str, bucket_name: &str) -> Result<()> {
-    let api_token = keys::get_or_env("cloudflare-api-token", "CLOUDFLARE_API_TOKEN")
+    let api_token = fob::get_or_env("cloudflare-api-token", "CLOUDFLARE_API_TOKEN")
         .context("resolving cloudflare-api-token")?
         .context(
             "cloudflare-api-token not found — set via `yah keys set cloudflare-api-token` \
@@ -1360,8 +1599,8 @@ async fn ensure_r2_bucket(account_id: &str, bucket_name: &str) -> Result<()> {
 
 fn load_workload(workload_dir: &Path) -> Result<StaticAssetWorkload> {
     let path = workload_dir.join("workload.toml");
-    let src = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let src =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     // Parse through the Workload envelope to validate the `kind` field.
     let envelope: workload_spec::Workload =
         toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
@@ -1436,6 +1675,7 @@ mod tests {
                 role: "assets".to_string(),
                 publishes: None,
                 wave: 0,
+                git: None,
             };
             Self {
                 _workspace: workspace,
@@ -1484,7 +1724,10 @@ schema_version = "V1"
     fn minio_slot() -> MirrorProviderSlot {
         let mut fields = BTreeMap::new();
         fields.insert("api_port".to_string(), toml::Value::Integer(9000));
-        fields.insert("bucket".to_string(), toml::Value::String("yah-dev".to_string()));
+        fields.insert(
+            "bucket".to_string(),
+            toml::Value::String("yah-dev".to_string()),
+        );
         MirrorProviderSlot::Inline {
             kind: Provider::MinioContainer,
             fields,
@@ -1499,8 +1742,8 @@ schema_version = "V1"
 
     // ── Mock executor for W164 materialize-transform tests ────────────────────
 
-    use task::executor::{ExecEvent, ExecOutcome, ForgeExecutorError};
-    use task::ForgeStatus;
+    use velveteen::executor::{ExecEvent, ExecOutcome, ForgeExecutorError};
+    use velveteen::ForgeStatus;
     use tokio::sync::mpsc::UnboundedSender;
     use tokio::sync::Mutex;
 
@@ -1545,7 +1788,10 @@ schema_version = "V1"
             *self.invocations.lock().await += 1;
             if let Some(reason) = &self.fail_with {
                 return Ok(ExecOutcome {
-                    status: ForgeStatus::Done { exit_code: 1, ended_at: 0 },
+                    status: ForgeStatus::Done {
+                        exit_code: 1,
+                        ended_at: 0,
+                    },
                     stderr_tail: reason.clone(),
                 });
             }
@@ -1561,15 +1807,15 @@ schema_version = "V1"
             // tmp output path verbatim. materialize_transform writes to
             // `<cache_dir>/<output_blake3>.tmp` (then renames to .bin on hash
             // match), so the output element is the one ending in `.tmp`.
-            let out_path = argv
-                .iter()
-                .find(|a| a.ends_with(".tmp"))
-                .ok_or(ForgeExecutorError::Unsupported(
-                    "mock recipe must pass a .tmp output path",
-                ))?;
+            let out_path = argv.iter().find(|a| a.ends_with(".tmp")).ok_or(
+                ForgeExecutorError::Unsupported("mock recipe must pass a .tmp output path"),
+            )?;
             std::fs::write(out_path, &self.out_bytes).map_err(ForgeExecutorError::Io)?;
             Ok(ExecOutcome {
-                status: ForgeStatus::Done { exit_code: 0, ended_at: 0 },
+                status: ForgeStatus::Done {
+                    exit_code: 0,
+                    ended_at: 0,
+                },
                 stderr_tail: String::new(),
             })
         }
@@ -1586,6 +1832,30 @@ schema_version = "V1"
 name  = "{name}"
 label = "test recipe"
 image = "ghcr.io/test/tool:v1@sha256:{HASH_64}"
+
+[placement]
+location = "local"
+runtime  = "container"
+
+[[steps]]
+name = "transform"
+argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
+"#
+        );
+        std::fs::write(transforms_dir.join(format!("{name}.toml")), toml).unwrap();
+    }
+
+    /// Like [`write_recipe`] but with a caller-chosen container digest, so a
+    /// test can simulate a digest bump (which must invalidate the W212 action
+    /// cache and force a re-run).
+    fn write_recipe_with_digest(workspace_root: &Path, name: &str, digest: &str) {
+        let transforms_dir = workspace_root.join(".yah/qed/transforms");
+        std::fs::create_dir_all(&transforms_dir).unwrap();
+        let toml = format!(
+            r#"
+name  = "{name}"
+label = "test recipe"
+image = "ghcr.io/test/tool:v1@sha256:{digest}"
 
 [placement]
 location = "local"
@@ -1830,8 +2100,11 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
 
         // We can't inject a prior manifest without a real/mock server, but we
         // can verify the prune detection logic directly.
-        let current_filenames: std::collections::HashSet<&str> =
-            workload.assets.iter().map(|a| a.filename.as_str()).collect();
+        let current_filenames: std::collections::HashSet<&str> = workload
+            .assets
+            .iter()
+            .map(|a| a.filename.as_str())
+            .collect();
         let prior: CatalogManifest = [("old.bin".to_string(), HASH_64.to_string())]
             .into_iter()
             .collect();
@@ -1967,7 +2240,10 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
             .await
             .expect_err("BLAKE3 mismatch must surface as hard error");
         let msg = format!("{err:#}");
-        assert!(msg.contains("BLAKE3") || msg.contains(&actual_hash), "got: {msg}");
+        assert!(
+            msg.contains("BLAKE3") || msg.contains(&actual_hash),
+            "got: {msg}"
+        );
         assert!(msg.contains(pinned_hash), "diff must mention pin: {msg}");
     }
 
@@ -2010,7 +2286,10 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
         };
         let cache_dir = fx.workspace_root.join(".yah/cache/derive/fetch");
         let (path, _hash) = materialize_fetch(&fetch, &cache_dir).await.unwrap();
-        assert!(path.exists(), "cache file must exist after successful retry");
+        assert!(
+            path.exists(),
+            "cache file must exist after successful retry"
+        );
         assert_eq!(
             counter.load(std::sync::atomic::Ordering::SeqCst),
             2,
@@ -2037,7 +2316,9 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
         let cache_dir = fx.workspace_root.join(".yah/cache/derive/fetch");
         tokio::fs::create_dir_all(&cache_dir).await.unwrap();
         let partial_path = cache_dir.join(format!("{hash}.partial"));
-        tokio::fs::write(&partial_path, &body[..half]).await.unwrap();
+        tokio::fs::write(&partial_path, &body[..half])
+            .await
+            .unwrap();
 
         let body_c = body.clone();
         let received_range: Arc<std::sync::Mutex<Option<String>>> =
@@ -2128,6 +2409,7 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
         let p1 = materialize_transform(
             &transform,
             &fetch_path,
+            &blake3_hex(b"fetch bytes"),
             &out_hash,
             &cache_dir,
             &fx.workspace_root,
@@ -2142,6 +2424,7 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
         let p2 = materialize_transform(
             &transform,
             &fetch_path,
+            &blake3_hex(b"fetch bytes"),
             &out_hash,
             &cache_dir,
             &fx.workspace_root,
@@ -2151,6 +2434,217 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
         .unwrap();
         assert_eq!(p1, p2);
         assert_eq!(*invocations.lock().await, 1, "cache HIT must not re-run");
+    }
+
+    /// W212/R518: the derivation key is hermetic — every declared input
+    /// dimension flips it, and identical inputs reproduce it. This is the
+    /// correctness invariant that makes the silent-stale-cache bug impossible:
+    /// a missing dimension would let two distinct inputs collide on one key.
+    #[test]
+    fn derivation_key_is_hermetic_over_every_input_dimension() {
+        let input = "a".repeat(64);
+        let recipe = "b".repeat(64);
+        let mut params = BTreeMap::new();
+        params.insert("quant".to_string(), "q5_1".to_string());
+
+        let base = derivation_key(&input, &recipe, &params);
+
+        // Fetched-input content (the model/version anchor) flips it.
+        assert_ne!(base, derivation_key(&"c".repeat(64), &recipe, &params));
+        // Recipe-file bytes (steps / pinned container digest / placement) flip it.
+        assert_ne!(base, derivation_key(&input, &"d".repeat(64), &params));
+        // A changed param value flips it.
+        let mut p2 = params.clone();
+        p2.insert("quant".to_string(), "q4_0".to_string());
+        assert_ne!(base, derivation_key(&input, &recipe, &p2));
+        // An added param flips it.
+        let mut p3 = params.clone();
+        p3.insert("extra".to_string(), "x".to_string());
+        assert_ne!(base, derivation_key(&input, &recipe, &p3));
+        // Identical inputs reproduce the key (deterministic, order-stable).
+        assert_eq!(base, derivation_key(&input, &recipe, &params));
+    }
+
+    /// W212/R518: the action cache is keyed on INPUTS, so a recipe change (here
+    /// a container-digest bump) forces a re-run even on a warm cache. This is
+    /// the regression guard against the W164/R438 output-keyed silent-stale
+    /// skip — the exact defect this relay fixes.
+    #[tokio::test]
+    async fn transform_recipe_change_busts_cache_and_reruns() {
+        let fx = Fixture::new(minio_slot());
+        let digest_a = HASH_64;
+        let digest_b = "1".repeat(64);
+        write_recipe_with_digest(&fx.workspace_root, "pinned", digest_a);
+
+        let out_bytes = b"transformed output".to_vec();
+        let out_hash = blake3_hex(&out_bytes);
+        let (mock, invocations) = MockExecutor::new(out_bytes);
+        let executor: Arc<dyn ForgeExecutor> = mock;
+
+        let fetch_path = fx.workspace_root.join(".yah/cache/derive/fetch/in.bin");
+        std::fs::create_dir_all(fetch_path.parent().unwrap()).unwrap();
+        std::fs::write(&fetch_path, b"fetch bytes").unwrap();
+        let in_hash = blake3_hex(b"fetch bytes");
+
+        let transform = TransformSpec {
+            recipe: "pinned".to_string(),
+            params: BTreeMap::new(),
+        };
+        let cache_dir = fx.workspace_root.join(".yah/cache/derive/transform");
+        let wr = &fx.workspace_root;
+
+        // Run 1 — cold, digest A.
+        materialize_transform(
+            &transform,
+            &fetch_path,
+            &in_hash,
+            &out_hash,
+            &cache_dir,
+            wr,
+            executor.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*invocations.lock().await, 1);
+
+        // Re-run with the SAME recipe → warm HIT, no re-run.
+        materialize_transform(
+            &transform,
+            &fetch_path,
+            &in_hash,
+            &out_hash,
+            &cache_dir,
+            wr,
+            executor.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*invocations.lock().await, 1, "identical inputs must skip");
+
+        // Bump the container digest A → B. Output-keyed caching silently
+        // skipped this; input-addressed caching MUST re-run.
+        write_recipe_with_digest(&fx.workspace_root, "pinned", &digest_b);
+        materialize_transform(
+            &transform,
+            &fetch_path,
+            &in_hash,
+            &out_hash,
+            &cache_dir,
+            wr,
+            executor.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *invocations.lock().await,
+            2,
+            "a digest bump must invalidate the cache and re-run",
+        );
+    }
+
+    /// W212/R518-P2b: the substituter fast-path honours the committed lock —
+    /// `Some(output)` when the key recomputed from the pins matches, `None` the
+    /// moment any input drifts (here a recipe-digest bump).
+    #[tokio::test]
+    async fn lock_skip_hash_honours_committed_lock() {
+        let fx = Fixture::new(minio_slot());
+        write_recipe_with_digest(&fx.workspace_root, "pinned", HASH_64);
+
+        let fetch_pin = "a".repeat(64);
+        let out_pin = "b".repeat(64);
+        // The lock's input_hash must equal the key the reconciler recomputes
+        // from the committed pins.
+        let recipe_bk = recipe_blake3(&fx.workspace_root, "pinned").await.unwrap();
+        let key = derivation_key(&fetch_pin, &recipe_bk, &BTreeMap::new());
+
+        let toml = format!(
+            r#"kind = "static-asset"
+schema_version = "V1"
+
+[[asset]]
+filename = "whisper/coreml.tar.gz"
+blake3   = "{out_pin}"
+
+[asset.derive.fetch]
+url     = "https://example/config.json"
+blake3  = "{fetch_pin}"
+license = "mit"
+
+[asset.derive.transform]
+recipe = "pinned"
+
+[asset.derive.lock]
+input_hash    = "{key}"
+output_blake3 = "{out_pin}"
+"#
+        );
+        let workload: StaticAssetWorkload = toml::from_str(&toml).unwrap();
+        let entry = &workload.assets[0];
+
+        // Lock current → Some(output hash) (caller then HEADs the bucket).
+        assert_eq!(
+            lock_skip_hash(entry, &fx.workspace_root).await.as_deref(),
+            Some(out_pin.as_str()),
+        );
+
+        // Bump the recipe digest → recipe-file hash changes → recomputed key no
+        // longer matches the lock → None (must rebuild). The exact drift the
+        // output-keyed cache missed.
+        write_recipe_with_digest(&fx.workspace_root, "pinned", &"1".repeat(64));
+        assert!(
+            lock_skip_hash(entry, &fx.workspace_root).await.is_none(),
+            "a stale recipe must not skip the build",
+        );
+    }
+
+    /// W212/R518-P2b: a bootstrap (zero-sentinel) row never short-circuits via
+    /// the lock — there is no pinned output to trust yet.
+    #[tokio::test]
+    async fn lock_skip_hash_declines_bootstrap_rows() {
+        let fx = Fixture::new(minio_slot());
+        write_recipe_with_digest(&fx.workspace_root, "pinned", HASH_64);
+        let sentinel = "0".repeat(64);
+        let toml = format!(
+            r#"kind = "static-asset"
+schema_version = "V1"
+
+[[asset]]
+filename = "whisper/coreml.tar.gz"
+blake3   = "{sentinel}"
+
+[asset.derive.fetch]
+url     = "https://example/config.json"
+blake3  = "{sentinel}"
+license = "mit"
+
+[asset.derive.transform]
+recipe = "pinned"
+
+[asset.derive.lock]
+input_hash    = "whatever"
+output_blake3 = "{sentinel}"
+"#
+        );
+        let workload: StaticAssetWorkload = toml::from_str(&toml).unwrap();
+        assert!(
+            lock_skip_hash(&workload.assets[0], &fx.workspace_root)
+                .await
+                .is_none(),
+            "bootstrap rows must always build",
+        );
+    }
+
+    #[test]
+    fn bootstrap_output_key_input_variant() {
+        let b = BootstrappedHash {
+            filename: "whisper/coreml.tar.gz".into(),
+            kind: BootstrapHashKind::Input,
+            hash: "deadbeef".into(),
+        };
+        assert_eq!(
+            bootstrap_output_key(&b),
+            "discovered_input_hash:whisper/coreml.tar.gz",
+        );
     }
 
     #[tokio::test]
@@ -2175,6 +2669,7 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
         let err = materialize_transform(
             &transform,
             &fetch_path,
+            &blake3_hex(b"fetch bytes"),
             pinned_hash,
             &fx.workspace_root.join(".yah/cache/derive/transform"),
             &fx.workspace_root,
@@ -2191,8 +2686,7 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
     async fn materialize_transform_recipe_failure_surfaces_stderr() {
         let fx = Fixture::new(minio_slot());
         write_recipe(&fx.workspace_root, "failing-recipe");
-        let executor: Arc<dyn ForgeExecutor> =
-            MockExecutor::failing("tool exploded".to_string());
+        let executor: Arc<dyn ForgeExecutor> = MockExecutor::failing("tool exploded".to_string());
 
         let fetch_path = fx.workspace_root.join(".yah/cache/derive/fetch/in.bin");
         std::fs::create_dir_all(fetch_path.parent().unwrap()).unwrap();
@@ -2205,6 +2699,7 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
         let err = materialize_transform(
             &transform,
             &fetch_path,
+            &blake3_hex(b"fetch bytes"),
             HASH_64,
             &fx.workspace_root.join(".yah/cache/derive/transform"),
             &fx.workspace_root,
@@ -2250,6 +2745,7 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
                     license: License::Mit,
                 },
                 transform: None,
+                lock: None,
             }),
             blake3: BlakeHash(hash.clone()),
         };
@@ -2261,7 +2757,8 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
         )
         .await
         .expect("fetch-only materialize");
-        assert!(materialized.path
+        assert!(materialized
+            .path
             .to_string_lossy()
             .contains(".yah/cache/derive/fetch/"));
         assert_eq!(std::fs::read(&materialized.path).unwrap(), body);
@@ -2300,7 +2797,10 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
         let cache_dir = fx.workspace_root.join(".yah/cache/derive/fetch");
         let (path, discovered) = materialize_fetch(&fetch, &cache_dir).await.unwrap();
         assert!(path.exists(), "cache file must exist after bootstrap fetch");
-        assert_eq!(discovered, actual_hash, "discovered hash = actual content hash");
+        assert_eq!(
+            discovered, actual_hash,
+            "discovered hash = actual content hash"
+        );
         assert!(
             path.file_name()
                 .and_then(|s| s.to_str())
@@ -2341,6 +2841,7 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
                     license: License::Mit,
                 },
                 transform: None,
+                lock: None,
             }),
             // entry.blake3 still sentinel — upload-side verify in sync_assets
             // handles the output-hash discovery; here we only assert the
@@ -2359,6 +2860,70 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
             materialized.discovered_fetch_hash.as_deref(),
             Some(actual_hash.as_str()),
             "fetch.blake3 sentinel → discovered hash returned",
+        );
+    }
+
+    /// W209/F4: discovered hashes write to `$YAH_OUTPUTS` with one line per
+    /// (kind, filename) pair so the QED runner can route them through
+    /// OutputMap into pipeline binds. Key shape encodes the filename so
+    /// multi-asset workloads round-trip; the value is the raw blake3 hex.
+    #[test]
+    fn bootstrap_outputs_format_round_trip() {
+        let dir = tempdir().unwrap();
+        let outputs = dir.path().join("outputs");
+        let bootstrapped = vec![
+            BootstrappedHash {
+                filename: "yah-desktop/whisper/distil-large-v3-coreml.tar.gz".to_string(),
+                kind: BootstrapHashKind::Output,
+                hash: "fb0afc9f3d966f5347c6dfd335adab12f1dc8ee6df18cf9e9ff90fe86f0416c0"
+                    .to_string(),
+            },
+            BootstrappedHash {
+                filename: "yah-desktop/whisper/distil-large-v3-coreml.tar.gz".to_string(),
+                kind: BootstrapHashKind::Fetch,
+                hash: "050ffe562134208781dc316181b146a725821fff005fb4ffb6de2a6ada334a9b"
+                    .to_string(),
+            },
+        ];
+        append_bootstrap_outputs(&outputs, &bootstrapped).expect("write outputs");
+        let content = std::fs::read_to_string(&outputs).expect("read outputs");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per discovery");
+        assert!(
+            lines.contains(
+                &"discovered_asset_blake3:yah-desktop/whisper/distil-large-v3-coreml.tar.gz=\
+                  fb0afc9f3d966f5347c6dfd335adab12f1dc8ee6df18cf9e9ff90fe86f0416c0"
+            ),
+            "asset output key encodes filename: {content:?}",
+        );
+        assert!(
+            lines.contains(
+                &"discovered_fetch_blake3:yah-desktop/whisper/distil-large-v3-coreml.tar.gz=\
+                  050ffe562134208781dc316181b146a725821fff005fb4ffb6de2a6ada334a9b"
+            ),
+            "fetch output key encodes filename: {content:?}",
+        );
+    }
+
+    /// Append, not truncate: a step that materializes N assets and emits
+    /// other outputs in the same step must not clobber what's already in
+    /// the file.
+    #[test]
+    fn bootstrap_outputs_append_preserves_prior_lines() {
+        let dir = tempdir().unwrap();
+        let outputs = dir.path().join("outputs");
+        std::fs::write(&outputs, "prior_key=prior_value\n").unwrap();
+        let bootstrapped = vec![BootstrappedHash {
+            filename: "a.bin".to_string(),
+            kind: BootstrapHashKind::Output,
+            hash: HASH_64.to_string(),
+        }];
+        append_bootstrap_outputs(&outputs, &bootstrapped).expect("append");
+        let content = std::fs::read_to_string(&outputs).expect("read");
+        assert!(content.starts_with("prior_key=prior_value\n"), "prior kept");
+        assert!(
+            content.contains(&format!("discovered_asset_blake3:a.bin={HASH_64}")),
+            "new line appended: {content:?}",
         );
     }
 }

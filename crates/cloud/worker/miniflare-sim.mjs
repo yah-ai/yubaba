@@ -13,6 +13,8 @@
 //   ASSET_ORIGIN        — base URL for static assets, no trailing slash
 //                         (e.g. http://minio:9000/yah-dev for bridge MinIO,
 //                         or http://127.0.0.1:9000/yah-dev legacy)
+//   UPLOAD_ORIGIN       — base URL for dynamic /uploads/* content (R490-T8);
+//                         empty string → Worker 404s /uploads/*
 //   WORKER_MODE         — "static" | "spa" | "ssr"
 //   SSR_ORIGIN          — SSR proxy origin (empty string for non-SSR modes)
 //   SSR_PREFIXES        — JSON array of SSR path prefixes (default: "[]")
@@ -23,6 +25,7 @@ const port = parseInt(process.env.MF_PORT ?? '4322', 10);
 const host = process.env.MF_HOST ?? '127.0.0.1';
 const scriptPath = process.env.MF_SCRIPT;
 const assetOrigin = process.env.ASSET_ORIGIN ?? '';
+const uploadOrigin = process.env.UPLOAD_ORIGIN ?? '';
 const workerMode = process.env.WORKER_MODE ?? 'static';
 const ssrOrigin = process.env.SSR_ORIGIN ?? '';
 const ssrPrefixes = process.env.SSR_PREFIXES ?? '[]';
@@ -50,6 +53,7 @@ const mf = new Miniflare({
   modules: true,
   bindings: {
     ASSET_ORIGIN: assetOrigin,
+    UPLOAD_ORIGIN: uploadOrigin,
     WORKER_MODE: workerMode,
     SSR_ORIGIN: ssrOrigin,
     SSR_PREFIXES: ssrPrefixes,

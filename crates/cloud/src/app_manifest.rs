@@ -115,9 +115,12 @@ pub struct RequiredWhen {
 
 impl RequiredWhen {
     pub fn parse(s: &str) -> Result<Self> {
-        let predicate = parse_predicate(s)
-            .with_context(|| format!("in required_when = \"{s}\""))?;
-        Ok(Self { raw: s.to_string(), predicate })
+        let predicate =
+            parse_predicate(s).with_context(|| format!("in required_when = \"{s}\""))?;
+        Ok(Self {
+            raw: s.to_string(),
+            predicate,
+        })
     }
 
     pub fn evaluate(&self, ctx: &HostContext) -> bool {
@@ -178,7 +181,10 @@ struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     fn new(src: &'a str) -> Self {
-        Self { src: src.as_bytes(), pos: 0 }
+        Self {
+            src: src.as_bytes(),
+            pos: 0,
+        }
     }
 
     fn skip_ws(&mut self) {
@@ -242,8 +248,7 @@ impl<'a> Lexer<'a> {
             c if c.is_ascii_alphabetic() || c == b'_' => {
                 let start = self.pos;
                 while self.pos < self.src.len()
-                    && (self.src[self.pos].is_ascii_alphanumeric()
-                        || self.src[self.pos] == b'_')
+                    && (self.src[self.pos].is_ascii_alphanumeric() || self.src[self.pos] == b'_')
                 {
                     self.pos += 1;
                 }
@@ -270,7 +275,9 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn new(input: &'a str) -> Self {
-        Self { lex: Lexer::new(input) }
+        Self {
+            lex: Lexer::new(input),
+        }
     }
 
     fn expect_eof(&mut self) -> Result<()> {
@@ -403,7 +410,9 @@ pub struct AssetDep {
 impl AssetDep {
     /// Whether this dep is required on `ctx`. Absent `required_when` → always required.
     pub fn required_here(&self, ctx: &HostContext) -> bool {
-        self.required_when.as_ref().map_or(true, |rw| rw.evaluate(ctx))
+        self.required_when
+            .as_ref()
+            .map_or(true, |rw| rw.evaluate(ctx))
     }
 }
 
@@ -427,17 +436,14 @@ impl AppManifest {
         let path = app_root.join("yah-app.toml");
         let src = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&src)
-            .with_context(|| format!("parsing {}", path.display()))
+        toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))
     }
 
     /// Save this manifest to `<app_root>/yah-app.toml`.
     pub fn save(&self, app_root: &Path) -> Result<()> {
         let path = app_root.join("yah-app.toml");
-        let src = toml::to_string_pretty(self)
-            .context("serializing AppManifest")?;
-        std::fs::write(&path, src)
-            .with_context(|| format!("writing {}", path.display()))
+        let src = toml::to_string_pretty(self).context("serializing AppManifest")?;
+        std::fs::write(&path, src).with_context(|| format!("writing {}", path.display()))
     }
 }
 
@@ -469,8 +475,7 @@ impl AppsRegistry {
     pub fn load(workspace_root: &Path) -> Result<Self> {
         let path = crate::paths::apps_registry(workspace_root);
         match std::fs::read_to_string(&path) {
-            Ok(src) => toml::from_str(&src)
-                .with_context(|| format!("parsing {}", path.display())),
+            Ok(src) => toml::from_str(&src).with_context(|| format!("parsing {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
@@ -484,8 +489,7 @@ impl AppsRegistry {
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let src = toml::to_string_pretty(self).context("serializing AppsRegistry")?;
-        std::fs::write(&path, src)
-            .with_context(|| format!("writing {}", path.display()))
+        std::fs::write(&path, src).with_context(|| format!("writing {}", path.display()))
     }
 
     /// Add an entry. Does not write to disk — call [`save`](Self::save) after.
@@ -535,21 +539,20 @@ pub fn discover_app_manifests(workspace_root: &Path) -> Result<Vec<(PathBuf, App
     }
 
     // Fallback: walk the workspace tree up to maxdepth=4.
-    find_yah_app_tomls(workspace_root, 4)
-        .map(|paths| {
-            paths
-                .into_iter()
-                .filter_map(|app_root| {
-                    AppManifest::load(&app_root)
-                        .map(|m| (app_root, m))
-                        .map_err(|e| {
-                            tracing::debug!(error = %e, "skipping unparseable yah-app.toml");
-                            e
-                        })
-                        .ok()
-                })
-                .collect()
-        })
+    find_yah_app_tomls(workspace_root, 4).map(|paths| {
+        paths
+            .into_iter()
+            .filter_map(|app_root| {
+                AppManifest::load(&app_root)
+                    .map(|m| (app_root, m))
+                    .map_err(|e| {
+                        tracing::debug!(error = %e, "skipping unparseable yah-app.toml");
+                        e
+                    })
+                    .ok()
+            })
+            .collect()
+    })
 }
 
 /// Walk `root` up to `max_depth` directory levels and return the *parent
@@ -562,7 +565,12 @@ pub fn find_yah_app_tomls(root: &Path, max_depth: usize) -> Result<Vec<PathBuf>>
     Ok(results)
 }
 
-fn walk_for_yah_app(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<PathBuf>) -> Result<()> {
+fn walk_for_yah_app(
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    out: &mut Vec<PathBuf>,
+) -> Result<()> {
     if dir.join("yah-app.toml").is_file() {
         out.push(dir.to_path_buf());
     }
@@ -582,7 +590,10 @@ fn walk_for_yah_app(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<Pa
         let name = entry.file_name();
         let name = name.to_string_lossy();
         // Skip common noise directories.
-        if matches!(name.as_ref(), ".git" | ".yah" | "target" | "node_modules" | ".build" | ".cache") {
+        if matches!(
+            name.as_ref(),
+            ".git" | ".yah" | "target" | "node_modules" | ".build" | ".cache"
+        ) {
             continue;
         }
         walk_for_yah_app(&path, depth + 1, max_depth, out)?;
@@ -681,7 +692,10 @@ mod tests {
     fn app_manifest_parse_and() {
         let p = parse_predicate(r#"target_os == "macos" && target_arch == "aarch64""#).unwrap();
         assert!(p.evaluate(&macos_ctx()));
-        let x86_mac = HostContext { target_arch: "x86_64".into(), ..macos_ctx() };
+        let x86_mac = HostContext {
+            target_arch: "x86_64".into(),
+            ..macos_ctx()
+        };
         assert!(!p.evaluate(&x86_mac));
         assert!(!p.evaluate(&linux_ctx()));
     }
@@ -691,7 +705,10 @@ mod tests {
         let p = parse_predicate(r#"target_os == "macos" || target_os == "linux""#).unwrap();
         assert!(p.evaluate(&macos_ctx()));
         assert!(p.evaluate(&linux_ctx()));
-        let windows = HostContext { target_os: "windows".into(), ..linux_ctx() };
+        let windows = HostContext {
+            target_os: "windows".into(),
+            ..linux_ctx()
+        };
         assert!(!p.evaluate(&windows));
     }
 
@@ -703,7 +720,10 @@ mod tests {
         .unwrap();
         assert!(p.evaluate(&macos_ctx())); // macos + aarch64
         assert!(!p.evaluate(&linux_ctx())); // linux + x86_64
-        let arm_linux = HostContext { target_arch: "aarch64".into(), ..linux_ctx() };
+        let arm_linux = HostContext {
+            target_arch: "aarch64".into(),
+            ..linux_ctx()
+        };
         assert!(p.evaluate(&arm_linux));
     }
 
@@ -760,16 +780,12 @@ mod tests {
             asset_deps: vec![
                 AssetDep {
                     alias: "whisper-default-coreml".into(),
-                    required_when: Some(
-                        RequiredWhen::parse(r#"target_os == "macos""#).unwrap(),
-                    ),
+                    required_when: Some(RequiredWhen::parse(r#"target_os == "macos""#).unwrap()),
                     purpose: Some("Local dictation (WhisperKit ANE path)".into()),
                 },
                 AssetDep {
                     alias: "whisper-default-ggml".into(),
-                    required_when: Some(
-                        RequiredWhen::parse(r#"target_os != "macos""#).unwrap(),
-                    ),
+                    required_when: Some(RequiredWhen::parse(r#"target_os != "macos""#).unwrap()),
                     purpose: None,
                 },
             ],

@@ -1,12 +1,12 @@
-//! `WorkloadSpec` — typed wire format for warden workloads.
+//! `WorkloadSpec` — typed wire format for yubaba workloads.
 //!
 //! This crate is the schema source of truth. It has zero dependencies on
-//! warden; warden depends on it, not the other way around. Agents and desktop
-//! code that construct specs can link this crate without pulling in warden's
+//! yubaba; yubaba depends on it, not the other way around. Agents and desktop
+//! code that construct specs can link this crate without pulling in yubaba's
 //! containerd client.
 //!
 //! Three validation layers live in [`validate`]: shape (sync, no I/O),
-//! semantic (reads warden state), and environment (deploy-time). The schema
+//! semantic (reads yubaba state), and environment (deploy-time). The schema
 //! types live at the top level.
 //!
 //! @yah:ticket(R222-T3, "Workload schema doesn't match per-kind on-disk shapes (mesofact-static)")
@@ -26,7 +26,7 @@
 //! @yah:parent(R256)
 //! @yah:next("role A — build/publish job: transient task that runs the build and PUTs to the object store, then exits/GC'd; needed whenever there is a build step (SSR or not)")
 //! @yah:next("role B — SSR/SPA runtime: long-lived container, only present when the app has realtime/dynamic pages (this is what the 'only if SSR/SPA' gate applies to)")
-//! @yah:next("decide the fidelity knob: does the build run in-container (matches CI, max fidelity, costs image+cold-start) or on host with warden orchestrating only the serving edge?")
+//! @yah:next("decide the fidelity knob: does the build run in-container (matches CI, max fidelity, costs image+cold-start) or on host with yubaba orchestrating only the serving edge?")
 //! @yah:assumes("in cloud these are separate: CI/build job produces artifacts, R2+CDN serve them, and a distinct worker serves any SSR — so one merged 'mesofact container' is the trap")
 //! @yah:handoff("BuildMode enum added to workload-spec with HostSide (default) and InContainer { image } variants. MesofactStaticWorkload gains build_mode: BuildMode (skip_serializing_if default) and ssr_runtime: Option<WorkloadSpec>. Encodes the two-role model: build step is always transient; SSR companion is optional long-lived. Fidelity knob decision: HostSide = host watcher (dev+sim), InContainer = CI-fidelity (cloud/ha). All three codegen targets updated: export-ts.rs, packages/yah/workload-spec/index.ts, .yah/schema/workload.toml.schema.json. Schema drift tests pass.")
 //! @yah:verify("cargo check -p workload-spec --locked")
@@ -43,10 +43,10 @@
 //! @yah:next("almanac output invalidates downstream mesofact sources cleanly + deliberately (a declared dependency edge, not a blunt rebuild-everything) — this is the reason it's a named manifest, not a shell cron")
 //! @yah:next("decide the not-ready policy knob: fail-fast vs wait-with-timeout vs requeue")
 //! @yah:next("generalizes the OpenRouter refresher (spawn_almanac_refresher), which is the degenerate no-dependency case (output = JSON cache, no app target)")
-//! @yah:assumes("precondition enforcement lives in the shared scheduler layer (embedded by camp for dev/sim, warden for cloud/ha) — it needs the workload registry + xlb-net discovery to answer 'is the target up?', which a bash cron lacks")
+//! @yah:assumes("precondition enforcement lives in the shared scheduler layer (embedded by camp for dev/sim, yubaba for cloud/ha) — it needs the workload registry + xlb-net discovery to answer 'is the target up?', which a bash cron lacks")
 //! @arch:see(.yah/docs/architecture/A024-vocabulary.md)
 //! @yah:depends_on(R256-F6)
-//! @yah:handoff("AlmanacTarget (Http/Tcp probe), NotReadyPolicy (WaitWithTimeout default=5s/FailFast/Requeue), Cadence (Once/Every/Cron), and AlmanacManifest types added to workload-spec. Workload enum gains Almanac(AlmanacManifest) variant (kind='almanac'). NotReadyPolicy::WaitWithTimeout(5s) is the default — matches sim-tier spinup budget. AlmanacManifest.invalidates: Vec<MeshIdent> declares downstream cache-bust targets. export-ts.rs updated; index.ts and workload.toml.schema.json regenerated; drift tests pass. The degenerate case (no inputs, no outputs, Cron, no invalidates) is exactly the OpenRouter refresher pattern. The orchestrator precondition enforcement (xlb-net probing) is left for R276/warden integration.")
+//! @yah:handoff("AlmanacTarget (Http/Tcp probe), NotReadyPolicy (WaitWithTimeout default=5s/FailFast/Requeue), Cadence (Once/Every/Cron), and AlmanacManifest types added to workload-spec. Workload enum gains Almanac(AlmanacManifest) variant (kind='almanac'). NotReadyPolicy::WaitWithTimeout(5s) is the default — matches sim-tier spinup budget. AlmanacManifest.invalidates: Vec<MeshIdent> declares downstream cache-bust targets. export-ts.rs updated; index.ts and workload.toml.schema.json regenerated; drift tests pass. The degenerate case (no inputs, no outputs, Cron, no invalidates) is exactly the OpenRouter refresher pattern. The orchestrator precondition enforcement (xlb-net probing) is left for R276/yubaba integration.")
 //! @yah:verify("cargo check -p workload-spec --locked")
 //! @yah:verify("cargo test -p xtask --locked  # schema drift tests pass")
 //! @yah:verify("cargo test -p cloud --locked --lib  # 165 passed")
@@ -66,10 +66,10 @@
 //! @yah:parent(R335)
 //! @yah:gotcha("Build ON R256-F9's AlmanacManifest (workload-spec/src/lib.rs) — do NOT invent a parallel manifest. R256-F9 is in review.")
 //! @yah:depends_on(R256-F9)
-//! @yah:handoff("Decided. Recorded in almanac-mirror-binding.md §11. KEY FINDING: two almanac paths exist; the live R330 feed uses almanac::FeedConfig (on_change=MesofactRebuild{service,route} — a service id, NOT a MeshIdent), so it never touches AlmanacManifest.invalidates. Verdict on the S1 title: NEITHER extend the manifest nor (yet) add capability is the accident fix — dev->cloud is ALREADY blocked by construction (feed path = process locality + per-mirror reconciler + MinIO/R2 backend split; manifest path = no camp-embedded MeshState, mesh resolution is warden-raft-only). Residual holes: /revalidate receiver is UNAUTHENTICATED, and same-tier (two clouds on one R2) has no per-mirror key prefix.")
-//! @yah:next("FILED: R335-F3 (P1, no warden dep) mirror-aware /revalidate receiver — reject feeds not bound to this mirror; satisfies R335-T2; lands with R330-F4.")
+//! @yah:handoff("Decided. Recorded in almanac-mirror-binding.md §11. KEY FINDING: two almanac paths exist; the live R330 feed uses almanac::FeedConfig (on_change=MesofactRebuild{service,route} — a service id, NOT a MeshIdent), so it never touches AlmanacManifest.invalidates. Verdict on the S1 title: NEITHER extend the manifest nor (yet) add capability is the accident fix — dev->cloud is ALREADY blocked by construction (feed path = process locality + per-mirror reconciler + MinIO/R2 backend split; manifest path = no camp-embedded MeshState, mesh resolution is yubaba-raft-only). Residual holes: /revalidate receiver is UNAUTHENTICATED, and same-tier (two clouds on one R2) has no per-mirror key prefix.")
+//! @yah:next("FILED: R335-F3 (P1, no yubaba dep) mirror-aware /revalidate receiver — reject feeds not bound to this mirror; satisfies R335-T2; lands with R330-F4.")
 //! @yah:next("FILED: R335-F4 (P2) per-mirror artifact key prefix in derive_minio_key/publish_to_r2 — closes same-tier collision.")
-//! @yah:next("FILED: R335-F5 (P3, BLOCKED on warden control plane) per-mirror capability gate on /revalidate via warden/xlb-net node identity.")
+//! @yah:next("FILED: R335-F5 (P3, BLOCKED on yubaba control plane) per-mirror capability gate on /revalidate via yubaba/xlb-net node identity.")
 //!
 //! @yah:ticket(R278-F4, "RolloutPolicy schema in workload-spec (TOML types)")
 //! @yah:assignee(agent:claude)
@@ -79,7 +79,7 @@
 //! @yah:next("Add src/rollout.rs with RolloutPolicy, RolloutStrategy, RolloutGate, RolloutStep, RolloutOnFailure")
 //! @yah:next("Export pub mod rollout from lib.rs")
 //! @yah:next("Add TS export via ts-rs in export-ts.rs")
-//! @arch:see(.yah/docs/working/W140-yah-warden-ci-cd.md)
+//! @arch:see(.yah/docs/working/W140-yah-yubaba-ci-cd.md)
 //! @yah:handoff("RolloutPolicy, RolloutStrategy, RolloutGate, RolloutStep, RolloutOnFailure added to workload-spec/src/rollout.rs. Exported from lib.rs. toml dev-dep added for round-trip test. Tests: rollout::tests::round_trip_toml + on_failure_default both green.")
 //!
 //! @yah:ticket(R429-T1, "Workload::StaticAsset variant + schema in workload-spec (catalog + aliases)")
@@ -172,19 +172,19 @@
 //! @arch:see(.yah/docs/working/W165-mesofact-build-mode-lowering.md)
 //! @yah:handoff("ImageRef now accepts either a string form (digest-pinned, W164/W165 path) or the legacy struct form (backwards-compat for WorkloadSpec configs). String form requires @sha256:<hex> suffix: bare-tag, non-sha256, and non-hex digests all reject at serde-deserialize. Single parser compose_import::parse_pinned_image_ref is the rule's one home; T4 (recipes) and T6 (BuildMode::InContainer) will both deserialize images through this string path. Custom Deserialize uses untagged enum (Pinned(String) | Struct(Fields)); Serialize/TS/JsonSchema derives stay on the struct so wire output and TS exports are unchanged. 6 new tests cover: bare-tag reject, pinned accept (docker.io + ghcr.io), non-sha256 algorithm reject, empty/non-hex digest reject, struct-form still works with digest=None, struct-form TOML round-trip. workload-spec: 30/30 lib + 18/18 semantic + 6/6 shape_fixtures. xtask schema_drift green after emit-schemas regen. cargo check --workspace clean.")
 //! @yah:next("Tighten ImageRef workspace-wide: digest: Option<String> → digest: String (required). tag stays as the human-readable identifier; digest is the source of truth. Rationale: every image we execute should be reproducible-by-construction; the on-disk shape should make unpinned-image bugs impossible.")
-//! @yah:next("Every existing ImageRef construction site updates to pass a digest. Call sites known today (~10): warden integration tests (fake digests via a test helper), warden/runtime/{containerd,fake}, warden/deploy/{mesh_resolve,env_validate}, local-runtime, cloud/config, workload-spec round_trip tests, restart_policy tests, compose_import::parse_image_ref. The break is bounded — single PR, no surprise call sites outside the workspace.")
-//! @yah:next("compose_import::parse_image_ref returns Result<ImageRef, ParseImageRefError> with an UnpinnedImage variant. Docker-compose strings without @sha256: become an explicit parse error — callers must pre-resolve tags to digests (most compose imports already happen at warden submission time where a pinning pass can run).")
+//! @yah:next("Every existing ImageRef construction site updates to pass a digest. Call sites known today (~10): yubaba integration tests (fake digests via a test helper), yubaba/runtime/{containerd,fake}, yubaba/deploy/{mesh_resolve,env_validate}, local-runtime, cloud/config, workload-spec round_trip tests, restart_policy tests, compose_import::parse_image_ref. The break is bounded — single PR, no surprise call sites outside the workspace.")
+//! @yah:next("compose_import::parse_image_ref returns Result<ImageRef, ParseImageRefError> with an UnpinnedImage variant. Docker-compose strings without @sha256: become an explicit parse error — callers must pre-resolve tags to digests (most compose imports already happen at yubaba submission time where a pinning pass can run).")
 //! @yah:next("Add task::local::test_support::test_digest() (or similar) for test fixtures — a fixed valid-format sha256 string so tests don't have to mint their own.")
 //! @yah:next("Recipe TOML loader (T4) and W165 BuildMode::InContainer (T6) inherit the new requirement for free — they consume ImageRef and digest is now structurally required.")
-//! @yah:verify("cargo check --workspace --locked passes after the tightening + call-site migration (warden, runtime, local-runtime, mesh_resolve, env_validate, cloud/config, compose_import)")
+//! @yah:verify("cargo check --workspace --locked passes after the tightening + call-site migration (yubaba, runtime, local-runtime, mesh_resolve, env_validate, cloud/config, compose_import)")
 //! @yah:verify("ImageRef without digest no longer constructs — parse-time + type-level enforcement. cargo test -p workload-spec round_trip + restart_policy pass with updated fixtures.")
 //! @yah:verify("compose_import::parse_image_ref(\"node:20\") → Err(UnpinnedImage); parse_image_ref(\"node:20@sha256:...\") → Ok.")
-//! @yah:verify("cargo test -p warden --tests + -p local-driver passes with new test_digest() helper in place of bare tags.")
-//! @yah:gotcha("Earlier framing assumed T3 needed a PinnedImageRef newtype to avoid breaking warden. Reversed after design discussion 2026-06-04: breaking warden in service of reproducibility-by-construction is the right architectural move. Digest is required workspace-wide; tag stays as a human-readable identifier. ~10 call sites migrate in one PR.")
+//! @yah:verify("cargo test -p yubaba --tests + -p local-driver passes with new test_digest() helper in place of bare tags.")
+//! @yah:gotcha("Earlier framing assumed T3 needed a PinnedImageRef newtype to avoid breaking yubaba. Reversed after design discussion 2026-06-04: breaking yubaba in service of reproducibility-by-construction is the right architectural move. Digest is required workspace-wide; tag stays as a human-readable identifier. ~10 call sites migrate in one PR.")
 //! @yah:gotcha("MesofactStaticWorkload.build_mode → InContainer { image } today is declared but never executed (build always runs on host — see W165). Once T3 tightens ImageRef, the wired-up build_mode lowering in T6 inherits digest-pinning automatically, closing W165 OQ#1's escape hatch.")
-//! @yah:assumes("No production warden deployment ships ImageRefs we don't already digest-pin. Spot-check Hetzner/cloud yah-castle workload specs before merging the tightening; if any prod path uses tag-only, it gets pinned in the same PR.")
-//! @yah:handoff("Pushed back from review 2026-06-04 — user reaffirmed the workspace-wide tightening direction. What landed (untagged Deserialize accepting string-form OR struct-form-with-digest:Option) ships digest enforcement at the W164/W165 wire surfaces but leaves the struct-form escape hatch (digest: None still constructs). User: 'breaking warden in order to improve it architecturally is fine'. Final shape needs both: (a) keep the string-form parser as a recipe-author convenience (image = \"ghcr.io/x@sha256:...\"), AND (b) tighten the struct form's digest: Option<String> → String. Then both paths land at the same digest-required field and unpinned-image bugs become impossible by construction. ~10 call sites still need migration (warden/runtime/{containerd,fake}, warden/deploy/{mesh_resolve,env_validate}, local-driver/local_runtime, cloud/config, workload-spec tests/round_trip + tests/restart_policy + warden integration_* + warden/tests/integration_public_ingress + integration_operator_bridge + integration_mesh + integration_single_node). Add task::local::test_support::test_digest() returning a fixed valid-format sha256 string. Pick this up by claiming R438-T3.")
-//! @yah:handoff("Workspace-wide ImageRef tightening landed. (a) ImageRef.digest: Option<String> → String at workload-spec/src/lib.rs:923; Deserialize struct arm now requires the field; untagged string-form parser at compose_import::parse_pinned_image_ref untouched. (b) ImageRef::docker_ref() now always emits tag@digest pair (informational tag alongside content-addressed digest). (c) validate.rs ImageTag check tightened: tag must be non-empty (digest presence is type-enforced now). (d) compose_import::parse_image_ref returns Result<ImageRef, String> — alias for parse_pinned_image_ref. import_compose gained ImportError::UnpinnedImage { service, image, reason } variant; only external caller (yah workload import in app/yah/cli/src/workload.rs) propagates the error type. (e) New workload_spec::testing module (doc-hidden) exposes TEST_DIGEST const + test_digest() fn — all-zeros 64-hex sentinel. (f) task::default_image::catalog_image falls back to testing::test_digest() when the per-image env var is unset, preserving the infallible API but making unset-digest visible at runtime via docker pull failure. default_buildkit_image follows the same pattern. (g) Migrated ~22 struct-form construction sites: workload-spec tests (round_trip/semantic/restart_policy + all 15 fixture JSONs + 3 compose YAML fixtures + matching expected.json), task crate (default_image/integration/lib/local/remote), warden (runtime/{containerd,fake}, deploy/{mesh_resolve,env_validate}, all 4 integration_*.rs files), cloud/config (3 sites), local-driver (local_runtime + pond_ssr_runtime), scryer/beholders, constable/{server,native,containerd}. (h) ImageSource::pull trait signature tightened: digest: Option<&'a str> → digest: &'a str (only one impl in warden/env_validate). (i) Read-site cleanup: warden::runtime::containerd::image_ref, constable::containerd::image_ref, local-driver::pond_ssr_runtime::compose_image_ref, task::local::image_ref_arg — all dropped Option ceremony, always emit tag@digest. cargo check --workspace clean. cargo test -p workload-spec: 82 pass. cargo test -p task --lib: 59 pass. Pre-existing test failures in cloud (5: 1 cloud_init drift, 4 mesofact_static adopt) and warden tests (pond_reconciler_smoke missing ssr_runtime/worker_mode/ssr_origin fields) are unrelated to ImageRef — separate ticket. R438-T4 (recipe loader) and R438-T6 (BuildMode::InContainer) inherit digest-required structurally with zero per-consumer work.")
+//! @yah:assumes("No production yubaba deployment ships ImageRefs we don't already digest-pin. Spot-check Hetzner/cloud yah-castle workload specs before merging the tightening; if any prod path uses tag-only, it gets pinned in the same PR.")
+//! @yah:handoff("Pushed back from review 2026-06-04 — user reaffirmed the workspace-wide tightening direction. What landed (untagged Deserialize accepting string-form OR struct-form-with-digest:Option) ships digest enforcement at the W164/W165 wire surfaces but leaves the struct-form escape hatch (digest: None still constructs). User: 'breaking yubaba in order to improve it architecturally is fine'. Final shape needs both: (a) keep the string-form parser as a recipe-author convenience (image = \"ghcr.io/x@sha256:...\"), AND (b) tighten the struct form's digest: Option<String> → String. Then both paths land at the same digest-required field and unpinned-image bugs become impossible by construction. ~10 call sites still need migration (yubaba/runtime/{containerd,fake}, yubaba/deploy/{mesh_resolve,env_validate}, local-driver/local_runtime, cloud/config, workload-spec tests/round_trip + tests/restart_policy + yubaba integration_* + yubaba/tests/integration_public_ingress + integration_operator_bridge + integration_mesh + integration_single_node). Add task::local::test_support::test_digest() returning a fixed valid-format sha256 string. Pick this up by claiming R438-T3.")
+//! @yah:handoff("Workspace-wide ImageRef tightening landed. (a) ImageRef.digest: Option<String> → String at workload-spec/src/lib.rs:923; Deserialize struct arm now requires the field; untagged string-form parser at compose_import::parse_pinned_image_ref untouched. (b) ImageRef::docker_ref() now always emits tag@digest pair (informational tag alongside content-addressed digest). (c) validate.rs ImageTag check tightened: tag must be non-empty (digest presence is type-enforced now). (d) compose_import::parse_image_ref returns Result<ImageRef, String> — alias for parse_pinned_image_ref. import_compose gained ImportError::UnpinnedImage { service, image, reason } variant; only external caller (yah workload import in app/yah/cli/src/workload.rs) propagates the error type. (e) New workload_spec::testing module (doc-hidden) exposes TEST_DIGEST const + test_digest() fn — all-zeros 64-hex sentinel. (f) task::default_image::catalog_image falls back to testing::test_digest() when the per-image env var is unset, preserving the infallible API but making unset-digest visible at runtime via docker pull failure. default_buildkit_image follows the same pattern. (g) Migrated ~22 struct-form construction sites: workload-spec tests (round_trip/semantic/restart_policy + all 15 fixture JSONs + 3 compose YAML fixtures + matching expected.json), task crate (default_image/integration/lib/local/remote), yubaba (runtime/{containerd,fake}, deploy/{mesh_resolve,env_validate}, all 4 integration_*.rs files), cloud/config (3 sites), local-driver (local_runtime + pond_ssr_runtime), scryer/beholders, kamaji/{server,native,containerd}. (h) ImageSource::pull trait signature tightened: digest: Option<&'a str> → digest: &'a str (only one impl in yubaba/env_validate). (i) Read-site cleanup: yubaba::runtime::containerd::image_ref, kamaji::containerd::image_ref, local-driver::pond_ssr_runtime::compose_image_ref, task::local::image_ref_arg — all dropped Option ceremony, always emit tag@digest. cargo check --workspace clean. cargo test -p workload-spec: 82 pass. cargo test -p task --lib: 59 pass. Pre-existing test failures in cloud (5: 1 cloud_init drift, 4 mesofact_static adopt) and yubaba tests (pond_reconciler_smoke missing ssr_runtime/worker_mode/ssr_origin fields) are unrelated to ImageRef — separate ticket. R438-T4 (recipe loader) and R438-T6 (BuildMode::InContainer) inherit digest-required structurally with zero per-consumer work.")
 //!
 //! @yah:ticket(R438-T7, "Golden tests: recipe→ForgeSpec lowering + BuildMode→ForgeSpec lowering parity")
 //! @yah:assignee(agent:claude)
@@ -257,10 +257,10 @@ impl Millis {
 
 // ── Primitive newtypes ────────────────────────────────────────────────────────
 
-/// Opaque identifier for a warden-managed machine within the cluster.
+/// Opaque identifier for a yubaba-managed machine within the cluster.
 ///
 /// Used by the semantic validation layer for admission-control capacity checks.
-/// Warden passes its own machine ID when validating a spec before deployment.
+/// Yubaba passes its own machine ID when validating a spec before deployment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct MachineId(pub String);
@@ -287,7 +287,7 @@ pub struct TierTag(pub String);
 /// discriminator.
 ///
 /// This is the **on-disk** envelope — distinct from [`WorkloadSpec`], the
-/// containerd wire format warden receives over RPC. A `kind = "container"`
+/// containerd wire format yubaba receives over RPC. A `kind = "container"`
 /// workload deserializes its remaining fields as a `WorkloadSpec`; other
 /// kinds carry their own per-reconciler payload shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -296,10 +296,10 @@ pub struct TierTag(pub String);
 pub enum Workload {
     /// Static-site build that publishes an artifact directory to the
     /// service's `static` provider slot. Reconciled by the
-    /// `mesofact-static` reconciler — does not deploy to warden.
+    /// `mesofact-static` reconciler — does not deploy to yubaba.
     MesofactStatic(MesofactStaticWorkload),
 
-    /// Containerd workload handed to warden over RPC. The inline fields
+    /// Containerd workload handed to yubaba over RPC. The inline fields
     /// are the full [`WorkloadSpec`] minus the `kind` discriminator.
     Container(WorkloadSpec),
 
@@ -351,7 +351,7 @@ pub struct MesofactStaticWorkload {
     /// `Some` → the workload spec describes a long-lived container that
     /// handles dynamic/SSR requests. Caddy routes static asset paths to
     /// the object store and all other paths to this container. The companion
-    /// uses `RestartPolicy::Always`; the orchestrator (camp or warden)
+    /// uses `RestartPolicy::Always`; the orchestrator (camp or yubaba)
     /// ensures it stays up alongside the Caddy edge.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
@@ -654,6 +654,27 @@ pub struct TransformSpec {
     pub params: BTreeMap<String, String>,
 }
 
+/// W212/R518: the committed derivation lock — the in-tree action-cache
+/// receipt. `input_hash` is the input-addressed derivation key computed over
+/// the complete declared input set (fetched-input pin ⊕ recipe-file bytes ⊕
+/// invocation params ⊕ schema version); `output_blake3` is what those inputs
+/// produced (== the entry's `blake3`). The reconciler skips the entire build
+/// (no fetch, no transform, no PUT) when the lock matches the inputs recomputed
+/// from the current pins and the bucket already holds the output — the
+/// Nix-substituter / Bazel-remote-cache behaviour. Written by the R510 bind
+/// path from the reconciler's `discovered_input_hash:<filename>` output; the
+/// `git diff` on this block is the receipt that the derivation rolled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct DeriveLock {
+    /// Input-addressed derivation key (BLAKE3 hex). A change to any declared
+    /// input flips this, so a stale lock never produces a false skip.
+    pub input_hash: String,
+    /// Output the locked inputs produced (BLAKE3 hex; equals the entry's
+    /// `blake3`). Carried so the lock is a self-contained action-cache entry.
+    pub output_blake3: String,
+}
+
 /// Provenance chain for a derived asset: required `fetch` step, optional
 /// `transform` step. Materialized bytes replace `AssetEntry.source` for the
 /// rest of the static-asset reconcile loop.
@@ -668,6 +689,14 @@ pub struct AssetDerive {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional = nullable)]
     pub transform: Option<TransformSpec>,
+
+    /// W212/R518: committed derivation lock (input-addressed action-cache
+    /// receipt). Absent until the first successful build writes it via the
+    /// bind path. When present and current, enables the substituter-style
+    /// build skip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional = nullable)]
+    pub lock: Option<DeriveLock>,
 }
 
 /// A single file entry in the static-asset catalog.
@@ -747,12 +776,12 @@ pub struct StaticAssetWorkload {
 
 // ── WorkloadSpec ──────────────────────────────────────────────────────────────
 
-/// Complete typed description of a containerd workload handed to warden over
+/// Complete typed description of a containerd workload handed to yubaba over
 /// RPC. This is also the payload of the `kind = "container"` variant of
 /// [`Workload`] on disk.
 ///
-/// Warden never accepts compose YAML on its RPC surface — agents, the desktop,
-/// and operator CLIs all hand warden `WorkloadSpec` values. See the arch doc
+/// Yubaba never accepts compose YAML on its RPC surface — agents, the desktop,
+/// and operator CLIs all hand yubaba `WorkloadSpec` values. See the arch doc
 /// for the validation layers and evolution rules.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -796,7 +825,7 @@ pub struct WorkloadSpec {
     pub user: Option<String>,
 
     /// Environment variables. Values may be literals, secret refs, or
-    /// mesh-address references resolved by warden at deploy time.
+    /// mesh-address references resolved by yubaba at deploy time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<EnvVar>,
 
@@ -820,7 +849,7 @@ pub struct WorkloadSpec {
     #[ts(optional = nullable)]
     pub healthcheck: Option<Healthcheck>,
 
-    /// What warden does when the container exits.
+    /// What yubaba does when the container exits.
     pub restart_policy: RestartPolicy,
 
     /// Graceful shutdown configuration.
@@ -830,12 +859,12 @@ pub struct WorkloadSpec {
     /// are independent and can be set in any combination.
     pub expose: ExposeSpec,
 
-    /// OCI-style labels, passed through to the container. Opaque to warden.
+    /// OCI-style labels, passed through to the container. Opaque to yubaba.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
 
     /// Yah-specific metadata, conventionally prefixed `yah.*`. Opaque to
-    /// warden beyond `yah.forge=true` which suppresses the Never-restart guard.
+    /// yubaba beyond `yah.forge=true` which suppresses the Never-restart guard.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub annotations: HashMap<String, String>,
 }
@@ -902,7 +931,36 @@ impl WorkloadSpec {
             annotations,
         }
     }
+
+    /// Whether this workload requests the **host network namespace** rather
+    /// than an isolated one.
+    ///
+    /// Opt-in via `annotations["yah.network"] == "host"` (see
+    /// [`HOST_NETWORK_ANNOTATION`] / [`HOST_NETWORK_VALUE`]). Default is the
+    /// isolated netns every other workload gets — host networking is a
+    /// privileged escape hatch for the few infra workloads that must bind a
+    /// host port so an on-host ingress (e.g. a Cloudflare tunnel reaching
+    /// `127.0.0.1:<port>`) can route to them without CNI/bridge plumbing.
+    ///
+    /// The backend (kamaji) is responsible for **guarding** this: host
+    /// networking is only honoured for `tier == "infra"` workloads; a
+    /// non-infra workload that sets the annotation is rejected at deploy. See
+    /// `validate_spec_for_constable`.
+    pub fn wants_host_network(&self) -> bool {
+        self.annotations
+            .get(HOST_NETWORK_ANNOTATION)
+            .map(|v| v == HOST_NETWORK_VALUE)
+            .unwrap_or(false)
+    }
 }
+
+/// Annotation key requesting a workload share the host network namespace.
+/// See [`WorkloadSpec::wants_host_network`].
+pub const HOST_NETWORK_ANNOTATION: &str = "yah.network";
+
+/// Annotation value (for [`HOST_NETWORK_ANNOTATION`]) selecting host
+/// networking. Any other value leaves the workload in an isolated netns.
+pub const HOST_NETWORK_VALUE: &str = "host";
 
 // ── ImageRef ─────────────────────────────────────────────────────────────────
 
@@ -1016,11 +1074,11 @@ pub enum EnvValue {
     /// Static string baked into the spec.
     Literal { value: String },
 
-    /// Resolved from a warden secret at deploy time; the secret value never
+    /// Resolved from a yubaba secret at deploy time; the secret value never
     /// appears in the spec JSON.
     FromSecret { secret: String, key: String },
 
-    /// Resolved from another workload's mesh address at deploy time by warden.
+    /// Resolved from another workload's mesh address at deploy time by yubaba.
     /// Lets workloads reference each other symbolically without IP pinning.
     FromMesh { ident: MeshIdent, kind: MeshLookup },
 }
@@ -1043,23 +1101,23 @@ pub enum MeshLookup {
 /// A secret value mounted into the container as an env var or file.
 ///
 /// The secret value never appears in the spec JSON — only the reference.
-/// Warden audits secret access per workload from these references.
+/// Yubaba audits secret access per workload from these references.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SecretMount {
-    /// Where warden reads the secret value from.
+    /// Where yubaba reads the secret value from.
     pub source: SecretRef,
 
     /// How the secret is surfaced inside the container.
     pub target: SecretTarget,
 }
 
-/// Where warden resolves the secret value from.
+/// Where yubaba resolves the secret value from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SecretRef {
-    /// Per-machine warden secret store at `/var/lib/yah/warden/secrets/`.
+    /// Per-machine yubaba secret store at `/var/lib/yah/yubaba/secrets/`.
     LocalFile { path: PathBuf },
 
     /// Raft-replicated cluster secret spanning all machines (planned; not in
@@ -1101,10 +1159,10 @@ pub struct VolumeMount {
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VolumeSource {
-    /// Warden-managed named volume; created on first use.
+    /// Yubaba-managed named volume; created on first use.
     Named { name: String },
 
-    /// Operator-managed host path. Warden rejects bind mounts unless
+    /// Operator-managed host path. Yubaba rejects bind mounts unless
     /// `WorkloadSpec.tier == "infra"`; shape validation enforces this.
     Bind { host_path: PathBuf },
 
@@ -1179,7 +1237,7 @@ pub enum HealthProbe {
 
 // ── Restart / Stop ────────────────────────────────────────────────────────────
 
-/// What warden does when the container exits.
+/// What yubaba does when the container exits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1228,14 +1286,14 @@ pub struct BackoffPolicy {
     pub multiplier: f32,
 }
 
-/// Graceful shutdown configuration for warden's stop sequence.
+/// Graceful shutdown configuration for yubaba's stop sequence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct StopPolicy {
     /// Signal number sent first, e.g. `15` (SIGTERM) or `2` (SIGINT).
     pub signal: i32,
 
-    /// Time warden waits after sending `signal` before issuing SIGKILL.
+    /// Time yubaba waits after sending `signal` before issuing SIGKILL.
     pub grace_period: Millis,
 }
 
@@ -1276,7 +1334,7 @@ pub struct MeshExpose {
     pub ports: Vec<u16>,
 
     /// Which tiers may initiate connections to this workload on the mesh. An
-    /// empty list means no peer restriction (warden default: allow all).
+    /// empty list means no peer restriction (yubaba default: allow all).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_from: Vec<TierTag>,
 }
@@ -1306,7 +1364,7 @@ pub enum PublicTls {
     /// record in the configured zone).
     CfManaged,
 
-    /// User-supplied certificate referenced by name in the warden secret store.
+    /// User-supplied certificate referenced by name in the yubaba secret store.
     UserCertRef { name: String },
 }
 
@@ -1344,13 +1402,13 @@ impl ImageRef {
 ///   via the docker CLI pointed at OrbStack (or any Docker-compatible socket).
 ///   No mesh — containers communicate over OrbStack's bridge network.
 ///
-/// - **Warden/cloud-HA tier**: `warden::runtime::ContainerRuntime` (gRPC to
+/// - **Yubaba/cloud-HA tier**: `yubaba::runtime::ContainerRuntime` (gRPC to
 ///   containerd) will implement this trait. Mesh assignment is a separate
-///   orchestration step on top (handled by warden's raft layer), not part
+///   orchestration step on top (handled by yubaba's raft layer), not part
 ///   of the shared deploy/supervise interface.
 ///
 /// Callers that type against `WorkloadRuntime` automatically work with both
-/// backends. Reconcilers in `cloud` use it today; warden wires its own impl
+/// backends. Reconcilers in `cloud` use it today; yubaba wires its own impl
 /// when R276 Tier-3 lands.
 #[async_trait::async_trait]
 pub trait WorkloadRuntime: Send + Sync {
@@ -1556,6 +1614,39 @@ blake3   = "{HASH_64}"
         assert_eq!(w, w2);
     }
 
+    /// W212/R518: the `[asset.derive.lock]` block round-trips through TOML, and
+    /// is omitted from output when absent (so non-derive / unlocked assets stay
+    /// clean).
+    #[test]
+    fn derive_lock_round_trips_through_toml() {
+        let toml = r#"
+url     = "https://example.invalid/config.json"
+blake3  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+license = "mit"
+"#;
+        let fetch: FetchSource = ::toml::from_str(toml).unwrap();
+        let derive = AssetDerive {
+            fetch,
+            transform: Some(TransformSpec {
+                recipe: "whisper-bundle-tar".into(),
+                params: BTreeMap::new(),
+            }),
+            lock: Some(DeriveLock {
+                input_hash: "1111111111111111111111111111111111111111111111111111111111111111".into(),
+                output_blake3: "2222222222222222222222222222222222222222222222222222222222222222".into(),
+            }),
+        };
+        let s = ::toml::to_string(&derive).unwrap();
+        assert!(s.contains("[lock]"), "lock serialized: {s}");
+        let back: AssetDerive = ::toml::from_str(&s).unwrap();
+        assert_eq!(derive, back);
+
+        // Absent lock → no `[lock]` table in the output.
+        let unlocked = AssetDerive { lock: None, ..derive };
+        let s2 = ::toml::to_string(&unlocked).unwrap();
+        assert!(!s2.contains("[lock]"), "unlocked must omit lock: {s2}");
+    }
+
     #[test]
     fn shape_static_asset_rejects_both_source_and_derive() {
         use crate::validate::{shape_static_asset, FieldPath, ShapeError};
@@ -1570,6 +1661,7 @@ blake3   = "{HASH_64}"
                     license: License::Mit,
                 },
                 transform: None,
+                lock: None,
             }),
             blake3: BlakeHash(HASH_64.into()),
         };
@@ -1627,6 +1719,7 @@ blake3   = "{HASH_64}"
                     license: License::Apache2,
                 },
                 transform: None,
+                lock: None,
             }),
             blake3: BlakeHash(HASH_64.into()),
         };

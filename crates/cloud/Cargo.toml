@@ -22,34 +22,40 @@ local-docker = ["dep:containerd-client", "dep:prost-types"]
 json-schema = ["dep:schemars", "workload-spec/json-schema"]
 
 [dependencies]
-# WorkloadSpec — typed wire format for warden workloads. Used by WorkloadConfig
+# WorkloadSpec — typed wire format for yubaba workloads. Used by WorkloadConfig
 # to validate workload TOML against the schema (R092-F1).
 workload-spec = { path = "../workload-spec" }
 # Almanac feed configs + OnChangeConfig — dispatch_on_change maps on_change
 # to the correct reconciler (R330-F4).
-almanac = { path = "../almanac" }
+yah-almanac = { path = "../almanac" }
 
 # Shared credential vault — HetznerDriver::from_default_sources() reads
 # hetzner-api-token / hetzner-s3-access-key / hetzner-s3-secret-key
 # from this vault, falling back to HETZNER_* env vars (R040-F9).
-keys = { path = "../keys" }
+fob = { path = "../keys" }
 # Shared Hetzner Cloud API client — transport, bearer auth, and server/SSH-key
 # operations. Cloud crate adds S3 bucket ops and MachineProvider trait impl on top.
-hetzner = { path = "../hetzner" }
+yah-hetzner = { path = "../hetzner" }
 
 # Object-store trait + R2 impl — publish_to_r2 delegates PUT/GET ops here (R498-F5).
 yah-object-store = { path = "../object-store" }
 
 # Local-tier infrastructure primitives (docker-CLI driver + S3 SigV4 helpers).
-# Both cloud and warden depend on this — moved out of cloud in R374-F3 so
-# warden could own MinIO lifecycle without a reverse warden→cloud dep.
+# Both cloud and yubaba depend on this — moved out of cloud in R374-F3 so
+# yubaba could own MinIO lifecycle without a reverse yubaba→cloud dep.
 local-driver = { path = "../local-driver" }
+
+# Kamaji supervisor — the mesofact-static local-static arm spawns
+# mesofact-dev as a host binary through the Native fork+exec backend
+# (R490-F2; W199's "ideal native-backend case"). Replaces the reconciler's
+# direct Command::spawn so dev-tier workloads share the supervision primitive.
+kamaji = { path = "../kamaji", features = ["native-integration"] }
 
 # Forge executor + transform recipe loader. Cloud's static-asset reconciler
 # materializes derived assets (W164) by lowering recipes → ForgeSpec and
 # handing them to a `dyn ForgeExecutor`. The dep edge intentionally stops
 # here: no cloud → qed edge, only cloud → task (R438-T13 architectural rule).
-task = { version = "0.8.11" }
+velveteen = { version = "0.8.16" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -81,7 +87,10 @@ schemars = { version = "0.8", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Parses rendered cloud-init in tests to guard against the YAML footgun where a
+# `: ` in a bare runcmd scalar turns the entry into a mapping (R330-F28 #12).
+serde_yaml = "0.9"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util"] }
-# Axum drives the in-process warden-mock the R374-F2 adopt-path tests use to
+# Axum drives the in-process yubaba-mock the R374-F2 adopt-path tests use to
 # verify pond.rs:adopt_only behaviour against each PondPhase response.
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }

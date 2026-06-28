@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Local-tier infrastructure primitives shared by cloud (sim/pond reconciler) and warden (pond MinIO slot lifecycle): docker-CLI runtime detection + S3 SigV4 helpers."
+description = "Local-tier infrastructure primitives shared by cloud (sim/pond reconciler) and yubaba (pond MinIO slot lifecycle): docker-CLI runtime detection + S3 SigV4 helpers."
 publish = false
 
 [lib]
@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # WorkloadSpec — LocalDockerRuntime implements workload_spec::WorkloadRuntime
-# to plug the docker-CLI driver into the warden seam (R256-F10).
+# to plug the docker-CLI driver into the yubaba seam (R256-F10).
 workload-spec = { path = "../workload-spec" }
 
 anyhow = "1.0"
@@ -21,7 +21,7 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "net", "time", "sync", "fs", "io-util"] }
 tracing = "0.1"
 
-# Serde — MinioSpec / MinioRunning derive Serialize/Deserialize so warden's
+# Serde — MinioSpec / MinioRunning derive Serialize/Deserialize so yubaba's
 # pond/deploy HTTP body and cloud's reconciler can share them.
 serde = { version = "1.0", features = ["derive"] }
 # serde_json — MiniflareSpec encodes ssr_prefixes as a JSON array string for

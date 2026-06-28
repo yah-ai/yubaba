@@ -1,5 +1,5 @@
 [package]
-name = "keys"
+name = "fob"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

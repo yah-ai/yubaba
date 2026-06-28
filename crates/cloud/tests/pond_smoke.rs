@@ -24,31 +24,31 @@
 //!   cargo test -p cloud --test pond_smoke --locked -- --nocapture
 //! ```
 //!
-//! @yah:ticket(R454-S2, "Measure cold + warm pond spinup with containerised warden against W142 budget")
+//! @yah:ticket(R454-S2, "Measure cold + warm pond spinup with containerised yubaba against W142 budget")
 //! @yah:assignee(agent:claude)
 //! @yah:at(2026-06-05T08:23:58Z)
 //! @yah:kind(spike)
 //! @yah:status(review)
 //! @yah:phase(C)
 //! @yah:parent(R454)
-//! @yah:next("Extend pond_smoke with a containerised-warden variant; capture cold (image pulled) + warm numbers vs W142's 'few-second cold / sub-second warm' budget")
+//! @yah:next("Extend pond_smoke with a containerised-yubaba variant; capture cold (image pulled) + warm numbers vs W142's 'few-second cold / sub-second warm' budget")
 //! @yah:next("Verdict: does image pre-warm need to ship in the same wave as F1, or after?")
 //! @yah:verify("Numbers + verdict captured in W142 §Spinup budget or W180 followup; one of: (a) budget held, defer pre-warm; (b) budget exceeded, file pre-warm before flipping default")
 //! @arch:see(.yah/docs/working/W180-pond-richer-topology.md)
 //! @arch:see(.yah/docs/working/W142-pond.md)
-//! @yah:handoff("Spike complete. Measured warden container spinup on OrbStack/arm64 (dev build, image cached): cold 653ms–2.15s (median ~1.2s), warm container restart 880ms–1.2s (median ~1.05s). Verdict: (a) warm budget HOLDS — warden stays running across pond down/up cycles per Phase B stop semantics; the W142 sub-second budget applies to MinIO+miniflare slot cycle only, not warden restart. (b) image pre-warm IS required — first-run yah-warden image pull (~120MB) would bust the cold budget; must ship alongside R454-F1. Also fixed a blocker: build_warden_run_spec was not injecting YAH_WARDEN_ARGS, so pond-supervise.sh started warden without the serve subcommand. Fixed in local_driver/src/pond_warden.rs — DEFAULT_WARDEN_ARGS injects 'serve --bind 0.0.0.0:8800 --state /var/lib/yah-warden/identity.json'. Numbers + verdict recorded in W142 §Spinup budget. warden_container_spinup_budget test added to pond_smoke.rs.")
+//! @yah:handoff("Spike complete. Measured yubaba container spinup on OrbStack/arm64 (dev build, image cached): cold 653ms–2.15s (median ~1.2s), warm container restart 880ms–1.2s (median ~1.05s). Verdict: (a) warm budget HOLDS — yubaba stays running across pond down/up cycles per Phase B stop semantics; the W142 sub-second budget applies to MinIO+miniflare slot cycle only, not yubaba restart. (b) image pre-warm IS required — first-run yah-yubaba image pull (~120MB) would bust the cold budget; must ship alongside R454-F1. Also fixed a blocker: build_warden_run_spec was not injecting YAH_WARDEN_ARGS, so pond-supervise.sh started yubaba without the serve subcommand. Fixed in local_driver/src/pond_warden.rs — DEFAULT_WARDEN_ARGS injects 'serve --bind 0.0.0.0:8800 --state /var/lib/yah-yubaba/identity.json'. Numbers + verdict recorded in W142 §Spinup budget. warden_container_spinup_budget test added to pond_smoke.rs.")
 //! @yah:verify("cargo test -p local-driver -- pond_warden (10 tests pass)")
 //! @yah:verify("cargo test -p cloud --test pond_smoke --no-run (compiles clean)")
 //! @yah:verify("YAH_LOCAL_SIM_E2E=1 cargo test -p cloud --test pond_smoke -- warden_container_spinup_budget --nocapture (measures cold+warm, asserts within generous budgets)")
-//! @yah:verify("W142 §Spinup budget §Containerised-warden delta section present with numbers and verdict")
+//! @yah:verify("W142 §Spinup budget §Containerised-yubaba delta section present with numbers and verdict")
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use cloud::{
-    publish_to_pond, CloudConfig, PondOptions, MesofactStaticReconciler,
-    MirrorProviderSlot, Provider, ReconcileCtx, Reconciler, ServiceComponent,
-    LocalRuntime, local_container_spec_from_provider,
+    local_container_spec_from_provider, publish_to_pond, CloudConfig, LocalRuntime,
+    MesofactStaticReconciler, MirrorProviderSlot, PondOptions, Provider, ReconcileCtx, Reconciler,
+    ServiceComponent,
 };
 use local_driver::pond_warden::{
     build_warden_run_spec, WardenContainerSpec, DEFAULT_WARDEN_HTTP_PORT,
@@ -58,11 +58,11 @@ use local_driver::pond_warden::{
 const COLD_START_BUDGET: Duration = Duration::from_secs(15);
 const WARM_RESTART_BUDGET: Duration = Duration::from_secs(3);
 
-/// Warden-container-only spinup budgets (R454-S2). Measure the overhead the
+/// Yubaba-container-only spinup budgets (R454-S2). Measure the overhead the
 /// container shell adds before pond deploy; full-pond budget is above.
 const WARDEN_COLD_BUDGET: Duration = Duration::from_secs(5);
 const WARDEN_WARM_BUDGET: Duration = Duration::from_secs(3);
-/// Absolute deadline for waiting on warden HTTP during the spike measurement.
+/// Absolute deadline for waiting on yubaba HTTP during the spike measurement.
 const WARDEN_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn workspace_root() -> PathBuf {
@@ -186,7 +186,10 @@ async fn pond_spinup_budget() {
         .dev_url
         .clone()
         .expect("pond path always sets dev_url");
-    eprintln!("[smoke] cold start done in {:.2?}  dev_url={dev_url}", cold_elapsed);
+    eprintln!(
+        "[smoke] cold start done in {:.2?}  dev_url={dev_url}",
+        cold_elapsed
+    );
 
     // ── Publish dist/ to MinIO ──────────────────────────────────────────
     let opts = PondOptions::default();
@@ -256,18 +259,21 @@ async fn pond_spinup_budget() {
     // ── Warm restart ────────────────────────────────────────────────────
     eprintln!("[smoke] warm restart: re-bringing up (images cached, containers stopped) …");
     let t_warm = Instant::now();
-    let running2 = reconciler
-        .up(make_ctx())
-        .await
-        .expect("warm reconciler.up");
+    let running2 = reconciler.up(make_ctx()).await.expect("warm reconciler.up");
     let warm_elapsed = t_warm.elapsed();
     eprintln!("[smoke] warm restart done in {:.2?}", warm_elapsed);
     running2.shutdown().await.expect("second shutdown");
 
     // ── Report ──────────────────────────────────────────────────────────
     eprintln!("\n[smoke] ═══ spinup-budget results ═══");
-    eprintln!("  cold start  : {:.2?}  (budget: {:?})", cold_elapsed, COLD_START_BUDGET);
-    eprintln!("  warm restart: {:.2?}  (budget: {:?})", warm_elapsed, WARM_RESTART_BUDGET);
+    eprintln!(
+        "  cold start  : {:.2?}  (budget: {:?})",
+        cold_elapsed, COLD_START_BUDGET
+    );
+    eprintln!(
+        "  warm restart: {:.2?}  (budget: {:?})",
+        warm_elapsed, WARM_RESTART_BUDGET
+    );
     eprintln!("  published   : {} key(s)", report.uploaded.len());
     eprintln!("  curl /      : 200 OK ({} bytes)", body.len());
 
@@ -292,7 +298,7 @@ async fn pond_spinup_budget() {
     eprintln!("[smoke] ✓ all assertions passed");
 }
 
-// ── Helpers shared by the warden-container test ───────────────────────────────
+// ── Helpers shared by the yubaba-container test ───────────────────────────────
 
 /// Detect the local docker runtime from the workspace CloudConfig.
 async fn detect_local_runtime(workspace: &std::path::Path) -> Option<LocalRuntime> {
@@ -325,15 +331,15 @@ async fn wait_for_warden_http(port: u16, deadline: Duration) -> Result<Duration,
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     Err(format!(
-        "warden HTTP on port {port} not ready within {deadline:?}"
+        "yubaba HTTP on port {port} not ready within {deadline:?}"
     ))
 }
 
-/// Measure the overhead the yah-warden container adds to pond bring-up.
+/// Measure the overhead the yah-yubaba container adds to pond bring-up.
 ///
 /// Tests two timing points (R454-S2 spike):
 /// - **Cold** (image already pulled, container freshly started): `docker run` +
-///   tini + constable UDS bind + warden HTTP bind.
+///   tini + kamaji UDS bind + yubaba HTTP bind.
 /// - **Warm** (container stopped, then restarted): same path but OCI layer
 ///   cache is warm and the state dir is already initialised.
 ///
@@ -346,14 +352,14 @@ async fn wait_for_warden_http(port: u16, deadline: Duration) -> Result<Duration,
 /// [`WARDEN_COLD_BUDGET`] and [`WARDEN_WARM_BUDGET`] are intentionally generous
 /// for this spike: we want the real numbers, not a gate-pass/fail. Tighten them
 /// once the F1 integration lands and the full-pond smoke (`pond_spinup_budget`)
-/// absorbs the warden contribution.
+/// absorbs the yubaba contribution.
 #[tokio::test]
 async fn warden_container_spinup_budget() {
     if std::env::var("YAH_LOCAL_SIM_E2E").as_deref() != Ok("1") {
         eprintln!(
-            "[warden-smoke] SKIP: set YAH_LOCAL_SIM_E2E=1 to run the warden \
+            "[yubaba-smoke] SKIP: set YAH_LOCAL_SIM_E2E=1 to run the yubaba \
              container spinup budget. Requires orbstack / colima / docker + \
-             yah-warden image (ghcr.io/yah-ai/yah-warden:latest)."
+             yah-yubaba image (ghcr.io/yah-ai/yah-yubaba:latest)."
         );
         return;
     }
@@ -364,7 +370,7 @@ async fn warden_container_spinup_budget() {
         Some(r) => r,
         None => {
             eprintln!(
-                "[warden-smoke] SKIP: no reachable local-container runtime; \
+                "[yubaba-smoke] SKIP: no reachable local-container runtime; \
                  start orbstack/colima/docker and rerun."
             );
             return;
@@ -377,25 +383,25 @@ async fn warden_container_spinup_budget() {
     let pulled = runtime
         .ensure_image(warden_image)
         .await
-        .expect("ensure_image yah-warden — build or pull ghcr.io/yah-ai/yah-warden:latest first");
+        .expect("ensure_image yah-yubaba — build or pull ghcr.io/yah-ai/yah-yubaba:latest first");
     if pulled {
-        eprintln!("[warden-smoke] image pulled fresh from registry");
+        eprintln!("[yubaba-smoke] image pulled fresh from registry");
     } else {
-        eprintln!("[warden-smoke] image already in local cache");
+        eprintln!("[yubaba-smoke] image already in local cache");
     }
 
     let pid = std::process::id();
     let state_dir = workspace
         .join(".yah/jit")
-        .join(format!("warden-spinup-smoke-{pid}"));
-    std::fs::create_dir_all(&state_dir).expect("create warden state dir");
+        .join(format!("yubaba-spinup-smoke-{pid}"));
+    std::fs::create_dir_all(&state_dir).expect("create yubaba state dir");
 
     let mut spec = WardenContainerSpec::new("smoke", "pond-s2", state_dir.clone());
     spec.http_port = 0; // random host port — resolved via `docker port` after start
 
     let run_spec = build_warden_run_spec(&spec);
     let container_name = run_spec.name.clone();
-    eprintln!("[warden-smoke] container name: {container_name}");
+    eprintln!("[yubaba-smoke] container name: {container_name}");
 
     // Cleanup guard — `docker rm -f` + remove state dir on test exit.
     struct Guard(String, PathBuf);
@@ -412,22 +418,25 @@ async fn warden_container_spinup_budget() {
     let _guard = Guard(container_name.clone(), state_dir.clone());
 
     // ── Cold start ────────────────────────────────────────────────────────────
-    eprintln!("[warden-smoke] cold start …");
+    eprintln!("[yubaba-smoke] cold start …");
     let t_cold = Instant::now();
-    runtime.run(&run_spec).await.expect("docker run warden (cold)");
+    runtime
+        .run(&run_spec)
+        .await
+        .expect("docker run yubaba (cold)");
 
     let host_port = runtime
         .container_host_port(&container_name, DEFAULT_WARDEN_HTTP_PORT)
         .await
-        .expect("docker port warden:8800");
-    eprintln!("[warden-smoke] warden bound to host port {host_port}; waiting for HTTP …");
+        .expect("docker port yubaba:8800");
+    eprintln!("[yubaba-smoke] yubaba bound to host port {host_port}; waiting for HTTP …");
 
     let cold_ready = wait_for_warden_http(host_port, WARDEN_READY_TIMEOUT)
         .await
         .unwrap_or_else(|e| panic!("{e}"));
     let cold_elapsed = t_cold.elapsed();
     eprintln!(
-        "[warden-smoke] cold: docker run→HTTP={:.2?}  total={:.2?}",
+        "[yubaba-smoke] cold: docker run→HTTP={:.2?}  total={:.2?}",
         cold_ready, cold_elapsed,
     );
 
@@ -435,55 +444,63 @@ async fn warden_container_spinup_budget() {
     runtime
         .stop_and_remove(&container_name, Duration::from_secs(10))
         .await
-        .expect("stop warden container");
-    eprintln!("[warden-smoke] container stopped");
+        .expect("stop yubaba container");
+    eprintln!("[yubaba-smoke] container stopped");
 
     // ── Warm restart ──────────────────────────────────────────────────────────
-    eprintln!("[warden-smoke] warm restart …");
+    eprintln!("[yubaba-smoke] warm restart …");
     let t_warm = Instant::now();
-    runtime.run(&run_spec).await.expect("docker run warden (warm)");
+    runtime
+        .run(&run_spec)
+        .await
+        .expect("docker run yubaba (warm)");
 
     let host_port2 = runtime
         .container_host_port(&container_name, DEFAULT_WARDEN_HTTP_PORT)
         .await
-        .expect("docker port warden:8800 (warm)");
+        .expect("docker port yubaba:8800 (warm)");
 
     let warm_ready = wait_for_warden_http(host_port2, WARDEN_READY_TIMEOUT)
         .await
         .unwrap_or_else(|e| panic!("{e}"));
     let warm_elapsed = t_warm.elapsed();
     eprintln!(
-        "[warden-smoke] warm: docker run→HTTP={:.2?}  total={:.2?}",
+        "[yubaba-smoke] warm: docker run→HTTP={:.2?}  total={:.2?}",
         warm_ready, warm_elapsed,
     );
 
     // ── Report ────────────────────────────────────────────────────────────────
-    eprintln!("\n[warden-smoke] ═══ warden container spinup results ═══");
+    eprintln!("\n[yubaba-smoke] ═══ yubaba container spinup results ═══");
     eprintln!("  image        : {warden_image}");
-    eprintln!("  cold start   : {:.2?}  (budget: {:?})", cold_elapsed, WARDEN_COLD_BUDGET);
-    eprintln!("  warm restart : {:.2?}  (budget: {:?})", warm_elapsed, WARDEN_WARM_BUDGET);
+    eprintln!(
+        "  cold start   : {:.2?}  (budget: {:?})",
+        cold_elapsed, WARDEN_COLD_BUDGET
+    );
+    eprintln!(
+        "  warm restart : {:.2?}  (budget: {:?})",
+        warm_elapsed, WARDEN_WARM_BUDGET
+    );
     // NOTE: the W142 "sub-second warm" budget applies to the slot cycle
     // (MinIO + miniflare restart via DELETE /pond?ident + POST /pond/deploy),
-    // NOT to warden container restart — warden stays running across pond
-    // down/up cycles in the Phase B stop model. Warden container restart is a
+    // NOT to yubaba container restart — yubaba stays running across pond
+    // down/up cycles in the Phase B stop model. Yubaba container restart is a
     // full-`camp-shutdown` scenario only.
     eprintln!(
-        "  NOTE: warden stays running across pond down/up; this measures\n  \
-         warden container restart (camp-shutdown scenario only)."
+        "  NOTE: yubaba stays running across pond down/up; this measures\n  \
+         yubaba container restart (camp-shutdown scenario only)."
     );
 
     assert!(
         cold_elapsed < WARDEN_COLD_BUDGET,
-        "warden cold start {:.2?} exceeded budget {:?}",
+        "yubaba cold start {:.2?} exceeded budget {:?}",
         cold_elapsed,
         WARDEN_COLD_BUDGET,
     );
     assert!(
         warm_elapsed < WARDEN_WARM_BUDGET,
-        "warden warm restart {:.2?} exceeded budget {:?}",
+        "yubaba warm restart {:.2?} exceeded budget {:?}",
         warm_elapsed,
         WARDEN_WARM_BUDGET,
     );
-    eprintln!("[warden-smoke] ✓ warden container spinup within budget");
+    eprintln!("[yubaba-smoke] ✓ yubaba container spinup within budget");
 }
-

@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use almanac::ServeConfig;
+use yah_almanac::ServeConfig;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,5 +39,5 @@ async fn main() -> anyhow::Result<()> {
         mirror_key: std::env::var("ALMANAC_MIRROR_KEY").ok(),
     };
 
-    almanac::serve::run(cfg).await
+    yah_almanac::serve::run(cfg).await
 }

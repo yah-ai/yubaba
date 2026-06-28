@@ -71,7 +71,11 @@ fn live_yah_workspace_loads_cleanly() {
     );
     let yah_dashboard = cfg.service("yah-dashboard").unwrap();
     assert!(
-        yah_dashboard.service.components.iter().any(|c| c.id == "dashboard"),
+        yah_dashboard
+            .service
+            .components
+            .iter()
+            .any(|c| c.id == "dashboard"),
         "yah-dashboard service must have a `dashboard` component"
     );
     assert!(

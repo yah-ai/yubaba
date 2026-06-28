@@ -228,9 +228,7 @@ pub async fn publish_to_r2(
             let zone_id = cf
                 .zone_id_for_name(&opts.zone_name)
                 .await
-                .with_context(|| {
-                    format!("resolving zone id for {:?}", opts.zone_name)
-                })?;
+                .with_context(|| format!("resolving zone id for {:?}", opts.zone_name))?;
             match cf.purge_cache_tags(&zone_id, &tags).await {
                 Ok(()) => {
                     info!(
@@ -258,7 +256,11 @@ pub async fn publish_to_r2(
         Vec::new()
     };
 
-    Ok(R2PublishReport { uploaded, skipped, purged_tags })
+    Ok(R2PublishReport {
+        uploaded,
+        skipped,
+        purged_tags,
+    })
 }
 
 // ---------- helpers ----------
@@ -379,7 +381,10 @@ mod tests {
         );
         // Different content → should upload.
         let other_hash = sha256_hex(b"different");
-        assert_ne!(manifest.get("index.html").map(|s| s.as_str()), Some(other_hash.as_str()));
+        assert_ne!(
+            manifest.get("index.html").map(|s| s.as_str()),
+            Some(other_hash.as_str())
+        );
         // Missing key → should upload.
         assert_eq!(manifest.get("missing.html"), None);
     }

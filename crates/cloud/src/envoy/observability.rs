@@ -233,11 +233,23 @@ mod tests {
 
     #[test]
     fn verbs_are_under_observability_category() {
-        assert_eq!(ObservabilityAlertList::CATEGORY, VerbCategory::Observability);
+        assert_eq!(
+            ObservabilityAlertList::CATEGORY,
+            VerbCategory::Observability
+        );
         assert_eq!(ObservabilityAlertAck::CATEGORY, VerbCategory::Observability);
-        assert_eq!(ObservabilityIncidentOpen::CATEGORY, VerbCategory::Observability);
-        assert_eq!(ObservabilityIncidentClose::CATEGORY, VerbCategory::Observability);
-        assert_eq!(ObservabilityDashboardSnapshot::CATEGORY, VerbCategory::Observability);
+        assert_eq!(
+            ObservabilityIncidentOpen::CATEGORY,
+            VerbCategory::Observability
+        );
+        assert_eq!(
+            ObservabilityIncidentClose::CATEGORY,
+            VerbCategory::Observability
+        );
+        assert_eq!(
+            ObservabilityDashboardSnapshot::CATEGORY,
+            VerbCategory::Observability
+        );
     }
 
     #[test]
@@ -274,7 +286,10 @@ mod tests {
 
     #[test]
     fn incident_open_output_omits_url_when_absent() {
-        let out = ObservabilityIncidentOpenOutput { id: "INC-1".into(), url: None };
+        let out = ObservabilityIncidentOpenOutput {
+            id: "INC-1".into(),
+            url: None,
+        };
         let wire = serde_json::to_value(&out).unwrap();
         assert!(!wire.as_object().unwrap().contains_key("url"));
     }

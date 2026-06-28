@@ -12,7 +12,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "WorkloadSpec — typed wire format for warden workloads. Schema crate with zero deps on warden; warden depends on this, not the other way around."
+description = "WorkloadSpec — typed wire format for yubaba workloads. Schema crate with zero deps on yubaba; yubaba depends on this, not the other way around."
 
 [lib]
 name = "workload_spec"

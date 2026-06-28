@@ -4,29 +4,37 @@ members = [
     "crates/keys",
     "crates/hetzner",
     "crates/local-driver",
-    "crates/constable-proto",
-    "crates/constable",
+    "crates/kamaji-proto",
+    "crates/kamaji",
     "crates/object-store",
     "crates/almanac",
     "crates/cloud",
-    "crates/constable-bin",
-    "crates/warden",
-    "crates/warden-test-harness",
-    "crates/warden-test-macros",
+    "crates/cheers-mock",
+    "crates/kamaji-bin",
+    "crates/yubaba",
+    "crates/yubaba-client",
+    "crates/yubaba-test-harness",
+    "crates/yubaba-test-macros",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.11"
+version = "0.8.16"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/yah-ai/warden"
+repository = "https://github.com/yah-ai/yubaba"
 
-# qed crates that warden/cloud depends on during local development
+# qed crates that yubaba/cloud depends on during local development
 [patch.crates-io]
-task           = { path = "../qed/crates/task" }
+# Self-patches: qed's crates (patched in below) depend on these by version;
+# patches don't transit workspaces, so this workspace must supply its own.
+workload-spec    = { path = "crates/workload-spec" }
+fob              = { path = "crates/keys" }
+yah-object-store = { path = "crates/object-store" }
+local-driver     = { path = "crates/local-driver" }
+velveteen      = { path = "../qed/crates/task" }
 task-runs      = { path = "../qed/crates/task-runs" }
 task-sessions  = { path = "../qed/crates/task-sessions" }
 observation    = { path = "../qed/crates/observation" }
-scryer         = { path = "../qed/crates/scryer" }
+yah-scryer     = { path = "../qed/crates/scryer" }

@@ -8,7 +8,7 @@
 //!   infra/                                 # substrate registry — Infra tab
 //!     machines/<name>.toml                 # provisioned hosts
 //!     providers/<id>.toml                  # account/runtime bindings
-//!     cloud-init/mirror.yml                # warden bootstrap template
+//!     cloud-init/mirror.yml                # yubaba bootstrap template
 //!     rules/<id>.yaml                      # tower alert rules
 //!   services/<svc>/                        # operator-facing deployables — Services tab
 //!     service.toml                         # name, domain, components
@@ -30,13 +30,13 @@
 //! @yah:verify("cargo check -p yah && cargo check -p agent-tools")
 //! @yah:verify("cargo check -p yah --tests && cargo check -p agent-tools --tests")
 //! @yah:verify("CloudConfig::load(workspace_root) populates providers + services (with mirrors) from the seven Phase-A manifests")
-//! @yah:cleanup("compose.rs + cli/cloud.rs bucket commands + handle_mirror{,_status} + collect_machine_services + derive_public_hostname likely deleted in B3-T2 — confirm against the warden integration story first")
+//! @yah:cleanup("compose.rs + cli/cloud.rs bucket commands + handle_mirror{,_status} + collect_machine_services + derive_public_hostname likely deleted in B3-T2 — confirm against the yubaba integration story first")
 //! @yah:cleanup("agent-tools/cloud_tools.rs's duplicate ServiceConfig/MirrorConfig collapses into a re-import once B3-T3/T4 stabilize the loader API")
 //! @yah:cleanup("MachineConfig::save signature: tighten in B5 once .yah/infra/ vs .yah/cloud/ migration settles")
 //! @yah:next("B4: schemars-generated JSON schemas → .yah/schema/{service,mirror,provider,workload,machine}.toml.schema.json. Implement as an xtask command (not a build script — keeps cloud's compile path clean). Drift test asserts generated == committed. Each manifest's #:schema directive points there.")
 //! @yah:next("R222-T1: Update cloud.mirror_state + cloud.service_ports to read from .yah/services/ layout (currently silently empty in post-B2 workspaces).")
 //! @yah:handoff("B2 landed (prev agent): Provider/ServiceConfig/MirrorConfig types in config.rs, cross-ref validation, 100+ tests passing.")
-//! @yah:handoff("B3 landed: All cli/cloud.rs callers migrated off pre-B2 field names. cfg.mirrors → cfg.legacy_mirrors in machines_for_workload_name, workload_ident_for_machine, machines_for_service, workload-show block. cfg.mirror() → cfg.legacy_mirror() in collect_machine_services, derive_public_hostname, handle_mirror, handle_mirror_status. cfg.services.iter() → cfg.legacy_services.iter() in collect_machine_services. cargo check -p cloud/yah/agent-tools clean; 104 cloud tests pass. compose.rs + bucket commands left pending warden integration confirmation. R222-T1 filed for agent-tools cloud_tools.rs path update (.yah/services/ layout).")
+//! @yah:handoff("B3 landed: All cli/cloud.rs callers migrated off pre-B2 field names. cfg.mirrors → cfg.legacy_mirrors in machines_for_workload_name, workload_ident_for_machine, machines_for_service, workload-show block. cfg.mirror() → cfg.legacy_mirror() in collect_machine_services, derive_public_hostname, handle_mirror, handle_mirror_status. cfg.services.iter() → cfg.legacy_services.iter() in collect_machine_services. cargo check -p cloud/yah/agent-tools clean; 104 cloud tests pass. compose.rs + bucket commands left pending yubaba integration confirmation. R222-T1 filed for agent-tools cloud_tools.rs path update (.yah/services/ layout).")
 
 use std::path::{Path, PathBuf};
 

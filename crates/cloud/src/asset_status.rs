@@ -42,8 +42,12 @@ pub fn build_status_json(
     // alias → (service_name, filename)
     let mut alias_to_asset: HashMap<String, (String, String)> = HashMap::new();
     // (service_name, component_id, assets, aliases)
-    let mut components: Vec<(String, String, Vec<workload_spec::AssetEntry>, std::collections::BTreeMap<String, String>)> =
-        Vec::new();
+    let mut components: Vec<(
+        String,
+        String,
+        Vec<workload_spec::AssetEntry>,
+        std::collections::BTreeMap<String, String>,
+    )> = Vec::new();
 
     for (svc_name, svc) in &cfg.services {
         if !only.is_empty() && !only.contains(svc_name.as_str()) {
@@ -53,8 +57,7 @@ pub fn build_status_json(
             if component.kind != "static-asset" {
                 continue;
             }
-            let workload_path =
-                workspace_root.join(&component.path).join("workload.toml");
+            let workload_path = workspace_root.join(&component.path).join("workload.toml");
             let src = match std::fs::read_to_string(&workload_path) {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -65,8 +68,7 @@ pub fn build_status_json(
             };
             if let workload_spec::Workload::StaticAsset(saw) = workload {
                 for (alias, filename) in &saw.aliases {
-                    alias_to_asset
-                        .insert(alias.clone(), (svc_name.clone(), filename.clone()));
+                    alias_to_asset.insert(alias.clone(), (svc_name.clone(), filename.clone()));
                 }
                 components.push((
                     svc_name.clone(),
@@ -96,10 +98,8 @@ pub fn build_status_json(
     }
 
     // 6. Build services array (grouped by service name).
-    let mut service_map: std::collections::BTreeMap<
-        String,
-        Vec<serde_json::Value>,
-    > = std::collections::BTreeMap::new();
+    let mut service_map: std::collections::BTreeMap<String, Vec<serde_json::Value>> =
+        std::collections::BTreeMap::new();
 
     for (svc_name, component_id, assets, _) in &components {
         let asset_arr: Vec<serde_json::Value> = assets
@@ -148,35 +148,41 @@ pub fn build_status_json(
     // 7. Build apps array.
     let apps_arr: Vec<serde_json::Value> = app_manifests
         .iter()
-        .filter(|(_, manifest)| {
-            filter_app.map_or(true, |name| manifest.name == name)
-        })
+        .filter(|(_, manifest)| filter_app.map_or(true, |name| manifest.name == name))
         .map(|(_, manifest)| {
             let deps: Vec<serde_json::Value> = manifest
                 .asset_deps
                 .iter()
                 .map(|dep| {
                     let required_here = dep.required_here(&host_ctx);
-                    let state_val = alias_to_asset.get(&dep.alias).map(|(svc, filename)| {
-                        let key = format!("{svc}:{filename}");
-                        events.get(&key).map(|ev| {
-                            serde_json::to_value(ev.to).unwrap_or(serde_json::Value::Null)
-                        }).unwrap_or_else(|| {
-                            // Infer from catalog.
-                            components.iter()
-                                .find(|(s, _, assets, _)| {
-                                    s == svc && assets.iter().any(|a| &a.filename == filename)
+                    let state_val = alias_to_asset
+                        .get(&dep.alias)
+                        .map(|(svc, filename)| {
+                            let key = format!("{svc}:{filename}");
+                            events
+                                .get(&key)
+                                .map(|ev| {
+                                    serde_json::to_value(ev.to).unwrap_or(serde_json::Value::Null)
                                 })
-                                .and_then(|(_, _, assets, _)| {
-                                    assets.iter().find(|a| &a.filename == filename)
+                                .unwrap_or_else(|| {
+                                    // Infer from catalog.
+                                    components
+                                        .iter()
+                                        .find(|(s, _, assets, _)| {
+                                            s == svc
+                                                && assets.iter().any(|a| &a.filename == filename)
+                                        })
+                                        .and_then(|(_, _, assets, _)| {
+                                            assets.iter().find(|a| &a.filename == filename)
+                                        })
+                                        .map(|entry| {
+                                            serde_json::to_value(infer_state(entry))
+                                                .unwrap_or(serde_json::Value::Null)
+                                        })
+                                        .unwrap_or(serde_json::json!("pinned-not-published"))
                                 })
-                                .map(|entry| {
-                                    serde_json::to_value(infer_state(entry))
-                                        .unwrap_or(serde_json::Value::Null)
-                                })
-                                .unwrap_or(serde_json::json!("pinned-not-published"))
                         })
-                    }).unwrap_or(serde_json::json!("unknown"));
+                        .unwrap_or(serde_json::json!("unknown"));
 
                     let mut obj = serde_json::json!({
                         "alias": dep.alias,
@@ -190,7 +196,13 @@ pub fn build_status_json(
                 })
                 .collect();
 
-            let overall = compute_overall_from_deps(&manifest.asset_deps, &alias_to_asset, &events, &host_ctx, &components);
+            let overall = compute_overall_from_deps(
+                &manifest.asset_deps,
+                &alias_to_asset,
+                &events,
+                &host_ctx,
+                &components,
+            );
 
             serde_json::json!({
                 "app": manifest.name,
@@ -257,7 +269,12 @@ fn compute_overall_from_deps(
     alias_to_asset: &HashMap<String, (String, String)>,
     events: &HashMap<String, AssetStatusEvent>,
     host_ctx: &HostContext,
-    components: &[(String, String, Vec<workload_spec::AssetEntry>, std::collections::BTreeMap<String, String>)],
+    components: &[(
+        String,
+        String,
+        Vec<workload_spec::AssetEntry>,
+        std::collections::BTreeMap<String, String>,
+    )],
 ) -> &'static str {
     let required_states: Vec<Option<AssetState>> = deps
         .iter()
@@ -266,9 +283,14 @@ fn compute_overall_from_deps(
             alias_to_asset.get(&d.alias).map(|(svc, filename)| {
                 let key = format!("{svc}:{filename}");
                 events.get(&key).map(|ev| ev.to).unwrap_or_else(|| {
-                    components.iter()
-                        .find(|(s, _, assets, _)| s == svc && assets.iter().any(|a| &a.filename == filename))
-                        .and_then(|(_, _, assets, _)| assets.iter().find(|a| &a.filename == filename))
+                    components
+                        .iter()
+                        .find(|(s, _, assets, _)| {
+                            s == svc && assets.iter().any(|a| &a.filename == filename)
+                        })
+                        .and_then(|(_, _, assets, _)| {
+                            assets.iter().find(|a| &a.filename == filename)
+                        })
                         .map(infer_state)
                         .unwrap_or(AssetState::PinnedNotPublished)
                 })
@@ -290,7 +312,10 @@ fn compute_overall_from_deps(
         }
     }
     for s in &required_states {
-        if !matches!(s, Some(AssetState::Published) | Some(AssetState::NotRequired)) {
+        if !matches!(
+            s,
+            Some(AssetState::Published) | Some(AssetState::NotRequired)
+        ) {
             return "amber";
         }
     }

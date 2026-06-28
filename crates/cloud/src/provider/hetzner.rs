@@ -9,7 +9,7 @@
 //! @yah:verify("cargo test -p keys")
 //! @yah:verify("cargo test -p cloud")
 //! @yah:verify("cargo check -p yah --bin yah-agentd")
-//! @yah:gotcha("cargo check --workspace currently fails on app/yah/cli/src/cloud.rs:210 because handle_agent is referenced but not yet defined — that's parallel R040-F7 WIP (yah cloud agent ping/services/logs against yah-warden), not this refactor. The `keys = ...` and HetznerDriver::from_default_sources additions compile clean on their own.")
+//! @yah:gotcha("cargo check --workspace currently fails on app/yah/cli/src/cloud.rs:210 because handle_agent is referenced but not yet defined — that's parallel R040-F7 WIP (yah cloud agent ping/services/logs against yah-yubaba), not this refactor. The `keys = ...` and HetznerDriver::from_default_sources additions compile clean on their own.")
 //!
 //! @yah:ticket(R040-F10, "Pass ssh_keys through to Hetzner create_server (pre-mesh SSH access)")
 //! @yah:at(2026-05-05T00:33:17Z)
@@ -17,8 +17,8 @@
 //! @yah:assignee(agent:claude)
 //! @yah:parent(R040)
 //! @yah:handoff("Threaded ssh_keys end-to-end. MachineConfig.ssh_keys: Vec<u64> with #[serde(default)] (existing toml files unaffected). ServerSpec.ssh_keys mirrors. hetzner.rs::create_server attaches `\"ssh_keys\": [...]` to the POST body when non-empty (Hetzner ignores empty arrays anyway). provision.rs threads MachineConfig.ssh_keys → ProvisionRequest → ServerSpec. 6 test sites updated to add the field; 29/29 cloud tests green.")
-//! @yah:handoff("Live-verified: provisioned yah-cloud-1 (cpx11, hil) via direct API (cloud-crate provision flow blew the 32KiB user_data cap embedding warden — separate ticket). With ssh_keys=[111513970, 111525493] the box accepted SSH on first boot via ~/.ssh/yah, no out-of-band root password recovery needed. The agentd round-trip succeeded over the socket: agent.list_sessions returned {sessions:[]}, bogus method returned -32601, stop-unknown returned {stopped:false}.")
-//! @yah:next("Follow-up R040-Tx: 32KiB user_data cap blocks the canonical `yah cloud machine provision` path because the warden binary embeds at ~3MB after base64. Refactor cloud-init to fetch warden from a URL (GitHub release artifact during cloud-init runcmd) instead of inlining the bytes. Until then, provision flows that need warden need a different transport (post-boot scp + register-hostkey).")
+//! @yah:handoff("Live-verified: provisioned yah-cloud-1 (cpx11, hil) via direct API (cloud-crate provision flow blew the 32KiB user_data cap embedding yubaba — separate ticket). With ssh_keys=[111513970, 111525493] the box accepted SSH on first boot via ~/.ssh/yah, no out-of-band root password recovery needed. The agentd round-trip succeeded over the socket: agent.list_sessions returned {sessions:[]}, bogus method returned -32601, stop-unknown returned {stopped:false}.")
+//! @yah:next("Follow-up R040-Tx: 32KiB user_data cap blocks the canonical `yah cloud machine provision` path because the yubaba binary embeds at ~3MB after base64. Refactor cloud-init to fetch yubaba from a URL (GitHub release artifact during cloud-init runcmd) instead of inlining the bytes. Until then, provision flows that need yubaba need a different transport (post-boot scp + register-hostkey).")
 //! @yah:verify("cargo test -p cloud")
 //! @yah:verify("cargo run -p yah --bin yah -- cloud machine status (sees ssh_keys field via the new yah-cloud-1.toml in .yah/cloud/machines/)")
 //!
@@ -70,12 +70,12 @@ use super::{
     BucketAcl, BucketRef, Location, MachineProvider, ProjectId, ServerId, ServerSpec, ServerStatus,
     ServerSummary,
 };
+use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
+use yah_hetzner::{HetznerClient, HetznerCreateServerSpec};
 use local_driver::s3_sign::{
     sign_s3_delete_bucket, sign_s3_head_bucket, sign_s3_put_bucket, sign_s3_put_bucket_acl,
 };
-use anyhow::{bail, Context, Result};
-use async_trait::async_trait;
-use hetzner::{HetznerClient, HetznerCreateServerSpec};
 use reqwest::StatusCode;
 
 /// Hetzner Cloud + Object Storage driver for Phase-1 mirror bootstrap.
@@ -153,15 +153,14 @@ impl HetznerDriver {
     /// Vault open errors (missing machine.key, etc.) are swallowed — they
     /// just mean "no vault here, try env."
     pub fn from_default_sources() -> Result<Self> {
-        let token = keys::get_or_env("hetzner-api-token", "HETZNER_API_TOKEN")?
-            .context(
-                "no Hetzner API token — set one with `yah keys set hetzner-api-token` \
+        let token = fob::get_or_env("hetzner-api-token", "HETZNER_API_TOKEN")?.context(
+            "no Hetzner API token — set one with `yah keys set hetzner-api-token` \
                  or export HETZNER_API_TOKEN; run `yah cloud secrets` for the full contract",
-            )?;
+        )?;
         let mut driver = Self::new(token);
         if let (Some(ak), Some(sk)) = (
-            keys::get_or_env("hetzner-s3-access-key", "HETZNER_S3_ACCESS_KEY")?,
-            keys::get_or_env("hetzner-s3-secret-key", "HETZNER_S3_SECRET_KEY")?,
+            fob::get_or_env("hetzner-s3-access-key", "HETZNER_S3_ACCESS_KEY")?,
+            fob::get_or_env("hetzner-s3-secret-key", "HETZNER_S3_SECRET_KEY")?,
         ) {
             driver = driver.with_storage(ak, sk);
         }
@@ -212,7 +211,12 @@ impl MachineProvider for HetznerDriver {
 
     async fn server_status(&self, id: &ServerId) -> Result<ServerStatus> {
         let server_id: u64 = id.0.parse().context("invalid server id")?;
-        match self.hclient.get_server(server_id).await.context("server_status")? {
+        match self
+            .hclient
+            .get_server(server_id)
+            .await
+            .context("server_status")?
+        {
             None => Ok(ServerStatus::Unknown("not-found".into())),
             Some(s) => Ok(parse_server_status(&s.status)),
         }
@@ -349,7 +353,10 @@ impl MachineProvider for HetznerDriver {
         let http_status = resp.status();
         // 200 OK or 409 Conflict (bucket already exists and belongs to caller) are both fine.
         if http_status.is_success() || http_status == StatusCode::CONFLICT {
-            return Ok(BucketRef { name: name.to_string(), endpoint });
+            return Ok(BucketRef {
+                name: name.to_string(),
+                endpoint,
+            });
         }
         let text = resp.text().await.unwrap_or_default();
         bail!("create_bucket failed ({http_status}): {text}");
@@ -411,7 +418,10 @@ mod tests {
     fn parse_status_known_values() {
         assert_eq!(parse_server_status("running"), ServerStatus::Running);
         assert_eq!(parse_server_status("off"), ServerStatus::Off);
-        assert_eq!(parse_server_status("initializing"), ServerStatus::Initializing);
+        assert_eq!(
+            parse_server_status("initializing"),
+            ServerStatus::Initializing
+        );
         assert_eq!(
             parse_server_status("banana"),
             ServerStatus::Unknown("banana".into())

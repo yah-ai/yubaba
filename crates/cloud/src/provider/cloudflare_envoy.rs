@@ -84,10 +84,10 @@ impl CloudflareEnvoy {
             .client
             .create_r2_bucket(&self.account_id, &input.name)
             .await
-            .with_context(|| {
-                format!("cloud.object.bucket.create: create {:?}", input.name)
-            })?;
-        Ok(CloudObjectBucketCreateOutput { endpoint: result.endpoint })
+            .with_context(|| format!("cloud.object.bucket.create: create {:?}", input.name))?;
+        Ok(CloudObjectBucketCreateOutput {
+            endpoint: result.endpoint,
+        })
     }
 
     /// Typed handler for `cloud.object.bucket.delete`.
@@ -98,9 +98,7 @@ impl CloudflareEnvoy {
         self.client
             .delete_r2_bucket(&self.account_id, &input.name)
             .await
-            .with_context(|| {
-                format!("cloud.object.bucket.delete: delete {:?}", input.name)
-            })?;
+            .with_context(|| format!("cloud.object.bucket.delete: delete {:?}", input.name))?;
         Ok(CloudObjectBucketDeleteOutput::default())
     }
 
@@ -143,9 +141,7 @@ impl CloudflareEnvoy {
             .client
             .zone_id_for_name(&input.zone)
             .await
-            .with_context(|| {
-                format!("dns.record.upsert: resolve zone {:?}", input.zone)
-            })?;
+            .with_context(|| format!("dns.record.upsert: resolve zone {:?}", input.zone))?;
         let id = self
             .client
             .upsert_dns_record(
@@ -175,16 +171,12 @@ impl CloudflareEnvoy {
             .client
             .zone_id_for_name(&input.zone)
             .await
-            .with_context(|| {
-                format!("dns.record.delete: resolve zone {:?}", input.zone)
-            })?;
+            .with_context(|| format!("dns.record.delete: resolve zone {:?}", input.zone))?;
         let deleted = self
             .client
             .delete_dns_records(&zone_id, &input.name, input.record_type.as_deref())
             .await
-            .with_context(|| {
-                format!("dns.record.delete: {}/{}", input.zone, input.name)
-            })?;
+            .with_context(|| format!("dns.record.delete: {}/{}", input.zone, input.name))?;
         Ok(DnsRecordDeleteOutput { deleted })
     }
 
@@ -224,38 +216,38 @@ impl EnvoyAdapter for CloudflareEnvoy {
     async fn dispatch(&self, verb_id: &str, input: Value) -> Result<Value> {
         match verb_id {
             id if id == CloudObjectBucketCreate::ID => {
-                let args: CloudObjectBucketCreateInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: CloudObjectBucketCreateInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.cloud_object_bucket_create(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
             id if id == CloudObjectBucketDelete::ID => {
-                let args: CloudObjectBucketDeleteInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: CloudObjectBucketDeleteInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.cloud_object_bucket_delete(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
             id if id == CloudObjectBucketExists::ID => {
-                let args: CloudObjectBucketExistsInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: CloudObjectBucketExistsInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.cloud_object_bucket_exists(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
             id if id == DnsRecordUpsert::ID => {
-                let args: DnsRecordUpsertInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: DnsRecordUpsertInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.dns_record_upsert(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
             id if id == DnsRecordDelete::ID => {
-                let args: DnsRecordDeleteInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: DnsRecordDeleteInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.dns_record_delete(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
             id if id == DnsZoneList::ID => {
-                let args: DnsZoneListInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: DnsZoneListInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.dns_zone_list(args).await?;
                 Ok(serde_json::to_value(out)?)
             }

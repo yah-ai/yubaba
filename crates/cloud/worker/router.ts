@@ -24,10 +24,20 @@
 
 // Worker router for mesofact-static sites.
 // Config injected via plain_text Worker bindings:
-//   ASSET_ORIGIN             — base URL for static assets (no trailing slash)
+//   ASSET_ORIGIN             — base URL for static (build-output) assets (no
+//                              trailing slash); the catch-all for non-route URLs
+//   UPLOAD_ORIGIN            — base URL for dynamic, user-writable content under
+//                              /uploads/* (R490-T8). Reserved seam: no writer
+//                              exists yet. Absent → /uploads/* returns 404.
+//                              Kept distinct from ASSET_ORIGIN so the publisher's
+//                              build-diff purge never treats uploads as stale and
+//                              write-auth / cache rules can diverge per prefix.
 //   WORKER_MODE              — "static" | "spa" | "ssr"
 //   SSR_ORIGIN               — SSR proxy origin URL (empty string for non-SSR modes)
 //   SSR_PREFIXES             — JSON-encoded array of path prefixes to proxy to SSR_ORIGIN
+//   SSR_RESILIENCE           — JSON-encoded `{ [prefix]: ResiliencePolicy }` (W181 v1);
+//                              optional; absent/invalid → no-op (one attempt, no
+//                              per-attempt timeout — today's behavior)
 //   MESOFACT_BACKEND_ORIGIN  — almanac surface (e.g. http://mesofact-dev:4323);
 //                              when set, /api/releases* is proxied here
 //   ISSUES_ORIGIN            — issue-tracker surface (e.g. http://mesofact-dev:8731);
@@ -35,39 +45,63 @@
 
 interface Env {
   ASSET_ORIGIN: string;
+  UPLOAD_ORIGIN?: string;
   WORKER_MODE: string;
   SSR_ORIGIN: string;
   SSR_PREFIXES: string;
+  SSR_RESILIENCE?: string;
   MESOFACT_BACKEND_ORIGIN?: string;
   ISSUES_ORIGIN?: string;
 }
+
+// W181 v1 schema mirror — see oss/mesofact/packages/mesofact-runtime/src/routes.ts.
+// Worker only consumes retry+timeout; queue is rejected upstream at defineRoutes.
+type RetryOn = "connection" | "5xx" | "any";
+interface RetryPolicy {
+  attempts: number;
+  backoff_ms: number[];
+  retry_on?: RetryOn;
+  budget_ms?: number;
+}
+interface ResiliencePolicy {
+  retry?: RetryPolicy;
+  timeout_ms?: number;
+}
+type ResilienceMap = Record<string, ResiliencePolicy>;
+
+const DEFAULT_TIMEOUT_MS = 30_000;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
+    const resilience = parseResilience(env.SSR_RESILIENCE);
 
     // Backend API routing (R455-T4): /api/issues* → ISSUES_ORIGIN,
     // /api/releases* → MESOFACT_BACKEND_ORIGIN. Takes priority over SSR
     // routing so pond/prod paths hit the backend container directly.
     if (env.ISSUES_ORIGIN && path.startsWith("/api/issues")) {
-      return fetch(
-        new Request(env.ISSUES_ORIGIN + "/issues" + path.slice("/api/issues".length) + url.search, {
-          method: request.method,
-          headers: request.headers,
-          body: ["GET", "HEAD"].includes(request.method) ? undefined : request.body,
-          redirect: "follow",
-        })
+      const target =
+        env.ISSUES_ORIGIN +
+        "/issues" +
+        path.slice("/api/issues".length) +
+        url.search;
+      return proxyWithResilience(
+        request,
+        target,
+        policyFor(resilience, path)
       );
     }
     if (env.MESOFACT_BACKEND_ORIGIN && path.startsWith("/api/releases")) {
-      return fetch(
-        new Request(env.MESOFACT_BACKEND_ORIGIN + "/releases" + path.slice("/api/releases".length) + url.search, {
-          method: request.method,
-          headers: request.headers,
-          body: ["GET", "HEAD"].includes(request.method) ? undefined : request.body,
-          redirect: "follow",
-        })
+      const target =
+        env.MESOFACT_BACKEND_ORIGIN +
+        "/releases" +
+        path.slice("/api/releases".length) +
+        url.search;
+      return proxyWithResilience(
+        request,
+        target,
+        policyFor(resilience, path)
       );
     }
 
@@ -82,21 +116,33 @@ export default {
       // Segment-aware match (W173): exact prefix OR descendant under prefix.
       // Naive `path.startsWith(p)` would proxy /api/healthcheck to an
       // /api/health origin — bytes match, segments don't.
-      const matches = prefixes.some(
+      const matched = prefixes.find(
         (p) => path === p || path.startsWith(p.endsWith("/") ? p : p + "/")
       );
-      if (matches) {
-        return fetch(
-          new Request(env.SSR_ORIGIN + path + url.search, {
-            method: request.method,
-            headers: request.headers,
-            body: ["GET", "HEAD"].includes(request.method)
-              ? undefined
-              : request.body,
-            redirect: "follow",
-          })
+      if (matched) {
+        const target = env.SSR_ORIGIN + path + url.search;
+        return proxyWithResilience(
+          request,
+          target,
+          policyFor(resilience, path)
         );
       }
+    }
+
+    // Dynamic user content (R490-T8): /uploads/* routes to UPLOAD_ORIGIN,
+    // separate from the build-output static assets on ASSET_ORIGIN. No writer
+    // exists yet — the binding is a reserved seam; absent → clean 404, and a
+    // miss is a real 404 (never the SPA shell or 404.html, which belong to the
+    // static site). Segment-aware: the trailing slash keeps /uploadsfoo out.
+    if (path.startsWith("/uploads/")) {
+      if (!env.UPLOAD_ORIGIN) {
+        return new Response("Not Found", { status: 404 });
+      }
+      const uploadResp = await fetch(`${env.UPLOAD_ORIGIN}/${path.slice(1)}`);
+      if (uploadResp.ok) {
+        return uploadResp;
+      }
+      return new Response("Not Found", { status: 404 });
     }
 
     // Resolve asset key from URL path
@@ -135,3 +181,156 @@ export default {
     }
   },
 };
+
+function parseResilience(raw: string | undefined): ResilienceMap {
+  if (!raw) return {};
+  try {
+    const v = JSON.parse(raw);
+    return v && typeof v === "object" ? (v as ResilienceMap) : {};
+  } catch {
+    return {};
+  }
+}
+
+// W173 segment-aware match: pick the longest matching prefix.
+function policyFor(
+  map: ResilienceMap,
+  path: string
+): ResiliencePolicy | undefined {
+  let best: { prefix: string; policy: ResiliencePolicy } | undefined;
+  for (const [prefix, policy] of Object.entries(map)) {
+    const matches =
+      path === prefix ||
+      path.startsWith(prefix.endsWith("/") ? prefix : prefix + "/");
+    if (!matches) continue;
+    if (!best || prefix.length > best.prefix.length) {
+      best = { prefix, policy };
+    }
+  }
+  return best?.policy;
+}
+
+// Proxy `request` to `targetUrl`, applying the route's resilience policy.
+// On no policy: one attempt, no per-attempt timeout — today's behavior.
+async function proxyWithResilience(
+  request: Request,
+  targetUrl: string,
+  policy: ResiliencePolicy | undefined
+): Promise<Response> {
+  const method = request.method;
+  const hasBody = !["GET", "HEAD"].includes(method);
+
+  // Buffer the body once so retries don't try to re-read a consumed stream.
+  // ReadableStreams are one-shot; if we hand the same body to two fetches the
+  // second call sees an empty body. Bodies are bounded by Worker request
+  // limits (100MB) — buffering in memory is acceptable for retry budgets.
+  let bodyBuf: ArrayBuffer | undefined;
+  if (hasBody) {
+    bodyBuf = await request.arrayBuffer();
+  }
+
+  const retry = policy?.retry;
+  const attempts = Math.max(1, retry?.attempts ?? 1);
+  const backoffMs = retry?.backoff_ms ?? [];
+  const retryOn: RetryOn = retry?.retry_on ?? "connection";
+  const timeoutMs = policy?.timeout_ms;
+  const budgetMs = retry?.budget_ms;
+  const start = Date.now();
+
+  let lastErr: unknown;
+  let lastResp: Response | undefined;
+
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (attempt > 0) {
+      const gap = backoffMs[attempt - 1] ?? 0;
+      if (gap > 0) await sleep(gap);
+    }
+    if (budgetMs !== undefined && Date.now() - start >= budgetMs) {
+      break;
+    }
+    const init: RequestInit = {
+      method,
+      headers: request.headers,
+      body: hasBody ? bodyBuf : undefined,
+      redirect: "follow",
+    };
+    const controller = timeoutMs !== undefined ? new AbortController() : undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    if (controller) {
+      init.signal = controller.signal;
+      timer = setTimeout(() => controller.abort(), timeoutMs);
+    }
+    try {
+      const resp = await fetch(targetUrl, init);
+      if (timer) clearTimeout(timer);
+      // HTTP-level success — return verbatim unless policy retries on 5xx/any.
+      if (!shouldRetryOnStatus(resp.status, retryOn)) {
+        emitTelemetry(targetUrl, attempt + 1, "ok", Date.now() - start);
+        return resp;
+      }
+      lastResp = resp;
+      // Consume body so the connection can be released before retrying.
+      try {
+        await resp.arrayBuffer();
+      } catch {
+        // best-effort
+      }
+    } catch (err) {
+      if (timer) clearTimeout(timer);
+      lastErr = err;
+      if (retryOn !== "connection" && retryOn !== "5xx" && retryOn !== "any") {
+        break;
+      }
+      // Connection-level errors are always retryable when ANY retry policy is
+      // declared — `retry_on: "5xx"` still retries connection failures (they
+      // strictly subsume the 5xx case).
+    }
+  }
+
+  const latency = Date.now() - start;
+  if (lastResp) {
+    emitTelemetry(targetUrl, attempts, "exhausted_5xx", latency);
+    return lastResp;
+  }
+  emitTelemetry(targetUrl, attempts, "exhausted_connection", latency);
+  return new Response(
+    `upstream unreachable: ${stringifyErr(lastErr)}`,
+    { status: 502, headers: { "Content-Type": "text/plain" } }
+  );
+}
+
+function shouldRetryOnStatus(status: number, retryOn: RetryOn): boolean {
+  if (status < 400) return false;
+  if (retryOn === "any") return status >= 400;
+  if (retryOn === "5xx") return status >= 500;
+  return false;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function stringifyErr(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === "string") return e;
+  return "unknown error";
+}
+
+// W181 v1 telemetry: emit one structured log per request. CF Workers picks up
+// console.log; downstream is OTel export, deferred per W181 § "Deferred to v2".
+function emitTelemetry(
+  target: string,
+  attempts: number,
+  outcome: "ok" | "exhausted_connection" | "exhausted_5xx",
+  latencyMs: number
+): void {
+  console.log(
+    JSON.stringify({
+      kind: "mesofact.resilience",
+      target,
+      attempts,
+      outcome,
+      latency_ms: latencyMs,
+    })
+  );
+}

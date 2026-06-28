@@ -185,24 +185,38 @@ mod tests {
         let parsed: CiPipelineRunInput = serde_json::from_str(no_vars).unwrap();
         assert!(parsed.variables.is_none());
 
-        let with_vars =
-            r#"{"pipeline":"build.yml","ref":"main","variables":{"ENV":"staging"}}"#;
+        let with_vars = r#"{"pipeline":"build.yml","ref":"main","variables":{"ENV":"staging"}}"#;
         let parsed: CiPipelineRunInput = serde_json::from_str(with_vars).unwrap();
         assert_eq!(
-            parsed.variables.as_ref().unwrap().get("ENV").map(|s| s.as_str()),
+            parsed
+                .variables
+                .as_ref()
+                .unwrap()
+                .get("ENV")
+                .map(|s| s.as_str()),
             Some("staging")
         );
     }
 
     #[test]
     fn pipeline_phase_is_snake_case() {
-        assert_eq!(serde_json::to_string(&PipelinePhase::Passing).unwrap(), "\"passing\"");
-        assert_eq!(serde_json::to_string(&PipelinePhase::Unknown).unwrap(), "\"unknown\"");
+        assert_eq!(
+            serde_json::to_string(&PipelinePhase::Passing).unwrap(),
+            "\"passing\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PipelinePhase::Unknown).unwrap(),
+            "\"unknown\""
+        );
     }
 
     #[test]
     fn pipeline_status_omits_detail_when_absent() {
-        let out = CiPipelineStatusOutput { phase: PipelinePhase::Running, url: None, detail: None };
+        let out = CiPipelineStatusOutput {
+            phase: PipelinePhase::Running,
+            url: None,
+            detail: None,
+        };
         let wire = serde_json::to_value(&out).unwrap();
         assert!(!wire.as_object().unwrap().contains_key("detail"));
     }

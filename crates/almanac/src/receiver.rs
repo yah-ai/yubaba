@@ -8,17 +8,17 @@
 //! @yah:next("On revalidate: load the feed, reject (4xx) unless on_change.service resolves to a mirror binding matching the receiver's own env.")
 //! @yah:next("Lands with R330-F4 (wires receiver into the reconciler). Satisfies R335-T2's negative case WITHOUT auth.")
 //!
-//! @yah:ticket(R335-F5, "Per-mirror capability gate on /revalidate (warden/xlb-net node identity)")
+//! @yah:ticket(R335-F5, "Per-mirror capability gate on /revalidate (yubaba/xlb-net node identity)")
 //! @yah:assignee(agent:claude)
 //! @yah:at(2026-05-27T02:39:12Z)
 //! @yah:status(review)
 //! @yah:phase(P3)
 //! @yah:parent(R335)
-//! @yah:next("Design captured in .yah/docs/working/W058-almanac-mirror-binding.md §12. Implementation gated on warden control plane (authorized-signer-set provisioning + rotation) — file a fresh impl ticket when warden lands.")
+//! @yah:next("Design captured in .yah/docs/working/W058-almanac-mirror-binding.md §12. Implementation gated on yubaba control plane (authorized-signer-set provisioning + rotation) — file a fresh impl ticket when yubaba lands.")
 //! @yah:next("Near-term mechanism = mode A (signed request over the existing HTTP receiver, asymmetric, request-bound); converges to mode C (xlb-net authenticated transport, verified peer NodeId) for cross-machine cloud/ha. mode B (macaroon) reserved for delegation/attenuation only.")
 //! @yah:next("When buildable: add authorized_signers (from .yah/services/<id>/mirrors/<env>.toml) to MirrorBind; replace the mirror_key body field with {signer,nonce,expiry,sig}; 401 invalid sig / 403 signer-not-authorized; nonce+expiry freshness cache.")
 //! @yah:next("Bootstrap = operator key seeded into the cloud receiver's signer set + revalidate port on ExposeSpec.operator (Tailscale tag) — mirror-sage.")
-//! @yah:handoff("Design-only deliverable complete. §12 of .yah/docs/working/W058-almanac-mirror-binding.md specifies the per-mirror /revalidate capability gate: (1) why mirror_key is insufficient (static symmetric bearer secret, replayable, identity-blind, no freshness); (2) identity grain = warden/xlb-net Ed25519 node identity (warden/src/identity.rs hostkey + iroh NodeId), infra not cheers; (3) mechanism options A signed-request / B macaroon / C authenticated-transport with recommendation (A near-term on the existing HTTP receiver, converging to C for cross-machine cloud/ha); (4) authorized-signer set declared in .yah/services/<id>/mirrors/<env>.toml, composing with OnChangeConfig.service (not a new AlmanacManifest field); (5) operator-bridge bootstrap riding ExposeSpec.operator Tailscale tag (mirror-sage); (6) receiver-shape sketch + status codes. receiver.rs MirrorBind.env and mirror_key doc comments now point at §12. NO mechanism built — implementation gated on warden's control plane.")
+//! @yah:handoff("Design-only deliverable complete. §12 of .yah/docs/working/W058-almanac-mirror-binding.md specifies the per-mirror /revalidate capability gate: (1) why mirror_key is insufficient (static symmetric bearer secret, replayable, identity-blind, no freshness); (2) identity grain = yubaba/xlb-net Ed25519 node identity (yubaba/src/identity.rs hostkey + iroh NodeId), infra not cheers; (3) mechanism options A signed-request / B macaroon / C authenticated-transport with recommendation (A near-term on the existing HTTP receiver, converging to C for cross-machine cloud/ha); (4) authorized-signer set declared in .yah/services/<id>/mirrors/<env>.toml, composing with OnChangeConfig.service (not a new AlmanacManifest field); (5) operator-bridge bootstrap riding ExposeSpec.operator Tailscale tag (mirror-sage); (6) receiver-shape sketch + status codes. receiver.rs MirrorBind.env and mirror_key doc comments now point at §12. NO mechanism built — implementation gated on yubaba's control plane.")
 //! @yah:gotcha("F5 SUPERSEDES mirror_key (R335-F2) — it is a replacement, not an additional auth knob. F3's feed-binding check (is-this-feed-mine) is orthogonal to F5 (are-you-allowed-to-ask) and stays.")
 //!
 
@@ -53,7 +53,7 @@ pub struct MirrorBind {
     /// logging; also the key the R335-F5 capability gate scopes its
     /// authorized-signer set by (per-`(service, env)` mirror). See the design
     /// in `.yah/docs/working/W058-almanac-mirror-binding.md` §12 — it supersedes the
-    /// static `mirror_key` below with a node-identity signature once warden's
+    /// static `mirror_key` below with a node-identity signature once yubaba's
     /// control plane can provision the signer set.
     pub env: String,
     /// Directory containing feed TOML files (`.yah/almanac/`).

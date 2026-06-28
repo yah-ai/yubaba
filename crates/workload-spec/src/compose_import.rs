@@ -13,7 +13,7 @@
 //!   `image:` reference").
 //! - Custom networks → flattened to the mesh; warns when topology can't be
 //!   preserved.
-//! - Bind volumes → echoed as warning that warden requires `tier = "infra"`
+//! - Bind volumes → echoed as warning that yubaba requires `tier = "infra"`
 //!   (the importer auto-promotes the spec's tier when bind mounts are
 //!   present so the result still passes shape validation).
 //! - Healthcheck blocks → noted as warning; not translated in V1 (compose's
@@ -71,19 +71,19 @@ pub enum ImportError {
     #[error("compose file has no `services:` block")]
     NoServices,
 
-    /// A service uses `network_mode: host`. Warden has no host-networking
+    /// A service uses `network_mode: host`. Yubaba has no host-networking
     /// escape hatch — every workload runs on the mesh. See arch doc
     /// §"What's deliberately not in the schema".
     #[error(
-        "service {service:?}: network_mode=host is not supported on the warden mesh \
+        "service {service:?}: network_mode=host is not supported on the yubaba mesh \
          (every workload runs through the mesh; see \
          .yah/docs/architecture/A054-yah-workload-spec.md §\"What's deliberately not in the schema\")"
     )]
     HostNetwork { service: String },
 
-    /// A service has neither `image:` nor a usable image fallback. Warden
+    /// A service has neither `image:` nor a usable image fallback. Yubaba
     /// can't deploy without an image reference.
-    #[error("service {service:?}: no `image:` field — warden requires an image reference")]
+    #[error("service {service:?}: no `image:` field — yubaba requires an image reference")]
     MissingImage { service: String },
 
     /// A service's `image:` reference lacks an `@sha256:<hex>` digest pin.
@@ -118,13 +118,13 @@ pub fn import_compose(yaml: &str) -> Result<ImportResult, ImportError> {
 
     let mut warnings = Vec::new();
 
-    // Top-level networks: warden flattens to one mesh, so any custom networks
+    // Top-level networks: yubaba flattens to one mesh, so any custom networks
     // are lossy.
     if !compose.networks.is_empty() {
         warnings.push(ImportWarning {
             path: "networks".into(),
             message: format!(
-                "compose declared {} custom network(s) ({}); warden flattens all workloads \
+                "compose declared {} custom network(s) ({}); yubaba flattens all workloads \
                  onto one mesh — segmentation must be re-expressed via tier `allow_from`",
                 compose.networks.len(),
                 compose
@@ -166,7 +166,7 @@ fn translate_service(
             warnings.push(ImportWarning {
                 path: format!("services.{name}.network_mode"),
                 message: format!(
-                    "network_mode={mode:?} ignored — warden runs every workload on the mesh"
+                    "network_mode={mode:?} ignored — yubaba runs every workload on the mesh"
                 ),
             });
         }
@@ -531,7 +531,7 @@ fn translate_restart(
             warnings.push(ImportWarning {
                 path: format!("services.{service}.restart"),
                 message: "restart=unless-stopped translated to RestartPolicy::Always — \
-                          warden has no manual-stop concept the policy can opt out of"
+                          yubaba has no manual-stop concept the policy can opt out of"
                     .into(),
             });
             RestartPolicy::Always
@@ -690,7 +690,7 @@ impl PortSpec {
 
 /// Compose short-form port shapes: `"80"`, `"8080:80"`, `"127.0.0.1:8080:80"`,
 /// `"8080:80/udp"`. We extract the container-side port and ignore host-side
-/// binding (warden's mesh handles that).
+/// binding (yubaba's mesh handles that).
 fn parse_short_port(s: &str) -> Result<u16, String> {
     let no_proto = s.split('/').next().unwrap_or(s);
     let segments: Vec<&str> = no_proto.split(':').collect();

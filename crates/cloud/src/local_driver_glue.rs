@@ -2,7 +2,7 @@
 //! [`local_driver::LocalContainerSpec`].
 //!
 //! Lives in the cloud crate (rather than `local-driver`) so the driver crate
-//! stays decoupled from cloud's config types. Callers in cloud + warden that
+//! stays decoupled from cloud's config types. Callers in cloud + yubaba that
 //! need a [`LocalContainerSpec`] from a `kind = "local-container"` provider
 //! TOML go through [`local_container_spec_from_provider`].
 
@@ -115,7 +115,10 @@ custom_docker_host = "tcp://localhost:2375"
         let p: ProviderConfig = toml::from_str(src).unwrap();
         let spec = local_container_spec_from_provider(&p).unwrap();
         assert_eq!(spec.runtime, RuntimePref::Custom);
-        assert_eq!(spec.custom_docker_host.as_deref(), Some("tcp://localhost:2375"));
+        assert_eq!(
+            spec.custom_docker_host.as_deref(),
+            Some("tcp://localhost:2375")
+        );
     }
 
     #[test]
@@ -127,8 +130,13 @@ custom_docker_host = "tcp://localhost:2375"
             credentials: None,
             fields: BTreeMap::new(),
         };
-        let err = local_container_spec_from_provider(&p).unwrap_err().to_string();
-        assert!(err.contains("Cloudflare"), "error should name the wrong kind, got: {err}");
+        let err = local_container_spec_from_provider(&p)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Cloudflare"),
+            "error should name the wrong kind, got: {err}"
+        );
     }
 
     #[test]
@@ -140,8 +148,13 @@ kind = "local-container"
 runtime = "nonsense-runtime"
 "#;
         let p: ProviderConfig = toml::from_str(src).unwrap();
-        let err = local_container_spec_from_provider(&p).unwrap_err().to_string();
-        assert!(err.contains("nonsense-runtime"), "error should name the bad value, got: {err}");
+        let err = local_container_spec_from_provider(&p)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("nonsense-runtime"),
+            "error should name the bad value, got: {err}"
+        );
     }
 
     #[test]
@@ -155,8 +168,13 @@ kind = "local-container"
 orbstack = 42
 "#;
         let p: ProviderConfig = toml::from_str(src).unwrap();
-        let err = local_container_spec_from_provider(&p).unwrap_err().to_string();
-        assert!(err.contains("orbstack"), "error should name the bad key, got: {err}");
+        let err = local_container_spec_from_provider(&p)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("orbstack"),
+            "error should name the bad key, got: {err}"
+        );
     }
 
     // ── live integration tests (require a reachable docker socket) ───────────
@@ -211,7 +229,10 @@ orbstack = 42
         assert_eq!(state, Some(ContainerState::Running));
         let owned = runtime.list_owned().await.unwrap();
         assert!(owned.iter().any(|c| c.name == spec.name));
-        runtime.stop_and_remove(&spec.name, Duration::from_secs(2)).await.unwrap();
+        runtime
+            .stop_and_remove(&spec.name, Duration::from_secs(2))
+            .await
+            .unwrap();
         let state = runtime.container_state(&spec.name).await.unwrap();
         assert_eq!(state, None);
         // Path-only fixture suppresses "unused" warning on platforms without a socket.

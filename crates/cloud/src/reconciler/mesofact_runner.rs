@@ -6,7 +6,7 @@
 //! error so a dispatcher arm doesn't silently report success.
 //!
 //! The dispatcher wiring (`app/yah/cli/src/cloud.rs::reconcile_component`
-//! + `app/yah/desktop/src/mirror_run.rs`) and the live warden bring-up
+//! + `app/yah/desktop/src/mirror_run.rs`) and the live yubaba bring-up
 //! land in a follow-up slice — see R330-F11's handoff annotation for the
 //! cut-list.
 
@@ -69,36 +69,51 @@ impl Reconciler for MesofactRunnerReconciler {
             );
         }
 
+        // Dispatcher arms ARE wired now (R330-F11 Step 4): cli
+        // reconcile_component + desktop mirror_run route `mesofact-runner`
+        // here. Placement constraints are validated above. What remains is
+        // the live yubaba bring-up on the resolved box — which needs yubaba
+        // actually running on the runner (R330-T9) and the apply-layer to
+        // resolve the concrete machine via `resolve_runner_machine` (the
+        // F16-region-aware resolver) and hand it the MesofactRunnerSpec. That
+        // is Step 6 (live deploy), blocked on T9.
         bail!(
-            "mesofact-runner dispatcher wiring pending (R330-F11 follow-up slice): \
-             validated placement against tags {:?} for service={}, env={}, but no warden \
-             bring-up is wired yet — see crates/yah/local-driver/src/cloud_mesofact_runner.rs \
-             for the runtime spec",
-            required.mesh_tags, ctx.service.name, ctx.env,
+            "mesofact-runner placement validated ({}) for service={}, env={}, but live yubaba \
+             bring-up is not wired yet — blocked on R330-T9 (yubaba not yet running on the \
+             runner box) + R330-F11 Step 6 (live deploy). The apply layer resolves the target \
+             machine via cloud::reconciler::mesofact_runner::resolve_runner_machine and hands it \
+             the MesofactRunnerSpec from crates/yah/local-driver/src/cloud_mesofact_runner.rs.",
+            required.describe(),
+            ctx.service.name,
+            ctx.env,
         )
     }
 }
 
 /// F16 helper: resolve which machine the mesofact-runner workload should
 /// land on for the given mirror. Returns `None` when the mirror's compute
-/// slot has no `required` block, when `required.mesh_tags` is empty, or
-/// when no machine carries the superset. Callers route a `None` result
-/// to a structured error.
+/// slot has no `required` block, when that block carries no constraints at
+/// all, or when no machine satisfies it. Callers route a `None` result to a
+/// structured error.
 ///
-/// Lives here (not on `CloudConfig`) because it composes the
-/// MirrorProviderSlot parser with the mesh-tag resolver — both surfaces
-/// the cloud crate already exposes — and ties them to this reconciler's
-/// dispatch convention (compute slot, mesofact-runner kind).
+/// Honors the **full** F16 placement spec — region/zone/provider membership
+/// plus mesh_tags superset — via [`CloudConfig::resolve_machine`], so a
+/// `required.regions = ["us-west"]` constraint excludes a same-tag box in
+/// another region. (The older mesh-tags-only path was the F11 stub.)
+///
+/// Lives here (not on `CloudConfig`) because it ties the MirrorProviderSlot
+/// parser to this reconciler's dispatch convention (compute slot,
+/// mesofact-runner kind).
 pub fn resolve_runner_machine<'a>(
     cfg: &'a CloudConfig,
     mirror: &crate::MirrorConfig,
 ) -> Option<&'a crate::MachineConfig> {
     let slot = mirror.providers.get("compute")?;
     let required = slot.required()?;
-    if required.mesh_tags.is_empty() {
+    if required.is_unconstrained() {
         return None;
     }
-    cfg.resolve_machine_by_mesh_tags(&required.mesh_tags)
+    cfg.resolve_machine(&required).ok()
 }
 
 #[cfg(test)]
@@ -113,15 +128,18 @@ mod tests {
         MachineConfig {
             name: name.into(),
             provider: "hetzner".into(),
-            location: "hil".into(),
-            server_type: "ccx13".into(),
+            location: Some("hil".into()),
+            server_type: Some("ccx13".into()),
             hosts_mirrors: vec![],
             mesh_tags: tags.into_iter().map(String::from).collect(),
+            region: None,
+            zone: None,
             bucket: None,
             hostkey_fingerprint: None,
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
+            connect: None,
         }
     }
 
@@ -143,7 +161,9 @@ mod tests {
         let mut fields: BTreeMap<String, toml::Value> = BTreeMap::new();
         let mut required_table = toml::value::Table::new();
         let tag_array = toml::Value::Array(
-            tags.into_iter().map(|t| toml::Value::String(t.into())).collect(),
+            tags.into_iter()
+                .map(|t| toml::Value::String(t.into()))
+                .collect(),
         );
         required_table.insert("mesh_tags".into(), tag_array);
         fields.insert("required".into(), toml::Value::Table(required_table));
@@ -189,5 +209,78 @@ mod tests {
         let cfg = cfg_with(vec![machine("yah-bnt-1", vec!["tag:primary-yah"])]);
         let mirror = mirror_with_required(vec!["tag:cloud-runner"]);
         assert!(resolve_runner_machine(&cfg, &mirror).is_none());
+    }
+
+    /// A machine carrying a `region` label plus tags.
+    fn machine_in_region(name: &str, region: &str, tags: Vec<&str>) -> MachineConfig {
+        MachineConfig {
+            region: Some(region.into()),
+            zone: Some(region.into()),
+            ..machine(name, tags)
+        }
+    }
+
+    /// Mirror whose compute slot constrains BOTH region and mesh_tags.
+    fn mirror_with_region_and_tags(region: &str, tags: Vec<&str>) -> MirrorConfig {
+        let mut required_table = toml::value::Table::new();
+        required_table.insert(
+            "regions".into(),
+            toml::Value::Array(vec![toml::Value::String(region.into())]),
+        );
+        required_table.insert(
+            "mesh_tags".into(),
+            toml::Value::Array(
+                tags.into_iter()
+                    .map(|t| toml::Value::String(t.into()))
+                    .collect(),
+            ),
+        );
+        let mut fields: BTreeMap<String, toml::Value> = BTreeMap::new();
+        fields.insert("required".into(), toml::Value::Table(required_table));
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "compute".into(),
+            MirrorProviderSlot::Reference {
+                provider_id: "hetzner".into(),
+                fields,
+            },
+        );
+        MirrorConfig {
+            schema_version: 1,
+            shape: MirrorShape::SingleMachine,
+            providers,
+            asset_aliases: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_runner_machine_honors_region_axis() {
+        // Two same-tag boxes in different regions; the region constraint picks.
+        let cfg = cfg_with(vec![
+            machine_in_region("us-west-001", "us-west", vec!["tag:cloud-runner"]),
+            machine_in_region("eu-west-001", "eu-west", vec!["tag:cloud-runner"]),
+        ]);
+        let picked = resolve_runner_machine(
+            &cfg,
+            &mirror_with_region_and_tags("us-west", vec!["tag:cloud-runner"]),
+        )
+        .map(|m| m.name.as_str());
+        assert_eq!(picked, Some("us-west-001"));
+    }
+
+    #[test]
+    fn resolve_runner_machine_region_mismatch_excludes_same_tag_box() {
+        // The box has the tag but the WRONG region → no placement (fail loud
+        // upstream), proving region isn't silently ignored.
+        let cfg = cfg_with(vec![machine_in_region(
+            "us-west-001",
+            "us-west",
+            vec!["tag:cloud-runner"],
+        )]);
+        let picked = resolve_runner_machine(
+            &cfg,
+            &mirror_with_region_and_tags("eu-west", vec!["tag:cloud-runner"]),
+        );
+        assert!(picked.is_none());
     }
 }

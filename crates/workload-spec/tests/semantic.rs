@@ -227,7 +227,7 @@ fn unknown_secret_returns_semantic_error() {
     let mut spec = minimal_spec();
     spec.secrets.push(SecretMount {
         source: SecretRef::LocalFile {
-            path: PathBuf::from("/var/lib/yah/warden/secrets/api-key"),
+            path: PathBuf::from("/var/lib/yah/yubaba/secrets/api-key"),
         },
         target: SecretTarget::EnvVar { name: "API_KEY".into() },
     });
@@ -255,14 +255,14 @@ fn known_secret_passes() {
     let mut spec = minimal_spec();
     spec.secrets.push(SecretMount {
         source: SecretRef::LocalFile {
-            path: PathBuf::from("/var/lib/yah/warden/secrets/api-key"),
+            path: PathBuf::from("/var/lib/yah/yubaba/secrets/api-key"),
         },
         target: SecretTarget::EnvVar { name: "API_KEY".into() },
     });
 
     let ctx = FakeContext::builder()
         .image("docker.io", "library/alpine", "3.19")
-        .secret_file("/var/lib/yah/warden/secrets/api-key")
+        .secret_file("/var/lib/yah/yubaba/secrets/api-key")
         .with_capacity()
         .build();
 

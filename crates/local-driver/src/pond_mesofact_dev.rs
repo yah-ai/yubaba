@@ -6,14 +6,14 @@
 //!  - `POST /revalidate` + `/healthz` + `/readyz` on [`MesofactDevSpec::almanac_port`]
 //!  - `POST /issues` + IssuesFeed loop + `/healthz` + `/readyz` on [`MesofactDevSpec::issues_port`]
 //!
-//! Both ports are published to host so the embedded warden reconciler
-//! ([`warden::pond::mesofact_dev::MesofactDevReconciler`]) can probe liveness
-//! and readiness from outside the bridge. After Phase C (warden containerised),
+//! Both ports are published to host so the embedded yubaba reconciler
+//! ([`yubaba::pond::mesofact_dev::MesofactDevReconciler`]) can probe liveness
+//! and readiness from outside the bridge. After Phase C (yubaba containerised),
 //! the ports can be unpublished and the reconciler can probe via bridge DNS.
 //!
 //! Used by:
 //!
-//! - `warden::pond::mesofact_dev::MesofactDevReconciler` — supervisor + restart
+//! - `yubaba::pond::mesofact_dev::MesofactDevReconciler` — supervisor + restart
 //!   loop that owns the running container slot.
 
 use std::collections::BTreeMap;

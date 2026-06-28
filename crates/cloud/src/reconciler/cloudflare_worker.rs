@@ -80,12 +80,8 @@ impl Reconciler for CloudflareWorkerReconciler {
                 ctx.service.name, ctx.env,
             )
         })?;
-        let (zone, domain) = read_registry_slot(
-            registry_slot,
-            registry_role,
-            &ctx.service.name,
-            ctx.env,
-        )?;
+        let (zone, domain) =
+            read_registry_slot(registry_slot, registry_role, &ctx.service.name, ctx.env)?;
 
         // (3) Read [build] + [[bindings]] from workload.toml.
         let workload_dir = ctx.workload_dir();
@@ -128,10 +124,7 @@ impl Reconciler for CloudflareWorkerReconciler {
         }
 
         // (7) Read bundled entrypoint.
-        let entrypoint_rel = workload
-            .entrypoint
-            .as_deref()
-            .unwrap_or("dist/index.js");
+        let entrypoint_rel = workload.entrypoint.as_deref().unwrap_or("dist/index.js");
         let entrypoint_path = workload_dir.join(entrypoint_rel);
         let script_js = std::fs::read_to_string(&entrypoint_path).with_context(|| {
             format!(
@@ -141,7 +134,7 @@ impl Reconciler for CloudflareWorkerReconciler {
         })?;
 
         // (8) API token + client.
-        let api_token = keys::get_or_env("cloudflare-api-token", "CLOUDFLARE_API_TOKEN")
+        let api_token = fob::get_or_env("cloudflare-api-token", "CLOUDFLARE_API_TOKEN")
             .context("resolving cloudflare-api-token")?
             .context(
                 "cloudflare-api-token not found — set it via `yah keys set cloudflare-api-token` \
@@ -181,9 +174,7 @@ impl Reconciler for CloudflareWorkerReconciler {
             .with_context(|| format!("resolving zone id for {zone}"))?;
         cf.upsert_worker_custom_domain(&account_id, &zone_id, &domain, &worker_name)
             .await
-            .with_context(|| {
-                format!("attaching custom domain {domain} to worker {worker_name}")
-            })?;
+            .with_context(|| format!("attaching custom domain {domain} to worker {worker_name}"))?;
         info!(domain, worker_name, "CF Worker custom domain attached");
 
         Ok(
@@ -211,8 +202,8 @@ struct WorkloadBindingDecl {
 
 fn read_workload_manifest(workload_dir: &Path) -> Result<WorkloadManifest> {
     let path = workload_dir.join("workload.toml");
-    let src = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let src =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let value: toml::Value =
         toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
     let build_command = value
@@ -485,6 +476,7 @@ account_id = "test-account"
                 role: "registry".to_string(),
                 publishes: None,
                 wave: 0,
+                git: None,
             };
             Self {
                 _workspace: workspace,
@@ -532,10 +524,19 @@ account_id = "test-account"
             cf_slot(&[("bucket", "yah-cr-cache"), ("binding", "CACHE")]),
         );
         let fx = Fixture::new(providers);
-        let err = CloudflareWorkerReconciler::new().up(fx.ctx()).await.unwrap_err();
+        let err = CloudflareWorkerReconciler::new()
+            .up(fx.ctx())
+            .await
+            .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("domain"), "error must name the missing field: {msg}");
-        assert!(msg.contains("registry"), "error must name the offending slot role: {msg}");
+        assert!(
+            msg.contains("domain"),
+            "error must name the missing field: {msg}"
+        );
+        assert!(
+            msg.contains("registry"),
+            "error must name the offending slot role: {msg}"
+        );
         assert!(msg.contains("yah-cr"), "error must name the service: {msg}");
         assert!(msg.contains("cloud"), "error must name the env: {msg}");
     }
@@ -556,10 +557,19 @@ account_id = "test-account"
             cf_slot(&[("bucket", "yah-cr-cache"), ("binding", "STORAGE")]),
         );
         let fx = Fixture::new(providers);
-        let err = CloudflareWorkerReconciler::new().up(fx.ctx()).await.unwrap_err();
+        let err = CloudflareWorkerReconciler::new()
+            .up(fx.ctx())
+            .await
+            .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("CACHE"), "error must name the unmatched workload binding: {msg}");
-        assert!(msg.contains("binding"), "error must mention the `binding` field: {msg}");
+        assert!(
+            msg.contains("CACHE"),
+            "error must name the unmatched workload binding: {msg}"
+        );
+        assert!(
+            msg.contains("binding"),
+            "error must mention the `binding` field: {msg}"
+        );
         assert!(msg.contains("yah-cr"), "error must name the service: {msg}");
         assert!(msg.contains("cloud"), "error must name the env: {msg}");
     }
@@ -577,11 +587,23 @@ account_id = "test-account"
         // Note: binding name matches workload.toml; only `bucket` is missing.
         providers.insert("cache".into(), cf_slot(&[("binding", "CACHE")]));
         let fx = Fixture::new(providers);
-        let err = CloudflareWorkerReconciler::new().up(fx.ctx()).await.unwrap_err();
+        let err = CloudflareWorkerReconciler::new()
+            .up(fx.ctx())
+            .await
+            .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("bucket"), "error must name the missing field: {msg}");
-        assert!(msg.contains("cache"), "error must name the offending slot role: {msg}");
-        assert!(msg.contains("CACHE"), "error must name the binding it relates to: {msg}");
+        assert!(
+            msg.contains("bucket"),
+            "error must name the missing field: {msg}"
+        );
+        assert!(
+            msg.contains("cache"),
+            "error must name the offending slot role: {msg}"
+        );
+        assert!(
+            msg.contains("CACHE"),
+            "error must name the binding it relates to: {msg}"
+        );
         assert!(msg.contains("yah-cr"), "error must name the service: {msg}");
         assert!(msg.contains("cloud"), "error must name the env: {msg}");
     }

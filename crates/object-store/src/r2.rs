@@ -21,14 +21,15 @@ use std::time::Duration;
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use reqwest::blocking::Client;
+use reqwest::header::{HeaderValue, ETAG, IF_MATCH, IF_NONE_MATCH};
 use reqwest::StatusCode;
 use sha2::{Digest, Sha256};
 
 use local_driver::s3_sign::{
-    sign_s3_empty_body, sign_s3_get_with_query, sign_s3_put_object,
+    sign_s3_empty_body, sign_s3_get_with_query, sign_s3_no_body, sign_s3_put_object,
 };
 
-use crate::{Error, ObjectStore};
+use crate::{Error, ObjectStore, Precondition};
 
 /// R2's S3-compat region. The endpoint always accepts `"auto"`.
 const R2_REGION: &str = "auto";
@@ -100,14 +101,14 @@ impl R2ObjectStore {
         account_id: impl Into<String>,
         bucket: impl Into<String>,
     ) -> Result<Self, Error> {
-        let access_key = keys::get_or_env(R2_ACCESS_KEY_SLOT, R2_ACCESS_KEY_ENV)
+        let access_key = fob::get_or_env(R2_ACCESS_KEY_SLOT, R2_ACCESS_KEY_ENV)
             .map_err(|e| Error::Auth(format!("vault read {R2_ACCESS_KEY_SLOT}: {e}")))?
             .ok_or_else(|| {
                 Error::Auth(format!(
                     "missing R2 credential: set vault slot {R2_ACCESS_KEY_SLOT} or env {R2_ACCESS_KEY_ENV}"
                 ))
             })?;
-        let secret_key = keys::get_or_env(R2_SECRET_KEY_SLOT, R2_SECRET_KEY_ENV)
+        let secret_key = fob::get_or_env(R2_SECRET_KEY_SLOT, R2_SECRET_KEY_ENV)
             .map_err(|e| Error::Auth(format!("vault read {R2_SECRET_KEY_SLOT}: {e}")))?
             .ok_or_else(|| {
                 Error::Auth(format!(
@@ -166,9 +167,14 @@ impl ObjectStore for R2ObjectStore {
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, Error> {
         let url = self.object_url(key);
-        let headers = sign_s3_empty_body(
-            "GET",
+        // GET has no body: reqwest drops the `content-length: 0` header on the
+        // wire, so signing it (as `sign_s3_empty_body` does) yields a signature
+        // the server can't reproduce → 403 SignatureDoesNotMatch. Sign with the
+        // content-length-free helper instead, exactly like ListObjectsV2. The
+        // empty query string is correct for a plain object GET.
+        let headers = sign_s3_get_with_query(
             &url,
+            "",
             R2_REGION,
             &self.access_key,
             &self.secret_key,
@@ -196,9 +202,11 @@ impl ObjectStore for R2ObjectStore {
 
     fn head(&self, key: &str) -> Result<bool, Error> {
         let url = self.object_url(key);
-        let headers = sign_s3_empty_body(
+        // HEAD is body-less like GET: sign without content-length (see `get`).
+        let headers = sign_s3_no_body(
             "HEAD",
             &url,
+            "",
             R2_REGION,
             &self.access_key,
             &self.secret_key,
@@ -251,6 +259,98 @@ impl ObjectStore for R2ObjectStore {
             .into_iter()
             .map(|m| m.key)
             .collect())
+    }
+
+    fn put_if(&self, key: &str, data: Vec<u8>, cond: Precondition) -> Result<String, Error> {
+        let url = self.object_url(key);
+        let body_sha256 = {
+            let mut h = Sha256::new();
+            h.update(&data);
+            hex::encode(h.finalize())
+        };
+        // Sign the same fixed header set as an unconditional PUT. The conditional
+        // header (If-Match / If-None-Match) is added *unsigned* afterwards: SigV4
+        // only covers the headers in `SignedHeaders`, and S3/R2 honor extra
+        // unsigned headers — so the precondition is enforced server-side without
+        // touching the signer.
+        let mut headers = sign_s3_put_object(
+            &url,
+            &body_sha256,
+            DEFAULT_CONTENT_TYPE,
+            data.len(),
+            R2_REGION,
+            &self.access_key,
+            &self.secret_key,
+        )
+        .map_err(|e| Error::Backend(format!("sign PUT {key}: {e}")))?;
+
+        match &cond {
+            Precondition::IfAbsent => {
+                headers.insert(IF_NONE_MATCH, HeaderValue::from_static("*"));
+            }
+            Precondition::IfMatch(etag) => {
+                let v = HeaderValue::from_str(etag)
+                    .map_err(|e| Error::Backend(format!("invalid If-Match etag {etag:?}: {e}")))?;
+                headers.insert(IF_MATCH, v);
+            }
+        }
+
+        let resp = self
+            .client
+            .put(&url)
+            .headers(headers)
+            .body(data)
+            .send()
+            .map_err(|e| io_err(&format!("PUT(if) {key}"), e))?;
+
+        let status = resp.status();
+        if status == StatusCode::PRECONDITION_FAILED {
+            return Err(Error::PreconditionFailed(format!(
+                "put_if {key}: precondition not met ({cond:?})"
+            )));
+        }
+        if !status.is_success() {
+            return Err(status_err("PUT(if)", key, status, resp.text().ok()));
+        }
+        // Prefer the ETag echoed in the PUT response; fall back to a HEAD if a
+        // backend ever omits it (R2 always returns it).
+        match resp.headers().get(ETAG).and_then(|v| v.to_str().ok()) {
+            Some(e) => Ok(e.to_string()),
+            None => self
+                .etag(key)?
+                .ok_or_else(|| Error::Backend(format!("PUT(if) {key} returned no ETag"))),
+        }
+    }
+
+    fn etag(&self, key: &str) -> Result<Option<String>, Error> {
+        let url = self.object_url(key);
+        // HEAD is body-less: sign without content-length (see `head`).
+        let headers = sign_s3_no_body(
+            "HEAD",
+            &url,
+            "",
+            R2_REGION,
+            &self.access_key,
+            &self.secret_key,
+        )
+        .map_err(|e| Error::Backend(format!("sign HEAD {key}: {e}")))?;
+
+        let resp = self
+            .client
+            .head(&url)
+            .headers(headers)
+            .send()
+            .map_err(|e| io_err(&format!("HEAD(etag) {key}"), e))?;
+
+        match resp.status() {
+            StatusCode::OK => Ok(resp
+                .headers()
+                .get(ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())),
+            StatusCode::NOT_FOUND => Ok(None),
+            s => Err(status_err("HEAD(etag)", key, s, None)),
+        }
     }
 }
 
@@ -422,15 +522,15 @@ mod tests {
         let body = r#"<?xml version="1.0" encoding="UTF-8"?>
             <ListBucketResult>
                 <IsTruncated>false</IsTruncated>
-                <Contents><Key>warden/0.8.9/x86_64-unknown-linux-musl/yah-warden.tar.gz</Key></Contents>
-                <Contents><Key>warden/release-manifest.json</Key></Contents>
+                <Contents><Key>yubaba/0.8.9/x86_64-unknown-linux-musl/yubaba.tar.gz</Key></Contents>
+                <Contents><Key>yubaba/release-manifest.json</Key></Contents>
             </ListBucketResult>"#;
         let (keys, next) = parse_list_v2(body);
         assert_eq!(
             keys,
             vec![
-                "warden/0.8.9/x86_64-unknown-linux-musl/yah-warden.tar.gz".to_string(),
-                "warden/release-manifest.json".to_string(),
+                "yubaba/0.8.9/x86_64-unknown-linux-musl/yubaba.tar.gz".to_string(),
+                "yubaba/release-manifest.json".to_string(),
             ]
         );
         assert!(next.is_none());
@@ -467,24 +567,24 @@ mod tests {
             <ListBucketResult>
                 <IsTruncated>false</IsTruncated>
                 <Contents>
-                    <Key>warden/0.8.9/x86_64-unknown-linux-musl/yah-warden.tar.gz</Key>
+                    <Key>yubaba/0.8.9/x86_64-unknown-linux-musl/yubaba.tar.gz</Key>
                     <LastModified>2026-06-08T20:14:32.000Z</LastModified>
                     <ETag>"abc"</ETag>
                     <Size>4823104</Size>
                     <StorageClass>STANDARD</StorageClass>
                 </Contents>
                 <Contents>
-                    <Key>warden/release-manifest.json</Key>
+                    <Key>yubaba/release-manifest.json</Key>
                     <LastModified>2026-06-08T20:14:35.000Z</LastModified>
                     <Size>412</Size>
                 </Contents>
             </ListBucketResult>"#;
         let (entries, next) = parse_list_v2_detailed(body);
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].key, "warden/0.8.9/x86_64-unknown-linux-musl/yah-warden.tar.gz");
+        assert_eq!(entries[0].key, "yubaba/0.8.9/x86_64-unknown-linux-musl/yubaba.tar.gz");
         assert_eq!(entries[0].size, 4823104);
         assert_eq!(entries[0].last_modified, "2026-06-08T20:14:32.000Z");
-        assert_eq!(entries[1].key, "warden/release-manifest.json");
+        assert_eq!(entries[1].key, "yubaba/release-manifest.json");
         assert_eq!(entries[1].size, 412);
         assert!(next.is_none());
     }
@@ -500,8 +600,8 @@ mod tests {
     fn object_url_preserves_slashes_in_key() {
         let s = R2ObjectStore::new("acct", "b", "AK", "SK").unwrap();
         assert_eq!(
-            s.object_url("warden/0.8.9/x86_64-unknown-linux-musl/yah-warden.tar.gz"),
-            "https://acct.r2.cloudflarestorage.com/b/warden/0.8.9/x86_64-unknown-linux-musl/yah-warden.tar.gz"
+            s.object_url("yubaba/0.8.9/x86_64-unknown-linux-musl/yubaba.tar.gz"),
+            "https://acct.r2.cloudflarestorage.com/b/yubaba/0.8.9/x86_64-unknown-linux-musl/yubaba.tar.gz"
         );
     }
 }

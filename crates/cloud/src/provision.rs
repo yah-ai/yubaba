@@ -23,27 +23,34 @@ pub struct ProvisionRequest {
 }
 
 /// Build a provision request: load the cloud-init template for the workspace and
-/// substitute per-machine values. The warden binary is fetched on the machine
+/// substitute per-machine values. The yubaba binary is fetched on the machine
 /// at first boot from `warden_url` and verified against `warden_sha256`
 /// (R040-F11) — base64-embedding it would blow past Hetzner's 32 KiB cap.
 ///
-/// `mesh_url` is the stable Headscale coordinator URL (R040-F18). When present,
-/// the rendered cloud-init passes `--login-server <url>` to `tailscale up` so
-/// the machine joins the camp's Headscale instead of Tailscale SaaS. When `None`,
-/// the machine joins the default Tailscale SaaS coordinator.
+/// `headscale_preauth_key` decides mesh membership (R330-F28). `Some` ⟺ this
+/// machine is JOINING an existing mesh: the rendered cloud-init emits the
+/// tailscaled install + `tailscale up --auth-key=<key>` join block. `None` ⟺
+/// STANDALONE / coordinator-to-be — no mesh exists yet, so no join block is
+/// emitted; the node comes up as bare yubaba and becomes the coordinator later
+/// via `yah mesh bootstrap`. Membership is gated purely on this key's presence,
+/// independent of `machine.hosts_operator_bridge`.
+///
+/// `mesh_url` is the stable Headscale coordinator URL (R040-F18). When present
+/// (only meaningful alongside a preauth key), the rendered cloud-init passes
+/// `--login-server <url>` to `tailscale up` so the machine joins the camp's
+/// Headscale instead of Tailscale SaaS. When `None`, a joining machine uses the
+/// default Tailscale SaaS coordinator.
 ///
 /// `warden_channel` selects the release channel (`"stable"` or `"beta"`);
-/// use [`cloud_init::DEFAULT_WARDEN_CHANNEL`] for Phase 1.
-/// `containerd_version` is the apt version pin; use
-/// [`cloud_init::DEFAULT_CONTAINERD_VERSION`] for the Phase 1 baseline.
+/// use [`cloud_init::DEFAULT_WARDEN_CHANNEL`] for Phase 1. containerd is
+/// installed unpinned (R330-T9 — an exact apt pin matched no Debian repo).
 pub fn build_request(
     workspace_root: &Path,
     machine: &MachineConfig,
     warden_url: String,
     warden_sha256: String,
     warden_channel: String,
-    containerd_version: String,
-    headscale_preauth_key: String,
+    headscale_preauth_key: Option<String>,
     mesh_url: Option<String>,
     cloudflared_token: Option<String>,
     warden_cosign_identity_regexp: Option<String>,
@@ -54,19 +61,18 @@ pub fn build_request(
         warden_url,
         warden_sha256,
         warden_channel,
-        containerd_version,
         headscale_preauth_key,
         mesh_url,
         cloudflared_token,
-        operator_bridge_enabled: machine.hosts_operator_bridge,
         warden_cosign_identity_regexp,
     };
     let user_data = cloud_init::render(&template, &input)?;
-    let location = Location::try_from(machine.location.as_str())
+    machine.validate()?;
+    let location = Location::try_from(machine.location())
         .with_context(|| format!("machine '{}' has unknown location", machine.name))?;
     Ok(ProvisionRequest {
         machine_name: machine.name.clone(),
-        server_type: machine.server_type.clone(),
+        server_type: machine.server_type().to_string(),
         location,
         user_data,
         ssh_keys: machine.ssh_keys.clone(),
@@ -75,9 +81,9 @@ pub fn build_request(
 
 /// Execute a built request against a provider. Returns the new server ID on success.
 ///
-/// Hostkey-fingerprint write-back lands with A8 (yah-warden `/identity` endpoint
+/// Hostkey-fingerprint write-back lands with A8 (yah-yubaba `/identity` endpoint
 /// and `MachineConfig::save` are both already in place; the missing piece is the
-/// warden binary itself).
+/// yubaba binary itself).
 pub async fn execute(
     provider: &dyn MachineProvider,
     project: &ProjectId,
@@ -103,10 +109,12 @@ mod tests {
         MachineConfig {
             name: "noisetable-pdx-1".into(),
             provider: "hetzner".into(),
-            location: "pdx".into(),
-            server_type: "cpx22".into(),
+            location: Some("pdx".into()),
+            server_type: Some("cpx22".into()),
             hosts_mirrors: vec!["noisetable".into(), "yah".into()],
             mesh_tags: vec!["tag:region-pdx".into(), "tag:tier-t2".into()],
+            region: None,
+            zone: None,
             bucket: Some(BucketSpec {
                 name: "noisetable-assets-pdx-1".into(),
                 public_read: false,
@@ -115,6 +123,7 @@ mod tests {
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
+            connect: None,
         }
     }
 
@@ -127,11 +136,10 @@ mod tests {
         build_request(
             dir,
             machine,
-            "https://example.com/yah-warden".into(),
+            "https://example.com/yah-yubaba".into(),
             "deadbeef".into(),
             cloud_init::DEFAULT_WARDEN_CHANNEL.into(),
-            cloud_init::DEFAULT_CONTAINERD_VERSION.into(),
-            "KEY".into(),
+            Some("KEY".into()),
             extra_url,
             extra_cf,
             None,
@@ -141,14 +149,13 @@ mod tests {
 
     #[test]
     fn build_request_renders_user_data_and_picks_location() {
-        // Enable operator bridge so the preauth key ("KEY") and tags are emitted.
-        let mut machine = sample_machine();
-        machine.hosts_operator_bridge = true;
+        // A preauth key present → join block emitted, so the key ("KEY") and tags appear.
+        let machine = sample_machine();
         let dir = tempfile::tempdir().unwrap();
         let req = build_req_defaults(dir.path(), &machine, None, None);
         assert_eq!(req.machine_name, "noisetable-pdx-1");
         assert_eq!(req.location, Location::Pdx);
-        assert!(req.user_data.contains("https://example.com/yah-warden"));
+        assert!(req.user_data.contains("https://example.com/yah-yubaba"));
         assert!(req.user_data.contains("deadbeef"));
         assert!(req.user_data.contains("KEY"));
         assert!(req.user_data.contains("tag:region-pdx,tag:tier-t2"));
@@ -156,17 +163,51 @@ mod tests {
 
     #[test]
     fn build_request_with_mesh_url_adds_login_server() {
-        let mut machine = sample_machine();
-        machine.hosts_operator_bridge = true;
+        let machine = sample_machine();
         let dir = tempfile::tempdir().unwrap();
-        let req = build_req_defaults(dir.path(), &machine, Some("https://mesh.example.com".into()), None);
-        assert!(req.user_data.contains("--login-server https://mesh.example.com"));
+        let req = build_req_defaults(
+            dir.path(),
+            &machine,
+            Some("https://mesh.example.com".into()),
+            None,
+        );
+        assert!(req
+            .user_data
+            .contains("--login-server https://mesh.example.com"));
+    }
+
+    #[test]
+    fn build_request_standalone_omits_join_block() {
+        // R330-F28: a standalone / coordinator-to-be node carries no preauth
+        // key (and no mesh_url). build_request must NOT emit the tailscale-up
+        // join block — the node comes up as bare yubaba.
+        let machine = sample_machine();
+        let dir = tempfile::tempdir().unwrap();
+        let req = build_request(
+            dir.path(),
+            &machine,
+            "https://example.com/yah-yubaba".into(),
+            "deadbeef".into(),
+            cloud_init::DEFAULT_WARDEN_CHANNEL.into(),
+            None, // standalone: no preauth
+            None, // standalone: no mesh_url
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !req.user_data.contains("tailscale up --auth-key"),
+            "standalone node must not emit the tailscale-up join block"
+        );
+        // Prose in the template header mentions --login-server; the real arg
+        // form (`--login-server https://`) must be absent.
+        assert!(!req.user_data.contains("--login-server https://"));
     }
 
     #[test]
     fn build_request_rejects_unknown_location() {
         let mut machine = sample_machine();
-        machine.location = "moon".into();
+        machine.location = Some("moon".into());
         let dir = tempfile::tempdir().unwrap();
         let err = build_request(
             dir.path(),
@@ -174,8 +215,7 @@ mod tests {
             "x".into(),
             "y".into(),
             "stable".into(),
-            "1.7.2".into(),
-            "z".into(),
+            Some("z".into()),
             None,
             None,
             None,
@@ -190,20 +230,18 @@ mod tests {
         // R330-F21: when an identity_regexp is passed, the rendered cloud-init
         // emits the cosign verify-blob block. Without it (the existing
         // build_req_defaults helper passes None) the block stays empty.
-        let mut machine = sample_machine();
-        machine.hosts_operator_bridge = false;
+        let machine = sample_machine();
         let dir = tempfile::tempdir().unwrap();
         let req = build_request(
             dir.path(),
             &machine,
-            "https://cdn.yah.dev/warden/0.9.0/x86_64-unknown-linux-musl/yah-warden-x86_64-unknown-linux-musl.tar.gz".into(),
+            "https://cdn.yah.dev/yubaba/0.9.0/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz".into(),
             "deadbeef".into(),
             cloud_init::DEFAULT_WARDEN_CHANNEL.into(),
-            cloud_init::DEFAULT_CONTAINERD_VERSION.into(),
-            "KEY".into(),
             None,
             None,
-            Some(r"^https://github\.com/anthropics/yah/".into()),
+            None,
+            Some(r"^https://github\.com/yah-ai/yah/".into()),
         )
         .unwrap();
         assert!(
@@ -212,7 +250,7 @@ mod tests {
             "verify-blob runcmd missing once identity_regexp is threaded"
         );
         assert!(
-            req.user_data.contains(r"^https://github\.com/anthropics/yah/"),
+            req.user_data.contains(r"^https://github\.com/yah-ai/yah/"),
             "identity_regexp value missing from rendered output"
         );
     }

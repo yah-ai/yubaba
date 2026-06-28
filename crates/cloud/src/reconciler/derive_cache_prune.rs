@@ -70,9 +70,7 @@ pub fn collect_live_derive_hashes<'a>(
             if component.kind != WORKLOAD_KIND {
                 continue;
             }
-            let workload_path = workspace_root
-                .join(&component.path)
-                .join("workload.toml");
+            let workload_path = workspace_root.join(&component.path).join("workload.toml");
             let src = match std::fs::read_to_string(&workload_path) {
                 Ok(s) => s,
                 Err(e) => {
@@ -99,7 +97,9 @@ pub fn collect_live_derive_hashes<'a>(
                 continue;
             };
             for entry in &workload.assets {
-                let Some(derive) = &entry.derive else { continue };
+                let Some(derive) = &entry.derive else {
+                    continue;
+                };
                 live.fetch.insert(derive.fetch.blake3.0.clone());
                 if derive.transform.is_some() {
                     live.transform.insert(entry.blake3.0.clone());
@@ -122,10 +122,7 @@ pub fn compute_derive_cache_candidates(
 ) -> Result<Vec<DerivePruneCandidate>> {
     let mut candidates = Vec::new();
 
-    for (subdir, live_set) in [
-        ("fetch", &live.fetch),
-        ("transform", &live.transform),
-    ] {
+    for (subdir, live_set) in [("fetch", &live.fetch), ("transform", &live.transform)] {
         let dir = derive_cache_root.join(subdir);
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
@@ -150,7 +147,11 @@ pub fn compute_derive_cache_candidates(
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             candidates.push(DerivePruneCandidate {
                 path,
-                cache_kind: if subdir == "fetch" { "fetch" } else { "transform" },
+                cache_kind: if subdir == "fetch" {
+                    "fetch"
+                } else {
+                    "transform"
+                },
                 hash,
                 size,
             });
@@ -208,6 +209,7 @@ mod tests {
             role: String::new(),
             publishes: None,
             wave: 0,
+            git: None,
         }
     }
 
@@ -263,7 +265,10 @@ recipe = "quantize"
     fn collect_live_hashes_fetch_only() {
         let tmp = TempDir::new().unwrap();
         let workload_dir = tmp.path().join("app/web");
-        write_workload(&workload_dir, &workload_with_fetch_only(FETCH_HASH, OUTPUT_HASH));
+        write_workload(
+            &workload_dir,
+            &workload_with_fetch_only(FETCH_HASH, OUTPUT_HASH),
+        );
 
         let svc = svc("my-svc", vec![static_asset_component("site", "app/web")]);
         let live = collect_live_derive_hashes(tmp.path(), [&svc]).unwrap();
@@ -316,6 +321,7 @@ recipe = "quantize"
                 role: String::new(),
                 publishes: None,
                 wave: 0,
+                git: None,
             }],
         );
         let live = collect_live_derive_hashes(tmp.path(), [&svc]).unwrap();

@@ -649,12 +649,12 @@ pub struct ContainerRunSpec {
     /// Optional CMD override; empty leaves the image default.
     pub cmd: Vec<String>,
     /// Linux capabilities to add via `--cap-add` (e.g. `["SYS_ADMIN"]`).
-    /// Empty by default; the pond warden-container path (R408-T2) sets this
-    /// so Constable can perform cgroup ops inside the container.
+    /// Empty by default; the pond yubaba-container path (R408-T2) sets this
+    /// so Kamaji can perform cgroup ops inside the container.
     pub cap_add: Vec<String>,
     /// Cgroup namespace mode forwarded to `docker run --cgroupns=...`. Valid
     /// values are `"private"` and `"host"`; `None` leaves the daemon default.
-    /// The pond warden-container path (R408-T2) sets `"private"` so the
+    /// The pond yubaba-container path (R408-T2) sets `"private"` so the
     /// container sees a fresh `/sys/fs/cgroup` it can write child cgroups
     /// under.
     pub cgroupns: Option<String>,
@@ -808,7 +808,7 @@ fn expand_tilde(p: &Path) -> PathBuf {
 /// Wraps a detected [`LocalRuntime`] and translates each [`WorkloadSpec`] into
 /// a [`ContainerRunSpec`] before delegating to the underlying docker calls.
 /// This is the sim-tier half of the F10 keystone: camp embeds it pointing at
-/// OrbStack; warden supplies the containerd half for cloud/HA.
+/// OrbStack; yubaba supplies the containerd half for cloud/HA.
 ///
 /// Translation notes:
 /// - Only `EnvValue::Literal` env vars are forwarded; `FromSecret` and
@@ -837,7 +837,7 @@ impl LocalDockerRuntime {
 
 /// Translate a `WorkloadSpec` into a `ContainerRunSpec` for the local docker
 /// tier. Only the subset of `WorkloadSpec` fields that map directly to docker
-/// run args are carried across; warden-specific fields (mesh, resources, raft
+/// run args are carried across; yubaba-specific fields (mesh, resources, raft
 /// ident) are silently dropped.
 fn workload_spec_to_crs(spec: &WorkloadSpec) -> ContainerRunSpec {
     let image = spec.image.docker_ref();

@@ -1,7 +1,7 @@
 //! Drift detection between declared `.yah/cloud/` config and live cloud state.
 //!
 //! Phase 1 scope (R040-T5): server existence + machine type + bucket existence.
-//! Hostkey-fingerprint verification stays stubbed for now; the warden-side
+//! Hostkey-fingerprint verification stays stubbed for now; the yubaba-side
 //! `/health` probe is wired via the [`AgentProbe`] trait — callers that want
 //! an agent-reachability check pass an implementation, otherwise no agent
 //! findings are emitted.
@@ -28,12 +28,12 @@ use async_trait::async_trait;
 use crate::config::MachineConfig;
 use crate::provider::{Location, MachineProvider, ServerStatus, ServerSummary};
 
-/// Hook for probing a per-machine `yah-warden`. Implemented in the CLI on top
+/// Hook for probing a per-machine `yah-yubaba`. Implemented in the CLI on top
 /// of `cloud-client` so this crate can stay independent of `reqwest` /
 /// transport concerns.
 #[async_trait]
 pub trait AgentProbe: Send + Sync {
-    /// `Ok(())` if the warden answered healthy. `Err(reason)` becomes the
+    /// `Ok(())` if the yubaba answered healthy. `Err(reason)` becomes the
     /// `AgentUnreachable.reason` string in the report.
     async fn probe(&self, machine: &MachineConfig) -> std::result::Result<(), String>;
 }
@@ -52,10 +52,9 @@ pub enum DriftFinding {
     HostkeyFingerprintMismatch { declared: String, actual: String },
 
     // ── Soft findings: surfaced but don't trigger non-zero exit ─────────────
-
     /// Couldn't probe the bucket (no S3 creds, transient API error).
     BucketUnchecked { name: String, reason: String },
-    /// yah-warden didn't respond. Always emitted pre-A8 with a "lands with A8" reason.
+    /// yah-yubaba didn't respond. Always emitted pre-A8 with a "lands with A8" reason.
     AgentUnreachable { reason: String },
     /// Hetzner API call failed for this machine; report is incomplete.
     ProviderError(String),
@@ -91,7 +90,11 @@ impl MachineReport {
 
     /// One-word summary for the top of a status block.
     pub fn headline(&self) -> &'static str {
-        if self.findings.iter().any(|f| matches!(f, DriftFinding::MissingServer)) {
+        if self
+            .findings
+            .iter()
+            .any(|f| matches!(f, DriftFinding::MissingServer))
+        {
             "not provisioned"
         } else if self.has_drift() {
             "drift"
@@ -107,7 +110,7 @@ impl MachineReport {
 ///
 /// - `provider = None` → cloud credentials aren't available; the report
 ///   contains a single `ProviderError` finding describing why.
-/// - `agent = None`    → no warden probe attempted; no `AgentUnreachable`
+/// - `agent = None`    → no yubaba probe attempted; no `AgentUnreachable`
 ///   finding is emitted regardless of server state. Pass an `AgentProbe`
 ///   when the caller wants reachability surfaced as drift.
 pub async fn collect_machine_report(
@@ -119,12 +122,12 @@ pub async fn collect_machine_report(
     let mut server: Option<ServerSummary> = None;
     let mut bucket_present: Option<bool> = None;
 
-    let location = match Location::try_from(machine.location.as_str()) {
+    let location = match Location::try_from(machine.location()) {
         Ok(l) => Some(l),
         Err(e) => {
             findings.push(DriftFinding::ProviderError(format!(
                 "unknown location '{}': {e}",
-                machine.location
+                machine.location()
             )));
             None
         }
@@ -144,9 +147,9 @@ pub async fn collect_machine_report(
 
     match p.find_server_by_name(&machine.name).await {
         Ok(Some(s)) => {
-            if s.server_type != machine.server_type {
+            if s.server_type != machine.server_type() {
                 findings.push(DriftFinding::WrongMachineType {
-                    declared: machine.server_type.clone(),
+                    declared: machine.server_type().to_string(),
                     actual: s.server_type.clone(),
                 });
             }
@@ -177,7 +180,7 @@ pub async fn collect_machine_report(
         }
     }
 
-    // Probe the warden iff the caller wired an `AgentProbe` AND there's a
+    // Probe the yubaba iff the caller wired an `AgentProbe` AND there's a
     // server worth talking to. Pre-provision the agent gap is implied by
     // `MissingServer` and a second line would just be noise.
     if let (Some(_), Some(probe)) = (server.as_ref(), agent) {
@@ -209,10 +212,12 @@ mod tests {
         MachineConfig {
             name: "noisetable-pdx-1".into(),
             provider: "hetzner".into(),
-            location: "pdx".into(),
-            server_type: "cpx22".into(),
+            location: Some("pdx".into()),
+            server_type: Some("cpx22".into()),
             hosts_mirrors: vec!["noisetable".into()],
             mesh_tags: vec!["region:pdx".into()],
+            region: None,
+            zone: None,
             bucket: Some(BucketSpec {
                 name: "noisetable-assets-pdx-1".into(),
                 public_read: false,
@@ -221,6 +226,7 @@ mod tests {
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
+            connect: None,
         }
     }
 
@@ -229,7 +235,7 @@ mod tests {
     #[derive(Default)]
     struct FakeProvider {
         servers: Mutex<Vec<(String, ServerSummary)>>,
-        buckets: Mutex<Vec<String>>, // present bucket names
+        buckets: Mutex<Vec<String>>,               // present bucket names
         bucket_check_fails: Mutex<Option<String>>, // if Some(reason), bucket_exists errors
     }
 
@@ -253,12 +259,7 @@ mod tests {
         async fn ensure_project(&self, name: &str) -> Result<ProjectId> {
             Ok(ProjectId(name.into()))
         }
-        async fn create_server(
-            &self,
-            _: &ProjectId,
-            _: &ServerSpec,
-            _: &str,
-        ) -> Result<ServerId> {
+        async fn create_server(&self, _: &ProjectId, _: &ServerSpec, _: &str) -> Result<ServerId> {
             bail!("not used in drift tests")
         }
         async fn create_bucket(&self, _: &str, _: Location) -> Result<BucketRef> {
@@ -346,10 +347,10 @@ mod tests {
         assert!(!report.has_drift());
         assert_eq!(report.bucket_present, Some(true));
         // No probe configured → no AgentUnreachable noise.
-        assert!(!report.findings.iter().any(|f| matches!(
-            f,
-            DriftFinding::AgentUnreachable { .. }
-        )));
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| matches!(f, DriftFinding::AgentUnreachable { .. })));
     }
 
     #[tokio::test]
@@ -367,12 +368,11 @@ mod tests {
             )
             .with_bucket("noisetable-assets-pdx-1");
         let probe = FakeProbe { result: Ok(()) };
-        let report =
-            collect_machine_report(&sample_machine(), Some(&provider), Some(&probe)).await;
-        assert!(!report.findings.iter().any(|f| matches!(
-            f,
-            DriftFinding::AgentUnreachable { .. }
-        )));
+        let report = collect_machine_report(&sample_machine(), Some(&provider), Some(&probe)).await;
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| matches!(f, DriftFinding::AgentUnreachable { .. })));
     }
 
     #[tokio::test]
@@ -392,12 +392,11 @@ mod tests {
         let probe = FakeProbe {
             result: Err("connection refused".into()),
         };
-        let report =
-            collect_machine_report(&sample_machine(), Some(&provider), Some(&probe)).await;
-        let unreachable = report.findings.iter().find(|f| matches!(
-            f,
-            DriftFinding::AgentUnreachable { .. }
-        ));
+        let report = collect_machine_report(&sample_machine(), Some(&provider), Some(&probe)).await;
+        let unreachable = report
+            .findings
+            .iter()
+            .find(|f| matches!(f, DriftFinding::AgentUnreachable { .. }));
         assert!(unreachable.is_some());
         if let Some(DriftFinding::AgentUnreachable { reason }) = unreachable {
             assert!(reason.contains("connection refused"));
@@ -414,12 +413,11 @@ mod tests {
         let probe = FakeProbe {
             result: Err("would fail if called".into()),
         };
-        let report =
-            collect_machine_report(&sample_machine(), Some(&provider), Some(&probe)).await;
-        assert!(!report.findings.iter().any(|f| matches!(
-            f,
-            DriftFinding::AgentUnreachable { .. }
-        )));
+        let report = collect_machine_report(&sample_machine(), Some(&provider), Some(&probe)).await;
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| matches!(f, DriftFinding::AgentUnreachable { .. })));
     }
 
     #[tokio::test]
@@ -455,7 +453,7 @@ mod tests {
                 server_type: "cpx22".into(),
                 status: ServerStatus::Running,
                 public_ipv4: None,
-                    location: "hil".into(),
+                location: "hil".into(),
             },
         );
 
@@ -486,10 +484,10 @@ mod tests {
         let report = collect_machine_report(&sample_machine(), Some(&provider), None).await;
         // Real drift only — soft finding doesn't trip.
         assert!(!report.has_drift());
-        assert!(report.findings.iter().any(|f| matches!(
-            f,
-            DriftFinding::BucketUnchecked { .. }
-        )));
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| matches!(f, DriftFinding::BucketUnchecked { .. })));
     }
 
     #[tokio::test]

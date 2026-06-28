@@ -1,0 +1,65 @@
+[package]
+name = "kamaji"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Kamaji — yah's relocatable workload supervisor. Trait surface + supporting types; backend impls land in R484-T2. See .yah/docs/working/W199-kamaji-universal-supervisor.md."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Production containerd gRPC backend. Mirrors the yubaba feature of the same
+# name — when yubaba's `containerd-integration` is on, this one is forwarded.
+containerd-integration = ["dep:containerd-client", "dep:prost-types", "dep:sha2"]
+
+# Docker-CLI backend for pond / OrbStack. No extra Rust deps (shells out).
+docker-integration = []
+
+# Native fork+exec backend (W199's "ideal native-backend case"; R490-F2's
+# supervision path for mesofact-dev). Host binaries only — no image pull.
+native-integration = ["dep:libc"]
+
+# In-memory FakeRuntime for unit testing. Excluded from release binaries.
+testing = []
+
+# Sibling-deployment client: postcard-over-UDS ConstableClient for callers
+# that talk to a separate kamaji.service process (W199 §The move shape 2).
+# Inlined deployments don't need this; gating it keeps the dep-light shape of
+# the inlined-only desktop build.
+sibling = ["dep:kamaji-proto"]
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+futures-core = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "sync", "fs", "time", "process"] }
+tokio-stream = { version = "0.1", features = ["io-util"] }
+tracing = "0.1"
+workload-spec = { path = "../workload-spec" }
+
+# containerd gRPC client (optional — only with containerd-integration feature)
+containerd-client = { version = "0.9", optional = true }
+prost-types = { version = "0.14", optional = true }
+# sha256 for OCI layer chainID computation (snapshot prepare) — containerd-integration only.
+sha2 = { version = "0.10", optional = true }
+
+# SIGTERM for the native backend's graceful stop (optional — native-integration).
+libc = { version = "0.2", optional = true }
+
+# Sibling-shape postcard wire codec (optional — gated on `sibling` feature).
+kamaji-proto = { path = "../kamaji-proto", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "signal"] }
+
+[[example]]
+name = "native_supervise"
+required-features = ["native-integration"]

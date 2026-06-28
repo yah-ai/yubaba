@@ -22,7 +22,7 @@
 //!
 //! Used by:
 //!
-//! - `warden::pond::miniflare::MiniflareReconciler` — supervisor + restart
+//! - `yubaba::pond::miniflare::MiniflareReconciler` — supervisor + restart
 //!   loop for the running container.
 //! - `cloud::reconciler::pond::up_pond` — cloud-direct path consumed by
 //!   `pond_smoke` and `yah cloud mirror up`.

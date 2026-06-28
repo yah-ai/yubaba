@@ -46,7 +46,7 @@
 //! @yah:relay(R327, "CF Worker provisioner: static→R2 + SSR/SPA→origin routing for mesofact sites")
 //! @yah:at(2026-05-26T07:25:51Z)
 //! @yah:status(review)
-//! @yah:next("Design the Worker script template: static routes fetch from R2 bucket binding, SSR routes proxy to origin (warden service URL), SPA shell falls back to R2 index.html for unmatched paths")
+//! @yah:next("Design the Worker script template: static routes fetch from R2 bucket binding, SSR routes proxy to origin (yubaba service URL), SPA shell falls back to R2 index.html for unmatched paths")
 //! @yah:next("Add CF Workers API calls to up_cloudflare_r2: upload Worker script, create KV/R2 bucket binding, wire Routes or Custom Domain to the Worker")
 //! @yah:next("Worker replaces the Transform Rule workaround (R320-T11) as the general solution — both static-only and SSR/SPA sites go through the Worker")
 //! @yah:gotcha("Pure-static sites (Mode 1) still need the Worker to serve index.html for / — R2 custom domains alone don't auto-index")
@@ -128,15 +128,15 @@
 //! @yah:next("R434-F5 (open) — convert one marketing route to mode:\"ssr\" — unblocked by F4; that's the first real SSR consumer")
 //! @yah:next("Optional: persist read_manifest_ssr_prefixes results across pond rebuilds so a stale dist/manifest.json fall-back doesn't bite (not needed today — manifest is always fresh after a mesofact-dev rebuild)")
 //! @yah:handoff("Phase A — Worker matcher + miniflare env plumbing. (1) router.ts:39 now uses segment-aware `path === p || path.startsWith(p + \"/\")`; rebuilt router.bundle.js; 4 new miniflare tests cover /api/health vs /api/healthcheck + trailing-slash boundary (16/16 pass). (2) local_driver::pond_miniflare::MiniflareSpec gained worker_mode/ssr_origin/ssr_prefixes fields; spawn_miniflare reads them from spec instead of hardcoding static. (3) cloud::reconciler::pond::spawn_miniflare_child + up_pond mirror the change; new public helpers parse_worker_mode and worker_mode_triple let camp derive the triple from mirror slot_fields. (4) camp::build_miniflare_deploy_spec calls parse_worker_mode → worker_mode_triple so flipping a mirror.toml to mode=ssr now works end-to-end.")
-//! @yah:handoff("Phase B — SSR runtime container slot in warden. (1) New local_driver::pond_ssr_runtime module with SsrRuntimeSpec, ensure_ssr_runtime_running, SsrRuntimeRunning, and lower_workload_spec(ws, host_port, name, label, timeout) → SsrRuntimeSpec. Lowering pulls image (with digest preference), command, literal env vars (FromSecret/FromMesh rejected with clear errors), Bind volumes, and expose.mesh.ports[0] as container_port (default 3000). 8/8 unit tests pass. (2) New warden::pond::ssr_runtime module with SsrRuntimeReconciler (probe + restart) and SsrRuntimeSupervision, mirroring MinioReconciler. (3) warden::pond::PondDeployReq gained ssr_runtime: Option<SsrRuntimeSpec>. The deploy handler brings SSR up BETWEEN MinIO and miniflare, overriding effective_miniflare.ssr_origin to point at the bound container so miniflare proxies correctly. RegistryEntry tracks ssr_runtime supervision alongside minio + miniflare; shutdown_all + mark_failed drain it.")
+//! @yah:handoff("Phase B — SSR runtime container slot in yubaba. (1) New local_driver::pond_ssr_runtime module with SsrRuntimeSpec, ensure_ssr_runtime_running, SsrRuntimeRunning, and lower_workload_spec(ws, host_port, name, label, timeout) → SsrRuntimeSpec. Lowering pulls image (with digest preference), command, literal env vars (FromSecret/FromMesh rejected with clear errors), Bind volumes, and expose.mesh.ports[0] as container_port (default 3000). 8/8 unit tests pass. (2) New yubaba::pond::ssr_runtime module with SsrRuntimeReconciler (probe + restart) and SsrRuntimeSupervision, mirroring MinioReconciler. (3) yubaba::pond::PondDeployReq gained ssr_runtime: Option<SsrRuntimeSpec>. The deploy handler brings SSR up BETWEEN MinIO and miniflare, overriding effective_miniflare.ssr_origin to point at the bound container so miniflare proxies correctly. RegistryEntry tracks ssr_runtime supervision alongside minio + miniflare; shutdown_all + mark_failed drain it.")
 //! @yah:handoff("Phase C — manifest-derived SSR_PREFIXES + camp wiring. (1) camp::build_ssr_runtime_deploy_spec reads <workload_dir>/workload.toml's MesofactStaticWorkload.ssr_runtime: Option<WorkloadSpec> and lowers it. Host port comes from static_fields.ssr_port (default 4324); collision with miniflare's port is rejected up-front. (2) camp::read_manifest_ssr_prefixes reads <workload_dir>/dist/manifest.json's top-level ssr_prefixes (R015-F2 contract). When present + non-empty, overrides miniflare's spec.ssr_prefixes (mirror.toml override path stays as fallback). (3) Camp's deploy loop now: builds miniflare → builds optional ssr_runtime → overrides miniflare.worker_mode=ssr + ssr_origin when runtime is present → overrides ssr_prefixes from manifest when available → POSTs full req. 9 new camp::r434_f4_ssr_pond_tests pass.")
 //! @yah:handoff("Verify lines satisfied: (a) Worker test /api/health vs /api/healthcheck DIRECTLY covered by tests/router.test.ts segment-aware matcher tests. (b) Pure static/spa pond mirrors still reconcile without spinning ssr_runtime — covered by build_ssr_runtime_deploy_spec_returns_none_without_ssr_runtime_field + existing 25 cloud reconciler::pond tests stay green. (c) End-to-end 'spins bun container and miniflare proxies prefix' is wired and unit-tested at the spec-build/registry layer; live smoke requires an actual workload with ssr_runtime declared + docker available (pond_smoke or YAH_LOCAL_SIM_E2E run). 5 pre-existing mesofact_static test flakes ignored — caused by a real desktop process on 127.0.0.1:4321 on the dev box, not by F4.")
 //! @yah:verify("cd crates/yah/cloud/worker && bun test tests/ → 16 pass (4 new R434-F4 segment-aware tests)")
 //! @yah:verify("cargo test -p local-driver --lib → 46 pass (8 new pond_ssr_runtime tests)")
-//! @yah:verify("cargo test -p warden --lib pond → 9 pass (registry handles ssr_runtime supervision)")
+//! @yah:verify("cargo test -p yubaba --lib pond → 9 pass (registry handles ssr_runtime supervision)")
 //! @yah:verify("cargo test -p cloud --lib -- reconciler::pond:: reconciler::mesofact_static::tests::config_bindings reconciler::mesofact_static::tests::parse_worker_mode reconciler::mesofact_static::tests::worker_script → 21 pass")
 //! @yah:verify("cargo test -p yah --lib r434_f4_ssr_pond_tests → 9 pass (camp helpers: workload.toml subtree read, manifest ssr_prefixes read, build_ssr_runtime_deploy_spec)")
-//! @yah:verify("cargo check -p local-driver -p warden -p cloud -p yah → clean (warnings only, none from F4)")
+//! @yah:verify("cargo check -p local-driver -p yubaba -p cloud -p yah → clean (warnings only, none from F4)")
 //! @yah:verify("Live smoke (user): workload.toml with [ssr_runtime] block + mirror.toml with providers.static.mode=\"ssr\" → yah camp → desktop adopts pond and the SSR prefix routes to the bun container")
 //!
 //! @yah:ticket(R438-T6, "W165 wiring: lower MesofactStaticWorkload.build_mode to ForgeCommand")
@@ -206,28 +206,41 @@
 pub const WORKER_SCRIPT: &str = include_str!("../../worker/router.bundle.js");
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use tokio::process::Command;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
-use task::{
+use kamaji::native::NativeRuntime;
+use kamaji::{Kamaji, MeshAssignment, MeshIdent};
+use velveteen::{
     ExecContext, ForgeCommand, ForgeExecutor, ForgeSpec, Initiator, LocalForgeDriver, MeshAccess,
     TaskLocation, TaskPlacement, TaskRuntime,
 };
-use workload_spec::{BuildConfig, BuildMode};
+use workload_spec::{
+    BuildConfig, BuildMode, EnvVar, ExposeSpec, ImageRef, MeshExpose, Millis, ResourceLimits,
+    RestartPolicy, SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
+};
 
 use super::{
-    into_running, pond, slot_field_u16, supervise_child, wait_for_port, LogBuffer,
-    ReconcileCtx, Reconciler, RunningWorkload,
+    into_running, pond, slot_field_u16, wait_for_port, LogBuffer, ReconcileCtx, Reconciler,
+    RunningWorkload,
 };
 use crate::{MirrorProviderSlot, Provider};
+
+/// Native workloads are a fork+exec of an already-present host binary — the
+/// kamaji Native backend treats `ImageRef` as identity metadata only and
+/// never pulls. The schema still demands a valid-format digest, so native
+/// specs stamp a fixed all-zeros marker: impossible for any real image, so a
+/// leak into a registry-pull path surfaces obviously. (Mirrors
+/// `workload_spec::testing::TEST_DIGEST` without reaching into a test-only
+/// helper from production code.)
+const NATIVE_IDENTITY_DIGEST: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Workload kind this reconciler handles. Matches `ServiceComponent.kind`
 /// and the `kind = "..."` line in `workload.toml`.
@@ -329,6 +342,11 @@ impl Reconciler for MesofactStaticReconciler {
     }
 
     async fn up(&self, ctx: ReconcileCtx<'_>) -> Result<RunningWorkload> {
+        // BYO git (R561-F1): if the component is git-sourced, shallow-clone it
+        // into the source cache before anything reads workload_dir(). No-op for
+        // in-tree components.
+        ctx.materialize().await?;
+
         // Validate that the workload manifest agrees with the component's
         // declared kind. Mismatch is an authoring error (service.toml
         // points at a workload of the wrong shape).
@@ -365,7 +383,10 @@ impl Reconciler for MesofactStaticReconciler {
                     "providers.static.kind = \"{kind:?}\" not supported by mesofact-static reconciler (only local-static + miniflare-container for now)",
                 )
             }
-            MirrorProviderSlot::Reference { provider_id, fields } => {
+            MirrorProviderSlot::Reference {
+                provider_id,
+                fields,
+            } => {
                 if provider_id != "cloudflare" {
                     anyhow::bail!(
                         "providers.static.use = \"{provider_id}\" — only \"cloudflare\" is \
@@ -413,16 +434,19 @@ impl MesofactStaticReconciler {
     }
 
     async fn up_local_static(&self, ctx: &ReconcileCtx<'_>, port: u16) -> Result<RunningWorkload> {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
-        // If the camp-embedded mesofact-dev server is already running on the
-        // configured port, adopt it rather than spawning a second instance.
+        // If a mesofact-dev server is already running on the configured port
+        // (e.g. a prior `mirror up` in this session), adopt it rather than
+        // spawning a second instance — keeps re-runs idempotent.
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
             let dev_url = format!("http://{addr}");
             info!(dev_url = %dev_url, port, "mesofact-dev already running; adopting");
-            return Ok(RunningWorkload::adopted("mesofact-static", "static", Some(dev_url)));
+            return Ok(RunningWorkload::adopted(
+                "mesofact-static",
+                "static",
+                Some(dev_url),
+            ));
         }
 
         // Camp may have fallen back to a dynamic port (OS-assigned when configured
@@ -434,7 +458,11 @@ impl MesofactStaticReconciler {
                 if tokio::net::TcpStream::connect(actual_addr).await.is_ok() {
                     let dev_url = format!("http://{actual_addr}");
                     info!(dev_url = %dev_url, actual_port, "mesofact-dev running on dynamic port; adopting");
-                    return Ok(RunningWorkload::adopted("mesofact-static", "static", Some(dev_url)));
+                    return Ok(RunningWorkload::adopted(
+                        "mesofact-static",
+                        "static",
+                        Some(dev_url),
+                    ));
                 }
             }
         }
@@ -447,14 +475,17 @@ impl MesofactStaticReconciler {
 
             // Distinguish "camp not attached" from "camp up but server didn't bind"
             // so the operator gets an actionable message.
-            let camp_live = self.local_static.camp_socket.as_deref()
+            let camp_live = self
+                .local_static
+                .camp_socket
+                .as_deref()
                 .map(is_unix_socket_live)
                 .unwrap_or(false);
 
             if camp_live {
                 anyhow::bail!(
-                    "component {}: camp is up but mesofact-dev did not bind on port {}{} \
-                     — check spawn_mesofact_dev workspace gating or camp logs",
+                    "component {}: a yah daemon is up but mesofact-dev did not bind on port {}{} \
+                     — check that the mesofact-dev workload reconciled, or inspect its logs",
                     ctx.component.id,
                     port,
                     jit_note,
@@ -490,63 +521,82 @@ impl MesofactStaticReconciler {
                         .context("could not bind any port for mesofact-dev")?;
                     let p = fallback.local_addr()?.port();
                     if port != 0 {
-                        info!(preferred = port, actual = p, "preferred port taken; mesofact-dev will use OS-assigned port");
+                        info!(
+                            preferred = port,
+                            actual = p,
+                            "preferred port taken; mesofact-dev will use OS-assigned port"
+                        );
                     }
                     p
                 }
             }
         };
 
-        let mut cmd = Command::new(&binary);
-        cmd.arg(&workload_dir)
-            .arg("--port")
-            .arg(spawn_port.to_string())
-            .args(&self.local_static.extra_args)
-            // Pipe stdio so lines feed the Run-tab log surface (R263-F3).
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        // R490-F2: spawn mesofact-dev through kamaji's Native (fork+exec)
+        // backend rather than a bespoke Command::spawn. NativeRuntime owns the
+        // fork+exec, stdio capture, and SIGTERM→grace→SIGKILL teardown; the
+        // reconciler keeps only the WorkloadSpec lowering, the readiness probe,
+        // and a file-tail→LogBuffer bridge that preserves the Run-tab's live
+        // log surface (NativeRuntime captures stdio to files, not a pipe).
+        self.spawn_via_constable(ctx, &binary, &workload_dir, spawn_port)
+            .await
+    }
+
+    /// Lower the mesofact-dev invocation to a [`WorkloadSpec`], deploy it on a
+    /// per-bring-up [`NativeRuntime`], wait for the port, and wrap the result
+    /// in a [`RunningWorkload`] whose shutdown tears the workload back down.
+    async fn spawn_via_constable(
+        &self,
+        ctx: &ReconcileCtx<'_>,
+        binary: &Path,
+        workload_dir: &Path,
+        spawn_port: u16,
+    ) -> Result<RunningWorkload> {
+        // NativeRuntime captures stdout/stderr under <state_dir>/<ident>/.
+        // Scope it per-workspace so concurrent camps don't collide.
+        let state_dir = ctx.workspace_root.join(".yah/jit/native");
+        let ident_str = native_ident(&ctx.service.name, &ctx.component.id);
+        let ident = MeshIdent(ident_str.clone());
+
+        let mut argv: Vec<String> = vec![
+            binary.display().to_string(),
+            workload_dir.display().to_string(),
+            "--port".to_string(),
+            spawn_port.to_string(),
+        ];
+        argv.extend(self.local_static.extra_args.iter().cloned());
+        let spec = native_mesofact_spec(&ident_str, argv);
+
+        let runtime = Arc::new(NativeRuntime::new(&state_dir));
+        let mesh = MeshAssignment::inlined(Ipv4Addr::LOCALHOST);
 
         info!(
             binary = %binary.display(),
             workload = %workload_dir.display(),
             port = spawn_port,
-            "spawning mesofact-dev",
+            ident = %ident_str,
+            "spawning mesofact-dev (kamaji native backend)",
         );
 
-        let mut child = cmd.spawn().with_context(|| {
-            format!(
-                "spawning {} — install with `cargo install --path crates/yah/mesofact-dev` or start yah-camp which embeds it",
-                binary.display(),
-            )
-        })?;
+        let deployed = runtime
+            .deploy_workload(&spec, &mesh)
+            .await
+            .with_context(|| {
+                format!(
+                    "deploying mesofact-dev via kamaji native backend \
+                     — install with `cargo install --path oss/mesofact/crates/mesofact-dev` \
+                     or ensure the bundled sidecar is on the path ({})",
+                    binary.display(),
+                )
+            })?;
 
-        // Drain stdout + stderr into a shared ring buffer.
-        let log_buf = LogBuffer::new();
-        if let Some(stdout) = child.stdout.take() {
-            let buf = log_buf.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    buf.push(line).await;
-                }
-            });
-        }
-        if let Some(stderr) = child.stderr.take() {
-            let buf = log_buf.clone();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    buf.push(line).await;
-                }
-            });
-        }
+        // Mirror NativeRuntime's capture layout (documented in native.rs).
+        let workload_log_dir = state_dir.join(&ident_str);
+        let stdout_path = workload_log_dir.join("stdout.log");
+        let stderr_path = workload_log_dir.join("stderr.log");
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let supervisor = supervise_child("mesofact-dev", child, shutdown_rx);
-
-        // Wait for the server to bind. If it doesn't, signal shutdown and
-        // return an error so the caller doesn't hand the UI a dead URL.
+        // Wait for the server to bind. If it doesn't, tear it down and return
+        // an error so the caller doesn't hand the UI a dead URL.
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), spawn_port);
         let timeout = self
             .local_static
@@ -554,16 +604,25 @@ impl MesofactStaticReconciler {
             .unwrap_or(Duration::from_secs(10));
         if !wait_for_port(addr, timeout).await {
             warn!(addr = %addr, "mesofact-dev did not bind within timeout; tearing down");
-            let _ = shutdown_tx.send(());
-            supervisor.await.ok();
-            anyhow::bail!(
-                "mesofact-dev failed to bind {addr} within {:?}",
-                timeout,
-            );
+            runtime.teardown_workload(&ident).await.ok();
+            anyhow::bail!("mesofact-dev failed to bind {addr} within {:?}", timeout);
         }
 
         let dev_url = format!("http://{addr}");
-        info!(dev_url = %dev_url, port = spawn_port, "mesofact-dev ready");
+        info!(dev_url = %dev_url, port = spawn_port, pid = deployed.task_pid, "mesofact-dev ready");
+
+        // Bridge NativeRuntime's file capture into the Run-tab LogBuffer and
+        // own teardown on shutdown.
+        let log_buf = LogBuffer::new();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let supervisor = spawn_native_log_supervisor(
+            runtime,
+            ident,
+            log_buf.clone(),
+            stdout_path,
+            stderr_path,
+            shutdown_rx,
+        );
 
         Ok(into_running(
             "mesofact-static",
@@ -584,8 +643,8 @@ impl MesofactStaticReconciler {
         slot_fields: &std::collections::BTreeMap<String, toml::Value>,
     ) -> Result<RunningWorkload> {
         use super::r2_publish::{
-            publish_to_r2, R2PurgeOpts, R2_ACCESS_KEY_ENV, R2_ACCESS_KEY_SLOT,
-            R2_SECRET_KEY_ENV, R2_SECRET_KEY_SLOT,
+            publish_to_r2, R2PurgeOpts, R2_ACCESS_KEY_ENV, R2_ACCESS_KEY_SLOT, R2_SECRET_KEY_ENV,
+            R2_SECRET_KEY_SLOT,
         };
         use crate::config::ProviderConfig;
         use crate::provider::cloudflare::{CloudflareClient, WorkerBinding};
@@ -629,20 +688,23 @@ impl MesofactStaticReconciler {
         // publish_to_r2 lays files down under `<svc>/<env>/<key>`, so this URL
         // must include the same prefix. Validate up front — without it the
         // Worker would 404 every request in prod.
-        let asset_origin = slot_fields
-            .get("asset_origin")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .with_context(|| format!(
+        let asset_origin =
+            slot_fields
+                .get("asset_origin")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .with_context(|| {
+                    format!(
                 "providers.static.asset_origin missing or empty (service={svc}, env={env}) — \
                  set it to the R2 public URL with the publish prefix, e.g. \
                  \"https://cdn.{zone}/{svc}/{env}\"",
                 svc = ctx.service.name, env = ctx.env, zone = zone,
-            ))?
-            .to_string();
+            )
+                })?
+                .to_string();
 
         // R2 S3 access keys (distinct from the management API token).
-        let access_key = keys::get_or_env(R2_ACCESS_KEY_SLOT, R2_ACCESS_KEY_ENV)
+        let access_key = fob::get_or_env(R2_ACCESS_KEY_SLOT, R2_ACCESS_KEY_ENV)
             .context("resolving R2 S3 access key")?
             .with_context(|| {
                 format!(
@@ -650,7 +712,7 @@ impl MesofactStaticReconciler {
                      or export {R2_ACCESS_KEY_ENV}"
                 )
             })?;
-        let secret_key = keys::get_or_env(R2_SECRET_KEY_SLOT, R2_SECRET_KEY_ENV)
+        let secret_key = fob::get_or_env(R2_SECRET_KEY_SLOT, R2_SECRET_KEY_ENV)
             .context("resolving R2 S3 secret key")?
             .with_context(|| {
                 format!(
@@ -662,12 +724,13 @@ impl MesofactStaticReconciler {
         // Management API token — used for cache-tag purge and Transform Rules.
         // Optional: publish itself only needs the R2 S3 keys.
         let cf_api_token: Option<String> =
-            keys::get_or_env("cloudflare-api-token", "CLOUDFLARE_API_TOKEN")
+            fob::get_or_env("cloudflare-api-token", "CLOUDFLARE_API_TOKEN")
                 .ok()
                 .flatten();
-        let purge = cf_api_token
-            .clone()
-            .map(|token| R2PurgeOpts { zone_name: zone.clone(), api_token: token });
+        let purge = cf_api_token.clone().map(|token| R2PurgeOpts {
+            zone_name: zone.clone(),
+            api_token: token,
+        });
 
         // Resolve dist dir from workload.toml build.out_dir (default: "dist").
         let workload_dir = ctx.workload_dir();
@@ -685,9 +748,7 @@ impl MesofactStaticReconciler {
             purge,
         )
         .await
-        .with_context(|| {
-            format!("publishing to R2 bucket {bucket:?} (account {account_id})")
-        })?;
+        .with_context(|| format!("publishing to R2 bucket {bucket:?} (account {account_id})"))?;
 
         info!(
             uploaded = report.uploaded.len(),
@@ -712,7 +773,10 @@ impl MesofactStaticReconciler {
             let bindings = worker_config_bindings(&mode, &asset_origin);
             let worker_bindings: Vec<WorkerBinding<'_>> = bindings
                 .iter()
-                .map(|(k, v)| WorkerBinding::PlainText { name: k.as_str(), text: v.as_str() })
+                .map(|(k, v)| WorkerBinding::PlainText {
+                    name: k.as_str(),
+                    text: v.as_str(),
+                })
                 .collect();
             // Hash script + bindings so config changes trigger redeploy.
             let script_hash = {
@@ -739,15 +803,20 @@ impl MesofactStaticReconciler {
                         &worker_bindings,
                     )
                     .await?;
-                    let _ = write_worker_script_hash(ctx.workspace_root, &worker_name, &script_hash);
+                    let _ =
+                        write_worker_script_hash(ctx.workspace_root, &worker_name, &script_hash);
                     info!(worker_name, "CF Worker script deployed");
                 } else {
-                    info!(worker_name, "CF Worker script unchanged — skipping redeploy");
+                    info!(
+                        worker_name,
+                        "CF Worker script unchanged — skipping redeploy"
+                    );
                 }
 
                 // Upsert zone route: `{zone}/*` → worker script.
                 let route_pattern = format!("{zone}/*");
-                cf.upsert_worker_route(&zone_id, &route_pattern, &worker_name).await?;
+                cf.upsert_worker_route(&zone_id, &route_pattern, &worker_name)
+                    .await?;
                 anyhow::Ok(())
             }
             .await;
@@ -769,7 +838,6 @@ impl MesofactStaticReconciler {
     }
 }
 
-
 /// Read the `[build]` + `[build_mode]` subtrees from
 /// `<workload_dir>/workload.toml`. Used by [`MesofactStaticReconciler::rebuild_static`]
 /// to drive [`run_build`] without forcing the whole workload through the
@@ -786,9 +854,7 @@ impl MesofactStaticReconciler {
 ///   error if relevant).
 /// - `Ok(Some((build, build_mode)))` on success; `build_mode` defaults to
 ///   `HostSide` when the field is absent.
-fn read_mesofact_build(
-    workload_dir: &std::path::Path,
-) -> Result<Option<(BuildConfig, BuildMode)>> {
+fn read_mesofact_build(workload_dir: &std::path::Path) -> Result<Option<(BuildConfig, BuildMode)>> {
     let path = workload_dir.join("workload.toml");
     let src = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -905,7 +971,11 @@ fn read_workload_out_dir(workload_dir: &std::path::Path) -> Option<String> {
     let path = workload_dir.join("workload.toml");
     let src = std::fs::read_to_string(&path).ok()?;
     let value: toml::Value = toml::from_str(&src).ok()?;
-    value.get("build")?.get("out_dir")?.as_str().map(str::to_string)
+    value
+        .get("build")?
+        .get("out_dir")?
+        .as_str()
+        .map(str::to_string)
 }
 
 // ---------- CF Worker script rendering ----------
@@ -922,14 +992,21 @@ pub enum WorkerMode {
     Spa,
     /// Paths matching `prefixes` are proxied to `origin_url`; the rest uses
     /// the SPA index.html fallback.
-    Ssr { origin_url: String, prefixes: Vec<String> },
+    Ssr {
+        origin_url: String,
+        prefixes: Vec<String>,
+    },
 }
 
 /// Parse the Worker routing mode from the mirror's static slot fields. Public
 /// so camp's pond bring-up can mirror the cloudflare-arm semantics without
 /// duplicating the field-name conventions.
 pub fn parse_worker_mode(fields: &std::collections::BTreeMap<String, toml::Value>) -> WorkerMode {
-    match fields.get("mode").and_then(|v| v.as_str()).unwrap_or("static") {
+    match fields
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("static")
+    {
         "spa" => WorkerMode::Spa,
         "ssr" => {
             let origin_url = fields
@@ -940,9 +1017,16 @@ pub fn parse_worker_mode(fields: &std::collections::BTreeMap<String, toml::Value
             let prefixes = fields
                 .get("ssr_prefixes")
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            WorkerMode::Ssr { origin_url, prefixes }
+            WorkerMode::Ssr {
+                origin_url,
+                prefixes,
+            }
         }
         _ => WorkerMode::Static,
     }
@@ -956,7 +1040,10 @@ fn worker_config_bindings(mode: &WorkerMode, asset_origin: &str) -> Vec<(String,
     let (mode_str, ssr_origin, ssr_prefixes) = match mode {
         WorkerMode::Static => ("static", String::new(), "[]".to_string()),
         WorkerMode::Spa => ("spa", String::new(), "[]".to_string()),
-        WorkerMode::Ssr { origin_url, prefixes } => (
+        WorkerMode::Ssr {
+            origin_url,
+            prefixes,
+        } => (
             "ssr",
             origin_url.clone(),
             serde_json::to_string(prefixes).unwrap_or_else(|_| "[]".to_string()),
@@ -964,6 +1051,10 @@ fn worker_config_bindings(mode: &WorkerMode, asset_origin: &str) -> Vec<(String,
     };
     vec![
         ("ASSET_ORIGIN".to_string(), asset_origin.to_string()),
+        // Reserved upload seam (R490-T8): prod has no upload origin yet, so the
+        // binding is empty and the Worker returns 404 on /uploads/*. A future
+        // dynamic-bucket consumer sets this to the user-writable origin.
+        ("UPLOAD_ORIGIN".to_string(), String::new()),
         ("WORKER_MODE".to_string(), mode_str.to_string()),
         ("SSR_ORIGIN".to_string(), ssr_origin),
         ("SSR_PREFIXES".to_string(), ssr_prefixes),
@@ -980,7 +1071,9 @@ fn read_worker_script_hash(workspace_root: &std::path::Path, worker_name: &str) 
     let path = workspace_root.join(".yah/jit/worker-script-hashes.json");
     let s = std::fs::read_to_string(&path).ok()?;
     let map: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&s).ok()?;
-    map.get(worker_name).and_then(|v| v.as_str()).map(|s| s.to_string())
+    map.get(worker_name)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Write the deployed Worker script hash to the jit cache.
@@ -998,14 +1091,16 @@ fn write_worker_script_hash(
     } else {
         serde_json::Map::new()
     };
-    map.insert(worker_name.to_string(), serde_json::Value::String(hash.to_string()));
+    map.insert(
+        worker_name.to_string(),
+        serde_json::Value::String(hash.to_string()),
+    );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(
         &path,
-        serde_json::to_string_pretty(&serde_json::Value::Object(map))
-            .unwrap_or_default(),
+        serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default(),
     )
 }
 
@@ -1035,6 +1130,170 @@ fn read_jit_port(workspace_root: &std::path::Path, svc: &str, component: &str) -
     map.get(&format!("{svc}/{component}"))
         .and_then(|v| v.as_u64())
         .and_then(|n| u16::try_from(n).ok())
+}
+
+/// Sanitize `service`/`component` into a [`MeshIdent`] that is DNS-segment
+/// shaped (kamaji contract) and safe as a filesystem path component
+/// (NativeRuntime joins it under its state dir for log capture). Lowercase;
+/// every non-alphanumeric collapses to `-`.
+fn native_ident(service: &str, component: &str) -> String {
+    let raw = format!("mesofact-dev-{service}-{component}");
+    raw.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Lower a mesofact-dev invocation to a native [`WorkloadSpec`]. `argv[0]` is
+/// the host binary; the remaining entries are its arguments (kamaji's
+/// Native backend uses container `command` semantics — see
+/// `constable_core::native`). `image` is identity metadata only: native never
+/// pulls, so it carries the [`NATIVE_IDENTITY_DIGEST`] marker.
+fn native_mesofact_spec(ident: &str, argv: Vec<String>) -> WorkloadSpec {
+    WorkloadSpec {
+        schema_version: SchemaVersion::V1,
+        name: ident.to_string(),
+        image: ImageRef {
+            registry: "localhost".to_string(),
+            repository: format!("native/{ident}"),
+            tag: "dev".to_string(),
+            digest: NATIVE_IDENTITY_DIGEST.to_string(),
+        },
+        tier: TierTag("dev".to_string()),
+        replicas: 1,
+        command: Some(argv),
+        entrypoint: None,
+        workdir: None,
+        user: None,
+        env: Vec::<EnvVar>::new(),
+        secrets: vec![],
+        volumes: vec![],
+        resources: ResourceLimits {
+            memory_mb: 512,
+            cpu_shares: 512,
+            ephemeral_storage_mb: 512,
+        },
+        depends_on: vec![],
+        healthcheck: None,
+        restart_policy: RestartPolicy::Never,
+        stop_policy: StopPolicy {
+            signal: 15,
+            grace_period: Millis::from_secs(5),
+        },
+        expose: ExposeSpec {
+            mesh: MeshExpose {
+                identity: MeshIdent(ident.to_string()),
+                ports: vec![],
+                allow_from: vec![],
+            },
+            public: None,
+            operator: None,
+        },
+        labels: Default::default(),
+        annotations: Default::default(),
+    }
+}
+
+/// Supervisor task for a kamaji-native mesofact-dev workload.
+///
+/// NativeRuntime captures stdout/stderr to files with no follow, but the
+/// Run-tab expects a live [`LogBuffer`]. This task incrementally tails both
+/// capture files into `log_buf`, watches for a terminal child state, and on
+/// shutdown (operator signal or self-exit) tears the workload down. Returned
+/// as the `RunningWorkload` supervisor so the existing lifecycle contract is
+/// unchanged.
+fn spawn_native_log_supervisor(
+    runtime: Arc<NativeRuntime>,
+    ident: MeshIdent,
+    log_buf: LogBuffer,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        let mut out_tail = FileTail::new(stdout_path);
+        let mut err_tail = FileTail::new(stderr_path);
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    out_tail.drain_into(&log_buf).await;
+                    err_tail.drain_into(&log_buf).await;
+                    runtime.teardown_workload(&ident).await.ok();
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                    out_tail.drain_into(&log_buf).await;
+                    err_tail.drain_into(&log_buf).await;
+                    match runtime.get_workload(&ident).await {
+                        // Still running — keep tailing.
+                        Ok(Some(state)) if !state.status.is_terminal() => {}
+                        // Exited on its own — final drain, then stop.
+                        Ok(Some(_)) => {
+                            out_tail.drain_into(&log_buf).await;
+                            err_tail.drain_into(&log_buf).await;
+                            return Ok(());
+                        }
+                        // Torn down elsewhere or runtime gone — stop.
+                        Ok(None) | Err(_) => return Ok(()),
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Incremental line-oriented tail of a capture file. Tracks the byte offset
+/// already consumed plus any partial trailing line, so each drain emits only
+/// whole new lines into the [`LogBuffer`].
+struct FileTail {
+    path: PathBuf,
+    offset: u64,
+    partial: String,
+}
+
+impl FileTail {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            offset: 0,
+            partial: String::new(),
+        }
+    }
+
+    async fn drain_into(&mut self, log_buf: &LogBuffer) {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let Ok(mut file) = tokio::fs::File::open(&self.path).await else {
+            return;
+        };
+        if file
+            .seek(std::io::SeekFrom::Start(self.offset))
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let mut buf = Vec::new();
+        let Ok(n) = file.read_to_end(&mut buf).await else {
+            return;
+        };
+        if n == 0 {
+            return;
+        }
+        self.offset += n as u64;
+        // Carry any incomplete trailing line over to the next drain.
+        self.partial.push_str(&String::from_utf8_lossy(&buf));
+        while let Some(idx) = self.partial.find('\n') {
+            let line: String = self.partial.drain(..=idx).collect();
+            log_buf
+                .push(line.trim_end_matches(['\n', '\r']).to_string())
+                .await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1098,6 +1357,7 @@ out_dir = "dist"
                 role: "static".to_string(),
                 publishes: None,
                 wave: 0,
+                git: None,
             };
             Self {
                 _workspace: workspace,
@@ -1288,8 +1548,14 @@ kind = "container"
     #[tokio::test]
     async fn up_bails_on_cloudflare_reference_missing_asset_origin() {
         let mut fields = BTreeMap::new();
-        fields.insert("bucket".to_string(), toml::Value::String("yah-dev".to_string()));
-        fields.insert("zone".to_string(), toml::Value::String("yah.dev".to_string()));
+        fields.insert(
+            "bucket".to_string(),
+            toml::Value::String("yah-dev".to_string()),
+        );
+        fields.insert(
+            "zone".to_string(),
+            toml::Value::String("yah.dev".to_string()),
+        );
         let cloudflare = MirrorProviderSlot::Reference {
             provider_id: "cloudflare".to_string(),
             fields,
@@ -1312,7 +1578,10 @@ account_id = "test-account"
         let reconciler = MesofactStaticReconciler::new();
         let err = reconciler.up(fx.ctx()).await.unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("asset_origin"), "error must name asset_origin; got: {msg}");
+        assert!(
+            msg.contains("asset_origin"),
+            "error must name asset_origin; got: {msg}"
+        );
     }
 
     /// R432-B2: stale jit file claiming the configured port must not produce
@@ -1415,8 +1684,8 @@ account_id = "test-account"
         let err = reconciler.up(fx.ctx()).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("camp is up"),
-            "live socket must give 'camp is up but didn't bind' message; got: {msg}"
+            msg.contains("a yah daemon is up but"),
+            "live socket must give 'daemon is up but didn't bind' message; got: {msg}"
         );
         assert!(
             msg.contains("did not bind"),
@@ -1435,6 +1704,70 @@ account_id = "test-account"
         let err = reconciler.up(fx.ctx()).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("spawning"), "got: {msg}");
+    }
+
+    /// R490-F2: native_ident produces a DNS-/path-safe slug.
+    #[test]
+    fn native_ident_sanitizes_to_path_safe_slug() {
+        assert_eq!(
+            native_ident("dev-yah", "static"),
+            "mesofact-dev-dev-yah-static"
+        );
+        // Non-alphanumerics (incl. slashes, dots) collapse to '-'; lowercased.
+        assert_eq!(native_ident("Foo.Bar", "a/b"), "mesofact-dev-foo-bar-a-b");
+    }
+
+    /// R490-F2: native_mesofact_spec lowers argv into the Native backend's
+    /// container-`command` shape with the no-pull identity digest.
+    #[test]
+    fn native_mesofact_spec_lowers_argv_and_identity() {
+        let spec = native_mesofact_spec(
+            "mesofact-dev-site-static",
+            vec![
+                "/bin/mesofact-dev".into(),
+                "/wd".into(),
+                "--port".into(),
+                "4321".into(),
+            ],
+        );
+        assert_eq!(spec.name, "mesofact-dev-site-static");
+        assert_eq!(spec.entrypoint, None);
+        assert_eq!(spec.command.as_deref().unwrap()[0], "/bin/mesofact-dev");
+        assert_eq!(spec.expose.mesh.identity.0, "mesofact-dev-site-static");
+        assert_eq!(spec.image.digest, NATIVE_IDENTITY_DIGEST);
+        assert_eq!(spec.replicas, 1);
+    }
+
+    /// R490-F2: FileTail emits only whole lines and carries a partial trailing
+    /// line over to the next drain (the Run-tab log bridge over kamaji's
+    /// file capture).
+    #[tokio::test]
+    async fn file_tail_emits_whole_lines_and_carries_partial() {
+        use tokio::io::AsyncWriteExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("stdout.log");
+        let log = LogBuffer::new();
+        let mut tail = FileTail::new(path.clone());
+
+        // No file yet → no-op, no lines.
+        tail.drain_into(&log).await;
+        let (l0, c0) = log.since(0).await;
+        assert!(l0.is_empty());
+
+        // Two whole lines + a partial third (no trailing newline).
+        let mut f = tokio::fs::File::create(&path).await.unwrap();
+        f.write_all(b"alpha\nbeta\npar").await.unwrap();
+        f.flush().await.unwrap();
+        tail.drain_into(&log).await;
+        let (l1, c1) = log.since(c0).await;
+        assert_eq!(l1, vec!["alpha".to_string(), "beta".to_string()]);
+
+        // Completing the partial line surfaces it whole on the next drain.
+        f.write_all(b"tial\ngamma\n").await.unwrap();
+        f.flush().await.unwrap();
+        tail.drain_into(&log).await;
+        let (l2, _) = log.since(c1).await;
+        assert_eq!(l2, vec!["partial".to_string(), "gamma".to_string()]);
     }
 
     /// Wait-for-port: bind a local TCP listener in-process, confirm
@@ -1532,10 +1865,16 @@ account_id = "test-account"
         let root = tmp.path();
         assert!(read_worker_script_hash(root, "test-worker").is_none());
         write_worker_script_hash(root, "test-worker", "abc123").unwrap();
-        assert_eq!(read_worker_script_hash(root, "test-worker").as_deref(), Some("abc123"));
+        assert_eq!(
+            read_worker_script_hash(root, "test-worker").as_deref(),
+            Some("abc123")
+        );
         // Writing a second worker doesn't clobber the first.
         write_worker_script_hash(root, "other-worker", "def456").unwrap();
-        assert_eq!(read_worker_script_hash(root, "test-worker").as_deref(), Some("abc123"));
+        assert_eq!(
+            read_worker_script_hash(root, "test-worker").as_deref(),
+            Some("abc123")
+        );
     }
 
     #[test]
@@ -1555,14 +1894,19 @@ account_id = "test-account"
     fn parse_worker_mode_ssr_extracts_origin_and_prefixes() {
         let mut fields = BTreeMap::new();
         fields.insert("mode".to_string(), toml::Value::String("ssr".to_string()));
-        fields.insert("origin_url".to_string(), toml::Value::String("https://origin.example.com".to_string()));
+        fields.insert(
+            "origin_url".to_string(),
+            toml::Value::String("https://origin.example.com".to_string()),
+        );
         fields.insert(
             "ssr_prefixes".to_string(),
-            toml::Value::Array(vec![
-                toml::Value::String("/api/".to_string()),
-            ]),
+            toml::Value::Array(vec![toml::Value::String("/api/".to_string())]),
         );
-        if let WorkerMode::Ssr { origin_url, prefixes } = parse_worker_mode(&fields) {
+        if let WorkerMode::Ssr {
+            origin_url,
+            prefixes,
+        } = parse_worker_mode(&fields)
+        {
             assert_eq!(origin_url, "https://origin.example.com");
             assert_eq!(prefixes, vec!["/api/"]);
         } else {
@@ -1573,8 +1917,8 @@ account_id = "test-account"
     // ---------- W165: BuildMode → ForgeSpec lowering (R438-T6) ----------
 
     use std::sync::Mutex as StdMutex;
-    use task::executor::{ExecEvent, ExecOutcome, ForgeExecutorError};
-    use task::ForgeStatus;
+    use velveteen::executor::{ExecEvent, ExecOutcome, ForgeExecutorError};
+    use velveteen::ForgeStatus;
     use tokio::sync::mpsc::UnboundedSender;
 
     /// Captures the [`ForgeSpec`] handed to `execute(...)` and returns
@@ -1605,7 +1949,10 @@ account_id = "test-account"
         ) -> Result<ExecOutcome, ForgeExecutorError> {
             self.captured.lock().unwrap().push((spec, ctx));
             Ok(ExecOutcome {
-                status: ForgeStatus::Done { exit_code: 0, ended_at: 0 },
+                status: ForgeStatus::Done {
+                    exit_code: 0,
+                    ended_at: 0,
+                },
                 stderr_tail: String::new(),
             })
         }
@@ -1626,7 +1973,10 @@ account_id = "test-account"
             _sink: Option<UnboundedSender<ExecEvent>>,
         ) -> Result<ExecOutcome, ForgeExecutorError> {
             Ok(ExecOutcome {
-                status: ForgeStatus::Done { exit_code: 2, ended_at: 0 },
+                status: ForgeStatus::Done {
+                    exit_code: 2,
+                    ended_at: 0,
+                },
                 stderr_tail: self.stderr.clone(),
             })
         }
@@ -1663,7 +2013,9 @@ account_id = "test-account"
         let (capture, captured) = CaptureExecutor::new();
         let tmp = tempdir().unwrap();
         let (build, mode) = host_side_build();
-        run_build(tmp.path(), &build, &mode, &*capture).await.unwrap();
+        run_build(tmp.path(), &build, &mode, &*capture)
+            .await
+            .unwrap();
 
         let captured = captured.lock().unwrap();
         assert_eq!(captured.len(), 1, "build executed exactly once");
@@ -1673,7 +2025,10 @@ account_id = "test-account"
         match &spec.command {
             ForgeCommand::Subprocess { argv, image } => {
                 assert!(image.is_none(), "host_side carries no image; got {image:?}");
-                assert_eq!(argv, &vec!["sh".to_string(), "-c".into(), "bun run build".into()]);
+                assert_eq!(
+                    argv,
+                    &vec!["sh".to_string(), "-c".into(), "bun run build".into()]
+                );
             }
             other => panic!("expected Subprocess, got {other:?}"),
         }
@@ -1685,7 +2040,9 @@ account_id = "test-account"
         let (capture, captured) = CaptureExecutor::new();
         let tmp = tempdir().unwrap();
         let (build, mode) = in_container_build();
-        run_build(tmp.path(), &build, &mode, &*capture).await.unwrap();
+        run_build(tmp.path(), &build, &mode, &*capture)
+            .await
+            .unwrap();
 
         let captured = captured.lock().unwrap();
         let (spec, ctx) = &captured[0];
@@ -1698,7 +2055,10 @@ account_id = "test-account"
                 assert_eq!(image.repository, "org/app-build");
                 assert_eq!(image.tag, "v1.2");
                 assert_eq!(image.digest, workload_spec::testing::test_digest());
-                assert_eq!(argv, &vec!["sh".to_string(), "-c".into(), "bun run build".into()]);
+                assert_eq!(
+                    argv,
+                    &vec!["sh".to_string(), "-c".into(), "bun run build".into()]
+                );
             }
             other => panic!("expected Subprocess, got {other:?}"),
         }
@@ -1712,7 +2072,9 @@ account_id = "test-account"
         });
         let tmp = tempdir().unwrap();
         let (build, mode) = host_side_build();
-        let err = run_build(tmp.path(), &build, &mode, &*executor).await.unwrap_err();
+        let err = run_build(tmp.path(), &build, &mode, &*executor)
+            .await
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("Cannot find module 'react'"), "got: {msg}");
         assert!(msg.contains("bun run build"), "got: {msg}");
@@ -1928,7 +2290,11 @@ digest = "{digest}"
         let _ = reconciler.rebuild_static(fx.ctx()).await;
 
         let captured = captured.lock().unwrap();
-        assert_eq!(captured.len(), 1, "build step still ran (host-side fallback)");
+        assert_eq!(
+            captured.len(),
+            1,
+            "build step still ran (host-side fallback)"
+        );
         let (spec, _) = &captured[0];
         assert_eq!(
             spec.where_.runtime,
@@ -1961,7 +2327,11 @@ digest = "{digest}"
             });
         let _ = reconciler.rebuild_static(fx.ctx()).await;
         let captured = captured.lock().unwrap();
-        assert_eq!(captured.len(), 1, "default build_mode still runs the build step");
+        assert_eq!(
+            captured.len(),
+            1,
+            "default build_mode still runs the build step"
+        );
         assert_eq!(captured[0].0.where_.runtime, TaskRuntime::Native);
     }
 

@@ -38,10 +38,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::config::ProviderConfig;
+use crate::reconciler::pond::{DEFAULT_MINIO_API_PORT, DEFAULT_MINIO_PASSWORD, DEFAULT_MINIO_USER};
 use crate::reconciler::r2_publish::{
     R2_ACCESS_KEY_ENV, R2_ACCESS_KEY_SLOT, R2_SECRET_KEY_ENV, R2_SECRET_KEY_SLOT,
 };
-use crate::reconciler::pond::{DEFAULT_MINIO_API_PORT, DEFAULT_MINIO_PASSWORD, DEFAULT_MINIO_USER};
 use crate::reconciler::static_asset::WORKLOAD_KIND;
 use crate::{MirrorProviderSlot, Provider, ServiceConfig};
 
@@ -211,8 +211,8 @@ pub fn compute_live_set(
 }
 
 fn load_static_asset_workload(path: &Path) -> Result<StaticAssetWorkload> {
-    let src = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let src =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let envelope: workload_spec::Workload =
         toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
     match envelope {
@@ -259,9 +259,10 @@ fn resolve_backend(
     })?;
 
     match slot {
-        MirrorProviderSlot::Reference { provider_id, fields }
-            if provider_id == "cloudflare" =>
-        {
+        MirrorProviderSlot::Reference {
+            provider_id,
+            fields,
+        } if provider_id == "cloudflare" => {
             let bucket = fields
                 .get("bucket")
                 .and_then(|v| v.as_str())
@@ -278,18 +279,16 @@ fn resolve_backend(
                 .fields
                 .get("account_id")
                 .and_then(|v| v.as_str())
-                .with_context(|| {
-                    format!("{}: missing `account_id`", provider_path.display())
-                })?
+                .with_context(|| format!("{}: missing `account_id`", provider_path.display()))?
                 .to_string();
-            let access_key = keys::get_or_env(R2_ACCESS_KEY_SLOT, R2_ACCESS_KEY_ENV)
+            let access_key = fob::get_or_env(R2_ACCESS_KEY_SLOT, R2_ACCESS_KEY_ENV)
                 .context("resolving R2 access key")?
                 .with_context(|| {
                     format!(
                         "R2 access key missing — `yah keys set {R2_ACCESS_KEY_SLOT}` or export {R2_ACCESS_KEY_ENV}"
                     )
                 })?;
-            let secret_key = keys::get_or_env(R2_SECRET_KEY_SLOT, R2_SECRET_KEY_ENV)
+            let secret_key = fob::get_or_env(R2_SECRET_KEY_SLOT, R2_SECRET_KEY_ENV)
                 .context("resolving R2 secret key")?
                 .with_context(|| {
                     format!(
@@ -369,10 +368,7 @@ async fn list_bucket_objects(backend: &Backend) -> Result<Vec<PruneCandidate>> {
     loop {
         let canonical_query = match &continuation {
             // Canonical query must be sorted lex by key: continuation-token < list-type.
-            Some(token) => format!(
-                "continuation-token={}&list-type=2",
-                urlencode(token)
-            ),
+            Some(token) => format!("continuation-token={}&list-type=2", urlencode(token)),
             None => "list-type=2".to_string(),
         };
         let url = format!(
@@ -510,11 +506,8 @@ async fn delete_object(client: &reqwest::Client, url: &str, backend: &Backend) -
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
-        let unreserved = b.is_ascii_alphanumeric()
-            || b == b'-'
-            || b == b'.'
-            || b == b'_'
-            || b == b'~';
+        let unreserved =
+            b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_' || b == b'~';
         if unreserved {
             out.push(b as char);
         } else {
@@ -581,6 +574,7 @@ mod tests {
             role: "assets".into(),
             publishes: None,
             wave: 0,
+            git: None,
         }
     }
 
@@ -613,8 +607,10 @@ mod tests {
             ],
         );
         let live = compute_live_set(root, &svc).unwrap();
-        let want: BTreeSet<String> =
-            ["a/one.bin", "a/two.bin", "b/three.bin"].iter().map(|s| s.to_string()).collect();
+        let want: BTreeSet<String> = ["a/one.bin", "a/two.bin", "b/three.bin"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(live, want);
     }
 
@@ -629,10 +625,7 @@ mod tests {
                  [[asset]]\nfilename = \"x.bin\"\nsource = \"x.bin\"\nblake3 = \"{HASH_64}\"\n"
             ),
         );
-        let mut svc = svc_with_components(
-            "mixed",
-            vec![asset_component("assets", "assets")],
-        );
+        let mut svc = svc_with_components("mixed", vec![asset_component("assets", "assets")]);
         svc.components.push(ServiceComponent {
             id: "site".into(),
             kind: "mesofact-static".into(),
@@ -640,6 +633,7 @@ mod tests {
             role: "static".into(),
             publishes: None,
             wave: 1,
+            git: None,
         });
         // Loading must not try to parse the mesofact-static path.
         let live = compute_live_set(root, &svc).unwrap();

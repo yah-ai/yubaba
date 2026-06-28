@@ -158,7 +158,10 @@ mod tests {
 
     #[test]
     fn create_input_omits_hint_when_absent() {
-        let input = CloudObjectBucketCreateInput { name: "b".into(), location_hint: None };
+        let input = CloudObjectBucketCreateInput {
+            name: "b".into(),
+            location_hint: None,
+        };
         let wire = serde_json::to_value(&input).unwrap();
         assert!(!wire.as_object().unwrap().contains_key("location_hint"));
     }
@@ -171,7 +174,10 @@ mod tests {
 
     #[test]
     fn exists_output_omits_endpoint_when_absent() {
-        let out = CloudObjectBucketExistsOutput { exists: false, endpoint: None };
+        let out = CloudObjectBucketExistsOutput {
+            exists: false,
+            endpoint: None,
+        };
         let wire = serde_json::to_value(&out).unwrap();
         assert_eq!(wire, serde_json::json!({ "exists": false }));
     }

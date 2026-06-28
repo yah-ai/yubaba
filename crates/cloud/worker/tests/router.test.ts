@@ -36,6 +36,7 @@ async function makeMf(cfg: {
   ssrPrefixes?: string[];
   mesofactBackendOrigin?: string;
   issuesOrigin?: string;
+  uploadOrigin?: string;
 }): Promise<MfSetup> {
   const { port, stop } = startAssetServer(cfg.assets);
   const bindings: Record<string, string> = {
@@ -44,6 +45,9 @@ async function makeMf(cfg: {
     SSR_ORIGIN: cfg.ssrOrigin ?? "",
     SSR_PREFIXES: JSON.stringify(cfg.ssrPrefixes ?? []),
   };
+  if (cfg.uploadOrigin !== undefined) {
+    bindings.UPLOAD_ORIGIN = cfg.uploadOrigin;
+  }
   if (cfg.mesofactBackendOrigin) {
     bindings.MESOFACT_BACKEND_ORIGIN = cfg.mesofactBackendOrigin;
   }
@@ -107,6 +111,71 @@ describe("static mode", () => {
     expect(await resp.text()).toBe("Not Found");
     await no404.mf.dispose();
     no404.stop();
+  });
+});
+
+// ── /uploads/ prefix routing (R490-T8) ──────────────────────────────────────
+
+describe("uploads prefix", () => {
+  test("/uploads/* returns 404 when UPLOAD_ORIGIN is unset", async () => {
+    // No uploadOrigin → binding absent → reserved seam 404s cleanly.
+    const setup = await makeMf({
+      mode: "static",
+      assets: { "index.html": { body: "<h1>hi</h1>", type: "text/html" } },
+    });
+    const resp = await setup.mf.dispatchFetch("http://w.test/uploads/pic.png");
+    expect(resp.status).toBe(404);
+    expect(await resp.text()).toBe("Not Found");
+    await setup.mf.dispose();
+    setup.stop();
+  });
+
+  test("/uploads/* routes to UPLOAD_ORIGIN when set", async () => {
+    // Distinct origin from ASSET_ORIGIN; echoes the full key it was asked for.
+    const uploads = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const key = new URL(req.url).pathname.slice(1);
+        if (key === "uploads/pic.png") {
+          return new Response("UPLOADBYTES", { status: 200 });
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    const setup = await makeMf({
+      mode: "static",
+      assets: { "index.html": { body: "<h1>hi</h1>", type: "text/html" } },
+      uploadOrigin: `http://localhost:${uploads.port}`,
+    });
+    const hit = await setup.mf.dispatchFetch("http://w.test/uploads/pic.png");
+    expect(hit.status).toBe(200);
+    expect(await hit.text()).toBe("UPLOADBYTES");
+    // A miss under /uploads/ is a real 404 — never the static 404.html/shell.
+    const miss = await setup.mf.dispatchFetch("http://w.test/uploads/absent.png");
+    expect(miss.status).toBe(404);
+    expect(await miss.text()).toBe("Not Found");
+    await setup.mf.dispose();
+    setup.stop();
+    uploads.stop(true);
+  });
+
+  test("non-/uploads/ paths still served from ASSET_ORIGIN unchanged", async () => {
+    // Even with UPLOAD_ORIGIN set, /illustrations/* stays on ASSET_ORIGIN.
+    const setup = await makeMf({
+      mode: "static",
+      assets: {
+        "index.html": { body: "<h1>hi</h1>", type: "text/html" },
+        "illustrations/x.webp": { body: "WEBP", type: "image/webp" },
+      },
+      uploadOrigin: "http://localhost:1", // unused — asset path must not hit it
+    });
+    const resp = await setup.mf.dispatchFetch(
+      "http://w.test/illustrations/x.webp",
+    );
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toBe("WEBP");
+    await setup.mf.dispose();
+    setup.stop();
   });
 });
 

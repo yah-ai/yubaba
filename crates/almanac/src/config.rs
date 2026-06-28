@@ -55,7 +55,7 @@ pub enum SourceConfig {
 pub enum TriggerConfig {
     /// A QED hook or GitHub webhook POSTs to `/revalidate` with `{"feed":"<name>"}`.
     Webhook,
-    /// Almanac receiver fires on a UTC cron schedule (warden cron, TBD).
+    /// Almanac receiver fires on a UTC cron schedule (yubaba cron, TBD).
     Cron { expression: String },
 }
 

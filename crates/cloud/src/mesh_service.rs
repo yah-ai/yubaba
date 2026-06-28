@@ -19,7 +19,7 @@
 //!
 //! The compose renderer emits `network_mode: "host"` for such a service.
 //! Pair it with the ufw rules from [`ufw_rules_for_mesh_port`] (applied by the
-//! warden's `POST /compose` via the `firewall_cmds` field) and the pg_hba
+//! yubaba's `POST /compose` via the `firewall_cmds` field) and the pg_hba
 //! snippet from [`pg_hba_snippet`] (injected into the Postgres container via
 //! a mounted config volume or env).
 //!
@@ -83,7 +83,7 @@ pub fn pg_hba_snippet(mesh_subnet: &str) -> String {
 /// ufw evaluates rules in insertion order — the interface-scoped allow must
 /// be added **before** the blanket deny or it will never be reached.
 ///
-/// This mirrors the pattern used for yah-warden's 7443 port in `mirror.yml`:
+/// This mirrors the pattern used for yah-yubaba's 7443 port in `mirror.yml`:
 /// ```text
 /// ufw allow in on tailscale0 to any port 7443
 /// ufw deny 7443
@@ -100,11 +100,9 @@ pub fn ufw_rules_for_mesh_port(iface: &str, port: u16) -> Vec<String> {
 /// make `POSTGRES_LISTEN_ADDRESSES` available to the compose stack via
 /// `env_file: [{MESH_IP_ENV_FILE}]`.
 pub fn mesh_ip_env_runcmd() -> Vec<String> {
-    vec![
-        format!(
-            "sh -c 'echo \"POSTGRES_LISTEN_ADDRESSES=$(tailscale ip --4)\" > {MESH_IP_ENV_FILE}'"
-        ),
-    ]
+    vec![format!(
+        "sh -c 'echo \"POSTGRES_LISTEN_ADDRESSES=$(tailscale ip --4)\" > {MESH_IP_ENV_FILE}'"
+    )]
 }
 
 #[cfg(test)]

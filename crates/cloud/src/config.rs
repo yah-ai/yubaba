@@ -6,7 +6,7 @@
 //! @yah:handoff("Companion to R040-F15. Inter-node TCP (Postgres primary↔replica, NATS clusters, anything raw-protocol) lives on the Headscale mesh, not on Hetzner public IPs. Each node has a stable 100.64.x.x mesh IP that survives replacement of the underlying box, so DNS / config / pg_hba never churn when a CPX-11 is rebuilt. WireGuard already encrypts the wire — TLS becomes defense-in-depth, not load-bearing. This ticket carries the concrete pg-shaped recipe so the first stateful service deploy doesn't have to re-derive the pattern; subsequent services (redis, NATS, etc.) cargo-cult from it.")
 //! @yah:next("ServiceConfig gains a `bind_interface: Option<String>` field (e.g. `Some(\"tailscale0\")` for mesh-only services). The cloud-init/podman compose renderer translates this into either `--network host` + `pg listen_addresses = '<mesh-ip>'` OR a podman macvlan/host-binding pattern that achieves the same.")
 //! @yah:next("Generated pg_hba.conf snippet: allow the mesh subnet (100.64.0.0/10) for replication + app users. Postgres binds to the node's tailscale0 mesh IP only — `listen_addresses` is templated from the node's `tailscale ip --4` at first boot.")
-//! @yah:next("Generated ufw rules: `ufw allow in on tailscale0 to any port 5432; ufw deny 5432` — mirrors the existing yah-warden 7443 pattern in mirror.yml. Same shape works for any mesh-only port.")
+//! @yah:next("Generated ufw rules: `ufw allow in on tailscale0 to any port 5432; ufw deny 5432` — mirrors the existing yah-yubaba 7443 pattern in mirror.yml. Same shape works for any mesh-only port.")
 //! @yah:next("Replica connection string uses primary's mesh IP, NOT its public IP. Stable across box replacement.")
 //! @yah:next("Out of scope: pg_basebackup orchestration, failover, WAL archiving — those belong in noisetable's domain; this ticket only standardizes the binding/firewall/auth shape so noisetable's pg deployment doesn't reinvent it.")
 //!
@@ -28,12 +28,12 @@
 //!
 //! @arch:see(.yah/docs/working/W142-pond.md)
 
-use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use thiserror::Error;
-use workload_spec::{WorkloadSpec, validate};
+use workload_spec::{validate, WorkloadSpec};
 
 /// Per-machine TOML from `.yah/cloud/machines/<name>.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,10 +41,41 @@ use workload_spec::{WorkloadSpec, validate};
 pub struct MachineConfig {
     pub name: String,
     pub provider: String,
-    pub location: String,
-    pub server_type: String,
+    /// Provider DC code (e.g. Hetzner `"hil"`). **Provisioning-only**: required
+    /// iff the provider has an auto-provision driver ([`provider_has_machine_driver`]);
+    /// a BYO `static` node we brought up over SSH has no such code. Optional at
+    /// load time so static machine.tomls omit it; [`MachineConfig::validate`]
+    /// enforces presence at the right moment for driver-backed providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// Provider SKU/size (e.g. Hetzner `"ccx13"`). Provisioning-only, same
+    /// optionality contract as [`location`](Self::location).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_type: Option<String>,
+    /// **Deprecated (R330-F16).** A machine should describe *itself* (region,
+    /// zone, provider, mesh_tags); *which* mirrors run on it is derived by the
+    /// reconciler from each mirror's `required` placement spec, not declared
+    /// here. Now optional + omitted-when-empty so new machine.tomls leave it
+    /// out. The legacy `resolve_mirror_machine` topology fallback still reads
+    /// it until yubaba's reverse-index supersedes the topology.toml path; once
+    /// that lands, this field and its readers are removed wholesale.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts_mirrors: Vec<String>,
     pub mesh_tags: Vec<String>,
+    /// Canonical geo region label (latency axis), e.g. `"us-west"`. F16's three
+    /// topology axes are orthogonal: `region` = geo (latency), `zone` = failure
+    /// domain within a region (HA), `provider` = network/cost. `region` is
+    /// distinct from `location` (the provider's DC code, e.g. Hetzner `"hil"`):
+    /// `location` is provider-scoped, `region` is our provider-neutral label.
+    /// Optional for backward-compat; a machine without it never satisfies a
+    /// `required.regions` constraint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// Failure-domain label within a region (HA axis), e.g. `"hil"`. For
+    /// single-DC Hetzner this typically mirrors `location`. F16 placement
+    /// matches `required.zones` against this. Optional for backward-compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
     pub bucket: Option<BucketSpec>,
     pub hostkey_fingerprint: Option<String>,
     /// Provider-side SSH-key IDs (Hetzner: from `GET /v1/ssh_keys`)
@@ -69,20 +100,91 @@ pub struct MachineConfig {
     /// backward-compat with existing machine declarations.
     #[serde(default)]
     pub hosts_operator_bridge: bool,
+    /// BYO `static`-node reach descriptor. Static nodes have no provider API to
+    /// probe, so how the camp reaches them (SSH user@host + the yubaba URL,
+    /// which is loopback until the WireGuard mesh lands) is *declared* here.
+    /// `None` for driver-backed providers (Hetzner/Vultr), whose address is
+    /// resolved from the provider API / mesh at provision time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect: Option<ConnectSpec>,
+}
+
+/// True iff `provider` has an auto-provision driver (create/destroy via API).
+/// Driver-backed providers require `location` + `server_type`; BYO `static`
+/// nodes (brought up over SSH) do not. The cloud-vs-vps distinction the fleet
+/// cares about lives here — at the provider-capability layer — not as a
+/// separate machine type (W242 BYO Phase-0 decision).
+pub fn provider_has_machine_driver(provider: &str) -> bool {
+    matches!(provider, "hetzner" | "vultr" | "digitalocean")
 }
 
 impl MachineConfig {
+    /// Provider DC code, or `""` when omitted (static nodes). Most readers want
+    /// a `&str`; the driver-backed provision/status paths still go through
+    /// [`validate`](Self::validate) which guarantees presence for those.
+    pub fn location(&self) -> &str {
+        self.location.as_deref().unwrap_or("")
+    }
+
+    /// Provider SKU, or `""` when omitted (static nodes).
+    pub fn server_type(&self) -> &str {
+        self.server_type.as_deref().unwrap_or("")
+    }
+
+    /// Enforce the provisioning-only-field contract: a machine whose provider
+    /// has an auto-provision driver MUST declare `location` + `server_type`
+    /// (the driver can't create a server without them). Static nodes may omit
+    /// both. Call this before any provision/diff that assumes a driver.
+    pub fn validate(&self) -> Result<()> {
+        if provider_has_machine_driver(&self.provider) {
+            if self.location.is_none() {
+                anyhow::bail!(
+                    "machine '{}' (provider '{}') has an auto-provision driver but no `location`",
+                    self.name,
+                    self.provider
+                );
+            }
+            if self.server_type.is_none() {
+                anyhow::bail!(
+                    "machine '{}' (provider '{}') has an auto-provision driver but no `server_type`",
+                    self.name,
+                    self.provider
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Persist to `<cloud_dir>/machines/<name>.toml`, creating the dir if needed.
     pub fn save(&self, cloud_dir: &Path) -> Result<()> {
         let dir = cloud_dir.join("machines");
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join(format!("{}.toml", self.name));
         let s = toml::to_string_pretty(self)
             .with_context(|| format!("serializing machine {}", self.name))?;
-        std::fs::write(&path, s)
-            .with_context(|| format!("writing {}", path.display()))
+        std::fs::write(&path, s).with_context(|| format!("writing {}", path.display()))
     }
+}
+
+/// Reach descriptor for a BYO `static` node (no provider API). Lives under
+/// `[connect]` in the machine TOML.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ConnectSpec {
+    /// Reachable IPv4/host for the box, e.g. `"45.32.194.254"`.
+    pub address: String,
+    /// SSH target the camp dials for bootstrap + (pre-mesh) tunneled deploys,
+    /// e.g. `"root@45.32.194.254"` or `"debian@15.204.89.240"`. Uses the
+    /// operator's `~/.ssh/yah` key.
+    pub ssh: String,
+    /// Yubaba RPC URL. Loopback (`"http://127.0.0.1:7443"`) until the WireGuard
+    /// mesh lands — reached via an SSH tunnel to `ssh`. Rebinds to the mesh IP
+    /// in the post-mesh world (W242 P2).
+    pub yubaba: String,
+    /// Declared CPU arch (`"x86_64"` / `"aarch64"`) — no provider API to probe
+    /// it, and the yubaba release triple depends on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,11 +228,20 @@ pub struct LegacyMirrorConfig {
 #[derive(Debug, Error)]
 pub enum WorkloadConfigError {
     #[error("reading {path}: {source}")]
-    Io { path: String, source: std::io::Error },
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("parsing {path}: {source}")]
-    Toml { path: String, source: toml::de::Error },
+    Toml {
+        path: String,
+        source: toml::de::Error,
+    },
     #[error("invalid WorkloadSpec in {path}: {source}")]
-    Shape { path: String, source: validate::ShapeError },
+    Shape {
+        path: String,
+        source: validate::ShapeError,
+    },
 }
 
 /// A workload declaration loaded from `.yah/cloud/workloads/<name>.toml`.
@@ -149,13 +260,11 @@ impl WorkloadConfig {
     /// Persist to `<cloud_dir>/workloads/<name>.toml`, creating the dir if needed.
     pub fn save(&self, cloud_dir: &Path) -> Result<()> {
         let dir = cloud_dir.join("workloads");
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join(format!("{}.toml", self.spec.name));
         let s = toml::to_string_pretty(self)
             .with_context(|| format!("serializing workload {}", self.spec.name))?;
-        std::fs::write(&path, s)
-            .with_context(|| format!("writing {}", path.display()))
+        std::fs::write(&path, s).with_context(|| format!("writing {}", path.display()))
     }
 }
 
@@ -171,7 +280,7 @@ pub enum CloudConfigError {
 /// Mirror-to-machine assignment table from `.yah/cloud/topology.toml`.
 ///
 /// Declares which logical mirror names are assigned to which machines.
-/// This is the source-canonical placement until warden raft observes it
+/// This is the source-canonical placement until yubaba raft observes it
 /// (per the migration tracker in the arch doc).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TopologyConfig {
@@ -179,7 +288,7 @@ pub struct TopologyConfig {
     #[serde(default)]
     pub assignments: Vec<MirrorAssignment>,
     /// Declared buckets, logged by `yah cloud bucket create`.
-    /// Source-canonical until warden raft observes actual placement.
+    /// Source-canonical until yubaba raft observes actual placement.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buckets: Vec<BucketLogEntry>,
 }
@@ -190,8 +299,8 @@ impl TopologyConfig {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let s = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let s =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))
     }
 
@@ -201,8 +310,7 @@ impl TopologyConfig {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let s = toml::to_string_pretty(self)
-            .context("serializing topology")?;
+        let s = toml::to_string_pretty(self).context("serializing topology")?;
         std::fs::write(path, s).with_context(|| format!("writing {}", path.display()))
     }
 
@@ -218,7 +326,9 @@ impl TopologyConfig {
 
     /// Returns true if the bucket is declared as cross-machine (no owning machine).
     pub fn is_cross_machine_bucket(&self, name: &str) -> bool {
-        self.buckets.iter().any(|b| b.name == name && b.machine.is_none())
+        self.buckets
+            .iter()
+            .any(|b| b.name == name && b.machine.is_none())
     }
 }
 
@@ -295,6 +405,12 @@ pub struct ServiceWithMirrors {
     pub service: ServiceConfig,
     /// Mirrors keyed by environment name (file stem of `mirrors/<env>.toml`).
     pub mirrors: BTreeMap<String, MirrorConfig>,
+    /// Transform recipe names keyed by component id. Populated from each
+    /// static-asset component's `workload.toml` at load time — not stored
+    /// in service.toml. Only present for components that declare
+    /// `[asset.derive.transform] recipe = "..."`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub component_transform_recipes: BTreeMap<String, String>,
 }
 
 /// All cloud config loaded from a workspace root (the parent of `.yah/`).
@@ -351,7 +467,7 @@ impl CloudConfig {
     /// declared under `.yah/infra/providers/`.
     pub fn load(workspace_root: &Path) -> Result<Self> {
         let providers = load_providers(&crate::paths::providers_dir(workspace_root))?;
-        let services = load_services(&crate::paths::services_dir(workspace_root))?;
+        let services = load_services(&crate::paths::services_dir(workspace_root), workspace_root)?;
         let domains = load_domains(&crate::paths::domains_dir(workspace_root))?;
 
         // Cross-ref validation: mirror `use = "<id>"` slots must resolve.
@@ -472,14 +588,48 @@ impl CloudConfig {
         self.workloads.iter().find(|w| w.spec.name == name)
     }
 
+    /// F16 placement v1: the first machine satisfying every hard axis of `req`
+    /// (region/zone/provider membership + mesh_tags superset). Declaration order
+    /// in `.yah/infra/machines/` decides ties — deterministic-greedy, no
+    /// backtracking. A fully-unconstrained `req` matches the first machine.
+    ///
+    /// Fails loud with the constraint summary and the candidate machine names
+    /// when nothing matches, so `yah cloud apply` surfaces *why* placement
+    /// failed instead of a silent empty set.
+    pub fn resolve_machine(&self, req: &RequiredSpec) -> Result<&MachineConfig> {
+        self.machines
+            .iter()
+            .find(|m| req.matches(m))
+            .ok_or_else(|| {
+                let candidates = if self.machines.is_empty() {
+                    "(no machines declared under .yah/infra/machines/)".to_string()
+                } else {
+                    self.machines
+                        .iter()
+                        .map(|m| m.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                anyhow::anyhow!(
+                    "no candidates matching {} — declared machines: {candidates}",
+                    req.describe()
+                )
+            })
+    }
+
     /// F16 placement: first machine whose `mesh_tags` is a superset of
     /// `required`. Declaration order in `.yah/infra/machines/` decides ties.
     /// Empty `required` matches the first machine; callers should treat
     /// empty-required as "no constraint" and skip this lookup.
+    ///
+    /// Back-compat thin wrapper over [`CloudConfig::resolve_machine`] for the
+    /// mesh-tags-only call sites that predate the topology axes.
     pub fn resolve_machine_by_mesh_tags(&self, required: &[String]) -> Option<&MachineConfig> {
-        self.machines.iter().find(|m| {
-            required.iter().all(|t| m.mesh_tags.iter().any(|mt| mt == t))
-        })
+        let req = RequiredSpec {
+            mesh_tags: required.to_vec(),
+            ..Default::default()
+        };
+        self.resolve_machine(&req).ok()
     }
 }
 
@@ -519,7 +669,10 @@ pub fn canonical_tier(stem: &str) -> &str {
 /// Walk `.yah/services/<svc>/` for every service and its mirrors.
 /// Missing directory → empty map. Mirror file stems are normalized to canonical
 /// tier names via [`canonical_tier`] so callers always see `dev/pond/cloud/ha`.
-fn load_services(dir: &Path) -> Result<BTreeMap<String, ServiceWithMirrors>> {
+fn load_services(
+    dir: &Path,
+    workspace_root: &Path,
+) -> Result<BTreeMap<String, ServiceWithMirrors>> {
     if !dir.exists() {
         return Ok(BTreeMap::new());
     }
@@ -564,9 +717,48 @@ fn load_services(dir: &Path) -> Result<BTreeMap<String, ServiceWithMirrors>> {
                 mirrors.insert(tier, MirrorConfig::load(&path)?);
             }
         }
-        out.insert(service.name.clone(), ServiceWithMirrors { service, mirrors });
+        let mut component_transform_recipes = BTreeMap::new();
+        for component in &service.components {
+            if component.kind == "static-asset" {
+                if let Some(recipe) =
+                    read_component_transform_recipe(workspace_root, &component.path)
+                {
+                    component_transform_recipes.insert(component.id.clone(), recipe);
+                }
+            }
+        }
+        out.insert(
+            service.name.clone(),
+            ServiceWithMirrors {
+                service,
+                mirrors,
+                component_transform_recipes,
+            },
+        );
     }
     Ok(out)
+}
+
+/// Read the first transform recipe name from a component's `workload.toml`.
+/// Returns `None` when the file is absent or has no `[asset.derive.transform]`
+/// section. Best-effort — parse failures are silently ignored so a malformed
+/// workload.toml doesn't abort the entire service catalog load.
+fn read_component_transform_recipe(workspace_root: &Path, component_path: &str) -> Option<String> {
+    let workload_path = workspace_root.join(component_path).join("workload.toml");
+    let text = std::fs::read_to_string(&workload_path).ok()?;
+    let value: toml::Value = toml::from_str(&text).ok()?;
+    let assets = value.get("asset")?.as_array()?;
+    for asset in assets {
+        if let Some(recipe) = asset
+            .get("derive")
+            .and_then(|d| d.get("transform"))
+            .and_then(|t| t.get("recipe"))
+            .and_then(|r| r.as_str())
+        {
+            return Some(recipe.to_string());
+        }
+    }
+    None
 }
 
 /// Load every `.yah/domains/*.toml` into a [`DomainConfig`] map keyed by
@@ -618,10 +810,10 @@ fn load_workloads(dir: std::path::PathBuf) -> Result<Vec<WorkloadConfig>> {
     for entry in entries {
         let path = entry.path();
         let path_str = path.display().to_string();
-        let src = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path_str))?;
-        let spec: WorkloadSpec = toml::from_str(&src)
-            .with_context(|| format!("parsing {}", path_str))?;
+        let src =
+            std::fs::read_to_string(&path).with_context(|| format!("reading {}", path_str))?;
+        let spec: WorkloadSpec =
+            toml::from_str(&src).with_context(|| format!("parsing {}", path_str))?;
 
         // Shape-validate before accepting into the loaded config.
         validate::shape(&spec)
@@ -669,8 +861,8 @@ fn load_mirrors(dir: std::path::PathBuf) -> Result<Vec<LegacyMirrorConfig>> {
             // Flat layout: mirrors/<id>.toml
             let src = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            let cfg: LegacyMirrorConfig = toml::from_str(&src)
-                .with_context(|| format!("parsing {}", path.display()))?;
+            let cfg: LegacyMirrorConfig =
+                toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
             mirrors.push(cfg);
         }
     }
@@ -682,10 +874,9 @@ fn load_topology(path: std::path::PathBuf) -> Result<TopologyConfig> {
     if !path.exists() {
         return Ok(TopologyConfig::default());
     }
-    let src = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    toml::from_str(&src)
-        .with_context(|| format!("parsing {}", path.display()))
+    let src =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))
 }
 
 fn load_dir<T: for<'de> Deserialize<'de>>(dir: std::path::PathBuf) -> Result<Vec<T>> {
@@ -693,16 +884,14 @@ fn load_dir<T: for<'de> Deserialize<'de>>(dir: std::path::PathBuf) -> Result<Vec
         return Ok(vec![]);
     }
     let mut items = vec![];
-    for entry in std::fs::read_dir(&dir)
-        .with_context(|| format!("reading {}", dir.display()))?
-    {
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
         if path.extension().map_or(false, |e| e == "toml") {
             let src = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            let item: T = toml::from_str(&src)
-                .with_context(|| format!("parsing {}", path.display()))?;
+            let item: T =
+                toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
             items.push(item);
         }
     }
@@ -741,6 +930,14 @@ pub enum Provider {
     Cloudflare,
     /// Hetzner Cloud + Object Storage account.
     Hetzner,
+    /// Vultr cloud VPS — auto-provisioned via the `cloud.vps.*` Envoy
+    /// (`VultrEnvoy`), the burst/scaling counterpart to Hetzner. Driver-backed.
+    Vultr,
+    /// BYO bare/static node (OVH, on-prem, anything we did NOT provision via a
+    /// cloud API). Brought up over SSH (`stand-up-yubaba.sh` / `yah cloud
+    /// machine bootstrap`); reach is declared in the machine's `[connect]`
+    /// block. No create/destroy driver — placement-only.
+    Static,
     /// Built-in static-file server bound to localhost. Inline-only; never
     /// declared as a standalone provider file because it carries no creds.
     LocalStatic,
@@ -792,8 +989,8 @@ pub struct ProviderConfig {
 impl ProviderConfig {
     /// Parse a single `providers/<id>.toml` file.
     pub fn load(path: &Path) -> Result<Self> {
-        let src = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let src =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))
     }
 }
@@ -817,8 +1014,8 @@ pub struct ServiceConfig {
 impl ServiceConfig {
     /// Parse a single `services/<svc>/service.toml` file.
     pub fn load(path: &Path) -> Result<Self> {
-        let src = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let src =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))
     }
 
@@ -828,8 +1025,7 @@ impl ServiceConfig {
     /// dir (the parent of `.yah/`).
     pub fn save(&self, workspace_root: &Path) -> Result<()> {
         let dir = crate::paths::service_dir(workspace_root, &self.name);
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = crate::paths::service_toml(workspace_root, &self.name);
         let s = toml::to_string_pretty(self)
             .with_context(|| format!("serializing service {}", self.name))?;
@@ -844,10 +1040,34 @@ impl ServiceConfig {
         if !dir.exists() {
             return Ok(false);
         }
-        std::fs::remove_dir_all(&dir)
-            .with_context(|| format!("removing {}", dir.display()))?;
+        std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
         Ok(true)
     }
+}
+
+/// A git source for a component (R561-F1, "BYO git").
+///
+/// When a [`ServiceComponent`] sets `git`, the component's code is NOT in this
+/// workspace — it lives in an external repo that the reconciler shallow-clones
+/// into a source cache before build (approach A: clone-at-reconcile, so config
+/// load + validation stay offline). The component's `path` is then interpreted
+/// relative to `<checkout>/<subdir>` instead of the workspace root.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct GitSource {
+    /// Clone URL (https or ssh) of the tenant repo.
+    pub repo: String,
+    /// Branch, tag, or commit SHA to check out. Defaults to `"main"`.
+    #[serde(default = "default_git_ref")]
+    pub r#ref: String,
+    /// Optional sub-directory within the repo that the workspace is rooted at
+    /// (e.g. a monorepo's `site/`). `path` is resolved relative to this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subdir: Option<String>,
+}
+
+fn default_git_ref() -> String {
+    "main".to_string()
 }
 
 /// One component of a [`ServiceConfig`]. The `kind` (e.g. `"mesofact-static"`,
@@ -858,9 +1078,14 @@ impl ServiceConfig {
 pub struct ServiceComponent {
     pub id: String,
     pub kind: String,
-    /// Path (relative to workspace root) of the directory holding this
-    /// component's `workload.toml`.
+    /// Path of the directory holding this component's `workload.toml`. Relative
+    /// to the workspace root for in-tree components, or to the materialized
+    /// `<checkout>/<subdir>` when [`git`](Self::git) is set.
     pub path: String,
+    /// Optional external git source (R561-F1). When set, the component's code
+    /// is materialized by shallow-clone before build; see [`GitSource`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitSource>,
     /// Operator-facing role label, e.g. `"static"`, `"dynamic"`, `"compute"`.
     pub role: String,
     /// Optional artifact kind this component publishes (`"static"`,
@@ -918,8 +1143,8 @@ pub struct MirrorConfig {
 impl MirrorConfig {
     /// Parse a single `mirrors/<env>.toml` file.
     pub fn load(path: &Path) -> Result<Self> {
-        let src = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let src =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))
     }
 
@@ -928,8 +1153,7 @@ impl MirrorConfig {
     /// named by `env` (its stem); `service` selects the owning service dir.
     pub fn save(&self, workspace_root: &Path, service: &str, env: &str) -> Result<()> {
         let dir = crate::paths::service_mirrors_dir(workspace_root, service);
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = crate::paths::service_mirror_toml(workspace_root, service, env);
         let s = toml::to_string_pretty(self)
             .with_context(|| format!("serializing mirror {service}/{env}"))?;
@@ -945,8 +1169,7 @@ impl MirrorConfig {
     pub fn delete(workspace_root: &Path, service: &str, env: &str) -> Result<bool> {
         let path = crate::paths::service_mirror_toml(workspace_root, service, env);
         if path.exists() {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("removing {}", path.display()))?;
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
             return Ok(true);
         }
         // Try legacy file stems for canonical tier names.
@@ -1016,7 +1239,7 @@ impl MirrorProviderSlot {
         }
     }
 
-    fn fields(&self) -> &BTreeMap<String, toml::Value> {
+    pub fn fields(&self) -> &BTreeMap<String, toml::Value> {
         match self {
             Self::Reference { fields, .. } | Self::Inline { fields, .. } => fields,
         }
@@ -1031,19 +1254,80 @@ impl MirrorProviderSlot {
     }
 }
 
-/// F16 placement constraints declared on a [`MirrorProviderSlot`]. Currently
-/// just a mesh-tag superset requirement; future fields (cpu, ram, locality)
-/// land here. Lives under `[providers.<role>] required = { mesh_tags = [...] }`
-/// in `mirrors/<env>.toml`.
+/// F16 placement constraints declared on a [`MirrorProviderSlot`], lives under
+/// `[providers.<role>] required = { regions = [...], mesh_tags = [...] }` in
+/// `mirrors/<env>.toml`.
 ///
-/// The semantic is *superset*: a machine matches when its `mesh_tags` field
-/// contains every tag in `required.mesh_tags`. Empty `mesh_tags` matches every
-/// machine.
+/// Four hard (must-satisfy) axes in v1, all AND-ed together:
+/// - `regions` / `zones` / `providers` — *membership*: the machine's
+///   `region` / `zone` / `provider` must be one of the listed values.
+/// - `mesh_tags` — *superset*: the machine's `mesh_tags` must contain every
+///   listed tag.
+///
+/// An empty list on any axis means "no constraint on that axis". A fully-empty
+/// `RequiredSpec` matches every machine (see [`RequiredSpec::is_unconstrained`]).
+///
+/// Capacity floors (`cpu`/`memory`/`gpu`) and soft `preferred.*` /
+/// `topology_spread` / `anti_affinity` are deliberately out of this v1 slice —
+/// they need the yubaba↔kamaji capability-gossip view, not just the
+/// workspace machine.toml. See R330-F16's next-steps.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct RequiredSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub zones: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mesh_tags: Vec<String>,
+}
+
+impl RequiredSpec {
+    /// True when no axis carries a constraint — every machine matches.
+    pub fn is_unconstrained(&self) -> bool {
+        self.regions.is_empty()
+            && self.zones.is_empty()
+            && self.providers.is_empty()
+            && self.mesh_tags.is_empty()
+    }
+
+    /// Whether `machine` satisfies every hard axis. Membership axes
+    /// (region/zone/provider) require the machine to carry the field AND have
+    /// it appear in the constraint list; the mesh_tags axis is a superset test.
+    pub fn matches(&self, machine: &MachineConfig) -> bool {
+        let member_ok = |constraint: &[String], value: Option<&str>| -> bool {
+            constraint.is_empty() || value.map_or(false, |v| constraint.iter().any(|c| c == v))
+        };
+        member_ok(&self.regions, machine.region.as_deref())
+            && member_ok(&self.zones, machine.zone.as_deref())
+            && member_ok(&self.providers, Some(machine.provider.as_str()))
+            && self
+                .mesh_tags
+                .iter()
+                .all(|t| machine.mesh_tags.iter().any(|mt| mt == t))
+    }
+
+    /// Human-readable summary of the constraints, for fail-loud error messages.
+    /// Example: `required.regions=[us-west] + required.mesh_tags=[tag:cloud-runner]`.
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        let mut push = |label: &str, vals: &[String]| {
+            if !vals.is_empty() {
+                parts.push(format!("required.{label}=[{}]", vals.join(",")));
+            }
+        };
+        push("regions", &self.regions);
+        push("zones", &self.zones);
+        push("providers", &self.providers);
+        push("mesh_tags", &self.mesh_tags);
+        if parts.is_empty() {
+            "no constraints".to_string()
+        } else {
+            parts.join(" + ")
+        }
+    }
 }
 
 /// A routing manifest for one domain, from `.yah/domains/<name>.toml`.
@@ -1095,7 +1379,7 @@ pub struct DomainRoute {
 ///   ref points at a `kind = "mesofact-static"` (or similar) service
 ///   component.
 /// - **Backend** — Worker proxies to an HTTP origin owned by a backend
-///   component (warden workload, gateway, etc.).
+///   component (yubaba workload, gateway, etc.).
 /// - **Redirect** — Worker emits a 30x to the target URL. Used to keep
 ///   old paths alive during domain refactors.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1113,7 +1397,7 @@ pub enum RouteMode {
         component: String,
         /// Origin URL the Worker `fetch()`es. Schema-permissive — could
         /// be `https://...`, `wss://...`, or a yah-internal mesh URL
-        /// resolved by warden.
+        /// resolved by yubaba.
         origin: String,
     },
     Redirect {
@@ -1133,8 +1417,8 @@ fn default_redirect_status() -> u16 {
 impl DomainConfig {
     /// Parse a single `.yah/domains/<name>.toml`.
     pub fn load(path: &Path) -> Result<Self> {
-        let src = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let src =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))
     }
 
@@ -1142,8 +1426,7 @@ impl DomainConfig {
     /// directory if needed. Create-or-overwrite.
     pub fn save(&self, workspace_root: &Path) -> Result<()> {
         let dir = crate::paths::domains_dir(workspace_root);
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = crate::paths::domain_toml(workspace_root, &self.name);
         let s = toml::to_string_pretty(self)
             .with_context(|| format!("serializing domain {}", self.name))?;
@@ -1157,8 +1440,7 @@ impl DomainConfig {
         if !path.exists() {
             return Ok(false);
         }
-        std::fs::remove_file(&path)
-            .with_context(|| format!("removing {}", path.display()))?;
+        std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
         Ok(true)
     }
 }
@@ -1192,15 +1474,33 @@ mod tests {
         MachineConfig {
             name: name.into(),
             provider: "hetzner".into(),
-            location: "hil".into(),
-            server_type: "ccx13".into(),
+            location: Some("hil".into()),
+            server_type: Some("ccx13".into()),
             hosts_mirrors: vec![],
             mesh_tags: mesh_tags.into_iter().map(String::from).collect(),
+            region: None,
+            zone: None,
             bucket: None,
             hostkey_fingerprint: None,
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
+            connect: None,
+        }
+    }
+
+    /// Like [`make_machine`] but with explicit topology axes for F16 tests.
+    fn make_machine_topo(
+        name: &str,
+        provider: &str,
+        region: &str,
+        mesh_tags: Vec<&str>,
+    ) -> MachineConfig {
+        MachineConfig {
+            provider: provider.into(),
+            region: Some(region.into()),
+            zone: Some(region.into()),
+            ..make_machine(name, mesh_tags)
         }
     }
 
@@ -1250,13 +1550,110 @@ mesh_tags = ["tag:cloud-runner"]
 
     #[test]
     fn resolve_machine_by_mesh_tags_returns_none_when_no_match() {
-        let cfg = make_empty_cfg(vec![
-            make_machine("yah-bnt-1", vec!["tag:primary-yah"]),
-        ]);
+        let cfg = make_empty_cfg(vec![make_machine("yah-bnt-1", vec!["tag:primary-yah"])]);
+        assert!(cfg
+            .resolve_machine_by_mesh_tags(&["tag:cloud-runner".into()])
+            .is_none());
+    }
+
+    // ─── F16 topology-aware resolver ────────────────────────────────────────
+
+    fn two_region_fleet() -> CloudConfig {
+        make_empty_cfg(vec![
+            make_machine_topo(
+                "us-west-001",
+                "hetzner",
+                "us-west",
+                vec!["tag:cloud-runner"],
+            ),
+            make_machine_topo(
+                "eu-west-001",
+                "hetzner",
+                "eu-west",
+                vec!["tag:cloud-runner"],
+            ),
+        ])
+    }
+
+    #[test]
+    fn resolve_machine_matches_on_region_plus_mesh_tags() {
+        let cfg = two_region_fleet();
+        let req = RequiredSpec {
+            regions: vec!["us-west".into()],
+            mesh_tags: vec!["tag:cloud-runner".into()],
+            ..Default::default()
+        };
+        let picked = cfg.resolve_machine(&req).unwrap();
+        assert_eq!(picked.name, "us-west-001");
+    }
+
+    #[test]
+    fn resolve_machine_region_disambiguates_same_tag() {
+        // Both boxes carry tag:cloud-runner; the region axis selects eu-west.
+        let cfg = two_region_fleet();
+        let req = RequiredSpec {
+            regions: vec!["eu-west".into()],
+            mesh_tags: vec!["tag:cloud-runner".into()],
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve_machine(&req).unwrap().name, "eu-west-001");
+    }
+
+    #[test]
+    fn resolve_machine_fails_loud_with_constraint_summary() {
+        let cfg = two_region_fleet();
+        let req = RequiredSpec {
+            regions: vec!["us-central".into()],
+            mesh_tags: vec!["tag:cloud-runner".into()],
+            ..Default::default()
+        };
+        let err = cfg.resolve_machine(&req).unwrap_err().to_string();
+        assert!(err.contains("required.regions=[us-central]"), "got: {err}");
         assert!(
-            cfg.resolve_machine_by_mesh_tags(&["tag:cloud-runner".into()])
-                .is_none()
+            err.contains("required.mesh_tags=[tag:cloud-runner]"),
+            "got: {err}"
         );
+        // Names the candidates it rejected.
+        assert!(err.contains("us-west-001"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_machine_provider_axis_filters() {
+        let cfg = make_empty_cfg(vec![
+            make_machine_topo("aws-west-1", "aws", "us-west", vec!["tag:cloud-runner"]),
+            make_machine_topo("hz-west-1", "hetzner", "us-west", vec!["tag:cloud-runner"]),
+        ]);
+        let req = RequiredSpec {
+            regions: vec!["us-west".into()],
+            providers: vec!["hetzner".into()],
+            ..Default::default()
+        };
+        assert_eq!(cfg.resolve_machine(&req).unwrap().name, "hz-west-1");
+    }
+
+    #[test]
+    fn unconstrained_required_spec_matches_first_machine() {
+        let cfg = two_region_fleet();
+        assert!(RequiredSpec::default().is_unconstrained());
+        assert_eq!(
+            cfg.resolve_machine(&RequiredSpec::default()).unwrap().name,
+            "us-west-001"
+        );
+    }
+
+    #[test]
+    fn required_spec_parses_topology_axes_from_toml() {
+        let toml_src = r#"
+use = "hetzner-primary"
+[required]
+regions = ["us-west"]
+mesh_tags = ["tag:cloud-runner"]
+"#;
+        let slot: MirrorProviderSlot = toml::from_str(toml_src).unwrap();
+        let req = slot.required().expect("required block present");
+        assert_eq!(req.regions, vec!["us-west"]);
+        assert_eq!(req.mesh_tags, vec!["tag:cloud-runner"]);
+        assert!(req.zones.is_empty());
     }
 
     #[test]
@@ -1264,20 +1661,28 @@ mesh_tags = ["tag:cloud-runner"]
         let cfg = MachineConfig {
             name: "test-pdx-1".into(),
             provider: "hetzner".into(),
-            location: "pdx".into(),
-            server_type: "cpx22".into(),
+            location: Some("pdx".into()),
+            server_type: Some("cpx22".into()),
             hosts_mirrors: vec!["noisetable".into()],
             mesh_tags: vec!["region:pdx".into()],
-            bucket: Some(BucketSpec { name: "test-assets-pdx-1".into(), public_read: false }),
+            region: Some("us-west".into()),
+            zone: Some("pdx".into()),
+            bucket: Some(BucketSpec {
+                name: "test-assets-pdx-1".into(),
+                public_read: false,
+            }),
             hostkey_fingerprint: None,
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
+            connect: None,
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: MachineConfig = toml::from_str(&s).unwrap();
         assert_eq!(back.name, cfg.name);
         assert_eq!(back.location, cfg.location);
+        assert_eq!(back.region.as_deref(), Some("us-west"));
+        assert_eq!(back.zone.as_deref(), Some("pdx"));
     }
 
     #[test]
@@ -1305,7 +1710,10 @@ mesh_tags = ["tag:cloud-runner"]
             cloud_domain: None,
         };
         let s = toml::to_string(&cfg).unwrap();
-        assert!(s.contains("camp = "), "serialised key should be 'camp': {s}");
+        assert!(
+            s.contains("camp = "),
+            "serialised key should be 'camp': {s}"
+        );
         assert!(!s.contains("rig = "), "old key should not appear: {s}");
     }
 
@@ -1313,7 +1721,8 @@ mesh_tags = ["tag:cloud-runner"]
     fn mirror_rig_alias_still_loads() {
         // Old mirrors/*.toml files use `rig = "..."` before the R137 rename;
         // the alias keeps them loading until the one-time `sed` migration runs.
-        let toml_str = "rig = \"noisetable\"\nregions = [\"pdx\"]\nworkloads = [\"asset-registry\"]\n";
+        let toml_str =
+            "rig = \"noisetable\"\nregions = [\"pdx\"]\nworkloads = [\"asset-registry\"]\n";
         let cfg: LegacyMirrorConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.camp, "noisetable");
     }
@@ -1322,7 +1731,8 @@ mesh_tags = ["tag:cloud-runner"]
     fn mirror_services_alias_still_loads() {
         // Old mirrors/*.toml files use `services = [...]`; the alias keeps them
         // loading without a migration step.
-        let toml_str = "camp = \"noisetable\"\nregions = [\"pdx\"]\nservices = [\"asset-registry\"]\n";
+        let toml_str =
+            "camp = \"noisetable\"\nregions = [\"pdx\"]\nservices = [\"asset-registry\"]\n";
         let cfg: LegacyMirrorConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.workloads, vec!["asset-registry"]);
     }
@@ -1334,7 +1744,10 @@ mesh_tags = ["tag:cloud-runner"]
             image: "ghcr.io/noisetable/asset-registry".into(),
             version: "v1.0.0".into(),
             env: HashMap::new(),
-            ports: vec![PortMapping { host: 8080, container: 8080 }],
+            ports: vec![PortMapping {
+                host: 8080,
+                container: 8080,
+            }],
             mesh_only: false,
             bind_interface: None,
         };
@@ -1351,7 +1764,10 @@ mesh_tags = ["tag:cloud-runner"]
             image: "postgres".into(),
             version: "16".into(),
             env: HashMap::new(),
-            ports: vec![PortMapping { host: 5432, container: 5432 }],
+            ports: vec![PortMapping {
+                host: 5432,
+                container: 5432,
+            }],
             mesh_only: true,
             bind_interface: Some("tailscale0".into()),
         };
@@ -1364,7 +1780,10 @@ mesh_tags = ["tag:cloud-runner"]
     fn service_bind_interface_absent_is_none() {
         let toml_str = "name = \"app\"\nimage = \"app\"\nversion = \"v1\"\n";
         let cfg: LegacyServiceConfig = toml::from_str(toml_str).unwrap();
-        assert!(cfg.bind_interface.is_none(), "bind_interface should default to None");
+        assert!(
+            cfg.bind_interface.is_none(),
+            "bind_interface should default to None"
+        );
     }
 
     #[test]
@@ -1393,8 +1812,14 @@ mesh_tags = ["tag:cloud-runner"]
     fn topology_round_trip() {
         let topo = TopologyConfig {
             assignments: vec![
-                MirrorAssignment { mirror: "noisetable-pdx".into(), machine: "noisetable-pdx-1".into() },
-                MirrorAssignment { mirror: "noisetable-iad".into(), machine: "noisetable-iad-1".into() },
+                MirrorAssignment {
+                    mirror: "noisetable-pdx".into(),
+                    machine: "noisetable-pdx-1".into(),
+                },
+                MirrorAssignment {
+                    mirror: "noisetable-iad".into(),
+                    machine: "noisetable-iad-1".into(),
+                },
             ],
             buckets: vec![],
         };
@@ -1431,10 +1856,12 @@ mesh_tags = ["tag:cloud-runner"]
         let machine = MachineConfig {
             name: "noisetable-pdx-1".into(),
             provider: "hetzner".into(),
-            location: "pdx".into(),
-            server_type: "cpx22".into(),
+            location: Some("pdx".into()),
+            server_type: Some("cpx22".into()),
             hosts_mirrors: vec!["noisetable".into(), "yah".into()],
             mesh_tags: vec!["region:pdx".into(), "tier:t2".into()],
+            region: None,
+            zone: None,
             bucket: Some(BucketSpec {
                 name: "noisetable-assets-pdx-1".into(),
                 public_read: false,
@@ -1443,6 +1870,7 @@ mesh_tags = ["tag:cloud-runner"]
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
+            connect: None,
         };
         // Land in the legacy tree so the legacy machine loader picks it up.
         machine.save(&cloud_dir).unwrap();
@@ -1466,7 +1894,7 @@ mesh_tags = ["tag:cloud-runner"]
         assert!(cfg.providers.is_empty(), "no R215+ providers/ tree");
 
         let m = cfg.machine("noisetable-pdx-1").unwrap();
-        assert_eq!(m.location, "pdx");
+        assert_eq!(m.location(), "pdx");
         assert_eq!(m.bucket.as_ref().unwrap().name, "noisetable-assets-pdx-1");
 
         let mir = cfg.legacy_mirror("noisetable").unwrap();
@@ -1485,7 +1913,8 @@ mesh_tags = ["tag:cloud-runner"]
         std::fs::write(
             mirror_dir.join("mirror.toml"),
             "camp = \"yah\"\nregions = [\"pdx\"]\nworkloads = [\"yah-web\"]\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let cfg = CloudConfig::load(root).unwrap();
         assert_eq!(cfg.legacy_mirrors.len(), 1);
@@ -1507,7 +1936,8 @@ mesh_tags = ["tag:cloud-runner"]
         std::fs::write(
             mirrors_root.join("noisetable.toml"),
             "camp = \"noisetable\"\nregions = [\"pdx\"]\nworkloads = []\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         // Folder-form mirror
         let yah_com_dir = mirrors_root.join("yah-com");
@@ -1515,7 +1945,8 @@ mesh_tags = ["tag:cloud-runner"]
         std::fs::write(
             yah_com_dir.join("mirror.toml"),
             "camp = \"yah\"\nregions = [\"pdx\"]\nworkloads = []\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let cfg = CloudConfig::load(root).unwrap();
         assert_eq!(cfg.legacy_mirrors.len(), 2);
@@ -1536,7 +1967,8 @@ mesh_tags = ["tag:cloud-runner"]
         std::fs::write(
             mirror_dir.join("mirror.toml"),
             "regions = [\"pdx\"]\nworkloads = []\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let err = CloudConfig::load(root).unwrap_err();
         let msg = err.to_string();
@@ -1549,8 +1981,8 @@ mesh_tags = ["tag:cloud-runner"]
     #[test]
     fn workload_config_load_and_validate() {
         use workload_spec::{
-            ImageRef, MeshIdent, SchemaVersion, TierTag, WorkloadSpec,
-            ExposeSpec, MeshExpose, ResourceLimits, RestartPolicy, StopPolicy,
+            ExposeSpec, ImageRef, MeshExpose, MeshIdent, ResourceLimits, RestartPolicy,
+            SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
         };
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1576,11 +2008,18 @@ mesh_tags = ["tag:cloud-runner"]
             env: vec![],
             secrets: vec![],
             volumes: vec![],
-            resources: ResourceLimits { memory_mb: 256, cpu_shares: 512, ephemeral_storage_mb: 512 },
+            resources: ResourceLimits {
+                memory_mb: 256,
+                cpu_shares: 512,
+                ephemeral_storage_mb: 512,
+            },
             depends_on: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
-            stop_policy: StopPolicy { signal: 15, grace_period: workload_spec::Millis::from_secs(10) },
+            stop_policy: StopPolicy {
+                signal: 15,
+                grace_period: workload_spec::Millis::from_secs(10),
+            },
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent("asset-registry.pdx".into()),
@@ -1606,8 +2045,8 @@ mesh_tags = ["tag:cloud-runner"]
     #[test]
     fn workload_loader_rejects_bad_spec() {
         use workload_spec::{
-            ImageRef, MeshIdent, SchemaVersion, TierTag, WorkloadSpec,
-            ExposeSpec, MeshExpose, ResourceLimits, RestartPolicy, StopPolicy,
+            ExposeSpec, ImageRef, MeshExpose, MeshIdent, ResourceLimits, RestartPolicy,
+            SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
         };
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1635,11 +2074,18 @@ mesh_tags = ["tag:cloud-runner"]
             env: vec![],
             secrets: vec![],
             volumes: vec![],
-            resources: ResourceLimits { memory_mb: 256, cpu_shares: 512, ephemeral_storage_mb: 512 },
+            resources: ResourceLimits {
+                memory_mb: 256,
+                cpu_shares: 512,
+                ephemeral_storage_mb: 512,
+            },
             depends_on: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
-            stop_policy: StopPolicy { signal: 15, grace_period: workload_spec::Millis::from_secs(10) },
+            stop_policy: StopPolicy {
+                signal: 15,
+                grace_period: workload_spec::Millis::from_secs(10),
+            },
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent("asset-registry.pdx".into()),
@@ -1663,7 +2109,9 @@ mesh_tags = ["tag:cloud-runner"]
         );
         let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("shape validation") || msg.contains("Replicas") || msg.contains("replicas"),
+            msg.contains("shape validation")
+                || msg.contains("Replicas")
+                || msg.contains("replicas"),
             "error should mention shape validation or replicas field, got: {msg}"
         );
 
@@ -1674,8 +2122,8 @@ mesh_tags = ["tag:cloud-runner"]
     #[test]
     fn workload_config_save_round_trip() {
         use workload_spec::{
-            ImageRef, MeshIdent, SchemaVersion, TierTag, WorkloadSpec,
-            ExposeSpec, MeshExpose, ResourceLimits, RestartPolicy, StopPolicy,
+            ExposeSpec, ImageRef, MeshExpose, MeshIdent, ResourceLimits, RestartPolicy,
+            SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
         };
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1699,11 +2147,18 @@ mesh_tags = ["tag:cloud-runner"]
             env: vec![],
             secrets: vec![],
             volumes: vec![],
-            resources: ResourceLimits { memory_mb: 128, cpu_shares: 256, ephemeral_storage_mb: 256 },
+            resources: ResourceLimits {
+                memory_mb: 128,
+                cpu_shares: 256,
+                ephemeral_storage_mb: 256,
+            },
             depends_on: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
-            stop_policy: StopPolicy { signal: 15, grace_period: workload_spec::Millis::from_secs(5) },
+            stop_policy: StopPolicy {
+                signal: 15,
+                grace_period: workload_spec::Millis::from_secs(5),
+            },
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent("signing.pdx".into()),
@@ -1735,15 +2190,18 @@ mesh_tags = ["tag:cloud-runner"]
         let mut machine = MachineConfig {
             name: "test-pdx-1".into(),
             provider: "hetzner".into(),
-            location: "pdx".into(),
-            server_type: "cpx22".into(),
+            location: Some("pdx".into()),
+            server_type: Some("cpx22".into()),
             hosts_mirrors: vec![],
             mesh_tags: vec![],
+            region: None,
+            zone: None,
             bucket: None,
             hostkey_fingerprint: None,
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
+            connect: None,
         };
         machine.save(root).unwrap();
 
@@ -1753,9 +2211,11 @@ mesh_tags = ["tag:cloud-runner"]
 
         let reloaded: Vec<MachineConfig> = load_dir(root.join("machines")).unwrap();
         assert_eq!(reloaded.len(), 1);
-        assert_eq!(reloaded[0].hostkey_fingerprint.as_deref(), Some("SHA256:abc123"));
+        assert_eq!(
+            reloaded[0].hostkey_fingerprint.as_deref(),
+            Some("SHA256:abc123")
+        );
     }
-
 
     // ─── New-shape (R222 B2) parse tests ────────────────────────────────────
     //
@@ -1777,7 +2237,10 @@ default_zone = "yah.dev"
         let cfg: ProviderConfig = toml::from_str(src).unwrap();
         assert_eq!(cfg.id, "cloudflare");
         assert_eq!(cfg.kind, Provider::Cloudflare);
-        assert_eq!(cfg.credentials.as_deref(), Some("keystore://cloudflare/yah"));
+        assert_eq!(
+            cfg.credentials.as_deref(),
+            Some("keystore://cloudflare/yah")
+        );
         assert_eq!(
             cfg.fields.get("default_zone").and_then(|v| v.as_str()),
             Some("yah.dev"),
@@ -1806,7 +2269,10 @@ ssh_keys = []
             Some("pdx"),
         );
         assert!(
-            cfg.fields.get("ssh_keys").map(|v| v.as_array().unwrap().is_empty()).unwrap_or(false),
+            cfg.fields
+                .get("ssh_keys")
+                .map(|v| v.as_array().unwrap().is_empty())
+                .unwrap_or(false),
             "ssh_keys must round-trip as empty array, got {:?}",
             cfg.fields.get("ssh_keys"),
         );
@@ -1904,9 +2370,15 @@ dns = { record = "@", type = "CNAME" }
         assert_eq!(slot.provider_id(), Some("cloudflare"));
         assert!(slot.inline_kind().is_none());
         if let MirrorProviderSlot::Reference { fields, .. } = slot {
-            assert_eq!(fields.get("bucket").and_then(|v| v.as_str()), Some("yah-dev"));
+            assert_eq!(
+                fields.get("bucket").and_then(|v| v.as_str()),
+                Some("yah-dev")
+            );
             assert_eq!(fields.get("zone").and_then(|v| v.as_str()), Some("yah.dev"));
-            let dns = fields.get("dns").and_then(|v| v.as_table()).expect("dns table");
+            let dns = fields
+                .get("dns")
+                .and_then(|v| v.as_table())
+                .expect("dns table");
             assert_eq!(dns.get("record").and_then(|v| v.as_str()), Some("@"));
             assert_eq!(dns.get("type").and_then(|v| v.as_str()), Some("CNAME"));
         } else {
@@ -1972,20 +2444,41 @@ bucket = "yah-dev"
         assert_eq!(cfg.shape, MirrorShape::Local);
 
         let static_slot = cfg.providers.get("static").expect("static slot");
-        assert_eq!(static_slot.inline_kind(), Some(Provider::MiniflareContainer));
+        assert_eq!(
+            static_slot.inline_kind(),
+            Some(Provider::MiniflareContainer)
+        );
         if let MirrorProviderSlot::Inline { fields, .. } = static_slot {
             assert_eq!(fields.get("port").and_then(|v| v.as_integer()), Some(4322));
-            assert_eq!(fields.get("bucket").and_then(|v| v.as_str()), Some("yah-dev"));
+            assert_eq!(
+                fields.get("bucket").and_then(|v| v.as_str()),
+                Some("yah-dev")
+            );
         } else {
             panic!("expected Inline slot for miniflare-container static");
         }
 
-        let object_store_slot = cfg.providers.get("object_store").expect("object_store slot");
-        assert_eq!(object_store_slot.inline_kind(), Some(Provider::MinioContainer));
+        let object_store_slot = cfg
+            .providers
+            .get("object_store")
+            .expect("object_store slot");
+        assert_eq!(
+            object_store_slot.inline_kind(),
+            Some(Provider::MinioContainer)
+        );
         if let MirrorProviderSlot::Inline { fields, .. } = object_store_slot {
-            assert_eq!(fields.get("api_port").and_then(|v| v.as_integer()), Some(9000));
-            assert_eq!(fields.get("console_port").and_then(|v| v.as_integer()), Some(9001));
-            assert_eq!(fields.get("bucket").and_then(|v| v.as_str()), Some("yah-dev"));
+            assert_eq!(
+                fields.get("api_port").and_then(|v| v.as_integer()),
+                Some(9000)
+            );
+            assert_eq!(
+                fields.get("console_port").and_then(|v| v.as_integer()),
+                Some(9001)
+            );
+            assert_eq!(
+                fields.get("bucket").and_then(|v| v.as_str()),
+                Some("yah-dev")
+            );
         } else {
             panic!("expected Inline slot for minio-container object_store");
         }
@@ -2027,7 +2520,7 @@ bucket = "yah-dev"
     #[test]
     fn mirror_compute_slot_with_machine_reference_parses() {
         // The on-disk prod.toml has a commented-out compute slot; this test
-        // covers the form Phase B will need once warden is provisioned.
+        // covers the form Phase B will need once yubaba is provisioned.
         let src = r#"
 schema_version = 1
 shape = "single-machine"
@@ -2067,6 +2560,55 @@ ssh_keys = [111513970, 111525493]
         assert_eq!(cfg.ssh_keys.len(), 2);
     }
 
+    #[test]
+    fn static_node_omits_location_server_type_and_carries_connect() {
+        // BYO Phase-0: a `static` node we brought up over SSH has no provider
+        // DC code or SKU; it declares reach in `[connect]` instead. Must load.
+        let src = r#"
+name = "us-south-001"
+provider = "static"
+region = "us-south"
+mesh_tags = ["tag:cloud-runner", "tag:voter-candidate"]
+
+[connect]
+address = "45.32.194.254"
+ssh = "root@45.32.194.254"
+yubaba = "http://127.0.0.1:7443"
+arch = "x86_64"
+"#;
+        let cfg: MachineConfig = toml::from_str(src).unwrap();
+        assert_eq!(cfg.provider, "static");
+        assert!(cfg.location.is_none());
+        assert!(cfg.server_type.is_none());
+        assert_eq!(cfg.location(), ""); // accessor defaults empty
+        let c = cfg.connect.as_ref().expect("connect block");
+        assert_eq!(c.ssh, "root@45.32.194.254");
+        assert_eq!(c.yubaba, "http://127.0.0.1:7443");
+        // Static providers have no driver, so validate() is a no-op pass.
+        assert!(!provider_has_machine_driver(&cfg.provider));
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn driver_provider_without_location_fails_validate() {
+        // A driver-backed provider (hetzner/vultr) still MUST carry location +
+        // server_type — the driver can't create a server without them. The
+        // contract moved from load-time (required field) to provision-time
+        // (validate), so the TOML loads but validate() rejects it.
+        let src = r#"
+name = "us-west-001"
+provider = "hetzner"
+mesh_tags = []
+"#;
+        let cfg: MachineConfig = toml::from_str(src).unwrap();
+        assert!(provider_has_machine_driver(&cfg.provider));
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("location"),
+            "expected location complaint: {err}"
+        );
+    }
+
     /// Helper for the new-tree integration tests below: lay out
     /// `<workspace>/.yah/{infra,services}/` with `dev-yah` + its mirrors and
     /// the three Phase-A providers (cloudflare, hetzner, orbstack).
@@ -2082,7 +2624,8 @@ kind = "cloudflare"
 credentials = "keystore://cloudflare/yah"
 default_zone = "yah.dev"
 "#,
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             providers.join("hetzner.toml"),
             r#"schema_version = 1
@@ -2093,7 +2636,8 @@ default_location = "pdx"
 default_server_type = "cpx11"
 ssh_keys = []
 "#,
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             providers.join("orbstack.toml"),
             r#"schema_version = 1
@@ -2104,7 +2648,8 @@ runtime = "auto"
 [discovery]
 orbstack = "~/.orbstack/run/docker.sock"
 "#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let svc = root.join(".yah").join("services").join("dev-yah");
         std::fs::create_dir_all(svc.join("mirrors")).unwrap();
@@ -2120,7 +2665,8 @@ kind = "mesofact-static"
 path = "app/yah/web"
 role = "static"
 "#,
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             svc.join("mirrors/prod.toml"),
             r#"schema_version = 1
@@ -2131,7 +2677,8 @@ use = "cloudflare"
 bucket = "yah-dev"
 zone = "yah.dev"
 "#,
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             svc.join("mirrors/local.toml"),
             r#"schema_version = 1
@@ -2144,7 +2691,8 @@ port = 4321
 [providers.compute]
 use = "orbstack"
 "#,
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2185,7 +2733,8 @@ use = "orbstack"
         std::fs::write(
             svc.join("service.toml"),
             "schema_version = 1\nname = \"dev-yah\"\ndomain = \"yah.dev\"\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             svc.join("mirrors/prod.toml"),
             "schema_version = 1\nshape = \"single-machine\"\n\n[providers.static]\nuse = \"fly-io\"\n",
@@ -2213,7 +2762,8 @@ use = "orbstack"
         std::fs::write(
             svc.join("service.toml"),
             "schema_version = 1\nname = \"local-only\"\ndomain = \"local.test\"\n",
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             svc.join("mirrors/local.toml"),
             "schema_version = 1\nshape = \"local\"\n\n[providers.static]\nkind = \"local-static\"\nport = 8080\n",
@@ -2236,7 +2786,8 @@ use = "orbstack"
         std::fs::write(
             cloud_dir.join("mirrors/noisetable.toml"),
             "camp = \"noisetable\"\nregions = [\"pdx\"]\nworkloads = []\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let cfg = CloudConfig::load(root).unwrap();
         assert_eq!(cfg.providers.len(), 3);
@@ -2266,10 +2817,22 @@ out_dir = "dist"
 routes = "./routes.ts"
 "#;
         let v: toml::Value = toml::from_str(src).unwrap();
-        assert_eq!(v.get("schema_version").and_then(|x| x.as_integer()), Some(1));
-        assert_eq!(v.get("kind").and_then(|x| x.as_str()), Some("mesofact-static"));
-        let build = v.get("build").and_then(|x| x.as_table()).expect("build table");
-        assert_eq!(build.get("command").and_then(|x| x.as_str()), Some("bun run build"));
+        assert_eq!(
+            v.get("schema_version").and_then(|x| x.as_integer()),
+            Some(1)
+        );
+        assert_eq!(
+            v.get("kind").and_then(|x| x.as_str()),
+            Some("mesofact-static")
+        );
+        let build = v
+            .get("build")
+            .and_then(|x| x.as_table())
+            .expect("build table");
+        assert_eq!(
+            build.get("command").and_then(|x| x.as_str()),
+            Some("bun run build")
+        );
         assert_eq!(build.get("out_dir").and_then(|x| x.as_str()), Some("dist"));
     }
 
@@ -2291,20 +2854,28 @@ routes = "./routes.ts"
                 role: "static".into(),
                 publishes: Some("static".into()),
                 wave: 0,
+                git: None,
             }],
         };
         svc.save(root).unwrap();
 
         // Landed at the canonical path.
         let path = crate::paths::service_toml(root, "dev-yah");
-        assert!(path.exists(), "service.toml should exist at {}", path.display());
+        assert!(
+            path.exists(),
+            "service.toml should exist at {}",
+            path.display()
+        );
 
         // Reloads through the full CloudConfig loader (no mirrors yet).
         let cfg = CloudConfig::load(root).unwrap();
         let loaded = cfg.service("dev-yah").expect("dev-yah service");
         assert_eq!(loaded.service.domain, "yah.dev");
         assert_eq!(loaded.service.components.len(), 1);
-        assert_eq!(loaded.service.components[0].publishes.as_deref(), Some("static"));
+        assert_eq!(
+            loaded.service.components[0].publishes.as_deref(),
+            Some("static")
+        );
         assert!(loaded.mirrors.is_empty());
     }
 
@@ -2324,7 +2895,10 @@ routes = "./routes.ts"
         svc.save(root).unwrap();
 
         let cfg = CloudConfig::load(root).unwrap();
-        assert_eq!(cfg.service("dev-yah").unwrap().service.domain, "yah.example");
+        assert_eq!(
+            cfg.service("dev-yah").unwrap().service.domain,
+            "yah.example"
+        );
     }
 
     #[test]
@@ -2385,13 +2959,20 @@ routes = "./routes.ts"
         mirror.save(root, "dev-yah", "cloud").unwrap();
 
         let path = crate::paths::service_mirror_toml(root, "dev-yah", "cloud");
-        assert!(path.exists(), "mirror toml should exist at {}", path.display());
+        assert!(
+            path.exists(),
+            "mirror toml should exist at {}",
+            path.display()
+        );
 
         let cfg = CloudConfig::load(root).unwrap();
         let loaded = &cfg.service("dev-yah").unwrap().mirrors["cloud"];
         assert_eq!(loaded.shape, MirrorShape::SingleMachine);
         assert_eq!(loaded.providers["static"].provider_id(), Some("cloudflare"));
-        assert_eq!(loaded.providers["compute"].inline_kind(), Some(Provider::LocalStatic));
+        assert_eq!(
+            loaded.providers["compute"].inline_kind(),
+            Some(Provider::LocalStatic)
+        );
     }
 
     #[test]
@@ -2415,7 +2996,10 @@ routes = "./routes.ts"
         .save(root, "dev-yah", "local")
         .unwrap();
 
-        assert!(ServiceConfig::delete(root, "dev-yah").unwrap(), "first delete reports true");
+        assert!(
+            ServiceConfig::delete(root, "dev-yah").unwrap(),
+            "first delete reports true"
+        );
         assert!(!crate::paths::service_dir(root, "dev-yah").exists());
         // Idempotent: deleting again is a no-op that reports false.
         assert!(!ServiceConfig::delete(root, "dev-yah").unwrap());
@@ -2452,7 +3036,9 @@ routes = "./routes.ts"
         assert!(!MirrorConfig::delete(root, "dev-yah", "prod").unwrap());
 
         let cfg = CloudConfig::load(root).unwrap();
-        let svc = cfg.service("dev-yah").expect("service survives mirror delete");
+        let svc = cfg
+            .service("dev-yah")
+            .expect("service survives mirror delete");
         // Legacy file stems are normalised on load: "prod" → "cloud", "local" → "dev".
         assert!(!svc.mirrors.contains_key("cloud"));
         assert!(svc.mirrors.contains_key("dev"));
@@ -2472,6 +3058,7 @@ routes = "./routes.ts"
                 role: "static".into(),
                 publishes: None,
                 wave: 0,
+                git: None,
             }],
         };
         svc.save(root).unwrap();
@@ -2719,5 +3306,38 @@ cdn_bucket = "yah-dev"
         let err = CloudConfig::load(root).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("must match the file stem"), "got: {msg}");
+    }
+
+    #[test]
+    fn net_alias_tier_subdomain_manifest_loads_and_cross_refs() {
+        // R561-F2: a per-tenant subdomain manifest on the net.yah.dev wildcard
+        // alias tier is just a DomainConfig whose `domain` is `<name>.net.yah.dev`
+        // and whose static route cross-refs the tenant's service component.
+        // This is exactly the shape .yah/domains/scrabcake-net-yah-dev.toml ships.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_marketing_service(root); // service "yah-marketing", component "site"
+
+        let dom = DomainConfig {
+            schema_version: 1,
+            name: "tenant-net-yah-dev".into(),
+            domain: "tenant.net.yah.dev".into(),
+            cdn_bucket: "net-yah-dev".into(), // shared per-tier bucket
+            worker_bundle_path: None,
+            routes: vec![DomainRoute {
+                path: "/*".into(),
+                mode: RouteMode::Static {
+                    component: "yah-marketing/site".into(),
+                },
+            }],
+        };
+        dom.save(root).unwrap();
+
+        let cfg = CloudConfig::load(root).unwrap();
+        let dom = cfg
+            .domain("tenant-net-yah-dev")
+            .expect("net-tier subdomain manifest should load");
+        assert_eq!(dom.domain, "tenant.net.yah.dev");
+        assert_eq!(dom.cdn_bucket, "net-yah-dev");
     }
 }

@@ -1,0 +1,21 @@
+[package]
+name = "yubaba-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Thin client surface for talking to a yubaba: pond deploy/state wire types, no server stack (no axum/openraft/russh/portable-pty)."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Embedded slot specs that PondDeployReq/PondStateRecord carry on the wire.
+# These live in local-driver (the runtime that consumes them); yubaba-client
+# only needs the serde types, not the runtime. local-driver is lean — it shells
+# out to the `docker` CLI and pulls no axum/openraft/russh/portable-pty — so a
+# crate that talks to a yubaba can link it without dragging the server stack.
+local-driver = { path = "../local-driver" }
+serde = { version = "1.0", features = ["derive"] }

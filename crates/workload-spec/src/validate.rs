@@ -4,7 +4,7 @@
 //! Sync, no I/O. Returns `Ok(warnings)` on pass or `Err(ShapeError)` on the
 //! first hard constraint violation.
 //!
-//! Layers: shape (this file, no I/O) → semantic (warden-side, R090-F3) →
+//! Layers: shape (this file, no I/O) → semantic (yubaba-side, R090-F3) →
 //! environment (deploy-time, R090-F4).
 
 use std::fmt;
@@ -246,7 +246,7 @@ pub fn shape(spec: &WorkloadSpec) -> Result<Vec<ShapeWarning>, ShapeError> {
             path: FieldPath::Tier,
             message: format!(
                 "\"{}\" is not in the known tier set (public/tenant/private/infra); \
-                 warden may reject it if the cluster config does not include this tier",
+                 yubaba may reject it if the cluster config does not include this tier",
                 spec.tier.0
             ),
         });
@@ -443,10 +443,10 @@ impl From<ContextError> for WorkloadValidationError {
     fn from(e: ContextError) -> Self { WorkloadValidationError::Context(e) }
 }
 
-/// Read-only view of warden state used for semantic validation.
+/// Read-only view of yubaba state used for semantic validation.
 ///
 /// Defined here so clients (desktop, CLI, agents) can run semantic checks
-/// without depending on the warden crate. Warden implements this trait.
+/// without depending on the yubaba crate. Yubaba implements this trait.
 ///
 /// Each method returns `Result<bool, ContextError>` so transient failures are
 /// distinguishable from definitive "not found" answers.
@@ -454,7 +454,7 @@ pub trait ValidationContext {
     /// True when the registry confirms the image exists.
     fn image_exists(&self, image: &ImageRef) -> Result<bool, ContextError>;
 
-    /// True when the named secret exists in the warden secret store.
+    /// True when the named secret exists in the yubaba secret store.
     fn secret_exists(&self, secret: &SecretRef) -> Result<bool, ContextError>;
 
     /// True when `ident` is a known deployed workload OR appears in `batch`
@@ -474,7 +474,7 @@ pub trait ValidationContext {
     fn capacity_for(&self, spec: &WorkloadSpec, machine_id: &MachineId) -> Result<bool, ContextError>;
 }
 
-/// Run semantic validation — requires warden state via [`ValidationContext`].
+/// Run semantic validation — requires yubaba state via [`ValidationContext`].
 ///
 /// Shape validation is NOT run here. Callers MUST run [`shape`] first; use
 /// [`all`] to enforce this automatically.
@@ -502,7 +502,7 @@ pub fn semantic(
         if !ctx.secret_exists(&secret.source)? {
             return Err(WorkloadValidationError::Semantic(SemanticError::Unknown {
                 path: FieldPath::Secret(i, "source"),
-                reason: format!("secret source at index {i} not found in warden secret store"),
+                reason: format!("secret source at index {i} not found in yubaba secret store"),
             }));
         }
     }
@@ -561,7 +561,7 @@ pub fn semantic(
 /// Failure surface for [`MeshResolver`] lookups.
 ///
 /// `NotDeployed` means the dependency hasn't been observed in mesh state yet
-/// (warden's deploy step waits on this — see [`crate::EnvValue::FromMesh`]).
+/// (yubaba's deploy step waits on this — see [`crate::EnvValue::FromMesh`]).
 /// `NoPorts` means the dependency is deployed but its `MeshExpose.ports`
 /// list is empty, so a port-based lookup can't render a value. `Lookup`
 /// covers transient failures from the underlying state read.
@@ -582,8 +582,8 @@ pub enum MeshError {
 /// Resolve [`crate::EnvValue::FromMesh`] references to literal env values.
 ///
 /// Defined in workload-spec so clients (agents, desktop, CLI) can render
-/// specs against fake mesh state without depending on the warden crate.
-/// Warden's production implementation (in `warden::deploy::mesh_resolve`)
+/// specs against fake mesh state without depending on the yubaba crate.
+/// Yubaba's production implementation (in `yubaba::deploy::mesh_resolve`)
 /// reads from raft state.
 ///
 /// **Resolution rules** match the arch doc §"Mesh-derived env":
@@ -603,8 +603,8 @@ pub trait MeshResolver {
 /// using `resolver`; pass through `Literal` and `FromSecret` values unchanged.
 ///
 /// Returns the first resolution error encountered. Callers should run this
-/// after warden's stage-3 mesh peering completes (see
-/// `warden::deploy::env_validate::run` doc), at containerd-spec assembly.
+/// after yubaba's stage-3 mesh peering completes (see
+/// `yubaba::deploy::env_validate::run` doc), at containerd-spec assembly.
 ///
 /// `FromSecret` values are deliberately untouched here — secret resolution
 /// is the secrets layer's job (R090-F5), not the mesh resolver's.

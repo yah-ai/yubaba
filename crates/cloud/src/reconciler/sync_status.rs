@@ -21,7 +21,7 @@
 //! This module computes status from (a) the declared [`MirrorConfig`] and
 //! (b) a caller-supplied [`MirrorObservation`]. It never reaches out to a
 //! runtime itself — the desktop fills observations from its in-memory
-//! running-mirror registry; a future warden probe will fill them for cloud
+//! running-mirror registry; a future yubaba probe will fill them for cloud
 //! tiers. Tiers with **no observation** (`None`) resolve to `unknown` sync /
 //! `missing` health, which is the honest state today for `cloud`/`ha`
 //! (read-only, declared status only — see the Area-A arch doc).
@@ -92,7 +92,9 @@ pub enum WireContainerStatus {
         last_finished_at_unix_ms: u64,
     },
     Stopped,
-    Failed { reason: String },
+    Failed {
+        reason: String,
+    },
 }
 
 /// The substrate a mirror runs on. `dev` is the odd one out (a bare
@@ -135,7 +137,7 @@ impl Runtime {
 /// What the operator can observe about one mirror right now.
 ///
 /// Callers fill this from whatever live source they have: the desktop from
-/// its in-memory running-mirror registry, a future CLI from a warden probe.
+/// its in-memory running-mirror registry, a future CLI from a yubaba probe.
 /// `None` (no observation) is a first-class state — it yields `unknown`
 /// sync, which is honest for tiers with no live source yet.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -241,7 +243,11 @@ pub struct StatusSummary {
 /// - **Health**: `errored` → `degraded`; `running && ready` → `healthy`;
 ///   `running && !ready` → `progressing`; `!running` → `idle` for a local
 ///   (on-demand) mirror, else `missing`.
-pub fn compute_cell(env: &str, mirror: &MirrorConfig, obs: Option<&MirrorObservation>) -> CellStatus {
+pub fn compute_cell(
+    env: &str,
+    mirror: &MirrorConfig,
+    obs: Option<&MirrorObservation>,
+) -> CellStatus {
     let runtime = Runtime::from_mirror(mirror);
     let declared_revision = declared_revision(mirror);
     let provider_label = provider_label(mirror);
@@ -420,6 +426,8 @@ fn provider_kind_label(kind: Provider) -> String {
     match kind {
         Provider::Cloudflare => "cloudflare",
         Provider::Hetzner => "hetzner",
+        Provider::Vultr => "vultr",
+        Provider::Static => "static",
         Provider::LocalStatic => "local-static",
         Provider::LocalContainer => "local-container",
         Provider::MiniflareContainer => "miniflare-container",
@@ -499,17 +507,26 @@ mod tests {
 
     #[test]
     fn runtime_process_for_local_static_only() {
-        assert_eq!(Runtime::from_mirror(&local_static_mirror()), Runtime::Process);
+        assert_eq!(
+            Runtime::from_mirror(&local_static_mirror()),
+            Runtime::Process
+        );
     }
 
     #[test]
     fn runtime_containers_for_inline_container_kinds() {
-        assert_eq!(Runtime::from_mirror(&sim_miniflare_mirror()), Runtime::Containers);
+        assert_eq!(
+            Runtime::from_mirror(&sim_miniflare_mirror()),
+            Runtime::Containers
+        );
     }
 
     #[test]
     fn runtime_containers_for_referenced_provider() {
-        assert_eq!(Runtime::from_mirror(&cloudflare_mirror()), Runtime::Containers);
+        assert_eq!(
+            Runtime::from_mirror(&cloudflare_mirror()),
+            Runtime::Containers
+        );
     }
 
     #[test]
@@ -523,7 +540,11 @@ mod tests {
 
     #[test]
     fn running_ready_local_is_synced_healthy() {
-        let obs = MirrorObservation { running: true, ready: true, ..Default::default() };
+        let obs = MirrorObservation {
+            running: true,
+            ready: true,
+            ..Default::default()
+        };
         let cell = compute_cell("dev", &local_static_mirror(), Some(&obs));
         assert_eq!(cell.sync, SyncState::Synced);
         assert_eq!(cell.health, HealthState::Healthy);
@@ -534,7 +555,10 @@ mod tests {
     fn declared_but_down_local_is_idle_not_missing() {
         // A local (on-demand) mirror that isn't running is idle — nothing
         // is wrong, it just hasn't been brought up. Distinct from missing.
-        let obs = MirrorObservation { running: false, ..Default::default() };
+        let obs = MirrorObservation {
+            running: false,
+            ..Default::default()
+        };
         let cell = compute_cell("sim", &sim_miniflare_mirror(), Some(&obs));
         assert_eq!(cell.health, HealthState::Idle);
         assert_eq!(cell.sync, SyncState::Synced);
@@ -544,21 +568,33 @@ mod tests {
     fn down_continuous_tier_is_missing() {
         // A single-machine (continuously-live) mirror observed as not running
         // is missing, not idle.
-        let obs = MirrorObservation { running: false, ..Default::default() };
+        let obs = MirrorObservation {
+            running: false,
+            ..Default::default()
+        };
         let cell = compute_cell("cloud", &cloudflare_mirror(), Some(&obs));
         assert_eq!(cell.health, HealthState::Missing);
     }
 
     #[test]
     fn running_not_ready_is_progressing() {
-        let obs = MirrorObservation { running: true, ready: false, ..Default::default() };
+        let obs = MirrorObservation {
+            running: true,
+            ready: false,
+            ..Default::default()
+        };
         let cell = compute_cell("cloud", &cloudflare_mirror(), Some(&obs));
         assert_eq!(cell.health, HealthState::Progressing);
     }
 
     #[test]
     fn errored_is_degraded() {
-        let obs = MirrorObservation { running: true, ready: true, errored: true, ..Default::default() };
+        let obs = MirrorObservation {
+            running: true,
+            ready: true,
+            errored: true,
+            ..Default::default()
+        };
         let cell = compute_cell("cloud", &cloudflare_mirror(), Some(&obs));
         assert_eq!(cell.health, HealthState::Degraded);
     }
@@ -593,7 +629,12 @@ mod tests {
     fn unknown_live_revision_does_not_force_out_of_sync() {
         // We know the declared rev but not the live one — that's not enough
         // to call divergence. Stays synced.
-        let obs = MirrorObservation { running: true, ready: true, live_revision: None, ..Default::default() };
+        let obs = MirrorObservation {
+            running: true,
+            ready: true,
+            live_revision: None,
+            ..Default::default()
+        };
         let cell = compute_cell("cloud", &cloudflare_mirror(), Some(&obs));
         assert_eq!(cell.sync, SyncState::Synced);
     }
@@ -606,7 +647,12 @@ mod tests {
         static_slot.insert("port".to_string(), "8080".to_string()); // matches declared
         live_fields.insert("static".to_string(), static_slot);
 
-        let obs = MirrorObservation { running: true, ready: true, live_fields, ..Default::default() };
+        let obs = MirrorObservation {
+            running: true,
+            ready: true,
+            live_fields,
+            ..Default::default()
+        };
         let cell = compute_cell("sim", &sim_miniflare_mirror(), Some(&obs));
         assert_eq!(cell.sync, SyncState::OutOfSync);
         assert_eq!(cell.drift_count(), 1, "only the image field drifts");
@@ -619,7 +665,10 @@ mod tests {
     fn provider_label_joins_inline_kinds() {
         // Order follows the role-key (BTreeMap) order — deterministic:
         // `object_store` (minio) sorts before `static` (miniflare).
-        assert_eq!(provider_label(&sim_miniflare_mirror()), "minio-container + miniflare-container");
+        assert_eq!(
+            provider_label(&sim_miniflare_mirror()),
+            "minio-container + miniflare-container"
+        );
         assert_eq!(provider_label(&cloudflare_mirror()), "cloudflare");
     }
 
@@ -641,12 +690,17 @@ mod tests {
                 ("dev".to_string(), local_static_mirror()),
                 ("cloud".to_string(), cloudflare_mirror()),
             ]),
+            component_transform_recipes: BTreeMap::new(),
         };
 
         let mut obs = BTreeMap::new();
         obs.insert(
             "dev".to_string(),
-            MirrorObservation { running: true, ready: true, ..Default::default() },
+            MirrorObservation {
+                running: true,
+                ready: true,
+                ..Default::default()
+            },
         );
         // No observation for "cloud" → unknown/missing.
 
@@ -671,7 +725,13 @@ mod tests {
             serde_json::to_string(&SyncState::OutOfSync).unwrap(),
             "\"out-of-sync\""
         );
-        assert_eq!(serde_json::to_string(&HealthState::Idle).unwrap(), "\"idle\"");
-        assert_eq!(serde_json::to_string(&Runtime::Containers).unwrap(), "\"containers\"");
+        assert_eq!(
+            serde_json::to_string(&HealthState::Idle).unwrap(),
+            "\"idle\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Runtime::Containers).unwrap(),
+            "\"containers\""
+        );
     }
 }

@@ -1,7 +1,7 @@
-//! Warden release-manifest fetch + per-triple resolution (R330-F21).
+//! Yubaba release-manifest fetch + per-triple resolution (R330-F21).
 //!
-//! `.github/workflows/release.yml`'s `warden-release-manifest` job publishes
-//! `https://cdn.yah.dev/warden/release-manifest.json` after every release tag
+//! `.github/workflows/release.yml`'s `yubaba-release-manifest` job publishes
+//! `https://cdn.yah.dev/yubaba/release-manifest.json` after every release tag
 //! (R330-F19). Operators do not need to memorise per-release URLs and sha256s —
 //! `yah cloud machine provision <name>` fetches the manifest once, looks up
 //! the entry matching the machine's architecture, and threads the resolved
@@ -14,11 +14,11 @@
 //!   "version": "0.9.0",
 //!   "triples": {
 //!     "x86_64-unknown-linux-musl": {
-//!       "url":      "https://cdn.yah.dev/warden/0.9.0/x86_64-unknown-linux-musl/yah-warden-x86_64-unknown-linux-musl.tar.gz",
+//!       "url":      "https://cdn.yah.dev/yubaba/0.9.0/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz",
 //!       "size":     2345678,
 //!       "sha256":   "abc…",
-//!       "sig_url":  "https://cdn.yah.dev/warden/.../...tar.gz.sig",
-//!       "cert_url": "https://cdn.yah.dev/warden/.../...tar.gz.cert"
+//!       "sig_url":  "https://cdn.yah.dev/yubaba/.../...tar.gz.sig",
+//!       "cert_url": "https://cdn.yah.dev/yubaba/.../...tar.gz.cert"
 //!     },
 //!     "aarch64-unknown-linux-musl": { … }
 //!   }
@@ -35,16 +35,15 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// Canonical manifest URL published by `.github/workflows/release.yml`'s
-/// `warden-release-manifest` job. Hardcoded so operators don't need to memorise
-/// it; operators *can* still override by passing `--warden-manifest-url`.
-pub const DEFAULT_RELEASE_MANIFEST_URL: &str =
-    "https://cdn.yah.dev/warden/release-manifest.json";
+/// `yubaba-release-manifest` job. Hardcoded so operators don't need to memorise
+/// it; operators *can* still override by passing `--yubaba-manifest-url`.
+pub const DEFAULT_RELEASE_MANIFEST_URL: &str = "https://cdn.yah.dev/yubaba/release-manifest.json";
 
-/// Default cosign keyless OIDC identity regexp the warden release pipeline
+/// Default cosign keyless OIDC identity regexp the yubaba release pipeline
 /// signs against. Matches the `cosign sign-blob` certificate identity emitted
-/// by GitHub Actions when running under `anthropics/yah` (R330-F19). Operators
-/// override with `--warden-cosign-identity` to point at a fork's OIDC subject.
-pub const DEFAULT_WARDEN_COSIGN_IDENTITY: &str = r"^https://github\.com/anthropics/yah/";
+/// by GitHub Actions when running under `yah-ai/yah` (R330-F19). Operators
+/// override with `--yubaba-cosign-identity` to point at a fork's OIDC subject.
+pub const DEFAULT_WARDEN_COSIGN_IDENTITY: &str = r"^https://github\.com/yah-ai/yah/";
 
 /// One per-triple entry in the manifest. Field order matches what
 /// release.yml's `Emit per-triple manifest fragment` step writes.
@@ -94,7 +93,7 @@ pub fn server_type_to_triple(server_type: &str) -> Result<&'static str> {
     } else {
         bail!(
             "unknown Hetzner server_type '{server_type}' — cannot infer architecture. \
-             Pass --warden-url + --warden-sha256 explicitly to skip manifest resolution."
+             Pass --yubaba-url + --yubaba-sha256 explicitly to skip manifest resolution."
         )
     }
 }
@@ -102,7 +101,7 @@ pub fn server_type_to_triple(server_type: &str) -> Result<&'static str> {
 /// Fetch the release-manifest from the canonical URL. Caller picks the runtime;
 /// inside `yah cloud machine provision` the existing `tokio::runtime::Runtime`
 /// drives this. Surfaces every failure mode loud (no silent placeholder
-/// fallback) — operators see an actionable message and pass `--warden-url`
+/// fallback) — operators see an actionable message and pass `--yubaba-url`
 /// explicitly to bypass.
 pub async fn fetch_release_manifest(url: &str) -> Result<WardenReleaseManifest> {
     let client = reqwest::Client::builder()
@@ -118,7 +117,7 @@ pub async fn fetch_release_manifest(url: &str) -> Result<WardenReleaseManifest> 
     if !resp.status().is_success() {
         bail!(
             "release-manifest fetch from {url} returned HTTP {} — \
-             pass --warden-url explicitly if the manifest is unreachable",
+             pass --yubaba-url explicitly if the manifest is unreachable",
             resp.status()
         );
     }
@@ -128,13 +127,13 @@ pub async fn fetch_release_manifest(url: &str) -> Result<WardenReleaseManifest> 
         .with_context(|| format!("reading release-manifest body from {url}"))?;
     let manifest: WardenReleaseManifest = serde_json::from_slice(&body).with_context(|| {
         format!(
-            "parsing release-manifest from {url} — pass --warden-url explicitly if the manifest is malformed"
+            "parsing release-manifest from {url} — pass --yubaba-url explicitly if the manifest is malformed"
         )
     })?;
     if manifest.triples.is_empty() {
         bail!(
             "release-manifest from {url} has no triples — \
-             pass --warden-url explicitly to bypass manifest resolution"
+             pass --yubaba-url explicitly to bypass manifest resolution"
         );
     }
     Ok(manifest)
@@ -180,7 +179,10 @@ mod tests {
     fn server_type_to_triple_rejects_unknown_prefix() {
         let err = server_type_to_triple("xxx99").unwrap_err().to_string();
         assert!(err.contains("unknown Hetzner server_type"), "msg: {err}");
-        assert!(err.contains("--warden-url"), "msg points to override: {err}");
+        assert!(
+            err.contains("--yubaba-url"),
+            "msg points to override: {err}"
+        );
     }
 
     #[test]
@@ -189,11 +191,11 @@ mod tests {
             "version": "0.9.0",
             "triples": {
                 "x86_64-unknown-linux-musl": {
-                    "url": "https://cdn.yah.dev/warden/0.9.0/x86_64-unknown-linux-musl/yah-warden-x86_64-unknown-linux-musl.tar.gz",
+                    "url": "https://cdn.yah.dev/yubaba/0.9.0/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz",
                     "size": 2345678,
                     "sha256": "abc123",
-                    "sig_url": "https://cdn.yah.dev/warden/0.9.0/x86_64-unknown-linux-musl/yah-warden-x86_64-unknown-linux-musl.tar.gz.sig",
-                    "cert_url": "https://cdn.yah.dev/warden/0.9.0/x86_64-unknown-linux-musl/yah-warden-x86_64-unknown-linux-musl.tar.gz.cert"
+                    "sig_url": "https://cdn.yah.dev/yubaba/0.9.0/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz.sig",
+                    "cert_url": "https://cdn.yah.dev/yubaba/0.9.0/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz.cert"
                 }
             }
         }"#;
@@ -210,16 +212,22 @@ mod tests {
     fn manifest_entry_missing_triple_lists_available() {
         let raw = r#"{"version":"0.9.0","triples":{"x86_64-unknown-linux-musl":{"url":"u","size":1,"sha256":"s","sig_url":"u.sig","cert_url":"u.cert"}}}"#;
         let parsed: WardenReleaseManifest = serde_json::from_str(raw).unwrap();
-        let err = parsed.entry("aarch64-unknown-linux-musl").unwrap_err().to_string();
+        let err = parsed
+            .entry("aarch64-unknown-linux-musl")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("aarch64-unknown-linux-musl"));
-        assert!(err.contains("x86_64-unknown-linux-musl"), "lists available: {err}");
+        assert!(
+            err.contains("x86_64-unknown-linux-musl"),
+            "lists available: {err}"
+        );
     }
 
     #[test]
-    fn default_identity_regexp_matches_anthropics_yah() {
+    fn default_identity_regexp_matches_yah_ai_yah() {
         // Sanity: the constant matches what release.yml's cosign sign-blob
         // step emits as the keyless certificate identity. Bumping the org
         // requires updating both this constant AND release.yml in lockstep.
-        assert!(DEFAULT_WARDEN_COSIGN_IDENTITY.contains("anthropics/yah"));
+        assert!(DEFAULT_WARDEN_COSIGN_IDENTITY.contains("yah-ai/yah"));
     }
 }

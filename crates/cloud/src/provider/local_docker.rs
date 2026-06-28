@@ -1,5 +1,5 @@
 //! `provider::local_docker` — `MachineProvider` backed by containerd on the
-//! dev box. Drives the same containerd socket that warden uses in production,
+//! dev box. Drives the same containerd socket that yubaba uses in production,
 //! exercising the same cloud-init boot path at tier-1 speed (seconds, not
 //! minutes).
 //!
@@ -17,7 +17,7 @@
 //!
 //! Each `create_server` call creates a containerd container that boots systemd
 //! as PID 1, runs the cloud-init NoCloud datasource against the supplied
-//! user-data, and ultimately starts yah-warden as a systemd unit — exactly the
+//! user-data, and ultimately starts yah-yubaba as a systemd unit — exactly the
 //! same boot path as a real Hetzner VPS. The boot image must be
 //! systemd-capable; see [`DEFAULT_MACHINE_IMAGE`].
 //!
@@ -46,7 +46,7 @@
 //! @yah:ticket(R091-F3, "provider::local_docker: containerd-in-containers MachineProvider")
 //! @yah:status(review)
 //! @yah:at(2026-05-12T18:24:04Z)
-//! @yah:see(.yah/docs/architecture/A053-yah-warden-integration-testing.md)
+//! @yah:see(.yah/docs/architecture/A053-yah-yubaba-integration-testing.md)
 //!
 //! @yah:ticket(R409-T7, "Slot LocalDockerProvider into the tier model per T1 decision (tier-S vs synthetic)")
 //! @yah:assignee(agent:claude)
@@ -68,24 +68,21 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use containerd_client::tonic::Request;
 use containerd_client::{
     services::v1::{
-        containers_client::ContainersClient,
-        tasks_client::TasksClient,
-        Container, CreateContainerRequest, CreateTaskRequest,
-        DeleteContainerRequest, DeleteTaskRequest,
+        containers_client::ContainersClient, tasks_client::TasksClient, Container,
+        CreateContainerRequest, CreateTaskRequest, DeleteContainerRequest, DeleteTaskRequest,
         KillRequest, ListContainersRequest, StartRequest,
     },
-    tonic,
-    with_namespace,
+    tonic, with_namespace,
 };
-use containerd_client::tonic::Request;
 use reqwest::StatusCode;
 use serde_json::json;
 
 use super::{
-    BucketAcl, BucketRef, Location, MachineProvider, ProjectId, ServerId, ServerSpec,
-    ServerStatus, ServerSummary,
+    BucketAcl, BucketRef, Location, MachineProvider, ProjectId, ServerId, ServerSpec, ServerStatus,
+    ServerSummary,
 };
 use local_driver::s3_sign::{
     sign_s3_delete_bucket, sign_s3_head_bucket, sign_s3_put_bucket, sign_s3_put_bucket_policy,
@@ -494,7 +491,9 @@ impl MachineProvider for LocalDockerProvider {
                 ..Default::default()
             };
 
-            let req = CreateContainerRequest { container: Some(container) };
+            let req = CreateContainerRequest {
+                container: Some(container),
+            };
             let req = with_namespace!(req, LOCAL_NAMESPACE);
             ctrs.create(req)
                 .await
@@ -594,8 +593,19 @@ impl MachineProvider for LocalDockerProvider {
 
     async fn bucket_exists(&self, name: &str, _location: Location) -> Result<bool> {
         let url = self.bucket_url(name);
-        let headers = sign_s3_head_bucket(&url, MINIO_REGION, &self.minio_access_key, &self.minio_secret_key)?;
-        let resp = self.http.head(&url).headers(headers).send().await.context("HEAD bucket")?;
+        let headers = sign_s3_head_bucket(
+            &url,
+            MINIO_REGION,
+            &self.minio_access_key,
+            &self.minio_secret_key,
+        )?;
+        let resp = self
+            .http
+            .head(&url)
+            .headers(headers)
+            .send()
+            .await
+            .context("HEAD bucket")?;
         match resp.status() {
             StatusCode::OK | StatusCode::NO_CONTENT => Ok(true),
             StatusCode::NOT_FOUND => Ok(false),
@@ -621,11 +631,17 @@ impl MachineProvider for LocalDockerProvider {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Delete task record.
-        let del_task = DeleteTaskRequest { container_id: container_id.clone() };
-        let _ = tasks.delete(with_namespace!(del_task, LOCAL_NAMESPACE)).await;
+        let del_task = DeleteTaskRequest {
+            container_id: container_id.clone(),
+        };
+        let _ = tasks
+            .delete(with_namespace!(del_task, LOCAL_NAMESPACE))
+            .await;
 
         // Delete container record.
-        let del_ctr = DeleteContainerRequest { id: container_id.clone() };
+        let del_ctr = DeleteContainerRequest {
+            id: container_id.clone(),
+        };
         match ctrs.delete(with_namespace!(del_ctr, LOCAL_NAMESPACE)).await {
             Ok(_) => {}
             Err(s) if s.code() == tonic::Code::NotFound => {}
@@ -640,7 +656,12 @@ impl MachineProvider for LocalDockerProvider {
 
     async fn create_bucket(&self, name: &str, _location: Location) -> Result<BucketRef> {
         let url = self.bucket_url(name);
-        let headers = sign_s3_put_bucket(&url, MINIO_REGION, &self.minio_access_key, &self.minio_secret_key)?;
+        let headers = sign_s3_put_bucket(
+            &url,
+            MINIO_REGION,
+            &self.minio_access_key,
+            &self.minio_secret_key,
+        )?;
         let resp = self
             .http
             .put(&url)
@@ -651,7 +672,10 @@ impl MachineProvider for LocalDockerProvider {
             .context("PUT bucket")?;
         let s = resp.status();
         if s.is_success() || s == StatusCode::CONFLICT {
-            return Ok(BucketRef { name: name.to_string(), endpoint: self.minio_endpoint.clone() });
+            return Ok(BucketRef {
+                name: name.to_string(),
+                endpoint: self.minio_endpoint.clone(),
+            });
         }
         let text = resp.text().await.unwrap_or_default();
         bail!("create_bucket MinIO failed ({s}): {text}");
@@ -659,7 +683,12 @@ impl MachineProvider for LocalDockerProvider {
 
     async fn delete_bucket(&self, name: &str, _location: Location) -> Result<()> {
         let url = self.bucket_url(name);
-        let headers = sign_s3_delete_bucket(&url, MINIO_REGION, &self.minio_access_key, &self.minio_secret_key)?;
+        let headers = sign_s3_delete_bucket(
+            &url,
+            MINIO_REGION,
+            &self.minio_access_key,
+            &self.minio_secret_key,
+        )?;
         let resp = self
             .http
             .delete(&url)
@@ -685,7 +714,13 @@ impl MachineProvider for LocalDockerProvider {
             BucketAcl::Private => br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec(),
         };
         let url = format!("{}?policy", self.bucket_url(name));
-        let headers = sign_s3_put_bucket_policy(&url, MINIO_REGION, &self.minio_access_key, &self.minio_secret_key, &policy_json)?;
+        let headers = sign_s3_put_bucket_policy(
+            &url,
+            MINIO_REGION,
+            &self.minio_access_key,
+            &self.minio_secret_key,
+            &policy_json,
+        )?;
         let resp = self
             .http
             .put(&url)
@@ -709,9 +744,15 @@ impl MachineProvider for LocalDockerProvider {
 fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     if s.ends_with('s') {
-        s[..s.len() - 1].parse::<u64>().ok().map(Duration::from_secs)
+        s[..s.len() - 1]
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_secs)
     } else if s.ends_with('m') {
-        s[..s.len() - 1].parse::<u64>().ok().map(|m| Duration::from_secs(m * 60))
+        s[..s.len() - 1]
+            .parse::<u64>()
+            .ok()
+            .map(|m| Duration::from_secs(m * 60))
     } else {
         s.parse::<u64>().ok().map(Duration::from_secs)
     }
@@ -728,7 +769,11 @@ fn parse_fail_inject(spec: &str) -> HashMap<FailTarget, (FailMode, u64)> {
         // split on ':' — allow "random:0.1" as mode
         let colon = part.find(':').unwrap_or(part.len());
         let target_str = &part[..colon];
-        let mode_str = if colon < part.len() { &part[colon + 1..] } else { "" };
+        let mode_str = if colon < part.len() {
+            &part[colon + 1..]
+        } else {
+            ""
+        };
 
         let target: FailTarget = match target_str.parse() {
             Ok(t) => t,
@@ -795,7 +840,9 @@ mod tests {
     fn parse_fail_inject_random() {
         let m = parse_fail_inject("mesh_join:random:0.25");
         assert!(m.contains_key(&FailTarget::MeshJoin));
-        assert!(matches!(m[&FailTarget::MeshJoin].0, FailMode::Random(p) if (p - 0.25).abs() < 1e-9));
+        assert!(
+            matches!(m[&FailTarget::MeshJoin].0, FailMode::Random(p) if (p - 0.25).abs() < 1e-9)
+        );
     }
 
     #[test]
@@ -825,9 +872,9 @@ mod tests {
         let seed = PathBuf::from("/tmp/yah-local-test");
         let spec = LocalDockerProvider::build_oci_spec("m", "img", &seed);
         let mounts = spec["mounts"].as_array().unwrap();
-        let nocloud = mounts.iter().find(|m| {
-            m["destination"].as_str() == Some("/var/lib/cloud/seed/nocloud")
-        });
+        let nocloud = mounts
+            .iter()
+            .find(|m| m["destination"].as_str() == Some("/var/lib/cloud/seed/nocloud"));
         assert!(nocloud.is_some(), "cloud-init nocloud mount missing");
         assert_eq!(
             nocloud.unwrap()["source"].as_str().unwrap(),
@@ -840,7 +887,9 @@ mod tests {
         let seed = PathBuf::from("/tmp");
         let spec = LocalDockerProvider::build_oci_spec("m", "img", &seed);
         let mounts = spec["mounts"].as_array().unwrap();
-        let cg = mounts.iter().find(|m| m["destination"].as_str() == Some("/sys/fs/cgroup"));
+        let cg = mounts
+            .iter()
+            .find(|m| m["destination"].as_str() == Some("/sys/fs/cgroup"));
         assert!(cg.is_some(), "cgroup2 mount missing");
         assert_eq!(cg.unwrap()["type"].as_str().unwrap(), "cgroup2");
     }
@@ -879,7 +928,10 @@ mod tests {
         );
 
         let found = p.find_server_by_name(&spec.name).await.unwrap();
-        assert!(found.is_some(), "find_server_by_name should find the container");
+        assert!(
+            found.is_some(),
+            "find_server_by_name should find the container"
+        );
 
         p.destroy_server(&id).await.unwrap();
         println!("destroyed");
@@ -900,10 +952,12 @@ mod tests {
 
         let user_data = crate::cloud_init::DEFAULT_TEMPLATE
             .replace("{{MACHINE_NAME}}", "ci-test-machine")
-            .replace("{{YAH_WARDEN_URL}}", "https://example.invalid/warden.tar.gz")
+            .replace(
+                "{{YAH_WARDEN_URL}}",
+                "https://example.invalid/yubaba.tar.gz",
+            )
             .replace("{{YAH_WARDEN_SHA256}}", "0".repeat(64).as_str())
             .replace("{{WARDEN_CHANNEL}}", "stable")
-            .replace("{{CONTAINERD_VERSION}}", "1.7.2")
             .replace("{{HEADSCALE_PREAUTH_KEY}}", "tskey-placeholder")
             .replace("{{MESH_LOGIN_SERVER_ARG}}", "")
             .replace("{{TAGS}}", "tag:ci")
@@ -918,17 +972,17 @@ mod tests {
             ssh_keys: vec![],
         };
 
-        let id = p
-            .create_server(&project, &spec, &user_data)
-            .await
-            .unwrap();
+        let id = p.create_server(&project, &spec, &user_data).await.unwrap();
 
-        // Poll for warden.service active within 60 seconds.
+        // Poll for yubaba.service active within 60 seconds.
         // (Full cloud-init + systemd boot; image must have systemd + cloud-init.)
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut active = false;
         while std::time::Instant::now() < deadline {
-            let s = p.server_status(&id).await.unwrap_or(ServerStatus::Unknown("poll".into()));
+            let s = p
+                .server_status(&id)
+                .await
+                .unwrap_or(ServerStatus::Unknown("poll".into()));
             if matches!(s, ServerStatus::Running) {
                 active = true;
                 break;

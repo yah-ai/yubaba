@@ -54,7 +54,9 @@ pub struct LocalDockerEnvoy {
 impl LocalDockerEnvoy {
     /// Wrap an owned provider.
     pub fn new(provider: LocalDockerProvider) -> Self {
-        Self { provider: Arc::new(provider) }
+        Self {
+            provider: Arc::new(provider),
+        }
     }
 
     /// Wrap a shared provider — useful when the same instance is also used
@@ -76,9 +78,8 @@ impl LocalDockerEnvoy {
     ) -> Result<CloudVpsCreateOutput> {
         // Validate location so the Synthetic adapter honours the same
         // contract as tier-S Native adapters. LocalDocker doesn't act on it.
-        Location::try_from(input.location.as_str()).with_context(|| {
-            format!("cloud.vps.create: unknown location {:?}", input.location)
-        })?;
+        Location::try_from(input.location.as_str())
+            .with_context(|| format!("cloud.vps.create: unknown location {:?}", input.location))?;
 
         let project = self
             .provider
@@ -143,10 +144,10 @@ impl LocalDockerEnvoy {
             .provider
             .create_bucket(&input.name, Location::Pdx)
             .await
-            .with_context(|| {
-                format!("cloud.object.bucket.create: create {:?}", input.name)
-            })?;
-        Ok(CloudObjectBucketCreateOutput { endpoint: bucket.endpoint })
+            .with_context(|| format!("cloud.object.bucket.create: create {:?}", input.name))?;
+        Ok(CloudObjectBucketCreateOutput {
+            endpoint: bucket.endpoint,
+        })
     }
 
     /// Typed handler for `cloud.object.bucket.delete`.
@@ -157,9 +158,7 @@ impl LocalDockerEnvoy {
         self.provider
             .delete_bucket(&input.name, Location::Pdx)
             .await
-            .with_context(|| {
-                format!("cloud.object.bucket.delete: delete {:?}", input.name)
-            })?;
+            .with_context(|| format!("cloud.object.bucket.delete: delete {:?}", input.name))?;
         Ok(CloudObjectBucketDeleteOutput::default())
     }
 
@@ -173,9 +172,7 @@ impl LocalDockerEnvoy {
             .provider
             .bucket_exists(&input.name, Location::Pdx)
             .await
-            .with_context(|| {
-                format!("cloud.object.bucket.exists: check {:?}", input.name)
-            })?;
+            .with_context(|| format!("cloud.object.bucket.exists: check {:?}", input.name))?;
         Ok(CloudObjectBucketExistsOutput {
             exists,
             endpoint: if exists {
@@ -211,38 +208,38 @@ impl EnvoyAdapter for LocalDockerEnvoy {
     async fn dispatch(&self, verb_id: &str, input: Value) -> Result<Value> {
         match verb_id {
             id if id == CloudVpsCreate::ID => {
-                let args: CloudVpsCreateInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: CloudVpsCreateInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.cloud_vps_create(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
             id if id == CloudVpsDestroy::ID => {
-                let args: CloudVpsDestroyInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: CloudVpsDestroyInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.cloud_vps_destroy(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
             id if id == CloudVpsStatus::ID => {
-                let args: CloudVpsStatusInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: CloudVpsStatusInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.cloud_vps_status(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
             id if id == CloudObjectBucketCreate::ID => {
-                let args: CloudObjectBucketCreateInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: CloudObjectBucketCreateInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.cloud_object_bucket_create(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
             id if id == CloudObjectBucketDelete::ID => {
-                let args: CloudObjectBucketDeleteInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: CloudObjectBucketDeleteInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.cloud_object_bucket_delete(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
             id if id == CloudObjectBucketExists::ID => {
-                let args: CloudObjectBucketExistsInput = serde_json::from_value(input)
-                    .with_context(|| format!("{id}: decode input"))?;
+                let args: CloudObjectBucketExistsInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.cloud_object_bucket_exists(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
@@ -286,7 +283,7 @@ mod tests {
         // id() / tier() / flavor() are stateless — verified via the constants
         // without constructing a real provider.
         assert_eq!("local-docker", "local-docker"); // id()
-        assert_eq!(Tier::S, Tier::S);               // tier()
+        assert_eq!(Tier::S, Tier::S); // tier()
         assert_eq!(AdapterFlavor::Synthetic, AdapterFlavor::Synthetic); // flavor()
     }
 }

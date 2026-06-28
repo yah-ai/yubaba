@@ -122,6 +122,29 @@ pub fn sign_s3_get_with_query(
     access_key: &str,
     secret_key: &str,
 ) -> Result<HeaderMap> {
+    sign_s3_no_body("GET", url, canonical_query, region, access_key, secret_key)
+}
+
+/// AWS Sig V4 for any body-less verb (`GET`, `HEAD`) **without** signing
+/// `content-length`.
+///
+/// reqwest/hyper strip the `content-length: 0` header off the wire for
+/// body-less requests, so signing it — as [`sign_s3_empty_body`] does — leaves
+/// the server unable to reproduce the signature, yielding
+/// `403 SignatureDoesNotMatch`. Object `GET`/`HEAD` must use this signer; only
+/// methods that actually carry a (possibly empty) body and emit
+/// `content-length` on the wire may use [`sign_s3_empty_body`].
+///
+/// `canonical_query` follows the [`sign_s3_get_with_query`] contract (empty
+/// string for no query).
+pub fn sign_s3_no_body(
+    method: &str,
+    url: &str,
+    canonical_query: &str,
+    region: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> Result<HeaderMap> {
     let now = chrono::Utc::now();
     let date = now.format("%Y%m%d").to_string();
     let datetime = now.format("%Y%m%dT%H%M%SZ").to_string();
@@ -142,7 +165,7 @@ pub fn sign_s3_get_with_query(
     let signed_headers = "host;x-amz-content-sha256;x-amz-date";
 
     let canonical_request = format!(
-        "GET\n{uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{empty_hash}"
+        "{method}\n{uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{empty_hash}"
     );
 
     let cr_hash = {
@@ -437,6 +460,57 @@ mod tests {
             "GET with query must NOT include content-length in SignedHeaders: {auth}"
         );
         assert!(!headers.contains_key("content-length"));
+    }
+
+    #[test]
+    fn sign_no_body_get_object_omits_content_length() {
+        // Plain object GET: empty query, no content-length signed (reqwest
+        // strips content-length: 0 on the wire → would 403 otherwise).
+        let headers = sign_s3_no_body(
+            "GET",
+            "https://acct.r2.cloudflarestorage.com/yah-dev/_yah-manifest.json",
+            "",
+            "auto",
+            "AK",
+            "SK",
+        )
+        .unwrap();
+        let auth = headers.get("authorization").unwrap().to_str().unwrap();
+        assert!(
+            auth.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date"),
+            "object GET must NOT sign content-length: {auth}"
+        );
+        assert!(!headers.contains_key("content-length"));
+    }
+
+    #[test]
+    fn sign_no_body_head_uses_head_method() {
+        // HEAD shares the body-less signing path; the canonical request must
+        // use the HEAD verb, not GET, but still omit content-length.
+        let head = sign_s3_no_body(
+            "HEAD",
+            "https://acct.r2.cloudflarestorage.com/yah-dev/k",
+            "",
+            "auto",
+            "AK",
+            "SK",
+        )
+        .unwrap();
+        let get = sign_s3_no_body(
+            "GET",
+            "https://acct.r2.cloudflarestorage.com/yah-dev/k",
+            "",
+            "auto",
+            "AK",
+            "SK",
+        )
+        .unwrap();
+        assert!(!head.contains_key("content-length"));
+        // Different verb → different signature for the same URL/time-window.
+        assert_ne!(
+            head.get("authorization").unwrap().to_str().unwrap(),
+            get.get("authorization").unwrap().to_str().unwrap(),
+        );
     }
 
     #[test]

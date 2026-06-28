@@ -1,8 +1,8 @@
 //! R090-F6 — `MeshResolver` trait contract tests.
 //!
 //! Round-trips `EnvValue::FromMesh` through serde and exercises the trait's
-//! happy + missing-ident error paths against a `FakeMeshResolver`. Warden's
-//! own resolver lives in `warden::deploy::mesh_resolve` and has its own
+//! happy + missing-ident error paths against a `FakeMeshResolver`. Yubaba's
+//! own resolver lives in `yubaba::deploy::mesh_resolve` and has its own
 //! integration tests (Url/Host/Port + waiting-for-dep + timeout).
 
 use std::collections::HashMap;

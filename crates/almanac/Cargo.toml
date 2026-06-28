@@ -1,5 +1,5 @@
 [package]
-name = "almanac"
+name = "yah-almanac"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -9,7 +9,7 @@ description = "Push-rebuild engine: feed configs, ReleaseSource adapters (GH + R
 publish = false
 
 [lib]
-name = "almanac"
+name = "yah_almanac"
 path = "src/lib.rs"
 
 [[bin]]
@@ -30,6 +30,7 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 anyhow = "1.0"
 workload-spec = { path = "../workload-spec" }
+yah-object-store = { path = "../object-store" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

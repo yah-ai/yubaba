@@ -46,15 +46,15 @@
 //! @yah:phase(P3)
 //! @yah:parent(R409)
 //! @yah:depends_on(R409-T11)
-//! @yah:handoff("Expanded verb catalog with four new category modules (R409-T12). dns.* was already defined in T6; this ticket covers the remaining four from W144 §'What the internal contract covers'. New files: envoy/observability.rs (5 verbs: alert.list, alert.ack, incident.open, incident.close, dashboard.snapshot — exemplar providers PagerDuty/Grafana/Datadog), envoy/ci.rs (3 verbs: pipeline.run, pipeline.status, artifact.fetch — GitHub Actions/GitLab/CircleCI; note 'ref' renamed to git_ref in Rust with #[serde(rename)]), envoy/payments.rs (3 verbs: charge.create, subscription.upsert, webhook.verify — Stripe/Lemon Squeezy/Paddle; webhook.verify is pure HMAC, no network call), envoy/messaging.rs (3 verbs: email.send, sms.send, webhook.dispatch — Resend/Twilio/plain HTTP). All four registered in envoy.rs pub mod block. Each file follows the cloud_vps.rs pattern: marker structs, typed Input/Output with serde + feature-gated schemars::JsonSchema, unit tests. No adapters — catalog shapes only; adapters land when a tier-A/B provider is onboarded. NOTE: crates/yah/warden/Cargo.toml references a missing integration test file (integration_ownership_smoke.rs) breaking workspace parse. All verification commands fail. Code follows established patterns from previously-verified modules.")
-//! @yah:verify("cargo test -p cloud --lib --features json-schema -- envoy::observability envoy::ci envoy::payments envoy::messaging — all pass (once warden/Cargo.toml workspace issue is resolved)")
+//! @yah:handoff("Expanded verb catalog with four new category modules (R409-T12). dns.* was already defined in T6; this ticket covers the remaining four from W144 §'What the internal contract covers'. New files: envoy/observability.rs (5 verbs: alert.list, alert.ack, incident.open, incident.close, dashboard.snapshot — exemplar providers PagerDuty/Grafana/Datadog), envoy/ci.rs (3 verbs: pipeline.run, pipeline.status, artifact.fetch — GitHub Actions/GitLab/CircleCI; note 'ref' renamed to git_ref in Rust with #[serde(rename)]), envoy/payments.rs (3 verbs: charge.create, subscription.upsert, webhook.verify — Stripe/Lemon Squeezy/Paddle; webhook.verify is pure HMAC, no network call), envoy/messaging.rs (3 verbs: email.send, sms.send, webhook.dispatch — Resend/Twilio/plain HTTP). All four registered in envoy.rs pub mod block. Each file follows the cloud_vps.rs pattern: marker structs, typed Input/Output with serde + feature-gated schemars::JsonSchema, unit tests. No adapters — catalog shapes only; adapters land when a tier-A/B provider is onboarded. NOTE: crates/yah/yubaba/Cargo.toml references a missing integration test file (integration_ownership_smoke.rs) breaking workspace parse. All verification commands fail. Code follows established patterns from previously-verified modules.")
+//! @yah:verify("cargo test -p cloud --lib --features json-schema -- envoy::observability envoy::ci envoy::payments envoy::messaging — all pass (once yubaba/Cargo.toml workspace issue is resolved)")
 //! @yah:verify("cargo check -p cloud --features json-schema — clean")
-//! @yah:gotcha("Workspace broken: crates/yah/warden/Cargo.toml references tests/integration_ownership_smoke.rs which does not exist. All cargo commands fail until that file is created or the [[test]] entry is removed.")
+//! @yah:gotcha("Workspace broken: crates/yah/yubaba/Cargo.toml references tests/integration_ownership_smoke.rs which does not exist. All cargo commands fail until that file is created or the [[test]] entry is removed.")
 
 use anyhow::Result;
 use async_trait::async_trait;
 
-// R374-F3: `s3_sign` moved to the `local-driver` crate; warden's pond MinIO
+// R374-F3: `s3_sign` moved to the `local-driver` crate; yubaba's pond MinIO
 // slot uses the same SigV4 helpers. Cloud's hetzner / r2_publish / pond_publish
 // callers now import from `local_driver::s3_sign`.
 
@@ -148,7 +148,7 @@ pub struct ServerSpec {
     /// Provider-side SSH-key IDs to authorize for `root` at create time.
     /// Empty means "no key" — Hetzner then emails a random root password,
     /// which the cloud-crate currently throws away. For machines that
-    /// expect mesh-only access via yah-warden once cloud-init finishes,
+    /// expect mesh-only access via yah-yubaba once cloud-init finishes,
     /// pre-mesh SSH is still useful for bootstrap deploys (the
     /// `yah-agentd` round-trip in R032-T3) and recovery.
     pub ssh_keys: Vec<u64>,
