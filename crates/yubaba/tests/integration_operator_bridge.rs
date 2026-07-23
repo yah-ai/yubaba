@@ -44,12 +44,12 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use kamaji::fake::FakeRuntime;
-use yubaba::testing::headscale_mock::HeadscaleMock;
-use yubaba::OperatorBridgeMode;
 use workload_spec::{
     ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, OperatorExpose, ResourceLimits,
     RestartPolicy, SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
 };
+use yubaba::testing::headscale_mock::HeadscaleMock;
+use yubaba::OperatorBridgeMode;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -64,6 +64,8 @@ fn operator_workload_spec(name: &str, tag: &str, port: u16) -> WorkloadSpec {
             digest: workload_spec::testing::test_digest(),
         },
         tier: TierTag("private".into()),
+        tenant: workload_spec::TenantId::singleton(),
+        namespace: workload_spec::NamespaceId::singleton(),
         replicas: 1,
         command: None,
         entrypoint: None,
@@ -74,12 +76,13 @@ fn operator_workload_spec(name: &str, tag: &str, port: u16) -> WorkloadSpec {
         volumes: vec![],
         resources: ResourceLimits {
             memory_mb: 64,
-            cpu_shares: 128,
+            cpu_millis: 128,
             ephemeral_storage_mb: 128,
         },
         depends_on: vec![],
         healthcheck: None,
         restart_policy: RestartPolicy::Always,
+        archetype: None,
         stop_policy: StopPolicy {
             signal: 15,
             grace_period: Millis::from_secs(5),
@@ -158,7 +161,10 @@ async fn case_tailscale_with_mock() {
     );
 
     let json = body_json(resp).await;
-    assert_eq!(json["status"], "deployed", "response status should be deployed");
+    assert_eq!(
+        json["status"], "deployed",
+        "response status should be deployed"
+    );
 
     // The preauth key must be present in the response.
     assert!(
@@ -217,14 +223,30 @@ async fn case_tailscale_tag_isolation() {
     let resp_ops = deploy(app.clone(), &spec_ops).await;
     let resp_dev = deploy(app.clone(), &spec_dev).await;
 
-    assert!(resp_ops.status().is_success(), "ops deploy failed: {}", resp_ops.status());
-    assert!(resp_dev.status().is_success(), "dev deploy failed: {}", resp_dev.status());
+    assert!(
+        resp_ops.status().is_success(),
+        "ops deploy failed: {}",
+        resp_ops.status()
+    );
+    assert!(
+        resp_dev.status().is_success(),
+        "dev deploy failed: {}",
+        resp_dev.status()
+    );
 
     let keys = mock.preauth_keys();
-    assert_eq!(keys.len(), 2, "expected two preauth keys (one per workload)");
+    assert_eq!(
+        keys.len(),
+        2,
+        "expected two preauth keys (one per workload)"
+    );
 
-    let ops_key = keys.iter().find(|k| k.acl_tags.contains(&"tag:ops".to_string()));
-    let dev_key = keys.iter().find(|k| k.acl_tags.contains(&"tag:dev".to_string()));
+    let ops_key = keys
+        .iter()
+        .find(|k| k.acl_tags.contains(&"tag:ops".to_string()));
+    let dev_key = keys
+        .iter()
+        .find(|k| k.acl_tags.contains(&"tag:dev".to_string()));
 
     assert!(ops_key.is_some(), "no preauth key found for tag:ops");
     assert!(dev_key.is_some(), "no preauth key found for tag:dev");

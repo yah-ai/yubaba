@@ -110,7 +110,9 @@ fn extract_instant_scalar(body: &serde_json::Value) -> Result<f64> {
     let result = body
         .pointer("/data/result")
         .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow::anyhow!("unexpected Prometheus response shape: missing /data/result"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("unexpected Prometheus response shape: missing /data/result")
+        })?;
 
     if result.is_empty() {
         return Ok(0.0);

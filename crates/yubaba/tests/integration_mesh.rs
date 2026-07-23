@@ -48,12 +48,12 @@ use std::time::Duration;
 
 use cloud::provider::MachineProvider;
 use kamaji::Kamaji as ContainerRuntime;
-use yubaba_test_harness::{test_cluster, wait_for_state, WorkloadStatus};
-use yubaba_test_macros::test_with_provider;
 use workload_spec::{
     ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, ResourceLimits, RestartPolicy,
     SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
 };
+use yubaba_test_harness::{test_cluster, wait_for_state, WorkloadStatus};
+use yubaba_test_macros::test_with_provider;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -68,6 +68,8 @@ fn test_workload_spec(name: &str) -> WorkloadSpec {
             digest: workload_spec::testing::test_digest(),
         },
         tier: TierTag("infra".into()),
+        tenant: workload_spec::TenantId::singleton(),
+        namespace: workload_spec::NamespaceId::singleton(),
         replicas: 1,
         command: Some(vec!["sh".into(), "-c".into(), "sleep 300".into()]),
         entrypoint: None,
@@ -78,12 +80,13 @@ fn test_workload_spec(name: &str) -> WorkloadSpec {
         volumes: vec![],
         resources: ResourceLimits {
             memory_mb: 64,
-            cpu_shares: 128,
+            cpu_millis: 128,
             ephemeral_storage_mb: 128,
         },
         depends_on: vec![],
         healthcheck: None,
         restart_policy: RestartPolicy::Never,
+        archetype: None,
         stop_policy: StopPolicy {
             signal: 15,
             grace_period: Millis::from_secs(5),
@@ -285,8 +288,8 @@ where
     );
 
     // Write path returns 503 when quorum is lost.
-    let write_spec = serde_json::to_value(test_workload_spec("quorum-rejected"))
-        .expect("serialize spec");
+    let write_spec =
+        serde_json::to_value(test_workload_spec("quorum-rejected")).expect("serialize spec");
     let write_resp = raw_client
         .post(format!(
             "{}/workloads/deploy",

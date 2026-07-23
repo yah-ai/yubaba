@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 
-use velveteen::transforms::{RecipeLocation, RecipePlacement, RecipeStep, TransformRecipe};
+use velveteen_exec::transforms::{RecipeLocation, RecipePlacement, RecipeStep, TransformRecipe};
 use velveteen::{ForgeCommand, ForgeSpec, Initiator, MeshAccess, TaskLocation, TaskRuntime};
 use workload_spec::{BuildConfig, BuildMode, ImageRef};
 
@@ -66,6 +66,7 @@ fn golden_build_in_container() -> (BuildConfig, BuildMode) {
         BuildConfig {
             command: "bun run build".into(),
             out_dir: PathBuf::from("dist"),
+            render_command: None,
         },
         BuildMode::InContainer {
             image: golden_image(),
@@ -78,6 +79,7 @@ fn golden_build_host_side() -> (BuildConfig, BuildMode) {
         BuildConfig {
             command: "bun run build".into(),
             out_dir: PathBuf::from("dist"),
+            render_command: None,
         },
         BuildMode::HostSide,
     )

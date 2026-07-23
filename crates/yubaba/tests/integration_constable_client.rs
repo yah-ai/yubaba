@@ -1,7 +1,7 @@
 //! Yubaba ↔ Kamaji end-to-end UDS smoke test (R406-T8).
 //!
 //! Spawns `kamaji::serve_with_shutdown` against a tempdir socket, opens
-//! a `yubaba::constable_client::ConstableClient`, and exercises the handshake
+//! a `yubaba::constable_client::KamajiClient`, and exercises the handshake
 //! + `list` + `drain(unknown)` round-trip. This is the smallest test that
 //! proves the yubaba side and kamaji side encode/decode the same frames
 //! over a real UDS — pure unit tests in either crate use stubs on the other
@@ -29,10 +29,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use kamaji::sibling::{ClientError, KamajiClient};
 use kamaji_proto::{DrainBudget, WorkloadId};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
-use kamaji::sibling::{ClientError, ConstableClient};
 
 /// Spawn a Kamaji on `socket`, then poll the path until the listener is
 /// bound. Returns the join handle + a shutdown sender; callers fire the
@@ -65,11 +65,9 @@ async fn handshake_and_list_round_trip_against_real_constable() {
     let sock = dir.path().join("kamaji.sock");
     let (server, stop) = spawn_constable(sock.clone()).await;
 
-    let client = ConstableClient::connect(sock)
-        .await
-        .expect("kamaji handshake");
+    let client = KamajiClient::connect(sock).await.expect("kamaji handshake");
     let info = client.info();
-    assert_eq!(info.constable_version, env!("CARGO_PKG_VERSION").to_string());
+    assert_eq!(info.kamaji_version, env!("CARGO_PKG_VERSION").to_string());
 
     let entries = client.list().await.expect("list");
     assert!(entries.is_empty(), "fresh kamaji has no workloads");
@@ -84,7 +82,7 @@ async fn drain_unknown_workload_surfaces_constable_reason() {
     let sock = dir.path().join("kamaji.sock");
     let (server, stop) = spawn_constable(sock.clone()).await;
 
-    let client = ConstableClient::connect(sock).await.unwrap();
+    let client = KamajiClient::connect(sock).await.unwrap();
     let (accepted, reason) = client
         .drain(
             &WorkloadId::new("never-registered"),
@@ -97,10 +95,7 @@ async fn drain_unknown_workload_surfaces_constable_reason() {
         .expect("drain RPC");
     assert!(!accepted);
     let reason = reason.expect("kamaji populates a reason");
-    assert!(
-        reason.contains("unknown"),
-        "expected 'unknown' in {reason}"
-    );
+    assert!(reason.contains("unknown"), "expected 'unknown' in {reason}");
 
     let _ = stop.send(());
     server.await.unwrap();
@@ -112,7 +107,7 @@ async fn stop_unknown_workload_returns_ack_for_idempotency() {
     let sock = dir.path().join("kamaji.sock");
     let (server, stop) = spawn_constable(sock.clone()).await;
 
-    let client = ConstableClient::connect(sock).await.unwrap();
+    let client = KamajiClient::connect(sock).await.unwrap();
     // R406-T9: Stop is idempotent — without a containerd backend attached,
     // Kamaji acks because the absence of the workload already satisfies
     // the requested end-state. (The ClientError import below is kept for

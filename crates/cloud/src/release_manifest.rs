@@ -27,7 +27,24 @@
 //!
 //! Identity-regexp is *not* per-release — it identifies the workspace's
 //! GitHub OIDC identity (matches the cosign sign-blob step in release.yml).
-//! See [`DEFAULT_WARDEN_COSIGN_IDENTITY`].
+//! See [`DEFAULT_YUBABA_COSIGN_IDENTITY`].
+//!
+//! @yah:ticket(R599-F1, "R2 bundle store: append-only blob/manifest publish + node-side materialize into kamaji LRU cache")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-07-20T04:20:25Z)
+//! @yah:phase(P1)
+//! @yah:parent(R599)
+//! @yah:depends_on(R599-F2)
+//! @yah:next("R599-F2: wire mesofact-build to EMIT a BundleManifest during a build (add yah-mesofact-bundle default-features=false; assemble app/ + optional bins/ tree, per-file blake3, write manifest.toml). Type already exists -> F2 is 'emit', not 'define'.")
+//! @yah:next("R599-F4: kamaji deploy dispatch calls materialize_bundle/BundleCache into kamaji state dir on Deploy of the mesofact bundle variant (add yah-mesofact-bundle features=store + yah-object-store to kamaji).")
+//! @yah:next("R599-F8: services-tab sync arm calls cloud reconciler::bundle_store::publish_bundle_to_r2 after building a bundle.")
+//! @yah:handoff("LANDED (types + store, 16 tests). New crate oss/yah-base/crates/mesofact-bundle (yah-mesofact-bundle). Default features = serde+blake3+toml TYPES ONLY: BundleManifest, BundleRuntime (self | mesofact/<ver>), BundleHash 64-hex, digest() over canonical length-prefixed fields, blob_key/manifest_key layout. This is what R599-F2's mesofact-build consumes via default-features=false.")
+//! @yah:handoff("Feature `store` adds yah-object-store + publish_bundle (append-only blob dedupe via HEAD + blake3 verify + immutable manifest-by-digest PUT), materialize_bundle (fetch+verify+atomic-rename into cache tree, idempotent, path-traversal guarded), BundleCache (LRU-by-digest, bytes budget, 0=unbounded). Store tests via InMemoryObjectStore+tempdir.")
+//! @yah:handoff("Canonical annotation kept here in release_manifest.rs (one-block-per-ID); the real work is the new crate (its lib.rs has a prose pointer, not a 2nd @yah block). Wired: yah-base workspace member + root + oss/yubaba [patch.crates-io]. cloud deps it (features=store) -> reconciler::bundle_store::publish_bundle_to_r2 (spawn_blocking R2ObjectStore wrapper) + BundlePublishReport re-export. Type home = new minimal crate (user-approved via ask_user): NOT workload-spec (avoids ts-rs/schemars weight at mesofact boundary), NOT mesofact-build (avoids drift); store logic feature-gated so the boundary stays serde-only.")
+//! @yah:verify("cd oss/yah-base && cargo test -p yah-mesofact-bundle (8 pass, types-only)")
+//! @yah:verify("cd oss/yah-base && cargo test -p yah-mesofact-bundle --features store (16 pass)")
+//! @yah:verify("cd oss/yubaba && cargo test -p cloud --lib reconciler::bundle_store (1 pass)")
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -43,7 +60,7 @@ pub const DEFAULT_RELEASE_MANIFEST_URL: &str = "https://cdn.yah.dev/yubaba/relea
 /// signs against. Matches the `cosign sign-blob` certificate identity emitted
 /// by GitHub Actions when running under `yah-ai/yah` (R330-F19). Operators
 /// override with `--yubaba-cosign-identity` to point at a fork's OIDC subject.
-pub const DEFAULT_WARDEN_COSIGN_IDENTITY: &str = r"^https://github\.com/yah-ai/yah/";
+pub const DEFAULT_YUBABA_COSIGN_IDENTITY: &str = r"^https://github\.com/yah-ai/yah/";
 
 /// One per-triple entry in the manifest. Field order matches what
 /// release.yml's `Emit per-triple manifest fragment` step writes.
@@ -58,12 +75,12 @@ pub struct ManifestTripleEntry {
 
 /// Top-level shape of `release-manifest.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WardenReleaseManifest {
+pub struct YubabaReleaseManifest {
     pub version: String,
     pub triples: BTreeMap<String, ManifestTripleEntry>,
 }
 
-impl WardenReleaseManifest {
+impl YubabaReleaseManifest {
     /// Look up the manifest entry for the given Rust target triple. Returns a
     /// descriptive error listing the available triples so operators can spot a
     /// typo or a missing matrix leg at a glance.
@@ -103,7 +120,7 @@ pub fn server_type_to_triple(server_type: &str) -> Result<&'static str> {
 /// drives this. Surfaces every failure mode loud (no silent placeholder
 /// fallback) — operators see an actionable message and pass `--yubaba-url`
 /// explicitly to bypass.
-pub async fn fetch_release_manifest(url: &str) -> Result<WardenReleaseManifest> {
+pub async fn fetch_release_manifest(url: &str) -> Result<YubabaReleaseManifest> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .user_agent("yah/cloud release-manifest fetcher")
@@ -125,7 +142,7 @@ pub async fn fetch_release_manifest(url: &str) -> Result<WardenReleaseManifest> 
         .bytes()
         .await
         .with_context(|| format!("reading release-manifest body from {url}"))?;
-    let manifest: WardenReleaseManifest = serde_json::from_slice(&body).with_context(|| {
+    let manifest: YubabaReleaseManifest = serde_json::from_slice(&body).with_context(|| {
         format!(
             "parsing release-manifest from {url} — pass --yubaba-url explicitly if the manifest is malformed"
         )
@@ -199,7 +216,7 @@ mod tests {
                 }
             }
         }"#;
-        let parsed: WardenReleaseManifest = serde_json::from_str(raw).unwrap();
+        let parsed: YubabaReleaseManifest = serde_json::from_str(raw).unwrap();
         assert_eq!(parsed.version, "0.9.0");
         let entry = parsed.entry("x86_64-unknown-linux-musl").unwrap();
         assert_eq!(entry.size, 2345678);
@@ -211,7 +228,7 @@ mod tests {
     #[test]
     fn manifest_entry_missing_triple_lists_available() {
         let raw = r#"{"version":"0.9.0","triples":{"x86_64-unknown-linux-musl":{"url":"u","size":1,"sha256":"s","sig_url":"u.sig","cert_url":"u.cert"}}}"#;
-        let parsed: WardenReleaseManifest = serde_json::from_str(raw).unwrap();
+        let parsed: YubabaReleaseManifest = serde_json::from_str(raw).unwrap();
         let err = parsed
             .entry("aarch64-unknown-linux-musl")
             .unwrap_err()
@@ -228,6 +245,6 @@ mod tests {
         // Sanity: the constant matches what release.yml's cosign sign-blob
         // step emits as the keyless certificate identity. Bumping the org
         // requires updating both this constant AND release.yml in lockstep.
-        assert!(DEFAULT_WARDEN_COSIGN_IDENTITY.contains("yah-ai/yah"));
+        assert!(DEFAULT_YUBABA_COSIGN_IDENTITY.contains("yah-ai/yah"));
     }
 }

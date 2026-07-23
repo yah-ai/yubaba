@@ -24,7 +24,7 @@ pub struct ProvisionRequest {
 
 /// Build a provision request: load the cloud-init template for the workspace and
 /// substitute per-machine values. The yubaba binary is fetched on the machine
-/// at first boot from `warden_url` and verified against `warden_sha256`
+/// at first boot from `yubaba_url` and verified against `yubaba_sha256`
 /// (R040-F11) — base64-embedding it would blow past Hetzner's 32 KiB cap.
 ///
 /// `headscale_preauth_key` decides mesh membership (R330-F28). `Some` ⟺ this
@@ -41,30 +41,30 @@ pub struct ProvisionRequest {
 /// Headscale instead of Tailscale SaaS. When `None`, a joining machine uses the
 /// default Tailscale SaaS coordinator.
 ///
-/// `warden_channel` selects the release channel (`"stable"` or `"beta"`);
-/// use [`cloud_init::DEFAULT_WARDEN_CHANNEL`] for Phase 1. containerd is
+/// `yubaba_channel` selects the release channel (`"stable"` or `"beta"`);
+/// use [`cloud_init::DEFAULT_YUBABA_CHANNEL`] for Phase 1. containerd is
 /// installed unpinned (R330-T9 — an exact apt pin matched no Debian repo).
 pub fn build_request(
     workspace_root: &Path,
     machine: &MachineConfig,
-    warden_url: String,
-    warden_sha256: String,
-    warden_channel: String,
+    yubaba_url: String,
+    yubaba_sha256: String,
+    yubaba_channel: String,
     headscale_preauth_key: Option<String>,
     mesh_url: Option<String>,
     cloudflared_token: Option<String>,
-    warden_cosign_identity_regexp: Option<String>,
+    yubaba_cosign_identity_regexp: Option<String>,
 ) -> Result<ProvisionRequest> {
     let template = cloud_init::load_template(workspace_root)?;
     let input = RenderInput {
         machine,
-        warden_url,
-        warden_sha256,
-        warden_channel,
+        yubaba_url,
+        yubaba_sha256,
+        yubaba_channel,
         headscale_preauth_key,
         mesh_url,
         cloudflared_token,
-        warden_cosign_identity_regexp,
+        yubaba_cosign_identity_regexp,
     };
     let user_data = cloud_init::render(&template, &input)?;
     machine.validate()?;
@@ -115,6 +115,7 @@ mod tests {
             mesh_tags: vec!["tag:region-pdx".into(), "tag:tier-t2".into()],
             region: None,
             zone: None,
+            arch: None,
             bucket: Some(BucketSpec {
                 name: "noisetable-assets-pdx-1".into(),
                 public_read: false,
@@ -124,6 +125,8 @@ mod tests {
             cloudflared: None,
             hosts_operator_bridge: false,
             connect: None,
+            allocatable: None,
+            taints: vec![],
         }
     }
 
@@ -138,7 +141,7 @@ mod tests {
             machine,
             "https://example.com/yah-yubaba".into(),
             "deadbeef".into(),
-            cloud_init::DEFAULT_WARDEN_CHANNEL.into(),
+            cloud_init::DEFAULT_YUBABA_CHANNEL.into(),
             Some("KEY".into()),
             extra_url,
             extra_cf,
@@ -188,7 +191,7 @@ mod tests {
             &machine,
             "https://example.com/yah-yubaba".into(),
             "deadbeef".into(),
-            cloud_init::DEFAULT_WARDEN_CHANNEL.into(),
+            cloud_init::DEFAULT_YUBABA_CHANNEL.into(),
             None, // standalone: no preauth
             None, // standalone: no mesh_url
             None,
@@ -237,7 +240,7 @@ mod tests {
             &machine,
             "https://cdn.yah.dev/yubaba/0.9.0/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz".into(),
             "deadbeef".into(),
-            cloud_init::DEFAULT_WARDEN_CHANNEL.into(),
+            cloud_init::DEFAULT_YUBABA_CHANNEL.into(),
             None,
             None,
             None,

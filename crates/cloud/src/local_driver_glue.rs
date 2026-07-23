@@ -220,6 +220,7 @@ orbstack = 42
             cgroupns: None,
             network: None,
             network_aliases: vec![],
+            extra_hosts: vec![],
         };
         runtime.run(&spec).await.unwrap();
         let state = runtime.container_state(&spec.name).await.unwrap();

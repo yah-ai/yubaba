@@ -134,12 +134,15 @@ mod tests {
             mesh_tags: tags.into_iter().map(String::from).collect(),
             region: None,
             zone: None,
+            arch: None,
             bucket: None,
             hostkey_fingerprint: None,
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
             connect: None,
+            allocatable: None,
+            taints: vec![],
         }
     }
 

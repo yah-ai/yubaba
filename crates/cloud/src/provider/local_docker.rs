@@ -48,16 +48,6 @@
 //! @yah:at(2026-05-12T18:24:04Z)
 //! @yah:see(.yah/docs/architecture/A053-yah-yubaba-integration-testing.md)
 //!
-//! @yah:ticket(R409-T7, "Slot LocalDockerProvider into the tier model per T1 decision (tier-S vs synthetic)")
-//! @yah:assignee(agent:claude)
-//! @yah:at(2026-06-02T20:59:17Z)
-//! @yah:status(review)
-//! @yah:phase(P3)
-//! @yah:parent(R409)
-//! @yah:depends_on(R409-T11)
-//! @yah:handoff("Slotted LocalDockerProvider into the tier model per W144 D3: tier-S, flavor-Synthetic. New file provider/local_docker_envoy.rs implements LocalDockerEnvoy wrapping Arc<LocalDockerProvider>. Covers cloud.vps.* (create/destroy/status) and cloud.object.* (bucket create/delete/exists) via the existing MachineProvider impl. id='local-docker', tier=S, flavor=Synthetic. Location is validated against known region tags (contract parity) but otherwise ignored — LocalDocker runs everything locally. ssh_keys on vps.create are silently ignored (no SSH injection in containerd containers). minio_endpoint() getter added to LocalDockerProvider for endpoint surfacing in bucket.exists output. server_status_to_output moved from hetzner_envoy.rs to envoy/cloud_vps.rs (pub fn) so LocalDockerEnvoy and HetznerEnvoy share one implementation; hetzner_envoy.rs test imports updated accordingly. Module gated on #[cfg(feature = local-docker)] matching LocalDockerProvider. local_docker_envoy registered in provider/mod.rs with same cfg gate. Note: cargo check -p cloud --features json-schema,local-docker fails on pre-existing missing pub mod asset_status in lib.rs (dirty tree, unrelated). Default features + json-schema: 381/382 pass (same pre-existing cloud_init template failure).")
-//! @yah:verify("cargo test -p cloud --lib --features json-schema -- envoy provider::hetzner_envoy — all pass")
-//! @yah:verify("cargo check -p cloud --features json-schema — clean")
 
 #![cfg(feature = "local-docker")]
 
@@ -942,7 +932,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "boots full cloud-init template; requires containerd + systemd-capable image (~60s)"]
-    async fn cloud_init_boots_warden_service() {
+    async fn cloud_init_boots_yubaba_service() {
         if !containerd_available().await {
             eprintln!("SKIP: containerd not reachable");
             return;
@@ -953,11 +943,11 @@ mod tests {
         let user_data = crate::cloud_init::DEFAULT_TEMPLATE
             .replace("{{MACHINE_NAME}}", "ci-test-machine")
             .replace(
-                "{{YAH_WARDEN_URL}}",
+                "{{YAH_YUBABA_URL}}",
                 "https://example.invalid/yubaba.tar.gz",
             )
-            .replace("{{YAH_WARDEN_SHA256}}", "0".repeat(64).as_str())
-            .replace("{{WARDEN_CHANNEL}}", "stable")
+            .replace("{{YAH_YUBABA_SHA256}}", "0".repeat(64).as_str())
+            .replace("{{YUBABA_CHANNEL}}", "stable")
             .replace("{{HEADSCALE_PREAUTH_KEY}}", "tskey-placeholder")
             .replace("{{MESH_LOGIN_SERVER_ARG}}", "")
             .replace("{{TAGS}}", "tag:ci")

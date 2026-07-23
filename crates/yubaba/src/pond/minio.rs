@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use local_driver::LocalRuntime;
+use local_driver::ContainerLauncher;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
@@ -42,19 +42,25 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 /// Failed and stops attempting restarts. Operator intervention required.
 const MAX_RESTART_FAILURES: u32 = 3;
 
-/// Per-workload reconciler: probe MinIO health on a tick, flip
-/// `PondPhase` Running ↔ Degraded, restart the container when it falls
-/// over. Marks the workload Failed after [`MAX_RESTART_FAILURES`]
-/// consecutive restart failures.
+/// Per-workload reconciler: probe MinIO health on a tick and publish the
+/// result into the registry.
+///
+/// Whether it also *restarts* the container depends on
+/// [`daemon_supervised`](Self::daemon_supervised) — see [`MinioReconciler::run`].
 ///
 /// Spawned by [`super::deploy`] right after the initial bring-up
 /// succeeds, and torn down when the workload is shutdown.
 pub(crate) struct MinioReconciler {
-    pub runtime: Arc<LocalRuntime>,
+    pub launcher: Arc<dyn ContainerLauncher>,
     pub spec: MinioSpec,
     pub ident: String,
     pub registry: Arc<super::PondRegistry>,
     pub cancel: Arc<Notify>,
+    /// True when the container daemon owns restart (pond deployed this slot
+    /// through kamaji with a restart policy, R626-F2). The reconciler then
+    /// probes and reports only — resurrecting here would fight dockerd and,
+    /// worse, undo a deliberate operator stop.
+    pub daemon_supervised: bool,
 }
 
 impl MinioReconciler {
@@ -69,7 +75,13 @@ impl MinioReconciler {
                 _ = tokio::time::sleep(PROBE_INTERVAL) => {}
             }
 
-            let endpoint = format!("http://127.0.0.1:{}", self.spec.api_port);
+            // `pond_probe_host()` — host.docker.internal when this yubaba
+            // runs containerized (R454-F1); loopback on the host.
+            let endpoint = format!(
+                "http://{}:{}",
+                local_driver::pond_probe_host(),
+                self.spec.api_port
+            );
             let health_url = format!("{endpoint}/minio/health/ready");
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -107,7 +119,14 @@ impl MinioReconciler {
                 continue;
             }
 
-            match ensure_minio_running(&self.runtime, &self.spec).await {
+            // Restart is the daemon's job (R626-F2): the container carries
+            // `--restart unless-stopped`, so a crash is already being retried
+            // and a stop was deliberate. Report, don't resurrect.
+            if self.daemon_supervised {
+                continue;
+            }
+
+            match ensure_minio_running(&self.launcher, &self.spec).await {
                 Ok(_) => {
                     info!(ident = %self.ident, "pond MinIO restarted; back to Running");
                     consecutive_failures = 0;
@@ -137,6 +156,93 @@ impl MinioReconciler {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use local_driver::ContainerRunSpec;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts the launcher calls a reconciler makes. The only thing under test
+    /// is *whether* the reconciler reaches for the launcher at all — that is
+    /// exactly the supervision authority R626-F2 moves to the daemon.
+    #[derive(Default)]
+    struct CountingLauncher {
+        runs: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ContainerLauncher for CountingLauncher {
+        async fn ensure_image(&self, _image: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn run(&self, _spec: &ContainerRunSpec) -> Result<()> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn stop_and_remove(&self, _name: &str, _grace: Duration) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Points at a port nothing listens on, so every liveness probe fails and
+    /// the restart branch is the one under test.
+    fn dead_spec() -> MinioSpec {
+        MinioSpec {
+            image: "minio/minio:test".into(),
+            user: "u".into(),
+            password: "p".into(),
+            // Port 1 is privileged and unbound — connection refused, fast.
+            api_port: 1,
+            console_port: 1,
+            bucket: "b".into(),
+            data_dir: PathBuf::from("/tmp/yah-pond-test/minio"),
+            container_name: "yah-pond-test-object_store".into(),
+            container_label: "test:pond:object_store".into(),
+            ready_timeout: Duration::from_secs(1),
+            network: None,
+            network_alias: None,
+        }
+    }
+
+    async fn run_one_tick(daemon_supervised: bool) -> usize {
+        let launcher = Arc::new(CountingLauncher::default());
+        let cancel = Arc::new(Notify::new());
+        let reconciler = MinioReconciler {
+            launcher: launcher.clone(),
+            spec: dead_spec(),
+            ident: "test".into(),
+            registry: Arc::new(super::super::PondRegistry::new()),
+            cancel: cancel.clone(),
+            daemon_supervised,
+        };
+        let handle = tokio::spawn(reconciler.run());
+        // One probe interval, then stop. The probe itself is a real (refused)
+        // connection, so give the loop wall-clock time rather than pausing the
+        // clock out from under reqwest.
+        tokio::time::sleep(PROBE_INTERVAL + Duration::from_millis(500)).await;
+        cancel.notify_waiters();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        launcher.runs.load(Ordering::SeqCst)
+    }
+
+    /// The migration's core claim: once the daemon owns restart, a failing
+    /// probe must NOT make yubaba re-run the container. If it did, a deliberate
+    /// `docker stop` would be undone within one probe interval — the exact bug
+    /// R626 exists to fix.
+    #[tokio::test]
+    async fn daemon_supervised_reconciler_never_resurrects() {
+        assert_eq!(run_one_tick(true).await, 0);
+    }
+
+    /// The fallback path (no kamaji wired) keeps its resurrect loop, so a
+    /// yubaba running without a kamaji sibling is no worse off than before.
+    #[tokio::test]
+    async fn unsupervised_reconciler_still_restarts() {
+        assert!(run_one_tick(false).await >= 1);
     }
 }
 

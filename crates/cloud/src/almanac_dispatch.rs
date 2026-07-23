@@ -5,9 +5,12 @@
 //! to map each action variant to the right reconciler.
 //!
 //! Current variant:
-//! - [`almanac::OnChangeConfig::MesofactRebuild`] → run the workload's build
-//!   command then call [`MesofactStaticReconciler::rebuild_static`] on the
-//!   named service's mirror for `env`.
+//! - [`almanac::OnChangeConfig::MesofactRebuild`] → call
+//!   [`MesofactStaticReconciler::revalidate_static`] on the named service's
+//!   mirror for `env`. An almanac feed change is *data*, not a source/template
+//!   change, so this is the revalidate-only path (W225 §3, R535-T1): it never
+//!   runs the workload's `build.command` — see `revalidate_static`'s doc for
+//!   what "already-built bundle" means for each provider arm.
 
 use yah_almanac::OnChangeConfig;
 use anyhow::{Context, Result};
@@ -27,14 +30,14 @@ pub async fn dispatch_on_change(
 ) -> Result<()> {
     match on_change {
         OnChangeConfig::MesofactRebuild { service, route } => {
-            rebuild_mesofact(service, route, workspace_root, env).await
+            revalidate_mesofact(service, route, workspace_root, env).await
         }
     }
 }
 
-async fn rebuild_mesofact(
+async fn revalidate_mesofact(
     service_name: &str,
-    _route: &str,
+    route: &str,
     workspace_root: &Path,
     env: &str,
 ) -> Result<()> {
@@ -63,16 +66,17 @@ async fn rebuild_mesofact(
         component,
         mirror,
         env,
+        scope: crate::reconciler::ProviderScope::singleton(),
     };
 
     let reconciler = MesofactStaticReconciler::new();
-    let result = reconciler.rebuild_static(ctx).await?;
+    let result = reconciler.revalidate_static(ctx, route).await?;
 
     tracing::info!(
         service = service_name,
         env,
         public_url = ?result.public_url,
-        "almanac on_change: mesofact rebuild complete"
+        "almanac on_change: mesofact revalidate complete"
     );
     Ok(())
 }

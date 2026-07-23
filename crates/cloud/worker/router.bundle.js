@@ -1,27 +1,96 @@
-// router.ts
-//! @yah:ticket(R369-F1, "CI guard router.bundle.js matches router.ts rebuild")
-//! @yah:assignee(agent:claude)
-//! @yah:at(2026-06-01T03:27:09Z)
-//! @yah:status(review)
-//! @yah:parent(R369)
-//! @yah:next("router.bundle.js is checked in and shipped to Cloudflare on each deploy, but router.ts is the source. If a contributor edits router.ts without running `bun run build`, prod ships stale code. The bundle hasn't been rebuilt recently per git log")
-//! @yah:next("Add a CI step (or pre-commit hook) that runs `bun run build` in crates/yah/cloud/worker/ and fails if the resulting router.bundle.js differs from the committed file. Alternatively, stop committing the bundle and build it in the deploy step. Pick one — committed-bundle-with-CI-guard is simpler")
-//! @yah:next("Worker tests at crates/yah/cloud/worker/tests/router.test.ts already exist (R327-F1) — make sure they run in CI alongside this guard")
-//! @yah:verify("CI fails on a PR that edits router.ts without re-running the build")
-//! @yah:verify("CI passes on a PR that edits both router.ts and router.bundle.js consistently")
-//!
-//! @yah:ticket(R455-T4, "Worker MESOFACT_BACKEND_ORIGIN + ISSUES_ORIGIN bindings; route /api/* through Worker")
-//! @yah:at(2026-06-05T08:24:46Z)
-//! @yah:status(review)
-//! @yah:phase(D)
-//! @yah:parent(R455)
-//! @yah:next("Worker env bindings injected through MiniflareSpec extra_env: MESOFACT_BACKEND_ORIGIN=http://mesofact-dev:4323, ISSUES_ORIGIN=http://mesofact-dev:8731")
-//! @yah:next("Worker router: forward /api/issues* to ISSUES_ORIGIN; /api/releases* (and future feed endpoints) to MESOFACT_BACKEND_ORIGIN")
-//! @yah:next("Marketing SSR handlers in app/yah/web/marketing/mesofact.routes.ts swap their direct fetches for Worker-routed paths so the prod CF path stays identical")
-//! @yah:verify("Pond up against yah-marketing: POST /api/issues round-trips through the Worker to mesofact-dev's issue-tracker")
-//! @yah:verify("GET /api/releases returns the almanac feed instead of 404")
-//! @arch:see(.yah/docs/working/W180-pond-richer-topology.md)
-//! @yah:depends_on(R455-F3)
+// src/manifest.ts
+async function loadManifest(assetOrigin) {
+  try {
+    const resp = await fetch(`${assetOrigin}/manifest.json`);
+    if (!resp.ok) {
+      return null;
+    }
+    return await resp.json();
+  } catch {
+    return null;
+  }
+}
+function matchesDeferredRoute(manifest, pathname) {
+  if (!manifest?.routes) {
+    return false;
+  }
+  return manifest.routes.some((r) => isDeferred(r) && matchRoutePattern(r.route, pathname));
+}
+function isDeferred(route) {
+  const p = route.prerender;
+  return !!p && p.deferred === true;
+}
+function matchRoutePattern(pattern, pathname) {
+  const pat = splitSegments(pattern);
+  const path = splitSegments(pathname);
+  if (pat.length !== path.length) {
+    return false;
+  }
+  for (let i = 0;i < pat.length; i++) {
+    const seg = pat[i];
+    if (seg.startsWith(":")) {
+      if (path[i].length === 0) {
+        return false;
+      }
+    } else if (seg !== path[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+function splitSegments(p) {
+  return p.split("/").filter((s) => s.length > 0);
+}
+
+// src/pointer.ts
+var POINTER_PREFIX = "p/";
+var POINTER_RECORD_V = 1;
+
+class PointerMalformed extends Error {
+}
+function validateKey(key) {
+  if (key.length === 0) {
+    return "empty key is reserved for the site root pointer";
+  }
+  if (key.startsWith("/") || key.endsWith("/")) {
+    return "leading/trailing slash";
+  }
+  for (const seg of key.split("/")) {
+    if (seg === "" || seg === "." || seg === "..") {
+      return "empty or dot path segment";
+    }
+  }
+  if (/[\s\x00-\x1f\x7f]/.test(key)) {
+    return "control or whitespace character";
+  }
+  return null;
+}
+async function resolvePointer(pointerOrigin, key) {
+  if (validateKey(key) !== null) {
+    return { kind: "absent" };
+  }
+  const url = `${pointerOrigin}/${POINTER_PREFIX}${key}`;
+  const resp = await fetch(url);
+  if (resp.status === 404) {
+    return { kind: "absent" };
+  }
+  if (!resp.ok) {
+    throw new PointerMalformed(`pointer read ${url} -> ${resp.status}`);
+  }
+  let record;
+  try {
+    record = await resp.json();
+  } catch {
+    throw new PointerMalformed(`pointer ${key}: malformed JSON`);
+  }
+  if (record.v !== POINTER_RECORD_V) {
+    throw new PointerMalformed(`pointer ${key}: record version ${record.v} (edge speaks ${POINTER_RECORD_V})`);
+  }
+  return record.pointer ? { kind: "present", pointer: record.pointer } : { kind: "deleted" };
+}
+
+// src/router.ts
+var IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 var router_default = {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -66,27 +135,89 @@ var router_default = {
     if (assetResp.ok) {
       return assetResp;
     }
-    if (env.WORKER_MODE === "static") {
-      const notFoundResp = await fetch(`${env.ASSET_ORIGIN}/404.html`);
-      if (notFoundResp.ok) {
-        return new Response(notFoundResp.body, {
-          status: 404,
-          headers: notFoundResp.headers
-        });
-      }
-      return new Response("Not Found", { status: 404 });
-    } else {
-      const shellResp = await fetch(`${env.ASSET_ORIGIN}/index.html`);
-      if (shellResp.ok) {
-        return new Response(shellResp.body, {
-          status: 200,
-          headers: shellResp.headers
-        });
-      }
-      return new Response("Not Found", { status: 404 });
+    const manifest = await loadManifest(env.ASSET_ORIGIN);
+    if (matchesDeferredRoute(manifest, path)) {
+      return serveInstance(env, path, manifest);
     }
+    const lastSegment = key.slice(key.lastIndexOf("/") + 1);
+    if (!lastSegment.includes(".")) {
+      for (const candidate of [`${key}.html`, `${key}/index.html`]) {
+        const cleanResp = await fetch(`${env.ASSET_ORIGIN}/${candidate}`);
+        if (cleanResp.ok) {
+          return cleanResp;
+        }
+      }
+    }
+    if (env.WORKER_MODE === "static") {
+      return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
+    }
+    const shellResp = await fetch(`${env.ASSET_ORIGIN}/index.html`);
+    if (shellResp.ok) {
+      return new Response(shellResp.body, {
+        status: 200,
+        headers: shellResp.headers
+      });
+    }
+    return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
   }
 };
+async function serveInstance(env, path, manifest) {
+  const pointerOrigin = env.POINTER_ORIGIN || env.ASSET_ORIGIN;
+  const key = path.slice(1);
+  let state;
+  try {
+    state = await resolvePointer(pointerOrigin, key);
+  } catch (err) {
+    if (err instanceof PointerMalformed) {
+      return errorResponse(500, env.ASSET_ORIGIN, manifest?.error_routes);
+    }
+    throw err;
+  }
+  if (state.kind === "present") {
+    const contentResp = await fetch(`${env.ASSET_ORIGIN}/${state.pointer.content_root}`);
+    if (!contentResp.ok) {
+      return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
+    }
+    const headers = new Headers(contentResp.headers);
+    headers.set("Cache-Control", IMMUTABLE_CACHE_CONTROL);
+    return new Response(contentResp.body, { status: 200, headers });
+  }
+  if (state.kind === "deleted") {
+    return errorResponse(410, env.ASSET_ORIGIN, manifest?.error_routes, "410 Gone");
+  }
+  return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
+}
+async function errorResponse(status, assetOrigin, errorRoutes, fallbackText) {
+  const brandedRoute = status >= 500 ? errorRoutes?.["5xx"] : errorRoutes?.["404"];
+  const keys = [];
+  if (brandedRoute)
+    keys.push(...routeToAssetKeys(brandedRoute));
+  if (status < 500)
+    keys.push("404.html");
+  for (const k of keys) {
+    const resp = await fetch(`${assetOrigin}/${k}`);
+    if (resp.ok) {
+      return new Response(resp.body, { status, headers: resp.headers });
+    }
+  }
+  return new Response(fallbackText ?? defaultStatusText(status), { status });
+}
+function routeToAssetKeys(routePath) {
+  const rel = routePath.replace(/^\/+/, "");
+  if (rel === "")
+    return ["index.html"];
+  const last = rel.split("/").pop() ?? "";
+  if (last.includes("."))
+    return [rel];
+  return [rel, `${rel}.html`, `${rel}/index.html`];
+}
+function defaultStatusText(status) {
+  if (status === 410)
+    return "Gone";
+  if (status >= 500)
+    return "Internal Server Error";
+  return "Not Found";
+}
 function parseResilience(raw) {
   if (!raw)
     return {};
@@ -173,7 +304,10 @@ async function proxyWithResilience(request, targetUrl, policy) {
     return lastResp;
   }
   emitTelemetry(targetUrl, attempts, "exhausted_connection", latency);
-  return new Response(`upstream unreachable: ${stringifyErr(lastErr)}`, { status: 502, headers: { "Content-Type": "text/plain" } });
+  return new Response(`upstream unreachable: ${stringifyErr(lastErr)}`, {
+    status: 502,
+    headers: { "Content-Type": "text/plain" }
+  });
 }
 function shouldRetryOnStatus(status, retryOn) {
   if (status < 400)

@@ -47,8 +47,8 @@ use std::time::{Duration, Instant};
 
 use cloud::{
     local_container_spec_from_provider, publish_to_pond, CloudConfig, LocalRuntime,
-    MesofactStaticReconciler, MirrorProviderSlot, PondOptions, Provider, ReconcileCtx, Reconciler,
-    ServiceComponent,
+    MesofactStaticReconciler, MirrorProviderSlot, PondOptions, Provider, ProviderScope,
+    ReconcileCtx, Reconciler, ServiceComponent,
 };
 use local_driver::pond_warden::{
     build_warden_run_spec, WardenContainerSpec, DEFAULT_WARDEN_HTTP_PORT,
@@ -154,6 +154,7 @@ async fn pond_spinup_budget() {
             kind: "mesofact-static".into(),
             path: "app/yah/web/marketing".into(),
             role: "static".into(),
+            git: None,
             publishes: None,
             wave: 0,
         });
@@ -165,6 +166,7 @@ async fn pond_spinup_budget() {
         component: &component,
         mirror,
         env: "pond",
+        scope: ProviderScope::singleton(),
     };
 
     // ── Build workload ──────────────────────────────────────────────────
@@ -396,7 +398,9 @@ async fn warden_container_spinup_budget() {
         .join(format!("yubaba-spinup-smoke-{pid}"));
     std::fs::create_dir_all(&state_dir).expect("create yubaba state dir");
 
-    let mut spec = WardenContainerSpec::new("smoke", "pond-s2", state_dir.clone());
+    // The pond yubaba container is camp-scoped, not service-scoped — the name
+    // is `yah-pond-camp-<env>-yubaba`, so `new` takes (env, state_dir) only.
+    let mut spec = WardenContainerSpec::new("pond-s2", state_dir.clone());
     spec.http_port = 0; // random host port — resolved via `docker port` after start
 
     let run_spec = build_warden_run_spec(&spec);

@@ -6,7 +6,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Shared Hetzner Cloud API client: HTTP transport, bearer auth, wire DTOs, and server/SSH-key operations. Token-source policy is left to callers."
-publish = false
+keywords = ["hetzner", "hcloud", "cloud", "api-client"]
+categories = ["api-bindings"]
+# R542: the true leaf of this workspace — only crates.io deps, no in-house ones.
+# `cargo publish --dry-run -p yah-hetzner` passes.
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

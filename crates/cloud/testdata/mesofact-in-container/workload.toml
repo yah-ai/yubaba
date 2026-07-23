@@ -24,6 +24,5 @@ out_dir = "dist"
 # pinned image instead of on the host. Digest pin ensures reproducibility
 # (same image version on every operator's machine). Tag is advisory; digest is
 # the source of truth (R438-T3 digest-pin enforcement).
-[build_mode]
-mode  = "in_container"
+[build_mode.in_container]
 image = "oven/bun:1.2.13@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

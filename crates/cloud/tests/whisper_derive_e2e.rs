@@ -37,10 +37,10 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Router;
 use cloud::{
-    MirrorConfig, MirrorProviderSlot, MirrorShape, Provider, ReconcileCtx, Reconciler,
-    ServiceComponent, ServiceConfig, StaticAssetReconciler,
+    MirrorConfig, MirrorProviderSlot, MirrorShape, Provider, ProviderScope, ReconcileCtx,
+    Reconciler, ServiceComponent, ServiceConfig, StaticAssetReconciler,
 };
-use velveteen::executor::{ExecContext, ExecEvent, ExecOutcome, ForgeExecutor, ForgeExecutorError};
+use velveteen_exec::executor::{ExecContext, ExecEvent, ExecOutcome, ForgeExecutor, ForgeExecutorError};
 use velveteen::{ForgeCommand, ForgeStatus};
 use tempfile::tempdir;
 use tokio::sync::mpsc::UnboundedSender;
@@ -224,6 +224,7 @@ impl TestWorkspace {
                 name: "test-svc".to_string(),
                 domain: "test.local".to_string(),
                 components: vec![],
+                db: cloud::DbCatalog::default(),
             },
             component: ServiceComponent {
                 id: "model-assets".to_string(),
@@ -231,6 +232,7 @@ impl TestWorkspace {
                 path: "app/assets/model".to_string(),
                 role: "assets".to_string(),
                 publishes: None,
+                git: None,
                 wave: 0,
             },
             mirror: MirrorConfig {
@@ -251,6 +253,7 @@ impl TestWorkspace {
             component: &self.component,
             mirror: &self.mirror,
             env: "test",
+            scope: ProviderScope::singleton(),
         }
     }
 
@@ -258,19 +261,19 @@ impl TestWorkspace {
     /// The transform recipe is `test-copy` (written by `write_recipe`).
     fn write_workload(&self, upstream_url: &str, fetch_hash: &str, output_hash: &str) {
         let content = format!(
-            r#"kind = "static-asset"
+            r#"[static-asset]
 schema_version = "V1"
 
-[[asset]]
+[[static-asset.asset]]
 filename = "model.bin"
 blake3 = "{output_hash}"
 
-[asset.derive.fetch]
+[static-asset.asset.derive.fetch]
 url     = "{upstream_url}"
 blake3  = "{fetch_hash}"
 license = "mit"
 
-[asset.derive.transform]
+[static-asset.asset.derive.transform]
 recipe = "test-copy"
 params = {{}}
 "#

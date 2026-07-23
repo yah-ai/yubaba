@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use local_driver::pond_ssr_runtime::{ensure_ssr_runtime_running, SsrRuntimeSpec};
-use local_driver::LocalRuntime;
+use local_driver::ContainerLauncher;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
@@ -31,7 +31,7 @@ const SLOT: &str = "ssr_runtime";
 /// Yubaba's per-workload supervision over the SSR-runtime container. Lives
 /// inside [`super::RegistryEntry`] while the workload is registered.
 pub(crate) struct SsrRuntimeSupervision {
-    pub runtime: Arc<LocalRuntime>,
+    pub launcher: Arc<dyn ContainerLauncher>,
     pub container_name: String,
     pub cancel: Arc<Notify>,
 }
@@ -39,11 +39,16 @@ pub(crate) struct SsrRuntimeSupervision {
 /// Per-workload reconciler: probe the SSR runtime's HTTP readiness path on a
 /// tick, flip `PondPhase`, restart the container on failure.
 pub(crate) struct SsrRuntimeReconciler {
-    pub runtime: Arc<LocalRuntime>,
+    pub launcher: Arc<dyn ContainerLauncher>,
     pub spec: SsrRuntimeSpec,
     pub ident: String,
     pub registry: Arc<super::PondRegistry>,
     pub cancel: Arc<Notify>,
+    /// True when the container daemon owns restart (pond deployed this slot
+    /// through kamaji with a restart policy, R626-F2). The reconciler then
+    /// probes and reports only — resurrecting here would fight dockerd and,
+    /// worse, undo a deliberate operator stop.
+    pub daemon_supervised: bool,
 }
 
 impl SsrRuntimeReconciler {
@@ -59,8 +64,9 @@ impl SsrRuntimeReconciler {
             }
 
             let probe_url = format!(
-                "http://127.0.0.1:{}{path}",
+                "http://{host}:{}{path}",
                 self.spec.host_port,
+                host = local_driver::pond_probe_host(),
                 path = self.spec.ready_path,
             );
             let now = SystemTime::now()
@@ -99,7 +105,14 @@ impl SsrRuntimeReconciler {
                 continue;
             }
 
-            match ensure_ssr_runtime_running(&self.runtime, &self.spec).await {
+            // Restart is the daemon's job (R626-F2): the container carries
+            // `--restart unless-stopped`, so a crash is already being retried
+            // and a stop was deliberate. Report, don't resurrect.
+            if self.daemon_supervised {
+                continue;
+            }
+
+            match ensure_ssr_runtime_running(&self.launcher, &self.spec).await {
                 Ok(_) => {
                     info!(ident = %self.ident, "pond SSR-runtime restarted; back to Running");
                     consecutive_failures = 0;

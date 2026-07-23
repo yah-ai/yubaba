@@ -2,8 +2,8 @@
 //!
 //! In yubaba v1 (degenerate-raft mode, R277 not yet live), rollout state
 //! lives in `RolloutStore` behind an `Arc<Mutex<>>` on `ServerState`. When
-//! R277 lands, the store migrates to raft state (`WardenState.rollouts`); the
-//! `WardenRequest` variants for rollout writes are already defined in
+//! R277 lands, the store migrates to raft state (`YubabaState.rollouts`); the
+//! `YubabaRequest` variants for rollout writes are already defined in
 //! `crates/yah/yubaba/src/raft/mod.rs` so the raft path compiles even today.
 
 pub mod engine;
@@ -41,7 +41,7 @@ fn now_unix_secs() -> u64 {
 
 /// In-process rollout registry (degenerate-raft v1).
 ///
-/// Replaced by raft-replicated state (see `WardenState.rollouts`) once
+/// Replaced by raft-replicated state (see `YubabaState.rollouts`) once
 /// R277 cluster-mesh-1 lands and raft is live.
 #[derive(Default)]
 pub struct RolloutStore {

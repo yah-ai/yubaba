@@ -26,9 +26,17 @@
 //!
 //! The `?endpoint=` query parameter is passed through to litestream's
 //! `endpoint` config key (Hetzner Object Storage, Backblaze B2, MinIO, etc.).
+//!
+//! @yah:ticket(R591-T3, "Turn on litestream DB continuity end-to-end (--litestream-s3-url + restore-on-place)")
+//! @yah:at(2026-07-02T17:35:20Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:parent(R591)
+//! @yah:next("Set --litestream-s3-url so leader.rs::on_became_leader's litestream restore + replicate sidecar actually run; verify a freshly-placed node restores headscale.db from S3 before it starts serving. Async replication = small RPO (a few writes) on failover — acceptable for headscale's low, mostly-static write rate.")
+//! @yah:next("With TLS moved to the CF edge (R591-T2), the acme-cache no longer needs to survive failover, removing the one piece of state litestream doesn't carry.")
 
-use std::path::Path;
 use anyhow::Result;
+use std::path::Path;
 
 /// Name of the litestream replicate systemd unit.
 pub const LITESTREAM_UNIT: &str = "litestream-headscale.service";
@@ -166,9 +174,8 @@ mod tests {
 
     #[test]
     fn split_url_with_endpoint() {
-        let (base, ep) = split_s3_url(
-            "s3://my-bucket/headscale?endpoint=https://fsn1.your-objectstorage.com",
-        );
+        let (base, ep) =
+            split_s3_url("s3://my-bucket/headscale?endpoint=https://fsn1.your-objectstorage.com");
         assert_eq!(base, "s3://my-bucket/headscale");
         assert_eq!(ep.as_deref(), Some("https://fsn1.your-objectstorage.com"));
     }
@@ -179,8 +186,14 @@ mod tests {
             &PathBuf::from("/etc/yah-cloud/headscale/headscale.db"),
             "s3://bucket/headscale",
         );
-        assert!(cfg.contains("/etc/yah-cloud/headscale/headscale.db"), "db path missing");
+        assert!(
+            cfg.contains("/etc/yah-cloud/headscale/headscale.db"),
+            "db path missing"
+        );
         assert!(cfg.contains("s3://bucket/headscale"), "s3 url missing");
-        assert!(cfg.contains("LITESTREAM_ACCESS_KEY_ID"), "cred placeholder missing");
+        assert!(
+            cfg.contains("LITESTREAM_ACCESS_KEY_ID"),
+            "cred placeholder missing"
+        );
     }
 }

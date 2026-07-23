@@ -9,10 +9,9 @@
 //! `yubaba::pond::PondDeployReq` keeps resolving for the server side.
 //!
 //! The slot specs `PondDeployReq` embeds (`MinioSpec`, `MiniflareSpec`,
-//! `SsrRuntimeSpec`, `MesofactDevSpec`) live in `local-driver` — the runtime
-//! that consumes them — and are re-used here unchanged.
+//! `SsrRuntimeSpec`) live in `local-driver` — the runtime that consumes them —
+//! and are re-used here unchanged.
 
-use local_driver::pond_mesofact_dev::MesofactDevSpec;
 use local_driver::pond_miniflare::MiniflareSpec;
 use local_driver::pond_minio::MinioSpec;
 use local_driver::pond_ssr_runtime::SsrRuntimeSpec;
@@ -49,13 +48,6 @@ pub struct PondDeployReq {
     /// at the bound container before miniflare starts proxying.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssr_runtime: Option<SsrRuntimeSpec>,
-    /// Optional mesofact-dev backend container (R455-F3, W180 Phase D).
-    /// When present, yubaba brings up almanac-serve + issue-tracker in a single
-    /// container after MinIO and SSR runtime but before miniflare, so the
-    /// Worker's `MESOFACT_BACKEND_ORIGIN` + `ISSUES_ORIGIN` bindings (R455-T4)
-    /// can reference it on the per-cell bridge.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mesofact_dev: Option<MesofactDevSpec>,
 }
 
 /// Per-workload phase reported by `GET /pond/state`.
@@ -87,7 +79,7 @@ pub enum ProbeOutcome {
 /// Each reconciler writes one entry after every probe tick.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SlotProbe {
-    /// Logical slot name: `"object_store"` | `"static"` | `"ssr_runtime"` | `"mesofact_dev"`.
+    /// Logical slot name: `"object_store"` | `"static"` | `"ssr_runtime"`.
     pub slot: String,
     /// HTTP GET on the slot's liveness path. Failure triggers a restart.
     pub liveness: ProbeOutcome,
@@ -116,6 +108,12 @@ pub struct PondStateRecord {
     pub endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Unix epoch **milliseconds** when this workload entered the Running
+    /// phase. `None` while Pending/Failed (nothing is serving yet). Feeds the
+    /// Run-tab Live scoreboard's uptime column. `default` so older serialized
+    /// records stay valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
     /// Per-slot probe snapshot (R456-F1). Empty while deploy is Pending.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slots: Vec<SlotProbe>,

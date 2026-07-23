@@ -19,6 +19,27 @@
 //! to drive the miniflare half — yubaba spawns it directly from the
 //! `MiniflareSpec` carried in `PondDeployReq`.
 //!
+//! ## Who owns restart (R626-F2)
+//!
+//! Each slot's containers are created through [`launcher::KamajiLauncher`]
+//! whenever a kamaji is wired ([`crate::ServerState::active_backend`]), which
+//! deploys them with a restart policy. **dockerd** then restarts a crashed
+//! slot, and an explicitly stopped slot stays stopped. The per-slot
+//! reconcilers keep probing and rolling phase up (`write_slot_probe` +
+//! `roll_up_phase`) but no longer restart anything — that is observability,
+//! not supervision.
+//!
+//! Before R626-F2 each reconciler ran its own resurrect loop against the
+//! docker CLI, which is why an operator's `docker stop` of a pond container
+//! lost a race with yubaba and came straight back. That path still exists as
+//! the fallback for a yubaba with no kamaji sibling (`daemon_supervised =
+//! false`), unchanged.
+//!
+//! One phase gap is deliberately left open: a slot an operator stopped on
+//! purpose reports `Degraded`, because `PondPhase` has no `Stopped` variant.
+//! Modelling desired state (and therefore a deliberate stop that is not a
+//! failure) is R626-S3 / R626-F4.
+//!
 //! @yah:relay(R455, "Phase D — mesofact-dev backend container + bridge network + Worker bindings")
 //! @yah:at(2026-06-05T08:23:34Z)
 //! @yah:status(open)
@@ -36,21 +57,6 @@
 //! @yah:next("Extend PondStateRecord with per-slot liveness/readiness probes; top-level phase becomes a roll-up; surface granularity through the observation seam to the UI")
 //! @arch:see(.yah/docs/working/W180-pond-richer-topology.md)
 //!
-//! @yah:ticket(R455-F3, "pond_mesofact_dev local-driver module + PondDeployReq field + yubaba MesofactDevReconciler with HTTP probes")
-//! @yah:assignee(agent:claude)
-//! @yah:at(2026-06-05T08:24:39Z)
-//! @yah:status(review)
-//! @yah:phase(D)
-//! @yah:parent(R455)
-//! @yah:next("New crates/yah/local-driver/src/pond_mesofact_dev.rs: MesofactDevSpec + ensure_mesofact_dev_running (mirror pond_minio.rs)")
-//! @yah:next("PondDeployReq grows optional mesofact_dev: Option<MesofactDevSpec>; existing mirrors keep working")
-//! @yah:next("Yubaba gets MesofactDevReconciler paralleling MinioReconciler/MiniflareReconciler: 5s loop, HTTP GET on liveness_path → restart; HTTP GET on readiness_path → mark not-ready (no restart)")
-//! @yah:verify("cargo test -p yubaba --lib pond")
-//! @yah:verify("Smoke: external HTTP kill of mesofact-dev → yubaba Degraded within probe interval → restart → Running")
-//! @arch:see(.yah/docs/working/W180-pond-richer-topology.md)
-//! @yah:depends_on(R455-F1)
-//! @yah:depends_on(R455-F2)
-//!
 //! @yah:ticket(R456-F1, "PondStateRecord.slots: Vec<SlotProbe>; phase becomes a roll-up over slots")
 //! @yah:at(2026-06-05T08:24:56Z)
 //! @yah:status(review)
@@ -62,21 +68,45 @@
 //! @yah:verify("cargo test -p yubaba --lib pond")
 //! @yah:verify("Smoke: kill miniflare → /pond/state shows slot=static liveness=Fail, top-level phase=Degraded; restart → back to Running")
 //! @arch:see(.yah/docs/working/W180-pond-richer-topology.md)
+//!
+//! @yah:ticket(R626-F2, "Migrate pond's per-slot reconcilers (minio/miniflare/ssr_runtime) off their own resurrect loops onto kamaji Deploy/Stop")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-07-23T03:50:41Z)
+//! @yah:phase(P2)
+//! @yah:parent(R626)
+//! @yah:depends_on(R626-F1)
+//! @yah:handoff("LANDED + verified live against OrbStack 29.4.0. Pond's three slots (object_store/static/ssr_runtime) no longer resurrect their own containers — dockerd does. (1) BLOCKER CLEARED FIRST, as the gotcha demanded: kamaji's docker backend now renders spec.restart_policy into `docker run --restart` (oss/kamaji/crates/kamaji/src/docker.rs, restart_flag()). Deliberate call: RestartPolicy::Always renders `unless-stopped`, NOT `always` — both restart on crash, but `always` resurrects an explicitly-stopped container at the next daemon start, which would undo the operator stop this whole relay exists to make possible. OnFailure{max_attempts} -> `on-failure:N`; Never -> `no`. That also un-deads docker.rs's Restarting status mapping, which could never fire without a policy set.")
+//! @yah:handoff("(2) DOCKER BACKEND MADE SPEC-FAITHFUL ENOUGH TO RUN A POND CONTAINER. deploy_workload previously rendered NO ports, volumes, or network — pond could not have been expressed through it at all. Extracted the argv build into a pure `DockerRuntime::run_args()` (13 new unit tests) and added: published host ports, bind/named/tmpfs volumes, user-defined bridge + DNS aliases (with an idempotent DockerRuntime::ensure_network), and spec.labels passthrough sorted for determinism. Ports/network/aliases are docker-only concerns with no home on the cross-backend WorkloadSpec, so they ride `spec.annotations` under new public consts yah.docker.publish / .network / .network_alias rather than widening the shared schema. Also: zero memory_mb / cpu_millis now OMIT --memory/--cpu-shares instead of rendering `0m` — pond slots have always run uncapped and a cap invented here would OOM-kill MinIO on a laptop.")
+//! @yah:handoff("(3) NEW SEAM IN local-driver: `ContainerLauncher` (ensure_image / run / stop_and_remove) — the only three verbs in the pond bring-up choreography that touch a daemon. LocalRuntime impls it (cloud tier unchanged, zero call-site churn) plus a blanket impl for Arc<T>; ensure_{minio,miniflare,ssr_runtime}_running became generic over it. The choreography around those verbs (state dirs, worker-script writes, readiness waits, MinIO bucket policy) stays exactly where it was.")
+//! @yah:handoff("(4) YUBABA SIDE: new yubaba::pond::launcher::KamajiLauncher lowers a ContainerRunSpec -> WorkloadSpec (identity == container name, which is what makes a later teardown resolve) and deploys through the generic kamaji surface — NOT through kamaji::docker, so yubaba needs no docker feature; the backend lives in the kamaji process. 14 unit tests incl. docker-image parsing (`minio/minio:X` is a Docker Hub org, not a registry — a naive split gives an unpullable ref). pond::deploy() picks KamajiLauncher when active_backend() is wired, else falls back to LocalRuntime with the pre-R626 resurrect loops intact, and passes `daemon_supervised` to each reconciler: when true they probe and report ONLY.")
+//! @yah:handoff("(5) THE WIRING THAT TURNS IT ON, both host-side so no image rebuild is needed for the flags themselves: DEFAULT_WARDEN_ARGS gains `--kamaji-socket /run/kamaji/kamaji.sock` (the pond image already runs a kamaji sibling on that path — yubaba just never dialled it), and the warden container env gains `KAMAJI_DOCKER=unix:///var/run/docker.sock` (kamaji reads it itself; explicit socket, not an ambient DOCKER_HOST). pond-supervise.sh and the Dockerfile needed no change.")
+//! @yah:handoff("(6) LIVE E2E, the part unit tests cannot reach: new crates/yubaba/tests/pond_kamaji_supervision.rs spawns a real kamaji with the docker backend, deploys a pond-shaped spec through KamajiLauncher, and asserts on the actual daemon — RestartPolicy.Name == unless-stopped, host port published, bind mount present, yah.pond label survived; then `docker stop` and asserts it STAYS exited (the R626 bug, inverted into a regression bar); then teardown removes the record. A second test proves a crashed slot (non-zero exit from inside) is restarted by dockerd with RestartCount >= 1. Both pass against live OrbStack; self-skip without a daemon.")
+//! @yah:handoff("(7) DISCOVERED FIXES, done in-pass rather than filed: crates/yubaba/tests/pond_reconciler_smoke.rs did not compile (stale `mesofact_dev` field on PondDeployReq) — that test is one of this ticket's own verify criteria, so it was fixed rather than deferred. yubaba's docker-integration feature now also forwards to kamaji-bin so the live test can build a ServerCtx with the docker backend.")
+//! @yah:verify("cd oss/kamaji && cargo test -p kamaji -p kamaji-bin --features docker-integration — all green (kamaji lib 66, was 52; kamaji-bin lib 200; docker_live 5; docker_backend_e2e 2)")
+//! @yah:verify("cd oss/yubaba && cargo test -p yubaba — 246 lib pass (was 229) + every integration target green")
+//! @yah:verify("cd oss/yubaba && cargo test -p yubaba --features docker-integration — 246 lib + pond_kamaji_supervision 2 pass against live OrbStack 29.4.0")
+//! @yah:verify("cd oss/yah-base && cargo check --workspace --all-targets — clean (the ContainerLauncher genericization did not disturb the cloud tier); cargo check --workspace at camp root — clean")
+//! @yah:verify("cargo clippy -p kamaji --features docker-integration --all-targets and -p yubaba — no new warnings in docker.rs / pond / launcher")
+//! @yah:verify("LIVE BAR: docker inspect of a slot deployed through kamaji shows RestartPolicy.Name=unless-stopped; docker stop leaves it exited (does NOT come back); an in-container non-zero exit is restarted by dockerd — all three asserted in pond_kamaji_supervision.rs")
+//! @yah:gotcha("`docker kill` is NOT a crash as far as dockerd is concerned. Docker records both `docker stop` and `docker kill` as manual stops and suppresses the restart policy for both. Convenient for R626 (an operator's kill also stays stopped) but it means any test that kills a container from outside proves nothing about crash recovery — pond_kamaji_supervision.rs crashes the container from the inside (non-zero exit) instead. A first draft of that test failed for exactly this reason.")
+//! @yah:gotcha("The pond image ships yubaba AND kamaji built together, so there is no version-skew fallback path: a yubaba carrying this change implies a kamaji from the same build. But the CURRENTLY PINNED pond image predates R626-F1, so its kamaji has no docker backend compiled in. Until the yah-yubaba image is rebuilt and re-pinned, a pond deploy against the old image will get BackendRefused from Deploy{Container}. Rebuild + re-pin the image before expecting the migrated path live; the host-side flags (--kamaji-socket, KAMAJI_DOCKER) are already in place and are inert against an old binary.")
+//! @yah:gotcha("PRE-EXISTING, NOT FROM THIS TICKET: `cargo check -p yubaba --features testing --all-targets` fails to compile against openraft 0.10.0-alpha.30 (CommittedLeaderId / RaftCommittedLeaderId in crates/yubaba/src/raft/mod.rs + secret_reload.rs test code). Untouched by R626-F2 — verified by error site, all in files this ticket never edits. Same for oss/yubaba/crates/cloud/tests/{pond_smoke,mesofact_static_e2e}.rs, which are stale against ReconcileCtx.scope and WardenContainerSpec::new's arity.")
+//! @yah:gotcha("A slot an operator stopped on purpose still reports PondPhase::Degraded — PondPhase has no Stopped variant, and inventing one here would have pre-empted the desired-state design. That is deliberately left to R626-S3 / R626-F4, and it is the one place the new model is still lossy: the phase cannot distinguish 'stopped on purpose' from 'fell over'.")
+//! @yah:next("SIGN-OFF CHECK: read oss/kamaji/crates/kamaji/src/docker.rs `run_args` + `restart_flag` (the Always -> unless-stopped call is the one judgement worth a second opinion), then oss/yubaba/crates/yubaba/src/pond/launcher.rs, then the `daemon_supervised` branch in pond/{minio,miniflare,ssr_runtime}.rs. Everything else follows from those three.")
+//! @yah:next("BEFORE THIS IS LIVE: rebuild + re-pin the yah-yubaba image so the pond container carries a kamaji with the docker backend (R626-F1 added it; the pinned image predates that). The host-side wiring is already in DEFAULT_WARDEN_ARGS + KAMAJI_DOCKER and is inert against the old binary.")
+//! @yah:next("R626-S3 (desired-state home) is now the load-bearing next question: this ticket makes a stop STICK, but pond still reports a deliberately-stopped slot as Degraded and has no way to express 'keep it stopped' as intent rather than as a docker-side side effect. PondPhase needs a Stopped variant once S3 picks where desired state lives.")
+//! @yah:next("R626-F5 (yubaba POST /workloads/deploy through kamaji) can reuse the ContainerLauncher seam and the annotation-based docker rendering landed here rather than inventing its own lowering.")
 
-pub mod mesofact_dev;
+pub mod launcher;
 pub mod miniflare;
 pub mod minio;
 pub mod ssr_runtime;
 
+pub use local_driver::pond_miniflare::{ensure_miniflare_running, MiniflareRunning, MiniflareSpec};
+pub use local_driver::pond_ssr_runtime::SsrRuntimeSpec;
 pub use minio::{ensure_bucket_public, ensure_minio_running, MinioRunning, MinioSpec};
 pub use ssr_runtime::{lower_workload_spec as lower_ssr_workload_spec, SsrRuntimeRunning};
-pub use local_driver::pond_miniflare::{
-    ensure_miniflare_running, MiniflareRunning, MiniflareSpec,
-};
-pub use local_driver::pond_mesofact_dev::{
-    ensure_mesofact_dev_running, MesofactDevRunning, MesofactDevSpec,
-};
-pub use local_driver::pond_ssr_runtime::SsrRuntimeSpec;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -86,11 +116,10 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use local_driver::LocalRuntime;
+use local_driver::ContainerLauncher;
 use serde::Deserialize;
 use tokio::sync::{Notify, RwLock};
 
-use crate::pond::mesofact_dev::{MesofactDevReconciler, MesofactDevSupervision};
 use crate::pond::miniflare::{MiniflareReconciler, MiniflareSupervision};
 use crate::pond::minio::MinioReconciler;
 use crate::pond::ssr_runtime::{SsrRuntimeReconciler, SsrRuntimeSupervision};
@@ -108,7 +137,7 @@ pub use yubaba_client::{
 /// Yubaba's per-workload supervision over the MinIO container. Lives inside
 /// [`RegistryEntry`] while the workload is registered.
 pub(crate) struct MinioSupervision {
-    pub runtime: Arc<LocalRuntime>,
+    pub launcher: Arc<dyn ContainerLauncher>,
     pub container_name: String,
     pub cancel: Arc<Notify>,
 }
@@ -122,11 +151,8 @@ struct RegistryEntry {
     /// SSR-runtime container supervision — `None` when the workload declares
     /// no `ssr_runtime`, or for test fixtures + failed deploys.
     ssr_runtime: Option<SsrRuntimeSupervision>,
-    /// Mesofact-dev container supervision — `None` when the workload declares
-    /// no `mesofact_dev`, or for test fixtures + failed deploys.
-    mesofact_dev: Option<MesofactDevSupervision>,
     /// Per-slot probe snapshots written by reconcilers (R456-F1). Keyed by
-    /// slot name (`"object_store"`, `"static"`, `"ssr_runtime"`, `"mesofact_dev"`).
+    /// slot name (`"object_store"`, `"static"`, `"ssr_runtime"`).
     slot_probes: HashMap<String, SlotProbe>,
 }
 
@@ -161,7 +187,9 @@ impl PondRegistry {
     /// concurrent reconciler from resurrecting a dead workload).
     pub(crate) async fn write_slot_probe(&self, ident: &str, probe: SlotProbe) {
         let mut g = self.entries.write().await;
-        let Some(entry) = g.get_mut(ident) else { return };
+        let Some(entry) = g.get_mut(ident) else {
+            return;
+        };
         if entry.record.phase == PondPhase::Failed {
             return;
         }
@@ -172,18 +200,12 @@ impl PondRegistry {
 
     /// Insert (or replace) a Running record. Used by tests that don't exercise
     /// the full bring-up sequence.
-    pub async fn insert_running(
-        &self,
-        req: &PondDeployReq,
-        dev_url: Option<String>,
-    ) {
-        self.insert_full(req, dev_url, None, None, None, None, None)
-            .await;
+    pub async fn insert_running(&self, req: &PondDeployReq, dev_url: Option<String>) {
+        self.insert_full(req, dev_url, None, None, None, None).await;
     }
 
-    /// Insert a Running record with yubaba-supervised MinIO, miniflare, SSR
-    /// runtime, and (optionally) mesofact-dev. Called by [`deploy`] after the
-    /// full bring-up sequence succeeds.
+    /// Insert a Running record with yubaba-supervised MinIO, miniflare, and SSR
+    /// runtime. Called by [`deploy`] after the full bring-up sequence succeeds.
     pub(crate) async fn insert_full(
         &self,
         req: &PondDeployReq,
@@ -192,18 +214,17 @@ impl PondRegistry {
         minio_supervision: Option<MinioSupervision>,
         miniflare_supervision: Option<MiniflareSupervision>,
         ssr_runtime_supervision: Option<SsrRuntimeSupervision>,
-        mesofact_dev_supervision: Option<MesofactDevSupervision>,
     ) {
         let (endpoint, console_url) = match minio_running {
             Some(m) => (Some(m.endpoint.clone()), Some(m.console_url.clone())),
             None => (None, None),
         };
-        let (prior_miniflare, prior_minio, prior_ssr, prior_md) = {
+        let (prior_miniflare, prior_minio, prior_ssr) = {
             let mut g = self.entries.write().await;
-            let (mf, mn, sr, md) = g
+            let (mf, mn, sr) = g
                 .remove(&req.ident)
-                .map(|e| (e.miniflare, e.minio, e.ssr_runtime, e.mesofact_dev))
-                .unwrap_or((None, None, None, None));
+                .map(|e| (e.miniflare, e.minio, e.ssr_runtime))
+                .unwrap_or((None, None, None));
             g.insert(
                 req.ident.clone(),
                 RegistryEntry {
@@ -217,44 +238,37 @@ impl PondRegistry {
                         console_url,
                         endpoint,
                         error: None,
+                        started_at: Some(now_epoch_ms()),
                         slots: vec![],
                     },
                     miniflare: miniflare_supervision,
                     minio: minio_supervision,
                     ssr_runtime: ssr_runtime_supervision,
-                    mesofact_dev: mesofact_dev_supervision,
                     slot_probes: Default::default(),
                 },
             );
-            (mf, mn, sr, md)
+            (mf, mn, sr)
         };
         // Tear down priors outside the write lock.
         if let Some(mf) = prior_miniflare {
             mf.cancel.notify_waiters();
             let _ = mf
-                .runtime
+                .launcher
                 .stop_and_remove(&mf.container_name, Duration::from_secs(3))
                 .await;
         }
         if let Some(mn) = prior_minio {
             mn.cancel.notify_waiters();
             let _ = mn
-                .runtime
+                .launcher
                 .stop_and_remove(&mn.container_name, Duration::from_secs(3))
                 .await;
         }
         if let Some(sr) = prior_ssr {
             sr.cancel.notify_waiters();
             let _ = sr
-                .runtime
+                .launcher
                 .stop_and_remove(&sr.container_name, Duration::from_secs(3))
-                .await;
-        }
-        if let Some(md) = prior_md {
-            md.cancel.notify_waiters();
-            let _ = md
-                .runtime
-                .stop_and_remove(&md.container_name, Duration::from_secs(3))
                 .await;
         }
     }
@@ -273,12 +287,12 @@ impl PondRegistry {
                 console_url: None,
                 endpoint: None,
                 error: None,
+                started_at: None,
                 slots: vec![],
             },
             miniflare: None,
             minio: None,
             ssr_runtime: None,
-            mesofact_dev: None,
             slot_probes: Default::default(),
         });
         if !matches!(entry.record.phase, PondPhase::Running | PondPhase::Degraded) {
@@ -289,7 +303,7 @@ impl PondRegistry {
 
     /// Mark a workload Failed with an error string. Tears down any prior supervision.
     pub async fn mark_failed(&self, req: &PondDeployReq, err: String) {
-        let (prior_miniflare, prior_minio, prior_ssr, prior_md) = {
+        let (prior_miniflare, prior_minio, prior_ssr) = {
             let mut g = self.entries.write().await;
             let entry = g.entry(req.ident.clone()).or_insert_with(|| RegistryEntry {
                 record: PondStateRecord {
@@ -302,12 +316,12 @@ impl PondRegistry {
                     console_url: None,
                     endpoint: None,
                     error: Some(err.clone()),
+                    started_at: None,
                     slots: vec![],
                 },
                 miniflare: None,
                 minio: None,
                 ssr_runtime: None,
-                mesofact_dev: None,
                 slot_probes: Default::default(),
             });
             entry.record.phase = PondPhase::Failed;
@@ -316,35 +330,27 @@ impl PondRegistry {
                 entry.miniflare.take(),
                 entry.minio.take(),
                 entry.ssr_runtime.take(),
-                entry.mesofact_dev.take(),
             )
         };
         if let Some(mf) = prior_miniflare {
             mf.cancel.notify_waiters();
             let _ = mf
-                .runtime
+                .launcher
                 .stop_and_remove(&mf.container_name, Duration::from_secs(3))
                 .await;
         }
         if let Some(mn) = prior_minio {
             mn.cancel.notify_waiters();
             let _ = mn
-                .runtime
+                .launcher
                 .stop_and_remove(&mn.container_name, Duration::from_secs(3))
                 .await;
         }
         if let Some(sr) = prior_ssr {
             sr.cancel.notify_waiters();
             let _ = sr
-                .runtime
+                .launcher
                 .stop_and_remove(&sr.container_name, Duration::from_secs(3))
-                .await;
-        }
-        if let Some(md) = prior_md {
-            md.cancel.notify_waiters();
-            let _ = md
-                .runtime
-                .stop_and_remove(&md.container_name, Duration::from_secs(3))
                 .await;
         }
     }
@@ -353,12 +359,7 @@ impl PondRegistry {
     /// [`MinioReconciler`] and [`MiniflareReconciler`] when probes flip the
     /// slot between Running ↔ Degraded ↔ Failed without dropping the supervision
     /// handles attached to the entry.
-    pub(crate) async fn mark_phase(
-        &self,
-        ident: &str,
-        phase: PondPhase,
-        error: Option<String>,
-    ) {
+    pub(crate) async fn mark_phase(&self, ident: &str, phase: PondPhase, error: Option<String>) {
         let mut g = self.entries.write().await;
         if let Some(entry) = g.get_mut(ident) {
             entry.record.phase = phase;
@@ -385,31 +386,22 @@ impl PondRegistry {
             if let Some(sr) = entry.ssr_runtime.as_ref() {
                 sr.cancel.notify_waiters();
             }
-            if let Some(md) = entry.mesofact_dev.as_ref() {
-                md.cancel.notify_waiters();
-            }
             if let Some(mf) = entry.miniflare {
                 let _ = mf
-                    .runtime
+                    .launcher
                     .stop_and_remove(&mf.container_name, Duration::from_secs(3))
                     .await;
             }
             if let Some(mn) = entry.minio {
                 let _ = mn
-                    .runtime
+                    .launcher
                     .stop_and_remove(&mn.container_name, Duration::from_secs(3))
                     .await;
             }
             if let Some(sr) = entry.ssr_runtime {
                 let _ = sr
-                    .runtime
+                    .launcher
                     .stop_and_remove(&sr.container_name, Duration::from_secs(3))
-                    .await;
-            }
-            if let Some(md) = entry.mesofact_dev {
-                let _ = md
-                    .runtime
-                    .stop_and_remove(&md.container_name, Duration::from_secs(3))
                     .await;
             }
         }
@@ -417,6 +409,15 @@ impl PondRegistry {
 }
 
 // ── Registry helpers ─────────────────────────────────────────────────────────
+
+/// Unix epoch milliseconds — start-time stamp for the Running phase so the
+/// Run-tab Live scoreboard can render real uptime.
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 fn record_with_slots(entry: &RegistryEntry) -> PondStateRecord {
     let mut record = entry.record.clone();
@@ -466,6 +467,26 @@ pub(crate) async fn deploy(
     };
     state.pond_registry.mark_pending(&req).await;
 
+    // ── Supervision seam (R626-F2) ────────────────────────────────────────────
+    // Prefer kamaji: it deploys each slot with a restart policy, so **dockerd**
+    // resurrects a crashed container and an explicit stop stays stopped. The
+    // reconcilers below then run as pure probes.
+    //
+    // Without a kamaji (no `--kamaji-socket`, e.g. a bare `yubaba serve` or a
+    // unit test) pond falls back to driving the docker CLI in-process and keeps
+    // its own resurrect loop — the pre-R626 behaviour, unchanged.
+    let (launcher, daemon_supervised): (Arc<dyn ContainerLauncher>, bool) =
+        match state.active_backend() {
+            Some(backend) => (Arc::new(launcher::KamajiLauncher::new(backend)), true),
+            None => (runtime.clone() as Arc<dyn ContainerLauncher>, false),
+        };
+    tracing::info!(
+        ident = %req.ident,
+        daemon_supervised,
+        "pond deploy: restart is owned by {}",
+        if daemon_supervised { "the container daemon (via kamaji)" } else { "yubaba's reconcilers" },
+    );
+
     // ── Per-cell bridge network (R455-F1) ─────────────────────────────────────
     // Idempotent: created on first deploy in a cell, reused on subsequent
     // deploys. Containers without a `network` field on their spec stay on the
@@ -494,7 +515,7 @@ pub(crate) async fn deploy(
     }
 
     // ── MinIO half ────────────────────────────────────────────────────────────
-    let minio_running = match ensure_minio_running(&runtime, &req.minio).await {
+    let minio_running = match ensure_minio_running(&launcher, &req.minio).await {
         Ok(m) => m,
         Err(e) => {
             let err = format!("{e:#}");
@@ -518,10 +539,7 @@ pub(crate) async fn deploy(
     // static/SPA pond mirrors keep working unchanged).
     let mut effective_miniflare = req.miniflare.clone();
     let ssr_running = if let Some(ref ssr_spec) = req.ssr_runtime {
-        match local_driver::pond_ssr_runtime::ensure_ssr_runtime_running(
-            &runtime, ssr_spec,
-        )
-        .await
+        match local_driver::pond_ssr_runtime::ensure_ssr_runtime_running(&launcher, ssr_spec).await
         {
             Ok(running) => {
                 // Camp may have left ssr_origin empty if it didn't know the
@@ -534,7 +552,7 @@ pub(crate) async fn deploy(
             }
             Err(e) => {
                 let err = format!("{e:#}");
-                let _ = runtime
+                let _ = launcher
                     .stop_and_remove(&minio_running.container_name, Duration::from_secs(3))
                     .await;
                 state.pond_registry.mark_failed(&req, err.clone()).await;
@@ -544,39 +562,6 @@ pub(crate) async fn deploy(
                         "error": err,
                         "ident": req.ident,
                         "stage": "ssr_runtime",
-                    })),
-                )
-                    .into_response();
-            }
-        }
-    } else {
-        None
-    };
-
-    // ── Mesofact-dev half (R455-F3, W180 Phase D) ─────────────────────────────
-    // Brought up after MinIO and SSR runtime but before miniflare so the
-    // Worker's MESOFACT_BACKEND_ORIGIN + ISSUES_ORIGIN bindings can reference
-    // the bridge endpoint when miniflare starts (R455-T4).
-    let mesofact_running = if let Some(ref md_spec) = req.mesofact_dev {
-        match ensure_mesofact_dev_running(&runtime, md_spec).await {
-            Ok(running) => Some(running),
-            Err(e) => {
-                let err = format!("{e:#}");
-                let _ = runtime
-                    .stop_and_remove(&minio_running.container_name, Duration::from_secs(3))
-                    .await;
-                if let Some(ref s) = ssr_running {
-                    let _ = runtime
-                        .stop_and_remove(&s.container_name, Duration::from_secs(3))
-                        .await;
-                }
-                state.pond_registry.mark_failed(&req, err.clone()).await;
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": err,
-                        "ident": req.ident,
-                        "stage": "mesofact_dev",
                     })),
                 )
                     .into_response();
@@ -606,16 +591,16 @@ pub(crate) async fn deploy(
     }
 
     // ── Miniflare half ────────────────────────────────────────────────────────
-    let miniflare_running = match ensure_miniflare_running(&runtime, &effective_miniflare).await {
+    let miniflare_running = match ensure_miniflare_running(&launcher, &effective_miniflare).await {
         Ok(running) => running,
         Err(e) => {
             let err = format!("{e:#}");
             // Tear down both containers so we don't leak a half-up workload.
-            let _ = runtime
+            let _ = launcher
                 .stop_and_remove(&minio_running.container_name, Duration::from_secs(3))
                 .await;
             if let Some(ref s) = ssr_running {
-                let _ = runtime
+                let _ = launcher
                     .stop_and_remove(&s.container_name, Duration::from_secs(3))
                     .await;
             }
@@ -636,27 +621,21 @@ pub(crate) async fn deploy(
     let minio_cancel = Arc::new(Notify::new());
     let miniflare_cancel = Arc::new(Notify::new());
     let ssr_cancel = Arc::new(Notify::new());
-    let mesofact_cancel = Arc::new(Notify::new());
 
     let minio_supervision = MinioSupervision {
-        runtime: runtime.clone(),
+        launcher: launcher.clone(),
         container_name: minio_running.container_name.clone(),
         cancel: minio_cancel.clone(),
     };
     let miniflare_supervision = MiniflareSupervision {
-        runtime: runtime.clone(),
+        launcher: launcher.clone(),
         container_name: miniflare_running.container_name.clone(),
         cancel: miniflare_cancel.clone(),
     };
     let ssr_supervision = ssr_running.as_ref().map(|s| SsrRuntimeSupervision {
-        runtime: runtime.clone(),
+        launcher: launcher.clone(),
         container_name: s.container_name.clone(),
         cancel: ssr_cancel.clone(),
-    });
-    let mesofact_dev_supervision = mesofact_running.as_ref().map(|md| MesofactDevSupervision {
-        runtime: runtime.clone(),
-        container_name: md.container_name.clone(),
-        cancel: mesofact_cancel.clone(),
     });
 
     let dev_url = Some(miniflare_running.dev_url.clone());
@@ -669,45 +648,37 @@ pub(crate) async fn deploy(
             Some(minio_supervision),
             Some(miniflare_supervision),
             ssr_supervision,
-            mesofact_dev_supervision,
         )
         .await;
 
     let minio_reconciler = MinioReconciler {
-        runtime: runtime.clone(),
+        launcher: launcher.clone(),
         spec: req.minio.clone(),
         ident: req.ident.clone(),
         registry: state.pond_registry.clone(),
         cancel: minio_cancel,
+        daemon_supervised,
     };
     let miniflare_reconciler = MiniflareReconciler {
-        runtime: runtime.clone(),
+        launcher: launcher.clone(),
         spec: effective_miniflare.clone(),
         ident: req.ident.clone(),
         registry: state.pond_registry.clone(),
         cancel: miniflare_cancel,
+        daemon_supervised,
     };
     tokio::spawn(minio_reconciler.run());
     tokio::spawn(miniflare_reconciler.run());
     if let Some(ref spec) = req.ssr_runtime {
         let ssr_reconciler = SsrRuntimeReconciler {
-            runtime: runtime.clone(),
+            launcher: launcher.clone(),
             spec: spec.clone(),
             ident: req.ident.clone(),
             registry: state.pond_registry.clone(),
             cancel: ssr_cancel,
+            daemon_supervised,
         };
         tokio::spawn(ssr_reconciler.run());
-    }
-    if let Some(ref spec) = req.mesofact_dev {
-        let mesofact_reconciler = MesofactDevReconciler {
-            runtime: runtime.clone(),
-            spec: spec.clone(),
-            ident: req.ident.clone(),
-            registry: state.pond_registry.clone(),
-            cancel: mesofact_cancel,
-        };
-        tokio::spawn(mesofact_reconciler.run());
     }
 
     match state.pond_registry.get(&req.ident).await {
@@ -747,11 +718,12 @@ pub(crate) async fn get_state(
 }
 
 /// `GET /pond` — list every currently-tracked pond workload. Always 200.
-pub(crate) async fn list_state(
-    State(state): State<Arc<crate::ServerState>>,
-) -> impl IntoResponse {
+pub(crate) async fn list_state(State(state): State<Arc<crate::ServerState>>) -> impl IntoResponse {
     let records = state.pond_registry.list().await;
-    (StatusCode::OK, Json(serde_json::json!({ "workloads": records })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "workloads": records })),
+    )
 }
 
 #[cfg(test)]
@@ -805,7 +777,6 @@ mod tests {
             minio: minio_spec_fixture(),
             miniflare: miniflare_spec_fixture(),
             ssr_runtime: None,
-            mesofact_dev: None,
         }
     }
 
@@ -889,7 +860,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .await;
         let snap = reg.get(&r.ident).await.unwrap();
@@ -907,7 +877,6 @@ mod tests {
             &r,
             Some("http://localhost:4322".into()),
             Some(&m),
-            None,
             None,
             None,
             None,
@@ -943,7 +912,9 @@ mod tests {
     fn fail_probe(slot: &str, reason: &str) -> SlotProbe {
         SlotProbe {
             slot: slot.into(),
-            liveness: ProbeOutcome::Fail { reason: reason.into() },
+            liveness: ProbeOutcome::Fail {
+                reason: reason.into(),
+            },
             readiness: ProbeOutcome::Pending,
             last_checked_at: 0,
             url: None,
@@ -971,7 +942,8 @@ mod tests {
         let r = req("w");
         reg.mark_pending(&r).await;
         reg.write_slot_probe("w", pass_probe("object_store")).await;
-        reg.write_slot_probe("w", fail_probe("static", "probe timed out")).await;
+        reg.write_slot_probe("w", fail_probe("static", "probe timed out"))
+            .await;
         let snap = reg.get("w").await.unwrap();
         assert_eq!(snap.phase, PondPhase::Degraded);
     }
@@ -981,7 +953,8 @@ mod tests {
         let reg = PondRegistry::new();
         let r = req("w");
         reg.mark_pending(&r).await;
-        reg.write_slot_probe("w", fail_probe("static", "down")).await;
+        reg.write_slot_probe("w", fail_probe("static", "down"))
+            .await;
         assert_eq!(reg.get("w").await.unwrap().phase, PondPhase::Degraded);
         reg.write_slot_probe("w", pass_probe("static")).await;
         assert_eq!(reg.get("w").await.unwrap().phase, PondPhase::Running);
@@ -993,7 +966,8 @@ mod tests {
         let r = req("w");
         reg.mark_pending(&r).await;
         reg.write_slot_probe("w", pass_probe("static")).await;
-        reg.mark_phase("w", PondPhase::Failed, Some("restarts exhausted".into())).await;
+        reg.mark_phase("w", PondPhase::Failed, Some("restarts exhausted".into()))
+            .await;
         // A subsequent passing probe must NOT overwrite the terminal Failed state.
         reg.write_slot_probe("w", pass_probe("static")).await;
         let snap = reg.get("w").await.unwrap();
@@ -1004,7 +978,8 @@ mod tests {
     async fn slots_absent_before_first_probe() {
         let reg = PondRegistry::new();
         let r = req("w");
-        reg.insert_running(&r, Some("http://localhost:4322".into())).await;
+        reg.insert_running(&r, Some("http://localhost:4322".into()))
+            .await;
         let snap = reg.get("w").await.unwrap();
         assert!(snap.slots.is_empty());
     }

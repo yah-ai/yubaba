@@ -685,6 +685,7 @@ mod tests {
                 name: "yah-dev".into(),
                 domain: "yah.dev".into(),
                 components: vec![],
+                db: crate::DbCatalog::default(),
             },
             mirrors: BTreeMap::from([
                 ("dev".to_string(), local_static_mirror()),

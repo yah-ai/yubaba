@@ -44,27 +44,7 @@
 //! @yah:next("Archive condition: this task is purely a design-decision marker. Archive it once R040-F15 lands (the architectural commitment is real). Until then it stays here as a tripwire so a future claim of 'we should add primary-IP support' surfaces the prior reasoning before the work starts.")
 //! @yah:next("Reopen condition: a concrete service requirement that needs raw TCP/UDP from the public internet AND can't justify CF Spectrum's pricing. If reopened, the natural shape is MachineConfig.primary_ip: Option<u64> + ServerSpec.primary_ip + a `yah cloud ip {create,list,destroy}` subcommand — but DON'T pre-build any of that until reopened.")
 //!
-//! @yah:ticket(R409-T4, "Establish .yah/envoys/<provider>/ convention; seed Hetzner sketch.md to validate the model")
-//! @yah:assignee(agent:claude)
-//! @yah:at(2026-06-02T20:59:01Z)
-//! @yah:status(review)
-//! @yah:phase(P1)
-//! @yah:parent(R409)
-//! @yah:handoff("Established .yah/envoys/ convention. Two files: README.md documents the directory layout (sketch.md required; manifest.toml lands with W145; notes/ optional), the relationship to .yah/infra/providers/ (operational vs catalog split with same provider id), and the provider list table; hetzner/sketch.md is the worked example that validates the model by retrofitting onto the existing Hetzner integration. The sketch answers W144's five classification-process questions — vendor surface (Cloud API + S3-compat Object Storage, two creds), auth model (cheers keystore slots, env fallback), license (Apache-2.0/MIT, no GPL/LGPL SDK pulled), verb coverage (3 implemented + 6 gaps mapped against W144's catalog), decision (Tier S, Native, categories=[cloud]) — plus a gotchas section drawn from existing driver comments (rate limits, bucket-delete two-step, 403 vs 404 on HEAD) so a picking-up agent inherits the operational history W144 promised.")
-//! @yah:verify("ls .yah/envoys/ — README.md + hetzner/ present")
-//! @yah:verify("Read .yah/envoys/README.md and .yah/envoys/hetzner/sketch.md, confirm structure matches W144 §'Classification process' (surface / auth / license / verb gaps / tier rationale) and the README's promised file list matches reality")
 //!
-//! @yah:ticket(R409-T5, "Refactor Hetzner behind cloud.vps.* verbs only (spike scope; rest of cloud.* lands after T11)")
-//! @yah:assignee(agent:claude)
-//! @yah:at(2026-06-02T20:59:07Z)
-//! @yah:status(review)
-//! @yah:phase(P2)
-//! @yah:parent(R409)
-//! @yah:depends_on(R409-T3)
-//! @yah:handoff("HetznerEnvoy adapter landed in crates/yah/cloud/src/provider/hetzner_envoy.rs, wired through provider/mod.rs (pub mod hetzner_envoy + re-export). Wraps an Arc<HetznerDriver>; impls EnvoyAdapter with id=hetzner, tier=S, flavor=Native, supported_verb_ids=[cloud.vps.create, cloud.vps.destroy, cloud.vps.status]. Dispatch decodes JSON into the typed Input, calls the typed handler, re-encodes the typed Output — unsupported verb ids bail with a programmer-error message (host shouldn't dispatch what's not registered). Typed handlers are public so integration tests can bypass the JSON envelope. server_status_to_output is a pure function so the wire mapping (ServerStatus::Unknown(s) → VpsPhase::Unknown + detail=Some(s); all closed phases drop detail) is unit-tested without touching the driver. Also added the EnvoyAdapter trait to crates/yah/cloud/src/envoy.rs alongside Tier/AdapterFlavor/VerbCategory. MachineProvider intentionally left in place — it's still the substrate the orchestration code calls into; R409-T9 retires it after T11+T6+T7+T8.")
-//! @yah:verify("cargo test -p cloud --lib --features json-schema envoy — 19/19 pass")
-//! @yah:verify("cargo test -p cloud --lib hetzner_envoy — 3/3 pass")
-//! @yah:gotcha("cloud_init::tests::embedded_template_matches_workspace_canonical fails on default cargo test -p cloud --lib (228/229). Pre-existing template drift between .yah/infra/cloud-init/mirror.yml (modified, unstaged) and the embedded crates/yah/cloud/templates/mirror.yml — unrelated to T5; do not regress it but don't try to fix from this ticket either.")
 
 use super::{
     BucketAcl, BucketRef, Location, MachineProvider, ProjectId, ServerId, ServerSpec, ServerStatus,

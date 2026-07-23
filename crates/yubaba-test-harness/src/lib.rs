@@ -30,7 +30,7 @@
 //!   nodes. Fast, no credentials, no billing.
 //! - **`YAH_SMOKE=1`** → smoke tier: provisions real Hetzner machines via
 //!   `provider`, waits for yubaba to become healthy on each machine. Requires
-//!   `HETZNER_API_TOKEN`, `YAH_WARDEN_URL`, `YAH_WARDEN_SHA256`.
+//!   `HETZNER_API_TOKEN`, `YAH_YUBABA_URL`, `YAH_YUBABA_SHA256`.
 //!
 //! ## Multi-node raft (local tier)
 //!
@@ -69,6 +69,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use cloud::provider::{MachineProvider, ServerId};
+use openraft::async_runtime::watch::WatchReceiver;
 use openraft::BasicNode;
 use workload_spec::{MeshIdent, WorkloadSpec};
 
@@ -260,7 +261,7 @@ struct ClusterNode {
     /// Raft node handle, stored for `initialize()` during bootstrap and
     /// `metrics()` queries for leader detection. `None` for smoke tier or
     /// single-node local clusters.
-    raft: Option<yubaba::raft::WardenRaft>,
+    raft: Option<yubaba::raft::YubabaRaft>,
     /// Raft persistence directory (local tier, multi-node). Used by
     /// `restart_node` to re-open the raft node from persisted state.
     raft_dir: Option<PathBuf>,
@@ -414,7 +415,7 @@ impl Cluster {
         });
 
         // Wait for the restarted server to respond.
-        wait_for_warden_health(&format!("http://127.0.0.1:{port}"))
+        wait_for_yubaba_health(&format!("http://127.0.0.1:{port}"))
             .await
             .with_context(|| format!("restart_node: health check for node {idx}"))?;
 
@@ -450,7 +451,7 @@ impl Cluster {
     pub fn current_leader_idx(&self) -> Option<usize> {
         for node in &self.nodes {
             if let Some(raft) = &node.raft {
-                let metrics = raft.metrics().borrow().clone();
+                let metrics = raft.metrics().borrow_watched().clone();
                 if let Some(leader_node_id) = metrics.current_leader {
                     // node_id is 1-indexed: node 0 → id 1.
                     let leader_idx = (leader_node_id as usize).saturating_sub(1);
@@ -499,7 +500,7 @@ impl Drop for Cluster {
 ///
 /// When `YAH_SMOKE=1` is set: provisions real Hetzner machines via `provider`,
 /// boots yubaba via cloud-init, waits for each node's `/health`. Requires
-/// `HETZNER_API_TOKEN`, `YAH_WARDEN_URL`, `YAH_WARDEN_SHA256` in the
+/// `HETZNER_API_TOKEN`, `YAH_YUBABA_URL`, `YAH_YUBABA_SHA256` in the
 /// environment. Prints a cost estimate before provisioning.
 ///
 /// Otherwise (local tier): starts yubaba in-process on random loopback ports.
@@ -533,7 +534,7 @@ where
 /// for a leader to be elected.
 ///
 /// Raft messages flow over HTTP between the in-process servers. The raft network
-/// uses `BasicNode.addr` = `"127.0.0.1:{port}"` which the `WardenNetworkFactory`
+/// uses `BasicNode.addr` = `"127.0.0.1:{port}"` which the `YubabaNetworkFactory`
 /// wraps as `"http://127.0.0.1:{port}"`.
 async fn test_cluster_local<R>(runtime: R, nodes: usize) -> Result<Cluster>
 where
@@ -547,7 +548,7 @@ where
 
     let mut tmp_dirs: Vec<tempfile::TempDir> = Vec::with_capacity(nodes);
     let mut ports: Vec<u16> = Vec::with_capacity(nodes);
-    let mut raft_nodes: Vec<Option<yubaba::raft::WardenRaft>> = Vec::with_capacity(nodes);
+    let mut raft_nodes: Vec<Option<yubaba::raft::YubabaRaft>> = Vec::with_capacity(nodes);
     let mut listeners: Vec<tokio::net::TcpListener> = Vec::with_capacity(nodes);
     let mut state_paths: Vec<PathBuf> = Vec::with_capacity(nodes);
     let mut raft_dirs: Vec<Option<PathBuf>> = Vec::with_capacity(nodes);
@@ -676,7 +677,7 @@ where
             }
             for node in &cluster_nodes {
                 if let Some(raft) = &node.raft {
-                    if raft.metrics().borrow().current_leader.is_some() {
+                    if raft.metrics().borrow_watched().current_leader.is_some() {
                         break 'election;
                     }
                 }
@@ -697,18 +698,18 @@ where
 
 /// Provision real Hetzner machines for the smoke tier.
 ///
-/// Required env vars: `HETZNER_API_TOKEN`, `YAH_WARDEN_URL`,
-/// `YAH_WARDEN_SHA256`. Missing any of them causes an immediate error.
+/// Required env vars: `HETZNER_API_TOKEN`, `YAH_YUBABA_URL`,
+/// `YAH_YUBABA_SHA256`. Missing any of them causes an immediate error.
 /// Cost estimate is printed before provisioning.
 async fn test_cluster_smoke<P>(provider: &P, nodes: usize) -> Result<Cluster>
 where
     P: MachineProvider + Clone + Send + Sync + 'static,
 {
     // Gate: all required secrets must be present before we spend money.
-    let warden_url = std::env::var("YAH_WARDEN_URL")
-        .context("YAH_WARDEN_URL required for smoke tier (URL to the yubaba binary)")?;
-    let warden_sha256 = std::env::var("YAH_WARDEN_SHA256")
-        .context("YAH_WARDEN_SHA256 required for smoke tier (SHA256 of yubaba binary)")?;
+    let yubaba_url = std::env::var("YAH_YUBABA_URL")
+        .context("YAH_YUBABA_URL required for smoke tier (URL to the yubaba binary)")?;
+    let yubaba_sha256 = std::env::var("YAH_YUBABA_SHA256")
+        .context("YAH_YUBABA_SHA256 required for smoke tier (SHA256 of yubaba binary)")?;
 
     // Print cost estimate before spinning anything.
     eprintln!(
@@ -730,7 +731,7 @@ where
     for i in 0..nodes {
         let name = format!("yah-smoke-{}-n{i}", std::process::id());
 
-        let user_data = build_smoke_cloud_init(&warden_url, &warden_sha256, &name);
+        let user_data = build_smoke_cloud_init(&yubaba_url, &yubaba_sha256, &name);
         let spec = cloud::provider::ServerSpec {
             name: name.clone(),
             server_type: "cpx11".into(),
@@ -751,7 +752,7 @@ where
             .with_context(|| format!("waiting for IP on node {i}"))?;
         let base_url = format!("http://{ip}:7443");
 
-        wait_for_warden_health(&base_url)
+        wait_for_yubaba_health(&base_url)
             .await
             .with_context(|| format!("waiting for yubaba health on node {i}"))?;
 
@@ -795,15 +796,15 @@ where
 }
 
 /// Build a minimal cloud-init user_data string that downloads and starts yubaba.
-fn build_smoke_cloud_init(warden_url: &str, warden_sha256: &str, name: &str) -> String {
+fn build_smoke_cloud_init(yubaba_url: &str, yubaba_sha256: &str, name: &str) -> String {
     format!(
         "#cloud-config\n\
          hostname: {name}\n\
          packages:\n\
            - curl\n\
          runcmd:\n\
-           - ['sh', '-c', 'curl -fsSL {warden_url} -o /usr/local/bin/yah-yubaba && \
-              echo \"{warden_sha256}  /usr/local/bin/yah-yubaba\" | sha256sum -c && \
+           - ['sh', '-c', 'curl -fsSL {yubaba_url} -o /usr/local/bin/yah-yubaba && \
+              echo \"{yubaba_sha256}  /usr/local/bin/yah-yubaba\" | sha256sum -c && \
               chmod +x /usr/local/bin/yah-yubaba']\n\
            - ['sh', '-c', 'nohup /usr/local/bin/yah-yubaba serve --bind 0.0.0.0:7443 \
               > /var/log/yah-yubaba.log 2>&1 &']\n"
@@ -827,7 +828,7 @@ async fn wait_for_server_ip<P: MachineProvider>(provider: &P, name: &str) -> Res
 }
 
 /// Poll `GET /health` until it returns 200 or the deadline expires.
-async fn wait_for_warden_health(base_url: &str) -> Result<()> {
+async fn wait_for_yubaba_health(base_url: &str) -> Result<()> {
     let client = reqwest::Client::new();
     let url = format!("{base_url}/health");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(180);

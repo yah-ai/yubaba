@@ -3,53 +3,9 @@
 //! @yah:status(open)
 //! @arch:see(.yah/docs/working/W144-envoy-providers-and-tiering.md)
 //!
-//! @yah:ticket(R409-T2, "Define Tier enum and InternalVerb type/schema")
-//! @yah:assignee(agent:claude)
-//! @yah:at(2026-06-02T20:58:52Z)
-//! @yah:status(review)
-//! @yah:phase(P1)
-//! @yah:parent(R409)
-//! @yah:depends_on(R409-T1)
-//! @yah:handoff("Landed envoy framework types in crates/yah/cloud/src/envoy.rs. Tier (S/A/B, lowercase serde, exhaustive per W144 'three tiers, roughly fixed'); AdapterFlavor (Native/OpenApiBound/McpBridged/Synthetic per D3, snake_case serde, #[non_exhaustive]); VerbCategory (Cloud/Dns/Observability/Ci/Payments/Messaging, lowercase serde, #[non_exhaustive] per W144 'catalog is not exhaustive and not closed'). InternalVerb trait stays schema-agnostic (Input: DeserializeOwned, Output: Serialize) so the cloud crate's runtime binary deps don't pull schemars unconditionally — matches the existing json-schema feature gate convention. VerbDescriptor::new takes hand-supplied schemas (debug-asserts id prefix matches category); VerbDescriptor::for_verb<V>() is feature-gated on json-schema and derives input/output schemas via schemars::schema_for!. Module is exported as pub mod envoy from cloud/src/lib.rs. 6 unit tests pass on default features; 7th (for_verb_derives_schemas) passes under --features json-schema. No verbs defined yet — that's R409-T3 (cloud.vps.* signatures only, gated on T11 postmortem).")
-//! @yah:verify("cargo test -p cloud --lib --features json-schema envoy")
 //!
-//! @yah:ticket(R409-T3, "Verb catalog spike scope: cloud.vps.* signatures only (gate full catalog on T11 postmortem)")
-//! @yah:assignee(agent:claude)
-//! @yah:at(2026-06-02T20:58:56Z)
-//! @yah:status(review)
-//! @yah:phase(P1)
-//! @yah:parent(R409)
-//! @yah:depends_on(R409-T2)
-//! @yah:handoff("Spike catalog landed: cloud.vps.create / cloud.vps.destroy / cloud.vps.status in crates/yah/cloud/src/envoy/cloud_vps.rs. Each is a marker struct impl InternalVerb with paired Input/Output structs deriving Serialize+Deserialize unconditionally and schemars::JsonSchema under the json-schema feature — same gating convention as the rest of the cloud crate. Scope stuck to W144's explicit three ('already partially present in MachineProvider'); find_server_by_name + snapshot/resize stay out per the spike framing. Wire types are deliberately separate from the in-crate domain types (ServerSpec/ServerStatus) — that boundary is what lets DigitalOcean's T10 spike validate the shape without leaking Hetzner specifics. VpsPhase is a closed enum (initializing/starting/running/stopping/off/deleting/unknown); vendor-detail strings ride in an optional detail field instead of polluting the variant set. Added pub mod cloud_vps to envoy.rs. 10 new unit tests including round-trips and feature-gated schema emission via VerbDescriptor::for_verb. All 16 envoy::* tests pass on --features json-schema; the 9 default-feature tests pass without schemars.")
-//! @yah:verify("cargo test -p cloud --lib --features json-schema envoy")
 //!
-//! @yah:ticket(R409-T10, "DigitalOcean cloud.vps.* spike adapter (native, pre-envoy-host) — second-provider validator for catalog shape")
-//! @yah:assignee(agent:claude)
-//! @yah:at(2026-06-02T21:05:50Z)
-//! @yah:status(review)
-//! @yah:phase(P2)
-//! @yah:parent(R409)
-//! @yah:depends_on(R409-T5)
-//! @yah:handoff("Spike DigitalOcean adapter landed at crates/yah/cloud/src/provider/digitalocean.rs. Two artifacts: (1) a minimal DigitalOceanClient (reqwest, bearer auth, three droplet endpoints — POST /v2/droplets, GET /v2/droplets/{id}, DELETE /v2/droplets/{id}) and (2) DigitalOceanEnvoy wrapping Arc<client> implementing EnvoyAdapter with id=digitalocean, tier=S, flavor=Native, supported_verb_ids=[cloud.vps.create, cloud.vps.destroy, cloud.vps.status]. No parallel MachineProvider impl — DO never had one and the spike skipped it, which itself is T11 evidence that EnvoyAdapter is the spine and MachineProvider is the retiring abstraction. Pure conversion helpers (do_region, do_status_to_output, parse_droplet_id) are unit-tested without network. 13 new tests pass under --features json-schema; combined envoy + hetzner_envoy + digitalocean suite is 32/32 green (was 19/19 before T10).")
-//! @yah:handoff("Catalog-shape findings written into .yah/envoys/digitalocean/sketch.md §'Catalog-shape findings (input for R409-T11 postmortem)'. Five points for T11 to react to: (1) status taxonomy mismatch — DO has 4 phases vs the wire's 7; closed-enum + Unknown(detail) shape absorbs it cleanly. (2) Location codes are too Hetzner-centric — pdx/iad/fsn map to Hetzner cities; DO has no Hillsboro region so the spike maps pdx→sfo3 (San Francisco, ~1000km off). T11 should decide: keep with documented 'nearest' semantics, re-shape as continent+ocean_hint, or per-provider region passthrough. (3) `project` field is opaque on both adapters — Hetzner because tokens are project-scoped, DO because Projects are a decoupled post-create resource; the wire field is currently a vestige and T11 should decide whether to delete it or grow a real cloud.project.* verb tree. (4) `ssh_keys: Vec<u64>` closes a door DO leaves open (DO accepts fingerprints too); probably want Vec<String> or an enum. (5) The two-layer EnvoyAdapter pattern held under refactor pressure — Hetzner has MachineProvider underneath, DO does not, and both present the same EnvoyAdapter surface; good evidence for R409-T9's retirement plan.")
-//! @yah:handoff("Also updated .yah/envoys/README.md provider list (DigitalOcean row now points at sketch.md + the spike adapter) and seeded crates/yah/cloud/src/provider/mod.rs with pub mod digitalocean + re-exports of DigitalOceanClient, DigitalOceanEnvoy, DoCreateDropletSpec. Spike is pre-envoy-host — nothing wires DigitalOceanEnvoy through KgToolRegistry (that's R409-T9 after T11 decides whether to keep the shape).")
-//! @yah:handoff("End-state: T11 (Catalog-shape postmortem) is the natural next ticket — it depends on T10 and is OPEN; it's the decision gate for whether to accept the current cloud.vps.* shape (Option A — proceed to T6/T7/T8/T12), revise it (Option B — fix items 2/3/4 from the findings then proceed), or redesign it (Option C — back to W144). The sketch's findings section is the agenda T11 should work through.")
-//! @yah:verify("cargo test -p cloud --lib --features json-schema -- envoy provider::hetzner_envoy provider::digitalocean — 32/32 pass (19 inherited + 13 new for DO)")
-//! @yah:verify("Read .yah/envoys/digitalocean/sketch.md §'Catalog-shape findings' and confirm the five points are the right T11 agenda before unblocking T11")
-//! @yah:gotcha("cloud_init::tests::embedded_template_matches_workspace_canonical still fails on default cargo test -p cloud --lib (245/246). Same pre-existing template drift R409-T5 flagged — .yah/infra/cloud-init/mirror.yml vs crates/yah/cloud/templates/mirror.yml. Not regressed by T10 but not fixed either; needs its own ticket.")
-//! @yah:gotcha("DigitalOceanClient is pre-envoy-host scaffolding — no integration test hits a real DO endpoint. If a future ticket wires it live, the spike's HTTP error handling does not yet honor 429 Retry-After (DO rate-limits at 5000 req/hour per token) and POST /droplets with ssh_keys=[] will be rejected by DO (vs Hetzner's email-the-password fallback) — both noted in the sketch's 'Known traps & gotchas'.")
 //!
-//! @yah:ticket(R409-T12, "Expand verb catalog signatures: dns.*, observability.*, ci.*, payments.*, messaging.* (gated on T11 outcome)")
-//! @yah:assignee(agent:claude)
-//! @yah:at(2026-06-02T21:06:04Z)
-//! @yah:status(review)
-//! @yah:phase(P3)
-//! @yah:parent(R409)
-//! @yah:depends_on(R409-T11)
-//! @yah:handoff("Expanded verb catalog with four new category modules (R409-T12). dns.* was already defined in T6; this ticket covers the remaining four from W144 §'What the internal contract covers'. New files: envoy/observability.rs (5 verbs: alert.list, alert.ack, incident.open, incident.close, dashboard.snapshot — exemplar providers PagerDuty/Grafana/Datadog), envoy/ci.rs (3 verbs: pipeline.run, pipeline.status, artifact.fetch — GitHub Actions/GitLab/CircleCI; note 'ref' renamed to git_ref in Rust with #[serde(rename)]), envoy/payments.rs (3 verbs: charge.create, subscription.upsert, webhook.verify — Stripe/Lemon Squeezy/Paddle; webhook.verify is pure HMAC, no network call), envoy/messaging.rs (3 verbs: email.send, sms.send, webhook.dispatch — Resend/Twilio/plain HTTP). All four registered in envoy.rs pub mod block. Each file follows the cloud_vps.rs pattern: marker structs, typed Input/Output with serde + feature-gated schemars::JsonSchema, unit tests. No adapters — catalog shapes only; adapters land when a tier-A/B provider is onboarded. NOTE: crates/yah/yubaba/Cargo.toml references a missing integration test file (integration_ownership_smoke.rs) breaking workspace parse. All verification commands fail. Code follows established patterns from previously-verified modules.")
-//! @yah:verify("cargo test -p cloud --lib --features json-schema -- envoy::observability envoy::ci envoy::payments envoy::messaging — all pass (once yubaba/Cargo.toml workspace issue is resolved)")
-//! @yah:verify("cargo check -p cloud --features json-schema — clean")
-//! @yah:gotcha("Workspace broken: crates/yah/yubaba/Cargo.toml references tests/integration_ownership_smoke.rs which does not exist. All cargo commands fail until that file is created or the [[test]] entry is removed.")
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -76,6 +32,25 @@ pub use hetzner_envoy::HetznerEnvoy;
 
 pub mod digitalocean;
 pub use digitalocean::{DigitalOceanClient, DigitalOceanEnvoy, DoCreateDropletSpec};
+
+// R594-F5: `floating_ip.*` envoy verb — raft `ingress_owner` follow-placement
+// for sovereign-tier public ingress (W267 §Tier 1). `floating_ip` holds the
+// provider-abstracted trait + idempotent reconcile core; the three
+// `*_floating_ip` modules are the Hetzner/OVH/Vultr adapters.
+pub mod floating_ip;
+pub use floating_ip::{
+    on_ingress_owner_changed, reconcile_assignment, FloatingIpAssignOutcome, FloatingIpProvider,
+    FloatingIpState, FloatingIpTarget,
+};
+
+pub mod hetzner_floating_ip;
+pub use hetzner_floating_ip::HetznerFloatingIp;
+
+pub mod ovh_floating_ip;
+pub use ovh_floating_ip::OvhFloatingIp;
+
+pub mod vultr_floating_ip;
+pub use vultr_floating_ip::VultrFloatingIp;
 
 #[cfg(feature = "local-docker")]
 pub mod local_docker;

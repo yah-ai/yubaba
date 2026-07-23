@@ -10,6 +10,8 @@
 //! carry `[[routes]]`) are out of scope for this module; they get DNS +
 //! route management through the Worker reconciler.
 
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use tracing::{debug, info};
 
@@ -20,29 +22,26 @@ use crate::CloudflareClient;
 /// state (CF reflects newly-added bindings as `enabled: true` immediately;
 /// disabling is an explicit dashboard action we don't undo here).
 ///
-/// Resolves the Cloudflare API token from the `cloudflare-api-token`
-/// keystore slot (or `CLOUDFLARE_API_TOKEN` env). Mirrors the list-first
-/// pattern of `static_asset::ensure_r2_bucket` so the apply loop is safe
-/// to re-run.
+/// Resolves account_id + the Cloudflare API token from the named provider
+/// (`.yah/infra/providers/<provider_id>.toml`, see
+/// [`super::cf_creds::CfProvider`]). Mirrors the list-first pattern of
+/// `static_asset::ensure_r2_bucket` so the apply loop is safe to re-run.
 ///
 /// Required token scopes: `Workers R2 Storage: Edit` and `Zone: Read`
 /// (the latter because the API requires the zone id of the parent zone —
 /// CF writes the CNAME there). The caller does NOT need `DNS: Edit`; CF
 /// provisions the record itself when the binding is created.
 pub async fn ensure_r2_custom_domain(
-    account_id: &str,
+    workspace_root: &Path,
+    provider_id: &str,
     bucket_name: &str,
     domain: &str,
 ) -> Result<()> {
-    let api_token = fob::get_or_env("cloudflare-api-token", "CLOUDFLARE_API_TOKEN")
-        .context("resolving cloudflare-api-token")?
-        .context(
-            "cloudflare-api-token not found — set via `yah keys set cloudflare-api-token` \
-             or export CLOUDFLARE_API_TOKEN",
-        )?;
-    let cf = CloudflareClient::new(api_token);
+    let cf_provider = super::cf_creds::CfProvider::resolve(workspace_root, provider_id)?;
+    let account_id = cf_provider.account_id.clone();
+    let cf = CloudflareClient::new(cf_provider.api_token()?);
     let existing = cf
-        .list_r2_custom_domains(account_id, bucket_name)
+        .list_r2_custom_domains(&account_id, bucket_name)
         .await
         .with_context(|| format!("listing R2 custom domains on bucket {bucket_name:?}"))?;
     if existing.iter().any(|d| d.domain == domain) {
@@ -57,7 +56,7 @@ pub async fn ensure_r2_custom_domain(
         .zone_id_for_name(zone_name)
         .await
         .with_context(|| format!("resolving zone id for {zone_name:?}"))?;
-    cf.add_r2_custom_domain(account_id, bucket_name, domain, &zone_id)
+    cf.add_r2_custom_domain(&account_id, bucket_name, domain, &zone_id)
         .await
         .with_context(|| format!("binding R2 custom domain {domain:?} → bucket {bucket_name:?}"))?;
     info!(domain, bucket_name, zone_name, "R2 custom domain bound");
@@ -191,14 +190,14 @@ pub fn plan_domain_worker(
 /// must target `net.yah.dev`, not `yah.dev`. Before this goes live, swap in a
 /// longest-suffix match against the account's zones (the upgrade path
 /// `parent_zone_name`'s doc already names). Tracked on R561-F3.
-pub async fn deploy_domain_worker(account_id: &str, plan: &DomainWorkerPlan) -> Result<()> {
-    let api_token = fob::get_or_env("cloudflare-api-token", "CLOUDFLARE_API_TOKEN")
-        .context("resolving cloudflare-api-token")?
-        .context(
-            "cloudflare-api-token not found — set via `yah keys set cloudflare-api-token` \
-             or export CLOUDFLARE_API_TOKEN",
-        )?;
-    let cf = CloudflareClient::new(api_token);
+pub async fn deploy_domain_worker(
+    workspace_root: &Path,
+    provider_id: &str,
+    plan: &DomainWorkerPlan,
+) -> Result<()> {
+    let cf_provider = super::cf_creds::CfProvider::resolve(workspace_root, provider_id)?;
+    let account_id = cf_provider.account_id.clone();
+    let cf = CloudflareClient::new(cf_provider.api_token()?);
 
     let worker_bindings: Vec<WorkerBinding<'_>> = plan
         .bindings
@@ -210,7 +209,7 @@ pub async fn deploy_domain_worker(account_id: &str, plan: &DomainWorkerPlan) -> 
         .collect();
 
     cf.deploy_worker_script(
-        account_id,
+        &account_id,
         &plan.worker_name,
         WORKER_SCRIPT,
         &worker_bindings,
@@ -224,7 +223,7 @@ pub async fn deploy_domain_worker(account_id: &str, plan: &DomainWorkerPlan) -> 
         .zone_id_for_name(zone)
         .await
         .with_context(|| format!("resolving zone id for {zone:?}"))?;
-    cf.upsert_worker_custom_domain(account_id, &zone_id, &plan.custom_domain, &plan.worker_name)
+    cf.upsert_worker_custom_domain(&account_id, &zone_id, &plan.custom_domain, &plan.worker_name)
         .await
         .with_context(|| {
             format!(

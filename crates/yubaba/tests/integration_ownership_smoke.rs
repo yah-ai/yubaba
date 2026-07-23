@@ -49,12 +49,12 @@ use pasetors::keys::{AsymmetricKeyPair, AsymmetricPublicKey, Generate};
 use pasetors::token::{Public, UntrustedToken};
 use pasetors::version4::{PublicToken, V4};
 
-use yubaba::cheers_client::{CheersClient, CheersConfig};
 use kamaji::fake::FakeRuntime;
 use workload_spec::{
     ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, ResourceLimits, RestartPolicy,
     SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
 };
+use yubaba::cheers_client::{CheersClient, CheersConfig};
 
 // ── Cheers mock ────────────────────────────────────────────────────────────
 
@@ -197,6 +197,8 @@ fn mesh_only_spec(name: &str) -> WorkloadSpec {
             digest: workload_spec::testing::test_digest(),
         },
         tier: TierTag("private".into()),
+        tenant: workload_spec::TenantId::singleton(),
+        namespace: workload_spec::NamespaceId::singleton(),
         replicas: 1,
         command: None,
         entrypoint: None,
@@ -207,12 +209,13 @@ fn mesh_only_spec(name: &str) -> WorkloadSpec {
         volumes: vec![],
         resources: ResourceLimits {
             memory_mb: 64,
-            cpu_shares: 128,
+            cpu_millis: 128,
             ephemeral_storage_mb: 128,
         },
         depends_on: vec![],
         healthcheck: None,
         restart_policy: RestartPolicy::Always,
+        archetype: None,
         stop_policy: StopPolicy {
             signal: 15,
             grace_period: Millis::from_secs(5),
@@ -318,7 +321,11 @@ async fn deploy_registers_then_destroy_revokes() {
 
     // ── Assert the POST /ownership the mock saw is the canonical shape ──
     let posts = mock.posts().await;
-    assert_eq!(posts.len(), 1, "cheers must receive exactly one POST /ownership");
+    assert_eq!(
+        posts.len(),
+        1,
+        "cheers must receive exactly one POST /ownership"
+    );
     let post = &posts[0];
 
     let posted = post.body.as_ref().unwrap();
@@ -391,20 +398,23 @@ async fn second_deploy_writes_a_distinct_row() {
     for name in ["svc-first", "svc-second"] {
         let app = yubaba::build_router(state.clone());
         let spec = mesh_only_spec(name);
-        let resp = deploy_with_attribution(
-            app,
-            &spec,
-            Some("camp:C-acme"),
-            Some("user:U-operator"),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::CREATED, "deploy {name} must succeed");
+        let resp =
+            deploy_with_attribution(app, &spec, Some("camp:C-acme"), Some("user:U-operator")).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "deploy {name} must succeed"
+        );
     }
 
     let posts = mock.posts().await;
     assert_eq!(posts.len(), 2, "cheers should see one POST per deploy");
-    let id_a = posts[0].body.as_ref().unwrap()["resource_id"].as_str().unwrap();
-    let id_b = posts[1].body.as_ref().unwrap()["resource_id"].as_str().unwrap();
+    let id_a = posts[0].body.as_ref().unwrap()["resource_id"]
+        .as_str()
+        .unwrap();
+    let id_b = posts[1].body.as_ref().unwrap()["resource_id"]
+        .as_str()
+        .unwrap();
     assert_eq!(id_a, "svc-first");
     assert_eq!(id_b, "svc-second");
 
@@ -436,7 +446,12 @@ async fn deploy_without_camp_id_skips_register() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     assert_eq!(mock.posts().await.len(), 0, "no camp_id ⇒ no cheers write");
-    assert!(state.ownership_rows.lock().unwrap().get("svc-anon").is_none());
+    assert!(state
+        .ownership_rows
+        .lock()
+        .unwrap()
+        .get("svc-anon")
+        .is_none());
 }
 
 /// When cheers's `/ownership` is down, the workload still deploys (yubaba
@@ -446,21 +461,14 @@ async fn deploy_without_camp_id_skips_register() {
 #[tokio::test]
 async fn register_failure_does_not_tear_down_workload() {
     let (cheers_url, mock, kp) = spawn_cheers_mock_with_keypair().await;
-    *mock.fail_post.lock().await = Some((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "cheers booting".into(),
-    ));
+    *mock.fail_post.lock().await =
+        Some((StatusCode::INTERNAL_SERVER_ERROR, "cheers booting".into()));
     let (_tmp, state) = fresh_warden(&cheers_url, &kp);
     let app = yubaba::build_router(state.clone());
 
     let spec = mesh_only_spec("svc-resilient");
-    let resp = deploy_with_attribution(
-        app,
-        &spec,
-        Some("camp:C-acme"),
-        Some("user:U-operator"),
-    )
-    .await;
+    let resp =
+        deploy_with_attribution(app, &spec, Some("camp:C-acme"), Some("user:U-operator")).await;
     // Deploy still succeeds — workload is up, ownership row missing.
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = body_json(resp).await;

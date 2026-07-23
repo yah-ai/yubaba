@@ -73,11 +73,17 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
+use workload_spec::{NamespaceId, TenantId};
+
 use crate::{GitSource, MirrorConfig, MirrorProviderSlot, ServiceComponent, ServiceConfig};
 
+pub(crate) mod cf_creds;
+pub mod bundle_store;
 pub mod cloudflare_worker;
+pub mod container;
 pub mod derive_cache_prune;
 pub mod domain;
+pub mod mesofact_bundle;
 pub mod mesofact_runner;
 pub mod mesofact_static;
 pub mod pond;
@@ -90,12 +96,18 @@ pub mod sync_status;
 #[cfg(test)]
 mod lowering_golden;
 
+pub use bundle_store::{publish_bundle_to_r2, PublishReport as BundlePublishReport};
 pub use cloudflare_worker::CloudflareWorkerReconciler;
+pub use container::{ContainerOptions, ContainerReconciler};
 pub use derive_cache_prune::{
     collect_live_derive_hashes, compute_derive_cache_candidates, execute_derive_cache_prune,
     DeriveCacheLiveHashes, DerivePruneCandidate,
 };
 pub use domain::ensure_r2_custom_domain;
+pub use mesofact_bundle::{
+    resolve_bundle_machines, BundleSlot, MesofactBundleReconciler,
+    SLOT_ROLE as BUNDLE_SLOT_ROLE,
+};
 pub use mesofact_runner::{resolve_runner_machine, MesofactRunnerReconciler};
 pub use mesofact_static::{LocalStaticOptions, MesofactStaticReconciler};
 pub use pond::{PondOptions, PondState};
@@ -160,6 +172,36 @@ impl LogBuffer {
     }
 }
 
+/// The `(tenant, namespace)` a bring-up is scoped to (W206). Reconcilers that
+/// touch a credentialed provider resolve it at this scope
+/// ([`CfProvider::resolve_scoped`](super::reconciler::cf_creds)) so a namespace's
+/// Cloudflare zone/account/keystore slots come from its own scope rather than the
+/// workspace-global defaults. Defaults to the singleton `(default, default)`,
+/// which collapses every scoped lookup back to the historical global slots — so
+/// single-namespace deployments are unaffected.
+#[derive(Debug, Clone)]
+pub struct ProviderScope {
+    pub tenant: TenantId,
+    pub namespace: NamespaceId,
+}
+
+impl ProviderScope {
+    /// The degenerate single-tenant / single-namespace scope. Scoped provider
+    /// lookups made against it resolve to the pre-W206 global keystore slots.
+    pub fn singleton() -> Self {
+        Self {
+            tenant: TenantId::singleton(),
+            namespace: NamespaceId::singleton(),
+        }
+    }
+}
+
+impl Default for ProviderScope {
+    fn default() -> Self {
+        Self::singleton()
+    }
+}
+
 /// Inputs a reconciler sees for one bring-up.
 pub struct ReconcileCtx<'a> {
     /// Workspace root (parent of `.yah/`). Used to resolve relative paths
@@ -173,6 +215,9 @@ pub struct ReconcileCtx<'a> {
     pub mirror: &'a MirrorConfig,
     /// Environment name (file stem of `mirrors/<env>.toml`).
     pub env: &'a str,
+    /// `(tenant, namespace)` this bring-up is scoped to (W206). Credentialed
+    /// providers resolve at this scope; defaults to [`ProviderScope::singleton`].
+    pub scope: ProviderScope,
 }
 
 impl<'a> ReconcileCtx<'a> {
@@ -540,6 +585,7 @@ mod source_seam_tests {
             name: "scrabcake".into(),
             domain: "scrabcake.example".into(),
             components: vec![comp],
+            db: crate::DbCatalog::default(),
         }
     }
 
@@ -559,6 +605,7 @@ mod source_seam_tests {
             component: &svc.components[0],
             mirror: mir,
             env: "dev",
+            scope: ProviderScope::singleton(),
         }
     }
 

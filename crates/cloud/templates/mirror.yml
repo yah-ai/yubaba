@@ -3,12 +3,12 @@
 #
 # Substitutions (written as {{ KEY }} with inner spaces so these docs survive rendering):
 #   {{ MACHINE_NAME }}           — machine name from .yah/cloud/machines/<name>.toml
-#   {{ YAH_WARDEN_URL }}         — HTTPS URL of the yah-yubaba release tar.gz
+#   {{ YAH_YUBABA_URL }}         — HTTPS URL of the yah-yubaba release tar.gz
 #                                  (published by .github/workflows/release.yml per musl target;
 #                                  R406-T13: now also contains the kamaji binary +
 #                                  yubaba.service + kamaji.service + yubaba.slice)
-#   {{ YAH_WARDEN_SHA256 }}      — lowercase hex sha256 of the tar.gz at YAH_WARDEN_URL
-#   {{ WARDEN_CHANNEL }}         — release channel: stable | beta
+#   {{ YAH_YUBABA_SHA256 }}      — lowercase hex sha256 of the tar.gz at YAH_YUBABA_URL
+#   {{ YUBABA_CHANNEL }}         — release channel: stable | beta
 #   {{ CONTAINERD_VERSION }}     — containerd apt version pin (e.g. 1.7.2~3-0~debian-bookworm);
 #                                  use DEFAULT_CONTAINERD_VERSION constant for Phase 1 baseline
 #   {{ HEADSCALE_PREAUTH_KEY }}  — Tailscale/Headscale pre-auth key (consumed once at join)
@@ -23,12 +23,12 @@
 #                                  when machine.hosts_operator_bridge = true; empty otherwise
 #   {{ COSIGN_VERIFY_BLOCK }}    — cosign install + `cosign verify-blob` of the yubaba tarball
 #                                  against a pinned GitHub-OIDC identity-regexp when
-#                                  warden_cosign_identity_regexp is set (R330-F19/F20); empty
+#                                  yubaba_cosign_identity_regexp is set (R330-F19/F20); empty
 #                                  string otherwise (sha256 verify stays as the trust gate)
 #
 # The yubaba tarball is curl-fetched at boot (not base64-embedded) because Hetzner caps
 # user_data at 32 KiB (R040-F11). The runcmd verifies sha256, extracts, and installs
-# /usr/local/bin/yah-yubaba + /usr/local/bin/kamaji + three systemd units under
+# /usr/local/bin/yubaba + /usr/local/bin/kamaji + three systemd units under
 # /etc/systemd/system/ before the systemd hand-off.
 #
 # Supervision model (W154, R406-T13): yubaba.service and kamaji.service are sibling
@@ -67,18 +67,18 @@ runcmd:
   - apt-get install -y containerd
   - systemctl enable --now containerd
   # Yubaba + kamaji bundle — fetch + verify + install (R406-T13).
-  # The tarball contains: yah-yubaba, kamaji, yubaba.service, kamaji.service,
+  # The tarball contains: yubaba, kamaji, yubaba.service, kamaji.service,
   # yubaba.slice. cloud-init lays the binaries under /usr/local/bin and the units
   # under /etc/systemd/system/ before systemctl daemon-reload.
-  - curl -fsSL -o /tmp/yah-yubaba.tar.gz {{YAH_WARDEN_URL}}
-  # cosign verify-blob — primary trust gate when warden_cosign_identity_regexp is
+  - curl -fsSL -o /tmp/yah-yubaba.tar.gz {{YAH_YUBABA_URL}}
+  # cosign verify-blob — primary trust gate when yubaba_cosign_identity_regexp is
   # set (R330-F19/F20). sha256 line below stays as a redundant integrity check.
 {{COSIGN_VERIFY_BLOCK}}
-  - sh -c 'echo "{{YAH_WARDEN_SHA256}}  /tmp/yah-yubaba.tar.gz" | sha256sum -c -'
+  - sh -c 'echo "{{YAH_YUBABA_SHA256}}  /tmp/yah-yubaba.tar.gz" | sha256sum -c -'
   - tar -xzf /tmp/yah-yubaba.tar.gz -C /tmp
-  - sh -c 'cp /tmp/yubaba-*/yah-yubaba /usr/local/bin/yah-yubaba'
+  - sh -c 'cp /tmp/yubaba-*/yubaba /usr/local/bin/yubaba'
   - sh -c 'cp /tmp/yubaba-*/kamaji /usr/local/bin/kamaji'
-  - chmod +x /usr/local/bin/yah-yubaba /usr/local/bin/kamaji
+  - chmod +x /usr/local/bin/yubaba /usr/local/bin/kamaji
   - sh -c 'cp /tmp/yubaba-*/yubaba.slice /etc/systemd/system/yubaba.slice'
   - sh -c 'cp /tmp/yubaba-*/kamaji.service /etc/systemd/system/kamaji.service'
   - sh -c 'cp /tmp/yubaba-*/yubaba.service /etc/systemd/system/yubaba.service'
@@ -87,7 +87,7 @@ runcmd:
   # Channel goes into a drop-in (yubaba.service's ExecStart bakes the default args;
   # the channel is operator-tunable per node).
   - mkdir -p /etc/systemd/system/yubaba.service.d
-  - sh -c 'printf "[Service]\nEnvironment=WARDEN_CHANNEL={{WARDEN_CHANNEL}}\n" > /etc/systemd/system/yubaba.service.d/channel.conf'
+  - sh -c 'printf "[Service]\nEnvironment=YUBABA_CHANNEL={{YUBABA_CHANNEL}}\n" > /etc/systemd/system/yubaba.service.d/channel.conf'
   # Cloudflare Tunnel — public ingress (when machine.cloudflared is set)
 {{CLOUDFLARED_BLOCK}}
   # Operator-bridge — Tailscale mesh access (when machine.hosts_operator_bridge = true)
@@ -98,16 +98,16 @@ runcmd:
   # mesh exists to reach it over (R330-F28 #13).
   - ufw --force enable
   - ufw allow 22/tcp
-{{UFW_WARDEN_RULE}}
+{{UFW_YUBABA_RULE}}
   # Coordinator pre-stage (standalone only) — cloud-init runs unsandboxed at boot,
   # so it lays down the headscale.service unit + opens ufw 80/443 here. yubaba runs
   # under ProtectSystem=strict and CANNOT write /etc/systemd/system or /etc/ufw, so
   # `yah mesh bootstrap` only writes config + `systemctl enable --now headscale`
   # against this pre-staged unit (R330-F28 #15). Empty for joining nodes.
 {{COORDINATOR_PRESTAGE_BLOCK}}
-  # yubaba.service's ReadWritePaths binds /var/lib/yah/yubaba; systemd refuses to
-  # start the unit (226/NAMESPACE) if it doesn't exist, so create it first (R330-T9).
-  - mkdir -p /var/lib/yah/yubaba
+  # /var/lib/yah/yubaba (the secret store, in yubaba.service's ReadWritePaths)
+  # is created by the unit itself via StateDirectory=yah/yubaba (R589-T2), so no
+  # pre-mkdir crutch is needed here — the unit no longer fails 226/NAMESPACE.
   # Bring up the supervision tree (W154 ordering): slice → kamaji → yubaba.
   # kamaji.service has After=yubaba.slice + PartOf=yubaba.slice; yubaba.service
   # has After=kamaji.service + Wants=kamaji.service, so enabling yubaba

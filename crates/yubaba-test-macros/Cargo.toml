@@ -7,6 +7,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+# R542: workspace-internal test crate — stays publish=false permanently.
+# Nothing outside oss/yubaba consumes it, and it has no root [patch.crates-io]
+# entry. Do not flip this when the rest of the workspace publishes.
 publish = false
 description = "Proc macro #[test_with_provider(local, smoke)] — parameterized integration test expansion for yubaba's two-tier test harness."
 
@@ -25,6 +28,6 @@ syn = { version = "2", features = ["full"] }
 # regenerate .expanded.rs golden files after changing the macro output.
 macrotest = "1"
 # Traits and types the fixture files reference.
-cloud = { path = "../cloud", features = ["local-docker"] }
+cloud = { package = "yah-cloud", path = "../cloud", features = ["local-docker"] }
 yubaba = { path = "../yubaba", features = ["containerd-integration", "testing"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

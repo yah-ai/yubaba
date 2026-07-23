@@ -27,6 +27,7 @@ pub mod ci;
 pub mod cloud_object;
 pub mod cloud_vps;
 pub mod dns_record;
+pub mod floating_ip;
 pub mod messaging;
 pub mod observability;
 pub mod payments;
@@ -70,13 +71,22 @@ pub enum AdapterFlavor {
 /// (e.g. `cloud.vps.create`). Marked non-exhaustive: the catalog grows
 /// through diligence/refine (see W144 §"What the internal contract covers").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+// `snake_case` (not `lowercase`) so multi-word variants like `FloatingIp`
+// serialize with the underscore its `as_str()` / verb-id prefix needs
+// (`"floating_ip"`, not `"floatingip"`) — a no-op change for every
+// existing single-word variant (Cloud/Dns/Observability/Ci/Payments/
+// Messaging serialize identically under both).
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum VerbCategory {
     /// `cloud.*` — VPS, object storage, networking, firewalls, load balancers.
     Cloud,
     /// `dns.*` — record CRUD, zone listing.
     Dns,
+    /// `floating_ip.*` — provider floating/reserved-IP assign + status
+    /// (R594-F5: raft `ingress_owner` follow-placement for sovereign-tier
+    /// public ingress, W267 §Tier 1).
+    FloatingIp,
     /// `observability.*` — alerts, incidents, dashboards.
     Observability,
     /// `ci.*` — pipelines, artifacts (external CI; yah's own scheduler is qed).
@@ -93,6 +103,7 @@ impl VerbCategory {
         match self {
             VerbCategory::Cloud => "cloud",
             VerbCategory::Dns => "dns",
+            VerbCategory::FloatingIp => "floating_ip",
             VerbCategory::Observability => "observability",
             VerbCategory::Ci => "ci",
             VerbCategory::Payments => "payments",
@@ -243,6 +254,90 @@ pub trait EnvoyAdapter: Send + Sync {
     async fn dispatch(&self, verb_id: &str, input: serde_json::Value) -> Result<serde_json::Value>;
 }
 
+/// Every [`VerbDescriptor`] for a verb at least one shipped adapter
+/// implements, keyed by [`VerbDescriptor::id`] via the caller.
+///
+/// R409-T9: the host (`KgToolRegistry`) resolves each adapter's
+/// [`EnvoyAdapter::supported_verb_ids`] against this catalog to build the
+/// (schema, dispatch) pair it registers per verb — one call site instead of
+/// every host needing to know the full concrete verb-type list.
+///
+/// Deliberately hand-enumerated rather than reflected: W144 D1 wants the
+/// Rust structs to be the source of truth and adding a verb to the catalog
+/// is a deliberate diligence/refine act (W144 §"What the internal contract
+/// covers"), not something that should silently expand via a derive macro.
+/// Extend this list when a new verb type lands in one of the `envoy::*`
+/// submodules — a verb an adapter claims but that's missing here just
+/// doesn't get registered (see the host's skip-with-warning behavior).
+#[cfg(feature = "json-schema")]
+pub fn known_verb_descriptors() -> Vec<VerbDescriptor> {
+    use cloud_object::{CloudObjectBucketCreate, CloudObjectBucketDelete, CloudObjectBucketExists};
+    use cloud_vps::{CloudVpsCreate, CloudVpsDestroy, CloudVpsStatus};
+    use dns_record::{DnsRecordDelete, DnsRecordUpsert, DnsZoneList};
+    use floating_ip::{FloatingIpAssign, FloatingIpStatus};
+
+    vec![
+        VerbDescriptor::for_verb::<CloudVpsCreate>(),
+        VerbDescriptor::for_verb::<CloudVpsDestroy>(),
+        VerbDescriptor::for_verb::<CloudVpsStatus>(),
+        VerbDescriptor::for_verb::<CloudObjectBucketCreate>(),
+        VerbDescriptor::for_verb::<CloudObjectBucketDelete>(),
+        VerbDescriptor::for_verb::<CloudObjectBucketExists>(),
+        VerbDescriptor::for_verb::<DnsRecordUpsert>(),
+        VerbDescriptor::for_verb::<DnsRecordDelete>(),
+        VerbDescriptor::for_verb::<DnsZoneList>(),
+        VerbDescriptor::for_verb::<FloatingIpAssign>(),
+        VerbDescriptor::for_verb::<FloatingIpStatus>(),
+    ]
+}
+
+/// Construct the tier-S adapters this process can source live credentials
+/// for from ambient env/vault state alone — no camp-scoped config needed.
+///
+/// R409-T9: this is the "host" half of the classification process W144
+/// describes — rather than every call site (the `yah-mcp` binary, tests,
+/// future hosts) re-deriving "which providers do we have tokens for," the
+/// policy lives once here. A provider with no credentials present is
+/// silently absent from the result (possibly empty) rather than an error —
+/// same graceful-degradation convention as `cloud.yubaba_status` and
+/// friends: the KgToolRegistry ends up simply not offering that provider's
+/// verbs rather than every session erroring at startup for lack of a
+/// Hetzner token.
+///
+/// Excluded on purpose:
+/// - **Cloudflare** (`dns.*` / `cloud.object.*`) — `CloudflareEnvoy` needs an
+///   `account_id`, which today is camp-scoped config
+///   (`.yah/infra/providers/cloudflare.toml`), not ambient env/vault state.
+///   A caller with a `camp_root` can build one directly
+///   (`CloudflareEnvoy::new(token, account_id)`) and register it alongside
+///   this function's output via `KgToolRegistry::with_envoy_adapters`.
+/// - **LocalDocker** — needs a live containerd socket and sits behind the
+///   `local-docker` cargo feature; wiring it in by default would make every
+///   consumer of this function require a reachable containerd, which most
+///   don't have. Same opt-in path as Cloudflare.
+///
+/// Both are natural follow-ups once a caller has the extra context to
+/// build them; nothing about the verb-tool wiring itself is Hetzner/DO-
+/// specific.
+pub fn default_adapters() -> Vec<std::sync::Arc<dyn EnvoyAdapter>> {
+    let mut adapters: Vec<std::sync::Arc<dyn EnvoyAdapter>> = Vec::new();
+
+    if let Ok(driver) = crate::provider::HetznerDriver::from_default_sources() {
+        adapters.push(std::sync::Arc::new(crate::provider::HetznerEnvoy::new(
+            driver,
+        )));
+    }
+
+    if let Ok(Some(token)) = fob::get_or_env("digitalocean-api-token", "DIGITALOCEAN_TOKEN") {
+        let client = crate::provider::DigitalOceanClient::new(token);
+        adapters.push(std::sync::Arc::new(crate::provider::DigitalOceanEnvoy::new(
+            client,
+        )));
+    }
+
+    adapters
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +348,7 @@ mod tests {
         for c in [
             VerbCategory::Cloud,
             VerbCategory::Dns,
+            VerbCategory::FloatingIp,
             VerbCategory::Observability,
             VerbCategory::Ci,
             VerbCategory::Payments,
@@ -354,6 +450,51 @@ mod tests {
             // The input schema must mention the `project` field.
             assert!(d.input_schema.to_string().contains("project"));
             assert!(d.output_schema.to_string().contains("ok"));
+        }
+    }
+
+    #[cfg(feature = "json-schema")]
+    #[test]
+    fn known_verb_descriptors_covers_every_implemented_verb() {
+        let ids: Vec<&str> = known_verb_descriptors().iter().map(|d| d.id).collect();
+        for expected in [
+            "cloud.vps.create",
+            "cloud.vps.destroy",
+            "cloud.vps.status",
+            "cloud.object.bucket.create",
+            "cloud.object.bucket.delete",
+            "cloud.object.bucket.exists",
+            "dns.record.upsert",
+            "dns.record.delete",
+            "dns.zone.list",
+            "floating_ip.assign",
+            "floating_ip.status",
+        ] {
+            assert!(ids.contains(&expected), "missing descriptor for {expected}");
+        }
+        assert_eq!(ids.len(), 11, "add new verbs here as they land: {ids:?}");
+    }
+
+    #[cfg(feature = "json-schema")]
+    #[test]
+    fn known_verb_descriptors_all_have_nonempty_schemas() {
+        for d in known_verb_descriptors() {
+            assert!(d.input_schema.is_object(), "{}: input schema not an object", d.id);
+        }
+    }
+
+    #[test]
+    fn default_adapters_never_panics_regardless_of_ambient_env() {
+        // No assertion on count — this runs in a shared process where
+        // HETZNER_API_TOKEN / DIGITALOCEAN_TOKEN may or may not be set by
+        // other tests or the CI environment. The contract under test is
+        // "never panics, never errors" — a credential-less box gets an
+        // empty Vec instead of a startup failure (W144's graceful-
+        // degradation convention).
+        let adapters = default_adapters();
+        for adapter in &adapters {
+            assert!(!adapter.id().is_empty());
+            assert_eq!(adapter.tier(), Tier::S);
         }
     }
 }

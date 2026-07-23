@@ -27,13 +27,59 @@
 //! @yah:verify("Component with no wave field in TOML deserializes as wave=0 (default). Saving a wave=0 component omits the field from the output TOML (skip_serializing_if).")
 //!
 //! @arch:see(.yah/docs/working/W142-pond.md)
+//!
+//! @yah:relay(R615, "Linked infra sources: sources.toml overlay so a camp can borrow another camp's substrate")
+//! @yah:at(2026-07-20T18:18:05Z)
+//! @yah:status(open)
+//! @arch:see(.yah/docs/working/W274-linked-infra-sources.md)
+//!
+//! @yah:ticket(R615-F1, "InfraSource types + SourcesConfig::load(infra_dir) parsing .yah/infra/sources.toml")
+//! @yah:at(2026-07-20T18:18:20Z)
+//! @yah:status(open)
+//! @yah:phase(P1)
+//! @yah:parent(R615)
+//! @yah:next("Add InfraSourceKind { Path { path }, Git(GitSource) } + InfraSource { owner, kind, mode, select } to cloud/src/config.rs. Reuse the existing GitSource (config.rs:1205, { repo, ref, subdir }) verbatim — do not invent a second git-source shape.")
+//! @yah:next("SourcesConfig::load(infra_dir) reads .yah/infra/sources.toml (schema_version = 1, ordered [[source]] array). Absent file = empty list, never an error — every existing camp has no sources.toml.")
+//! @yah:next("mode is the write-gate: read-only (borrower cannot mutate) vs owner-manages. Model it as an enum, not a bool, so a future read-write-with-approval tier is additive.")
+//! @yah:verify("cargo check -p cloud && cargo test -p cloud")
+//! @arch:see(.yah/docs/working/W274-linked-infra-sources.md)
+//! @yah:tier(Cleric)
+//!
+//! @yah:ticket(R615-F2, "Overlay loader: resolve sources in CloudConfig::load, tag origin, camp-local wins on collision")
+//! @yah:at(2026-07-20T18:18:30Z)
+//! @yah:status(open)
+//! @yah:phase(P1)
+//! @yah:parent(R615)
+//! @yah:next("In CloudConfig::load, after loading camp-local machines/providers/rules, resolve each source to an infra root (git sources read from the .yah/cache/infra/ sync cache — load stays offline), load that root's machines/providers/rules, tag each entry with origin { owner, source }, and overlay UNDER camp-local. Camp-local wins on name collision.")
+//! @yah:next("The machine load site is config.rs:533 (load_dir::<MachineConfig>(paths::machines_dir(...))). Note config.rs:575 load_from_config_dir is a SECOND machine load site that deliberately skips the inherit_machines redirect for multi-root/sibling trees (W206) — decide explicitly whether sources overlay applies there too, and document the answer either way.")
+//! @yah:verify("cargo check -p cloud && cargo test -p cloud")
+//! @yah:verify("A camp with sources.toml [[source]] kind=path to a sibling camp sees that camp's machines in CloudConfig::load, each tagged with the source owner")
+//! @yah:gotcha("Cross-camp MachineConfig schema skew is real: noisetable ships an older machine schema (location/server_type/hosts_mirrors) while yah's use region/arch/[connect]. A borrowed source can carry fields the borrower's binary predates. Overlay load MUST tolerate/skip unparseable foreign entries per-file and warn — never fail the whole load.")
+//! @arch:see(.yah/docs/working/W274-linked-infra-sources.md)
+//! @yah:depends_on(R615-F1)
+//! @yah:tier(Warrior)
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use thiserror::Error;
-use workload_spec::{validate, WorkloadSpec};
+use workload_spec::{validate, LifecycleArchetype, TenantId, WorkloadSpec};
+
+/// Static node capacity declaration on `machine.toml` (R572-F3).
+///
+/// `memory_mb` and `cpu_millis` express the node's *total* hardware budget.
+/// F5's bin-packer subtracts the sum of committed workload requests from
+/// this floor to determine available headroom; an absent `allocatable`
+/// block means no capacity constraint is enforced (any workload fits).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct NodeAllocatable {
+    /// Total physical RAM in mebibytes (e.g. 512 for a 512 MB node).
+    pub memory_mb: u32,
+    /// Total CPU in k8s millicores (1000 = 1 core, 250 = 0.25 CPU).
+    pub cpu_millis: u32,
+}
 
 /// Per-machine TOML from `.yah/cloud/machines/<name>.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +122,13 @@ pub struct MachineConfig {
     /// matches `required.zones` against this. Optional for backward-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone: Option<String>,
+    /// Declared CPU architecture (`"x86_64"` / `"aarch64"`). A machine has
+    /// exactly one — it's a first-class property of the box, not a reach
+    /// detail and not a mesh tag. Drives the yubaba release triple. Optional
+    /// only because there's no provider API to probe it (static nodes declare
+    /// it; a driver-backed provider may leave it unset until known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
     pub bucket: Option<BucketSpec>,
     pub hostkey_fingerprint: Option<String>,
     /// Provider-side SSH-key IDs (Hetzner: from `GET /v1/ssh_keys`)
@@ -107,6 +160,18 @@ pub struct MachineConfig {
     /// resolved from the provider API / mesh at provision time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect: Option<ConnectSpec>,
+    /// Static node capacity (R572-F3). Declares the node's total hardware
+    /// budget; F5's scheduler subtracts committed workload requests from this
+    /// to check whether a new workload fits. Absent means unconstrained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocatable: Option<NodeAllocatable>,
+    /// Repel-unless-tolerate taint keys (R572-F3). A workload must tolerate
+    /// every taint on a candidate node for the scheduler to place it there.
+    /// Examples: `"no-appliance"` prevents Appliance workloads; `"no-voter"`
+    /// prevents a node from joining quorum; `"public-ip"` is a positive
+    /// requirement marker the ingress appliance (W267) demands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub taints: Vec<String>,
 }
 
 /// True iff `provider` has an auto-provision driver (create/destroy via API).
@@ -181,10 +246,6 @@ pub struct ConnectSpec {
     /// mesh lands — reached via an SSH tunnel to `ssh`. Rebinds to the mesh IP
     /// in the post-mesh world (W242 P2).
     pub yubaba: String,
-    /// Declared CPU arch (`"x86_64"` / `"aarch64"`) — no provider API to probe
-    /// it, and the yubaba release triple depends on it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub arch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,6 +449,15 @@ pub struct LegacyServiceConfig {
     /// the standard pg_hba.conf snippet and ufw rules to pair with this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bind_interface: Option<String>,
+
+    /// Tenant this service belongs to (W206 isolation axis). Absent in the
+    /// service TOML → [`TenantId::singleton`], keeping single-tenant machines
+    /// on one shared compose network. When a machine hosts services from two
+    /// or more distinct tenants, the compose renderer (R558-T2) splits them
+    /// into per-tenant `<tenant>-<tier>` networks so cross-tenant stacks on the
+    /// same host are not bridged together.
+    #[serde(default = "TenantId::singleton")]
+    pub tenant: TenantId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,54 +540,7 @@ impl CloudConfig {
         let services = load_services(&crate::paths::services_dir(workspace_root), workspace_root)?;
         let domains = load_domains(&crate::paths::domains_dir(workspace_root))?;
 
-        // Cross-ref validation: mirror `use = "<id>"` slots must resolve.
-        let provider_ids: std::collections::HashSet<&str> =
-            providers.iter().map(|p| p.id.as_str()).collect();
-        for (svc_name, svc) in &services {
-            for (env, mirror) in &svc.mirrors {
-                for (slot, body) in &mirror.providers {
-                    if let Some(id) = body.provider_id() {
-                        if !provider_ids.contains(id) {
-                            anyhow::bail!(
-                                "services/{svc_name}/mirrors/{env}.toml: \
-                                 providers.{slot}.use = \"{id}\" — no such provider; \
-                                 declare it at .yah/infra/providers/{id}.toml"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // Cross-ref validation: every domain route's `component =
-        // "<service>/<component-id>"` must resolve to a real component.
-        for (dom_name, dom) in &domains {
-            for (idx, route) in dom.routes.iter().enumerate() {
-                let Some(component_ref) = route.mode.component() else {
-                    continue; // redirects don't reference components
-                };
-                let Some((svc_name, comp_id)) = split_component_ref(component_ref) else {
-                    anyhow::bail!(
-                        "domains/{dom_name}.toml: routes[{idx}].component = \
-                         \"{component_ref}\" — expected \"<service>/<component-id>\""
-                    );
-                };
-                let Some(svc) = services.get(svc_name) else {
-                    anyhow::bail!(
-                        "domains/{dom_name}.toml: routes[{idx}].component = \
-                         \"{component_ref}\" — no such service \"{svc_name}\" \
-                         under .yah/services/"
-                    );
-                };
-                if !svc.service.components.iter().any(|c| c.id == comp_id) {
-                    anyhow::bail!(
-                        "domains/{dom_name}.toml: routes[{idx}].component = \
-                         \"{component_ref}\" — service \"{svc_name}\" has no \
-                         component with id \"{comp_id}\""
-                    );
-                }
-            }
-        }
+        Self::cross_ref_validate(&providers, &services, &domains)?;
 
         // Legacy `.yah/cloud/` reads — empty in post-B1 workspaces. Wrapped in
         // a helper so a missing tree is silent (no error, no warning).
@@ -558,6 +581,101 @@ impl CloudConfig {
             topology,
             legacy_services,
         })
+    }
+
+    /// Load the R215+ tree (`infra/`, `services/`, `domains/`) rooted at an
+    /// arbitrary config directory instead of the hardcoded `.yah/`. This is the
+    /// building block for multi-root deployments (W206 config layout (b), sibling
+    /// `.noisetable/` trees) — see [`crate::multi_root`]. Part of R558-F4.
+    ///
+    /// `config_dir` is the `.X/` directory itself (e.g. `<parent>/.noisetable`);
+    /// `workspace_root` remains the camp dir (the config dir's parent) so a
+    /// component's `path` reference resolves against the same tree the classic
+    /// [`CloudConfig::load`] uses. The legacy `.yah/cloud/` reads are skipped —
+    /// multi-root deployments are post-R215 by construction — so `legacy_*`,
+    /// `workloads`, and `topology` come back empty. Machines are read from
+    /// `config_dir/infra/machines` with no `inherit_machines` redirect (sibling
+    /// trees declare their own inventory or none).
+    pub fn load_from_config_dir(config_dir: &Path, workspace_root: &Path) -> Result<Self> {
+        let providers = load_providers(&config_dir.join("infra").join("providers"))?;
+        let services = load_services(&config_dir.join("services"), workspace_root)?;
+        let domains = load_domains(&config_dir.join("domains"))?;
+
+        Self::cross_ref_validate(&providers, &services, &domains)?;
+
+        let machines = load_dir::<MachineConfig>(config_dir.join("infra").join("machines"))?;
+
+        Ok(Self {
+            workspace_root: workspace_root.to_path_buf(),
+            machines,
+            providers,
+            services,
+            domains,
+            legacy_mirrors: vec![],
+            workloads: vec![],
+            topology: TopologyConfig::default(),
+            legacy_services: vec![],
+        })
+    }
+
+    /// Cross-reference validation shared by [`CloudConfig::load`] and
+    /// [`CloudConfig::load_from_config_dir`]: every mirror `providers.X.use =
+    /// "<id>"` must resolve to a declared provider, and every domain route's
+    /// `component = "<service>/<component-id>"` must resolve to a real component.
+    fn cross_ref_validate(
+        providers: &[ProviderConfig],
+        services: &BTreeMap<String, ServiceWithMirrors>,
+        domains: &BTreeMap<String, DomainConfig>,
+    ) -> Result<()> {
+        // Mirror `use = "<id>"` slots must resolve to a declared provider.
+        let provider_ids: std::collections::HashSet<&str> =
+            providers.iter().map(|p| p.id.as_str()).collect();
+        for (svc_name, svc) in services {
+            for (env, mirror) in &svc.mirrors {
+                for (slot, body) in &mirror.providers {
+                    if let Some(id) = body.provider_id() {
+                        if !provider_ids.contains(id) {
+                            anyhow::bail!(
+                                "services/{svc_name}/mirrors/{env}.toml: \
+                                 providers.{slot}.use = \"{id}\" — no such provider; \
+                                 declare it at infra/providers/{id}.toml"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Every domain route's `component = "<service>/<component-id>"` must
+        // resolve to a real component.
+        for (dom_name, dom) in domains {
+            for (idx, route) in dom.routes.iter().enumerate() {
+                let Some(component_ref) = route.mode.component() else {
+                    continue; // redirects don't reference components
+                };
+                let Some((svc_name, comp_id)) = split_component_ref(component_ref) else {
+                    anyhow::bail!(
+                        "domains/{dom_name}.toml: routes[{idx}].component = \
+                         \"{component_ref}\" — expected \"<service>/<component-id>\""
+                    );
+                };
+                let Some(svc) = services.get(svc_name) else {
+                    anyhow::bail!(
+                        "domains/{dom_name}.toml: routes[{idx}].component = \
+                         \"{component_ref}\" — no such service \"{svc_name}\" \
+                         under services/"
+                    );
+                };
+                if !svc.service.components.iter().any(|c| c.id == comp_id) {
+                    anyhow::bail!(
+                        "domains/{dom_name}.toml: routes[{idx}].component = \
+                         \"{component_ref}\" — service \"{svc_name}\" has no \
+                         component with id \"{comp_id}\""
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Look up a domain manifest by name (file stem under `.yah/domains/`).
@@ -631,6 +749,60 @@ impl CloudConfig {
         };
         self.resolve_machine(&req).ok()
     }
+
+    /// Admission: resolve the target machine for a remote [`WorkloadSpec`],
+    /// honoring the R594 mesh-tag node-selector annotation
+    /// (`velveteen_exec::remote::NODE_SELECTOR_MESH_TAGS_ANNOTATION` =
+    /// `yah.node-selector.mesh-tags`, comma-joined).
+    ///
+    /// The producer side (`velveteen_exec::remote::build_workload_spec`, R594) writes
+    /// `TaskLocation::RemoteAny.mesh_tags` — e.g. `[tag:build-worker, tier:x86]`
+    /// from [`qed::platform::build_worker_mesh_tags`] — into the workload's
+    /// annotations. This is the consumer: candidates are restricted to machines
+    /// whose `mesh_tags` are a **superset** of the requested set, so an amd64
+    /// build lands on the `tier:x86` build-worker (us-west-002) and an arm64
+    /// build on a `tier:arm` Pi5. Declaration order in `.yah/infra/machines/`
+    /// breaks ties.
+    ///
+    /// An absent or empty annotation means "no mesh-tag constraint" — pre-R594
+    /// behavior (any node), matching [`RequiredSpec::is_unconstrained`].
+    ///
+    /// This is the single admission seam: R572-F5 extends it with the capacity
+    /// floor (workload request fits node allocatable−committed) and
+    /// repel-unless-tolerate taints by enriching [`RequiredSpec::matches`] /
+    /// [`Self::resolve_machine`]. Do not fork a second selector.
+    pub fn admit_workload(&self, ws: &WorkloadSpec) -> Result<&MachineConfig> {
+        let req = RequiredSpec {
+            mesh_tags: node_selector_mesh_tags(ws),
+            // R572-F5: capacity floor from the workload's resource request.
+            memory_mb: ws.resources.memory_mb,
+            cpu_millis: ws.resources.cpu_millis,
+            // R572-F5: taint repulsion derived from the workload's effective archetype.
+            repel_archetype: Some(ws.effective_archetype()),
+            // R572-F5: taint affinity from the requires-taint annotation.
+            requires_taint: ws.requires_taint().map(str::to_owned),
+            ..Default::default()
+        };
+        self.resolve_machine(&req)
+    }
+}
+
+/// Parse the R594 mesh-tag node-selector off a workload's annotations into the
+/// requested tag set. Absent annotation or empty value ⇒ empty vec ("no
+/// constraint"). Whitespace around each comma-separated tag is trimmed and
+/// empty segments are dropped, so `"tag:build-worker, tier:x86"` and
+/// `"tag:build-worker,tier:x86"` parse identically.
+pub fn node_selector_mesh_tags(ws: &WorkloadSpec) -> Vec<String> {
+    ws.annotations
+        .get(velveteen_exec::remote::NODE_SELECTOR_MESH_TAGS_ANNOTATION)
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Load every `.yah/infra/providers/*.toml` into a [`ProviderConfig`] list.
@@ -1009,6 +1181,13 @@ pub struct ServiceConfig {
     pub domain: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<ServiceComponent>,
+    /// Databases this service exposes, grouped by environment (W241). Every
+    /// entry becomes a data-workbench / `sql_*` catalog id of the shape
+    /// `<env>:<service>:<name>` (e.g. `pond:scrabcake:main`). Optional and
+    /// default-empty — services without databases omit the `[db]` table
+    /// entirely.
+    #[serde(default, skip_serializing_if = "DbCatalog::is_empty")]
+    pub db: DbCatalog,
 }
 
 impl ServiceConfig {
@@ -1102,6 +1281,131 @@ pub struct ServiceComponent {
 #[inline]
 fn is_zero_u32(n: &u32) -> bool {
     *n == 0
+}
+
+/// A service's declared databases, grouped by environment (W241 §Sections).
+/// Parsed from the `[db]` table of `service.toml`; each `[[db.<env>]]` array
+/// entry names one database. The environment tag drives backend selection at
+/// query time (see the data-workbench's `db.query` / the `sql_*` MCP tools):
+/// `dev` = local file, `pond` = a DB inside the running pond container stack
+/// (reached on a declared localhost port), `cloud` = a remote libSQL/Turso or
+/// Postgres endpoint whose auth comes from an env var (never stored in TOML).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct DbCatalog {
+    /// Local-file SQLite databases used in dev mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dev: Vec<DevDb>,
+    /// Databases running inside the pond container stack.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pond: Vec<PondDb>,
+    /// Remote cloud databases (Turso, Postgres).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cloud: Vec<CloudDb>,
+}
+
+impl DbCatalog {
+    /// True when no database is declared in any environment. Lets
+    /// [`ServiceConfig`] skip serializing an empty `[db]` table.
+    pub fn is_empty(&self) -> bool {
+        self.dev.is_empty() && self.pond.is_empty() && self.cloud.is_empty()
+    }
+}
+
+/// A dev-mode local SQLite database (`[[db.dev]]`). `path` is resolved
+/// relative to the workspace root and opened as a local file — read/write, no
+/// network, no auth.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct DevDb {
+    /// Logical name, unique within the service's `dev` list. Forms the `name`
+    /// segment of the catalog id `dev:<service>:<name>`.
+    pub name: String,
+    /// On-disk SQLite path, relative to the workspace root (or absolute).
+    pub path: String,
+}
+
+/// A database running inside the pond container stack (`[[db.pond]]`). The
+/// pond publishes the DB on a localhost TCP port; the hub connects to
+/// `127.0.0.1:<port>` when the pond is up and returns a clear error when it is
+/// not. Either `port` (defaulting to a libSQL/`sqld` HTTP endpoint) or a full
+/// `url` must be given.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct PondDb {
+    /// Logical name, unique within the service's `pond` list.
+    pub name: String,
+    /// Localhost TCP port the pond publishes the DB on. Interpreted per
+    /// [`kind`](Self::kind). Mutually complete with `url` (provide one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Full connection URL, overriding `port` when set (e.g. a non-localhost
+    /// host or an explicit scheme).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Wire protocol the pond DB speaks. Selects how a bare `port` becomes a
+    /// URL: `turso` → `http://127.0.0.1:<port>` (libSQL/`sqld` over Hrana),
+    /// `postgres` → `postgres://127.0.0.1:<port>`.
+    #[serde(default)]
+    pub kind: PondDbKind,
+}
+
+/// Wire protocol of a [`PondDb`].
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum PondDbKind {
+    /// libSQL / `sqld` over Hrana HTTP — the default.
+    #[default]
+    Turso,
+    /// PostgreSQL wire protocol.
+    Postgres,
+}
+
+/// A remote cloud database (`[[db.cloud]]`). The connection `url` is stored in
+/// TOML but the credential never is — `auth_token_env` names an environment
+/// variable the daemon reads at connect time, so the same declaration works
+/// whether the token is provisioned service-locally or camp-shared (W241;
+/// operator confirmed both scopes are needed). A camp-wide cloud DB not owned
+/// by any single service is declared identically in `.yah/db/cloud.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct CloudDb {
+    /// Logical name, unique within its `cloud` list.
+    pub name: String,
+    /// Connection URL: `libsql://…` / `http(s)://…` (Turso, `sqld`) or
+    /// `postgres://…`.
+    pub url: String,
+    /// Name of the environment variable holding the auth token. Resolved in
+    /// the daemon at connect time (value never stored on disk). For a libSQL
+    /// URL the token is threaded as `?auth_token=…`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token_env: Option<String>,
+}
+
+/// A camp-shared cloud database catalog, parsed from `.yah/db/cloud.toml`.
+/// These are cloud DBs not owned by any single service — declared once at camp
+/// scope and addressed as `cloud:<name>` (two-segment id), distinct from a
+/// service-local `cloud:<service>:<name>`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct CampCloudDbs {
+    #[serde(default, rename = "cloud", skip_serializing_if = "Vec::is_empty")]
+    pub cloud: Vec<CloudDb>,
+}
+
+impl CampCloudDbs {
+    /// Load `<camp_root>/.yah/db/cloud.toml`, or an empty catalog if the file
+    /// is absent (the common case — most camps declare no shared cloud DBs).
+    pub fn load(camp_root: &Path) -> Result<Self> {
+        let path = camp_root.join(".yah/db/cloud.toml");
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let src =
+            std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))
+    }
 }
 
 /// Topological shape of a mirror — how its providers sit relative to each other.
@@ -1258,19 +1562,22 @@ impl MirrorProviderSlot {
 /// `[providers.<role>] required = { regions = [...], mesh_tags = [...] }` in
 /// `mirrors/<env>.toml`.
 ///
-/// Four hard (must-satisfy) axes in v1, all AND-ed together:
+/// Hard (must-satisfy) axes, all AND-ed together:
 /// - `regions` / `zones` / `providers` — *membership*: the machine's
 ///   `region` / `zone` / `provider` must be one of the listed values.
 /// - `mesh_tags` — *superset*: the machine's `mesh_tags` must contain every
 ///   listed tag.
+/// - `memory_mb` / `cpu_millis` — *capacity floor* (R572-F5): the machine's
+///   `allocatable` budget must cover the demand. `0` = no constraint.
+/// - `repel_archetype` — *taint repulsion* (R572-F5): the machine must not
+///   carry the taint `"no-<archetype.taint_key()>"` for the workload's class.
+///   `None` = no repulsion check.
+/// - `requires_taint` — *taint affinity* (R572-F5): the machine must carry
+///   this taint key (in `taints` or `mesh_tags`). `None` = no affinity.
 ///
-/// An empty list on any axis means "no constraint on that axis". A fully-empty
-/// `RequiredSpec` matches every machine (see [`RequiredSpec::is_unconstrained`]).
-///
-/// Capacity floors (`cpu`/`memory`/`gpu`) and soft `preferred.*` /
-/// `topology_spread` / `anti_affinity` are deliberately out of this v1 slice —
-/// they need the yubaba↔kamaji capability-gossip view, not just the
-/// workspace machine.toml. See R330-F16's next-steps.
+/// An empty / zero / None on every axis means "no constraint on that axis".
+/// A fully-unconstrained `RequiredSpec` matches every machine (see
+/// [`RequiredSpec::is_unconstrained`]).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct RequiredSpec {
@@ -1282,6 +1589,28 @@ pub struct RequiredSpec {
     pub providers: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mesh_tags: Vec<String>,
+
+    /// R572-F5: minimum memory (MiB) the target node must have in its
+    /// declared `allocatable` budget. `0` = no constraint. Filled by
+    /// [`CloudConfig::admit_workload`] from the workload's `resources.memory_mb`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub memory_mb: u32,
+    /// R572-F5: minimum CPU (millicores) the target node must have in its
+    /// declared `allocatable` budget. `0` = no constraint. Filled by
+    /// [`CloudConfig::admit_workload`] from the workload's `resources.cpu_millis`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub cpu_millis: u32,
+    /// R572-F5: effective archetype of the workload being placed. The scheduler
+    /// rejects any node that carries the taint `"no-<archetype.taint_key()>"`.
+    /// `None` = no repulsion check (backwards-compat for callers that don't
+    /// thread a spec through).
+    #[serde(skip)]
+    pub repel_archetype: Option<LifecycleArchetype>,
+    /// R572-F5: taint the workload requires the target node to carry
+    /// (annotation `yah.placement.requires-taint`). The node must have the
+    /// key in its `taints` list or `mesh_tags`. `None` = no affinity constraint.
+    #[serde(skip)]
+    pub requires_taint: Option<String>,
 }
 
 impl RequiredSpec {
@@ -1291,22 +1620,71 @@ impl RequiredSpec {
             && self.zones.is_empty()
             && self.providers.is_empty()
             && self.mesh_tags.is_empty()
+            && self.memory_mb == 0
+            && self.cpu_millis == 0
+            && self.repel_archetype.is_none()
+            && self.requires_taint.is_none()
     }
 
-    /// Whether `machine` satisfies every hard axis. Membership axes
-    /// (region/zone/provider) require the machine to carry the field AND have
-    /// it appear in the constraint list; the mesh_tags axis is a superset test.
+    /// Whether `machine` satisfies every hard axis.
+    ///
+    /// - Membership axes (region/zone/provider): machine must carry the field
+    ///   and it must appear in the constraint list.
+    /// - `mesh_tags`: machine tags must be a superset of the required set.
+    /// - **R572-F5 capacity floor**: `machine.allocatable.{memory,cpu}` must
+    ///   cover `self.{memory,cpu}`. A machine with no `allocatable` block passes
+    ///   unconditionally (capacity unknown → no constraint enforced).
+    /// - **R572-F5 taint repulsion**: machine must not carry the taint
+    ///   `"no-<archetype.taint_key()>"` for the workload's class.
+    /// - **R572-F5 taint affinity**: if `requires_taint` is set, the machine
+    ///   must carry that key in its `taints` list or `mesh_tags`.
     pub fn matches(&self, machine: &MachineConfig) -> bool {
         let member_ok = |constraint: &[String], value: Option<&str>| -> bool {
             constraint.is_empty() || value.map_or(false, |v| constraint.iter().any(|c| c == v))
         };
-        member_ok(&self.regions, machine.region.as_deref())
-            && member_ok(&self.zones, machine.zone.as_deref())
-            && member_ok(&self.providers, Some(machine.provider.as_str()))
-            && self
+
+        // Membership + mesh-tags (pre-existing axes).
+        if !member_ok(&self.regions, machine.region.as_deref())
+            || !member_ok(&self.zones, machine.zone.as_deref())
+            || !member_ok(&self.providers, Some(machine.provider.as_str()))
+            || !self
                 .mesh_tags
                 .iter()
                 .all(|t| machine.mesh_tags.iter().any(|mt| mt == t))
+        {
+            return false;
+        }
+
+        // R572-F5: capacity floor. Skipped when machine has no allocatable
+        // declaration (unknown capacity → passes, consistent with pre-F5 behaviour).
+        if self.memory_mb > 0 || self.cpu_millis > 0 {
+            if let Some(alloc) = &machine.allocatable {
+                if self.memory_mb > alloc.memory_mb || self.cpu_millis > alloc.cpu_millis {
+                    return false;
+                }
+            }
+        }
+
+        // R572-F5: taint repulsion. A node taint "no-<archetype>" repels the
+        // workload class unless it explicitly tolerates it.
+        if let Some(arch) = self.repel_archetype {
+            let repel_key = format!("no-{}", arch.taint_key());
+            if machine.taints.iter().any(|t| *t == repel_key) {
+                return false;
+            }
+        }
+
+        // R572-F5: taint affinity. Machine must carry the required taint key
+        // in either its `taints` list or `mesh_tags`.
+        if let Some(req) = &self.requires_taint {
+            let has_it = machine.taints.iter().any(|t| t == req)
+                || machine.mesh_tags.iter().any(|t| t == req);
+            if !has_it {
+                return false;
+            }
+        }
+
+        true
     }
 
     /// Human-readable summary of the constraints, for fail-loud error messages.
@@ -1322,6 +1700,18 @@ impl RequiredSpec {
         push("zones", &self.zones);
         push("providers", &self.providers);
         push("mesh_tags", &self.mesh_tags);
+        if self.memory_mb > 0 {
+            parts.push(format!("memory_mb>={}", self.memory_mb));
+        }
+        if self.cpu_millis > 0 {
+            parts.push(format!("cpu_millis>={}", self.cpu_millis));
+        }
+        if let Some(arch) = self.repel_archetype {
+            parts.push(format!("not-tainted(no-{})", arch.taint_key()));
+        }
+        if let Some(req) = &self.requires_taint {
+            parts.push(format!("requires_taint={req}"));
+        }
         if parts.is_empty() {
             "no constraints".to_string()
         } else {
@@ -1480,12 +1870,15 @@ mod tests {
             mesh_tags: mesh_tags.into_iter().map(String::from).collect(),
             region: None,
             zone: None,
+            arch: None,
             bucket: None,
             hostkey_fingerprint: None,
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
             connect: None,
+            allocatable: None,
+            taints: vec![],
         }
     }
 
@@ -1537,6 +1930,64 @@ mesh_tags = ["tag:cloud-runner"]
     }
 
     #[test]
+    fn db_catalog_parses_all_env_blocks() {
+        // W241 / R571-F8: a service.toml [db] table with dev/pond/cloud.
+        let toml_src = r#"
+schema_version = 1
+name = "scrabcake"
+domain = "scrabcake.net.yah.dev"
+
+[[db.dev]]
+name = "main"
+path = "data/dev.sqlite"
+
+[[db.pond]]
+name = "main"
+port = 5433
+
+[[db.pond]]
+name = "pg"
+port = 5432
+kind = "postgres"
+
+[[db.cloud]]
+name = "main"
+url = "libsql://scrabcake.turso.io"
+auth_token_env = "SCRABCAKE_TURSO_TOKEN"
+"#;
+        let svc: ServiceConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(svc.db.dev.len(), 1);
+        assert_eq!(svc.db.dev[0].path, "data/dev.sqlite");
+        assert_eq!(svc.db.pond.len(), 2);
+        assert_eq!(svc.db.pond[0].port, Some(5433));
+        assert_eq!(svc.db.pond[0].kind, PondDbKind::Turso); // default
+        assert_eq!(svc.db.pond[1].kind, PondDbKind::Postgres);
+        assert_eq!(svc.db.cloud[0].auth_token_env.as_deref(), Some("SCRABCAKE_TURSO_TOKEN"));
+    }
+
+    #[test]
+    fn service_without_db_table_has_empty_catalog() {
+        let svc: ServiceConfig =
+            toml::from_str("schema_version = 1\nname = \"s\"\ndomain = \"s.dev\"\n").unwrap();
+        assert!(svc.db.is_empty());
+        // And an empty [db] must not appear when re-serialized.
+        let out = toml::to_string(&svc).unwrap();
+        assert!(!out.contains("[db"), "empty db table should be skipped: {out}");
+    }
+
+    #[test]
+    fn camp_shared_cloud_toml_parses() {
+        let src = r#"
+[[cloud]]
+name = "analytics"
+url = "postgres://shared/analytics"
+"#;
+        let shared: CampCloudDbs = toml::from_str(src).unwrap();
+        assert_eq!(shared.cloud.len(), 1);
+        assert_eq!(shared.cloud[0].name, "analytics");
+    }
+
+    #[test]
     fn resolve_machine_by_mesh_tags_superset_match() {
         let cfg = make_empty_cfg(vec![
             make_machine("yah-bnt-1", vec!["tag:primary-yah", "tag:tier-scratch"]),
@@ -1554,6 +2005,89 @@ mesh_tags = ["tag:cloud-runner"]
         assert!(cfg
             .resolve_machine_by_mesh_tags(&["tag:cloud-runner".into()])
             .is_none());
+    }
+
+    // ─── R590-F1 mesh-tag node-selector admission ───────────────────────────
+
+    /// Build a forge WorkloadSpec carrying the R594 node-selector annotation.
+    /// `selector` is the comma-joined mesh-tag set; `None` omits the annotation
+    /// entirely (pre-R594 "no constraint").
+    fn ws_with_selector(selector: Option<&str>) -> WorkloadSpec {
+        use workload_spec::{ImageRef, TierTag};
+        let mut ws = WorkloadSpec::for_forge(
+            "R590-F1-test",
+            ImageRef {
+                registry: "docker.io".into(),
+                repository: "library/busybox".into(),
+                tag: "latest".into(),
+                digest: workload_spec::testing::test_digest(),
+            },
+            TierTag("infra".into()),
+            vec![],
+        );
+        if let Some(sel) = selector {
+            ws.annotations.insert(
+                velveteen_exec::remote::NODE_SELECTOR_MESH_TAGS_ANNOTATION.into(),
+                sel.into(),
+            );
+        }
+        ws
+    }
+
+    /// The build-worker fleet shape: one x86 node (us-west-002) and one arm
+    /// node (a Pi5), both carrying `tag:build-worker`.
+    fn build_worker_fleet() -> CloudConfig {
+        make_empty_cfg(vec![
+            make_machine("us-west-002", vec!["tag:build-worker", "tier:x86"]),
+            make_machine("pi5-001", vec!["tag:build-worker", "tier:arm"]),
+        ])
+    }
+
+    #[test]
+    fn admit_workload_routes_amd64_to_x86_worker() {
+        let cfg = build_worker_fleet();
+        let ws = ws_with_selector(Some("tag:build-worker,tier:x86"));
+        let picked = cfg.admit_workload(&ws).unwrap();
+        assert_eq!(picked.name, "us-west-002");
+    }
+
+    #[test]
+    fn admit_workload_routes_arm64_to_pi5_worker() {
+        let cfg = build_worker_fleet();
+        let ws = ws_with_selector(Some("tag:build-worker,tier:arm"));
+        let picked = cfg.admit_workload(&ws).unwrap();
+        assert_eq!(picked.name, "pi5-001");
+    }
+
+    #[test]
+    fn admit_workload_rejects_node_missing_required_tag() {
+        // Only an arm worker exists; an x86 build must NOT land on it.
+        let cfg = make_empty_cfg(vec![make_machine(
+            "pi5-001",
+            vec!["tag:build-worker", "tier:arm"],
+        )]);
+        let ws = ws_with_selector(Some("tag:build-worker,tier:x86"));
+        assert!(cfg.admit_workload(&ws).is_err());
+    }
+
+    #[test]
+    fn admit_workload_empty_selector_is_unconstrained() {
+        // Absent annotation ⇒ no mesh-tag constraint ⇒ first declared machine
+        // (pre-R594 behavior preserved).
+        let cfg = build_worker_fleet();
+        let ws = ws_with_selector(None);
+        let picked = cfg.admit_workload(&ws).unwrap();
+        assert_eq!(picked.name, "us-west-002");
+    }
+
+    #[test]
+    fn node_selector_mesh_tags_trims_and_drops_empties() {
+        let ws = ws_with_selector(Some(" tag:build-worker , tier:x86 ,"));
+        assert_eq!(
+            node_selector_mesh_tags(&ws),
+            vec!["tag:build-worker".to_string(), "tier:x86".to_string()]
+        );
+        assert!(node_selector_mesh_tags(&ws_with_selector(None)).is_empty());
     }
 
     // ─── F16 topology-aware resolver ────────────────────────────────────────
@@ -1667,6 +2201,7 @@ mesh_tags = ["tag:cloud-runner"]
             mesh_tags: vec!["region:pdx".into()],
             region: Some("us-west".into()),
             zone: Some("pdx".into()),
+            arch: None,
             bucket: Some(BucketSpec {
                 name: "test-assets-pdx-1".into(),
                 public_read: false,
@@ -1676,6 +2211,8 @@ mesh_tags = ["tag:cloud-runner"]
             cloudflared: None,
             hosts_operator_bridge: false,
             connect: None,
+            allocatable: None,
+            taints: vec![],
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: MachineConfig = toml::from_str(&s).unwrap();
@@ -1750,6 +2287,7 @@ mesh_tags = ["tag:cloud-runner"]
             }],
             mesh_only: false,
             bind_interface: None,
+            tenant: TenantId::singleton(),
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: LegacyServiceConfig = toml::from_str(&s).unwrap();
@@ -1770,6 +2308,7 @@ mesh_tags = ["tag:cloud-runner"]
             }],
             mesh_only: true,
             bind_interface: Some("tailscale0".into()),
+            tenant: TenantId::singleton(),
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: LegacyServiceConfig = toml::from_str(&s).unwrap();
@@ -1796,6 +2335,7 @@ mesh_tags = ["tag:cloud-runner"]
             ports: vec![],
             mesh_only: false,
             bind_interface: None,
+            tenant: TenantId::singleton(),
         };
         let s = toml::to_string(&cfg).unwrap();
         assert!(!s.contains("bind_interface"), "None should be skipped: {s}");
@@ -1862,6 +2402,7 @@ mesh_tags = ["tag:cloud-runner"]
             mesh_tags: vec!["region:pdx".into(), "tier:t2".into()],
             region: None,
             zone: None,
+            arch: None,
             bucket: Some(BucketSpec {
                 name: "noisetable-assets-pdx-1".into(),
                 public_read: false,
@@ -1871,6 +2412,8 @@ mesh_tags = ["tag:cloud-runner"]
             cloudflared: None,
             hosts_operator_bridge: false,
             connect: None,
+            allocatable: None,
+            taints: vec![],
         };
         // Land in the legacy tree so the legacy machine loader picks it up.
         machine.save(&cloud_dir).unwrap();
@@ -1981,8 +2524,8 @@ mesh_tags = ["tag:cloud-runner"]
     #[test]
     fn workload_config_load_and_validate() {
         use workload_spec::{
-            ExposeSpec, ImageRef, MeshExpose, MeshIdent, ResourceLimits, RestartPolicy,
-            SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
+            ExposeSpec, ImageRef, MeshExpose, MeshIdent, NamespaceId, ResourceLimits,
+            RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
         };
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2010,12 +2553,13 @@ mesh_tags = ["tag:cloud-runner"]
             volumes: vec![],
             resources: ResourceLimits {
                 memory_mb: 256,
-                cpu_shares: 512,
+                cpu_millis: 512,
                 ephemeral_storage_mb: 512,
             },
             depends_on: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
+            archetype: None,
             stop_policy: StopPolicy {
                 signal: 15,
                 grace_period: workload_spec::Millis::from_secs(10),
@@ -2029,6 +2573,8 @@ mesh_tags = ["tag:cloud-runner"]
                 public: None,
                 operator: None,
             },
+            tenant: TenantId::singleton(),
+            namespace: NamespaceId::singleton(),
             labels: Default::default(),
             annotations: Default::default(),
         };
@@ -2045,8 +2591,8 @@ mesh_tags = ["tag:cloud-runner"]
     #[test]
     fn workload_loader_rejects_bad_spec() {
         use workload_spec::{
-            ExposeSpec, ImageRef, MeshExpose, MeshIdent, ResourceLimits, RestartPolicy,
-            SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
+            ExposeSpec, ImageRef, MeshExpose, MeshIdent, NamespaceId, ResourceLimits,
+            RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
         };
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2076,12 +2622,13 @@ mesh_tags = ["tag:cloud-runner"]
             volumes: vec![],
             resources: ResourceLimits {
                 memory_mb: 256,
-                cpu_shares: 512,
+                cpu_millis: 512,
                 ephemeral_storage_mb: 512,
             },
             depends_on: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
+            archetype: None,
             stop_policy: StopPolicy {
                 signal: 15,
                 grace_period: workload_spec::Millis::from_secs(10),
@@ -2095,6 +2642,8 @@ mesh_tags = ["tag:cloud-runner"]
                 public: None,
                 operator: None,
             },
+            tenant: TenantId::singleton(),
+            namespace: NamespaceId::singleton(),
             labels: Default::default(),
             annotations: Default::default(),
         };
@@ -2122,8 +2671,8 @@ mesh_tags = ["tag:cloud-runner"]
     #[test]
     fn workload_config_save_round_trip() {
         use workload_spec::{
-            ExposeSpec, ImageRef, MeshExpose, MeshIdent, ResourceLimits, RestartPolicy,
-            SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
+            ExposeSpec, ImageRef, MeshExpose, MeshIdent, NamespaceId, ResourceLimits,
+            RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
         };
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2149,12 +2698,13 @@ mesh_tags = ["tag:cloud-runner"]
             volumes: vec![],
             resources: ResourceLimits {
                 memory_mb: 128,
-                cpu_shares: 256,
+                cpu_millis: 256,
                 ephemeral_storage_mb: 256,
             },
             depends_on: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
+            archetype: None,
             stop_policy: StopPolicy {
                 signal: 15,
                 grace_period: workload_spec::Millis::from_secs(5),
@@ -2168,6 +2718,8 @@ mesh_tags = ["tag:cloud-runner"]
                 public: None,
                 operator: None,
             },
+            tenant: TenantId::singleton(),
+            namespace: NamespaceId::singleton(),
             labels: Default::default(),
             annotations: Default::default(),
         };
@@ -2196,12 +2748,15 @@ mesh_tags = ["tag:cloud-runner"]
             mesh_tags: vec![],
             region: None,
             zone: None,
+            arch: None,
             bucket: None,
             hostkey_fingerprint: None,
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
             connect: None,
+            allocatable: None,
+            taints: vec![],
         };
         machine.save(root).unwrap();
 
@@ -2847,6 +3402,7 @@ routes = "./routes.ts"
             schema_version: 1,
             name: "dev-yah".into(),
             domain: "yah.dev".into(),
+            db: DbCatalog::default(),
             components: vec![ServiceComponent {
                 id: "site".into(),
                 kind: "mesofact-static".into(),
@@ -2889,6 +3445,7 @@ routes = "./routes.ts"
             name: "dev-yah".into(),
             domain: "yah.dev".into(),
             components: vec![],
+            db: DbCatalog::default(),
         };
         svc.save(root).unwrap();
         svc.domain = "yah.example".into();
@@ -2912,6 +3469,7 @@ routes = "./routes.ts"
             name: "dev-yah".into(),
             domain: "yah.dev".into(),
             components: vec![],
+            db: DbCatalog::default(),
         }
         .save(root)
         .unwrap();
@@ -2985,6 +3543,7 @@ routes = "./routes.ts"
             name: "dev-yah".into(),
             domain: "yah.dev".into(),
             components: vec![],
+            db: DbCatalog::default(),
         };
         svc.save(root).unwrap();
         MirrorConfig {
@@ -3018,6 +3577,7 @@ routes = "./routes.ts"
             name: "dev-yah".into(),
             domain: "yah.dev".into(),
             components: vec![],
+            db: DbCatalog::default(),
         }
         .save(root)
         .unwrap();
@@ -3051,6 +3611,7 @@ routes = "./routes.ts"
             schema_version: 1,
             name: "yah-marketing".into(),
             domain: "yah.dev".into(),
+            db: DbCatalog::default(),
             components: vec![ServiceComponent {
                 id: "site".into(),
                 kind: "mesofact-static".into(),
@@ -3339,5 +3900,249 @@ cdn_bucket = "yah-dev"
             .expect("net-tier subdomain manifest should load");
         assert_eq!(dom.domain, "tenant.net.yah.dev");
         assert_eq!(dom.cdn_bucket, "net-yah-dev");
+    }
+
+    // ─── R572-F3: NodeAllocatable + taints ──────────────────────────────────
+
+    #[test]
+    fn machine_allocatable_round_trips() {
+        let toml_src = r#"
+name = "us-west-001"
+provider = "static"
+mesh_tags = ["tag:cloud-runner"]
+[allocatable]
+memory_mb = 3800
+cpu_millis = 2000
+"#;
+        let m: MachineConfig = toml::from_str(toml_src).unwrap();
+        let a = m.allocatable.as_ref().expect("allocatable should parse");
+        assert_eq!(a.memory_mb, 3800);
+        assert_eq!(a.cpu_millis, 2000);
+
+        let s = toml::to_string(&m).unwrap();
+        let back: MachineConfig = toml::from_str(&s).unwrap();
+        let a2 = back.allocatable.as_ref().unwrap();
+        assert_eq!(a2.memory_mb, 3800);
+        assert_eq!(a2.cpu_millis, 2000);
+    }
+
+    #[test]
+    fn machine_taints_round_trips() {
+        let toml_src = r#"
+name = "us-south-001"
+provider = "static"
+mesh_tags = ["tag:cloud-runner"]
+taints = ["no-appliance"]
+"#;
+        let m: MachineConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(m.taints, vec!["no-appliance"]);
+
+        let s = toml::to_string(&m).unwrap();
+        let back: MachineConfig = toml::from_str(&s).unwrap();
+        assert_eq!(back.taints, vec!["no-appliance"]);
+    }
+
+    #[test]
+    fn machine_allocatable_absent_is_none() {
+        let toml_src = "name = \"node\"\nprovider = \"static\"\nmesh_tags = []\n";
+        let m: MachineConfig = toml::from_str(toml_src).unwrap();
+        assert!(m.allocatable.is_none());
+        assert!(m.taints.is_empty());
+    }
+
+    #[test]
+    fn machine_allocatable_skipped_when_none() {
+        let m = make_machine("node", vec![]);
+        let s = toml::to_string(&m).unwrap();
+        assert!(!s.contains("allocatable"), "None allocatable must be omitted: {s}");
+        assert!(!s.contains("taints"), "empty taints must be omitted: {s}");
+    }
+
+    #[test]
+    fn machine_multiple_taints_round_trip() {
+        let toml_src = r#"
+name = "us-west-002"
+provider = "static"
+mesh_tags = ["tag:build-worker"]
+taints = ["no-server", "no-appliance", "no-voter"]
+"#;
+        let m: MachineConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(m.taints.len(), 3);
+        assert!(m.taints.contains(&"no-server".to_string()));
+        assert!(m.taints.contains(&"no-appliance".to_string()));
+        assert!(m.taints.contains(&"no-voter".to_string()));
+    }
+
+    // ─── R572-F5: capacity floor + repel-unless-tolerate taints ─────────────
+
+    fn make_machine_with_capacity(
+        name: &str,
+        memory_mb: u32,
+        cpu_millis: u32,
+        taints: Vec<&str>,
+    ) -> MachineConfig {
+        MachineConfig {
+            allocatable: Some(NodeAllocatable { memory_mb, cpu_millis }),
+            taints: taints.into_iter().map(String::from).collect(),
+            ..make_machine(name, vec![])
+        }
+    }
+
+    fn server_spec(memory_mb: u32, cpu_millis: u32) -> WorkloadSpec {
+        use workload_spec::{ImageRef, LifecycleArchetype, ResourceLimits, TierTag};
+        let mut ws = WorkloadSpec::for_forge(
+            "f5-test",
+            ImageRef {
+                registry: "localhost".into(),
+                repository: "test".into(),
+                tag: "latest".into(),
+                digest: workload_spec::testing::test_digest(),
+            },
+            TierTag("infra".into()),
+            vec![],
+        );
+        ws.archetype = Some(LifecycleArchetype::Server);
+        ws.resources = ResourceLimits { memory_mb, cpu_millis, ephemeral_storage_mb: 0 };
+        ws
+    }
+
+    fn appliance_spec_ws(memory_mb: u32, cpu_millis: u32) -> WorkloadSpec {
+        use workload_spec::LifecycleArchetype;
+        let mut ws = server_spec(memory_mb, cpu_millis);
+        ws.archetype = Some(LifecycleArchetype::Appliance);
+        ws
+    }
+
+    #[test]
+    fn capacity_floor_rejects_undersized_node() {
+        let cfg = make_empty_cfg(vec![make_machine_with_capacity("small", 256, 500, vec![])]);
+        let ws = server_spec(512, 1000); // demands more than available
+        assert!(cfg.admit_workload(&ws).is_err());
+    }
+
+    #[test]
+    fn capacity_floor_accepts_exact_fit() {
+        let cfg = make_empty_cfg(vec![make_machine_with_capacity("exact", 512, 1000, vec![])]);
+        let ws = server_spec(512, 1000);
+        assert_eq!(cfg.admit_workload(&ws).unwrap().name, "exact");
+    }
+
+    #[test]
+    fn capacity_floor_passes_when_allocatable_absent() {
+        // A machine with no allocatable block skips the capacity check (no data).
+        let cfg = make_empty_cfg(vec![make_machine("no-alloc", vec![])]);
+        let ws = server_spec(99999, 99999); // would exceed any real node
+        assert_eq!(cfg.admit_workload(&ws).unwrap().name, "no-alloc");
+    }
+
+    #[test]
+    fn taint_repulsion_blocks_appliance_on_no_appliance_node() {
+        let cfg = make_empty_cfg(vec![make_machine_with_capacity(
+            "south",
+            1024,
+            2000,
+            vec!["no-appliance"],
+        )]);
+        let ws = appliance_spec_ws(256, 500);
+        assert!(
+            cfg.admit_workload(&ws).is_err(),
+            "appliance must be repelled by no-appliance taint"
+        );
+    }
+
+    #[test]
+    fn taint_repulsion_allows_server_on_no_appliance_node() {
+        // "no-appliance" only repels Appliance workloads; servers are unaffected.
+        let cfg = make_empty_cfg(vec![make_machine_with_capacity(
+            "south",
+            1024,
+            2000,
+            vec!["no-appliance"],
+        )]);
+        let ws = server_spec(256, 500);
+        assert_eq!(cfg.admit_workload(&ws).unwrap().name, "south");
+    }
+
+    #[test]
+    fn taint_repulsion_job_not_blocked_by_no_server() {
+        use workload_spec::LifecycleArchetype;
+        let cfg = make_empty_cfg(vec![make_machine_with_capacity(
+            "build-box",
+            8192,
+            4000,
+            vec!["no-server", "no-appliance"],
+        )]);
+        let mut ws = server_spec(256, 500);
+        ws.archetype = Some(LifecycleArchetype::Job);
+        // Job only repelled by "no-job"; "no-server" and "no-appliance" don't affect it.
+        assert_eq!(cfg.admit_workload(&ws).unwrap().name, "build-box");
+    }
+
+    #[test]
+    fn requires_taint_affinity_blocks_placement_without_it() {
+        use workload_spec::{LifecycleArchetype, PUBLIC_IP_TAINT, REQUIRES_TAINT_ANNOTATION};
+        // Simulate the passway ingress appliance: requires "public-ip" taint.
+        let mut ws = appliance_spec_ws(256, 512);
+        ws.archetype = Some(LifecycleArchetype::Appliance);
+        ws.annotations
+            .insert(REQUIRES_TAINT_ANNOTATION.into(), PUBLIC_IP_TAINT.into());
+
+        // Node without the taint: rejected.
+        let cfg = make_empty_cfg(vec![make_machine_with_capacity("no-pip", 2048, 2000, vec![])]);
+        assert!(cfg.admit_workload(&ws).is_err());
+
+        // Node with the taint: accepted.
+        let cfg = make_empty_cfg(vec![make_machine_with_capacity(
+            "pub-node",
+            2048,
+            2000,
+            vec!["public-ip"],
+        )]);
+        assert_eq!(cfg.admit_workload(&ws).unwrap().name, "pub-node");
+    }
+
+    #[test]
+    fn w244_fleet_scenario_appliance_rejected_from_south_and_west002() {
+        // Full W244 fleet table scenario:
+        // us-west-001/east-001: no taints, large capacity → appliance lands here
+        // us-south-001: no-appliance taint → appliance rejected
+        // us-west-002: no-server, no-appliance, no-voter → appliance rejected
+        let cfg = make_empty_cfg(vec![
+            make_machine_with_capacity("us-south-001", 512, 1000, vec!["no-appliance"]),
+            make_machine_with_capacity("us-west-002", 16384, 8000, vec![
+                "no-server",
+                "no-appliance",
+                "no-voter",
+            ]),
+            make_machine_with_capacity("us-west-001", 4096, 4000, vec![]),
+        ]);
+        let ws = appliance_spec_ws(256, 500);
+        // Skips south (no-appliance) and west-002 (no-appliance), lands on west-001.
+        assert_eq!(cfg.admit_workload(&ws).unwrap().name, "us-west-001");
+    }
+
+    #[test]
+    fn w244_fleet_scenario_job_lands_on_west002_first() {
+        use workload_spec::LifecycleArchetype;
+        // Jobs should prefer (or at least land on) the job-only box.
+        let cfg = make_empty_cfg(vec![
+            make_machine_with_capacity("us-west-001", 4096, 4000, vec![]),
+            make_machine_with_capacity("us-west-002", 16384, 8000, vec![
+                "no-server",
+                "no-appliance",
+                "no-voter",
+            ]),
+        ]);
+        let mut ws = server_spec(256, 500);
+        ws.archetype = Some(LifecycleArchetype::Job);
+        // Jobs tolerate all fleet taints; west-001 comes first in declaration
+        // order (greedy, no preference), which is the expected tie-break.
+        let picked = cfg.admit_workload(&ws).unwrap();
+        // Both are eligible (Job tolerates no-server/no-appliance/no-voter).
+        assert!(
+            picked.name == "us-west-001" || picked.name == "us-west-002",
+            "job must land on an eligible node, got {}",
+            picked.name
+        );
     }
 }

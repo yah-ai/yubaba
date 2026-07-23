@@ -145,13 +145,13 @@
 //! @yah:handoff("Wired up via `pub mod probe;` + `pub use probe::{BackendAvailability, BackendProbe};` in lib.rs:31. tempfile + tokio rt-multi-thread/macros/test-util were already in dev-dependencies — 8 new tests cover: native-always-available, missing-socket → install hint + require() returns BackendUnavailable, reachable socket → available + path captured, first-reachable-wins ordering, per-backend routing through availability.require(), and env-var precedence over default paths.")
 //! @yah:handoff("Verified: cargo test -p kamaji-core --all-features → 50 passed (was 42 in T2; 8 new probe tests). cargo check -p yubaba --features containerd-integration,testing,docker-integration clean. No changes to existing impls — probe is additive.")
 //! @yah:next("Sign-off check: skim crates/yah/kamaji/src/probe.rs end-to-end (~270 LoC; one file, no impl-block changes elsewhere). If shape looks right, archive R484-T3 — T4 (two-constructor API) gates on probe results at init.")
-//! @yah:next("T4 wires probe into the two constructors: inlined builder calls BackendAvailability::probe() once at init and stores it on the Kamaji instance; sibling ConstableClient receives the probe snapshot from the server side over the W154 UDS protocol so the client knows which backends to surface in UI.")
+//! @yah:next("T4 wires probe into the two constructors: inlined builder calls BackendAvailability::probe() once at init and stores it on the Kamaji instance; sibling KamajiClient receives the probe snapshot from the server side over the W154 UDS protocol so the client knows which backends to surface in UI.")
 //! @yah:verify("cargo test -p kamaji-core --all-features  # 50 passed (8 new probe tests)")
 //! @yah:verify("cargo check -p yubaba --features containerd-integration,testing,docker-integration  # clean")
 //! @yah:verify("grep -n 'pub use probe::' crates/yah/kamaji/src/lib.rs  # BackendAvailability + BackendProbe re-exported")
 //! @yah:verify("grep -c 'install_hint' crates/yah/kamaji/src/probe.rs  # >0 (structured install hints surface in BackendUnavailable)")
 //!
-//! @yah:ticket(R484-T4, "Two-constructor API: inlined (Arc&lt;dyn Kamaji&gt;) and sibling (ConstableClient over UDS+postcard) re-targeted at new crate")
+//! @yah:ticket(R484-T4, "Two-constructor API: inlined (Arc&lt;dyn Kamaji&gt;) and sibling (KamajiClient over UDS+postcard) re-targeted at new crate")
 //! @yah:assignee(agent:claude)
 //! @yah:at(2026-06-08T02:31:09Z)
 //! @yah:status(review)
@@ -169,8 +169,7 @@
 
 use async_trait::async_trait;
 use kamaji::{
-    Backend, Kamaji, DeployResult, LogOpts, LogStream, MeshAssignment, RuntimeHealth,
-    WorkloadState,
+    Backend, DeployResult, Kamaji, LogOpts, LogStream, MeshAssignment, RuntimeHealth, WorkloadState,
 };
 use workload_spec::{MeshIdent, WorkloadSpec};
 
@@ -192,7 +191,11 @@ impl Kamaji for DummyRuntime {
     fn backend(&self) -> Backend {
         Backend::Containerd
     }
-    async fn deploy_workload(&self, _spec: &WorkloadSpec, _mesh: &MeshAssignment) -> anyhow::Result<DeployResult> {
+    async fn deploy_workload(
+        &self,
+        _spec: &WorkloadSpec,
+        _mesh: &MeshAssignment,
+    ) -> anyhow::Result<DeployResult> {
         anyhow::bail!("DummyRuntime: smoke tier does not use a local Kamaji")
     }
     async fn list_workloads(&self) -> anyhow::Result<Vec<WorkloadState>> {

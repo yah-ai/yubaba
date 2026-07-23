@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use local_driver::pond_miniflare::{ensure_miniflare_running, MiniflareSpec};
-use local_driver::LocalRuntime;
+use local_driver::ContainerLauncher;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
@@ -30,7 +30,7 @@ const SLOT: &str = "static";
 /// Yubaba's in-memory handle for a managed miniflare container.
 /// Stored inside `RegistryEntry` while the workload is registered.
 pub(crate) struct MiniflareSupervision {
-    pub runtime: Arc<LocalRuntime>,
+    pub launcher: Arc<dyn ContainerLauncher>,
     pub container_name: String,
     pub cancel: Arc<Notify>,
 }
@@ -38,11 +38,16 @@ pub(crate) struct MiniflareSupervision {
 /// Per-workload reconciler: probe miniflare HTTP, restart on failure, tear
 /// down the container cleanly on cancel.
 pub(crate) struct MiniflareReconciler {
-    pub runtime: Arc<LocalRuntime>,
+    pub launcher: Arc<dyn ContainerLauncher>,
     pub spec: MiniflareSpec,
     pub ident: String,
     pub registry: Arc<super::PondRegistry>,
     pub cancel: Arc<Notify>,
+    /// True when the container daemon owns restart (pond deployed this slot
+    /// through kamaji with a restart policy, R626-F2). The reconciler then
+    /// probes and reports only — resurrecting here would fight dockerd and,
+    /// worse, undo a deliberate operator stop.
+    pub daemon_supervised: bool,
 }
 
 impl MiniflareReconciler {
@@ -57,7 +62,11 @@ impl MiniflareReconciler {
                 _ = tokio::time::sleep(PROBE_INTERVAL) => {}
             }
 
-            let probe_url = format!("http://127.0.0.1:{}/", self.spec.port);
+            let probe_url = format!(
+                "http://{}:{}/",
+                local_driver::pond_probe_host(),
+                self.spec.port
+            );
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -95,7 +104,14 @@ impl MiniflareReconciler {
                 continue;
             }
 
-            match ensure_miniflare_running(&self.runtime, &self.spec).await {
+            // Restart is the daemon's job (R626-F2): the container carries
+            // `--restart unless-stopped`, so a crash is already being retried
+            // and a stop was deliberate. Report, don't resurrect.
+            if self.daemon_supervised {
+                continue;
+            }
+
+            match ensure_miniflare_running(&self.launcher, &self.spec).await {
                 Ok(_) => {
                     info!(ident = %self.ident, "pond miniflare restarted; back to Running");
                     consecutive_failures = 0;
@@ -135,7 +151,9 @@ async fn probe_miniflare(port: u16) -> Result<()> {
         .timeout(Duration::from_secs(2))
         .build()
         .context("building reqwest client for miniflare probe")?;
-    let url = format!("http://127.0.0.1:{port}/");
+    // `pond_probe_host()` — host.docker.internal when this yubaba runs
+    // containerized (R454-F1); loopback on the host.
+    let url = format!("http://{}:{port}/", local_driver::pond_probe_host());
     let resp = client
         .get(&url)
         .send()

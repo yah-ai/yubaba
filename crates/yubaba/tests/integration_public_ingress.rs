@@ -36,11 +36,11 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use kamaji::fake::FakeRuntime;
-use yubaba::testing::cloudflared_mock::CloudflaredMock;
 use workload_spec::{
     ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, PublicExpose, PublicTls, ResourceLimits,
     RestartPolicy, SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
 };
+use yubaba::testing::cloudflared_mock::CloudflaredMock;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -56,6 +56,8 @@ fn public_workload_spec(name: &str, hostname: &str, port: u16) -> WorkloadSpec {
         },
         // Shape validation requires expose.public.port to be in expose.mesh.ports.
         tier: TierTag("public".into()),
+        tenant: workload_spec::TenantId::singleton(),
+        namespace: workload_spec::NamespaceId::singleton(),
         replicas: 1,
         command: None,
         entrypoint: None,
@@ -66,12 +68,13 @@ fn public_workload_spec(name: &str, hostname: &str, port: u16) -> WorkloadSpec {
         volumes: vec![],
         resources: ResourceLimits {
             memory_mb: 64,
-            cpu_shares: 128,
+            cpu_millis: 128,
             ephemeral_storage_mb: 128,
         },
         depends_on: vec![],
         healthcheck: None,
         restart_policy: RestartPolicy::Always,
+        archetype: None,
         stop_policy: StopPolicy {
             signal: 15,
             grace_period: Millis::from_secs(5),

@@ -81,6 +81,42 @@
 //! @yah:gotcha("Architectural decision during T15: moved qed::transforms → task::transforms because cloud cannot dep on qed (per the original T5 verify clause). transforms.rs only deps on task::TaskRuntime + workload_spec::ImageRef; task is the right home. qed re-exports dropped (no external callers existed). Added `toml = '0.8'` + `pub mod transforms;` to task/Cargo.toml + task/src/lib.rs. Cloud's Cargo.toml now has `task = { path = '../task' }`. The W164 doc's piece-placement table that says 'Recipe TOML loader | qed (existing)' is now stale; transforms lives in task.")
 //! @yah:gotcha("Stale test fixed: task::transforms::tests::rejects_recipe_with_struct_image_missing_digest now expects RecipeError::Parse (was ImageNotPinned). After R438-T3 tightened ImageRef.digest to non-Optional String, struct-form bare-tag fails at serde-deserialize, not at the post-parse ImageNotPinned check (which is now belt-and-braces against an empty-string digest).")
 //! @yah:gotcha("Reconciler is per-asset sequential — W164 calls for bounded semaphore (default 4) cross-asset concurrency. Filed as R438-F11-style follow-up rather than added in this ticket to keep the diff focused on correctness. Not blocking for R422-F11.")
+//!
+//! @yah:ticket(R546-B6, "yah cloud cache seed computes the fetched-input blake3 then discards it — leaves [asset.derive.fetch].blake3 sentinel unfilled, silently disarming the shared lock fast-path")
+//! @yah:at(2026-07-20T23:24:24Z)
+//! @yah:status(open)
+//! @yah:parent(R546)
+//! @yah:next("Make `yah cloud cache seed` print the fetched-input blake3 alongside the other three, e.g. `[asset.derive.fetch].blake3 = \"<fetched_hash>\"`, so the operator can paste all four and arm BOTH skip layers. The value is already in scope as `fetched_hash` in seed_derivation_for_target — this is a print-line change plus threading it out through SeededDerivation.")
+//! @yah:next("Verified fix shape by hand for the x86_64 row: fetch.blake3 = 3568931fb074a4e1b4d43098db5810e683cdadd06887a8bdd964a5719bca6481 (b3sum of the rusty_v8-149.4.0 archive; the fetch cache is content-addressed so the blob FILENAME is the blake3). After pasting, a re-seed reproduces the identical derive_key 6238d80e..., i.e. lock_skip_hash's recomputation now matches the lock.")
+//! @yah:next("Consider also asserting it: if seed writes a lock whose fast-path cannot engage (fetch pin still sentinel), emit a warning rather than printing a success message that implies the job is done.")
+//! @yah:gotcha("Surfaced 2026-07-20 by leif while closing R546-T3: 'why wasn't fetch.blake3 filled in already?'. `seed_derivation_for_target` ALREADY has the value — it calls materialize_fetch(&derive.fetch, ...) and binds `fetched_hash`, uses it to compute the derive_key, then prints ONLY [[asset]].blake3 + lock.input_hash + lock.output_blake3. The fetched-input hash is dropped on the floor.")
+//! @yah:gotcha("CONSEQUENCE (non-obvious, cost real time to find): with [asset.derive.fetch].blake3 left as the zero sentinel, lock_skip_hash() bails at its FIRST guard (`is_bootstrap_sentinel(&derive.fetch.blake3.0) -> return None`, static_asset.rs ~line 770). So the W212 substituter fast-path never engages. The local action cache still skips the build, which MASKS the problem on the seeding machine — but a clean checkout / CI / another operator gets no skip at all. The seed command's whole purpose is 'prepare a no-rebuild apply', so leaving this unfilled defeats the shared half of it.")
+//!
+//! @yah:ticket(R546-B8, "static-asset transform passes a RELATIVE YAH_TRANSFORM_OUT into the container — any recipe that chdirs writes its artifact inside the container and silently loses it (cost a ~2h rusty-v8 arm64 build)")
+//! @yah:at(2026-07-21T02:08:04Z)
+//! @yah:status(open)
+//! @yah:parent(R546)
+//! @yah:next("FIX LANDED: canonicalize `cache_dir` and join the filename (the tmp file itself does not exist yet so it cannot be canonicalized directly); also canonicalize `input_path` for the YAH_TRANSFORM_IN_0 binding for the same reason. static_asset tests 46/46 green.")
+//! @yah:next("ADD A REGRESSION TEST that asserts both YAH_TRANSFORM_IN_0 and YAH_TRANSFORM_OUT bindings are absolute after substitution. Not added yet — the existing tests exercise recipes that never chdir, so they cannot catch this class. A cheap version: assert Path::new(&params[ENV_TRANSFORM_OUT]).is_absolute().")
+//! @yah:next("HARDENING: the reconciler should fail LOUDLY when a transform step exits 0 but produces no output at YAH_TRANSFORM_OUT — today the missing-file error surfaces as a confusing BLAKE3 read failure that reads like cache corruption rather than 'your recipe never wrote its output'.")
+//! @yah:gotcha("FAILURE MODE IS SILENT AND EXPENSIVE: the step exits 0, no 'step failed' is reported, and the reconciler dies afterwards on `reading transform output ./.yah/cache/derive/transform/<derive_key>.tmp for BLAKE3: No such file or directory`. Hit 2026-07-20 after a ~2h native arm64 V8 build that had actually SUCCEEDED — the finished tar was written inside the container and thrown away with it.")
+//! @yah:gotcha("ROOT CAUSE: materialize_transform built `tmp_output = cache_dir.join(\"<derive_key>.tmp\")` from `workspace_root`, which is \".\" by CLI default, then bound that RELATIVE string into the recipe argv as {{YAH_TRANSFORM_OUT}}. Note the code immediately below it already canonicalized `workspace_abs` for the container cwd (docker rejects `-w .`) — the OUT binding just never got the same treatment. A relative OUT only survives if the recipe never leaves its cwd: true for the whisper recipes (which is why this went unnoticed for months), FALSE for rusty-v8 because build-v8.sh chdirs into /tmp/tmp.XXXX/v8src to build V8.")
+//! @yah:gotcha("CONTRAST: the QED/P018 offload path was unaffected because it passes an ABSOLUTE container path (/yah/produced/...). Only the LOCAL static-asset transform path had the relative binding.")
+//!
+//! @yah:ticket(R546-B10, "static-asset publish skips PUT on key EXISTENCE (HEAD), not content — bucket keeps stale bytes while the manifest records the new hash")
+//! @yah:status(review)
+//! @yah:assignee(agent:claude)
+//! @yah:at(2026-07-21T21:00:26Z)
+//! @yah:parent(R546)
+//! @yah:severity(high)
+//! @yah:next("Repro (real, cost this relay a wrong pin): static_asset.rs:670 does `if object_exists(...) { report.already_synced.push(key); new_manifest.insert(key, actual_hash); continue; }`. object_exists issues an existence-only probe (HTTP-verb HEAD) with no content comparison. So when the locally-materialized artifact differs from the object already at that key, the reconciler skips the PUT (bucket keeps the OLD bytes) yet still records the NEW locally-computed hash in the manifest. The published _yah-asset-catalog.json then advertises a hash that describes bytes which were never uploaded.")
+//! @yah:next("Live evidence: cdn.yah.dev/yah-cloud/rusty-v8/v149.4.0/rusty-v8-aarch64-unknown-linux-musl.tar.gz serves blake3 d322b4a1… (last-modified 2026-06-20, hand-uploaded), while _yah-asset-catalog.json claims ebdd842d… — the artifact the 2026-07-20 apply built and then silently declined to upload. Both hashes are real; they describe different tarballs.")
+//! @yah:next("Fix shape: when the object already exists, compare its hash against actual_hash before skipping. Cheapest probe is the ETag when it is a plain MD5 (single-part upload), but ETag is NOT a content hash for multipart uploads — do not key correctness on it alone. Preferred: store the blake3 as object metadata (x-amz-meta-blake3) at PUT time and compare that on the existence probe; fall back to re-PUT when the metadata is absent (older objects). Re-PUT on mismatch instead of skipping.")
+//! @yah:next("Also decide the drift POSTURE, not just the mechanism: a content mismatch at a stable key is exactly the DriftBucket condition the journal already models (AssetState::DriftBucket, used at static_asset.rs:645 for source-vs-declared mismatch). Emitting the same event here, rather than silently overwriting, is probably the right default for a published CDN object — make it explicit rather than incidental.")
+//! @yah:verify("Regression test: seed a bucket object at key K with bytes A, run the reconciler with a workload whose materialized artifact for K is bytes B (B != A), assert the object at K afterwards is B (or that a DriftBucket event was emitted) AND that the manifest never records B while the bucket still holds A.")
+//! @yah:gotcha("Latent for most assets, which is why it went unnoticed for so long: W164 catalogs put the VERSION IN THE PATH (yah-cloud/rusty-v8/v149.4.0/…), so bytes at a given key normally never change and the skip is correct. It only bites when an object is placed at a key out-of-band (hand-uploaded) or when a rebuild is non-deterministic — both true for rusty-v8 arm64.")
+//! @yah:gotcha("The manifest is NOT load-bearing for consumer correctness, so do not overstate the blast radius: prior_manifest is read only for PRUNE-candidate detection (static_asset.rs:534-549), and consumers verify pulled bytes against [[asset]].blake3 in workload.toml, not against the catalog JSON. The damage is a lying audit record + a silently-skipped publish, not corrupted downloads.")
+//! @yah:assumes("Tier: Cleric — mechanism is a few lines, but the drift posture (overwrite vs refuse-and-report) is a real design call, and the ETag/multipart trap makes the naive fix wrong.")
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -97,20 +133,15 @@ use crate::asset_journal::{AssetState, AssetStatusEvent, AssetStatusJournal};
 use crate::provider::cloudflare::CloudflareClient;
 use crate::reconciler::pond::DEFAULT_MINIO_PASSWORD;
 use crate::reconciler::pond::DEFAULT_MINIO_USER;
-use crate::reconciler::r2_publish::{
-    R2_ACCESS_KEY_ENV, R2_ACCESS_KEY_SLOT, R2_SECRET_KEY_ENV, R2_SECRET_KEY_SLOT,
-};
 use crate::{MirrorProviderSlot, Provider};
 
 use local_driver::s3_sign::{sign_s3_empty_body, sign_s3_put_object};
-use velveteen::transforms::{
+use velveteen_exec::transforms::{
     substitute_argv, RecipeStep, TransformRecipe, TransformRecipeLoader, ENV_TRANSFORM_IN_0,
     ENV_TRANSFORM_OUT,
 };
-use velveteen::{
-    ExecContext, ForgeCommand, ForgeExecutor, ForgeSpec, Initiator, LocalForgeDriver, MeshAccess,
-    TaskLocation, TaskPlacement,
-};
+use velveteen::{ForgeCommand, ForgeSpec, Initiator, MeshAccess, TaskLocation, TaskPlacement};
+use velveteen_exec::{ExecContext, ForgeExecutor, LocalForgeDriver};
 use workload_spec::validate::shape_static_asset;
 use workload_spec::{AssetEntry, FetchSource, Millis, StaticAssetWorkload, TransformSpec};
 
@@ -213,10 +244,18 @@ type CatalogManifest = HashMap<String, String>;
 /// Summary of a completed static-asset sync.
 #[derive(Debug, Default)]
 pub struct StaticAssetSyncReport {
-    /// Asset filenames that were already present in the bucket (skipped).
+    /// Asset filenames that were already present in the bucket with a matching
+    /// BLAKE3 stamp (genuinely skipped — the bytes are known to be current).
     pub already_synced: Vec<String>,
     /// Asset filenames uploaded this run.
     pub uploaded: Vec<String>,
+    /// R546-B10: filenames whose bucket object existed but did NOT match the
+    /// declared artifact — either drifted content or a legacy object with no
+    /// `x-amz-meta-blake3` stamp — and was therefore re-uploaded. A key showing
+    /// up here repeatedly across runs means something outside this reconciler
+    /// keeps rewriting it; a key appearing exactly once is the expected
+    /// one-time heal of a pre-metadata object.
+    pub republished: Vec<String>,
     /// Asset filenames whose source BLAKE3 hash didn't match the manifest.
     /// These are NOT uploaded — operator must rebuild or fix the declaration.
     pub hash_mismatch: Vec<String>,
@@ -296,9 +335,25 @@ impl Reconciler for StaticAssetReconciler {
             MirrorProviderSlot::Reference {
                 provider_id,
                 fields,
-            } if provider_id == "cloudflare" => {
+            } => {
+                // Any cloudflare-*kind* provider routes here (dispatch is on
+                // the resolved kind, not the literal name) so a workspace can
+                // declare several — e.g. `cloudflare` + `cloudflare-scrabcake`.
+                let cf = super::cf_creds::CfProvider::resolve_scoped(
+                    ctx.workspace_root,
+                    provider_id,
+                    &ctx.scope.tenant,
+                    &ctx.scope.namespace,
+                )?;
+                anyhow::ensure!(
+                    matches!(cf.cfg.kind, Provider::Cloudflare),
+                    "providers.object_store.use = {provider_id:?} (kind={:?}) not supported \
+                     for static-asset — only cloudflare-kind reference providers are",
+                    cf.cfg.kind,
+                );
                 sync_to_r2(
                     &ctx,
+                    cf,
                     &workload,
                     fields,
                     self.executor.clone(),
@@ -306,12 +361,6 @@ impl Reconciler for StaticAssetReconciler {
                     &journal,
                 )
                 .await?
-            }
-            MirrorProviderSlot::Reference { provider_id, .. } => {
-                anyhow::bail!(
-                    "providers.object_store.use = {provider_id:?} not supported for \
-                     static-asset (only \"cloudflare\" is supported as a reference provider)"
-                );
             }
             MirrorProviderSlot::Inline {
                 kind: Provider::MinioContainer,
@@ -402,30 +451,16 @@ impl Reconciler for StaticAssetReconciler {
 
 async fn sync_to_r2(
     ctx: &ReconcileCtx<'_>,
+    cf_provider: super::cf_creds::CfProvider,
     workload: &StaticAssetWorkload,
     slot_fields: &std::collections::BTreeMap<String, toml::Value>,
     executor: Arc<dyn ForgeExecutor>,
     service_name: &str,
     journal: &AssetStatusJournal,
 ) -> Result<StaticAssetSyncReport> {
-    use crate::config::ProviderConfig;
-
-    // Cloudflare provider config supplies account_id.
-    let provider_path = ctx
-        .workspace_root
-        .join(".yah/infra/providers/cloudflare.toml");
-    let provider_cfg = ProviderConfig::load(&provider_path).with_context(|| {
-        format!(
-            "loading Cloudflare provider config — expected at {}",
-            provider_path.display()
-        )
-    })?;
-    let account_id = provider_cfg
-        .fields
-        .get("account_id")
-        .and_then(|v| v.as_str())
-        .with_context(|| format!("{}: missing `account_id` field", provider_path.display()))?
-        .to_string();
+    // `cf_provider` resolved from the mirror slot's `use = "<id>"` — supplies
+    // account_id + management token + R2 S3 keys, all per-provider.
+    let account_id = cf_provider.account_id.clone();
 
     let bucket = slot_fields
         .get("bucket")
@@ -433,24 +468,10 @@ async fn sync_to_r2(
         .context("providers.object_store missing `bucket` field for cloudflare static-asset sync")?
         .to_string();
 
-    let access_key = fob::get_or_env(R2_ACCESS_KEY_SLOT, R2_ACCESS_KEY_ENV)
-        .context("resolving R2 S3 access key")?
-        .with_context(|| {
-            format!(
-                "R2 access key not found — add via `yah keys set {R2_ACCESS_KEY_SLOT}` \
-                 or export {R2_ACCESS_KEY_ENV}"
-            )
-        })?;
-    let secret_key = fob::get_or_env(R2_SECRET_KEY_SLOT, R2_SECRET_KEY_ENV)
-        .context("resolving R2 S3 secret key")?
-        .with_context(|| {
-            format!(
-                "R2 secret key not found — add via `yah keys set {R2_SECRET_KEY_SLOT}` \
-                 or export {R2_SECRET_KEY_ENV}"
-            )
-        })?;
+    let (access_key, secret_key) = cf_provider.r2_keys()?;
+    let api_token = cf_provider.api_token()?;
 
-    ensure_r2_bucket(&account_id, &bucket).await?;
+    ensure_r2_bucket(&api_token, &account_id, &bucket).await?;
 
     let endpoint = format!("https://{account_id}.r2.cloudflarestorage.com");
     let client = reqwest::Client::new();
@@ -561,14 +582,26 @@ async fn sync_assets(
         // checked-in lock as the action cache and R2 as the CAS.
         if let Some(out_hash) = lock_skip_hash(entry, workspace_root).await {
             let object_url = format!("{endpoint}/{bucket}/{}", entry.filename);
-            if object_exists(client, &object_url, region, access_key, secret_key).await? {
+            // R546-B10: the lock says WHAT the output should be; the bucket must
+            // actually hold it. An unstamped legacy object is not evidence of a
+            // match, so it falls through and rebuilds rather than blessing bytes
+            // we cannot identify — the expensive-but-correct direction.
+            let remote = head_object(client, &object_url, region, access_key, secret_key).await?;
+            if remote.matches(&out_hash) {
                 debug!(
                     filename = %entry.filename,
-                    "derivation lock in sync + object present — skipping build",
+                    "derivation lock in sync + object content matches — skipping build",
                 );
                 report.already_synced.push(entry.filename.clone());
                 new_manifest.insert(entry.filename.clone(), out_hash);
                 continue;
+            }
+            if remote.exists() {
+                debug!(
+                    filename = %entry.filename,
+                    "derivation lock in sync but bucket object is unstamped or drifted \
+                     — not trusting it, falling through to build/publish",
+                );
             }
         }
 
@@ -666,12 +699,41 @@ async fn sync_assets(
         let key = &entry.filename;
         let object_url = format!("{endpoint}/{bucket}/{key}");
 
-        // HEAD check — skip PUT if the object is already in the bucket.
-        if object_exists(client, &object_url, region, access_key, secret_key).await? {
-            debug!(key, "already present in bucket — skipping PUT");
+        // R546-B10: skip the PUT only when the bucket demonstrably holds THESE
+        // bytes. Existence alone is not enough — an object placed at this key
+        // out-of-band, or a rebuild that isn't byte-reproducible, leaves content
+        // that differs from the artifact we just verified. Skipping on mere
+        // existence let the bucket keep stale bytes while `new_manifest` below
+        // recorded the new hash, so the published catalog described bytes that
+        // were never uploaded.
+        //
+        // Note `actual_hash` is already verified equal to the declared
+        // `entry.blake3` at this point (the mismatch arm above `continue`s), so
+        // re-PUTting on drift converges the bucket toward the committed catalog
+        // rather than clobbering it with something unvetted.
+        let remote = head_object(client, &object_url, region, access_key, secret_key).await?;
+        if remote.matches(&actual_hash) {
+            debug!(key, "already present with matching blake3 — skipping PUT");
             report.already_synced.push(key.clone());
             new_manifest.insert(key.clone(), actual_hash);
             continue;
+        }
+        if remote.exists() {
+            // Drifted, or a legacy object predating the metadata stamp. Either
+            // way re-PUT: identical bytes make it a cheap idempotent overwrite
+            // that heals the missing stamp, and differing bytes are exactly the
+            // case that must not be skipped. Legacy objects therefore cost ONE
+            // re-upload, after which the stamp makes the skip work again.
+            warn!(
+                key,
+                expected = %actual_hash,
+                remote = ?match &remote {
+                    RemoteObject::Present { blake3 } => blake3.as_deref(),
+                    RemoteObject::Absent => None,
+                },
+                "bucket object does not match the declared artifact — re-publishing",
+            );
+            report.republished.push(key.clone());
         }
 
         // PUT the file.
@@ -686,6 +748,9 @@ async fn sync_assets(
             region,
             access_key,
             secret_key,
+            // R546-B10: stamp the content hash so a later run can tell whether
+            // the bucket already holds these exact bytes.
+            Some(actual_hash.as_str()),
         )
         .with_context(|| format!("signing PUT {object_url}"))?;
 
@@ -1286,10 +1351,6 @@ async fn materialize_transform(
         // lost the bytes).
     }
 
-    // Tmp output is named by the derivation key — unique per input set, so
-    // concurrent rows (and zero-sentinel bootstrap rows) never collide on it.
-    let tmp_output = cache_dir.join(format!("{derive_key}.tmp"));
-
     // Absolute workspace_root for the container bind-mount — docker rejects
     // `-w .` ("the working directory '.' is invalid"). Callers may pass a
     // relative path (the CLI `--path` default is "."), so canonicalize once.
@@ -1297,10 +1358,33 @@ async fn materialize_transform(
         .canonicalize()
         .with_context(|| format!("canonicalizing workspace root {}", workspace_root.display()))?;
 
+    // R546-B8: the IN/OUT bindings handed to the recipe MUST be absolute.
+    // `cache_dir` is derived from workspace_root, which is "." by CLI default,
+    // so these used to be relative (`./.yah/cache/derive/transform/<key>.tmp`).
+    // A relative path only survives if the recipe never leaves its cwd — true
+    // for whisper's recipes, FALSE for rusty-v8: build-v8.sh chdirs into a
+    // scratch dir (/tmp/tmp.XXXX/v8src) to build V8, so it wrote its finished
+    // tar to "<scratch>/./.yah/cache/..." INSIDE the container, invisible to the
+    // host. The step then exited 0 and the reconciler failed reading a file that
+    // was never going to be there — after a ~2h build. Canonicalize the parent
+    // (it exists; created above) and join the filename, since the tmp output
+    // itself does not exist yet and cannot be canonicalized directly.
+    let cache_dir_abs = cache_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalizing transform cache dir {}", cache_dir.display()))?;
+
+    // Tmp output is named by the derivation key — unique per input set, so
+    // concurrent rows (and zero-sentinel bootstrap rows) never collide on it.
+    let tmp_output = cache_dir_abs.join(format!("{derive_key}.tmp"));
+
+    let input_abs = input_path
+        .canonicalize()
+        .unwrap_or_else(|_| input_path.to_path_buf());
+
     let mut params: BTreeMap<String, String> = BTreeMap::new();
     params.insert(
         ENV_TRANSFORM_IN_0.to_string(),
-        input_path.to_string_lossy().into_owned(),
+        input_abs.to_string_lossy().into_owned(),
     );
     params.insert(
         ENV_TRANSFORM_OUT.to_string(),
@@ -1392,6 +1476,164 @@ async fn materialize_transform(
     }
 
     Ok(cache_path)
+}
+
+/// Outcome of seeding the transform derivation cache from a pre-built artifact
+/// (the qed→W164 bridge, R546-T3).
+#[derive(Debug, Clone)]
+pub struct SeededDerivation {
+    /// The W212 derivation key the seeded action-cache entry is filed under —
+    /// byte-identical to the one [`materialize_transform`] will look up, so the
+    /// next `yah cloud apply` HITs it. Equals the value to paste into
+    /// `[asset.derive.lock].input_hash`.
+    pub derive_key: String,
+    /// BLAKE3 of the pre-built artifact — the transform output hash. Equals the
+    /// value to paste into `[[asset]].blake3` and `[asset.derive.lock].output_blake3`.
+    pub output_blake3: String,
+    /// The content-addressed store path the artifact was landed at.
+    pub cas_path: PathBuf,
+}
+
+/// Seed the transform derivation cache (AC + CAS) from an artifact built OUT OF
+/// BAND — the qed→W164 bridge (R546-T3).
+///
+/// # Why this exists
+///
+/// The static-asset reconciler lowers every transform to
+/// [`TaskLocation::Local`](task::TaskLocation::Local) (see
+/// [`lower_recipe_step_to_forge_spec`]) — it has no fleet-offload path, so on a
+/// foreign-arch host it can only build the recipe under emulation (which OOMs for
+/// the rusty_v8 musl build, the reason R546 exists). `yah qed run <pipeline>`
+/// (e.g. P018) DOES offload to an arch-matched build-worker and, via R590-F6,
+/// retrieves the produced tar content-addressed onto the caller. This function
+/// bridges that pre-built tar into the W164 substituter: it writes the exact
+/// action-cache + CAS entries [`materialize_transform`] would have written, so
+/// the next `yah cloud apply` finds a HIT and PUBLISHES the pre-built bytes to
+/// the consumer key + records the lock, instead of re-running the transform.
+///
+/// # Hermeticity
+///
+/// The derivation key is computed with the reconciler's OWN [`derivation_key`] +
+/// [`recipe_blake3`], keyed on the SAME `fetched_hash` the reconciler derives
+/// from the version anchor. Reusing those (not reimplementing) is what makes the
+/// seeded key byte-identical to the lookup key — a drift would reintroduce the
+/// W164/R438 silent-stale-cache bug. `fetched_hash` MUST be the value
+/// [`materialize_fetch`] returns for `derive.fetch` (see [`seed_derivation_for_target`]).
+pub async fn seed_transform_derivation(
+    workspace_root: &Path,
+    transform: &TransformSpec,
+    fetched_hash: &str,
+    artifact_path: &Path,
+) -> Result<SeededDerivation> {
+    let recipe_bk = recipe_blake3(workspace_root, &transform.recipe)
+        .await
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "recipe {:?} unreadable under .yah/qed/transforms — cannot compute derivation key",
+                transform.recipe,
+            )
+        })?;
+    let derive_key = derivation_key(fetched_hash, &recipe_bk, &transform.params);
+
+    let bytes = tokio::fs::read(artifact_path)
+        .await
+        .with_context(|| format!("reading pre-built artifact {}", artifact_path.display()))?;
+    let output_blake3 = blake3_hex(&bytes);
+
+    let cache_dir = workspace_root.join(".yah/cache/derive/transform");
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .with_context(|| format!("creating transform cache dir {}", cache_dir.display()))?;
+
+    // CAS: <cache_dir>/<output_blake3>.bin — the exact name materialize_transform
+    // renames its output to (so its HIT-path verify_blake3_path passes). Atomic
+    // tmp+rename; idempotent when the entry already exists.
+    let cas_path = cache_dir.join(format!("{output_blake3}.bin"));
+    if !tokio::fs::try_exists(&cas_path).await.unwrap_or(false) {
+        let tmp = cache_dir.join(format!("{output_blake3}.seed.tmp"));
+        tokio::fs::write(&tmp, &bytes)
+            .await
+            .with_context(|| format!("writing CAS tmp {}", tmp.display()))?;
+        tokio::fs::rename(&tmp, &cas_path)
+            .await
+            .with_context(|| format!("promoting CAS entry {}", cas_path.display()))?;
+    }
+
+    // Action cache: <cache_dir>/ac/<derive_key>.out = <output_blake3>. Reuses the
+    // reconciler's writer so the on-disk format can't drift from the reader.
+    let ac_path = cache_dir.join("ac").join(format!("{derive_key}.out"));
+    write_action_cache(&ac_path, &output_blake3)
+        .await
+        .with_context(|| format!("recording seeded action-cache entry {}", ac_path.display()))?;
+
+    info!(
+        recipe = %transform.recipe,
+        derive_key,
+        output_blake3,
+        "seeded transform derivation cache from pre-built artifact (qed→W164 bridge)",
+    );
+
+    Ok(SeededDerivation {
+        derive_key,
+        output_blake3,
+        cas_path,
+    })
+}
+
+/// CLI-facing entry for the qed→W164 bridge (R546-T3): seed the derivation cache
+/// for the `[[asset]]` row whose `derive.transform.params["target"]` equals
+/// `target`, from a pre-built `artifact_path`.
+///
+/// Loads the static-asset workload, resolves the matching asset row, computes the
+/// fetched-input hash via the reconciler's own [`materialize_fetch`] (downloading
+/// the version anchor once; cached thereafter), then delegates to
+/// [`seed_transform_derivation`]. After this returns, `yah cloud apply` on the
+/// same service publishes the pre-built bytes without re-running the transform.
+pub async fn seed_derivation_for_target(
+    workspace_root: &Path,
+    workload_path: &Path,
+    target: &str,
+    artifact_path: &Path,
+) -> Result<SeededDerivation> {
+    let raw = tokio::fs::read_to_string(workload_path)
+        .await
+        .with_context(|| format!("reading workload {}", workload_path.display()))?;
+    let workload: StaticAssetWorkload = toml::from_str(&raw)
+        .with_context(|| format!("parsing static-asset workload {}", workload_path.display()))?;
+
+    let entry = workload
+        .assets
+        .iter()
+        .find(|a| {
+            a.derive
+                .as_ref()
+                .and_then(|d| d.transform.as_ref())
+                .map(|t| t.params.get("target").map(String::as_str) == Some(target))
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no [[asset]] with derive.transform.params.target = {target:?} in {}",
+                workload_path.display(),
+            )
+        })?;
+
+    let derive = entry
+        .derive
+        .as_ref()
+        .expect("asset matched by derive.transform above");
+    let transform = derive
+        .transform
+        .as_ref()
+        .expect("asset matched by derive.transform above");
+
+    // Recompute the fetched-input hash exactly as the reconciler will — same
+    // fetch source, same cache dir.
+    let cache_root = workspace_root.join(".yah/cache/derive");
+    let (_fetched_path, fetched_hash) =
+        materialize_fetch(&derive.fetch, &cache_root.join("fetch")).await?;
+
+    seed_transform_derivation(workspace_root, transform, &fetched_hash, artifact_path).await
 }
 
 /// Lower a single recipe step to a [`ForgeSpec`] (W164).
@@ -1495,6 +1737,9 @@ async fn save_catalog_manifest(
         region,
         access_key,
         secret_key,
+        // The manifest sidecar is rewritten every run by definition — stamping it
+        // would be noise, and nothing skips a PUT on it (R546-B10).
+        None,
     )
     .context("signing manifest PUT")?;
     let resp = client
@@ -1514,14 +1759,47 @@ async fn save_catalog_manifest(
 
 // ── S3 helpers ────────────────────────────────────────────────────────────────
 
-/// Returns `true` when a HEAD request succeeds (object exists in bucket).
-async fn object_exists(
+/// What a HEAD probe found at an object key (R546-B10).
+///
+/// The distinction that matters is *not* present-vs-absent but whether the
+/// present bytes are the ones we are about to publish. `Present { blake3: None }`
+/// is an object written before we started stamping `x-amz-meta-blake3` — its
+/// content is unknowable from a HEAD, so callers must treat it as "might be
+/// stale" rather than "matches".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteObject {
+    Absent,
+    Present { blake3: Option<String> },
+}
+
+impl RemoteObject {
+    /// True only when the remote object is known to hold exactly `expected`.
+    /// Unknown provenance (no metadata) is deliberately NOT a match.
+    fn matches(&self, expected: &str) -> bool {
+        matches!(self, RemoteObject::Present { blake3: Some(b3) } if hashes_equal(b3, expected))
+    }
+
+    fn exists(&self) -> bool {
+        matches!(self, RemoteObject::Present { .. })
+    }
+}
+
+/// HEAD an object key and report existence *plus* the recorded BLAKE3.
+///
+/// R546-B10: the previous `object_exists` returned a bare bool, so the publish
+/// loop could not tell "same bytes already there" from "different bytes already
+/// there" and skipped the PUT for both — leaving stale content in the bucket
+/// while the catalog manifest advertised the new hash. We read our own
+/// `x-amz-meta-blake3` stamp rather than the ETag, because ETag is only an MD5
+/// of the content for single-part uploads; for multipart it is a digest-of-
+/// digests and comparing it to a content hash is simply wrong.
+async fn head_object(
     client: &reqwest::Client,
     url: &str,
     region: &str,
     access_key: &str,
     secret_key: &str,
-) -> Result<bool> {
+) -> Result<RemoteObject> {
     let headers = sign_s3_empty_body("HEAD", url, region, access_key, secret_key)
         .with_context(|| format!("signing HEAD {url}"))?;
     let resp = client
@@ -1530,7 +1808,15 @@ async fn object_exists(
         .send()
         .await
         .with_context(|| format!("HEAD {url}"))?;
-    Ok(resp.status().is_success())
+    if !resp.status().is_success() {
+        return Ok(RemoteObject::Absent);
+    }
+    let blake3 = resp
+        .headers()
+        .get("x-amz-meta-blake3")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    Ok(RemoteObject::Present { blake3 })
 }
 
 // ── Crypto helpers ────────────────────────────────────────────────────────────
@@ -1565,21 +1851,15 @@ fn content_type_for(path: &Path) -> &'static str {
 
 /// List R2 buckets under `account_id`; create `bucket_name` only when absent.
 ///
-/// Resolves the Cloudflare API token from the `cloudflare-api-token` keystore
-/// slot (or `CLOUDFLARE_API_TOKEN` env). Mirrors the idempotent pattern in
+/// Takes the management `api_token` already resolved from the service's
+/// provider (see [`super::cf_creds::CfProvider`]). Mirrors the idempotent pattern in
 /// `cloudflare_worker.rs::ensure_r2_bucket` — list-first keeps the reconcile
 /// loop safe to re-run without depending on CF's 4xx error shape on duplicate
 /// create. R422-T12: lets the first `yah cloud apply --env cloud --service <s>`
 /// against a static-asset mirror provision its bucket without an out-of-band
 /// dashboard step.
-async fn ensure_r2_bucket(account_id: &str, bucket_name: &str) -> Result<()> {
-    let api_token = fob::get_or_env("cloudflare-api-token", "CLOUDFLARE_API_TOKEN")
-        .context("resolving cloudflare-api-token")?
-        .context(
-            "cloudflare-api-token not found — set via `yah keys set cloudflare-api-token` \
-             or export CLOUDFLARE_API_TOKEN",
-        )?;
-    let cf = CloudflareClient::new(api_token);
+async fn ensure_r2_bucket(api_token: &str, account_id: &str, bucket_name: &str) -> Result<()> {
+    let cf = CloudflareClient::new(api_token.to_string());
     let existing = cf
         .list_r2_buckets(account_id)
         .await
@@ -1601,17 +1881,49 @@ fn load_workload(workload_dir: &Path) -> Result<StaticAssetWorkload> {
     let path = workload_dir.join("workload.toml");
     let src =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    // Parse through the Workload envelope to validate the `kind` field.
-    let envelope: workload_spec::Workload =
+    // R546-B7: do NOT route this through the `workload_spec::Workload` envelope.
+    // That enum derives Deserialize with only `rename_all` — no
+    // `#[serde(tag = "kind")]` — so it is EXTERNALLY tagged and only accepts the
+    // nested `[[static-asset.asset]]` shape. Every real on-disk workload.toml is
+    // flat (`kind = "static-asset"` alongside `[[asset]]`), which serde rejects
+    // with "wanted exactly 1 element, more than 1 element" — the whole document
+    // is a multi-key map where it wanted a single variant key. That broke
+    // `yah cloud apply` for EVERY static-asset component (verified against the
+    // long-published whisper catalog, not just rusty-v8).
+    //
+    // The envelope is not fixed here on purpose: `Workload` is also a
+    // postcard wire type on the kamaji RPC path, and postcard (non
+    // self-describing) cannot decode an internally-tagged enum — so slapping
+    // `tag = "kind"` on it risks breaking that wire. Deserializing the payload
+    // directly and checking `kind` by hand is the same thing
+    // `seed_derivation_for_target` already does successfully. See R546-B7 for
+    // the envelope-level fix.
+    #[derive(serde::Deserialize)]
+    struct KindProbe {
+        kind: String,
+    }
+    let probe: KindProbe =
         toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
-    match envelope {
-        workload_spec::Workload::StaticAsset(w) => Ok(w),
-        other => anyhow::bail!(
+    if probe.kind != "static-asset" {
+        anyhow::bail!(
             "{}: expected kind=\"static-asset\" but found kind={:?}",
             path.display(),
-            workload_kind_str(&other)
-        ),
+            probe.kind
+        );
     }
+    let workload: StaticAssetWorkload =
+        toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
+
+    // R546-B7: enforce the closed-catalog invariant the type's docs promise
+    // ("every value in [aliases] must be a filename that exists in [[asset]],
+    // enforced by validate::shape_static_asset"). It was NOT actually being run
+    // here — `up_bails_when_catalog_alias_orphaned` only passed because the old
+    // fixture failed to PARSE, so the expected error came from the wrong place.
+    // With parsing fixed, an orphaned alias would have silently reconciled.
+    workload_spec::validate::shape_static_asset(&workload)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+
+    Ok(workload)
 }
 
 fn workload_kind_str(w: &workload_spec::Workload) -> &'static str {
@@ -1667,6 +1979,7 @@ mod tests {
                 name: "yah-desktop".to_string(),
                 domain: "releases.yah.dev".to_string(),
                 components: vec![],
+                db: crate::DbCatalog::default(),
             };
             let component = ServiceComponent {
                 id: "whisper-models".to_string(),
@@ -1694,6 +2007,7 @@ mod tests {
                 component: &self.component,
                 mirror: &self.mirror,
                 env: &self.env,
+                scope: crate::reconciler::ProviderScope::singleton(),
             }
         }
 
@@ -1702,9 +2016,16 @@ mod tests {
         }
 
         fn write_workload(&self, extra: &str) {
+            // R546-B7: emit the FLAT shape every real on-disk workload.toml uses
+            // (`kind = "static-asset"` beside `schema_version`), not the
+            // externally-tagged `[static-asset]` wrapper. The old fixture encoded
+            // the `workload_spec::Workload` enum's (untagged) representation,
+            // which NO real file has ever used — so these tests were asserting a
+            // shape that could not occur in production and masked the fact that
+            // `yah cloud apply` could not parse any actual catalog.
             let toml = format!(
-                r#"kind = "static-asset"
-schema_version = "V1"
+                r#"schema_version = "V1"
+kind = "static-asset"
 {extra}
 "#
             );
@@ -1742,7 +2063,7 @@ schema_version = "V1"
 
     // ── Mock executor for W164 materialize-transform tests ────────────────────
 
-    use velveteen::executor::{ExecEvent, ExecOutcome, ForgeExecutorError};
+    use velveteen_exec::executor::{ExecEvent, ExecOutcome, ForgeExecutorError};
     use velveteen::ForgeStatus;
     use tokio::sync::mpsc::UnboundedSender;
     use tokio::sync::Mutex;
@@ -1902,9 +2223,18 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
         };
         let fx = Fixture::new(slot);
         fx.write_workload("");
+        // Declare a real non-cloudflare provider so dispatch resolves it and
+        // reaches the kind check (the new dispatch keys on kind, not name).
+        let providers_dir = fx.workspace_root.join(".yah/infra/providers");
+        std::fs::create_dir_all(&providers_dir).unwrap();
+        std::fs::write(
+            providers_dir.join("hetzner.toml"),
+            "schema_version = 1\nid = \"hetzner\"\nkind = \"hetzner\"\naccount_id = \"x\"\n",
+        )
+        .unwrap();
         let err = StaticAssetReconciler::new().up(fx.ctx()).await.unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("cloudflare"), "got: {msg}");
+        assert!(msg.contains("cloudflare-kind"), "got: {msg}");
     }
 
     #[tokio::test]
@@ -2075,6 +2405,52 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
         let json = serde_json::to_vec(&m).unwrap();
         let m2: CatalogManifest = serde_json::from_slice(&json).unwrap();
         assert_eq!(m, m2);
+    }
+
+    // ── R546-B10: publish-skip must be content-aware, not existence-aware ─────
+
+    /// The defect this encodes: an object that EXISTS is not evidence that the
+    /// object holds the bytes we are about to publish. Skipping the PUT on mere
+    /// existence left stale bytes in the bucket while the catalog manifest
+    /// advertised the new hash — the published catalog described bytes that were
+    /// never uploaded (real incident: rusty-v8 aarch64, bucket held d322b4a1
+    /// while the manifest claimed ebdd842d).
+    #[test]
+    fn remote_object_matches_only_on_identical_content() {
+        let expected = "a".repeat(64);
+        let other = "b".repeat(64);
+
+        // Same bytes → genuine no-op, safe to skip the PUT.
+        assert!(RemoteObject::Present { blake3: Some(expected.clone()) }.matches(&expected));
+
+        // Different bytes → MUST NOT be treated as synced. This is the bug.
+        assert!(!RemoteObject::Present { blake3: Some(other) }.matches(&expected));
+
+        // Absent → nothing to match.
+        assert!(!RemoteObject::Absent.matches(&expected));
+        assert!(!RemoteObject::Absent.exists());
+    }
+
+    /// A legacy object written before we stamped `x-amz-meta-blake3` has
+    /// unknowable content. It must NOT count as a match — otherwise every
+    /// pre-existing object keeps its old bytes forever. It re-PUTs once, which
+    /// installs the stamp and restores the cheap skip on subsequent runs.
+    #[test]
+    fn unstamped_remote_object_is_not_a_match_but_does_exist() {
+        let expected = "c".repeat(64);
+        let legacy = RemoteObject::Present { blake3: None };
+        assert!(!legacy.matches(&expected), "unstamped object must not be trusted as current");
+        assert!(legacy.exists(), "it does exist — caller re-publishes rather than treating as absent");
+    }
+
+    /// Hashes may have been authored in either case; comparison goes through
+    /// `hashes_equal`, so an uppercase stamp must still match.
+    #[test]
+    fn remote_object_match_is_case_insensitive() {
+        let lower = "abcdef".repeat(10) + "abcd";
+        let upper = lower.to_uppercase();
+        assert_eq!(lower.len(), 64);
+        assert!(RemoteObject::Present { blake3: Some(upper) }.matches(&lower));
     }
 
     // ── Prune candidate detection ─────────────────────────────────────────────
@@ -2434,6 +2810,68 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
         .unwrap();
         assert_eq!(p1, p2);
         assert_eq!(*invocations.lock().await, 1, "cache HIT must not re-run");
+    }
+
+    /// R546-T3 qed→W164 bridge: seeding the derivation cache from a pre-built
+    /// artifact makes the NEXT `materialize_transform` a HIT that returns the
+    /// seeded bytes without running the recipe. This is the whole point —
+    /// offload the arch-locked, expensive build to a fleet worker (P018), retrieve
+    /// its tar (R590-F6), seed the cache, and let `yah cloud apply` publish the
+    /// pre-built bytes instead of re-building under emulation.
+    #[tokio::test]
+    async fn seed_transform_derivation_makes_next_transform_a_hit() {
+        let fx = Fixture::new(minio_slot());
+        write_recipe(&fx.workspace_root, "noop-recipe");
+
+        let transform = TransformSpec {
+            recipe: "noop-recipe".to_string(),
+            params: BTreeMap::new(),
+        };
+        let fetched_hash = blake3_hex(b"fetch bytes");
+
+        // A pre-built artifact standing in for the F6-retrieved rusty_v8 tar.
+        let prebuilt = fx.workspace_root.join("prebuilt.tar.gz");
+        let prebuilt_bytes = b"prebuilt rusty_v8 tarball".to_vec();
+        std::fs::write(&prebuilt, &prebuilt_bytes).unwrap();
+
+        let seeded =
+            seed_transform_derivation(&fx.workspace_root, &transform, &fetched_hash, &prebuilt)
+                .await
+                .unwrap();
+        assert_eq!(seeded.output_blake3, blake3_hex(&prebuilt_bytes));
+        assert!(seeded.cas_path.exists(), "CAS entry must be written");
+
+        // A materialize_transform with the SAME inputs must HIT the seeded cache:
+        // the executor is never invoked and the returned bytes are the seeded
+        // artifact (NOT what the recipe would have produced).
+        let fetch_path = fx.workspace_root.join(".yah/cache/derive/fetch/in.bin");
+        std::fs::create_dir_all(fetch_path.parent().unwrap()).unwrap();
+        std::fs::write(&fetch_path, b"fetch bytes").unwrap();
+        let cache_dir = fx.workspace_root.join(".yah/cache/derive/transform");
+        let (mock, invocations) = MockExecutor::new(b"RECIPE OUTPUT (must not appear)".to_vec());
+
+        let out = materialize_transform(
+            &transform,
+            &fetch_path,
+            &fetched_hash,
+            &seeded.output_blake3,
+            &cache_dir,
+            &fx.workspace_root,
+            mock.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *invocations.lock().await,
+            0,
+            "seeded derivation cache must make the transform a HIT (no recipe run)"
+        );
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            prebuilt_bytes,
+            "HIT must return the seeded pre-built bytes",
+        );
     }
 
     /// W212/R518: the derivation key is hermetic — every declared input

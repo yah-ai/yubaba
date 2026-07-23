@@ -127,9 +127,27 @@ pub async fn publish_to_r2(
         anyhow::bail!("dist_dir not found: {}", dist_dir.display());
     }
 
+    // R2ObjectStore holds a reqwest::blocking::Client whose internal runtime
+    // panics if constructed (or dropped) inside an async context — off-load
+    // both endpoints to a blocking worker thread. Every method call below is
+    // already spawn_blocking-wrapped; matching Drop is handled in the store's
+    // impl.
+    let account_id_owned = account_id.to_string();
+    let bucket_owned = bucket.to_string();
+    let access_key_owned = access_key.to_string();
+    let secret_key_owned = secret_key.to_string();
     let store = Arc::new(
-        R2ObjectStore::new(account_id, bucket, access_key, secret_key)
-            .context("building R2ObjectStore")?,
+        tokio::task::spawn_blocking(move || {
+            R2ObjectStore::new(
+                account_id_owned,
+                bucket_owned,
+                access_key_owned,
+                secret_key_owned,
+            )
+        })
+        .await
+        .context("R2ObjectStore construction task panicked")?
+        .context("building R2ObjectStore")?,
     );
 
     // Load manifest non-fatally: empty map on first run or any transient error.

@@ -127,25 +127,27 @@ impl HeadscaleClient {
     }
 
     /// List all nodes currently in the tailnet.
+    ///
+    /// Uses Headscale's `GET /api/v1/node` (the endpoint was renamed from the
+    /// pre-v0.23 `/api/v1/machine`, with the response key `machines` → `nodes`,
+    /// when Headscale retired "machine" for "node"). The per-node JSON shape is
+    /// otherwise unchanged (`id`, `name`, `ipAddresses`, `online`).
     pub async fn list_nodes(&self) -> Result<Vec<NodeInfo>> {
         let resp = self
             .http
-            .get(format!("{}/api/v1/machine", self.base_url))
+            .get(format!("{}/api/v1/node", self.base_url))
             .bearer_auth(&self.api_key)
             .send()
             .await
-            .context("GET /api/v1/machine")?;
+            .context("GET /api/v1/node")?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Headscale API {status} on GET /api/v1/machine: {text}");
+            anyhow::bail!("Headscale API {status} on GET /api/v1/node: {text}");
         }
-        let resp_json: serde_json::Value = resp.json().await.context("parsing machine list")?;
-        let machines = resp_json["machines"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        Ok(machines
+        let resp_json: serde_json::Value = resp.json().await.context("parsing node list")?;
+        let nodes = resp_json["nodes"].as_array().cloned().unwrap_or_default();
+        Ok(nodes
             .iter()
             .filter_map(|m| {
                 Some(NodeInfo {

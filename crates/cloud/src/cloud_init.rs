@@ -9,7 +9,7 @@
 //! Hetzner caps `user_data` at 32KiB so the yubaba binary cannot be
 //! base64-embedded (R040-F11). The first-boot `runcmd` fetches the release
 //! tar.gz (matching what `.github/workflows/release.yml` publishes), verifies
-//! sha256 against the archive, extracts, and installs `/usr/local/bin/yah-yubaba`
+//! sha256 against the archive, extracts, and installs `/usr/local/bin/yubaba`
 //! before the systemd hand-off.
 //!
 //! @yah:ticket(R040-F11, "yah-yubaba delivery: fetch from URL instead of base64 (Hetzner 32KiB user_data cap)")
@@ -46,6 +46,13 @@
 //! @yah:next("Pick the source of truth (the canonical-template path that the embedded test enforces was meant to be the cloud/templates copy) and sync the other file to match. Re-run the test to confirm.")
 //! @yah:verify("cargo test -p cloud --lib cloud_init::tests::embedded_template_matches_workspace_canonical passes")
 //! @yah:handoff("Overwrote crates/yah/cloud/templates/mirror.yml to match .yah/infra/cloud-init/mirror.yml (W154/R406-T13 yubaba+kamaji+yubaba.slice format). The workspace file was the canonical updated version; the embedded template hadn't been synced. cargo test -p cloud --lib cloud_init::tests::embedded_template_matches_workspace_canonical passes.")
+//!
+//! @yah:ticket(R589-F1, "Rename service/binary emitters warden→yubaba in the provision path so new nodes provision as yubaba")
+//! @yah:status(review)
+//! @yah:at(2026-07-06T06:13:22Z)
+//! @yah:assignee(agent:claude)
+//! @yah:parent(R589)
+//! @yah:handoff("Hard-cut warden→yubaba across the provision-path emitters (no shims/aliases). cloud_init.rs: RenderInput fields warden_url/warden_sha256/warden_channel/warden_cosign_identity_regexp → yubaba_*; placeholders {{YAH_WARDEN_URL}}/{{YAH_WARDEN_SHA256}}/{{WARDEN_CHANNEL}}/{{UFW_WARDEN_RULE}} → {{YAH_YUBABA_URL}}/{{YAH_YUBABA_SHA256}}/{{YUBABA_CHANNEL}}/{{UFW_YUBABA_RULE}}; PLACEHOLDER_WARDEN_URL/SHA256 → PLACEHOLDER_YUBABA_URL/SHA256; DEFAULT_WARDEN_CHANNEL → DEFAULT_YUBABA_CHANNEL; compute_warden_sha256() → compute_yubaba_sha256(). templates/mirror.yml + its workspace-canonical twin .yah/infra/cloud-init/mirror.yml (drift-tested against each other) got matching placeholder/env renames, incl. the systemd drop-in's Environment=WARDEN_CHANNEL→YUBABA_CHANNEL. provision.rs's build_request() params + release_manifest.rs's WardenReleaseManifest→YubabaReleaseManifest / DEFAULT_WARDEN_COSIGN_IDENTITY→DEFAULT_YUBABA_COSIGN_IDENTITY followed (they feed straight into RenderInput). yubaba-test-harness/src/lib.rs: YAH_WARDEN_URL/SHA256 env vars → YAH_YUBABA_URL/SHA256, plus the local build_smoke_cloud_init()/wait_for_warden_health() helpers renamed to match. local_docker.rs's cloud_init_boots_warden_service test renamed + its template placeholders updated. Cross-crate consumers outside oss/yubaba also updated in the same pass (real compile deps, not board-protocol scope creep): app/yah/cli/src/{cloud.rs,cli.rs,yubaba_fetch.rs} + tests/camp_yubaba_fetch.rs. Fenced OFF (belongs to R592-T4, wire-layer type/client renames): WardenHandle, YubabaRaft, YubabaRequest, WardenRoute wire types in yubaba/raft/*, yubaba-test-harness's WardenHandle, and camp.rs's WardenContainerSpec/build_warden_run_spec/DEFAULT_WARDEN_IMAGE/DEFAULT_WARDEN_HTTP_PORT/read_warden_pond_port/WardenDeploy (pond continuous-deploy runtime, not the cloud-init provisioning path). Also left untouched: name-neutral state paths (/var/lib/yah-cloud/identity.json, /run/constable/constable.sock) per this ticket's own scope fence, and stale warden_test_harness/warden_test_macros doc-comment crate names in yubaba-test-macros (pre-existing drift from an earlier, unrelated crate rename — not provision-path env/template residue). Verify: cargo check/test -p cloud -p yubaba-test-harness (oss/yubaba workspace) clean; cargo check -p yah + cargo test -p yah --lib yubaba_fetch:: + --test camp_yubaba_fetch clean from repo root. Zero remaining WARDEN_ env/placeholder refs in the provision path (grep-verified).")
 
 use crate::config::MachineConfig;
 use anyhow::{bail, Context, Result};
@@ -62,17 +69,17 @@ pub struct RenderInput<'a> {
     pub machine: &'a MachineConfig,
     /// HTTPS URL of the yah-yubaba release tar.gz (e.g. a GitHub release
     /// asset published by `.github/workflows/release.yml`). Cloud-init's
-    /// `runcmd` downloads it, verifies sha256 against [`Self::warden_sha256`],
-    /// extracts, and installs `/usr/local/bin/yah-yubaba`. Use
-    /// `PLACEHOLDER_WARDEN_URL` for dry-run previews.
-    pub warden_url: String,
-    /// Lowercase hex sha256 of the tar.gz at `warden_url`. Cloud-init verifies
+    /// `runcmd` downloads it, verifies sha256 against [`Self::yubaba_sha256`],
+    /// extracts, and installs `/usr/local/bin/yubaba`. Use
+    /// `PLACEHOLDER_YUBABA_URL` for dry-run previews.
+    pub yubaba_url: String,
+    /// Lowercase hex sha256 of the tar.gz at `yubaba_url`. Cloud-init verifies
     /// this with `sha256sum -c -` against the downloaded archive and fails
     /// the boot if it doesn't match.
-    pub warden_sha256: String,
+    pub yubaba_sha256: String,
     /// Release channel passed to `yah-yubaba serve --channel`. One of
-    /// `"stable"` or `"beta"`. Use [`DEFAULT_WARDEN_CHANNEL`] for Phase 1.
-    pub warden_channel: String,
+    /// `"stable"` or `"beta"`. Use [`DEFAULT_YUBABA_CHANNEL`] for Phase 1.
+    pub yubaba_channel: String,
     /// Headscale pre-auth key. `Some` ⟺ this machine is joining an existing
     /// mesh: the renderer emits the tailscaled install + `tailscale up` join
     /// block (gated on this being `Some`, see [`render`]). `None` ⟺ standalone
@@ -98,19 +105,19 @@ pub struct RenderInput<'a> {
     /// in parallel as belt-and-suspenders (R330-F20, W203 §1.4). When `None`
     /// the placeholder substitutes to an empty string and the bootstrap stays
     /// on the sha256-only path.
-    pub warden_cosign_identity_regexp: Option<String>,
+    pub yubaba_cosign_identity_regexp: Option<String>,
 }
 
 /// Placeholders used when the user requests a dry-run without supplying real
 /// substitutes. Makes the rendered YAML obviously non-shippable while still
 /// preserving the structure for review.
-pub const PLACEHOLDER_WARDEN_URL: &str = "<WARDEN_URL_PLACEHOLDER>";
-pub const PLACEHOLDER_WARDEN_SHA256: &str = "<WARDEN_SHA256_PLACEHOLDER>";
+pub const PLACEHOLDER_YUBABA_URL: &str = "<YUBABA_URL_PLACEHOLDER>";
+pub const PLACEHOLDER_YUBABA_SHA256: &str = "<YUBABA_SHA256_PLACEHOLDER>";
 pub const PLACEHOLDER_PREAUTH_KEY: &str = "<HEADSCALE_PREAUTH_KEY_PLACEHOLDER>";
 pub const PLACEHOLDER_CLOUDFLARED_TOKEN: &str = "<CLOUDFLARED_TOKEN_PLACEHOLDER>";
 
 /// Phase 1 defaults for new provisioning keys.
-pub const DEFAULT_WARDEN_CHANNEL: &str = "stable";
+pub const DEFAULT_YUBABA_CHANNEL: &str = "stable";
 /// Pinned cosign release used by the cloud-init verify-blob block. Bump in
 /// lockstep with [`COSIGN_SHA256_AMD64`] / [`COSIGN_SHA256_ARM64`] when
 /// upgrading the verifier — supply-chain hygiene (W203 §1.4, R330-F22).
@@ -176,7 +183,7 @@ pub fn render(template: &str, input: &RenderInput) -> Result<String> {
     // an `allow in on tailscale0` so yubaba is mesh-reachable only. STANDALONE
     // (no preauth): allow public 7443 so the operator can attach + bootstrap
     // the coordinator before any mesh exists to reach it over.
-    let ufw_warden_rule = match &input.headscale_preauth_key {
+    let ufw_yubaba_rule = match &input.headscale_preauth_key {
         Some(_) => "  - ufw deny 7443".to_string(),
         None => "  - ufw allow 7443".to_string(),
     };
@@ -192,16 +199,16 @@ pub fn render(template: &str, input: &RenderInput) -> Result<String> {
         None => build_coordinator_prestage_block(),
     };
 
-    let cosign_verify_block = match &input.warden_cosign_identity_regexp {
-        Some(regexp) => build_cosign_verify_block(&input.warden_url, regexp),
+    let cosign_verify_block = match &input.yubaba_cosign_identity_regexp {
+        Some(regexp) => build_cosign_verify_block(&input.yubaba_url, regexp),
         None => String::new(),
     };
 
     let rendered = template
         .replace("{{MACHINE_NAME}}", &input.machine.name)
-        .replace("{{YAH_WARDEN_URL}}", &input.warden_url)
-        .replace("{{YAH_WARDEN_SHA256}}", &input.warden_sha256)
-        .replace("{{WARDEN_CHANNEL}}", &input.warden_channel)
+        .replace("{{YAH_YUBABA_URL}}", &input.yubaba_url)
+        .replace("{{YAH_YUBABA_SHA256}}", &input.yubaba_sha256)
+        .replace("{{YUBABA_CHANNEL}}", &input.yubaba_channel)
         .replace(
             "{{HEADSCALE_PREAUTH_KEY}}",
             input.headscale_preauth_key.as_deref().unwrap_or(""),
@@ -210,7 +217,7 @@ pub fn render(template: &str, input: &RenderInput) -> Result<String> {
         .replace("{{TAGS}}", &tags)
         .replace("{{CLOUDFLARED_BLOCK}}", &cloudflared_block)
         .replace("{{OPERATOR_BRIDGE_BLOCK}}", &operator_bridge_block)
-        .replace("{{UFW_WARDEN_RULE}}", &ufw_warden_rule)
+        .replace("{{UFW_YUBABA_RULE}}", &ufw_yubaba_rule)
         .replace(
             "{{COORDINATOR_PRESTAGE_BLOCK}}",
             &coordinator_prestage_block,
@@ -228,7 +235,7 @@ pub fn render(template: &str, input: &RenderInput) -> Result<String> {
 /// that a local copy matches an expected `--yubaba-sha256` value. The path
 /// should point to the release archive (matching what cloud-init downloads),
 /// not a bare binary.
-pub fn compute_warden_sha256(path: &Path) -> Result<String> {
+pub fn compute_yubaba_sha256(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("reading yah-yubaba archive at {}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -269,7 +276,7 @@ fn build_cloudflared_block(token: &str) -> String {
 /// matching what `release.yml` publishes alongside the canonical artifact
 /// (R330-F19). Architecture is detected at boot via `dpkg --print-architecture`
 /// so one rendered template serves both x86_64 and aarch64 Hetzner machines.
-fn build_cosign_verify_block(warden_url: &str, identity_regexp: &str) -> String {
+fn build_cosign_verify_block(yubaba_url: &str, identity_regexp: &str) -> String {
     // ARCH + SHA must be set, checked, and consumed inside the same `sh -c`
     // process — cloud-init runcmd entries are independent shells, so a
     // multi-step download-then-verify-then-install split would lose the
@@ -297,8 +304,8 @@ fn build_cosign_verify_block(warden_url: &str, identity_regexp: &str) -> String 
     );
     [
         install_and_verify_cosign,
-        format!("  - curl -fsSL -o /tmp/yah-yubaba.tar.gz.sig {warden_url}.sig"),
-        format!("  - curl -fsSL -o /tmp/yah-yubaba.tar.gz.cert {warden_url}.cert"),
+        format!("  - curl -fsSL -o /tmp/yah-yubaba.tar.gz.sig {yubaba_url}.sig"),
+        format!("  - curl -fsSL -o /tmp/yah-yubaba.tar.gz.cert {yubaba_url}.cert"),
         format!(
             "  - cosign verify-blob --certificate-identity-regexp '{identity_regexp}' --certificate-oidc-issuer {issuer} --certificate /tmp/yah-yubaba.tar.gz.cert --signature /tmp/yah-yubaba.tar.gz.sig /tmp/yah-yubaba.tar.gz",
             issuer = COSIGN_OIDC_ISSUER
@@ -317,9 +324,25 @@ fn build_operator_bridge_block(
     mesh_login_server_arg: &str,
     tags: &str,
 ) -> String {
+    // `--accept-dns=false` is load-bearing, not a preference (R624-B1).
+    //
+    // With MagicDNS accepted, tailscaled rewrites /etc/resolv.conf to point at
+    // its own resolver (100.100.100.100). If tailscaled is then down — as it is
+    // on every boot before it connects — nothing answers that address, so the
+    // node cannot resolve the control server, so tailscaled can never come up.
+    // The loop is self-sustaining and survives reboots and restarts; it took
+    // us-south-001 (a raft voter) off the mesh for 30+ hours until a human
+    // edited resolv.conf by hand. Ordering the unit After=tailscaled does NOT
+    // help: tailscaled starts fine, it just can never CONNECT.
+    //
+    // Server nodes have nothing to lose here. Nothing on a node resolves a
+    // mesh name: yubaba binds a literal 100.64.0.0/10 address, the machine
+    // TOMLs carry literal IPs, and kamaji reaches its peers over a unix socket.
+    // MagicDNS buys a convenience we never use, at the cost of a node that can
+    // permanently strand itself.
     [
         "  - curl -fsSL https://tailscale.com/install.sh | sh".to_string(),
-        format!("  - tailscale up{mesh_login_server_arg} --auth-key={preauth_key} --advertise-tags={tags}"),
+        format!("  - tailscale up{mesh_login_server_arg} --auth-key={preauth_key} --advertise-tags={tags} --accept-dns=false"),
         "  - ufw allow in on tailscale0 to any port 7443".to_string(),
     ]
     .join("\n")
@@ -390,6 +413,7 @@ mod tests {
             mesh_tags: vec!["tag:region-pdx".into(), "tag:tier-t2".into()],
             region: None,
             zone: None,
+            arch: None,
             bucket: Some(BucketSpec {
                 name: "noisetable-assets-pdx-1".into(),
                 public_read: false,
@@ -399,21 +423,23 @@ mod tests {
             cloudflared: None,
             hosts_operator_bridge: false,
             connect: None,
+            allocatable: None,
+            taints: vec![],
         }
     }
 
     fn minimal_input(machine: &MachineConfig) -> RenderInput<'_> {
         RenderInput {
             machine,
-            warden_url: "https://example.com/yah-yubaba".into(),
-            warden_sha256: "deadbeef".into(),
-            warden_channel: DEFAULT_WARDEN_CHANNEL.into(),
+            yubaba_url: "https://example.com/yah-yubaba".into(),
+            yubaba_sha256: "deadbeef".into(),
+            yubaba_channel: DEFAULT_YUBABA_CHANNEL.into(),
             // Default: standalone (no join block). Tests that exercise the
             // mesh-join path set `headscale_preauth_key = Some(...)`.
             headscale_preauth_key: None,
             mesh_url: None,
             cloudflared_token: None,
-            warden_cosign_identity_regexp: None,
+            yubaba_cosign_identity_regexp: None,
         }
     }
 
@@ -427,7 +453,7 @@ mod tests {
         assert!(out.contains("noisetable-pdx-1"));
         assert!(out.contains("https://example.com/yah-yubaba"));
         assert!(out.contains("deadbeef"));
-        assert!(out.contains(DEFAULT_WARDEN_CHANNEL));
+        assert!(out.contains(DEFAULT_YUBABA_CHANNEL));
         assert!(out.contains("apt-get install -y containerd"));
         assert!(out.contains("tskey-test"));
         assert!(out.contains("tag:region-pdx,tag:tier-t2"));
@@ -464,18 +490,18 @@ mod tests {
         let machine = sample_machine();
         let input = RenderInput {
             machine: &machine,
-            warden_url: PLACEHOLDER_WARDEN_URL.into(),
-            warden_sha256: PLACEHOLDER_WARDEN_SHA256.into(),
-            warden_channel: DEFAULT_WARDEN_CHANNEL.into(),
+            yubaba_url: PLACEHOLDER_YUBABA_URL.into(),
+            yubaba_sha256: PLACEHOLDER_YUBABA_SHA256.into(),
+            yubaba_channel: DEFAULT_YUBABA_CHANNEL.into(),
             // A preauth key present → join block emitted, so the placeholder appears in output.
             headscale_preauth_key: Some(PLACEHOLDER_PREAUTH_KEY.into()),
             mesh_url: None,
             cloudflared_token: None,
-            warden_cosign_identity_regexp: None,
+            yubaba_cosign_identity_regexp: None,
         };
         let out = render(DEFAULT_TEMPLATE, &input).unwrap();
-        assert!(out.contains(PLACEHOLDER_WARDEN_URL));
-        assert!(out.contains(PLACEHOLDER_WARDEN_SHA256));
+        assert!(out.contains(PLACEHOLDER_YUBABA_URL));
+        assert!(out.contains(PLACEHOLDER_YUBABA_SHA256));
         assert!(out.contains(PLACEHOLDER_PREAUTH_KEY));
     }
 
@@ -492,15 +518,15 @@ mod tests {
         let machine = sample_machine();
         let input = RenderInput {
             machine: &machine,
-            warden_url: "https://github.com/yah-ai/yah/releases/download/v0.7.0/yah-yubaba-v0.7.0-x86_64-unknown-linux-musl.tar.gz".into(),
-            warden_sha256: "0".repeat(64),
-            warden_channel: "stable".into(),
+            yubaba_url: "https://github.com/yah-ai/yah/releases/download/v0.7.0/yah-yubaba-v0.7.0-x86_64-unknown-linux-musl.tar.gz".into(),
+            yubaba_sha256: "0".repeat(64),
+            yubaba_channel: "stable".into(),
             headscale_preauth_key: Some("tskey-auth-keylongenoughforrealism123456".into()),
             mesh_url: Some("https://mesh.example.com".into()),
             cloudflared_token: Some(PLACEHOLDER_CLOUDFLARED_TOKEN.into()),
             // Worst-case includes the cosign block so the 32 KiB cap test
             // covers the bootstrap-channel signing path too (W203 §1.4).
-            warden_cosign_identity_regexp: Some("^https://github\\.com/yah-ai/yah/".into()),
+            yubaba_cosign_identity_regexp: Some("^https://github\\.com/yah-ai/yah/".into()),
         };
         let out = render(DEFAULT_TEMPLATE, &input).unwrap();
         assert!(
@@ -515,13 +541,13 @@ mod tests {
         let machine = sample_machine();
         let input = RenderInput {
             machine: &machine,
-            warden_url: "x".into(),
-            warden_sha256: "y".into(),
-            warden_channel: "stable".into(),
+            yubaba_url: "x".into(),
+            yubaba_sha256: "y".into(),
+            yubaba_channel: "stable".into(),
             headscale_preauth_key: None,
             mesh_url: None,
             cloudflared_token: None,
-            warden_cosign_identity_regexp: None,
+            yubaba_cosign_identity_regexp: None,
         };
         let bad = "foo: {{NOT_A_KEY}}\n";
         let err = render(bad, &input).unwrap_err().to_string();
@@ -567,8 +593,8 @@ mod tests {
         // The header comment uses `{{ KEY }}` (with spaces) so it survives the
         // `{{KEY}}` (no-spaces) substitution and stays readable.
         assert!(out.contains("{{ MACHINE_NAME }}"));
-        assert!(out.contains("{{ YAH_WARDEN_URL }}"));
-        assert!(out.contains("{{ YAH_WARDEN_SHA256 }}"));
+        assert!(out.contains("{{ YAH_YUBABA_URL }}"));
+        assert!(out.contains("{{ YAH_YUBABA_SHA256 }}"));
     }
 
     #[test]
@@ -631,6 +657,30 @@ mod tests {
         assert!(find_unsubstituted(&out).is_none());
     }
 
+    /// R624-B1: a provisioned node must never let tailscaled own
+    /// `/etc/resolv.conf`.
+    ///
+    /// Accepting MagicDNS points the resolver at 100.100.100.100, which only
+    /// answers while tailscaled is up — so a tailscaled that is down cannot
+    /// resolve its control server and can never come up again. That deadlock
+    /// took a raft voter off the mesh for 30+ hours. This assertion is the
+    /// guard: dropping the flag silently re-arms the trap on every node
+    /// provisioned afterwards, and the damage only shows up at the next reboot.
+    #[test]
+    fn tailscale_join_refuses_magicdns_so_a_node_cannot_strand_itself() {
+        let machine = sample_machine();
+        let mut input = minimal_input(&machine);
+        input.headscale_preauth_key = Some("tskey-test".into());
+        let out = render(DEFAULT_TEMPLATE, &input).unwrap();
+        assert!(
+            out.contains("--accept-dns=false"),
+            "tailscale up MUST pass --accept-dns=false — without it tailscaled \
+             rewrites /etc/resolv.conf to MagicDNS and a node that boots with \
+             tailscaled down can never resolve its control server again \
+             (R624-B1). Rendered:\n{out}"
+        );
+    }
+
     #[test]
     fn operator_bridge_block_omitted_when_disabled() {
         let machine = sample_machine();
@@ -664,13 +714,13 @@ mod tests {
         // operator-bridge), since that's where dynamic strings are injected.
         let input = RenderInput {
             machine: &machine,
-            warden_url: "https://cdn.yah.dev/yubaba/0.8.13/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz".into(),
-            warden_sha256: "0".repeat(64),
-            warden_channel: "stable".into(),
+            yubaba_url: "https://cdn.yah.dev/yubaba/0.8.13/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz".into(),
+            yubaba_sha256: "0".repeat(64),
+            yubaba_channel: "stable".into(),
             headscale_preauth_key: Some("tskey-auth-keylongenoughforrealism123456".into()),
             mesh_url: Some("https://cloud.mesh.yah.dev".into()),
             cloudflared_token: Some("tok_abc123".into()),
-            warden_cosign_identity_regexp: Some(r"^https://github\.com/yah-ai/yah/".into()),
+            yubaba_cosign_identity_regexp: Some(r"^https://github\.com/yah-ai/yah/".into()),
         };
         let out = render(DEFAULT_TEMPLATE, &input).unwrap();
         let doc: serde_yaml::Value =
@@ -695,7 +745,7 @@ mod tests {
     /// preauth) allows public 7443 so the operator can attach + bootstrap it
     /// before any mesh exists.
     #[test]
-    fn ufw_warden_rule_keys_off_mesh_role() {
+    fn ufw_yubaba_rule_keys_off_mesh_role() {
         let machine = sample_machine();
 
         // Standalone: allow public 7443.
@@ -779,15 +829,15 @@ mod tests {
     }
 
     #[test]
-    fn render_warden_channel_in_output() {
+    fn render_yubaba_channel_in_output() {
         let machine = sample_machine();
         let mut input = minimal_input(&machine);
-        input.warden_channel = "beta".into();
+        input.yubaba_channel = "beta".into();
         let out = render(DEFAULT_TEMPLATE, &input).unwrap();
-        // Channel rides a systemd drop-in (Environment=WARDEN_CHANNEL=…), not a
+        // Channel rides a systemd drop-in (Environment=YUBABA_CHANNEL=…), not a
         // --channel flag (the ExecStart bakes defaults; the drop-in tunes it).
         assert!(
-            out.contains("WARDEN_CHANNEL=beta"),
+            out.contains("YUBABA_CHANNEL=beta"),
             "yubaba channel missing"
         );
         // containerd is installed unpinned (R330-T9).
@@ -827,7 +877,7 @@ mod tests {
         // single-quoted body and the case/esac terminators are present.
         let machine = sample_machine();
         let mut input = minimal_input(&machine);
-        input.warden_cosign_identity_regexp = Some("^https://github\\.com/yah-ai/yah/".into());
+        input.yubaba_cosign_identity_regexp = Some("^https://github\\.com/yah-ai/yah/".into());
         let out = render(DEFAULT_TEMPLATE, &input).unwrap();
         let sh_line = out
             .lines()
@@ -863,8 +913,8 @@ mod tests {
     fn render_with_cosign_identity_emits_verify_block() {
         let machine = sample_machine();
         let mut input = minimal_input(&machine);
-        input.warden_url = "https://cdn.yah.dev/yubaba/0.9.0/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz".into();
-        input.warden_cosign_identity_regexp = Some("^https://github\\.com/yah-ai/yah/".into());
+        input.yubaba_url = "https://cdn.yah.dev/yubaba/0.9.0/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz".into();
+        input.yubaba_cosign_identity_regexp = Some("^https://github\\.com/yah-ai/yah/".into());
         let out = render(DEFAULT_TEMPLATE, &input).unwrap();
         assert!(
             out.contains("cosign verify-blob --certificate-identity-regexp '^https://github\\.com/yah-ai/yah/'"),
@@ -873,11 +923,11 @@ mod tests {
         assert!(out.contains(COSIGN_OIDC_ISSUER), "oidc-issuer flag missing");
         // sig + cert sibling URLs are derived by suffixing the tarball URL.
         assert!(
-            out.contains(&format!("{}.sig", input.warden_url)),
+            out.contains(&format!("{}.sig", input.yubaba_url)),
             ".sig sibling URL missing"
         );
         assert!(
-            out.contains(&format!("{}.cert", input.warden_url)),
+            out.contains(&format!("{}.cert", input.yubaba_url)),
             ".cert sibling URL missing"
         );
         // cosign install is pinned to a specific release version (no `latest`).
@@ -914,7 +964,7 @@ mod tests {
     #[test]
     fn render_without_cosign_identity_omits_verify_block() {
         // Byte-equivalence check against today's sha256-only render: when
-        // warden_cosign_identity_regexp is None, no cosign content appears.
+        // yubaba_cosign_identity_regexp is None, no cosign content appears.
         let machine = sample_machine();
         let input = minimal_input(&machine);
         let out = render(DEFAULT_TEMPLATE, &input).unwrap();
@@ -938,12 +988,12 @@ mod tests {
     }
 
     #[test]
-    fn compute_warden_sha256_matches_known_value() {
+    fn compute_yubaba_sha256_matches_known_value() {
         // sha256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
         let dir = tempfile::tempdir().unwrap();
         let bin_path = dir.path().join("yah-yubaba");
         std::fs::write(&bin_path, b"hello").unwrap();
-        let sha = compute_warden_sha256(&bin_path).unwrap();
+        let sha = compute_yubaba_sha256(&bin_path).unwrap();
         assert_eq!(
             sha,
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"

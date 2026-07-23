@@ -25,3 +25,4 @@
 
 pub mod env_validate;
 pub mod mesh_resolve;
+pub mod secret_mount;

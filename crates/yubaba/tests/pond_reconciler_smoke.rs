@@ -36,8 +36,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cloud::CloudConfig;
-use local_driver::pond_minio::MinioSpec;
 use local_driver::pond_miniflare::MiniflareSpec;
+use local_driver::pond_minio::MinioSpec;
 use local_driver::LocalRuntime;
 use yubaba::pond::{PondDeployReq, PondPhase};
 
@@ -185,7 +185,10 @@ async fn fetch_state_raw(port: u16, ident: &str) -> String {
         .send()
         .await
     {
-        Ok(resp) => resp.text().await.unwrap_or_else(|e| format!("<body read failed: {e}>")),
+        Ok(resp) => resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<body read failed: {e}>")),
         Err(e) => format!("<request failed: {e}>"),
     }
 }
@@ -264,9 +267,10 @@ async fn warden_reconciler_restarts_minio_and_miniflare() {
         .expect("bind 127.0.0.1:0");
     let port = listener.local_addr().expect("local_addr").port();
 
-    let state_path = workspace
-        .join(".yah/jit")
-        .join(format!("pond-reconciler-smoke-state-{}.json", std::process::id()));
+    let state_path = workspace.join(".yah/jit").join(format!(
+        "pond-reconciler-smoke-state-{}.json",
+        std::process::id()
+    ));
     if let Some(parent) = state_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -291,7 +295,6 @@ async fn warden_reconciler_restarts_minio_and_miniflare() {
         minio: minio_spec.clone(),
         miniflare: miniflare_spec.clone(),
         ssr_runtime: None,
-        mesofact_dev: None,
     };
 
     let client = reqwest::Client::new();

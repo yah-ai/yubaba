@@ -37,11 +37,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::config::ProviderConfig;
 use crate::reconciler::pond::{DEFAULT_MINIO_API_PORT, DEFAULT_MINIO_PASSWORD, DEFAULT_MINIO_USER};
-use crate::reconciler::r2_publish::{
-    R2_ACCESS_KEY_ENV, R2_ACCESS_KEY_SLOT, R2_SECRET_KEY_ENV, R2_SECRET_KEY_SLOT,
-};
 use crate::reconciler::static_asset::WORKLOAD_KIND;
 use crate::{MirrorProviderSlot, Provider, ServiceConfig};
 
@@ -262,39 +258,23 @@ fn resolve_backend(
         MirrorProviderSlot::Reference {
             provider_id,
             fields,
-        } if provider_id == "cloudflare" => {
+        } => {
+            // Dispatch on the resolved provider *kind* so multiple cloudflare
+            // providers (per zone/account) can coexist in one workspace.
+            let cf = super::cf_creds::CfProvider::resolve(workspace_root, provider_id)?;
+            anyhow::ensure!(
+                matches!(cf.cfg.kind, Provider::Cloudflare),
+                "providers.object_store.use = {provider_id:?} (kind={:?}) not supported for \
+                 prune — only cloudflare-kind reference providers are",
+                cf.cfg.kind,
+            );
             let bucket = fields
                 .get("bucket")
                 .and_then(|v| v.as_str())
                 .context("providers.object_store missing `bucket` for cloudflare")?
                 .to_string();
-            let provider_path = workspace_root.join(".yah/infra/providers/cloudflare.toml");
-            let provider_cfg = ProviderConfig::load(&provider_path).with_context(|| {
-                format!(
-                    "loading Cloudflare provider config — expected at {}",
-                    provider_path.display()
-                )
-            })?;
-            let account_id = provider_cfg
-                .fields
-                .get("account_id")
-                .and_then(|v| v.as_str())
-                .with_context(|| format!("{}: missing `account_id`", provider_path.display()))?
-                .to_string();
-            let access_key = fob::get_or_env(R2_ACCESS_KEY_SLOT, R2_ACCESS_KEY_ENV)
-                .context("resolving R2 access key")?
-                .with_context(|| {
-                    format!(
-                        "R2 access key missing — `yah keys set {R2_ACCESS_KEY_SLOT}` or export {R2_ACCESS_KEY_ENV}"
-                    )
-                })?;
-            let secret_key = fob::get_or_env(R2_SECRET_KEY_SLOT, R2_SECRET_KEY_ENV)
-                .context("resolving R2 secret key")?
-                .with_context(|| {
-                    format!(
-                        "R2 secret key missing — `yah keys set {R2_SECRET_KEY_SLOT}` or export {R2_SECRET_KEY_ENV}"
-                    )
-                })?;
+            let account_id = cf.account_id.clone();
+            let (access_key, secret_key) = cf.r2_keys()?;
             Ok(Backend {
                 endpoint: format!("https://{account_id}.r2.cloudflarestorage.com"),
                 bucket,
@@ -302,12 +282,6 @@ fn resolve_backend(
                 access_key,
                 secret_key,
             })
-        }
-        MirrorProviderSlot::Reference { provider_id, .. } => {
-            anyhow::bail!(
-                "providers.object_store.use = {provider_id:?} not supported for prune \
-                 (only `cloudflare` is a supported reference provider)"
-            )
         }
         MirrorProviderSlot::Inline {
             kind: Provider::MinioContainer,
@@ -563,6 +537,7 @@ mod tests {
             name: name.into(),
             domain: "releases.example".into(),
             components,
+            db: crate::DbCatalog::default(),
         }
     }
 
@@ -587,16 +562,16 @@ mod tests {
         write_static_asset_workload(
             &root.join("comp-a"),
             &format!(
-                "kind = \"static-asset\"\nschema_version = \"V1\"\n\n\
-                 [[asset]]\nfilename = \"a/one.bin\"\nsource = \"src/one.bin\"\nblake3 = \"{HASH_64}\"\n\n\
-                 [[asset]]\nfilename = \"a/two.bin\"\nsource = \"src/two.bin\"\nblake3 = \"{HASH_64}\"\n"
+                "[static-asset]\nschema_version = \"V1\"\n\n\
+                 [[static-asset.asset]]\nfilename = \"a/one.bin\"\nsource = \"src/one.bin\"\nblake3 = \"{HASH_64}\"\n\n\
+                 [[static-asset.asset]]\nfilename = \"a/two.bin\"\nsource = \"src/two.bin\"\nblake3 = \"{HASH_64}\"\n"
             ),
         );
         write_static_asset_workload(
             &root.join("comp-b"),
             &format!(
-                "kind = \"static-asset\"\nschema_version = \"V1\"\n\n\
-                 [[asset]]\nfilename = \"b/three.bin\"\nsource = \"src/three.bin\"\nblake3 = \"{HASH_64}\"\n"
+                "[static-asset]\nschema_version = \"V1\"\n\n\
+                 [[static-asset.asset]]\nfilename = \"b/three.bin\"\nsource = \"src/three.bin\"\nblake3 = \"{HASH_64}\"\n"
             ),
         );
         let svc = svc_with_components(
@@ -621,8 +596,8 @@ mod tests {
         write_static_asset_workload(
             &root.join("assets"),
             &format!(
-                "kind = \"static-asset\"\nschema_version = \"V1\"\n\n\
-                 [[asset]]\nfilename = \"x.bin\"\nsource = \"x.bin\"\nblake3 = \"{HASH_64}\"\n"
+                "[static-asset]\nschema_version = \"V1\"\n\n\
+                 [[static-asset.asset]]\nfilename = \"x.bin\"\nsource = \"x.bin\"\nblake3 = \"{HASH_64}\"\n"
             ),
         );
         let mut svc = svc_with_components("mixed", vec![asset_component("assets", "assets")]);
@@ -657,8 +632,7 @@ mod tests {
         std::fs::create_dir_all(root.join("oops")).unwrap();
         std::fs::write(
             root.join("oops/workload.toml"),
-            "kind = \"almanac\"\nschema_version = \"V1\"\ncommand = \"true\"\n\
-             [cadence]\nkind = \"once\"\n",
+            "[almanac]\nschema_version = \"V1\"\ncommand = \"true\"\ncadence = \"once\"\n",
         )
         .unwrap();
         let svc = svc_with_components("oops", vec![asset_component("oops", "oops")]);

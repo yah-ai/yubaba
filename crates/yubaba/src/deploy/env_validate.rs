@@ -82,10 +82,21 @@ pub struct EnvValidateError {
 impl fmt::Display for EnvValidateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.cause {
-            EnvValidateCause::ImagePull { registry, repository, tag, reason } => {
-                write!(f, "image pull failed ({registry}/{repository}:{tag}): {reason}")
+            EnvValidateCause::ImagePull {
+                registry,
+                repository,
+                tag,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "image pull failed ({registry}/{repository}:{tag}): {reason}"
+                )
             }
-            EnvValidateCause::HealthcheckTimeout { deadline_ms, reason } => {
+            EnvValidateCause::HealthcheckTimeout {
+                deadline_ms,
+                reason,
+            } => {
                 write!(f, "healthcheck timed out after {deadline_ms}ms: {reason}")
             }
             EnvValidateCause::MeshPeerUnreachable { ident, reason } => {
@@ -200,7 +211,10 @@ async fn stage_image_pull(
     tokio::time::timeout(timeout, pull)
         .await
         .unwrap_or_else(|_| {
-            Err(format!("image pull timed out after {}ms", timeout.as_millis()))
+            Err(format!(
+                "image pull timed out after {}ms",
+                timeout.as_millis()
+            ))
         })
         .map_err(|reason| EnvValidateCause::ImagePull {
             registry: spec.image.registry.clone(),
@@ -226,8 +240,7 @@ async fn stage_healthcheck(
         None => return Ok(()),
     };
 
-    let deadline_ms =
-        hc.failure_threshold as u64 * hc.interval.as_ms() + hc.initial_delay.as_ms();
+    let deadline_ms = hc.failure_threshold as u64 * hc.interval.as_ms() + hc.initial_delay.as_ms();
 
     // Wait before the first probe.
     if hc.initial_delay.as_ms() > 0 {
@@ -238,8 +251,7 @@ async fn stage_healthcheck(
     let per_probe_timeout = Duration::from_millis(hc.timeout.as_ms().max(1));
 
     for attempt in 0..hc.failure_threshold {
-        let result =
-            tokio::time::timeout(per_probe_timeout, prober.probe_once(&hc.probe)).await;
+        let result = tokio::time::timeout(per_probe_timeout, prober.probe_once(&hc.probe)).await;
         if matches!(result, Ok(Ok(()))) {
             return Ok(());
         }
@@ -272,7 +284,10 @@ async fn stage_mesh_peering(
     tokio::time::timeout(timeout, peering.await_peer_ready(ident))
         .await
         .unwrap_or_else(|_| {
-            Err(format!("mesh peering timed out after {}ms", timeout.as_millis()))
+            Err(format!(
+                "mesh peering timed out after {}ms",
+                timeout.as_millis()
+            ))
         })
         .map_err(|reason| EnvValidateCause::MeshPeerUnreachable {
             ident: ident.0.clone(),
@@ -380,6 +395,8 @@ mod integration {
                     digest: workload_spec::testing::test_digest(),
                 },
                 tier: TierTag("public".into()),
+                tenant: workload_spec::TenantId::singleton(),
+                namespace: workload_spec::NamespaceId::singleton(),
                 replicas: 1,
                 command: None,
                 entrypoint: None,
@@ -390,12 +407,13 @@ mod integration {
                 volumes: vec![],
                 resources: ResourceLimits {
                     memory_mb: 128,
-                    cpu_shares: 256,
+                    cpu_millis: 256,
                     ephemeral_storage_mb: 128,
                 },
                 depends_on: vec![],
                 healthcheck: None,
                 restart_policy: RestartPolicy::Always,
+                archetype: None,
                 stop_policy: StopPolicy {
                     signal: 15,
                     grace_period: Millis::from_secs(5),
@@ -597,7 +615,10 @@ mod integration {
                 &fast_config(),
             )
             .await;
-            assert!(result.is_ok(), "healthcheck stage must be skipped when spec.healthcheck is None");
+            assert!(
+                result.is_ok(),
+                "healthcheck stage must be skipped when spec.healthcheck is None"
+            );
         }
 
         // ── Stage 3: mesh peering ─────────────────────────────────────────────
@@ -674,7 +695,10 @@ mod integration {
                 &fast_config(),
             )
             .await;
-            assert!(result.is_ok(), "CF stage must be skipped when expose.public is None");
+            assert!(
+                result.is_ok(),
+                "CF stage must be skipped when expose.public is None"
+            );
         }
 
         // ── Stage ordering ────────────────────────────────────────────────────

@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use cloud::{
     LocalStaticOptions, MesofactStaticReconciler, MirrorConfig, MirrorProviderSlot, MirrorShape,
-    Provider, ReconcileCtx, Reconciler, ServiceComponent, ServiceConfig,
+    Provider, ProviderScope, ReconcileCtx, Reconciler, ServiceComponent, ServiceConfig,
 };
 
 fn workspace_root() -> PathBuf {
@@ -90,6 +90,7 @@ async fn local_static_reconciler_brings_up_app_yah_web() {
         name: "dev-yah".to_string(),
         domain: "yah.dev".to_string(),
         components: vec![],
+        db: cloud::DbCatalog::default(),
     };
     let component = ServiceComponent {
         id: "site".to_string(),
@@ -97,6 +98,7 @@ async fn local_static_reconciler_brings_up_app_yah_web() {
         path: "app/yah/web/marketing".to_string(),
         role: "static".to_string(),
         publishes: None,
+        git: None,
         wave: 0,
     };
 
@@ -118,6 +120,7 @@ async fn local_static_reconciler_brings_up_app_yah_web() {
         component: &component,
         mirror: &mirror,
         env: "local",
+        scope: ProviderScope::singleton(),
     };
 
     let running = reconciler

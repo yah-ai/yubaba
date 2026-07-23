@@ -198,6 +198,7 @@ mod tests {
             name: name.into(),
             domain: String::new(),
             components,
+            db: crate::DbCatalog::default(),
         }
     }
 
@@ -226,14 +227,14 @@ mod tests {
 
     fn workload_with_fetch_only(fetch_hash: &str, output_hash: &str) -> String {
         format!(
-            r#"schema_version = "V1"
-kind = "static-asset"
+            r#"[static-asset]
+schema_version = "V1"
 
-[[asset]]
+[[static-asset.asset]]
 filename = "model.bin"
 blake3 = "{output_hash}"
 
-[asset.derive.fetch]
+[static-asset.asset.derive.fetch]
 url = "https://example.com/model.bin"
 blake3 = "{fetch_hash}"
 license = "mit"
@@ -243,19 +244,19 @@ license = "mit"
 
     fn workload_with_fetch_and_transform(fetch_hash: &str, output_hash: &str) -> String {
         format!(
-            r#"schema_version = "V1"
-kind = "static-asset"
+            r#"[static-asset]
+schema_version = "V1"
 
-[[asset]]
+[[static-asset.asset]]
 filename = "model.bin"
 blake3 = "{output_hash}"
 
-[asset.derive.fetch]
+[static-asset.asset.derive.fetch]
 url = "https://example.com/model.bin"
 blake3 = "{fetch_hash}"
 license = "mit"
 
-[asset.derive.transform]
+[static-asset.asset.derive.transform]
 recipe = "quantize"
 "#
         )

@@ -68,7 +68,9 @@ impl RolloutEngine {
                 "strategy {:?} is not implemented in v1 (only 'linear' is supported)",
                 self.policy.strategy
             );
-            self.set_status(RolloutStatus::Failed { reason: reason.clone() });
+            self.set_status(RolloutStatus::Failed {
+                reason: reason.clone(),
+            });
             return Err(anyhow::anyhow!(reason));
         }
 
@@ -116,7 +118,10 @@ impl RolloutEngine {
                         warn!(rollout_id = %self.rollout_id, step = idx, metric = %gate.metric, %reason, "gate failed");
                         let status = match on_failure {
                             RolloutOnFailure::RollbackStep | RolloutOnFailure::RollbackAll => {
-                                RolloutStatus::RolledBack { step: idx, reason: reason.clone() }
+                                RolloutStatus::RolledBack {
+                                    step: idx,
+                                    reason: reason.clone(),
+                                }
                             }
                         };
                         self.set_status(status);
@@ -128,7 +133,9 @@ impl RolloutEngine {
                             gate.metric, idx
                         );
                         warn!(rollout_id = %self.rollout_id, step = idx, error = %e, "gate evaluation error");
-                        self.set_status(RolloutStatus::Failed { reason: reason.clone() });
+                        self.set_status(RolloutStatus::Failed {
+                            reason: reason.clone(),
+                        });
                         return Err(anyhow::anyhow!(reason));
                     }
                 }
@@ -147,10 +154,7 @@ impl RolloutEngine {
         Ok(())
     }
 
-    async fn eval_gate(
-        &self,
-        gate: &workload_spec::rollout::RolloutGate,
-    ) -> anyhow::Result<bool> {
+    async fn eval_gate(&self, gate: &workload_spec::rollout::RolloutGate) -> anyhow::Result<bool> {
         match &self.evaluator {
             Some(ev) => ev.evaluate(gate).await,
             None => {

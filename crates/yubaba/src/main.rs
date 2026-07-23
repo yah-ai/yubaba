@@ -30,6 +30,16 @@
 //! @yah:verify("./target/debug/yah-yubaba  # logs 'yah-yubaba serve' + 'yah-yubaba listening', does NOT print help and exit 2")
 //! @yah:verify("./target/debug/yah-yubaba --help  # still lists subcommands (root-level help unchanged)")
 //! @yah:verify("Rebuild + reload the pond image (`yah qed run build-yah-yubaba` or equivalent), then `docker inspect <pond-yubaba>` shows State.Restarting=false and RestartCount stops climbing.")
+//!
+//! @yah:ticket(R590-B9, "yubaba GET /workloads/{id}/state returns 404 for kamaji-deployed forge workloads — CLI can't poll state, marks fleet runs Failed")
+//! @yah:at(2026-07-12T15:24:47Z)
+//! @yah:status(review)
+//! @yah:assignee(agent:claude)
+//! @yah:parent(R590)
+//! @yah:severity(blocks-on-box-green)
+//! @yah:next("Register kamaji-dispatched workloads in yubaba's state map at deploy time (or proxy GET /workloads/{id}/state through the kamaji UDS list/state RPC, which IS attached), so the ident is queryable for the run's lifetime and terminal state (Exited 0 / Failed) is observable. Cross-check R590-F2's MeshYubabaClient::connect_logs which polls this endpoint for terminal status.")
+//! @yah:verify("After deploying a forge workload, GET http://<node>:7443/workloads/{ident}/state returns the live state (not 404) through to a terminal Exited/Failed; `yah qed run rusty-v8-musl` reflects the container's real exit instead of failing on the 404 poll.")
+//! @yah:gotcha("PROVEN live (2026-07-11): a workload deploy succeeds (kamaji logs 'containerd workload deployed container_id=forge-... pid=...'), but the qed CLI's state poll gets `404 Not Found {\"error\":\"workload not found\"}` from GET /workloads/{id}/state on the SAME ident — so RemoteForgeDriver marks the run Failed regardless of the container's real outcome. Even a green long build would be reported Failed. The deploy goes yubaba->kamaji->containerd, but yubaba's queryable state registry doesn't hold the deployed ident.")
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -46,12 +56,23 @@ const DEFAULT_RAFT_DIR: &str = "/var/lib/yah-cloud/raft";
 /// is built without the `containerd-integration` feature.
 const DEFAULT_CONTAINERD_SOCKET: &str = "/run/containerd/containerd.sock";
 
-/// How long yubaba waits on a Kamaji UDS handshake at startup before
-/// falling back to the legacy in-process `ContainerRuntime`. Short enough
-/// that a missing/misconfigured sibling unit doesn't stall systemd's
-/// `ExecStart` timer; long enough to ride out the kamaji.service unit
-/// settling on a fresh boot.
+/// Per-attempt timeout on a single Kamaji UDS handshake. Short enough that a
+/// dead socket fails fast so the outer retry loop can back off and try again.
 const CONSTABLE_CONNECT_TIMEOUT_SECS: u64 = 5;
+
+/// Total wall-clock budget yubaba spends retrying the Kamaji UDS handshake at
+/// startup before falling back to the legacy in-process `ContainerRuntime`.
+///
+/// R589-T2 boot race: `yubaba.service` orders `After=kamaji.service`, but
+/// kamaji is `Type=simple`, so systemd considers it "active" the instant it
+/// forks — *before* it has bound `/run/kamaji/kamaji.sock`. On a slow node
+/// (e.g. the Raspberry Pi worker) yubaba would win the race, get
+/// ECONNREFUSED on its single connect attempt, and silently fall back to the
+/// in-process runtime — leaving kamaji unused until a manual
+/// `systemctl restart yubaba`, and recurring on every reboot. Retrying with
+/// backoff for this budget rides out the socket-bind gap without a
+/// per-box shim or a kamaji-side `Type=notify` change.
+const KAMAJI_CONNECT_BUDGET_SECS: u64 = 30;
 
 #[derive(Parser)]
 #[command(version, about = "yah per-machine infrastructure daemon")]
@@ -95,12 +116,19 @@ enum Cmd {
         /// R406-T8: UDS path for the Kamaji sibling process. When set,
         /// yubaba dispatches workload list/state/drain through Kamaji
         /// over postcard-framed messages. If the connection fails at
-        /// startup, yubaba falls back to the legacy in-process
+        /// startup, yubaba retries with backoff (rides out kamaji settling
+        /// on a fresh boot) and then falls back to the legacy in-process
         /// `ContainerRuntime` (with a warning) so existing single-node
-        /// deploys keep working until T9 ships Kamaji's containerd
-        /// backend.
-        #[arg(long)]
-        constable_socket: Option<PathBuf>,
+        /// deploys keep working.
+        ///
+        /// Flag name tracks the constable→kamaji rename: the sibling unit
+        /// (`kamaji.service`) and the cloud-init drop-ins spell it
+        /// `--kamaji-socket`, so the binary must too (R589-T2 — the shipped
+        /// v0.8.17 skew where the unit passed `--kamaji-socket` but the
+        /// binary only accepted `--constable-socket` fails `serve` with
+        /// exit 2).
+        #[arg(long = "kamaji-socket")]
+        kamaji_socket: Option<PathBuf>,
         /// Phase 2: this node's raft node ID (u64, unique per yubaba instance).
         /// When set, the raft coordination layer is started and `/raft/*`
         /// routes become active.
@@ -109,6 +137,20 @@ enum Cmd {
         /// Phase 2: directory for raft persistence files.
         #[arg(long, default_value = DEFAULT_RAFT_DIR)]
         raft_dir: PathBuf,
+        /// W197 §"Single-node raft" / A032 cluster-mesh-1 (R482-T3): on the
+        /// BYO-VPS bootstrap path, auto-initialise this node as a raft
+        /// cluster-of-one at startup instead of waiting for an operator
+        /// `raft init --member …` call. Requires `--raft-node-id`. Idempotent
+        /// across restarts. Do NOT combine with the multi-node founding flow —
+        /// a self-initialised node is its own cluster and cannot later merge
+        /// with a separately-founded one; fleet growth is join-by-NodeId.
+        #[arg(long)]
+        bootstrap_single_node: bool,
+        /// Membership address recorded for this node when self-initialising a
+        /// cluster-of-one (`--bootstrap-single-node`). Defaults to `--bind`.
+        /// Self-referential for a cluster-of-one and never dialed.
+        #[arg(long)]
+        raft_advertise_addr: Option<String>,
         /// Phase 2: S3 URL for litestream Headscale DB replication.
         /// Format: `s3://bucket/path?endpoint=https://fsn1.your-objectstorage.com`
         /// When set, the leader watcher manages litestream replicate + restore.
@@ -137,6 +179,16 @@ enum Cmd {
 enum RaftCmd {
     /// Show raft cluster status (leader, term, last log).
     Status,
+    /// One-time cluster bootstrap: write the founding membership (R570-F1).
+    ///
+    /// Run against exactly one founding voter after every member is up with
+    /// `--raft-node-id`; the rest learn membership from the elected leader.
+    Init {
+        /// Founding voter as `id=host:port`, repeatable
+        /// (e.g. --member 1=100.64.0.1:7443 --member 2=100.64.0.2:7443).
+        #[arg(long = "member", required = true)]
+        members: Vec<String>,
+    },
     /// List raft peers and their current state.
     Peers,
     /// Transfer raft leadership to another node.
@@ -154,9 +206,11 @@ fn default_serve() -> Cmd {
         state: PathBuf::from(DEFAULT_STATE_PATH),
         channel: "stable".to_string(),
         containerd_socket: DEFAULT_CONTAINERD_SOCKET.to_string(),
-        constable_socket: None,
+        kamaji_socket: None,
         raft_node_id: None,
         raft_dir: PathBuf::from(DEFAULT_RAFT_DIR),
+        bootstrap_single_node: false,
+        raft_advertise_addr: None,
         litestream_s3_url: None,
     }
 }
@@ -175,9 +229,11 @@ async fn main() -> Result<()> {
             state,
             channel,
             containerd_socket,
-            constable_socket,
+            kamaji_socket,
             raft_node_id,
             raft_dir,
+            bootstrap_single_node,
+            raft_advertise_addr,
             litestream_s3_url,
         } => {
             tracing::info!(channel = %channel, "yah-yubaba serve");
@@ -197,16 +253,79 @@ async fn main() -> Result<()> {
             // Failure here is non-fatal so an operator can boot yubaba alone
             // for triage, but the warning makes it clear the requested
             // dispatch path is unavailable.
-            server_state = attach_constable_client(server_state, constable_socket).await;
+            server_state = attach_constable_client(server_state, kamaji_socket).await;
+
+            // Pond (R454-F1 seam): the containerized pond yubaba drives
+            // MinIO/miniflare as sibling containers through the host docker
+            // socket mounted at /var/run/docker.sock. Wire the LocalRuntime
+            // whenever that socket exists so `POST /pond/deploy` works;
+            // without it the pond routes answer 503 and every camp deploy
+            // silently fails. Cloud/systemd deployments don't mount the
+            // socket, so this is a no-op there.
+            server_state = attach_pond_runtime(server_state).await;
 
             if let Some(node_id) = raft_node_id {
                 tracing::info!(node_id, dir = ?raft_dir, "starting raft coordination layer");
-                let raft_node = yubaba::raft::open(node_id, raft_dir).await?;
-                server_state = server_state.with_raft(raft_node.clone()).with_node_id(node_id);
+                let (raft_node, state_machine) =
+                    yubaba::raft::open_with_state_machine(node_id, raft_dir).await?;
+                server_state = server_state
+                    .with_raft(raft_node.clone())
+                    .with_node_id(node_id)
+                    // R600-F6 (W273): share the raft state-machine handle so
+                    // admission can resolve `SecretRef::Cluster` File mounts.
+                    // Cloned here because the ACME issuer (F3) also moves a
+                    // handle in below.
+                    .with_secret_state(state_machine.clone());
+                // W197 §"Single-node raft" (R482-T3): the BYO-VPS bootstrap
+                // path self-initialises a cluster-of-one so the node comes up
+                // as a live one-voter raft with no operator `raft init` call.
+                // Idempotent across restarts; a no-op once the node has
+                // vote/log state. Runs before the leader watcher spawns so the
+                // watcher observes the self-election on its first tick.
+                if bootstrap_single_node {
+                    let addr = raft_advertise_addr.clone().unwrap_or_else(|| bind.clone());
+                    match yubaba::raft::bootstrap_single_node(&raft_node, node_id, addr).await {
+                        Ok(true) => tracing::info!(
+                            node_id,
+                            "raft cluster-of-one initialised (single-node bootstrap)"
+                        ),
+                        Ok(false) => tracing::info!(
+                            node_id,
+                            "raft already initialised — single-node bootstrap is a no-op"
+                        ),
+                        Err(e) => return Err(e.context("single-node raft bootstrap")),
+                    }
+                }
                 let shared_state = Arc::new(server_state);
                 // Spawn leadership watcher before serving so Headscale starts
                 // immediately on the first leader election.
-                let _watcher = yubaba::leader::spawn(node_id, raft_node, Arc::clone(&shared_state));
+                let _watcher =
+                    yubaba::leader::spawn(node_id, raft_node.clone(), Arc::clone(&shared_state));
+                // R600-F4 (W273): every node consuming a cluster cert runs the
+                // rotation watcher — not just the elected issuer. On a replicated
+                // cert renewal it re-renders the local tmpfs mount and graceful-
+                // upgrades the consuming workload. No-op until a workload with a
+                // cluster File secret is deployed on this node.
+                tokio::spawn(yubaba::secret_reload::run(Arc::clone(&shared_state)));
+                // R600-F3 (W273): the fleet-shared ACME issuer. Opt-in — only
+                // spawns when YUBABA_ACME_DOMAIN et al are set (the HA fleet),
+                // and only one node issues at a time (raft-lock elected). Reads
+                // the stored cert's age via the state-machine handle to decide
+                // renewal; seals cert+key under the node KEK and PutSecrets them.
+                match yubaba::acme_issuer::parse_issuer_config(|k| std::env::var(k).ok()) {
+                    Ok(Some(issuer_cfg)) => {
+                        let _issuer = yubaba::acme_issuer::spawn(
+                            node_id,
+                            raft_node,
+                            state_machine,
+                            issuer_cfg,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::error!(
+                        "acme issuer config invalid — issuer not started (fix YUBABA_ACME_*): {e}"
+                    ),
+                }
                 serve(&bind, shared_state).await
             } else {
                 // Single-node mode: real containerd runtime, no raft mesh.
@@ -234,21 +353,45 @@ async fn main() -> Result<()> {
 
         Cmd::Raft { daemon, cmd } => match cmd {
             RaftCmd::Status => {
-                let body: serde_json::Value =
-                    reqwest::get(format!("{daemon}/raft/status"))
-                        .await?
-                        .json()
-                        .await?;
+                let body: serde_json::Value = reqwest::get(format!("{daemon}/raft/status"))
+                    .await?
+                    .json()
+                    .await?;
                 println!("{}", serde_json::to_string_pretty(&body)?);
+                Ok(())
+            }
+            RaftCmd::Init { members } => {
+                let mut parsed = std::collections::BTreeMap::new();
+                for m in &members {
+                    let (id, addr) = m.split_once('=').ok_or_else(|| {
+                        anyhow::anyhow!("--member must be id=host:port, got {m:?}")
+                    })?;
+                    let id: u64 = id
+                        .parse()
+                        .with_context(|| format!("--member node id must be a u64, got {id:?}"))?;
+                    parsed.insert(id, addr.to_string());
+                }
+                let client = reqwest::Client::new();
+                let resp = client
+                    .post(format!("{daemon}/raft/initialize"))
+                    .json(&serde_json::json!({ "members": parsed }))
+                    .send()
+                    .await?;
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if status.is_success() {
+                    println!("{body}");
+                } else {
+                    anyhow::bail!("raft init failed ({status}): {body}");
+                }
                 Ok(())
             }
             RaftCmd::Peers => {
                 // Peers are included in the metrics membership_config field.
-                let body: serde_json::Value =
-                    reqwest::get(format!("{daemon}/raft/status"))
-                        .await?
-                        .json()
-                        .await?;
+                let body: serde_json::Value = reqwest::get(format!("{daemon}/raft/status"))
+                    .await?
+                    .json()
+                    .await?;
                 let peers = &body["membership_config"];
                 println!("{}", serde_json::to_string_pretty(peers)?);
                 Ok(())
@@ -317,40 +460,109 @@ async fn attach_runtime(mut state: ServerState, containerd_socket: &str) -> Serv
     state
 }
 
-/// Connect to Kamaji when `--kamaji-socket` is set; on failure, log a
-/// warning and leave `constable_client = None` so yubaba falls back to the
-/// legacy in-process runtime.
-async fn attach_constable_client(
-    mut state: ServerState,
-    socket: Option<PathBuf>,
-) -> ServerState {
-    let Some(socket) = socket else {
-        return state;
+/// Wire the pond [`local_driver::LocalRuntime`] when a docker socket is
+/// reachable, flipping `POST /pond/deploy` from 503 to live.
+///
+/// The containerized pond yubaba (R454-F1) gets the host docker socket
+/// bind-mounted at `/var/run/docker.sock` (see
+/// `local_driver::pond_warden::build_warden_run_spec`); sibling MinIO/
+/// miniflare containers spawn through it as host siblings, never
+/// docker-in-docker. `DOCKER_HOST` overrides the socket path for
+/// non-standard runtimes. When neither is present (cloud/systemd nodes),
+/// pond stays unwired and the routes answer 503 — that's the correct
+/// shape for non-pond deployments.
+async fn attach_pond_runtime(state: ServerState) -> ServerState {
+    let docker_host = match std::env::var("DOCKER_HOST") {
+        Ok(h) if !h.trim().is_empty() => h,
+        _ => {
+            let sock =
+                std::path::Path::new(local_driver::pond_warden::DOCKER_SOCKET_CONTAINER_PATH);
+            if !sock.exists() {
+                tracing::info!(
+                    socket = %sock.display(),
+                    "no docker socket mounted; pond deploy routes stay 503 \
+                     (expected outside pond)"
+                );
+                return state;
+            }
+            format!("unix://{}", sock.display())
+        }
     };
-    match kamaji::sibling::connect_with_timeout(
-        socket.clone(),
-        std::time::Duration::from_secs(CONSTABLE_CONNECT_TIMEOUT_SECS),
-    )
-    .await
-    {
-        Ok(client) => {
+
+    let spec = local_driver::LocalContainerSpec {
+        runtime: local_driver::RuntimePref::Custom,
+        discovery: Default::default(),
+        custom_docker_host: Some(docker_host.clone()),
+    };
+    match local_driver::LocalRuntime::detect(&spec).await {
+        Ok(rt) => {
             tracing::info!(
-                socket = %socket.display(),
-                constable_version = %client.info().constable_version,
-                "kamaji client attached; workload list/state/drain dispatch \
-                 through UDS"
+                docker_host = %docker_host,
+                probe_host = %local_driver::pond_probe_host(),
+                "pond LocalRuntime attached; /pond/deploy is live"
             );
-            state = state.with_constable_client(Arc::new(client));
+            state.with_pond_local_runtime(Arc::new(rt))
         }
         Err(e) => {
             tracing::warn!(
-                socket = %socket.display(),
+                docker_host = %docker_host,
                 error = %e,
-                "kamaji UDS connect failed; falling back to in-process \
-                 ContainerRuntime for workload lifecycle"
+                "pond LocalRuntime detect failed; /pond/deploy stays 503"
             );
+            state
         }
     }
+}
+
+/// Connect to Kamaji when `--kamaji-socket` is set, retrying with backoff to
+/// ride out the sibling unit's socket-bind gap on a fresh boot (see
+/// [`KAMAJI_CONNECT_BUDGET_SECS`]). If the whole budget is exhausted, log a
+/// warning and leave `constable_client = None` so yubaba falls back to the
+/// legacy in-process runtime.
+async fn attach_constable_client(state: ServerState, socket: Option<PathBuf>) -> ServerState {
+    let Some(socket) = socket else {
+        return state;
+    };
+    let per_attempt = std::time::Duration::from_secs(CONSTABLE_CONNECT_TIMEOUT_SECS);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(KAMAJI_CONNECT_BUDGET_SECS);
+    let mut backoff = std::time::Duration::from_millis(500);
+    let last_err = loop {
+        match kamaji::sibling::connect_with_timeout(socket.clone(), per_attempt).await {
+            Ok(client) => {
+                tracing::info!(
+                    socket = %socket.display(),
+                    kamaji_version = %client.info().kamaji_version,
+                    "kamaji client attached; workload list/state/drain dispatch \
+                     through UDS"
+                );
+                return state.with_constable_client(Arc::new(client));
+            }
+            Err(e) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break e;
+                }
+                // Never sleep past the budget deadline.
+                let nap = backoff.min(deadline - now);
+                tracing::debug!(
+                    socket = %socket.display(),
+                    error = %e,
+                    retry_in = ?nap,
+                    "kamaji UDS not ready yet (sibling unit still settling); retrying"
+                );
+                tokio::time::sleep(nap).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(3));
+            }
+        }
+    };
+    tracing::warn!(
+        socket = %socket.display(),
+        error = %last_err,
+        budget_secs = KAMAJI_CONNECT_BUDGET_SECS,
+        "kamaji UDS connect failed within budget; falling back to in-process \
+         ContainerRuntime for workload lifecycle"
+    );
     state
 }
 

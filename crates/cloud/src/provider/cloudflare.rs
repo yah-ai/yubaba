@@ -54,15 +54,6 @@
 //! @yah:verify("cargo check -p cloud -p desktop — clean (R2BucketInfo extended, deserialized from BucketEntry, re-exported unchanged)")
 //! @yah:verify("cd packages/yah/ui && bun run typecheck — no new errors in infra/ or env/")
 //!
-//! @yah:ticket(R409-T6, "Refactor Cloudflare provider: register cloud.* (object storage) + dns.* verbs")
-//! @yah:assignee(agent:claude)
-//! @yah:at(2026-06-02T20:59:12Z)
-//! @yah:status(review)
-//! @yah:phase(P3)
-//! @yah:parent(R409)
-//! @yah:handoff("Implemented CloudflareEnvoy adapter covering cloud.object.* and dns.* verb categories. Three new files landed: (1) envoy/cloud_object.rs — CloudObjectBucketCreate/Delete/Exists verb types with optional location_hint on create; (2) envoy/dns_record.rs — DnsRecordUpsert/Delete + DnsZoneList verb types (initial dns.* catalog, defines the shapes T12 was gated on); (3) provider/cloudflare_envoy.rs — CloudflareEnvoy implements EnvoyAdapter with id=cloudflare, tier=S, flavor=Native, 6 supported verbs. CloudflareClient gained: delete_r2_bucket, upsert_dns_record (idempotent find+update-or-create), delete_dns_records (bulk by name+type), find_dns_record (private), cf_delete HTTP helper; list_zones promoted from private to pub. envoy.rs and provider/mod.rs updated to export the new modules. depends_on(R409-T12) removed — dns.* shapes defined here, narrowing T12's remaining scope to observability.*/ci.*/payments.*/messaging.*. 58 envoy+cloudflare tests pass; 381/382 cloud --lib pass (pre-existing cloud_init template drift, not a regression).")
-//! @yah:verify("cargo test -p cloud --lib --features json-schema -- envoy provider::cloudflare_envoy provider::cloudflare — 58/58 pass")
-//! @yah:verify("cargo check -p cloud --features json-schema — clean")
 //!
 //! @yah:ticket(R419-F1, "Extend deploy_worker_script for r2_bucket bindings")
 //! @yah:assignee(agent:claude)

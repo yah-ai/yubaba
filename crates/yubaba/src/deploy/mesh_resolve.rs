@@ -84,14 +84,15 @@ impl<'a> MeshResolver for StateMeshResolver<'a> {
             })?;
         match kind {
             MeshLookup::Host => Ok(addr.ident.0.clone()),
-            MeshLookup::Port => addr
-                .ports
-                .first()
-                .map(|p| p.to_string())
-                .ok_or(MeshError::NoPorts {
-                    ident: ident.0.clone(),
-                    lookup: kind,
-                }),
+            MeshLookup::Port => {
+                addr.ports
+                    .first()
+                    .map(|p| p.to_string())
+                    .ok_or(MeshError::NoPorts {
+                        ident: ident.0.clone(),
+                        lookup: kind,
+                    })
+            }
             MeshLookup::Url => addr
                 .ports
                 .first()
@@ -235,6 +236,8 @@ mod mesh {
                     digest: workload_spec::testing::test_digest(),
                 },
                 tier: TierTag("private".into()),
+                tenant: workload_spec::TenantId::singleton(),
+                namespace: workload_spec::NamespaceId::singleton(),
                 replicas: 1,
                 command: None,
                 entrypoint: None,
@@ -245,12 +248,13 @@ mod mesh {
                 volumes: vec![],
                 resources: ResourceLimits {
                     memory_mb: 64,
-                    cpu_shares: 256,
+                    cpu_millis: 256,
                     ephemeral_storage_mb: 64,
                 },
                 depends_on: deps,
                 healthcheck: None,
                 restart_policy: RestartPolicy::Always,
+                archetype: None,
                 stop_policy: StopPolicy {
                     signal: 15,
                     grace_period: Millis::from_secs(5),
@@ -399,8 +403,7 @@ mod mesh {
                 ident: MeshIdent("noisetable-db.pdx".into()),
                 address: db_address(),
             };
-            let spec =
-                spec_with_depends_on(vec![MeshIdent("noisetable-db.pdx".into())]);
+            let spec = spec_with_depends_on(vec![MeshIdent("noisetable-db.pdx".into())]);
 
             let result = await_dependencies(
                 &spec,
@@ -409,7 +412,10 @@ mod mesh {
                 Duration::from_millis(1),
             )
             .await;
-            assert!(result.is_ok(), "expected Ok once dep appears, got {result:?}");
+            assert!(
+                result.is_ok(),
+                "expected Ok once dep appears, got {result:?}"
+            );
             assert!(
                 *state.counter.lock().unwrap() >= 4,
                 "polled at least 4 times before resolving"
@@ -420,8 +426,7 @@ mod mesh {
         async fn await_dependencies_returns_ok_immediately_when_already_deployed() {
             let mut state = InMemoryMeshState::new();
             state.insert(db_address());
-            let spec =
-                spec_with_depends_on(vec![MeshIdent("noisetable-db.pdx".into())]);
+            let spec = spec_with_depends_on(vec![MeshIdent("noisetable-db.pdx".into())]);
 
             let result = await_dependencies(
                 &spec,
@@ -450,8 +455,7 @@ mod mesh {
         #[tokio::test]
         async fn await_dependencies_times_out_after_deps_deadline() {
             let state = InMemoryMeshState::new(); // dep never appears
-            let spec =
-                spec_with_depends_on(vec![MeshIdent("never-deploys".into())]);
+            let spec = spec_with_depends_on(vec![MeshIdent("never-deploys".into())]);
             let err = await_dependencies(
                 &spec,
                 &state,

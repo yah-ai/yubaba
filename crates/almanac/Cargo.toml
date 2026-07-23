@@ -6,7 +6,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Push-rebuild engine: feed configs, ReleaseSource adapters (GH + R2), and axum webhook receiver"
-publish = false
+keywords = ["webhook", "release", "rebuild", "automation"]
+categories = ["development-tools"]
+# R542: publishable now — yah-workload-spec and yah-object-store are both on
+# crates.io at 0.8.20, and `cargo publish --dry-run -p yah-almanac` passes.
 
 [lib]
 name = "yah_almanac"
@@ -29,8 +32,8 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 anyhow = "1.0"
-workload-spec = { package = "yah-workload-spec", version = "0.8.16" }
-yah-object-store = { version = "0.8.16" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.20" }
+yah-object-store = { version = "0.8.20" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

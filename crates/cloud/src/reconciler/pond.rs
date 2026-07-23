@@ -222,7 +222,7 @@
 //! @yah:parent(R408)
 //! @arch:see(.yah/docs/working/W154-yubaba-dual-runtime.md)
 //! @yah:depends_on(R406-T2,R406-T6)
-//! @yah:handoff("Pond yubaba-container image landed as a bundled qed catalog entry. Three files: (1) crates/yah/qed/images/yah-yubaba/Dockerfile — multi-stage build (rust:1-slim-bookworm builder compiles --bin yah-yubaba + --bin kamaji with yubaba/containerd-integration feature; debian:bookworm-slim runtime ships tini + ca-certificates + iproute2 + procps + the two binaries + supervisor). tini installed via apt is wired as ENTRYPOINT ['/usr/bin/tini', '--']. Build context MUST be the workspace root (header documents this). (2) crates/yah/qed/images/yah-yubaba/pond-supervise.sh — bash launcher: cleans stale UDS, starts kamaji with --socket $CONSTABLE_SOCK (default /run/kamaji/kamaji.sock), waits up to 5s for the socket to bind, then starts yah-yubaba with that env var. wait -n on both pids; SIGTERM trap forwards to both. First-sibling-to-die-exits-the-container is acceptable pond-tier policy (systemd siblings handle independent restart at cloud tier per R406-T13). (3) crates/yah/qed/images/catalog.toml + crates/yah/qed/src/images/catalog.rs — added yah-yubaba as the 8th bundled entry (base = debian:bookworm-slim; description references W154); EXPECTED_BUNDLED test array and the file docstring extended to match. Pre-existing per_camp_produces_* tests already use 'yah-yubaba' as the override name — upsert semantics keep them passing.")
+//! @yah:handoff("Pond yubaba-container image landed as a bundled qed catalog entry. Three files: (1) crates/yah/qed/images/yah-yubaba/Dockerfile — multi-stage build (rust:1-slim-bookworm builder compiles --bin yah-yubaba + --bin kamaji with yubaba/containerd-integration feature; debian:bookworm-slim runtime ships tini + ca-certificates + iproute2 + procps + the two binaries + supervisor). tini installed via apt is wired as ENTRYPOINT ['/usr/bin/tini', '--']. Build context MUST be the workspace root (header documents this). (2) crates/yah/qed/images/yah-yubaba/pond-supervise.sh — bash launcher: cleans stale UDS, starts kamaji with --socket $KAMAJI_SOCK (default /run/kamaji/kamaji.sock), waits up to 5s for the socket to bind, then starts yah-yubaba with that env var. wait -n on both pids; SIGTERM trap forwards to both. First-sibling-to-die-exits-the-container is acceptable pond-tier policy (systemd siblings handle independent restart at cloud tier per R406-T13). (3) crates/yah/qed/images/catalog.toml + crates/yah/qed/src/images/catalog.rs — added yah-yubaba as the 8th bundled entry (base = debian:bookworm-slim; description references W154); EXPECTED_BUNDLED test array and the file docstring extended to match. Pre-existing per_camp_produces_* tests already use 'yah-yubaba' as the override name — upsert semantics keep them passing.")
 //! @yah:handoff("Required docker run flags surfaced in the Dockerfile header (acceptance contract for T2): --cgroupns=private (cgroup namespace isolation so Kamaji can create child cgroups), --cap-add=SYS_ADMIN (cgroup/mount/unshare ops), -v /var/run/docker.sock:/var/run/docker.sock (T2 — sibling-container workloads), -v <state>:/var/lib/yah-yubaba (raft state per W105). The image itself does not enforce these — that's T2's pond reconciler wiring.")
 //! @yah:handoff("Verification: cargo test -p qed --lib images::catalog::tests → 16/16 pass. cargo check -p qed → clean. bash -n on the supervisor script → ok. Image not yet built locally — that's release-pipeline territory (R381-T7 builds yah-base/yah-rust/yah-rust-bun today; adding image-yah-yubaba to .github/workflows/release.yml is the next concrete step, mirroring those jobs).")
 //! @yah:next("T2 picks up here: pond reconciler must (a) pull/build yah-yubaba image, (b) docker run it with --cgroupns=private, --cap-add=SYS_ADMIN, -v /var/run/docker.sock:/var/run/docker.sock, -v <state>:/var/lib/yah-yubaba, (c) replace today's embedded yubaba in camp with a connection to the yubaba-container instance. The current camp-embedded yubaba path stays as a fallback until T2 lands the container-backed path.")
@@ -268,6 +268,17 @@
 //! @yah:verify("bun run typecheck (packages/yah/ui)  # no new errors beyond pre-existing ChatSurface + vitest")
 //! @arch:see(.yah/docs/working/W180-pond-richer-topology.md)
 //! @yah:depends_on(R456-F1)
+//!
+//! @yah:ticket(R374-T6, "Pre-flight sim-port conflict guard on the unsupervised cloud-direct up_pond path")
+//! @yah:at(2026-07-16T11:55:54Z)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R374)
+//! @yah:handoff("Durable fix for the host-side workerd orphan class on the cloud-direct up_pond path (the one R455-F1 left on the in-process bun shim, outside yubaba supervision). Added ensure_sim_port_free(sim_port) as a pre-flight in spawn_miniflare_child: (1) port_has_listener() TCP-connect probe on 127.0.0.1:sim_port — a squatted port otherwise hid behind a 30s 'did not emit ready signal' ERR_RUNTIME_FAILURE; (2) self-heal: enumerate host procs via `ps -axww` and SIGTERM->SIGKILL any workerd whose argv binds our port on loopback (entry=127.0.0.1:PORT — the exact host-side signature; the containerised sim binds 0.0.0.0 and never matches, so the reap can never reach into a container); (3) if a foreign holder remains (running pond container / other process), bail with a named actionable error instead of hanging. +233 LOC in pond.rs, 9 new unit tests. Original root cause: orphaned workerd PID 3232 (PPID=1 since Jul 11) squatting 127.0.0.1:4323 -> `yah qed run publish-assets service=yah-dashboard env=pond` failed while yah-marketing (mesofact-static, no worker runtime) passed.")
+//! @yah:next("MinIO bring-up was analyzed for the same symmetry and found ALREADY covered -- do NOT re-file: LocalRuntime::run idempotently replaces a same-named stale MinIO container, and a foreign port holder surfaces as docker's own 'port already allocated' error (not an opaque timeout). MinIO is fully container-managed so the host-side double-fork orphan class does not exist there.")
+//! @yah:next("Deeper durable direction -- fold the cloud-direct up_pond path into yubaba's supervised lifecycle so host-side orphans become structurally impossible -- remains the R374 thesis; this guard hardens the residual unsupervised path R455-F1 explicitly left on the bun shim (pond_smoke + `yah cloud mirror up`).")
+//! @yah:verify("cargo test -p cloud --lib reconciler::pond  # 36/36 pass (9 new sim-port tests: reapable host-vs-container-vs-wrong-port classification, ps-parse robustness, char-safe truncation, live-listener probe, ok-on-free, bail-on-foreign-holder)")
+//! @yah:verify("Signature validated live: real orphan argv `--socket-addr=entry=127.0.0.1:4323` matches the reap filter; the container-published :4323 shows 0 host-ps matches (container binds 0.0.0.0) -> guard bails with the actionable message and never reaps a container")
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -502,6 +513,16 @@ pub async fn up_pond(
     );
 
     let minio_spec = build_minio_spec(ctx, options, store_fields, &bucket, &state)?;
+    // The spec names the per-cell bridge network (R455-F1) but only the
+    // yubaba-deploy path ensured it existed — this direct-call path (pond_smoke
+    // + `yah cloud mirror up`) must create it too or `docker run --network`
+    // fails on a cell's first-ever bring-up.
+    if let Some(ref network) = minio_spec.network {
+        runtime
+            .ensure_network(network)
+            .await
+            .with_context(|| format!("ensuring pond bridge network {network}"))?;
+    }
     let minio_running = ensure_minio_running(&runtime, &minio_spec).await?;
 
     write_credentials_file(
@@ -512,8 +533,41 @@ pub async fn up_pond(
         &minio_running.secret_key,
     )?;
 
-    let (worker_mode_str, ssr_origin, ssr_prefixes) =
-        worker_mode_triple(&super::mesofact_static::parse_worker_mode(static_fields));
+    // Reconcile = sync + serve: publish the built dist into the bucket before
+    // the Worker starts routing to it, mirroring the cloudflare arm (which
+    // publishes to R2 inside the same `up`). Without this, a cell's first
+    // bring-up serves an empty bucket and every request 404s. Skipped with a
+    // warning when the workload has no built dist yet — the serve stack still
+    // comes up and adopts whatever is already in the bucket.
+    let out_dir =
+        super::mesofact_static::read_workload_out_dir(&ctx.workload_dir()).unwrap_or_else(|| "dist".to_string());
+    let dist_dir = ctx.workload_dir().join(&out_dir);
+    if dist_dir.exists() {
+        let report = super::pond_publish::publish_to_pond(
+            &dist_dir,
+            &minio_running.endpoint,
+            &minio_running.bucket,
+            &minio_running.access_key,
+            &minio_running.secret_key,
+            None,
+        )
+        .await
+        .with_context(|| format!("publishing {} to pond bucket", dist_dir.display()))?;
+        info!(
+            uploaded = report.uploaded.len(),
+            bucket = %minio_running.bucket,
+            "pond publish complete",
+        );
+    } else {
+        warn!(
+            dist = %dist_dir.display(),
+            "no built dist to publish — serving existing bucket contents",
+        );
+    }
+
+    let (worker_mode_str, ssr_origin, ssr_prefixes) = worker_mode_triple(
+        &super::mesofact_static::parse_worker_mode(&ctx.component.kind, static_fields),
+    );
 
     let (child, log_buf) = spawn_miniflare_child(
         ctx,
@@ -563,6 +617,80 @@ pub async fn up_pond(
         supervisor,
     )
     .with_console_url(minio_running.console_url.clone()))
+}
+
+/// Re-sync a running pond mirror: ensure its MinIO container is up (adopting
+/// the already-running one) and re-publish the workload's built `dist/` into
+/// the bucket — **without** touching the miniflare serve stack.
+///
+/// This is the "⟳ sync" affordance for local mirrors. `up_pond`'s desktop
+/// adopt path (`adopt_only: true`) returns at the Running branch before the
+/// publish step, so a re-click of ▶ never re-publishes; and re-running the
+/// non-adopt path would collide on the already-bound miniflare port (the
+/// R374 orphan-workerd class). `sync_pond` composes the same MinIO + publish
+/// primitives as `up_pond`'s bring-up but stops short of the serve stack, so
+/// it is safe to run against a live mirror.
+///
+/// Returns the number of assets uploaded; `0` when the workload has no built
+/// `dist/` yet (the bucket is left serving whatever it already holds).
+pub async fn sync_pond(
+    ctx: &ReconcileCtx<'_>,
+    options: &PondOptions,
+    static_fields: &BTreeMap<String, toml::Value>,
+) -> Result<usize> {
+    let store_fields = require_object_store_slot(ctx)?;
+    let bucket = resolve_bucket(static_fields, store_fields);
+    let state = PondState::for_ctx(ctx);
+    prepare_state_dir(ctx, &state)?;
+
+    let local_spec = load_local_container_spec(ctx)?;
+    let runtime = LocalRuntime::detect(&local_spec)
+        .await
+        .context("detecting local container runtime (orbstack/colima/docker)")?;
+
+    let minio_spec = build_minio_spec(ctx, options, store_fields, &bucket, &state)?;
+    if let Some(ref network) = minio_spec.network {
+        runtime
+            .ensure_network(network)
+            .await
+            .with_context(|| format!("ensuring pond bridge network {network}"))?;
+    }
+    let minio_running = ensure_minio_running(&runtime, &minio_spec).await?;
+
+    write_credentials_file(
+        &state,
+        &minio_running.endpoint,
+        &minio_running.bucket,
+        &minio_running.access_key,
+        &minio_running.secret_key,
+    )?;
+
+    let out_dir = super::mesofact_static::read_workload_out_dir(&ctx.workload_dir())
+        .unwrap_or_else(|| "dist".to_string());
+    let dist_dir = ctx.workload_dir().join(&out_dir);
+    if !dist_dir.exists() {
+        warn!(
+            dist = %dist_dir.display(),
+            "sync_pond: no built dist to publish — bucket left serving existing contents",
+        );
+        return Ok(0);
+    }
+    let report = super::pond_publish::publish_to_pond(
+        &dist_dir,
+        &minio_running.endpoint,
+        &minio_running.bucket,
+        &minio_running.access_key,
+        &minio_running.secret_key,
+        None,
+    )
+    .await
+    .with_context(|| format!("publishing {} to pond bucket", dist_dir.display()))?;
+    info!(
+        uploaded = report.uploaded.len(),
+        bucket = %minio_running.bucket,
+        "sync_pond: re-publish complete",
+    );
+    Ok(report.uploaded.len())
 }
 
 /// Build a [`MinioSpec`] from the canonical pond options + the
@@ -697,6 +825,10 @@ async fn spawn_miniflare_child(
     ssr_origin: &str,
     ssr_prefixes: &[String],
 ) -> Result<(tokio::process::Child, LogBuffer)> {
+    // Fail fast (and self-heal our own orphans) on a squatted port — otherwise
+    // a bind conflict hides behind a 30s "did not emit ready signal" timeout.
+    ensure_sim_port_free(sim_port).await?;
+
     std::fs::write(&state.worker_js, worker_script.as_bytes())
         .with_context(|| format!("writing {}", state.worker_js.display()))?;
     std::fs::write(&state.miniflare_shim, MINIFLARE_SIM_SCRIPT.as_bytes())
@@ -786,9 +918,28 @@ async fn spawn_miniflare_child(
         Ok(Err(_)) | Err(_) => {
             let _ = child.start_kill();
             let _ = child.wait().await;
+            // Give the reader tasks a beat to drain, then surface what the
+            // shim actually said — an opaque timeout hides the real error
+            // (missing miniflare import, port conflict, workerd crash, …).
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let (lines, _) = log_buf.since(0).await;
+            let tail = if lines.is_empty() {
+                "(no output captured)".to_string()
+            } else {
+                lines
+                    .iter()
+                    .rev()
+                    .take(15)
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n  ")
+            };
             bail!(
-                "miniflare did not emit ready signal within {:?}",
+                "miniflare did not emit ready signal within {:?} — via `{}`, last output:\n  {}",
                 options.ready_timeout,
+                node_binary.display(),
+                tail,
             );
         }
     }
@@ -948,13 +1099,29 @@ pub fn which_bun_on_path() -> bool {
         .unwrap_or(false)
 }
 
+/// Locate the worker directory's node_modules under the workspace root. Two
+/// live layouts: the yah monorepo (cloud vendored at `oss/yubaba/crates/cloud`)
+/// and the standalone yubaba export (`crates/cloud`).
+fn resolve_worker_node_modules(workspace_root: &std::path::Path) -> Option<PathBuf> {
+    [
+        "oss/yubaba/crates/cloud/worker/node_modules",
+        "crates/cloud/worker/node_modules",
+    ]
+    .iter()
+    .map(|rel| workspace_root.join(rel))
+    // Canonicalize: workspace_root is often relative (CLI `--path` defaults
+    // to `.`), but the path is handed to the shim as an import specifier,
+    // which bun/node resolve against the shim's dir — it must be absolute.
+    .find_map(|p| p.canonicalize().ok())
+}
+
 /// Return an absolute path to miniflare's CJS entry point if the monorepo
 /// worker directory is present under the workspace root. Operators who have
 /// the yah source tree get zero-download spinup; those who don't fall back to
 /// the bare `"miniflare"` specifier (which requires a lazy npm install).
 pub fn resolve_miniflare_import(workspace_root: &std::path::Path) -> Option<String> {
     let index =
-        workspace_root.join("crates/yah/cloud/worker/node_modules/miniflare/dist/src/index.js");
+        resolve_worker_node_modules(workspace_root)?.join("miniflare/dist/src/index.js");
     if index.exists() {
         Some(index.to_string_lossy().into_owned())
     } else {
@@ -967,16 +1134,162 @@ pub fn resolve_miniflare_import(workspace_root: &std::path::Path) -> Option<Stri
 /// binary is never re-downloaded when it's already on disk. Falls back to
 /// miniflare's own resolution (from the `workerd` npm package) when absent.
 pub fn resolve_workerd_binary(workspace_root: &std::path::Path) -> Option<PathBuf> {
-    let bin = workspace_root.join(if cfg!(windows) {
-        "crates/yah/cloud/worker/node_modules/workerd/bin/workerd.exe"
+    let bin = resolve_worker_node_modules(workspace_root)?.join(if cfg!(windows) {
+        "workerd/bin/workerd.exe"
     } else {
-        "crates/yah/cloud/worker/node_modules/workerd/bin/workerd"
+        "workerd/bin/workerd"
     });
     if bin.exists() {
         Some(bin)
     } else {
         None
     }
+}
+
+// ── Sim-port pre-flight: surface (and self-heal) serve-layer conflicts ───────
+//
+// A stale serve-layer squatting `sim_port` otherwise fails opaquely: workerd
+// dies on `bind(): Address already in use`, never emits the ready line, and
+// the caller only learns about it as `ERR_RUNTIME_FAILURE` after the full
+// `ready_timeout` (30s). We turn that into an immediate, actionable signal.
+//
+// The recurring offender (R362-B1 / R374) is a host-side `workerd` orphaned to
+// pid 1: bun double-forks workerd, so `kill_on_drop` misses the grandchild and
+// it survives an abnormal parent exit still holding the port. That specific
+// orphan — identified by its argv binding OUR port on loopback — is reaped and
+// retried. Any other holder (a running pond container, a foreign process) is
+// reported by name instead of hanging.
+
+/// True if something is accepting TCP connections on `host:port` right now. A
+/// live listener is the real conflict; a lingering `TIME_WAIT` socket has no
+/// listener and refuses the connect, so this avoids the false positives a
+/// bind-probe would hit.
+fn port_has_listener(host: &str, port: u16) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Ok(addrs) = (host, port).to_socket_addrs() else {
+        return false;
+    };
+    addrs.into_iter().any(|addr| {
+        TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+    })
+}
+
+/// `(pid, cmdline)` for every host `workerd` process whose argv references
+/// `port`. Source for both reaping (loopback-bound orphans) and the
+/// human-readable holder list in the conflict error. Best-effort: a missing or
+/// failing `ps` yields an empty vec and the caller falls through to its bail.
+async fn workerd_procs_on_port(port: u16) -> Vec<(i32, String)> {
+    // `-axww`: all processes, no-tty included, unlimited width so a deep argv
+    // (the `entry=127.0.0.1:PORT` signature) is never truncated. Portable
+    // across macOS (BSD ps) and Linux (procps).
+    let out = match Command::new("ps")
+        .args(["-axww", "-o", "pid=,command="])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return vec![],
+    };
+    scan_workerd_procs(&String::from_utf8_lossy(&out), port)
+}
+
+/// Pure parser for `ps -o pid=,command=` output. macOS right-justifies the pid
+/// column, so lines are left-trimmed before the pid/command split.
+fn scan_workerd_procs(ps_stdout: &str, port: u16) -> Vec<(i32, String)> {
+    let needle = format!(":{port}");
+    ps_stdout
+        .lines()
+        .filter_map(|line| {
+            let (pid_str, cmd) = line.trim_start().split_once(char::is_whitespace)?;
+            let pid: i32 = pid_str.parse().ok()?;
+            (cmd.contains("workerd") && cmd.contains(&needle)).then(|| (pid, cmd.to_string()))
+        })
+        .collect()
+}
+
+/// A workerd is a reapable host-side pond-sim orphan iff its argv binds our sim
+/// port on loopback — the host-side shim's default `MF_HOST=127.0.0.1`. The
+/// containerised sim binds `0.0.0.0` inside its netns and is published by
+/// docker, so it never matches: we never reach into a container this way.
+fn is_reapable_sim_workerd(cmdline: &str, sim_port: u16) -> bool {
+    cmdline.contains(&format!("entry=127.0.0.1:{sim_port}"))
+}
+
+/// Trim an argv for a log/error line — long enough to show the binding, capped
+/// on a char boundary so multi-byte paths never panic the slice.
+fn truncate_cmd(cmd: &str) -> String {
+    const MAX: usize = 160;
+    if cmd.chars().count() <= MAX {
+        return cmd.to_string();
+    }
+    format!("{}…", cmd.chars().take(MAX).collect::<String>())
+}
+
+/// Best-effort SIGTERM→SIGKILL of a pid via the `kill` binary. Reaping a stale
+/// dev-sim orphan is not worth a direct `libc`/`nix` dependency in this crate.
+fn signal_pid(pid: i32, sig: &str) {
+    let _ = std::process::Command::new("kill")
+        .arg(format!("-{sig}"))
+        .arg(pid.to_string())
+        .status();
+}
+
+/// Pre-flight guard for [`spawn_miniflare_child`]: ensure the miniflare Worker
+/// runtime can actually bind `sim_port` before we spawn it. Reaps a stale
+/// host-side sim orphan on that exact port and retries; if a foreign holder (a
+/// running container, an unrelated process) remains, bails with a crisp,
+/// actionable error rather than a silent 30s `ERR_RUNTIME_FAILURE`.
+async fn ensure_sim_port_free(sim_port: u16) -> Result<()> {
+    if !port_has_listener("127.0.0.1", sim_port) {
+        return Ok(());
+    }
+
+    let reapable: Vec<i32> = workerd_procs_on_port(sim_port)
+        .await
+        .into_iter()
+        .filter(|(_, cmd)| is_reapable_sim_workerd(cmd, sim_port))
+        .map(|(pid, _)| pid)
+        .collect();
+
+    if !reapable.is_empty() {
+        for &pid in &reapable {
+            signal_pid(pid, "TERM");
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for &pid in &reapable {
+            signal_pid(pid, "KILL");
+        }
+        warn!(
+            port = sim_port,
+            pids = ?reapable,
+            "reaped stale host-side miniflare (workerd) orphan(s) squatting the pond sim port",
+        );
+        // Give the OS a beat to release the listener socket before re-probing.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if !port_has_listener("127.0.0.1", sim_port) {
+            return Ok(());
+        }
+    }
+
+    let holders = workerd_procs_on_port(sim_port).await;
+    let detail = if holders.is_empty() {
+        "(no host-side workerd found on this port via `ps` — most likely a \
+         running pond container publishing it, or a foreign process)"
+            .to_string()
+    } else {
+        holders
+            .iter()
+            .map(|(pid, cmd)| format!("pid {pid}: {}", truncate_cmd(cmd)))
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    };
+    bail!(
+        "pond sim port {sim_port} is already in use on 127.0.0.1 — miniflare's \
+         Worker runtime cannot bind it (this otherwise surfaces as an opaque \
+         ERR_RUNTIME_FAILURE only after the ready timeout elapses). Holder(s):\n  {detail}\n\
+         Stop the other pond mirror on this port (`docker stop` its container, \
+         or kill a stale host-side serve-layer), then retry.",
+    );
 }
 
 // ── R374-F2: yubaba status query (desktop adopt path) ────────────────────────
@@ -1047,6 +1360,11 @@ pub struct AdoptPondRecord {
     pub console_url: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// Unix epoch **milliseconds** when the workload entered Running (mirrors
+    /// `PondStateRecord::started_at`). `None` while Pending/Failed or from a
+    /// pre-uptime yubaba. Feeds the Run-tab Live scoreboard's uptime column.
+    #[serde(default)]
+    pub started_at: Option<u64>,
     /// Per-slot probe snapshots from yubaba (R456-F1 Phase E). Empty for
     /// pre-E yubaba responses — callers treat an empty vec as "no probe
     /// data yet" rather than "all slots failed".
@@ -1144,6 +1462,89 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    // ── sim-port pre-flight ──────────────────────────────────────────────
+
+    const HOST_SIDE_WORKERD: &str = "/ws/oss/yubaba/crates/cloud/worker/node_modules/workerd/bin/workerd serve --binary --experimental --socket-addr=entry=127.0.0.1:4323 --external-addr=loopback=127.0.0.1:59934 --control-fd=3";
+    const CONTAINER_WORKERD: &str = "/usr/local/bin/workerd serve --binary --experimental --socket-addr=entry=0.0.0.0:4322 --control-fd=3";
+
+    #[test]
+    fn reapable_matches_host_side_sim_on_its_port() {
+        assert!(is_reapable_sim_workerd(HOST_SIDE_WORKERD, 4323));
+    }
+
+    #[test]
+    fn reapable_rejects_container_bound_sim() {
+        // Container binds 0.0.0.0, never loopback — must never be reaped.
+        assert!(!is_reapable_sim_workerd(CONTAINER_WORKERD, 4322));
+    }
+
+    #[test]
+    fn reapable_rejects_workerd_on_a_different_port() {
+        assert!(!is_reapable_sim_workerd(HOST_SIDE_WORKERD, 4322));
+    }
+
+    #[test]
+    fn scan_extracts_workerd_pids_on_port_only() {
+        let ps = "\
+  3232 /ws/node_modules/workerd/bin/workerd serve --socket-addr=entry=127.0.0.1:4323 --control-fd=3
+  4100 /usr/bin/minio server /data --address :4323
+  5000 /ws/node_modules/workerd/bin/workerd serve --socket-addr=entry=127.0.0.1:4322 --control-fd=3
+ 99999 /bin/some-daemon --port 4323";
+        let hits = scan_workerd_procs(ps, 4323);
+        // Only the workerd whose argv mentions :4323 — minio + the 4322 workerd
+        // + the non-workerd daemon are excluded.
+        assert_eq!(hits, vec![(3232, ps.lines().next().unwrap().trim_start().split_once(' ').unwrap().1.to_string())]);
+    }
+
+    #[test]
+    fn scan_tolerates_blank_and_malformed_lines() {
+        let ps = "\n   \nnotanumber /ws/workerd serve entry=127.0.0.1:4323\n";
+        assert!(scan_workerd_procs(ps, 4323).is_empty());
+    }
+
+    #[test]
+    fn truncate_cmd_caps_and_is_char_safe() {
+        let short = "workerd serve :4323";
+        assert_eq!(truncate_cmd(short), short);
+        let long = "é".repeat(500);
+        let out = truncate_cmd(&long);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 161); // 160 kept + ellipsis
+    }
+
+    #[test]
+    fn port_has_listener_true_for_live_listener_false_for_free_port() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let bound = listener.local_addr().unwrap().port();
+        assert!(port_has_listener("127.0.0.1", bound));
+        drop(listener);
+        // A now-unbound ephemeral port refuses connects.
+        assert!(!port_has_listener("127.0.0.1", bound));
+    }
+
+    #[tokio::test]
+    async fn ensure_sim_port_free_ok_when_unbound() {
+        // Reserve then release an ephemeral port to get one that is almost
+        // certainly free, and confirm the guard passes without a holder.
+        let port = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        ensure_sim_port_free(port).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_sim_port_free_bails_with_holder_on_foreign_listener() {
+        // A plain TcpListener (not a reapable sim workerd) holds the port —
+        // the guard must refuse to touch it and surface an actionable error.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let err = ensure_sim_port_free(port).await.unwrap_err().to_string();
+        assert!(err.contains(&format!("pond sim port {port} is already in use")), "got: {err}");
+        assert!(err.contains("Stop the other pond mirror"), "got: {err}");
+    }
+
     #[test]
     fn resolve_bucket_static_wins_on_disagreement() {
         let mut s = BTreeMap::new();
@@ -1187,6 +1588,7 @@ mod tests {
             name: "dev-yah".into(),
             domain: "yah.dev".into(),
             components: vec![],
+            db: crate::DbCatalog::default(),
         };
         let comp = crate::ServiceComponent {
             id: "site".into(),
@@ -1209,6 +1611,7 @@ mod tests {
             component: &comp,
             mirror: &mirror,
             env: "pond",
+            scope: crate::reconciler::ProviderScope::singleton(),
         };
         let state = PondState::for_ctx(&ctx);
         assert_eq!(state.dir, tmp.path().join(".yah/infra/pond/dev-yah-pond"),);
@@ -1252,6 +1655,7 @@ mod tests {
             name: "test-svc".into(),
             domain: "test.dev".into(),
             components: vec![],
+            db: crate::DbCatalog::default(),
         };
         let comp = crate::ServiceComponent {
             id: "site".into(),
@@ -1274,6 +1678,7 @@ mod tests {
             component: &comp,
             mirror: &mirror,
             env: "pond",
+            scope: crate::reconciler::ProviderScope::singleton(),
         };
         let mut fields = BTreeMap::new();
         fields.insert("port".into(), toml::Value::Integer(19423));
@@ -1329,6 +1734,7 @@ mod tests {
             name: "test-svc".into(),
             domain: "test.dev".into(),
             components: vec![],
+            db: crate::DbCatalog::default(),
         };
         let comp = crate::ServiceComponent {
             id: "site".into(),
@@ -1351,6 +1757,7 @@ mod tests {
             component: &comp,
             mirror: &mirror,
             env: "pond",
+            scope: crate::reconciler::ProviderScope::singleton(),
         };
         let fields = BTreeMap::new();
         let opts = PondOptions {
@@ -1404,6 +1811,7 @@ mod tests {
             name: "test-svc".into(),
             domain: "test.dev".into(),
             components: vec![],
+            db: crate::DbCatalog::default(),
         };
         let comp = crate::ServiceComponent {
             id: "site".into(),
@@ -1426,6 +1834,7 @@ mod tests {
             component: &comp,
             mirror: &mirror,
             env: "pond",
+            scope: crate::reconciler::ProviderScope::singleton(),
         };
         let fields = BTreeMap::new();
         let opts = PondOptions {
@@ -1473,6 +1882,7 @@ mod tests {
             name: "test-svc".into(),
             domain: "test.dev".into(),
             components: vec![],
+            db: crate::DbCatalog::default(),
         };
         let comp = crate::ServiceComponent {
             id: "site".into(),
@@ -1495,6 +1905,7 @@ mod tests {
             component: &comp,
             mirror: &mirror,
             env: "pond",
+            scope: crate::reconciler::ProviderScope::singleton(),
         };
         let fields = BTreeMap::new();
         let opts = PondOptions {

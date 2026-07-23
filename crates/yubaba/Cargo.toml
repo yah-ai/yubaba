@@ -5,6 +5,16 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "Per-machine infrastructure daemon for yah-managed mirrors: HTTP control surface, openraft cluster coordination, pond deploy/state reconciliation, and containerd/docker workload supervision."
+keywords = ["daemon", "orchestration", "raft", "infrastructure"]
+categories = ["command-line-utilities", "network-programming"]
+# R542 gate: BLOCKED on `acme-engine`. Every other in-house dep is on crates.io
+# at 0.8.20 (yah-workload-spec, yah-local-driver, kamaji, kamaji-proto, mshr),
+# and the `yubaba` name is ours (reserved at 0.0.0). But `acme-engine` on
+# crates.io is an UNRELATED 0.4.0 crate — the name is squatted, so our
+# `acme-engine = "0.8.20"` can never resolve from the registry and publish
+# verification fails. oss/passway's crate needs a yah- prefix rename first;
+# that is tracked as its own relay. Do not flip this until then.
 publish = false
 
 [[bin]]
@@ -30,7 +40,7 @@ containerd-integration = [
 # Docker CLI-backed ContainerRuntime for pond/OrbStack. No extra Rust deps —
 # shells out to the `docker` binary. Enable this in the desktop/camp build
 # that drives the pond yubaba-container.
-docker-integration = ["kamaji/docker-integration"]
+docker-integration = ["kamaji/docker-integration", "kamaji-bin/docker-integration"]
 
 # In-memory fakes for unit testing (runtime::fake, provider::fake).
 # Excluded from release binaries; enable in dev-dependency test targets only.
@@ -39,18 +49,26 @@ testing = ["kamaji/testing"]
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
+# R600-F2 (W273): decrypt raft-replicated cluster secret ciphertext with the
+# node-local cluster KEK. AES-256-GCM matches the issuer's seal (R600-F3);
+# already a transitive dep, promoted to direct here. `zeroize` scrubs the
+# expanded AES key schedule from the cipher struct on drop.
+aes-gcm = { version = "0.10", features = ["zeroize"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 futures-core = "0.3"
-openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+openraft = { version = "=0.10.0-alpha.30", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-# R406-T8: typed error surface on the ConstableClient. Already a transitive
+# R600-F2 (W273): scrub the node-local cluster KEK from memory on drop and wipe
+# the intermediate read buffer in load_cluster_kek.
+zeroize = "1"
+# R406-T8: typed error surface on the KamajiClient. Already a transitive
 # workspace dep via kamaji-proto + reqwest; no new build cost.
 thiserror = "1.0"
 # R427-F1: privileged cheers client mints PASETO v4.public tokens locally
@@ -62,22 +80,37 @@ tokio-stream = { version = "0.1", features = ["io-util"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-workload-spec = { package = "yah-workload-spec", version = "0.8.16" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.20" }
+# R600-F3 (W273): the elected ACME issuer reuses passway's extracted issuance
+# engine (RFC-8555 order flow + DNS-01-via-Cloudflare, returns cert+key PEM in
+# memory) instead of copy-pasting acme.rs. Version dep + [patch.crates-io]
+# redirect to the sibling passway workspace, same shape as the yah-base deps.
+acme-engine = "0.8.20"
 # R484-T2: shared Kamaji trait + runtime backend impls (containerd, docker,
 # fake). Pre-W199 these lived in `yubaba::runtime::*`; now they live in
 # kamaji-core and yubaba re-exports the surface through this crate.
-kamaji = { version = "0.8.16", features = ["sibling"] }
+kamaji = { version = "0.8.20", features = ["sibling"] }
 # R406-T8: Yubaba ↔ Kamaji UDS wire protocol — postcard-framed messages
 # shared with the kamaji binary in app/yah/kamaji/.
-kamaji-proto = { version = "0.8.16" }
+kamaji-proto = { version = "0.8.20" }
 # Shared docker-CLI driver + S3 SigV4 helpers — yubaba owns the pond MinIO
 # slot lifecycle from R374-F3 onward. cloud depends on the same crate.
-local-driver = { package = "yah-local-driver", version = "0.8.16" }
+local-driver = { package = "yah-local-driver", version = "0.8.20" }
+
+# R593-T2: mshr is the machine-identity primary (promoted from xlb-net,
+# R593-T1) — yubaba's hostkey loader now sources its Ed25519 keypair from
+# mshr's identity-file loader instead of self-generating, so the hostkey IS
+# the mshr NodeId. Path dep during development, same convention as
+# oss/cheers/crates/cheers's lan-pair dep. mshr has no Cargo feature gates
+# today (identity/keypair loading, the QUIC Endpoint, and discovery all
+# compile together as one crate) so there is no smaller feature surface to
+# opt into here — identity.rs only calls Keypair::load_or_create_at.
+mshr = { path = "../../../mshr/crates/mshr", version = "0.8.20" }
 
 # Thin pond wire-type surface (PondDeployReq/PondStateRecord/…). Carved out of
 # this lib (R483-T5) so clients link the types without yubaba's server closure;
 # the server side here re-exports them via `pub use warden_client::*` in pond.rs.
-yubaba-client = { path = "../yubaba-client" }
+yubaba-client = { path = "../yubaba-client", version = "0.8.20" }
 
 # containerd gRPC client (optional — only with containerd-integration feature)
 containerd-client = { version = "0.9", optional = true }
@@ -86,15 +119,20 @@ prost-types = { version = "0.14", optional = true }
 [dev-dependencies]
 http-body-util = "0.1"
 tempfile = "3"
+# R625-S1: the deployed fleet (yubaba v0.8.20 tag) runs openraft 0.9 while
+# in-tree runs 0.10.0-alpha.30. Linking BOTH lets tests/mixed_version_wire_interop.rs
+# round-trip real 0.9 wire payloads against real 0.10 decoders instead of
+# inferring compatibility from the route table. Dev-only: never in the shipped lib.
+openraft_09 = { package = "openraft", version = "0.9", features = ["serde", "storage-v2"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 # Integration test harness — used in tests/integration_smoke_filter.rs and
 # future F5/F6 integration tests.
-cloud = { path = "../cloud", features = ["local-docker"] }
+cloud = { package = "yah-cloud", path = "../cloud", features = ["local-docker"] }
 yubaba-test-macros = { path = "../yubaba-test-macros" }
 yubaba-test-harness = { path = "../yubaba-test-harness" }
 # R406-T8: spawn a real kamaji::serve_with_shutdown inside the
 # yubaba↔kamaji integration test (tests/integration_constable_client.rs).
-kamaji-bin = { version = "0.8.16" }
+kamaji-bin = { version = "0.8.20" }
 
 # integration_smoke_filter requires containerd-integration for ContainerdRuntime.
 [[test]]

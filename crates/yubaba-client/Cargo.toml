@@ -6,7 +6,11 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Thin client surface for talking to a yubaba: pond deploy/state wire types, no server stack (no axum/openraft/russh/portable-pty)."
-publish = false
+keywords = ["yubaba", "client", "wire-types", "orchestration"]
+categories = ["api-bindings"]
+# R542: publishable now — the name is ours on crates.io (reserved at 0.0.0) and
+# its only in-house dep, yah-local-driver, is published at 0.8.20. Publishing
+# 0.8.20 is a version bump over the 0.0.0 placeholder, not a virgin publish.
 
 [lib]
 path = "src/lib.rs"
@@ -17,5 +21,5 @@ path = "src/lib.rs"
 # only needs the serde types, not the runtime. local-driver is lean — it shells
 # out to the `docker` CLI and pulls no axum/openraft/russh/portable-pty — so a
 # crate that talks to a yubaba can link it without dragging the server stack.
-local-driver = { package = "yah-local-driver", version = "0.8.16" }
+local-driver = { package = "yah-local-driver", version = "0.8.20" }
 serde = { version = "1.0", features = ["derive"] }

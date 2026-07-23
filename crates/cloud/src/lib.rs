@@ -236,6 +236,7 @@ pub mod identities;
 pub mod local_driver_glue;
 pub mod mesh;
 pub mod mesh_service;
+pub mod multi_root;
 pub mod paths;
 pub mod provider;
 pub mod provision;
@@ -250,23 +251,27 @@ pub use almanac_dispatch::dispatch_on_change;
 pub use asset_journal::{AssetState, AssetStatusEvent, AssetStatusJournal};
 pub use compose::{generate_compose_bundle, ComposeBundle};
 pub use config::{
-    BucketLogEntry, CloudConfig, ConnectSpec, GitSource, LegacyMirrorConfig, LegacyServiceConfig,
-    MachineConfig, MirrorAssignment, MirrorConfig, MirrorProviderSlot, MirrorShape, Provider,
-    ProviderConfig, ServiceComponent, ServiceConfig, TopologyConfig, WorkloadConfig,
-    WorkloadConfigError,
+    BucketLogEntry, CampCloudDbs, CloudConfig, CloudDb, ConnectSpec, DbCatalog, DevDb, GitSource,
+    LegacyMirrorConfig, LegacyServiceConfig, MachineConfig, MirrorAssignment, MirrorConfig,
+    MirrorProviderSlot, MirrorShape, PondDb, PondDbKind, Provider, ProviderConfig, ServiceComponent,
+    ServiceConfig, TopologyConfig, WorkloadConfig, WorkloadConfigError,
 };
 pub use local_driver::{
     canonical_label, canonical_name, ContainerRunSpec, ContainerState, CustomDockerHostProvider,
     DetectedRuntime, LocalContainerSpec, LocalDockerRuntime, LocalRuntime, OwnedContainer,
     RuntimePref, RuntimeProvider, SocketRuntimeProvider, LABEL_KEY, NAME_PREFIX,
 };
+pub use local_driver::pond_warden::{warden_container_label, warden_container_name};
 pub use local_driver_glue::local_container_spec_from_provider;
 pub use provider::{
-    BucketAcl, BucketRef, CfAccountInfo, CloudflareClient, CloudflareEnvoy, CreateR2BucketResult,
-    CreateTokenResult, CreateTunnelResult, DigitalOceanEnvoy, GrantScope, HetznerDriver,
-    HetznerEnvoy, Location, MachineProvider, ProjectId, R2BucketInfo, R2CustomDomain, ServerId,
+    on_ingress_owner_changed, reconcile_assignment, BucketAcl, BucketRef, CfAccountInfo,
+    CloudflareClient, CloudflareEnvoy, CreateR2BucketResult, CreateTokenResult,
+    CreateTunnelResult, DigitalOceanEnvoy, FloatingIpAssignOutcome, FloatingIpProvider,
+    FloatingIpState, FloatingIpTarget, GrantScope, HetznerDriver, HetznerEnvoy, HetznerFloatingIp,
+    Location, MachineProvider, OvhFloatingIp, ProjectId, R2BucketInfo, R2CustomDomain, ServerId,
     ServerSpec, ServerStatus, ServerSummary, TokenGrant, TunnelConnState, TunnelDnsRecord,
-    TunnelDriftRow, TunnelDriftState, WorkerDeployResult, MESOFACT_STATIC_GRANTS,
+    TunnelDriftRow, TunnelDriftState, VultrFloatingIp, WorkerDeployResult,
+    MESOFACT_STATIC_GRANTS,
 };
 #[cfg(feature = "local-docker")]
 pub use provider::{LocalDockerEnvoy, LocalDockerProvider};
@@ -275,10 +280,12 @@ pub use reconciler::{
     compute_prune_candidates, compute_service, derive_minio_key, execute_derive_cache_prune,
     execute_prune, load_service_and_mirror, mesofact_static::WORKER_SCRIPT, new_sync_id,
     pond::MINIFLARE_SIM_SCRIPT, publish_to_pond, resolve_runner_machine, summarize, CellStatus,
-    CloudflareWorkerReconciler, DeriveCacheLiveHashes, DerivePruneCandidate, DriftEntry,
+    CloudflareWorkerReconciler, ContainerOptions, ContainerReconciler, DeriveCacheLiveHashes,
+    DerivePruneCandidate, DriftEntry,
     HealthState, LocalStaticOptions, MesofactRunnerReconciler, MesofactStaticReconciler,
     MirrorObservation, PondOptions, PondPublishReport, PondState, PruneCandidate, PruneOutcome,
-    PruneReport, ReconcileCtx, Reconciler, RunningWorkload, RunningWorkloadSummary, Runtime,
+    PruneReport, ProviderScope, ReconcileCtx, Reconciler, RunningWorkload, RunningWorkloadSummary,
+    Runtime,
     ServiceStatus, StaticAssetReconciler, StatusSummary, SyncHistoryEntry, SyncOutcome, SyncState,
     WireContainerStatus,
 };

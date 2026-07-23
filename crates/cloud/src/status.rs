@@ -218,6 +218,7 @@ mod tests {
             mesh_tags: vec!["region:pdx".into()],
             region: None,
             zone: None,
+            arch: None,
             bucket: Some(BucketSpec {
                 name: "noisetable-assets-pdx-1".into(),
                 public_read: false,
@@ -227,6 +228,8 @@ mod tests {
             cloudflared: None,
             hosts_operator_bridge: false,
             connect: None,
+            allocatable: None,
+            taints: vec![],
         }
     }
 

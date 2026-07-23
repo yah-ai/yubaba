@@ -7,6 +7,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+# R542: workspace-internal test crate — stays publish=false permanently.
+# Nothing outside oss/yubaba consumes it, and it has no root [patch.crates-io]
+# entry. Do not flip this when the rest of the workspace publishes.
 publish = false
 description = "Cluster harness for yubaba integration tests — test_cluster(), WardenHandle, NetworkDegrade, and the auto-teardown Drop impl."
 
@@ -17,18 +20,18 @@ path = "src/lib.rs"
 anyhow = "1.0"
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-cloud = { path = "../cloud" }
+cloud = { package = "yah-cloud", path = "../cloud" }
 # openraft: needed to call raft.initialize(members) during multi-node bootstrap.
 # Version must match yubaba's openraft dependency exactly.
-openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+openraft = { version = "=0.10.0-alpha.30", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1.0"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tracing = "0.1"
-workload-spec = { package = "yah-workload-spec", version = "0.8.16" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.20" }
 yubaba = { path = "../yubaba" }
-kamaji = { version = "0.8.16" }
+kamaji = { version = "0.8.20" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

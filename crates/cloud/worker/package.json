@@ -2,13 +2,8 @@
   "name": "@yah/cloud-worker",
   "private": true,
   "type": "module",
-  "scripts": {
-    "build": "bun build router.ts --outfile router.bundle.js --format=esm --target=browser",
-    "typecheck": "bunx tsc --noEmit",
-    "test": "bun test tests/"
-  },
+  "description": "Pond local-sim harness. Holds miniflare-sim.mjs (the workerd sim shim the pond reconciler spawns) and the vendored router.bundle.js. The bundle is NOT built here — it is the compiled @mesofact/edge artifact, vendored by scripts/check-worker-bundle.sh (W270 §3, R595-F3). miniflare is kept as the pond sim's runtime.",
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240529.0",
     "miniflare": "^3.20240610.1"
   }
 }

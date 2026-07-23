@@ -197,12 +197,27 @@
 //! @yah:next("Coordinate with whoever last touched the mesofact-static reconciler before flipping the assertions.")
 //! @yah:verify("cargo test -p cloud --lib reconciler::mesofact_static::tests::adopt_only_  # all 4 pass")
 //! @yah:handoff("Root cause: all four tests used hardcoded port 4321 which a running camp's mesofact-dev occupies, causing up_local_static to adopt it as Ok instead of reaching the adopt_only error path. Fix: added pick_unused_port() helper (bind :0, read port, drop listener) and replaced local_static_slot(4321) with pick_unused_port() in all four tests. stale_jit_different_port_names_it also replaced hardcoded 9999 with a second pick_unused_port() so the assertion checks the dynamic value. All 4 pass.")
+//!
+//! R535-T1 ("Split rebuild_static: revalidate-only path... called by
+//! almanac_dispatch", W225 §3) landed here: see [`MesofactStaticReconciler::
+//! revalidate_static`] and [`MesofactStaticReconciler::rebuild_static`]'s docs
+//! for the split, and `crate::almanac_dispatch` for the caller-side switch.
+//! Ticket record lives in `.yah/docs/working/W225-mesofact-consumer-deployment-model.md`
+//! (single declaration site — not duplicated here per Rule11).
 
 /// Bundled Worker script embedded at compile time from `worker/router.bundle.js`.
-/// The bundle is generated from `worker/router.ts` via `bun build` — regenerate
-/// it when editing the TS source.
-/// Compiled CF Worker bundle, embedded at compile time. Used both for prod
-/// deployment and as the miniflare-sim artifact in the pond tier.
+///
+/// The source of truth is `@mesofact/edge`
+/// (`oss/mesofact/packages/mesofact-edge`) — the manifest-driven serving
+/// artifact mesofact owns (W270 §3, R595-F3). Its built bundle is *vendored*
+/// into `worker/router.bundle.js` by `scripts/check-worker-bundle.sh` so this
+/// crate stays standalone-exportable across the OSS mirror boundary (a
+/// cross-boundary `include_str!` into `oss/mesofact` would break yubaba's
+/// export). Run `scripts/check-worker-bundle.sh --update` after editing the
+/// worker; do NOT hand-edit `router.bundle.js`.
+///
+/// Used both for prod deployment and as the miniflare-sim artifact in the pond
+/// tier.
 pub const WORKER_SCRIPT: &str = include_str!("../../worker/router.bundle.js");
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -218,12 +233,12 @@ use tracing::{info, warn};
 use kamaji::native::NativeRuntime;
 use kamaji::{Kamaji, MeshAssignment, MeshIdent};
 use velveteen::{
-    ExecContext, ForgeCommand, ForgeExecutor, ForgeSpec, Initiator, LocalForgeDriver, MeshAccess,
-    TaskLocation, TaskPlacement, TaskRuntime,
+    ForgeCommand, ForgeSpec, Initiator, MeshAccess, TaskLocation, TaskPlacement, TaskRuntime,
 };
+use velveteen_exec::{ExecContext, ForgeExecutor, LocalForgeDriver};
 use workload_spec::{
-    BuildConfig, BuildMode, EnvVar, ExposeSpec, ImageRef, MeshExpose, Millis, ResourceLimits,
-    RestartPolicy, SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
+    BuildConfig, BuildMode, EnvVar, ExposeSpec, ImageRef, MeshExpose, Millis, NamespaceId,
+    ResourceLimits, RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
 };
 
 use super::{
@@ -245,6 +260,18 @@ const NATIVE_IDENTITY_DIGEST: &str =
 /// Workload kind this reconciler handles. Matches `ServiceComponent.kind`
 /// and the `kind = "..."` line in `workload.toml`.
 pub const WORKLOAD_KIND: &str = "mesofact-static";
+
+/// SPA sibling of [`WORKLOAD_KIND`]: mesofact emits a hydrate-bundle-loading
+/// HTML shell instead of a fully-rendered page per route. The serving path is
+/// identical (assets in a bucket behind the Worker/miniflare router); the only
+/// behavioral difference is the Worker's fallback mode, so the same reconciler
+/// handles both kinds.
+pub const WORKLOAD_KIND_SPA: &str = "mesofact-spa";
+
+/// True for the component kinds served by [`MesofactStaticReconciler`].
+pub fn is_mesofact_site_kind(kind: &str) -> bool {
+    kind == WORKLOAD_KIND || kind == WORKLOAD_KIND_SPA
+}
 
 /// Default port for the `local-static` provider slot — matches
 /// `mesofact-dev`'s `DEFAULT_PORT` and the canonical
@@ -351,10 +378,11 @@ impl Reconciler for MesofactStaticReconciler {
         // declared kind. Mismatch is an authoring error (service.toml
         // points at a workload of the wrong shape).
         let kind = ctx.workload_kind().context("loading workload.toml")?;
-        if kind != WORKLOAD_KIND {
+        if kind != ctx.component.kind {
             anyhow::bail!(
-                "component {component_id} kind=\"mesofact-static\" but {workload_dir}/workload.toml declares kind=\"{kind}\"",
+                "component {component_id} kind=\"{component_kind}\" but {workload_dir}/workload.toml declares kind=\"{kind}\"",
                 component_id = ctx.component.id,
+                component_kind = ctx.component.kind,
                 workload_dir = ctx.workload_dir().display(),
             );
         }
@@ -387,24 +415,69 @@ impl Reconciler for MesofactStaticReconciler {
                 provider_id,
                 fields,
             } => {
-                if provider_id != "cloudflare" {
-                    anyhow::bail!(
-                        "providers.static.use = \"{provider_id}\" — only \"cloudflare\" is \
-                         supported as a reference provider for mesofact-static",
-                    );
-                }
-                self.up_cloudflare_r2(&ctx, fields).await
+                // Dispatch on the resolved provider *kind*, not the literal
+                // name, so a workspace can name several cloudflare providers
+                // (e.g. `cloudflare` + `cloudflare-scrabcake`).
+                let cf = super::cf_creds::CfProvider::resolve_scoped(
+                    ctx.workspace_root,
+                    provider_id,
+                    &ctx.scope.tenant,
+                    &ctx.scope.namespace,
+                )?;
+                anyhow::ensure!(
+                    matches!(cf.cfg.kind, Provider::Cloudflare),
+                    "providers.static.use = {provider_id:?} (kind={:?}) — only cloudflare-kind \
+                     reference providers are supported for mesofact-static",
+                    cf.cfg.kind,
+                );
+                self.up_cloudflare_r2(&ctx, cf, fields).await
             }
         }
     }
 }
 
 impl MesofactStaticReconciler {
-    /// Build the workload then publish it to its configured provider slot.
+    /// Re-sync a *running* mirror in place — re-publish the built dist without
+    /// rebuilding or restarting the serve stack. Only the pond
+    /// (miniflare-container) slot supports this: it re-publishes `dist/` into
+    /// the already-running MinIO bucket via [`pond::sync_pond`], returning the
+    /// number of assets uploaded.
     ///
-    /// Called by the almanac `on_change` dispatcher for
-    /// `OnChangeConfig::MesofactRebuild`. Runs `build.command` from the
-    /// workload's `workload.toml` first, then delegates to [`Self::up`].
+    /// This is what the desktop's `⟳` affordance calls for local mirrors.
+    /// `up`'s desktop adopt path returns before the publish step, so a re-click
+    /// of `▶` never re-publishes; `sync` is the correct re-sync entry point.
+    /// local-static (dev) serves from disk and cloudflare goes through the
+    /// publish-assets pipeline, so neither has an in-place bucket re-sync.
+    pub async fn sync(&self, ctx: ReconcileCtx<'_>) -> Result<usize> {
+        ctx.materialize().await?;
+        let slot = ctx.slot("static").with_context(|| {
+            format!(
+                "mirror has no `providers.static` slot — required for kind=\"mesofact-static\" (service={}, env={})",
+                ctx.service.name, ctx.env,
+            )
+        })?;
+        match slot {
+            MirrorProviderSlot::Inline {
+                kind: Provider::MiniflareContainer,
+                fields,
+            } => pond::sync_pond(&ctx, &self.pond, fields).await,
+            MirrorProviderSlot::Inline { kind, .. } => anyhow::bail!(
+                "providers.static.kind = \"{kind:?}\" has no in-place re-sync — only miniflare-container (pond) supports ⟳ sync",
+            ),
+            MirrorProviderSlot::Reference { .. } => anyhow::bail!(
+                "reference (cloud) providers re-sync through the publish-assets pipeline, not the pond reconciler",
+            ),
+        }
+    }
+
+    /// Build the workload (re-running `build.command`) then publish it to its
+    /// configured provider slot.
+    ///
+    /// This is the **full rebuild** path — source/template changes, a fresh
+    /// `mirror up`, or any case where the compiled bundle itself may be
+    /// stale. It is *not* what `almanac_dispatch` calls for a data-only feed
+    /// change — see [`Self::revalidate_static`] for that (W225 §3: a data
+    /// change is "revalidate", not "build", and never needs the bundler).
     ///
     /// For the Cloudflare reference arm this publishes the freshly-built
     /// `dist/` to R2 and purges the CDN cache-tag `page:releases`. For the
@@ -433,20 +506,72 @@ impl MesofactStaticReconciler {
         self.up(ctx).await
     }
 
+    /// Publish the workload's **already-built** artifact directory — never
+    /// runs `build.command` (W225 §3, R535-T1).
+    ///
+    /// This is the path `almanac_dispatch` calls for
+    /// `OnChangeConfig::MesofactRebuild`: an almanac feed change is *data*,
+    /// not a source/template change, so re-running the bundler is wasted
+    /// work (and, for CI-gated `in_container` builds, wasted pull/cold-start
+    /// too). Per the doc: "almanac = revalidate = data → SSG output on the
+    /// already-built bundle... no recompilation, no CI gate, because nothing
+    /// executable changed."
+    ///
+    /// When the workload declares `build.render_command` (R535-T7), the
+    /// data-only re-render runs first — `{route}` substituted with the
+    /// invalidated route pattern, executed against the **already-built**
+    /// bundle via the same [`ForgeExecutor`] lowering as the build step
+    /// (host-side or in-container per `build_mode`), but never
+    /// `build.command` itself. The canonical command is `mesofact-build
+    /// render <dir> --route {route} --all`, which re-expands the route's
+    /// prerender params fresh and rewrites `out_dir`'s HTML for that route
+    /// only. Without `render_command` this republishes whatever bytes sit in
+    /// `build.out_dir` (the pre-T7 behavior, still correct when the bundle's
+    /// HTML was refreshed by some other actor).
+    ///
+    /// The `local-static` arm skips the render entirely — the host
+    /// `mesofact-dev` watcher already re-renders on data-file changes
+    /// independently of this reconciler (see the `rebuild_static` doc on the
+    /// pre-existing "local watcher handles rebuilds" behavior it inherits).
+    pub async fn revalidate_static(
+        &self,
+        ctx: ReconcileCtx<'_>,
+        route: &str,
+    ) -> Result<RunningWorkload> {
+        let workload_dir = ctx.workload_dir();
+        let is_local_static =
+            ctx.slot("static").and_then(|s| s.inline_kind()) == Some(Provider::LocalStatic);
+        if !is_local_static {
+            if let Some((build, build_mode)) = read_mesofact_build(&workload_dir)? {
+                if let Some(render_command) = &build.render_command {
+                    let render = BuildConfig {
+                        command: render_command.replace("{route}", route),
+                        out_dir: build.out_dir.clone(),
+                        render_command: None,
+                    };
+                    run_build(&workload_dir, &render, &build_mode, &*self.executor).await?;
+                }
+            }
+        }
+        self.up(ctx).await
+    }
+
     async fn up_local_static(&self, ctx: &ReconcileCtx<'_>, port: u16) -> Result<RunningWorkload> {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let svc = &ctx.service.name;
+        let comp = &ctx.component.id;
 
         // If a mesofact-dev server is already running on the configured port
         // (e.g. a prior `mirror up` in this session), adopt it rather than
-        // spawning a second instance — keeps re-runs idempotent.
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            let dev_url = format!("http://{addr}");
-            info!(dev_url = %dev_url, port, "mesofact-dev already running; adopting");
-            return Ok(RunningWorkload::adopted(
-                "mesofact-static",
-                "static",
-                Some(dev_url),
-            ));
+        // spawning a second instance — keeps re-runs idempotent. But adopt ONLY
+        // when it identifies as THIS (service, component): a bare port probe is
+        // identity-blind, so a different service's dev server (or a foreign
+        // process) on a colliding host port would be silently hijacked and
+        // serve the wrong site (R602-B4). `/__mesofact/info` is the oracle;
+        // identity mismatch is a hard error, not a fall-through to spawn (the
+        // port is taken — there is nothing safe to do but surface it).
+        if let Some(adopted) = try_adopt_identified(addr, svc, comp, "configured").await? {
+            return Ok(adopted);
         }
 
         // Camp may have fallen back to a dynamic port (OS-assigned when configured
@@ -455,14 +580,8 @@ impl MesofactStaticReconciler {
         if let Some(actual_port) = jit_port {
             if actual_port != port {
                 let actual_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), actual_port);
-                if tokio::net::TcpStream::connect(actual_addr).await.is_ok() {
-                    let dev_url = format!("http://{actual_addr}");
-                    info!(dev_url = %dev_url, actual_port, "mesofact-dev running on dynamic port; adopting");
-                    return Ok(RunningWorkload::adopted(
-                        "mesofact-static",
-                        "static",
-                        Some(dev_url),
-                    ));
+                if let Some(adopted) = try_adopt_identified(actual_addr, svc, comp, "dynamic").await? {
+                    return Ok(adopted);
                 }
             }
         }
@@ -563,6 +682,13 @@ impl MesofactStaticReconciler {
             workload_dir.display().to_string(),
             "--port".to_string(),
             spawn_port.to_string(),
+            // Stamp logical identity so the child answers /__mesofact/info and a
+            // later adopt re-run can confirm the port holds *this* server rather
+            // than a colliding foreign listener (R602-B4).
+            "--service".to_string(),
+            ctx.service.name.clone(),
+            "--component".to_string(),
+            ctx.component.id.clone(),
         ];
         argv.extend(self.local_static.extra_args.iter().cloned());
         let spec = native_mesofact_spec(&ident_str, argv);
@@ -640,37 +766,14 @@ impl MesofactStaticReconciler {
     async fn up_cloudflare_r2(
         &self,
         ctx: &ReconcileCtx<'_>,
+        cf_provider: super::cf_creds::CfProvider,
         slot_fields: &std::collections::BTreeMap<String, toml::Value>,
     ) -> Result<RunningWorkload> {
-        use super::r2_publish::{
-            publish_to_r2, R2PurgeOpts, R2_ACCESS_KEY_ENV, R2_ACCESS_KEY_SLOT, R2_SECRET_KEY_ENV,
-            R2_SECRET_KEY_SLOT,
-        };
-        use crate::config::ProviderConfig;
+        use super::r2_publish::{publish_to_r2, R2PurgeOpts};
         use crate::provider::cloudflare::{CloudflareClient, WorkerBinding};
 
-        // Load cloudflare provider config to get account_id.
-        let provider_path = ctx
-            .workspace_root
-            .join(".yah/infra/providers/cloudflare.toml");
-        let provider_cfg = ProviderConfig::load(&provider_path).with_context(|| {
-            format!(
-                "loading Cloudflare provider config — expected at {}",
-                provider_path.display()
-            )
-        })?;
-
-        let account_id = provider_cfg
-            .fields
-            .get("account_id")
-            .and_then(|v| v.as_str())
-            .with_context(|| {
-                format!(
-                    "{}: missing `account_id` field — add your Cloudflare account ID",
-                    provider_path.display()
-                )
-            })?
-            .to_string();
+        // account_id + credentials come from the resolved provider.
+        let account_id = cf_provider.account_id.clone();
 
         // Extract bucket + zone from the mirror's static slot.
         let bucket = slot_fields
@@ -704,29 +807,11 @@ impl MesofactStaticReconciler {
                 .to_string();
 
         // R2 S3 access keys (distinct from the management API token).
-        let access_key = fob::get_or_env(R2_ACCESS_KEY_SLOT, R2_ACCESS_KEY_ENV)
-            .context("resolving R2 S3 access key")?
-            .with_context(|| {
-                format!(
-                    "R2 access key not found — add via `yah keys set {R2_ACCESS_KEY_SLOT}` \
-                     or export {R2_ACCESS_KEY_ENV}"
-                )
-            })?;
-        let secret_key = fob::get_or_env(R2_SECRET_KEY_SLOT, R2_SECRET_KEY_ENV)
-            .context("resolving R2 S3 secret key")?
-            .with_context(|| {
-                format!(
-                    "R2 secret key not found — add via `yah keys set {R2_SECRET_KEY_SLOT}` \
-                     or export {R2_SECRET_KEY_ENV}"
-                )
-            })?;
+        let (access_key, secret_key) = cf_provider.r2_keys()?;
 
         // Management API token — used for cache-tag purge and Transform Rules.
         // Optional: publish itself only needs the R2 S3 keys.
-        let cf_api_token: Option<String> =
-            fob::get_or_env("cloudflare-api-token", "CLOUDFLARE_API_TOKEN")
-                .ok()
-                .flatten();
+        let cf_api_token: Option<String> = cf_provider.api_token_opt();
         let purge = cf_api_token.clone().map(|token| R2PurgeOpts {
             zone_name: zone.clone(),
             api_token: token,
@@ -764,7 +849,7 @@ impl MesofactStaticReconciler {
         // Non-fatal: warn if token lacks Workers Scripts: Edit scope.
         if let Some(ref token) = cf_api_token {
             let cf = CloudflareClient::new(token.clone());
-            let mode = parse_worker_mode(slot_fields);
+            let mode = parse_worker_mode(&ctx.component.kind, slot_fields);
             let worker_name = slot_fields
                 .get("worker_name")
                 .and_then(|v| v.as_str())
@@ -967,7 +1052,7 @@ async fn run_build(
 /// Read `build.out_dir` from a workload's `workload.toml`. Returns `None`
 /// when the file is absent, unreadable, or the field is missing — callers
 /// default to `"dist"`.
-fn read_workload_out_dir(workload_dir: &std::path::Path) -> Option<String> {
+pub(crate) fn read_workload_out_dir(workload_dir: &std::path::Path) -> Option<String> {
     let path = workload_dir.join("workload.toml");
     let src = std::fs::read_to_string(&path).ok()?;
     let value: toml::Value = toml::from_str(&src).ok()?;
@@ -1001,11 +1086,23 @@ pub enum WorkerMode {
 /// Parse the Worker routing mode from the mirror's static slot fields. Public
 /// so camp's pond bring-up can mirror the cloudflare-arm semantics without
 /// duplicating the field-name conventions.
-pub fn parse_worker_mode(fields: &std::collections::BTreeMap<String, toml::Value>) -> WorkerMode {
+///
+/// When the slot declares no explicit `mode`, the default derives from the
+/// component's kind: `mesofact-spa` → SPA fallback, everything else → static.
+/// An explicit `mode` field always wins.
+pub fn parse_worker_mode(
+    component_kind: &str,
+    fields: &std::collections::BTreeMap<String, toml::Value>,
+) -> WorkerMode {
+    let default_mode = if component_kind == WORKLOAD_KIND_SPA {
+        "spa"
+    } else {
+        "static"
+    };
     match fields
         .get("mode")
         .and_then(|v| v.as_str())
-        .unwrap_or("static")
+        .unwrap_or(default_mode)
     {
         "spa" => WorkerMode::Spa,
         "ssr" => {
@@ -1051,6 +1148,12 @@ fn worker_config_bindings(mode: &WorkerMode, asset_origin: &str) -> Vec<(String,
     };
     vec![
         ("ASSET_ORIGIN".to_string(), asset_origin.to_string()),
+        // Pointer-store origin for instance-addressed routes (W270 §3): the
+        // @mesofact/edge worker reads `p/<key>` records here. Pointers live
+        // under the `p/` prefix in the same bucket as content, so this defaults
+        // to ASSET_ORIGIN; it stays a distinct binding so a future consumer can
+        // front the (uncached) pointer reads separately.
+        ("POINTER_ORIGIN".to_string(), asset_origin.to_string()),
         // Reserved upload seam (R490-T8): prod has no upload origin yet, so the
         // binding is empty and the Worker returns 404 on /uploads/*. A future
         // dynamic-bucket consumer sets this to the user-writable origin.
@@ -1118,9 +1221,90 @@ fn is_unix_socket_live(_path: &std::path::Path) -> bool {
     false
 }
 
-/// Read the actual port written by `spawn_mesofact_dev` in camp after it binds.
-/// Returns `None` when the file is absent or the entry is missing.
-fn read_jit_port(workspace_root: &std::path::Path, svc: &str, component: &str) -> Option<u16> {
+/// Adopt a mesofact-dev already listening on `addr` — but only when it
+/// identifies as `(expected_service, expected_component)` via `/__mesofact/info`
+/// (R602-B4). Returns:
+/// - `Ok(None)` — nothing is listening on `addr` (caller falls through to the
+///   next candidate / spawns a fresh server).
+/// - `Ok(Some(_))` — a matching mesofact-dev is running; adopt it.
+/// - `Err(_)` — a listener is present but is a *different* service/component,
+///   or is not an identifiable mesofact-dev at all. Adoption is refused; the
+///   port is taken by a foreign workload, so there is nothing to spawn — surface
+///   the collision instead of silently serving the wrong site.
+///
+/// `label` distinguishes the "configured" vs jit "dynamic" port in logs.
+async fn try_adopt_identified(
+    addr: SocketAddr,
+    expected_service: &str,
+    expected_component: &str,
+    label: &str,
+) -> Result<Option<RunningWorkload>> {
+    // Liveness gate first: no listener → nothing to adopt (spawn path).
+    if tokio::net::TcpStream::connect(addr).await.is_err() {
+        return Ok(None);
+    }
+
+    match probe_dev_identity(addr).await {
+        Some((svc, comp)) if svc == expected_service && comp == expected_component => {
+            let dev_url = format!("http://{addr}");
+            info!(
+                dev_url = %dev_url,
+                port = addr.port(),
+                %label,
+                "mesofact-dev already running; identity matches, adopting"
+            );
+            Ok(Some(RunningWorkload::adopted(
+                "mesofact-static",
+                "static",
+                Some(dev_url),
+            )))
+        }
+        Some((svc, comp)) => anyhow::bail!(
+            "port {} is serving {svc}/{comp}, but component {expected_component} of service \
+             {expected_service} expected it — refusing to adopt another workload's dev server. \
+             This is a host-port collision; give each service a distinct port \
+             (check `.yah/services/*/mirrors/*.toml`, or run `yah cloud validate`).",
+            addr.port(),
+        ),
+        None => anyhow::bail!(
+            "port {} is occupied by a process that is not an identifiable mesofact-dev \
+             (no /__mesofact/info) — refusing to adopt a foreign listener for component \
+             {expected_component} of service {expected_service}. Free the port or point this \
+             component at an unused one.",
+            addr.port(),
+        ),
+    }
+}
+
+/// Query `GET http://{addr}/__mesofact/info` and return the server's logical
+/// `(service, component)` identity. `None` when the endpoint is unreachable,
+/// non-2xx (older/identity-less mesofact-dev, or a foreign server), or the body
+/// is not the expected JSON shape. Short timeout — this is a loopback probe on
+/// the reconcile hot path.
+async fn probe_dev_identity(addr: SocketAddr) -> Option<(String, String)> {
+    let url = format!("http://{addr}/__mesofact/info");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let svc = body.get("service")?.as_str()?.to_string();
+    let comp = body.get("component")?.as_str()?.to_string();
+    Some((svc, comp))
+}
+
+/// Read the actual port recorded in `.yah/jit/mesofact-dev-ports.json` after
+/// a mesofact-dev bind. Returns `None` when the file is absent or the entry
+/// is missing. `pub` since R490 follow-through: the desktop's dev-cell
+/// observation probes this port when the camp's `mesofact_dev.list` has no
+/// entry (the camp stopped spawning mesofact-dev in R490-F2, so its list no
+/// longer sees desktop-spawned processes).
+pub fn read_jit_port(workspace_root: &std::path::Path, svc: &str, component: &str) -> Option<u16> {
     let path = workspace_root
         .join(".yah")
         .join("jit")
@@ -1175,12 +1359,13 @@ fn native_mesofact_spec(ident: &str, argv: Vec<String>) -> WorkloadSpec {
         volumes: vec![],
         resources: ResourceLimits {
             memory_mb: 512,
-            cpu_shares: 512,
+            cpu_millis: 512,
             ephemeral_storage_mb: 512,
         },
         depends_on: vec![],
         healthcheck: None,
         restart_policy: RestartPolicy::Never,
+        archetype: None,
         stop_policy: StopPolicy {
             signal: 15,
             grace_period: Millis::from_secs(5),
@@ -1194,6 +1379,8 @@ fn native_mesofact_spec(ident: &str, argv: Vec<String>) -> WorkloadSpec {
             public: None,
             operator: None,
         },
+        tenant: TenantId::singleton(),
+        namespace: NamespaceId::singleton(),
         labels: Default::default(),
         annotations: Default::default(),
     }
@@ -1349,6 +1536,7 @@ out_dir = "dist"
                 name: "test-svc".to_string(),
                 domain: "test.local".to_string(),
                 components: vec![],
+                db: crate::DbCatalog::default(),
             };
             let component = ServiceComponent {
                 id: "site".to_string(),
@@ -1376,6 +1564,7 @@ out_dir = "dist"
                 component: &self.component,
                 mirror: &self.mirror,
                 env: &self.env,
+                scope: crate::reconciler::ProviderScope::singleton(),
             }
         }
     }
@@ -1820,6 +2009,26 @@ account_id = "test-account"
         );
     }
 
+    /// The vendored @mesofact/edge bundle must carry the W270 §3 serving logic:
+    /// manifest read, pointer-store resolution for instance-addressed routes,
+    /// and manifest error_routes. Substring markers (not behavior — behavior is
+    /// covered by the miniflare tests in oss/mesofact/packages/mesofact-edge).
+    #[test]
+    fn worker_script_resolves_pointers_and_error_routes() {
+        assert!(
+            WORKER_SCRIPT.contains("manifest.json"),
+            "bundled Worker must read the published manifest; got: {WORKER_SCRIPT}"
+        );
+        assert!(
+            WORKER_SCRIPT.contains("POINTER_ORIGIN"),
+            "bundled Worker must resolve pointers via POINTER_ORIGIN; got: {WORKER_SCRIPT}"
+        );
+        assert!(
+            WORKER_SCRIPT.contains("error_routes"),
+            "bundled Worker must honor manifest error_routes; got: {WORKER_SCRIPT}"
+        );
+    }
+
     #[test]
     fn config_bindings_static_mode() {
         let b: std::collections::HashMap<_, _> =
@@ -1828,6 +2037,8 @@ account_id = "test-account"
                 .collect();
         assert_eq!(b["WORKER_MODE"], "static");
         assert_eq!(b["ASSET_ORIGIN"], "https://assets.example.com");
+        // Pointer origin defaults to the asset origin (W270 §3).
+        assert_eq!(b["POINTER_ORIGIN"], "https://assets.example.com");
         assert_eq!(b["SSR_ORIGIN"], "");
         assert_eq!(b["SSR_PREFIXES"], "[]");
     }
@@ -1880,14 +2091,42 @@ account_id = "test-account"
     #[test]
     fn parse_worker_mode_defaults_to_static() {
         let fields = BTreeMap::new();
-        assert!(matches!(parse_worker_mode(&fields), WorkerMode::Static));
+        assert!(matches!(
+            parse_worker_mode(WORKLOAD_KIND, &fields),
+            WorkerMode::Static
+        ));
+    }
+
+    #[test]
+    fn parse_worker_mode_spa_kind_defaults_to_spa() {
+        let fields = BTreeMap::new();
+        assert!(matches!(
+            parse_worker_mode(WORKLOAD_KIND_SPA, &fields),
+            WorkerMode::Spa
+        ));
+    }
+
+    #[test]
+    fn parse_worker_mode_explicit_mode_beats_kind_default() {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "mode".to_string(),
+            toml::Value::String("static".to_string()),
+        );
+        assert!(matches!(
+            parse_worker_mode(WORKLOAD_KIND_SPA, &fields),
+            WorkerMode::Static
+        ));
     }
 
     #[test]
     fn parse_worker_mode_spa() {
         let mut fields = BTreeMap::new();
         fields.insert("mode".to_string(), toml::Value::String("spa".to_string()));
-        assert!(matches!(parse_worker_mode(&fields), WorkerMode::Spa));
+        assert!(matches!(
+            parse_worker_mode(WORKLOAD_KIND, &fields),
+            WorkerMode::Spa
+        ));
     }
 
     #[test]
@@ -1905,7 +2144,7 @@ account_id = "test-account"
         if let WorkerMode::Ssr {
             origin_url,
             prefixes,
-        } = parse_worker_mode(&fields)
+        } = parse_worker_mode(WORKLOAD_KIND, &fields)
         {
             assert_eq!(origin_url, "https://origin.example.com");
             assert_eq!(prefixes, vec!["/api/"]);
@@ -1917,7 +2156,7 @@ account_id = "test-account"
     // ---------- W165: BuildMode → ForgeSpec lowering (R438-T6) ----------
 
     use std::sync::Mutex as StdMutex;
-    use velveteen::executor::{ExecEvent, ExecOutcome, ForgeExecutorError};
+    use velveteen_exec::executor::{ExecEvent, ExecOutcome, ForgeExecutorError};
     use velveteen::ForgeStatus;
     use tokio::sync::mpsc::UnboundedSender;
 
@@ -1987,6 +2226,7 @@ account_id = "test-account"
             BuildConfig {
                 command: "bun run build".into(),
                 out_dir: PathBuf::from("dist"),
+                render_command: None,
             },
             BuildMode::HostSide,
         )
@@ -2003,6 +2243,7 @@ account_id = "test-account"
             BuildConfig {
                 command: "bun run build".into(),
                 out_dir: PathBuf::from("dist"),
+                render_command: None,
             },
             BuildMode::InContainer { image },
         )
@@ -2120,10 +2361,7 @@ routes = "./routes.ts"
 command = "bun run build"
 out_dir = "dist"
 
-[build_mode]
-mode = "in_container"
-
-[build_mode.image]
+[build_mode.in_container.image]
 registry = "ghcr.io"
 repository = "org/app-build"
 tag = "v1.2"
@@ -2158,8 +2396,7 @@ routes = "./routes.ts"
 command = "bun run build"
 out_dir = "dist"
 
-[build_mode]
-mode = "in_container"
+[build_mode.in_container]
 image = "ghcr.io/org/app-build:v1.2"
 "#,
         )
@@ -2213,10 +2450,7 @@ routes = "./routes.ts"
 command = "bun run build"
 out_dir = "dist"
 
-[build_mode]
-mode = "in_container"
-
-[build_mode.image]
+[build_mode.in_container.image]
 registry = "ghcr.io"
 repository = "org/app-build"
 tag = "v1.2"
@@ -2266,10 +2500,7 @@ routes = "./routes.ts"
 command = "bun run build"
 out_dir = "dist"
 
-[build_mode]
-mode = "in_container"
-
-[build_mode.image]
+[build_mode.in_container.image]
 registry = "ghcr.io"
 repository = "org/app-build"
 tag = "v1.2"
@@ -2352,6 +2583,136 @@ digest = "{digest}"
         );
     }
 
+    // ── revalidate_static (R535-T1) ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn revalidate_static_without_render_command_never_touches_executor() {
+        // W225 §3 / R535-T1: an almanac on_change is a data-only trigger — it
+        // must never re-run build.command, regardless of provider arm or
+        // whether the subsequent publish step succeeds. The fixture's
+        // workload.toml carries a real [build] table (write_workload=true)
+        // but NO render_command — so the executor must record zero calls
+        // (R535-T7 only runs the executor for a declared render_command).
+        let fx = Fixture::new(cloudflare_reference_slot(), /*write_workload*/ true);
+        let (capture, captured) = CaptureExecutor::new();
+        let reconciler = MesofactStaticReconciler::new().with_executor(capture.clone());
+
+        // up_cloudflare_r2 will fail (no provider config on disk) — that's
+        // expected and irrelevant here; only the executor call count matters.
+        let _ = reconciler.revalidate_static(fx.ctx(), "/releases").await;
+
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "revalidate_static without render_command must never invoke the executor"
+        );
+    }
+
+    #[tokio::test]
+    async fn revalidate_static_delegates_to_up() {
+        // Without a render_command, revalidate_static's publish behavior must
+        // be indistinguishable from calling up() directly. Same fixture, same
+        // reconciler, two independent ReconcileCtx borrows: both arms must
+        // hit the identical error (missing
+        // .yah/infra/providers/cloudflare.toml) with byte-identical text.
+        let fx = Fixture::new(cloudflare_reference_slot(), /*write_workload*/ true);
+        let reconciler = MesofactStaticReconciler::new();
+
+        let revalidate_err =
+            reconciler.revalidate_static(fx.ctx(), "/releases").await.unwrap_err();
+        let up_err = reconciler.up(fx.ctx()).await.unwrap_err();
+
+        assert_eq!(
+            format!("{revalidate_err:#}"),
+            format!("{up_err:#}"),
+            "revalidate_static must delegate straight to up() with no extra behavior"
+        );
+    }
+
+    #[tokio::test]
+    async fn revalidate_static_skips_build_when_workload_toml_missing() {
+        // Mirrors rebuild_static_skips_build_when_workload_toml_missing:
+        // revalidate_static must not panic when workload.toml is absent (no
+        // [build] table → no render_command → no executor call); the
+        // missing-manifest error surfaces from deeper in up().
+        let fx = Fixture::new(local_static_slot(0), /*write_workload*/ false);
+        let (capture, captured) = CaptureExecutor::new();
+        let reconciler = MesofactStaticReconciler::new().with_executor(capture.clone());
+        let err = reconciler.revalidate_static(fx.ctx(), "/releases").await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("workload.toml"), "got: {msg}");
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "no build executed by revalidate_static",
+        );
+    }
+
+    // ── revalidate_static render_command (R535-T7) ───────────────────────────
+
+    fn write_workload_with_render_command(fx: &Fixture) {
+        std::fs::write(
+            fx.workspace_root.join("app/web/workload.toml"),
+            r#"schema_version = 1
+kind = "mesofact-static"
+routes = "./routes.ts"
+
+[build]
+command = "echo built"
+out_dir = "dist"
+render_command = "echo render {route} --all"
+"#,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn revalidate_static_runs_render_command_with_route_substituted() {
+        // R535-T7: a declared render_command runs exactly once before the
+        // publish step — {route} substituted, host-side lowering (Native, no
+        // image), cwd = workload dir — and NEVER build.command.
+        let fx = Fixture::new(cloudflare_reference_slot(), /*write_workload*/ true);
+        write_workload_with_render_command(&fx);
+        let (capture, captured) = CaptureExecutor::new();
+        let reconciler = MesofactStaticReconciler::new().with_executor(capture.clone());
+
+        // up_cloudflare_r2 still fails after the render step (no provider
+        // config on disk) — only the executor capture matters here.
+        let _ = reconciler.revalidate_static(fx.ctx(), "/issues/:id").await;
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1, "render executed exactly once");
+        let (spec, ctx) = &captured[0];
+        assert_eq!(spec.where_.runtime, TaskRuntime::Native);
+        match &spec.command {
+            ForgeCommand::Subprocess { argv, image } => {
+                assert!(image.is_none(), "host_side render carries no image");
+                assert_eq!(
+                    argv,
+                    &vec!["sh".to_string(), "-c".into(), "echo render /issues/:id --all".into()],
+                    "route pattern substituted into {{route}}"
+                );
+            }
+            other => panic!("expected Subprocess, got {other:?}"),
+        }
+        assert_eq!(ctx.cwd.as_deref(), Some(fx.workspace_root.join("app/web").as_path()));
+    }
+
+    #[tokio::test]
+    async fn revalidate_static_local_static_skips_render_command() {
+        // The local-static arm never runs the render step — the host
+        // mesofact-dev watcher re-renders on data-file changes independently.
+        let fx = Fixture::new(local_static_slot(0), /*write_workload*/ true);
+        write_workload_with_render_command(&fx);
+        let (capture, captured) = CaptureExecutor::new();
+        let reconciler = MesofactStaticReconciler::new().with_executor(capture.clone());
+
+        let _ = reconciler.revalidate_static(fx.ctx(), "/issues/:id").await;
+
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "local-static revalidate must not run render_command"
+        );
+    }
+
     /// Validate the in-tree fixture at `testdata/mesofact-in-container/workload.toml`.
     ///
     /// Verifies that `read_mesofact_build` returns `BuildMode::InContainer` for an
@@ -2371,5 +2732,88 @@ digest = "{digest}"
             "expected BuildMode::InContainer but got {build_mode:?}",
         );
         assert!(!build.command.is_empty(), "build.command must be non-empty");
+    }
+
+    /// Spin up a throwaway loopback server that answers `/__mesofact/info` with
+    /// `identity` (Some → 200 JSON `{service,component}`, None → 404), for the
+    /// adopt identity-check tests (R602-B4). Returns the bound port.
+    async fn spawn_info_server(identity: Option<(&str, &str)>) -> u16 {
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        use axum::Router;
+
+        let json = identity.map(|(s, c)| format!(r#"{{"service":"{s}","component":"{c}"}}"#));
+        let app = Router::new().route(
+            "/__mesofact/info",
+            get(move || {
+                let json = json.clone();
+                async move {
+                    match json {
+                        Some(b) => (
+                            [(reqwest::header::CONTENT_TYPE, "application/json")],
+                            b,
+                        )
+                            .into_response(),
+                        None => axum::http::StatusCode::NOT_FOUND.into_response(),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        // Let the accept loop come up before the probe connects.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        port
+    }
+
+    fn loopback(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    #[tokio::test]
+    async fn adopt_identified_matches_and_adopts() {
+        let port = spawn_info_server(Some(("scrabcake", "site"))).await;
+        let got = try_adopt_identified(loopback(port), "scrabcake", "site", "configured")
+            .await
+            .unwrap();
+        assert!(got.is_some(), "matching identity should adopt");
+    }
+
+    #[tokio::test]
+    async fn adopt_identified_mismatch_bails_naming_both() {
+        // The headline repro: scrabcake dev finds yah-marketing on the port.
+        let port = spawn_info_server(Some(("yah-marketing", "pond"))).await;
+        let err = try_adopt_identified(loopback(port), "scrabcake", "site", "configured")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("yah-marketing/pond"), "msg was: {msg}");
+        assert!(msg.contains("scrabcake"), "msg was: {msg}");
+    }
+
+    #[tokio::test]
+    async fn adopt_identified_foreign_listener_bails() {
+        // Listener present but no /__mesofact/info (a foreign server, e.g.
+        // workerd, or an identity-less mesofact-dev) → refuse to adopt.
+        let port = spawn_info_server(None).await;
+        let err = try_adopt_identified(loopback(port), "scrabcake", "site", "configured")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not an identifiable mesofact-dev"),
+            "msg was: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopt_identified_no_listener_returns_none() {
+        let port = pick_unused_port();
+        let got = try_adopt_identified(loopback(port), "scrabcake", "site", "configured")
+            .await
+            .unwrap();
+        assert!(got.is_none(), "no listener → nothing to adopt");
     }
 }

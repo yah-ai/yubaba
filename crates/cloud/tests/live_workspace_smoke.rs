@@ -11,23 +11,33 @@
 //! build hermetic fixtures inside tempdirs and can't catch
 //! "manifests-on-disk drift from the loader."
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cloud::CloudConfig;
 
-fn workspace_root() -> PathBuf {
-    // CARGO_MANIFEST_DIR is crates/yah/cloud. Workspace root is 3 up.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .expect("crates/yah/cloud must be three levels under the workspace root")
-        .to_path_buf()
+/// Find the yah workspace root by walking up from this crate looking for a
+/// `.yah/services/` tree.
+///
+/// A fixed "N levels up" hop broke when `cloud` was extracted from
+/// `crates/yah/cloud` to `oss/yubaba/crates/cloud` (the OSS split): the
+/// depth to the yah repo root changed. Walking ancestors is depth-agnostic,
+/// and — crucially — returns `None` when the crate is checked out standalone
+/// in its export mirror (where no yah `.yah/` exists at all), letting the
+/// test skip instead of failing outside the monorepo.
+fn workspace_root() -> Option<PathBuf> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .find(|p| p.join(".yah/services").is_dir())
+        .map(Path::to_path_buf)
 }
 
 #[test]
 fn live_yah_workspace_loads_cleanly() {
-    let root = workspace_root();
+    let Some(root) = workspace_root() else {
+        // Standalone mirror checkout — no live yah workspace to validate.
+        eprintln!("skipping: no .yah/services/ in any ancestor of CARGO_MANIFEST_DIR");
+        return;
+    };
     let cfg = CloudConfig::load(&root).unwrap_or_else(|e| {
         panic!(
             "CloudConfig::load({}) failed — a committed manifest is malformed: {e:#}",

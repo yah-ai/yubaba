@@ -123,6 +123,9 @@ pub async fn publish_to_pond(
             MINIO_REGION,
             access_key,
             secret_key,
+            // Pond publishes whole site trees keyed by path, not content-addressed
+            // catalog entries — no BLAKE3 is tracked per object here (R546-B10).
+            None,
         )
         .with_context(|| format!("signing PUT {url}"))?;
 

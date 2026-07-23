@@ -32,7 +32,6 @@ use tokio::process::Command;
 use tracing::info;
 
 use super::{ReconcileCtx, Reconciler, RunningWorkload};
-use crate::config::ProviderConfig;
 use crate::provider::cloudflare::{CloudflareClient, WorkerBinding};
 use crate::MirrorProviderSlot;
 
@@ -96,27 +95,19 @@ impl Reconciler for CloudflareWorkerReconciler {
             ctx.env,
         )?;
 
-        // (5) Cloudflare account id from the provider file (fail before build).
-        let provider_path = ctx
-            .workspace_root
-            .join(".yah/infra/providers/cloudflare.toml");
-        let provider_cfg = ProviderConfig::load(&provider_path).with_context(|| {
-            format!(
-                "loading Cloudflare provider config — expected at {}",
-                provider_path.display()
-            )
+        // (5) Cloudflare provider resolved from the registry slot's
+        // `use = "<id>"` — supplies account_id + management token (fail before
+        // build). Different services can name different providers/accounts.
+        let provider_id = registry_slot.provider_id().with_context(|| {
+            "cloudflare-worker registry slot must be a `use = \"<id>\"` reference".to_string()
         })?;
-        let account_id = provider_cfg
-            .fields
-            .get("account_id")
-            .and_then(|v| v.as_str())
-            .with_context(|| {
-                format!(
-                    "{}: missing `account_id` field — add your Cloudflare account ID",
-                    provider_path.display()
-                )
-            })?
-            .to_string();
+        let cf_provider = super::cf_creds::CfProvider::resolve_scoped(
+            ctx.workspace_root,
+            provider_id,
+            &ctx.scope.tenant,
+            &ctx.scope.namespace,
+        )?;
+        let account_id = cf_provider.account_id.clone();
 
         // (6) Run build (no-op when [build].command is absent).
         if let Some(cmd) = &workload.build_command {
@@ -133,13 +124,8 @@ impl Reconciler for CloudflareWorkerReconciler {
             )
         })?;
 
-        // (8) API token + client.
-        let api_token = fob::get_or_env("cloudflare-api-token", "CLOUDFLARE_API_TOKEN")
-            .context("resolving cloudflare-api-token")?
-            .context(
-                "cloudflare-api-token not found — set it via `yah keys set cloudflare-api-token` \
-                 or export CLOUDFLARE_API_TOKEN",
-            )?;
+        // (8) API token + client (from the resolved provider).
+        let api_token = cf_provider.api_token()?;
         let cf = CloudflareClient::new(api_token);
 
         // (9) Idempotent R2 bucket creation for r2_bucket bindings.
@@ -351,6 +337,20 @@ fn slot_fields(slot: &MirrorProviderSlot) -> &BTreeMap<String, toml::Value> {
     }
 }
 
+/// Runs `[build].command` from `workload.toml` via a shell.
+///
+/// **Shell invariant (R592-T2):** `cmd_str` is operator-authored trusted
+/// config read from a file the operator commits to the repo — the same
+/// trust tier as a qed-gha workflow's `run:` step, or mesofact-dev's own
+/// `[build].command` (`mesofact-dev/src/watcher.rs::build_and_swap`, same
+/// `sh -c` shape). It is never derived from a request body or other
+/// externally-influenced input, so `sh -c` here is not a shell-injection
+/// surface — it exists because build commands routinely rely on real shell
+/// semantics (`&&` chains, globs, `$VAR` expansion, `npm run x -- --flag`)
+/// that a naive argv split would silently break for some subset of
+/// `workload.toml`s. Do not replace this with direct argv construction
+/// without also handling those cases (e.g. shell-lexing only when no
+/// metacharacters are present, keeping `sh -c` as the fallback).
 async fn run_build_command(workload_dir: &Path, cmd_str: &str) -> Result<()> {
     info!(
         workload = %workload_dir.display(),
@@ -468,6 +468,7 @@ account_id = "test-account"
                 name: "yah-cr".to_string(),
                 domain: "cr.yah.dev".to_string(),
                 components: vec![],
+                db: crate::DbCatalog::default(),
             };
             let component = ServiceComponent {
                 id: "cache".to_string(),
@@ -495,6 +496,7 @@ account_id = "test-account"
                 component: &self.component,
                 mirror: &self.mirror,
                 env: &self.env,
+                scope: crate::reconciler::ProviderScope::singleton(),
             }
         }
     }
