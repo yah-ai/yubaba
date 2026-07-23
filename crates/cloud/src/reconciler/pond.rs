@@ -1431,6 +1431,43 @@ struct WardenPondListResponse {
     workloads: Vec<AdoptPondRecord>,
 }
 
+/// `POST http://127.0.0.1:{port}/pond/teardown` — stop+remove one pond
+/// workload's containers and drop its registry entry (R626-F4). Returns the
+/// `removed` flag yubaba reports: `true` if a registration was present,
+/// `false` if the ident was already absent (idempotent success, not an
+/// error). Bails on connection errors / non-2xx.
+///
+/// This is the actuation half of a desired-state stop. The camp daemon
+/// records intent `stopped` FIRST (durable), then calls this. The intent —
+/// not this call — is what keeps the workload down across reconciles, so a
+/// teardown of something already gone is fine.
+pub async fn teardown_warden_pond(port: u16, ident: &str) -> Result<bool> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("building reqwest client for yubaba teardown")?;
+    let url = format!("http://127.0.0.1:{port}/pond/teardown");
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({ "ident": ident }))
+        .send()
+        .await
+        .with_context(|| format!("POST {url} ident={ident}"))?;
+    match resp.status() {
+        StatusCode::OK => {
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .context("parsing yubaba /pond/teardown response")?;
+            Ok(body.get("removed").and_then(|v| v.as_bool()).unwrap_or(false))
+        }
+        s => {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("yubaba /pond/teardown returned {s}: {body}")
+        }
+    }
+}
+
 pub async fn query_warden_pond_list(port: u16) -> Result<Vec<AdoptPondRecord>> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))

@@ -47,6 +47,28 @@ pub enum SourceConfig {
         /// e.g. `"https://releases.yah.dev"`.
         base_url: String,
     },
+    /// Public manifest at an arbitrary URL, same `release-manifest.json` schema
+    /// as [`SourceConfig::R2Channel`].
+    ///
+    /// Deliberately NOT a new schema. W059 §3 makes the manifest do double duty
+    /// — self-update pointer *and* almanac source input — and a competing wire
+    /// format would break that. This variant only lifts the *path* constraint:
+    /// `R2Channel` can only address `{base_url}/{binary}/release-manifest.json`,
+    /// which cannot express a content-addressed bucket layout.
+    ///
+    /// That layout works unchanged because the manifest's per-triple
+    /// `host.bundle[..].url` entries are absolute: the blobs may live at hashed
+    /// keys while only the manifest sits at a stable, overwritten key. The
+    /// stable key is the *only* mutable object, which is what makes a single
+    /// conditional GET a complete change-detector for the whole release.
+    R2Manifest {
+        /// Fully-qualified public URL of the manifest,
+        /// e.g. `"https://releases.yah.dev/yah-desktop/manifest.json"`.
+        url: String,
+        /// Identifier used in logs. Defaults to the feed name when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
 }
 
 /// What event fires a revalidation.
@@ -206,6 +228,69 @@ artifact = "app/yah/web/src/data/releases.json"
         assert!(matches!(cfg.feed.source, SourceConfig::R2Channel { .. }));
         assert!(matches!(cfg.feed.trigger, TriggerConfig::Cron { .. }));
         assert!(cfg.feed.emit.on_change.is_none());
+    }
+
+    #[test]
+    fn load_r2_manifest_feed_at_an_arbitrary_url() {
+        let tmp = TempDir::new().unwrap();
+        write_feed(
+            tmp.path(),
+            "desktop",
+            r#"
+[feed]
+name = "desktop"
+
+[feed.source]
+kind = "r2-manifest"
+url = "https://releases.yah.dev/yah-desktop/manifest.json"
+id = "yah-desktop"
+
+[feed.trigger]
+kind = "webhook"
+
+[feed.emit]
+artifact = "app/yah/web/marketing/src/data/releases.json"
+on_change = { kind = "mesofact-rebuild", service = "yah-marketing", route = "/releases" }
+"#,
+        );
+        let loader = FeedLoader::new(tmp.path());
+        let cfg = loader.load("desktop").unwrap();
+        match cfg.feed.source {
+            SourceConfig::R2Manifest { ref url, ref id } => {
+                assert_eq!(url, "https://releases.yah.dev/yah-desktop/manifest.json");
+                assert_eq!(id.as_deref(), Some("yah-desktop"));
+            }
+            ref other => panic!("expected R2Manifest, got {other:?}"),
+        }
+        assert!(cfg.feed.emit.on_change.is_some());
+    }
+
+    #[test]
+    fn r2_manifest_id_is_optional() {
+        let tmp = TempDir::new().unwrap();
+        write_feed(
+            tmp.path(),
+            "d2",
+            r#"
+[feed]
+name = "d2"
+
+[feed.source]
+kind = "r2-manifest"
+url = "https://cdn.example/m.json"
+
+[feed.trigger]
+kind = "webhook"
+
+[feed.emit]
+artifact = "out.json"
+"#,
+        );
+        let cfg = FeedLoader::new(tmp.path()).load("d2").unwrap();
+        assert!(matches!(
+            cfg.feed.source,
+            SourceConfig::R2Manifest { ref id, .. } if id.is_none()
+        ));
     }
 
     #[test]

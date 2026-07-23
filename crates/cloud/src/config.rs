@@ -4145,4 +4145,63 @@ taints = ["no-server", "no-appliance", "no-voter"]
             picked.name
         );
     }
+
+    #[test]
+    fn r569_f4_macos_node_taints_keep_cloud_critical_off_but_admit_build_jobs() {
+        use workload_spec::LifecycleArchetype;
+        // R569-F4: the headless M2 (us-west-015) joins the fleet as a
+        // build-worker but must never take cloud-critical load. It carries the
+        // same repel set as the rpi/x86 build-worker pool
+        // (`no-server, no-appliance, no-voter` — see
+        // .yah/infra/machines/us-west-015.toml). This pins that intent: with a
+        // plain cloud node available beside the Mac, every cloud-critical
+        // archetype lands on the cloud node and never the Mac; build Jobs
+        // (the Mac's actual purpose) remain eligible on it. `no-voter` is
+        // honored separately by R569-F3's learner-only join, not by workload
+        // admission — there is no "voter" workload archetype.
+        let mac_taints = vec!["no-server", "no-appliance", "no-voter"];
+        let fleet = || {
+            make_empty_cfg(vec![
+                make_machine_with_capacity("us-west-015", 24576, 8000, mac_taints.clone()),
+                make_machine_with_capacity("us-west-001", 4096, 4000, vec![]),
+            ])
+        };
+
+        // A cloud-critical Server workload is repelled from the Mac and lands
+        // on the untainted cloud node.
+        let cfg = fleet();
+        assert_eq!(
+            cfg.admit_workload(&server_spec(256, 500)).unwrap().name,
+            "us-west-001",
+            "a Server workload must never land on the no-server Mac node"
+        );
+
+        // Same for an Appliance (pinned/stateful cloud-critical) workload.
+        let cfg = fleet();
+        assert_eq!(
+            cfg.admit_workload(&appliance_spec_ws(256, 500)).unwrap().name,
+            "us-west-001",
+            "an Appliance workload must never land on the no-appliance Mac node"
+        );
+
+        // Sharpest repulsion proof: with ONLY the Mac in the fleet, a
+        // cloud-critical Server workload is rejected outright — the taint keeps
+        // it off even when that means nowhere to run.
+        let mac_only =
+            make_empty_cfg(vec![make_machine_with_capacity("us-west-015", 24576, 8000, mac_taints.clone())]);
+        assert!(
+            mac_only.admit_workload(&server_spec(256, 500)).is_err(),
+            "a Server workload must be repelled from a Mac-only fleet, not admitted"
+        );
+
+        // But the Mac's real job — build/forge workloads — IS admitted on it:
+        // it tolerates every fleet taint (there is no `no-job`).
+        let mut job = server_spec(256, 500);
+        job.archetype = Some(LifecycleArchetype::Job);
+        assert_eq!(
+            mac_only.admit_workload(&job).unwrap().name,
+            "us-west-015",
+            "a build Job must still be admitted on the Mac build-worker"
+        );
+    }
 }

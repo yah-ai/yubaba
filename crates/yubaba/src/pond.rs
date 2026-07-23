@@ -373,38 +373,75 @@ impl PondRegistry {
     pub async fn shutdown_all(&self) {
         let drained: Vec<_> = {
             let mut g = self.entries.write().await;
-            g.drain().collect()
+            g.drain().map(|(_, entry)| entry).collect()
         };
-        for (_, entry) in drained {
-            // Signal reconcilers first so they don't race teardown with a restart.
-            if let Some(mf) = entry.miniflare.as_ref() {
-                mf.cancel.notify_waiters();
-            }
-            if let Some(mn) = entry.minio.as_ref() {
-                mn.cancel.notify_waiters();
-            }
-            if let Some(sr) = entry.ssr_runtime.as_ref() {
-                sr.cancel.notify_waiters();
-            }
-            if let Some(mf) = entry.miniflare {
-                let _ = mf
-                    .launcher
-                    .stop_and_remove(&mf.container_name, Duration::from_secs(3))
-                    .await;
-            }
-            if let Some(mn) = entry.minio {
-                let _ = mn
-                    .launcher
-                    .stop_and_remove(&mn.container_name, Duration::from_secs(3))
-                    .await;
-            }
-            if let Some(sr) = entry.ssr_runtime {
-                let _ = sr
-                    .launcher
-                    .stop_and_remove(&sr.container_name, Duration::from_secs(3))
-                    .await;
-            }
+        for entry in drained {
+            teardown_entry(entry).await;
         }
+    }
+
+    /// Tear down ONE registered workload by ident and drop its registry
+    /// entry. Returns `true` if an entry was present, `false` if the ident
+    /// was not registered (already gone, or never deployed here).
+    ///
+    /// This is the actuation half of desired-state stop (R626-F4): the camp
+    /// daemon records intent (`replicas = 0`) and then calls this so the
+    /// container is actually stopped+removed. It stays stopped because
+    /// (1) the reconcilers are pure probes under kamaji supervision, and
+    /// (2) the camp's re-assert gate (`reconcile_pond_deploys`) now skips a
+    /// workload whose desired state is stopped — so nothing re-deploys it.
+    ///
+    /// Unlike marking the entry `Failed`, this is NOT a failure signal:
+    /// dropping the entry means a stopped workload is simply *absent* from
+    /// `GET /pond`, which the camp daemon renders as "deliberately stopped"
+    /// by joining it against desired state. A deliberate stop must never
+    /// read as breakage.
+    pub async fn teardown_one(&self, ident: &str) -> bool {
+        let entry = {
+            let mut g = self.entries.write().await;
+            g.remove(ident)
+        };
+        match entry {
+            Some(entry) => {
+                teardown_entry(entry).await;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Signal an entry's reconcilers to stop, then stop+remove each of its
+/// containers. Shared by [`PondRegistry::shutdown_all`] and
+/// [`PondRegistry::teardown_one`] so both reap in exactly the same order.
+async fn teardown_entry(entry: RegistryEntry) {
+    // Signal reconcilers first so they don't race teardown with a restart.
+    if let Some(mf) = entry.miniflare.as_ref() {
+        mf.cancel.notify_waiters();
+    }
+    if let Some(mn) = entry.minio.as_ref() {
+        mn.cancel.notify_waiters();
+    }
+    if let Some(sr) = entry.ssr_runtime.as_ref() {
+        sr.cancel.notify_waiters();
+    }
+    if let Some(mf) = entry.miniflare {
+        let _ = mf
+            .launcher
+            .stop_and_remove(&mf.container_name, Duration::from_secs(3))
+            .await;
+    }
+    if let Some(mn) = entry.minio {
+        let _ = mn
+            .launcher
+            .stop_and_remove(&mn.container_name, Duration::from_secs(3))
+            .await;
+    }
+    if let Some(sr) = entry.ssr_runtime {
+        let _ = sr
+            .launcher
+            .stop_and_remove(&sr.container_name, Duration::from_secs(3))
+            .await;
     }
 }
 
@@ -726,6 +763,35 @@ pub(crate) async fn list_state(State(state): State<Arc<crate::ServerState>>) -> 
     )
 }
 
+/// Body for `POST /pond/teardown`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PondTeardownReq {
+    pub ident: String,
+}
+
+/// `POST /pond/teardown` — stop+remove one workload's containers and drop
+/// its registry entry (R626-F4). Idempotent: tearing down an ident that
+/// isn't registered returns 200 with `removed: false` rather than an error,
+/// so the camp daemon's stop path is safe to call whether or not the
+/// workload was up.
+///
+/// Always 200. This is the actuation the camp daemon calls AFTER recording
+/// desired state `stopped`; the durable intent — not this call — is what
+/// keeps the workload down across reconciles and restarts, so a teardown of
+/// something already absent is a success, not a 404.
+pub(crate) async fn teardown(
+    State(state): State<Arc<crate::ServerState>>,
+    Json(req): Json<PondTeardownReq>,
+) -> axum::response::Response {
+    let removed = state.pond_registry.teardown_one(&req.ident).await;
+    tracing::info!(ident = %req.ident, removed, "pond teardown");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ident": req.ident, "removed": removed })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,6 +900,45 @@ mod tests {
         assert_eq!(reg.list().await.len(), 2);
         reg.shutdown_all().await;
         assert_eq!(reg.list().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn teardown_one_removes_only_the_named_workload() {
+        let reg = PondRegistry::new();
+        reg.insert_running(&req("a"), Some("http://a".into())).await;
+        reg.insert_running(&req("b"), Some("http://b".into())).await;
+
+        // Returns true and drops only "a"; "b" is untouched.
+        assert!(reg.teardown_one("a").await);
+        assert!(reg.get("a").await.is_none());
+        assert!(reg.get("b").await.is_some());
+        assert_eq!(reg.list().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn teardown_one_is_idempotent_for_an_absent_ident() {
+        let reg = PondRegistry::new();
+        // Never registered → false, no panic. This is what makes the camp
+        // daemon's stop path safe to call whether or not the workload was up.
+        assert!(!reg.teardown_one("never-deployed").await);
+
+        reg.insert_running(&req("a"), Some("http://a".into())).await;
+        assert!(reg.teardown_one("a").await);
+        // Second teardown of the now-gone ident is a no-op success.
+        assert!(!reg.teardown_one("a").await);
+    }
+
+    #[tokio::test]
+    async fn teardown_one_does_not_leave_a_failed_tombstone() {
+        // A deliberate stop must NOT read as a failure. After teardown the
+        // ident is simply absent — not present-with-phase-Failed — so the
+        // camp daemon renders it "deliberately stopped" by joining against
+        // desired state, never as breakage.
+        let reg = PondRegistry::new();
+        reg.insert_running(&req("a"), Some("http://a".into())).await;
+        reg.teardown_one("a").await;
+        assert!(reg.get("a").await.is_none());
+        assert!(reg.list().await.is_empty());
     }
 
     #[tokio::test]

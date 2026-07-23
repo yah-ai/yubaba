@@ -13,8 +13,8 @@
 # (No nasm hook here — unlike the yah-root build, nothing in oss/yubaba pulls
 # rav1e/`all-image`.)
 #
-# Repo-root volume: oss/yubaba's [patch.crates-io] redirects task / task-runs /
-# task-sessions / observation / scryer to ../qed/crates/* — crates in the SIBLING
+# Repo-root volume: oss/yubaba's [patch.crates-io] redirects velveteen /
+# velveteen-exec / task-runs / observation / scryer to ../qed/crates/* — crates in the SIBLING
 # oss/qed workspace. cross mounts only the oss/yubaba workspace dir into the build
 # container by default, so those ../qed path deps (and oss/qed/Cargo.toml, which
 # they inherit `edition`/`version` from) fall outside the mount → "failed to find

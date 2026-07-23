@@ -87,6 +87,12 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
 
     let almanac_dir = cfg.almanac_dir.clone();
     let project_root = cfg.project_root.clone();
+    // Per-feed conflation. The dispatch loop below MUST stay non-blocking:
+    // each admitted run is spawned, never awaited inline. That is what keeps
+    // the mpsc channel drained, and a drained channel is what stops
+    // receiver.rs from returning 503 and DROPPING a trigger — the one failure
+    // mode that actually loses a change (see coalesce.rs's module docs).
+    let coalescer = crate::coalesce::Coalescer::new();
     tokio::spawn(async move {
         while let Some(feed_name) = rx.recv().await {
             tracing::info!(%feed_name, "almanac: revalidate received");
@@ -94,25 +100,56 @@ pub async fn run(cfg: ServeConfig) -> Result<()> {
                 tracing::warn!(%feed_name, "ALMANAC_DIR not set; skipping feed run");
                 continue;
             };
-            let loader = FeedLoader::new(dir);
-            match loader.load(&feed_name) {
-                Ok(fcfg) => {
-                    let runner = FeedRunner::new(fcfg, &project_root);
-                    match runner.run().await {
-                        Ok(result) => tracing::info!(
-                            %feed_name,
-                            destination = %result.destination,
-                            "almanac: feed rebuilt"
-                        ),
-                        Err(e) => {
-                            tracing::error!(%feed_name, err = %e, "almanac: feed run failed")
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!(%feed_name, err = %e, "almanac: feed not found"),
+
+            if coalescer.admit(&feed_name) == crate::coalesce::Admission::Coalesced {
+                tracing::info!(
+                    %feed_name,
+                    "almanac: run already in flight — coalesced into the queued re-run"
+                );
+                continue;
             }
+
+            let dir = dir.clone();
+            let project_root = project_root.clone();
+            let coalescer = coalescer.clone();
+            tokio::spawn(async move {
+                // Loop rather than return: finish() reports whether a trigger
+                // landed mid-run. Because the source is absolute, this single
+                // extra pass subsumes every trigger that arrived, however many.
+                loop {
+                    run_feed_once(&feed_name, &dir, &project_root).await;
+                    if !coalescer.finish(&feed_name) {
+                        break;
+                    }
+                    tracing::info!(%feed_name, "almanac: draining coalesced re-run");
+                }
+            });
         }
     });
+
+    async fn run_feed_once(
+        feed_name: &str,
+        dir: &std::path::Path,
+        project_root: &std::path::Path,
+    ) {
+        let loader = FeedLoader::new(dir);
+        match loader.load(feed_name) {
+            Ok(fcfg) => {
+                let runner = FeedRunner::new(fcfg, project_root);
+                match runner.run().await {
+                    Ok(result) => tracing::info!(
+                        %feed_name,
+                        destination = %result.destination,
+                        "almanac: feed rebuilt"
+                    ),
+                    Err(e) => {
+                        tracing::error!(%feed_name, err = %e, "almanac: feed run failed")
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(%feed_name, err = %e, "almanac: feed not found"),
+        }
+    }
 
     axum::serve(listener, app)
         .await

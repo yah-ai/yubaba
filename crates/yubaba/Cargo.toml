@@ -8,14 +8,10 @@ repository.workspace = true
 description = "Per-machine infrastructure daemon for yah-managed mirrors: HTTP control surface, openraft cluster coordination, pond deploy/state reconciliation, and containerd/docker workload supervision."
 keywords = ["daemon", "orchestration", "raft", "infrastructure"]
 categories = ["command-line-utilities", "network-programming"]
-# R542 gate: BLOCKED on `acme-engine`. Every other in-house dep is on crates.io
-# at 0.8.20 (yah-workload-spec, yah-local-driver, kamaji, kamaji-proto, mshr),
-# and the `yubaba` name is ours (reserved at 0.0.0). But `acme-engine` on
-# crates.io is an UNRELATED 0.4.0 crate — the name is squatted, so our
-# `acme-engine = "0.8.20"` can never resolve from the registry and publish
-# verification fails. oss/passway's crate needs a yah- prefix rename first;
-# that is tracked as its own relay. Do not flip this until then.
-publish = false
+# R542 gate CLEARED by R635: the squatted `acme-engine` dep is now consumed as
+# `passway-acme`, a name we own, so every in-house dep of this crate resolves
+# from the registry. The `yubaba` name is ours (reserved at 0.0.0), so the first
+# real publish is a version bump.
 
 [[bin]]
 name = "yubaba"
@@ -80,22 +76,23 @@ tokio-stream = { version = "0.1", features = ["io-util"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-workload-spec = { package = "yah-workload-spec", version = "0.8.20" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.21" }
 # R600-F3 (W273): the elected ACME issuer reuses passway's extracted issuance
 # engine (RFC-8555 order flow + DNS-01-via-Cloudflare, returns cert+key PEM in
 # memory) instead of copy-pasting acme.rs. Version dep + [patch.crates-io]
 # redirect to the sibling passway workspace, same shape as the yah-base deps.
-acme-engine = "0.8.20"
+# R635: registry name is `passway-acme`; the alias keeps `use acme_engine::…`.
+acme-engine = { package = "passway-acme", version = "0.8.21" }
 # R484-T2: shared Kamaji trait + runtime backend impls (containerd, docker,
 # fake). Pre-W199 these lived in `yubaba::runtime::*`; now they live in
 # kamaji-core and yubaba re-exports the surface through this crate.
-kamaji = { version = "0.8.20", features = ["sibling"] }
+kamaji = { version = "0.8.21", features = ["sibling"] }
 # R406-T8: Yubaba ↔ Kamaji UDS wire protocol — postcard-framed messages
 # shared with the kamaji binary in app/yah/kamaji/.
-kamaji-proto = { version = "0.8.20" }
+kamaji-proto = { version = "0.8.21" }
 # Shared docker-CLI driver + S3 SigV4 helpers — yubaba owns the pond MinIO
 # slot lifecycle from R374-F3 onward. cloud depends on the same crate.
-local-driver = { package = "yah-local-driver", version = "0.8.20" }
+local-driver = { package = "yah-local-driver", version = "0.8.21" }
 
 # R593-T2: mshr is the machine-identity primary (promoted from xlb-net,
 # R593-T1) — yubaba's hostkey loader now sources its Ed25519 keypair from
@@ -105,12 +102,12 @@ local-driver = { package = "yah-local-driver", version = "0.8.20" }
 # today (identity/keypair loading, the QUIC Endpoint, and discovery all
 # compile together as one crate) so there is no smaller feature surface to
 # opt into here — identity.rs only calls Keypair::load_or_create_at.
-mshr = { path = "../../../mshr/crates/mshr", version = "0.8.20" }
+mshr = { path = "../../../mshr/crates/mshr", version = "0.8.21" }
 
 # Thin pond wire-type surface (PondDeployReq/PondStateRecord/…). Carved out of
 # this lib (R483-T5) so clients link the types without yubaba's server closure;
 # the server side here re-exports them via `pub use warden_client::*` in pond.rs.
-yubaba-client = { path = "../yubaba-client", version = "0.8.20" }
+yubaba-client = { path = "../yubaba-client", version = "0.8.21" }
 
 # containerd gRPC client (optional — only with containerd-integration feature)
 containerd-client = { version = "0.9", optional = true }
@@ -132,7 +129,7 @@ yubaba-test-macros = { path = "../yubaba-test-macros" }
 yubaba-test-harness = { path = "../yubaba-test-harness" }
 # R406-T8: spawn a real kamaji::serve_with_shutdown inside the
 # yubaba↔kamaji integration test (tests/integration_constable_client.rs).
-kamaji-bin = { version = "0.8.20" }
+kamaji-bin = { version = "0.8.21" }
 
 # integration_smoke_filter requires containerd-integration for ContainerdRuntime.
 [[test]]

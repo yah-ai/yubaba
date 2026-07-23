@@ -225,7 +225,7 @@
 //! @yah:handoff("NOT YET IN EFFECT: `yah qed run` proxies to the camp daemon, which is still running the OLD binary. The fix needs a daemon rebuild+restart (or an in-process run) before a clean rusty-v8-musl goes end-to-end.")
 //! @yah:handoff("ALL 3 FIXES LANDED + E2E CONFIRMED GREEN 2026-07-20. (1) oss/qed runner: QedStep::timeout lowered with Millis::from_secs (was from_ms -> P018's 9000s '2.5h cap' became 9s); field documented; regression test step_timeout_is_seconds_not_millis. (2) app/yah/cli/resources/yubaba.service: added `yah/qed/produced` to StateDirectory (systemd CREATES the dir AND makes it writable -- strictly better than the box hand-patch, which needed a separate mkdir) + listed /var/lib/yah/qed/produced in ReadWritePaths for consistency. (3) yubaba destroy_workload: reap_produced_dir now fires ONLY on a CONFIRMED teardown (teardown_status == 'destroyed'); a 'not_found' teardown no longer deletes the output dir of a possibly-still-running container -- that was the actual destructive defect. reap success log raised debug -> info.")
 //! @yah:handoff("PROOF: `yah qed run rusty-v8-musl` ran GREEN for the first time ever -- qed.status = success, 58m21s (21:33:59 -> 22:32:20 UTC), run 9243ca2e. Durable dir /var/lib/yah/qed/produced/b96b0784-... persisted the whole run (previously reaped within ~10s), the tar landed in it (30714560 bytes), and retrieve_remote_artifacts auto-landed it content-addressed at .yah/cache/artifacts/ebb53464...9971b2 -- that retrieval leg had NEVER executed before.")
-//! @yah:handoff("DETERMINISM VERIFIED (not assumed): two independent builds an hour apart produced byte-identical tars, sha256 e856a18d14146fd199040c2557881c38e7275a911e3f6c2076587e5acbb42d01. That validated pasting the recorded hashes into build/rusty-v8/workload.toml, closing R546-T3's code side.")
+//! @yah:handoff("DETERMINISM VERIFIED (not assumed): two independent builds an hour apart produced byte-identical tars, sha256 e856a18d14146fd199040c2557881c38e7275a911e3f6c2076587e5acbb42d01. That validated pasting the recorded hashes into .yah/services/yah-cloud/components/rusty-v8-musl/workload.toml, closing R546-T3's code side.")
 //! @yah:handoff("TEST GAP (deliberate, not done): the reap guard is NOT unit-tested -- workload_spec::forge_produced::HOST_ROOT is a hardcoded absolute /var/lib path, so a test would touch the real host fs. Making HOST_ROOT injectable is the prerequisite; I did not refactor that unprompted.")
 //! @yah:handoff("FLEET NOT YET PROTECTED: us-west-002 still runs the hand-patched unit + a yubaba binary WITHOUT the reap guard. The repo fixes only reach it on the next cross-build+redeploy. Fine for now (the timeout fix removes the trigger; the guard is defense-in-depth), but a fresh node provisioned before that redeploy would still hit the EROFS mkdir failure.")
 //!
@@ -256,20 +256,24 @@
 //! @yah:gotcha("UNCOMMITTED: the git commit was denied at the permission prompt, so the change is in the WORKING TREE ONLY (oss/yubaba/crates/yubaba/src/lib.rs) and not in any commit. That file also carries @Ashguard:dragon's in-flight R599-T5 hunks (deploy_non_container, Workload-envelope parse, WorkloadDeployBody.id, mod bundle_deploy_tests), so any commit of this path necessarily includes theirs too. Do not checkout/restore/stash the file.")
 //!
 //! @yah:ticket(R626-F5, "Migrate yubaba POST /workloads/deploy to dispatch through kamaji (the read side already is)")
-//! @yah:at(2026-07-23T02:53:26Z)
-//! @yah:status(open)
-//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:status(review)
+//! @yah:at(2026-07-23T19:04:42Z)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
 //! @yah:parent(R626)
-//! @yah:next("Deferred from R406-T8, then from R406-T9, and never picked up — the existing next/gotcha notes at oss/yubaba/crates/yubaba/src/lib.rs:83-108 already spell out the intended migration; start by reading those rather than re-deriving.")
-//! @yah:next("Handler ordering the old notes prescribe: validate (already done) -> allocate ident+mesh_ip (already done) -> resolve EnvValue::FromMesh / FromSecret on yubaba's side (admission) -> kamaji.deploy(id, Workload::Container(enriched_spec)) -> on Ack run cloudflared + headscale registration -> on registration failure kamaji.stop(id) to clean up -> respond. Admission decisions stay in yubaba; supervision moves to kamaji.")
-//! @yah:next("The original blocker for this ('kamaji's Deploy arm returns Internal, backend driver not implemented') is GONE: R406-T9 landed containerd and R626-F1 landed docker, so Deploy is served on both tiers now. The stated reason for the deferral no longer holds.")
-//! @yah:next("Test churn is the real cost and the old note flagged it as a judgement call: integration_smoke_filter / integration_single_node / integration_public_ingress all drive the legacy runtime. Either give them a kamaji fixture or keep them on the runtime path and add a parallel kamaji-fixture suite.")
-//! @yah:verify("cd oss/yubaba && cargo test -p yubaba")
-//! @yah:verify("On us-west-015: POST a container workload to http://100.64.0.7:7443/workloads/deploy and confirm it actually starts (docker ps on the node shows it) rather than being silently stubbed")
-//! @yah:verify("Boot log no longer needs the '/workloads/deploy runs in stub mode' warning to be harmless on a darwin node")
 //! @yah:gotcha("This is what actually blocks tag:build-worker on us-west-015 (and any future darwin/pond node). Found 2026-07-22 while clearing that node's other three blockers: kamaji there now has a working docker backend on a yah-owned Colima, and GET /workloads already reports x-workload-source: kamaji — but a qed forge job arrives via POST /workloads/deploy (app/yah/cli/src/yubaba_client.rs:348), which is still the legacy in-process ContainerRuntime path. On a build WITHOUT containerd-integration (every macOS node) that path is STUB MODE, so the job is accepted and then does not run.")
 //! @yah:gotcha("The READ side is already migrated and must not be re-done: GET /workloads, GET /workloads/{id}/state and POST /workloads/drain all prefer the kamaji client already (R406-T8). Only deploy is stranded. Verified live on us-west-015 2026-07-22 — a labelled container surfaced correctly through yubaba with the right pid.")
 //! @yah:gotcha("yubaba on macOS is built WITHOUT containerd-integration and always will be (containerd is Linux-only), so 'just enable the feature' is not an out for darwin nodes. Dispatching to kamaji is the only path that gives a Mac a working deploy.")
+//! @yah:handoff("VERIFIED COMPLETE + closed the test gap. FINDING: the deploy->kamaji routing is ALREADY committed in the current tree — F5's premise ('POST /workloads/deploy is still the legacy in-process path / stub mode') is STALE. deploy_workload_spec (oss/yubaba/crates/yubaba/src/lib.rs:2229) does `let backend = s.active_backend()` and deploys through it; active_backend() (lib.rs:1071) prefers the sibling KamajiClient (constable_client) over the legacy runtime, falling back to stub ONLY when neither is set. KamajiClient::deploy_workload (oss/kamaji/crates/kamaji/src/sibling.rs:472) is fully implemented — wraps the spec in Workload::Container and sends YubabaToKamaji::Deploy, awaiting the Deploy Ack. So on a darwin/pond node launched with --kamaji-socket (R626-F2 already added it to DEFAULT_WARDEN_ARGS), a forge job's POST /workloads/deploy dispatches to kamaji, whose docker backend (R626-F1) runs the container. This is the R406-T9 follow-on the T8/T9 notes anticipated; it landed in an earlier commit without closing F5.")
+//! @yah:handoff("THE REAL REMAINING GAP was test coverage, exactly as the old T8/T9 notes flagged ('test churn is the real cost'). integration_constable_client.rs covers list/drain/stop through a real kamaji but its own header (line 11) says deploy was never covered ('the Kamaji handler short-circuits'). CLOSED: new hermetic test crates/yubaba/tests/integration_deploy_through_kamaji.rs — spawns a real kamaji sibling, builds a ServerState.with_constable_client, POSTs a container workload to /workloads/deploy through build_router, and asserts it is NOT stub-accepted (status != 202, body.runtime != 'stub') and instead surfaces kamaji's backend-refused as a 5xx. That refusal (a bare kamaji has no docker/containerd backend) is the proof the deploy reached kamaji rather than being handled in-process — the exact inversion of the darwin build-worker bug.")
+//! @yah:handoff("ATTRIBUTION: I did NOT author the deploy-routing code (it was committed before this session); I verified it end-to-end and added the missing regression coverage. The T8-era @yah:gotcha at lib.rs:94 ('deploy is still on the legacy path on purpose') is now superseded by the current code + comment at lib.rs:2216 — left in place as R406-T8's point-in-time historical record rather than rewriting a reviewed ticket's annotation on a shared tree.")
+//! @yah:verify("cargo test -p yubaba --test integration_deploy_through_kamaji — 1 pass (the new deploy-routes-to-kamaji-not-stub regression)")
+//! @yah:verify("cargo test -p yubaba --lib — 253 pass, 0 fail (includes R626-F4's teardown_one tests; no regression)")
+//! @yah:verify("cargo test -p yubaba --test integration_constable_client — 3 pass (list/drain/stop wire round-trips still green)")
+//! @yah:verify("CODE-REVIEW BAR (the substance of this ticket): deploy_workload_spec at lib.rs:2229 routes through active_backend(); active_backend() at lib.rs:1071 prefers the sibling KamajiClient; KamajiClient::deploy_workload at oss/kamaji/.../sibling.rs:472 sends a real Deploy frame. Stub mode (lib.rs:2586) is reached only when NO backend is attached — correct.")
+//! @yah:verify("LIVE BAR (operator/infra step, cannot run from a dev box — needs the node + a rebuilt+re-pinned pond/yubaba image per R626-F2's standing gotcha, since the pinned image predates the docker backend): on us-west-015, POST a container workload to the node's /workloads/deploy and confirm `docker ps` shows it running (not silently stubbed); boot log's '/workloads/deploy runs in stub mode' warning is now harmless because --kamaji-socket routes deploy to kamaji.")
+//! @yah:next("LIVE VERIFY on a real node once the pond/yubaba image is rebuilt + re-pinned (blocked on that image bump per R626-F2 — the host-side --kamaji-socket wiring is already in place and inert against the old binary). This is the only thing between 'code + tests done' and 'darwin build-workers actually run forge jobs'.")
+//! @yah:next("OPTIONAL cleanup, not blocking: the T8-era @yah:gotcha at oss/yubaba/crates/yubaba/src/lib.rs:94 still reads 'POST /workloads/deploy is still on the legacy in-process path on purpose' — factually superseded by the code at lib.rs:2216. Left as R406-T8's historical record; a maintainer touching that reviewed ticket's block could strike it.")
+//! @yah:next("tag:build-worker on us-west-015: this ticket removes the deploy-path blocker, but adding the tag still needs the node on 0.8.20 + a docker daemon reachable by the runtime account (per R626-F1's note). Separate infra step.")
 //!
 //! @yah:relay(R635, "Rename acme-engine (squatted on crates.io at 0.4.0) to a yah- name; unblocks yubaba publish")
 //! @yah:at(2026-07-23T03:25:03Z)
@@ -1215,6 +1219,10 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         // R040-F20: raft operator API
         .route("/raft/status", get(raft_status))
         .route("/raft/initialize", post(raft_initialize))
+        // R569-F3: add a node to a *running* quorum as a non-voting learner
+        // (dynamic membership). `/raft/initialize` only founds a fresh cluster;
+        // this is the join-an-existing-cluster path a macOS fleet node takes.
+        .route("/raft/add-learner", post(raft_add_learner))
         .route("/raft/write", post(raft_write))
         .route("/raft/transfer-leader", post(raft_transfer_leader))
         // R608-B11: openraft-native TransferLeader message — the leader's
@@ -1222,6 +1230,7 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/raft/transfer-leader-msg", post(raft_transfer_leader_msg))
         // R374-F2: pond (sim-tier mesofact-static) status surface
         .route("/pond/deploy", post(pond::deploy))
+        .route("/pond/teardown", post(pond::teardown))
         .route("/pond/state", get(pond::get_state))
         .route("/pond", get(pond::list_state))
         .with_state(state.clone())
@@ -3942,6 +3951,72 @@ async fn raft_initialize(
             openraft::error::InitializeError::NotAllowed(_),
         )) => Ok(Json(
             serde_json::json!({ "initialized": false, "already_initialized": true }),
+        )),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+/// `POST /raft/add-learner` request — add a node to a running cluster (R569-F3).
+#[derive(Deserialize)]
+struct RaftAddLearnerRequest {
+    /// The joining node's raft node id (u64, unique fleet-wide). The node must
+    /// already be up with `--raft-node-id <this>` and *uninitialised* (no
+    /// `raft init`, no `--bootstrap-single-node`), so the leader's AppendEntries
+    /// establishes it.
+    node_id: raft::YubabaNodeId,
+    /// The joining node's mesh address (`host:port`) the leader will dial to
+    /// replicate to it — e.g. the Tailscale mesh IP `100.64.0.7:7443`. Never a
+    /// LAN address: those drift (see W255).
+    addr: String,
+}
+
+/// `POST /raft/add-learner` — add a node to a **running** quorum as a non-voting
+/// learner (R569-F3, W255 §"Mesh / raft join").
+///
+/// This is the join-an-existing-cluster counterpart to [`raft_initialize`],
+/// which only founds a *fresh* cluster from a known genesis membership. A
+/// learner receives full log/snapshot replication (so it holds the complete
+/// cluster state — service placement, secrets, rollout mirror — and can serve
+/// linearizable-free local reads) but does **not** vote and does **not** count
+/// toward quorum. Promotion to voter (openraft `change_membership`) is a
+/// separate, deliberate step and is intentionally NOT exposed here: a macOS
+/// home-lab fleet node stays a learner so a flaky residential-network box can
+/// never endanger the cloud voters' quorum (dovetails with the R569-F4 taint
+/// intent — schedulable, but never cluster-critical).
+///
+/// Must be called on the current **leader** (only the leader can change
+/// membership). A follower returns 421 Misdirected with openraft's
+/// forward-to-leader hint in the body so the caller can retarget. Blocking:
+/// waits until the leader believes the learner's log is caught up, so a 200
+/// means replication is actually established, not merely requested. Re-adding an
+/// existing learner/voter is a harmless no-op (openraft re-adds it).
+async fn raft_add_learner(
+    State(s): State<Arc<ServerState>>,
+    Json(body): Json<RaftAddLearnerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let raft = require_raft!(s);
+    let node = openraft::BasicNode {
+        addr: body.addr.clone(),
+    };
+    match raft.add_learner(body.node_id, node, true).await {
+        Ok(resp) => Ok(Json(serde_json::json!({
+            "added": true,
+            "node_id": body.node_id,
+            "addr": body.addr,
+            "log_id": format!("{:?}", resp.log_id),
+        }))),
+        // Not the leader: hand back the redirect hint (leader id + node) so the
+        // operator/orchestrator can retarget the call at the actual leader,
+        // rather than a bare 500. Same class of error the write path can hit.
+        Err(openraft::error::RaftError::APIError(
+            openraft::error::ClientWriteError::ForwardToLeader(fwd),
+        )) => Err((
+            StatusCode::MISDIRECTED_REQUEST,
+            format!(
+                "add-learner must be called on the raft leader; forward to leader \
+                 {:?} at {:?}",
+                fwd.leader_id, fwd.leader_node
+            ),
         )),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }

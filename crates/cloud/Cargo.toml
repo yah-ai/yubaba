@@ -12,12 +12,13 @@ repository.workspace = true
 description = "Declarative cloud substrate for yah-managed camps: .yah/cloud/ config schema, MachineProvider drivers (Hetzner + local containerd), cloud-init rendering, and the pond/mesofact reconcilers."
 keywords = ["cloud", "provisioning", "hetzner", "cloud-init", "reconciler"]
 categories = ["config", "development-tools"]
-# R542 gate: LAST in this workspace's publish order. yah-base (yah-workload-spec,
-# fob, yah-object-store, yah-mesofact-bundle, yah-local-driver), kamaji and
-# velveteen are all on crates.io at 0.8.20 already; what's left is
-#   - yah-hetzner + yah-almanac (this workspace, publish immediately before it)
-#   - velveteen-exec (brand-new crate from R543's velveteen split, unpublished)
-publish = false
+# R542 gate CLEARED (2026-07-23): this crate is LAST in the workspace's publish
+# order and every dep it waited on is now satisfiable — yah-base, kamaji and
+# velveteen were already on crates.io; yah-hetzner + yah-almanac published today;
+# velveteen-exec publishes in the same wave, ahead of this workspace (qed before
+# yubaba in scripts/release-all.sh's OSS_ORDER). Dropping publish=false; the
+# `cloud` name is squatted so it ships as `yah-cloud` (see [lib] name below and
+# the `package =` aliases at every consumer).
 
 [lib]
 # Lib target keeps the short name so the crate's own tests/examples
@@ -39,43 +40,43 @@ json-schema = ["dep:schemars", "workload-spec/json-schema"]
 [dependencies]
 # WorkloadSpec — typed wire format for yubaba workloads. Used by WorkloadConfig
 # to validate workload TOML against the schema (R092-F1).
-workload-spec = { package = "yah-workload-spec", version = "0.8.20" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.21" }
 # Almanac feed configs + OnChangeConfig — dispatch_on_change maps on_change
 # to the correct reconciler (R330-F4).
-yah-almanac = { path = "../almanac", version = "0.8.20" }
+yah-almanac = { path = "../almanac", version = "0.8.21" }
 
 # Shared credential vault — HetznerDriver::from_default_sources() reads
 # hetzner-api-token / hetzner-s3-access-key / hetzner-s3-secret-key
 # from this vault, falling back to HETZNER_* env vars (R040-F9).
-fob = { version = "0.8.20" }
+fob = { version = "0.8.21" }
 # Shared Hetzner Cloud API client — transport, bearer auth, and server/SSH-key
 # operations. Cloud crate adds S3 bucket ops and MachineProvider trait impl on top.
-yah-hetzner = { path = "../hetzner", version = "0.8.20" }
+yah-hetzner = { path = "../hetzner", version = "0.8.21" }
 
 # Object-store trait + R2 impl — publish_to_r2 delegates PUT/GET ops here (R498-F5).
-yah-object-store = { version = "0.8.20" }
+yah-object-store = { version = "0.8.21" }
 
 # W272 mesofact bundle store (R599-F1) — content-addressed blob/manifest publish.
 # `store` feature pulls the ObjectStore-backed publish/materialize surface.
-yah-mesofact-bundle = { version = "0.8.20", features = ["store"] }
+yah-mesofact-bundle = { version = "0.8.21", features = ["store"] }
 
 # Local-tier infrastructure primitives (docker-CLI driver + S3 SigV4 helpers).
 # Both cloud and yubaba depend on this — moved out of cloud in R374-F3 so
 # yubaba could own MinIO lifecycle without a reverse yubaba→cloud dep.
-local-driver = { package = "yah-local-driver", version = "0.8.20" }
+local-driver = { package = "yah-local-driver", version = "0.8.21" }
 
 # Kamaji supervisor — the mesofact-static local-static arm spawns
 # mesofact-dev as a host binary through the Native fork+exec backend
 # (R490-F2; W199's "ideal native-backend case"). Replaces the reconciler's
 # direct Command::spawn so dev-tier workloads share the supervision primitive.
-kamaji = { version = "0.8.20", features = ["native-integration"] }
+kamaji = { version = "0.8.21", features = ["native-integration"] }
 
 # Forge executor + transform recipe loader. Cloud's static-asset reconciler
 # materializes derived assets (W164) by lowering recipes → ForgeSpec and
 # handing them to a `dyn ForgeExecutor`. The dep edge intentionally stops
 # here: no cloud → qed edge, only cloud → task (R438-T13 architectural rule).
-velveteen = { version = "0.8.20" }
-velveteen-exec = { version = "0.8.20" }
+velveteen = { version = "0.8.21" }
+velveteen-exec = { version = "0.8.21" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

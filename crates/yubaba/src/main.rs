@@ -191,6 +191,24 @@ enum RaftCmd {
     },
     /// List raft peers and their current state.
     Peers,
+    /// Add a node to a *running* cluster as a non-voting learner (R569-F3).
+    ///
+    /// The join-an-existing-quorum path (vs `init`, which founds a fresh
+    /// cluster). Run against the current **leader** (`--daemon <leader-mesh>`).
+    /// The joining node must already be up with `--raft-node-id <node-id>` and
+    /// uninitialised (no `init`, no `--bootstrap-single-node`). The learner
+    /// receives full replicated state but never votes or counts toward quorum;
+    /// promotion to voter is a separate, deliberate step (not this command) —
+    /// a home-lab macOS node stays a learner by design (W255).
+    AddLearner {
+        /// The joining node's raft node id (u64, unique fleet-wide).
+        #[arg(long)]
+        node_id: u64,
+        /// The joining node's mesh address `host:port` the leader will dial —
+        /// e.g. its Tailscale mesh IP `100.64.0.7:7443`, never a LAN address.
+        #[arg(long)]
+        addr: String,
+    },
     /// Transfer raft leadership to another node.
     TransferLeader {
         /// Target node ID to become leader.
@@ -383,6 +401,22 @@ async fn main() -> Result<()> {
                     println!("{body}");
                 } else {
                     anyhow::bail!("raft init failed ({status}): {body}");
+                }
+                Ok(())
+            }
+            RaftCmd::AddLearner { node_id, addr } => {
+                let client = reqwest::Client::new();
+                let resp = client
+                    .post(format!("{daemon}/raft/add-learner"))
+                    .json(&serde_json::json!({ "node_id": node_id, "addr": addr }))
+                    .send()
+                    .await?;
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if status.is_success() {
+                    println!("{body}");
+                } else {
+                    anyhow::bail!("raft add-learner failed ({status}): {body}");
                 }
                 Ok(())
             }

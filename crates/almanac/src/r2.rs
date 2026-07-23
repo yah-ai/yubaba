@@ -19,11 +19,29 @@ use crate::sources::{ReleaseSource, SourceError};
 pub struct R2Channel {
     binary: String,
     base_url: String,
+    /// When set, addresses the manifest directly instead of deriving the path
+    /// from `base_url` + `binary`.
+    manifest_url: Option<String>,
 }
 
 impl R2Channel {
     pub fn new(binary: impl Into<String>, base_url: impl Into<String>) -> Self {
-        Self { binary: binary.into(), base_url: base_url.into() }
+        Self { binary: binary.into(), base_url: base_url.into(), manifest_url: None }
+    }
+
+    /// Read the same manifest schema from an explicit URL.
+    ///
+    /// Lets the blobs live under content-addressed keys while the manifest
+    /// stays at one stable, overwritten key — see [`crate::config::SourceConfig::R2Manifest`].
+    pub fn at_url(url: impl Into<String>, id: impl Into<String>) -> Self {
+        Self { binary: id.into(), base_url: String::new(), manifest_url: Some(url.into()) }
+    }
+
+    fn manifest_url(&self) -> String {
+        match &self.manifest_url {
+            Some(u) => u.clone(),
+            None => format!("{}/{}/release-manifest.json", self.base_url, self.binary),
+        }
     }
 }
 
@@ -34,7 +52,7 @@ impl ReleaseSource for R2Channel {
     }
 
     async fn fetch(&self) -> Result<ReleaseFeed, SourceError> {
-        let url = format!("{}/{}/release-manifest.json", self.base_url, self.binary);
+        let url = self.manifest_url();
         let resp: ChannelManifest =
             reqwest::get(&url).await?.json().await?;
 

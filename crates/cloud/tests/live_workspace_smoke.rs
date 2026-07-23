@@ -102,4 +102,32 @@ fn live_yah_workspace_loads_cleanly() {
         Some("yah-dashboard/dashboard"),
         "/* route must reference yah-dashboard/dashboard"
     );
+
+    // Every `static-asset` component's `path` must actually contain a
+    // workload.toml. This is not belt-and-braces: a wrong `path` fails
+    // SILENTLY. `check_alias_collisions` (validate.rs) does
+    // `if !workload_toml_path.exists() { continue; }`, and the asset
+    // reconciler walk in asset_status.rs does the same — so a typo'd or
+    // stale path doesn't error, it just makes the whole catalog (aliases,
+    // pinned BLAKE3s, derivation lock) quietly vanish from the config.
+    //
+    // Added 2026-07-23 when the rusty-v8-musl catalog moved out of the
+    // gitignored `build/rusty-v8/` into its service's components dir.
+    for service in cfg.services.values() {
+        for component in &service.service.components {
+            if component.kind != "static-asset" {
+                continue;
+            }
+            let workload_toml = root.join(&component.path).join("workload.toml");
+            assert!(
+                workload_toml.exists(),
+                "static-asset component `{}/{}` declares path `{}`, but no \
+                 workload.toml exists there — the asset catalog would be \
+                 silently dropped at load",
+                service.service.name,
+                component.id,
+                component.path,
+            );
+        }
+    }
 }
