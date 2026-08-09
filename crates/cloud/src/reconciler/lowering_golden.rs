@@ -8,17 +8,23 @@
 //! These are independent helpers because the inputs differ (a recipe carries
 //! an image + per-step argv + per-step timeout; a build carries a shell-string
 //! command + a build_mode). The **shape** of the lowered ForgeSpec is the
-//! parity property: both consumers must land in the same
-//! `Subprocess + Local + Container` quadrant with a pinned image, so the
-//! downstream `ForgeExecutor` dispatch is identical for both.
+//! parity property: both consumers land in the `Subprocess + Container`
+//! quadrant with a pinned image, so the downstream `ForgeExecutor` dispatch is
+//! identical for both.
+//!
+//! The *location* half of that quadrant stopped being a constant in W235: a
+//! mesofact build is always `Local` (there is no fleet-offload path for it),
+//! while a recipe now lowers whatever `[placement] location` it declares
+//! (R555-T2). `golden_remote_recipe_step_keeps_its_placement` pins that the
+//! lowering is pass-through and not re-pinned to `Local`.
 //!
 //! These tests pin the lowering output explicitly so a drift in either path
 //! shows up as a single-file regression with a clear diff.
 
 use std::path::PathBuf;
 
-use velveteen_exec::transforms::{RecipeLocation, RecipePlacement, RecipeStep, TransformRecipe};
 use velveteen::{ForgeCommand, ForgeSpec, Initiator, MeshAccess, TaskLocation, TaskRuntime};
+use velveteen_exec::transforms::{RecipeLocation, RecipePlacement, RecipeStep, TransformRecipe};
 use workload_spec::{BuildConfig, BuildMode, ImageRef};
 
 use super::mesofact_static::lower_build_to_forge_spec;
@@ -188,6 +194,52 @@ fn golden_recipe_step_with_zero_timeout_lowers_to_none() {
     assert!(
         spec.timeout.is_none(),
         "step.timeout=0 must lower to None (no wall-clock cap)"
+    );
+}
+
+/// W235 / R555-T2: the lowering used to hard-code `TaskLocation::Local`
+/// because `RecipeLocation` had no other variant. Now that it does, a recipe
+/// declaring a remote tier must survive lowering intact — a re-pin here would
+/// silently demote the run back to the dev box, which is exactly the amd64-OOM
+/// wall R546 is stuck behind.
+#[test]
+fn golden_remote_recipe_step_keeps_its_placement() {
+    let mut recipe = golden_recipe();
+    recipe.placement.location = RecipeLocation::RemoteAny {
+        tier: workload_spec::TierTag("infra".into()),
+        mesh_tags: vec!["tier:x86".into()],
+    };
+    let step = &recipe.steps[0];
+
+    let spec = lower_recipe_step_to_forge_spec(&recipe, step, vec!["./quantize".into()]);
+
+    assert_eq!(
+        spec.where_.location,
+        TaskLocation::RemoteAny {
+            tier: workload_spec::TierTag("infra".into()),
+            mesh_tags: vec!["tier:x86".into()],
+        },
+        "recipe placement must lower straight through, not re-pin to Local"
+    );
+    assert_eq!(spec.where_.runtime, TaskRuntime::Container);
+}
+
+/// The pinned-node variant of the same property.
+#[test]
+fn golden_node_pinned_recipe_step_keeps_its_placement() {
+    let mut recipe = golden_recipe();
+    recipe.placement.location = RecipeLocation::Remote {
+        node: workload_spec::MeshIdent("us-west-002".into()),
+    };
+    let step = &recipe.steps[0];
+
+    let spec = lower_recipe_step_to_forge_spec(&recipe, step, vec!["./quantize".into()]);
+
+    assert_eq!(
+        spec.where_.location,
+        TaskLocation::Remote {
+            node: workload_spec::MeshIdent("us-west-002".into()),
+        }
     );
 }
 

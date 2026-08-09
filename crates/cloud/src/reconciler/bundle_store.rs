@@ -80,7 +80,9 @@ mod tests {
         let manifest = BundleManifest {
             schema_version: SCHEMA_VERSION,
             name: "yah-marketing".to_string(),
-            runtime: BundleRuntime::Mesofact { version: "0.8.18".into() },
+            runtime: BundleRuntime::Mesofact {
+                version: "0.8.18".into(),
+            },
             content,
         };
         fs::write(

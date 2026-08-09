@@ -62,6 +62,89 @@ pub const DEFAULT_RELEASE_MANIFEST_URL: &str = "https://cdn.yah.dev/yubaba/relea
 /// override with `--yubaba-cosign-identity` to point at a fork's OIDC subject.
 pub const DEFAULT_YUBABA_COSIGN_IDENTITY: &str = r"^https://github\.com/yah-ai/yah/";
 
+/// Sigstore Fulcio OIDC issuer for GitHub-Actions-rooted keyless signing —
+/// what `.github/workflows/release.yml`'s `cosign sign-blob` step produces
+/// (R330-F19). The canonical copy; `cloud_init` and the yah CLI's
+/// `yubaba_fetch` both read it from here so the two verify paths can't drift.
+pub const COSIGN_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
+
+/// Prefix that selects key-based verification in a cosign-identity spec.
+/// See [`ReleaseTrust::parse`].
+pub const KEY_TRUST_PREFIX: &str = "key:";
+
+/// How a consumer proves a release artifact is ours (R605-F1).
+///
+/// The two arms are the verify-side mirror of `yah_qed::SigningIdentity`, and
+/// they exist for the same reason: a release cut on QED instead of GitHub
+/// cannot use Fulcio keyless, because the public-good Fulcio only issues certs
+/// for OIDC issuers on its own configured allowlist. W235 §"Off-GHA forfeits
+/// GitHub OIDC keyless cosign" makes the call — key-based cosign, key vaulted
+/// in kamaji — so every consumer that verifies a yubaba/CLI artifact has to be
+/// able to express both.
+///
+/// This is carried through the config plumbing as a plain string (the existing
+/// `--yubaba-cosign-identity` value, the `RenderInput` field, the manifest's
+/// identity regexp) and parsed at the two points that actually shell `cosign`.
+/// Keeping the wire type a string is deliberate: it means flipping a fleet to
+/// key-based trust is a value change, not a schema migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseTrust {
+    /// Fulcio keyless: pin the certificate identity + the OIDC issuer.
+    Keyless {
+        identity_regexp: String,
+        oidc_issuer: String,
+    },
+    /// Key-based: pin the cosign *public* key. `key_ref` is whatever
+    /// `cosign verify-blob --key` accepts — a `.pub` path, an `https://` URL,
+    /// or a KMS URI (`awskms://…`, `hashivault://…`).
+    Key { key_ref: String },
+}
+
+impl ReleaseTrust {
+    /// Parse an operator-supplied cosign-identity spec.
+    ///
+    /// `key:<ref>` selects key-based verification; anything else is a keyless
+    /// certificate-identity regexp against [`COSIGN_OIDC_ISSUER`]. The prefix
+    /// is explicit rather than sniffed, because a KMS URI and a regexp are
+    /// both arbitrary strings and guessing between them would silently pick
+    /// the wrong trust model.
+    pub fn parse(spec: &str) -> Self {
+        match spec.strip_prefix(KEY_TRUST_PREFIX) {
+            Some(key_ref) => Self::Key {
+                key_ref: key_ref.trim().to_string(),
+            },
+            None => Self::Keyless {
+                identity_regexp: spec.to_string(),
+                oidc_issuer: COSIGN_OIDC_ISSUER.to_string(),
+            },
+        }
+    }
+
+    /// Whether verification consumes the `.cert` sidecar. Key-based signatures
+    /// have no Fulcio certificate, so a consumer must not fail the download
+    /// when the release published no `.cert` alongside the `.sig`.
+    pub fn needs_certificate(&self) -> bool {
+        matches!(self, Self::Keyless { .. })
+    }
+
+    /// The `cosign verify-blob` flags this trust model contributes, in order.
+    /// The caller appends `--signature`/`--certificate`/the blob itself.
+    pub fn verify_flags(&self) -> Vec<String> {
+        match self {
+            Self::Keyless {
+                identity_regexp,
+                oidc_issuer,
+            } => vec![
+                "--certificate-identity-regexp".into(),
+                identity_regexp.clone(),
+                "--certificate-oidc-issuer".into(),
+                oidc_issuer.clone(),
+            ],
+            Self::Key { key_ref } => vec!["--key".into(), key_ref.clone()],
+        }
+    }
+}
+
 /// One per-triple entry in the manifest. Field order matches what
 /// release.yml's `Emit per-triple manifest fragment` step writes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,9 +157,30 @@ pub struct ManifestTripleEntry {
 }
 
 /// Top-level shape of `release-manifest.json`.
+///
+/// The two epoch fields (R625-F2) are **release-wide, not per-triple** — the
+/// raft protocol and on-disk layout are architecture-independent, so they sit
+/// alongside `version` rather than inside each [`ManifestTripleEntry`]. They are
+/// `Option` because manifests published before this field existed carry neither;
+/// see [`YubabaReleaseManifest::cluster_epochs`] for why absent must never be
+/// read as "compatible".
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct YubabaReleaseManifest {
     pub version: String,
+    /// Wire-compatibility epoch: may a node running this release sit in one raft
+    /// cluster with a node running some other release. Mixed operation is
+    /// permitted iff every node shares this integer (W275 "Cluster compatibility
+    /// epochs"). Sourced from `oss/yubaba/crates/yubaba/cluster-epochs.json`,
+    /// the same file the binary parses at compile time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_protocol: Option<u32>,
+    /// On-disk state epoch: can this release read the previous release's raft
+    /// log/snapshot, and can you roll **back** to it. Tracked separately from
+    /// `cluster_protocol` on purpose — openraft 0.9→0.10 broke both at once,
+    /// which is exactly how one combined flag would have hidden the rollback
+    /// hazard (W275 §5 "Roll-back is symmetric").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_epoch: Option<u32>,
     pub triples: BTreeMap<String, ManifestTripleEntry>,
 }
 
@@ -160,6 +264,63 @@ pub async fn fetch_release_manifest(url: &str) -> Result<YubabaReleaseManifest> 
 mod tests {
     use super::*;
 
+    // ── R605-F1 release trust spec ────────────────────────────────────────
+
+    #[test]
+    fn bare_spec_is_keyless_against_the_default_issuer() {
+        // Every existing config value must keep meaning exactly what it meant
+        // before the key arm existed.
+        assert_eq!(
+            ReleaseTrust::parse(DEFAULT_YUBABA_COSIGN_IDENTITY),
+            ReleaseTrust::Keyless {
+                identity_regexp: DEFAULT_YUBABA_COSIGN_IDENTITY.into(),
+                oidc_issuer: COSIGN_OIDC_ISSUER.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn key_prefix_selects_key_trust_and_trims() {
+        assert_eq!(
+            ReleaseTrust::parse("key: awskms:///alias/yah-release "),
+            ReleaseTrust::Key {
+                key_ref: "awskms:///alias/yah-release".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_kms_uri_without_the_prefix_stays_keyless() {
+        // Deliberate: sniffing a URI scheme out of a free-form regexp would
+        // silently swap the trust model. The prefix is the only signal.
+        assert!(matches!(
+            ReleaseTrust::parse("awskms:///alias/yah-release"),
+            ReleaseTrust::Keyless { .. }
+        ));
+    }
+
+    #[test]
+    fn verify_flags_and_cert_need_track_the_arm() {
+        let keyless = ReleaseTrust::parse(DEFAULT_YUBABA_COSIGN_IDENTITY);
+        assert!(keyless.needs_certificate());
+        assert_eq!(
+            keyless.verify_flags(),
+            vec![
+                "--certificate-identity-regexp".to_string(),
+                DEFAULT_YUBABA_COSIGN_IDENTITY.to_string(),
+                "--certificate-oidc-issuer".to_string(),
+                COSIGN_OIDC_ISSUER.to_string(),
+            ]
+        );
+
+        let keyed = ReleaseTrust::parse("key:cosign.pub");
+        assert!(!keyed.needs_certificate());
+        assert_eq!(
+            keyed.verify_flags(),
+            vec!["--key".to_string(), "cosign.pub".to_string()]
+        );
+    }
+
     #[test]
     fn server_type_to_triple_maps_arm_prefix() {
         assert_eq!(
@@ -218,6 +379,9 @@ mod tests {
         }"#;
         let parsed: YubabaReleaseManifest = serde_json::from_str(raw).unwrap();
         assert_eq!(parsed.version, "0.9.0");
+        // This manifest predates R625-F2 — the epochs are absent, not zero.
+        assert_eq!(parsed.cluster_protocol, None);
+        assert_eq!(parsed.state_epoch, None);
         let entry = parsed.entry("x86_64-unknown-linux-musl").unwrap();
         assert_eq!(entry.size, 2345678);
         assert_eq!(entry.sha256, "abc123");
@@ -238,6 +402,43 @@ mod tests {
             err.contains("x86_64-unknown-linux-musl"),
             "lists available: {err}"
         );
+    }
+
+    #[test]
+    fn manifest_carries_the_two_cluster_epochs() {
+        // R625-F2. The shape release.yml now publishes: two release-wide
+        // integers alongside `version`, NOT per-triple (raft protocol and
+        // on-disk layout are architecture-independent).
+        let raw = r#"{
+            "version": "0.8.22",
+            "cluster_protocol": 2,
+            "state_epoch": 2,
+            "triples": {
+                "x86_64-unknown-linux-musl": {
+                    "url": "u", "size": 1, "sha256": "s", "sig_url": "a", "cert_url": "b"
+                }
+            }
+        }"#;
+        let parsed: YubabaReleaseManifest = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.cluster_protocol, Some(2));
+        assert_eq!(parsed.state_epoch, Some(2));
+
+        // Round-trip keeps them, and a manifest that declares nothing emits
+        // nothing (rather than an implicit 0, which would read as "declared").
+        let back: YubabaReleaseManifest =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        assert_eq!(back.cluster_protocol, Some(2));
+        assert_eq!(back.state_epoch, Some(2));
+
+        let undeclared = YubabaReleaseManifest {
+            version: "0.8.20".into(),
+            cluster_protocol: None,
+            state_epoch: None,
+            triples: BTreeMap::new(),
+        };
+        let json = serde_json::to_string(&undeclared).unwrap();
+        assert!(!json.contains("cluster_protocol"), "{json}");
+        assert!(!json.contains("state_epoch"), "{json}");
     }
 
     #[test]

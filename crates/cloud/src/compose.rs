@@ -340,7 +340,10 @@ mod tests {
                 name: "test-assets-pdx-1".into(),
                 public_read: false,
             }),
-            hostkey_fingerprint: None,
+            vendor: None,
+            nickname: None,
+            legacy_hostkey_fingerprint: None,
+            registration: Default::default(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -512,7 +515,10 @@ mod tests {
         assert!(yaml.contains("caddy:"), "caddy present for public services");
         // Isolate Caddy's own `networks:` list: it sits between its
         // `caddy_data:/data` volume line and the top-level `networks:` block.
-        let after_caddy_vol = yaml.split("- caddy_data:/data").nth(1).expect("caddy volumes");
+        let after_caddy_vol = yaml
+            .split("- caddy_data:/data")
+            .nth(1)
+            .expect("caddy volumes");
         let caddy_nets = after_caddy_vol.split("\nnetworks:").next().unwrap();
         assert!(
             caddy_nets.contains("- ss-tier-t2"),

@@ -4,17 +4,18 @@
 //! to its caller; this module is the caller-side implementation that knows how
 //! to map each action variant to the right reconciler.
 //!
-//! Current variant:
+//! Current variants:
 //! - [`almanac::OnChangeConfig::MesofactRebuild`] → call
 //!   [`MesofactStaticReconciler::revalidate_static`] on the named service's
 //!   mirror for `env`. An almanac feed change is *data*, not a source/template
 //!   change, so this is the revalidate-only path (W225 §3, R535-T1): it never
 //!   runs the workload's `build.command` — see `revalidate_static`'s doc for
 //!   what "already-built bundle" means for each provider arm.
+//! - [`almanac::OnChangeConfig::Reload`] → nothing, deliberately. See the arm.
 
-use yah_almanac::OnChangeConfig;
 use anyhow::{Context, Result};
 use std::path::Path;
+use yah_almanac::OnChangeConfig;
 
 use crate::config::CloudConfig;
 use crate::reconciler::{MesofactStaticReconciler, ReconcileCtx};
@@ -31,6 +32,29 @@ pub async fn dispatch_on_change(
     match on_change {
         OnChangeConfig::MesofactRebuild { service, route } => {
             revalidate_mesofact(service, route, workspace_root, env).await
+        }
+        // Nothing to do here, and that is the design rather than a stub.
+        //
+        // A `reload` feed's consumer reads the emitted artifact directly, so the
+        // artifact write that already happened upstream of this call IS the
+        // update — there is no render to trigger and no bundle to publish. The
+        // variant exists because `on_change` carries the feed's mirror binding
+        // as well as its action (see the enum's docs and R335-F3): without one,
+        // the receiver rejects the feed with 422 before it ever runs.
+        //
+        // A consumer that needs a genuine in-process nudge must get it from the
+        // process embedding `almanac::serve::run`, which owns the artifact and
+        // the reader. This function is the *control-plane* reconciler and cannot
+        // reach into another process's address space; pretending otherwise here
+        // would be a silent no-op instead of an explicit one.
+        OnChangeConfig::Reload { service } => {
+            tracing::info!(
+                service,
+                env,
+                "almanac on_change: reload — the artifact write is the update, \
+                 nothing to rebuild"
+            );
+            Ok(())
         }
     }
 }
@@ -137,5 +161,20 @@ wave = 0
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("no mirror"), "got: {msg}");
+    }
+
+    /// R707-F4: a `reload` needs no service declared in `.yah/services/` and no
+    /// mirror for `env` — it dispatches nothing. It must not be routed through
+    /// the mesofact path and fail on a missing component that was never
+    /// relevant.
+    #[tokio::test]
+    async fn reload_dispatches_nothing_and_needs_no_service_config() {
+        let tmp = TempDir::new().unwrap();
+        let on_change = OnChangeConfig::Reload {
+            service: "yah-cloud-admin".to_string(),
+        };
+        dispatch_on_change(&on_change, tmp.path(), "prod")
+            .await
+            .expect("a reload must succeed against an empty workspace");
     }
 }

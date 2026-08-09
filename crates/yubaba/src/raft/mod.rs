@@ -43,6 +43,22 @@
 //! @yah:next("DONE (R597-T2): renamed Warden* raft symbols to Yubaba* across oss/yubaba (YubabaState, YubabaRequest, YubabaNodeId, YubabaRaft, YubabaRaftConfig, YubabaStateMachine, YubabaLogStore, YubabaNetwork, YubabaNetworkFactory, YubabaResponse). No wire change; openraft type params only.")
 //! @yah:verify("cd oss/yubaba && cargo check -p yubaba --all-features")
 //! @yah:gotcha("Tier: Thief -- single-workspace rote symbol rename, no behavior change, no wire surface.")
+//!
+//! @yah:ticket(R625-B6, "cluster_protocol drift gate is red — raft wire surface moved, epoch not bumped, needs a breaking/non-breaking call")
+//! @yah:at(2026-08-07T12:54:59Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R625)
+//! @yah:severity(medium)
+//! @yah:next("`cargo test -p xtask --test cluster_epoch_drift` fails on raft_protocol_surface_matches_the_declared_epochs. declared cluster_protocol = 3; recorded surface 8abc533d1ed5254925afb1f39468b4f64106a71cbaf61d48ffbba47defdf5009; computed 899bcce046e26ffd0233f21ac6a01a62459e599b68a4a582bf4618bcfd4daddc. The other 7 tests in that suite pass, so the mechanism is fine — it is the recorded value that is stale.")
+//! @yah:next("SOURCE: uncommitted working-tree edits by a live peer, as of 2026-08-07 — oss/yubaba/crates/yubaba/src/{lib.rs (+17), raft/mod.rs (+93), raft/store.rs (+38)}. All three are cluster_protocol / state_epoch surface inputs (xtask/src/cluster_epochs.rs:209). Whoever authored those hunks owns the call.")
+//! @yah:gotcha("I did NOT run `cluster-epochs --write`, and the shared-tree 'regenerate the derived artifact' rule does not cover this one. .yah/schema/*.json and the TS bindings are pure functions of the tree, so regenerating them takes no decision from anyone. This gate is different: it asks whether the change is BREAKING (two builds cannot share a raft cluster — bump cluster_protocol to 4 and add a history entry) or non-breaking (re-record only). Silently re-recording a peer's raft change as non-breaking is how you ship a cluster split. Filed from R719's session (Glimmerstone:polaris) because my final sweep hit it; none of my files are surface inputs.")
+//! @yah:handoff("VERDICT: NOT BREAKING on both axes. cluster_protocol stays at 3, state_epoch stays at 2; both surface hashes re-recorded via `cargo run -p xtask -- cluster-epochs --write`. Full reasoning written into oss/yubaba/crates/yubaba/cluster-epochs.json's surface_rerecords array (2026-08-07 entry, same rich-audit-trail style as the existing R706/R118-T9 entries) -- not just asserted here.")
+//! @yah:handoff("Grounded the call in the actual encoding rather than the field shape alone, per the ask. Read network.rs: every raft RPC (append-entries/vote/snapshot) is reqwest .json() / axum Json<T> -- serde_json IS the wire format, re-confirming R625-S1's prior finding still holds (nothing in my R720-F1 change touched network.rs or the route/handler surface at all). Read store.rs: raft_log.json and raft_state.json are both serde_json::to_string -- the on-disk format is the SAME self-describing JSON as the wire, not bincode/postcard. Grepped the full SecretRecord/PutSecret/YubabaRequest chain for #[serde(deny_unknown_fields)] -- zero hits. So both directions of both axes (old-reads-new, new-reads-old) hold by construction: an unrecognized `digest` key is silently ignored by an old-binary reader, and a missing `digest` key defaults to None via #[serde(default)] on a new-binary reader -- neither errors, and openraft's replication model applies identical log bytes on every node regardless of local struct shape, so there's no state-machine divergence risk either.")
+//! @yah:handoff("The real judgment call was distinguishing this from the R706 `access` precedent that WAS bumped (history entry \"3\", same file, same #[serde(default)] Option-field shape) -- surface-level pattern-matching against that precedent would have suggested BREAKING by analogy. The actual discriminator: access is a SECURITY GATE -- an old node dropping the unknown field kept serving the secret to any workload under its own (absent) authorization check, silently defeating the guarantee the field exists to create. digest has NO enforcement path anywhere -- it is a read-only diagnostic value that only ever feeds `yah cloud secret status`'s (R720-T2) drift comparison, and that command's own design already treats a missing digest as 'unknown(pre-digest)', never as a false match. A dropped/defaulted digest across a version mismatch produces exactly that documented state, not a silent lie -- so the shape that made access dangerous is structurally absent here. Wrote this comparison into the ticket rather than only into cluster-epochs.json so the next reader sees the discriminating test, not just the two verdicts.")
+//! @yah:handoff("Tree anchor 85801e7f. Pathspec: oss/yubaba/crates/yubaba/cluster-epochs.json (both *_surface hash values updated by --write, plus the hand-authored 2026-08-07 surface_rerecords entry). No other files touched -- this ticket was a judgment call + a re-record, not a code change.")
+//! @yah:handoff("Verify: cargo test -p xtask --test cluster_epoch_drift = 8 passed / 0 failed (was 7 passed / 1 failed -- raft_protocol_surface_matches_the_declared_epochs -- before). JSON validity of cluster-epochs.json checked (python3 json.load) before running --write.")
+//! @yah:handoff("Tree anchor at handoff: 85801e7f6b76b369c0c8ecd2e5c7874990cd9286 — the shared tree as I left it. Diff against it (`git diff 85801e7f6b76b369c0c8ecd2e5c7874990cd9286..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:next("None. Verdict is final and the gate is green; nothing queued behind this ticket.")
 
 pub mod network;
 pub mod store;
@@ -51,11 +67,14 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use openraft::{BasicNode, Config, Raft};
+use openraft::{BasicNode, Raft};
 use serde::{Deserialize, Serialize};
+use workload_spec::secrets::SecretAccess;
 
 pub use network::{YubabaNetwork, YubabaNetworkFactory};
 pub use store::{YubabaLogStore, YubabaStateMachine};
+
+use crate::cluster_policy::ClusterPolicy;
 
 // ── Type config ──────────────────────────────────────────────────────────────
 
@@ -155,6 +174,20 @@ pub enum YubabaRequest {
         /// Caller-stamped unix seconds (the domain owns "when", like
         /// [`YubabaRequest::AcquireLock`]'s `acquired_at`).
         updated_at: u64,
+        /// R706 (W294): who may be served this secret. `#[serde(default)]` so a
+        /// log entry written before the field existed replays as
+        /// [`SecretAccess::default`] — deny-all — rather than failing the
+        /// replay or silently granting access.
+        #[serde(default)]
+        access: SecretAccess,
+        /// R720-F1 (W294): keyed digest of the plaintext — HMAC-SHA256 under a
+        /// subkey HKDF-derived from the cluster KEK, domain-separated from the
+        /// sealing key. Lets a camp/fleet drift check ("does the record on the
+        /// fleet match what's declared locally?") compare without ever
+        /// decrypting. `#[serde(default)]` so a log entry written before this
+        /// field existed replays as `None` rather than failing.
+        #[serde(default)]
+        digest: Option<Vec<u8>>,
     },
     /// Remove a cluster secret. Hard delete, no tombstone: a secret that should
     /// stop being served is removed and the consuming resolver (R600-F2) fails
@@ -239,6 +272,39 @@ pub struct SecretRecord {
     /// Caller-stamped unix seconds of the last write. Lets a consumer detect
     /// rotation (R600-F4) and aids debugging; not security-sensitive.
     pub updated_at: u64,
+
+    /// R706 (W294): which workloads may be served this secret.
+    ///
+    /// The rule lives **on the record** rather than in the camp's config so the
+    /// check happens where the plaintext is produced — `secrets::ClusterResolver`
+    /// on the node at mount time. A rule the deploying CLI checks is a lint that
+    /// a hand-rolled `POST /workloads/deploy` walks straight past; a rule the
+    /// resolver checks cannot be walked past without the KEK.
+    ///
+    /// `#[serde(default)]` lands pre-R706 snapshots on
+    /// [`SecretAccess::default`] — the empty allow-list, which admits nobody. An
+    /// unruled legacy secret is therefore **refused**, not granted; the operator
+    /// re-stamps it with `yah cloud secret rule`.
+    #[serde(default)]
+    pub access: SecretAccess,
+
+    /// R720-F1 (W294): keyed digest of the plaintext this record's ciphertext
+    /// was sealed from — HMAC-SHA256 under a subkey HKDF-derived from the
+    /// cluster KEK (domain-separated from the AES-GCM sealing key), computed
+    /// camp-side before sealing since the state machine never sees plaintext.
+    ///
+    /// **Not "in sync" when `None`** — that means "written before this field
+    /// existed", not "matches". `#[serde(default)]` lands pre-digest snapshots
+    /// there so they deserialize instead of failing, same forward-compat
+    /// contract as `access`. Treating `None` as a match would readmit the
+    /// confident-lie failure this field exists to remove.
+    ///
+    /// Keyed rather than a bare `SHA-256(plaintext)`: `GET /secrets` serves
+    /// this, and a bare hash of a low-entropy secret would be a brute-force
+    /// oracle for anyone without the KEK. The camp already holds the KEK, so a
+    /// keyed digest costs nothing extra.
+    #[serde(default)]
+    pub digest: Option<Vec<u8>>,
 }
 
 // Redact the opaque bytes from Debug (which `YubabaState`/snapshot dumps and any
@@ -258,6 +324,20 @@ impl std::fmt::Debug for SecretRecord {
             )
             .field("nonce", &format_args!("<{} bytes>", self.nonce.len()))
             .field("updated_at", &self.updated_at)
+            // The rule is not sensitive — it names workloads, not key material —
+            // and seeing it in a state dump is exactly what you want when
+            // debugging a refused mount.
+            .field("access", &format_args!("{}", self.access.summary()))
+            .field(
+                "digest",
+                &format_args!(
+                    "{}",
+                    match &self.digest {
+                        Some(d) => format!("<{} bytes>", d.len()),
+                        None => "None (pre-digest)".to_string(),
+                    }
+                ),
+            )
             .finish()
     }
 }
@@ -366,14 +446,23 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
             ciphertext,
             nonce,
             updated_at,
+            access,
+            digest,
         } => {
             // Opaque bytes in, opaque bytes stored — this layer never decrypts.
+            // The access rule and digest are stored verbatim alongside them;
+            // the raft layer does not evaluate the rule (that's
+            // `secrets::ClusterResolver`'s job, at mount time) and cannot
+            // itself compute the digest (that needs the KEK, which never
+            // reaches this layer).
             state.secrets.insert(
                 name.clone(),
                 SecretRecord {
                     ciphertext: ciphertext.clone(),
                     nonce: nonce.clone(),
                     updated_at: *updated_at,
+                    access: access.clone(),
+                    digest: digest.clone(),
                 },
             );
             YubabaResponse::Ok
@@ -391,8 +480,15 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
 ///
 /// `node_id`  — this machine's unique yubaba node ID (u64, assigned at provision time).
 /// `raft_dir` — directory for raft persistence files (`raft_vote.json`, `raft_log.json`, `raft_state.json`).
-pub async fn open(node_id: YubabaNodeId, raft_dir: PathBuf) -> anyhow::Result<YubabaRaft> {
-    Ok(open_with_state_machine(node_id, raft_dir).await?.0)
+/// `policy`   — the cluster policy this node runs under; its
+///              [`RaftTiming`](crate::cluster_policy::RaftTiming) sets the
+///              election and heartbeat timers.
+pub async fn open(
+    node_id: YubabaNodeId,
+    raft_dir: PathBuf,
+    policy: &ClusterPolicy,
+) -> anyhow::Result<YubabaRaft> {
+    Ok(open_with_state_machine(node_id, raft_dir, policy).await?.0)
 }
 
 /// Like [`open`], but also hands back a clone of the [`YubabaStateMachine`] so
@@ -405,18 +501,14 @@ pub async fn open(node_id: YubabaNodeId, raft_dir: PathBuf) -> anyhow::Result<Yu
 pub async fn open_with_state_machine(
     node_id: YubabaNodeId,
     raft_dir: PathBuf,
+    policy: &ClusterPolicy,
 ) -> anyhow::Result<(YubabaRaft, YubabaStateMachine)> {
     std::fs::create_dir_all(&raft_dir)?;
 
-    let config = Arc::new(
-        Config {
-            heartbeat_interval: 500,
-            election_timeout_min: 1500,
-            election_timeout_max: 3000,
-            ..Default::default()
-        }
-        .validate()?,
-    );
+    // Timings come from the cluster policy (R118-T9): a cross-region fleet and a
+    // single-LAN installation want very different election timeouts, and which
+    // one this node is running under is a deployment fact, not a constant.
+    let config = Arc::new(policy.timing.to_openraft_config()?);
 
     let log_store = YubabaLogStore::open(raft_dir.clone()).await?;
     let state_machine = YubabaStateMachine::open(raft_dir).await?;
@@ -555,12 +647,15 @@ mod tests {
                 ciphertext: vec![1, 2, 3, 4],
                 nonce: vec![9; 12],
                 updated_at: 1000,
+                access: SecretAccess::workloads(["ingress"]),
+                digest: Some(vec![0xaa; 32]),
             },
         );
         let rec = state.secrets.get("tls/yah.dev").expect("secret stored");
         assert_eq!(rec.ciphertext, vec![1, 2, 3, 4]);
         assert_eq!(rec.nonce, vec![9; 12]);
         assert_eq!(rec.updated_at, 1000);
+        assert_eq!(rec.digest, Some(vec![0xaa; 32]));
 
         // A second PutSecret for the same name overwrites in place (rotation).
         apply(
@@ -570,11 +665,14 @@ mod tests {
                 ciphertext: vec![5, 6],
                 nonce: vec![7; 12],
                 updated_at: 2000,
+                access: SecretAccess::workloads(["ingress"]),
+                digest: Some(vec![0xbb; 32]),
             },
         );
         let rec = state.secrets.get("tls/yah.dev").unwrap();
         assert_eq!(rec.ciphertext, vec![5, 6]);
         assert_eq!(rec.updated_at, 2000);
+        assert_eq!(rec.digest, Some(vec![0xbb; 32]), "overwrite replaces digest too");
         assert_eq!(state.secrets.len(), 1, "overwrite, not append");
 
         // Delete removes it; deleting a missing key is a no-op, never a panic.
@@ -606,11 +704,55 @@ mod tests {
                 ciphertext: vec![0xde, 0xad, 0xbe, 0xef],
                 nonce: vec![1; 12],
                 updated_at: 42,
+                access: SecretAccess::workloads(["ingress"]),
+                digest: Some(vec![0xcc; 32]),
             },
         );
         let json = serde_json::to_string(&state).unwrap();
         let restored: YubabaState = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.secrets, state.secrets);
+    }
+
+    #[test]
+    fn digest_round_trips_through_the_state_machine() {
+        // R720-F1: a record with a digest survives apply + snapshot round-trip
+        // byte-identically — the drift check downstream depends on this.
+        let mut state = YubabaState::default();
+        apply(
+            &mut state,
+            &YubabaRequest::PutSecret {
+                name: "tls/yah.dev".into(),
+                ciphertext: vec![1, 2, 3],
+                nonce: vec![4; 12],
+                updated_at: 500,
+                access: SecretAccess::workloads(["ingress"]),
+                digest: Some(vec![0x42; 32]),
+            },
+        );
+        let rec = state.secrets.get("tls/yah.dev").unwrap();
+        assert_eq!(rec.digest, Some(vec![0x42; 32]));
+
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: YubabaState = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            restored.secrets.get("tls/yah.dev").unwrap().digest,
+            Some(vec![0x42; 32])
+        );
+    }
+
+    #[test]
+    fn pre_digest_secret_record_deserializes_to_none() {
+        // A SecretRecord serialised before R720-F1 has no `digest` key.
+        // `#[serde(default)]` must land it on `None` — meaning "predates
+        // digests", never to be read as "matches" by a downstream comparison.
+        let legacy = r#"{
+            "ciphertext": [1, 2, 3],
+            "nonce": [4, 4, 4],
+            "updated_at": 7,
+            "access": "allow_any"
+        }"#;
+        let rec: SecretRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(rec.digest, None);
     }
 
     #[test]

@@ -309,6 +309,46 @@ impl YubabaStateMachine {
             .get(name)
             .cloned()
     }
+
+    /// Metadata for every cluster secret in the local replica, as
+    /// `(name, updated_at, access-rule summary, digest hex)` (R706 / R720-F1 /
+    /// W294).
+    ///
+    /// **Deliberately returns no bytes for ciphertext.** This backs
+    /// `GET /secrets` → `yah cloud secret ls`, whose job is to answer "what
+    /// exists, who may mount it, when did it last change, does it match what
+    /// the camp declares" — none of which needs the ciphertext, and the
+    /// ciphertext is the one thing an operator listing must never casually
+    /// hand out (it would put a KEK-compromise's whole decrypt corpus one
+    /// unauthenticated GET away). The digest is served hex-encoded — it is
+    /// already keyed (see `SecretRecord::digest`), so publishing it costs
+    /// nothing an attacker without the KEK can use; `None` becomes `None`
+    /// (pre-digest), never a stand-in hex value.
+    pub fn cluster_secret_index(&self) -> Vec<(String, u64, String, Option<String>)> {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .state
+            .secrets
+            .iter()
+            .map(|(name, rec)| {
+                (
+                    name.clone(),
+                    rec.updated_at,
+                    rec.access.summary(),
+                    rec.digest.as_deref().map(hex_encode),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Lower-case hex encoding. No `hex` crate dep in this crate; a digest is
+/// rendered a handful of times per `GET /secrets`, not a hot path, so a
+/// one-line encoder beats pulling in a dependency for it.
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl RaftSnapshotBuilder<TC> for YubabaStateMachine {
@@ -475,6 +515,8 @@ mod tests {
                     ciphertext: vec![1, 2, 3],
                     nonce: vec![0; 12],
                     updated_at: 1,
+                    access: workload_spec::secrets::SecretAccess::AllowAny,
+                    digest: None,
                 },
             ),
         )

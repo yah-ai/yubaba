@@ -83,18 +83,26 @@
 //! @yah:gotcha("Reconciler is per-asset sequential — W164 calls for bounded semaphore (default 4) cross-asset concurrency. Filed as R438-F11-style follow-up rather than added in this ticket to keep the diff focused on correctness. Not blocking for R422-F11.")
 //!
 //! @yah:ticket(R546-B6, "yah cloud cache seed computes the fetched-input blake3 then discards it — leaves [asset.derive.fetch].blake3 sentinel unfilled, silently disarming the shared lock fast-path")
-//! @yah:at(2026-07-20T23:24:24Z)
-//! @yah:status(open)
+//! @yah:phase(P1)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-08-02T23:38:04Z)
 //! @yah:parent(R546)
 //! @yah:next("Make `yah cloud cache seed` print the fetched-input blake3 alongside the other three, e.g. `[asset.derive.fetch].blake3 = \"<fetched_hash>\"`, so the operator can paste all four and arm BOTH skip layers. The value is already in scope as `fetched_hash` in seed_derivation_for_target — this is a print-line change plus threading it out through SeededDerivation.")
 //! @yah:next("Verified fix shape by hand for the x86_64 row: fetch.blake3 = 3568931fb074a4e1b4d43098db5810e683cdadd06887a8bdd964a5719bca6481 (b3sum of the rusty_v8-149.4.0 archive; the fetch cache is content-addressed so the blob FILENAME is the blake3). After pasting, a re-seed reproduces the identical derive_key 6238d80e..., i.e. lock_skip_hash's recomputation now matches the lock.")
 //! @yah:next("Consider also asserting it: if seed writes a lock whose fast-path cannot engage (fetch pin still sentinel), emit a warning rather than printing a success message that implies the job is done.")
 //! @yah:gotcha("Surfaced 2026-07-20 by leif while closing R546-T3: 'why wasn't fetch.blake3 filled in already?'. `seed_derivation_for_target` ALREADY has the value — it calls materialize_fetch(&derive.fetch, ...) and binds `fetched_hash`, uses it to compute the derive_key, then prints ONLY [[asset]].blake3 + lock.input_hash + lock.output_blake3. The fetched-input hash is dropped on the floor.")
 //! @yah:gotcha("CONSEQUENCE (non-obvious, cost real time to find): with [asset.derive.fetch].blake3 left as the zero sentinel, lock_skip_hash() bails at its FIRST guard (`is_bootstrap_sentinel(&derive.fetch.blake3.0) -> return None`, static_asset.rs ~line 770). So the W212 substituter fast-path never engages. The local action cache still skips the build, which MASKS the problem on the seeding machine — but a clean checkout / CI / another operator gets no skip at all. The seed command's whole purpose is 'prepare a no-rebuild apply', so leaving this unfilled defeats the shared half of it.")
+//! @yah:handoff("DONE. `yah cloud cache seed` now prints all FOUR paste-back values and a pin verdict. (1) oss/yubaba/crates/cloud/src/reconciler/static_asset.rs: SeededDerivation gains fetch_blake3 (the fetched-input hash the derive_key was keyed on, previously computed then dropped) and fetch_pin: Option<FetchPinState>; new pub enum FetchPinState {Pinned, Sentinel, Mismatch{committed}} plus pure fn classify_fetch_pin(committed, fetched). seed_transform_derivation fills fetch_blake3 and logs it; seed_derivation_for_target classifies the COMMITTED [asset.derive.fetch].blake3 against what it actually fetched. (2) app/yah/cli/src/cloud.rs handle_cache_seed: prints [asset.derive.fetch].blake3 first (columns realigned), then a per-verdict block -- Pinned = fast-path arms as soon as the lock lands; Sentinel = WARNING that lock_skip_hash declines and the skip is local-action-cache-only so CI / a clean checkout / another operator still rebuilds; Mismatch = WARNING printing both hashes (moved version anchor or wrong pin).")
+//! @yah:verify("LIVE-VERIFIED offline against the real workload (fetch anchor + artifact both already cached): `./target/debug/yah cloud cache seed --workload .yah/services/yah-cloud/components/rusty-v8-musl/workload.toml --target x86_64-unknown-linux-musl --artifact .yah/cache/artifacts/567e8f9c...` printed [asset.derive.fetch].blake3 = 3568931fb074a4e1b4d43098db5810e683cdadd06887a8bdd964a5719bca6481 -- byte-identical to the value leif verified by hand in this ticket -- and input_hash f188580181d5ae26004ecd3267b48ca7703b68969e8ad1e1db68e6c4b94d5207, reproducing the committed lock exactly. Verdict line printed: 'fetch pin already committed - the W212 fast-path arms as soon as the lock lands' (both rows of that workload were pinned by hand in an earlier session, so Pinned is correct there).")
+//! @yah:verify("Tests: 2 new in static_asset.rs. seed_surfaces_fetched_input_hash_and_pin_state drives seed_derivation_for_target end-to-end with a pre-warmed fetch cache (materialize_fetch HIT path = hermetic, no network) and asserts (a) fetch_blake3 equals the fetched hash, (b) fetch_pin == Pinned, (c) derivation_key(fetch_blake3, recipe_bk, params) reproduces seeded.derive_key -- i.e. the surfaced value really IS the key input. classify_fetch_pin_covers_all_three_verdicts covers Sentinel / Pinned (case-insensitive) / Mismatch without a network fetch. `cargo test -p yah-cloud --lib` from oss/yubaba: 595 passed, 1 pre-existing flake (reconciler::pond::tests::ensure_sim_port_free_ok_when_unbound -- binds a real port, passes in isolation, unrelated). `cargo check -p yah --bin yah` clean.")
+//! @yah:gotcha("RESOLVED-IN-PLACE, not a leftover: the two [asset.derive.fetch].blake3 rows in .yah/services/yah-cloud/components/rusty-v8-musl/workload.toml were ALREADY pinned to 3568931f... by hand in an earlier session, so this workload's fast-path is armed today. This ticket fixed the TOOLING that made them get missed; nothing in the workload needed editing. Consequence for review: the Sentinel and Mismatch warning branches are covered by unit test only, not by a live run -- exercising Sentinel live would require an unpinned workload and a real network fetch.")
 //!
 //! @yah:ticket(R546-B8, "static-asset transform passes a RELATIVE YAH_TRANSFORM_OUT into the container — any recipe that chdirs writes its artifact inside the container and silently loses it (cost a ~2h rusty-v8 arm64 build)")
-//! @yah:at(2026-07-21T02:08:04Z)
-//! @yah:status(open)
+//! @yah:phase(P1)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-08-03T00:53:38Z)
 //! @yah:parent(R546)
 //! @yah:next("FIX LANDED: canonicalize `cache_dir` and join the filename (the tmp file itself does not exist yet so it cannot be canonicalized directly); also canonicalize `input_path` for the YAH_TRANSFORM_IN_0 binding for the same reason. static_asset tests 46/46 green.")
 //! @yah:next("ADD A REGRESSION TEST that asserts both YAH_TRANSFORM_IN_0 and YAH_TRANSFORM_OUT bindings are absolute after substitution. Not added yet — the existing tests exercise recipes that never chdir, so they cannot catch this class. A cheap version: assert Path::new(&params[ENV_TRANSFORM_OUT]).is_absolute().")
@@ -102,6 +110,12 @@
 //! @yah:gotcha("FAILURE MODE IS SILENT AND EXPENSIVE: the step exits 0, no 'step failed' is reported, and the reconciler dies afterwards on `reading transform output ./.yah/cache/derive/transform/<derive_key>.tmp for BLAKE3: No such file or directory`. Hit 2026-07-20 after a ~2h native arm64 V8 build that had actually SUCCEEDED — the finished tar was written inside the container and thrown away with it.")
 //! @yah:gotcha("ROOT CAUSE: materialize_transform built `tmp_output = cache_dir.join(\"<derive_key>.tmp\")` from `workspace_root`, which is \".\" by CLI default, then bound that RELATIVE string into the recipe argv as {{YAH_TRANSFORM_OUT}}. Note the code immediately below it already canonicalized `workspace_abs` for the container cwd (docker rejects `-w .`) — the OUT binding just never got the same treatment. A relative OUT only survives if the recipe never leaves its cwd: true for the whisper recipes (which is why this went unnoticed for months), FALSE for rusty-v8 because build-v8.sh chdirs into /tmp/tmp.XXXX/v8src to build V8.")
 //! @yah:gotcha("CONTRAST: the QED/P018 offload path was unaffected because it passes an ABSOLUTE container path (/yah/produced/...). Only the LOCAL static-asset transform path had the relative binding.")
+//! @yah:handoff("DONE — both remaining next-steps landed (the canonicalize fix itself was already in the tree when I picked this up). (1) REGRESSION TEST: reconciler::static_asset::tests::transform_bindings_are_absolute_from_a_relative_workspace_root asserts BOTH YAH_TRANSFORM_IN_0 and YAH_TRANSFORM_OUT are absolute in the substituted argv. New ArgvCapture test executor records the argv (and can decline to write the output while still reporting exit 0 — the exact shape of the bug). (2) HARDENING: materialize_transform now checks tmp_output exists before reading it and bails with 'recipe X completed successfully but produced no output at <path> (YAH_TRANSFORM_OUT)' plus the three things to check. Covered by transform_that_writes_no_output_names_the_recipe_contract, which also asserts the raw 'No such file or directory' does NOT leak — that string is what sent the last reader into the cache subsystem instead of the recipe.")
+//! @yah:handoff("THE FIXTURE IS THE LOAD-BEARING PART OF THE TEST, and it is not obvious: it uses tempfile::TempDir::new_in(\".\") and rebuilds the relative form by hand (new_in returns an ABSOLUTE path), because `yah cloud apply` defaults --path to \".\". The repo's standard Fixture uses an absolute tempdir, and against an absolute root cache_dir is absolute either way — so an absolute-tempdir version of this test passes against the BUGGY code and proves nothing. Commented at the test.")
+//! @yah:handoff("ALSO recorded the invariant at the definition site so a future edit cannot re-break it silently: oss/qed/crates/velveteen-exec/src/transforms.rs — ENV_TRANSFORM_OUT / ENV_TRANSFORM_IN_0 doc comments now state 'Bind an ABSOLUTE path', why (a recipe is free to cd), and what it cost. Doc-only, no behaviour change; cargo check -p velveteen-exec clean.")
+//! @yah:handoff("SWEEP: grepped every ENV_TRANSFORM_IN_0/ENV_TRANSFORM_OUT binding site across oss/yubaba, oss/qed and app/yah/cli. static_asset.rs is the only production binder; velveteen-exec only defines the constants and its own test already uses absolute paths. The QED/P018 offload path was never affected (it passes /yah/produced/... absolute), confirming the ticket's contrast note. No other instance of this bug class exists.")
+//! @yah:verify("THE TEST WAS PROVEN TO FAIL AGAINST THE BUG, not just to pass against the fix. I reverted both canonicalizations in place (tmp_output back to cache_dir.join(...), input_abs back to input_path.to_path_buf()), re-ran, and got: 'YAH_TRANSFORM_IN_0 binding must be absolute, got \"./.tmpX7vsrP/.yah/cache/derive/fetch/in.bin\"'. Then restored both and re-ran green. Without this step the test would have been indistinguishable from one that can never fire.")
+//! @yah:verify("GREEN: cargo test -p yah-cloud --lib — 617 passed, 0 failed, 4 ignored (the pond real-port flakes did not fire this run; they are unrelated and pass in isolation). cargo test -p yah-cloud --test whisper_derive_e2e — 1/1. cargo check -p velveteen-exec clean.")
 //!
 //! @yah:ticket(R546-B10, "static-asset publish skips PUT on key EXISTENCE (HEAD), not content — bucket keeps stale bytes while the manifest records the new hash")
 //! @yah:status(review)
@@ -136,12 +150,12 @@ use crate::reconciler::pond::DEFAULT_MINIO_USER;
 use crate::{MirrorProviderSlot, Provider};
 
 use local_driver::s3_sign::{sign_s3_empty_body, sign_s3_put_object};
+use velveteen::{ForgeCommand, ForgeSpec, Initiator, MeshAccess, TaskLocation, TaskPlacement};
 use velveteen_exec::transforms::{
     substitute_argv, RecipeStep, TransformRecipe, TransformRecipeLoader, ENV_TRANSFORM_IN_0,
     ENV_TRANSFORM_OUT,
 };
-use velveteen::{ForgeCommand, ForgeSpec, Initiator, MeshAccess, TaskLocation, TaskPlacement};
-use velveteen_exec::{ExecContext, ForgeExecutor, LocalForgeDriver};
+use velveteen_exec::{ExecContext, ForgeExecutor, LocalForgeDriver, PlacementRouter};
 use workload_spec::validate::shape_static_asset;
 use workload_spec::{AssetEntry, FetchSource, Millis, StaticAssetWorkload, TransformSpec};
 
@@ -271,10 +285,16 @@ pub struct StaticAssetSyncReport {
 /// Reconciles `kind = "static-asset"` components.
 ///
 /// The `executor` field handles W164 transform recipes for derive-mode assets
-/// (R438-T15). Default is `LocalForgeDriver` — the cloud reconciler runs the
-/// recipe on the same host that owns the cache. Callers wanting to redirect
-/// transforms to a different `ForgeExecutor` (e.g. for tests with a mock
-/// executor) use [`Self::with_executor`].
+/// (R438-T15). Default is a [`PlacementRouter`] over `LocalForgeDriver` with no
+/// remote side: local recipes run on the host that owns the cache, and a
+/// remotely-placed one is refused with a message naming the missing wiring.
+///
+/// It is a router rather than a bare `LocalForgeDriver` because this crate
+/// *cannot* build the remote half — a `RemoteForgeDriver` needs a
+/// `WardenClient` over the camp's machine inventory, which lives one layer up
+/// in the CLI (R555-F3). So the default has to be the honest "no cloud from
+/// here" case, and the caller that does have one injects it through
+/// [`Self::with_executor`] (see `yah cloud apply`).
 pub struct StaticAssetReconciler {
     executor: Arc<dyn ForgeExecutor>,
 }
@@ -282,13 +302,15 @@ pub struct StaticAssetReconciler {
 impl StaticAssetReconciler {
     pub fn new() -> Self {
         Self {
-            executor: Arc::new(LocalForgeDriver::default()),
+            executor: Arc::new(PlacementRouter::local_only(Arc::new(
+                LocalForgeDriver::default(),
+            ))),
         }
     }
 
     /// Swap the [`ForgeExecutor`] used to materialize derive-mode transforms.
-    /// Used by tests to inject a mock executor; production paths take the
-    /// `LocalForgeDriver` default.
+    /// Production callers inject a router that can also reach the camp's fleet;
+    /// tests inject a mock.
     pub fn with_executor(mut self, executor: Arc<dyn ForgeExecutor>) -> Self {
         self.executor = executor;
         self
@@ -439,12 +461,63 @@ impl Reconciler for StaticAssetReconciler {
             "static-asset sync complete",
         );
 
-        Ok(RunningWorkload::adopted(
-            WORKLOAD_KIND,
-            "object_store",
-            None,
-        ))
+        Ok(
+            RunningWorkload::adopted(WORKLOAD_KIND, "object_store", None)
+                .with_notes(render_sync_notes(&report)),
+        )
     }
+}
+
+/// R546-B12: what this run actually DID, one line per outcome class, for the
+/// apply console.
+///
+/// Everything above goes to `info!`, which the CLI does not render — so a clean
+/// static-asset reconcile printed the component header and then nothing at all.
+/// A successful publish and a successful no-op looked identical, and the view
+/// that would have told them apart (`yah cloud status`) was blind for the same
+/// underlying reason. The no-op case is stated explicitly rather than omitted:
+/// "nothing to do" is a result, and silence is not.
+fn render_sync_notes(report: &StaticAssetSyncReport) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !report.uploaded.is_empty() {
+        notes.push(format!("published {} asset(s):", report.uploaded.len()));
+        notes.extend(report.uploaded.iter().map(|k| format!("  + {k}")));
+    }
+    if !report.republished.is_empty() {
+        notes.push(format!(
+            "re-published {} asset(s) whose bucket bytes did not match the declared hash:",
+            report.republished.len()
+        ));
+        notes.extend(report.republished.iter().map(|k| format!("  ~ {k}")));
+    }
+    if !report.already_synced.is_empty() {
+        notes.push(format!(
+            "{} asset(s) already current (bucket hash matches) — no upload",
+            report.already_synced.len()
+        ));
+    }
+    if !report.bootstrapped.is_empty() {
+        notes.push(format!(
+            "discovered {} BLAKE3 value(s) for paste-back into workload.toml:",
+            report.bootstrapped.len()
+        ));
+        notes.extend(
+            report
+                .bootstrapped
+                .iter()
+                .map(|b| format!("  {} = {}", bootstrap_output_key(b), b.hash)),
+        );
+    }
+    if !report.prune_candidates.is_empty() {
+        notes.push(format!(
+            "{} bucket object(s) no longer declared — `yah cloud cache prune` to review",
+            report.prune_candidates.len()
+        ));
+    }
+    if notes.is_empty() {
+        notes.push("no assets declared — nothing to reconcile".to_string());
+    }
+    notes
 }
 
 // ── Backend dispatch ──────────────────────────────────────────────────────────
@@ -1381,6 +1454,16 @@ async fn materialize_transform(
         .canonicalize()
         .unwrap_or_else(|_| input_path.to_path_buf());
 
+    // R555-F3: a remotely-placed recipe runs on a worker with its own
+    // filesystem, so the IN/OUT contract has to be re-read there. `remote_out`
+    // is the worker-side path bound as {{YAH_TRANSFORM_OUT}}; the bytes are
+    // pulled back to `tmp_output` after the step, and everything downstream
+    // (exists-check, BLAKE3, rename, action cache) is untouched.
+    let remote_out = match &recipe.placement.location {
+        TaskLocation::Local => None,
+        _ => Some(remote_transform_out(&recipe, &derive_key)?),
+    };
+
     let mut params: BTreeMap<String, String> = BTreeMap::new();
     params.insert(
         ENV_TRANSFORM_IN_0.to_string(),
@@ -1388,7 +1471,11 @@ async fn materialize_transform(
     );
     params.insert(
         ENV_TRANSFORM_OUT.to_string(),
-        tmp_output.to_string_lossy().into_owned(),
+        remote_out
+            .as_ref()
+            .unwrap_or(&tmp_output)
+            .to_string_lossy()
+            .into_owned(),
     );
     for (k, v) in &transform.params {
         params.insert(k.clone(), v.clone());
@@ -1408,10 +1495,31 @@ async fn materialize_transform(
                 unresolved,
             );
         }
+        // R555-T2 opened the recipe surface to `remote` / `remote_any`, so the
+        // lowered spec carries whatever the recipe declared and reaches the
+        // matching driver through the injected router (R555-F3). The two
+        // placements need different execution context, and the difference is
+        // invisible at the type level — hence the split below rather than one
+        // shared `ctx`.
         let spec = lower_recipe_step_to_forge_spec(&recipe, step, argv);
-        let mut ctx = ExecContext::default().with_cwd(workspace_abs.clone());
-        if let Some(platform) = &recipe.placement.platform {
-            ctx = ctx.with_platform(platform.clone());
+        let mut ctx = ExecContext::default();
+        if let Some(remote_out) = &remote_out {
+            // NO cwd: `workspace_abs` is a path on THIS box. The local driver
+            // bind-mounts it; a remote workdir is just a string interpreted on
+            // the worker, where that path doesn't exist. A recipe needing a
+            // source tree on the worker must bring it (the rusty-v8 builder
+            // image clones its own).
+            ctx = ctx.with_produced(remote_out.clone(), tmp_output.clone());
+        } else {
+            ctx = ctx.with_cwd(workspace_abs.clone());
+            // `platform` asks a HOST container runtime for foreign-arch
+            // emulation. It has no remote referent — a remote run picks
+            // architecture by scheduling (mesh_tags) — and RemoteForgeDriver
+            // refuses it rather than handing back a wrong-arch artifact, so it
+            // is only ever applied on the local leg.
+            if let Some(platform) = &recipe.placement.platform {
+                ctx = ctx.with_platform(platform.clone());
+            }
         }
         let outcome = executor
             .execute(spec, ctx, None)
@@ -1426,6 +1534,28 @@ async fn materialize_transform(
                 outcome.stderr_tail
             );
         }
+    }
+
+    // R546-B8: every step exited 0, so if the output is missing the recipe
+    // simply never wrote it. Say THAT, rather than letting the `read` below
+    // surface `No such file or directory` on a cache path — which reads like
+    // cache corruption and sent the last person debugging the wrong subsystem
+    // after a ~2h build. The relative-OUT bug that caused it is fixed above,
+    // but a recipe can still write to the wrong place on its own, and this is
+    // the only moment we can tell the operator exactly which contract broke.
+    if !tokio::fs::try_exists(&tmp_output).await.unwrap_or(false) {
+        anyhow::bail!(
+            "recipe {:?} completed successfully but produced no output at {} \
+             ({ENV_TRANSFORM_OUT}). The recipe's last step must write its artifact \
+             to that exact path — check that it doesn't chdir and then write to a \
+             relative location, and that it isn't writing to a directory instead \
+             of a file.",
+            recipe.name,
+            // A remote run was told a worker-side path; naming `tmp_output` (a
+            // local path it never saw) would send the reader hunting for a
+            // binding bug that isn't there.
+            remote_out.as_ref().unwrap_or(&tmp_output).display(),
+        );
     }
 
     // Compute the actual hash once — used for verify (strict) and cache
@@ -1478,6 +1608,42 @@ async fn materialize_transform(
     Ok(cache_path)
 }
 
+/// State of the committed `[asset.derive.fetch].blake3` pin, relative to the
+/// fetched-input hash a seed run actually keyed its derivation on (R546-B6).
+///
+/// The W212 substituter fast-path ([`lock_skip_hash`]) recomputes the derivation
+/// key from the COMMITTED pins with no network access, so it bails immediately
+/// when the fetch pin is still the zero sentinel. Seeding a lock without also
+/// pinning the fetch input therefore leaves that fast-path disarmed for every
+/// machine except the one that seeded (whose local action cache masks it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchPinState {
+    /// Committed pin equals the fetched-input hash — the fast-path can engage.
+    Pinned,
+    /// Committed pin is the 64-zero sentinel — the fast-path is disarmed until
+    /// the operator pastes the fetched-input hash back into the workload.
+    Sentinel,
+    /// Committed pin names a DIFFERENT blob than the one this seed fetched.
+    /// Either the version anchor moved or the pin is wrong; the fast-path will
+    /// silently decline (input drift) until they agree.
+    Mismatch { committed: String },
+}
+
+/// Classify the committed `[asset.derive.fetch].blake3` against the hash the
+/// fetch actually resolved to (R546-B6). Pure so the three arms are testable
+/// without a network fetch.
+fn classify_fetch_pin(committed: &str, fetched: &str) -> FetchPinState {
+    if is_bootstrap_sentinel(committed) {
+        FetchPinState::Sentinel
+    } else if hashes_equal(committed, fetched) {
+        FetchPinState::Pinned
+    } else {
+        FetchPinState::Mismatch {
+            committed: committed.to_string(),
+        }
+    }
+}
+
 /// Outcome of seeding the transform derivation cache from a pre-built artifact
 /// (the qed→W164 bridge, R546-T3).
 #[derive(Debug, Clone)]
@@ -1490,6 +1656,14 @@ pub struct SeededDerivation {
     /// BLAKE3 of the pre-built artifact — the transform output hash. Equals the
     /// value to paste into `[[asset]].blake3` and `[asset.derive.lock].output_blake3`.
     pub output_blake3: String,
+    /// BLAKE3 of the fetched *input* the derivation key was keyed on — the
+    /// fourth paste-back value, `[asset.derive.fetch].blake3` (R546-B6). Without
+    /// it the seeded lock is unusable off the seeding machine.
+    pub fetch_blake3: String,
+    /// What the workload currently commits for that pin, when the caller went
+    /// through [`seed_derivation_for_target`] (which has the `[[asset]]` row in
+    /// hand). `None` for direct [`seed_transform_derivation`] callers.
+    pub fetch_pin: Option<FetchPinState>,
     /// The content-addressed store path the artifact was landed at.
     pub cas_path: PathBuf,
 }
@@ -1504,7 +1678,7 @@ pub struct SeededDerivation {
 /// [`lower_recipe_step_to_forge_spec`]) — it has no fleet-offload path, so on a
 /// foreign-arch host it can only build the recipe under emulation (which OOMs for
 /// the rusty_v8 musl build, the reason R546 exists). `yah qed run <pipeline>`
-/// (e.g. P018) DOES offload to an arch-matched build-worker and, via R590-F6,
+/// (e.g. rusty-v8-musl) DOES offload to an arch-matched build-worker and, via R590-F6,
 /// retrieves the produced tar content-addressed onto the caller. This function
 /// bridges that pre-built tar into the W164 substituter: it writes the exact
 /// action-cache + CAS entries [`materialize_transform`] would have written, so
@@ -1570,12 +1744,15 @@ pub async fn seed_transform_derivation(
         recipe = %transform.recipe,
         derive_key,
         output_blake3,
+        fetch_blake3 = fetched_hash,
         "seeded transform derivation cache from pre-built artifact (qed→W164 bridge)",
     );
 
     Ok(SeededDerivation {
         derive_key,
         output_blake3,
+        fetch_blake3: fetched_hash.to_string(),
+        fetch_pin: None,
         cas_path,
     })
 }
@@ -1633,14 +1810,27 @@ pub async fn seed_derivation_for_target(
     let (_fetched_path, fetched_hash) =
         materialize_fetch(&derive.fetch, &cache_root.join("fetch")).await?;
 
-    seed_transform_derivation(workspace_root, transform, &fetched_hash, artifact_path).await
+    // R546-B6: classify the COMMITTED fetch pin against what we just fetched, so
+    // the caller can tell the operator whether the W212 fast-path is armed. A
+    // seeded lock with a sentinel fetch pin skips builds only on this machine
+    // (via the local action cache) — everywhere else `lock_skip_hash` declines.
+    let fetch_pin = classify_fetch_pin(&derive.fetch.blake3.0, &fetched_hash);
+
+    let mut seeded =
+        seed_transform_derivation(workspace_root, transform, &fetched_hash, artifact_path).await?;
+    seeded.fetch_pin = Some(fetch_pin);
+    Ok(seeded)
 }
 
 /// Lower a single recipe step to a [`ForgeSpec`] (W164).
 ///
 /// - `image` is always `Some(recipe.image)` — recipes always run inside the
 ///   pinned container.
-/// - `where_` mirrors `recipe.placement` (Local + recipe-declared runtime).
+/// - `where_` mirrors `recipe.placement` straight through — both the
+///   recipe-declared location and runtime. Until W235 this hard-coded
+///   `TaskLocation::Local` because `RecipeLocation` had no other variant;
+///   R555-T2 opened the recipe surface to `remote` / `remote_any`, so pinning
+///   here would have quietly demoted every remote recipe back to the dev box.
 /// - `timeout=0` in the recipe means "no timeout" (omitted from the spec).
 /// - `label = "transform:<recipe>:<step>"`; initiator carries the reconciler
 ///   identity in the Gnome variant so audit traces attribute the run.
@@ -1659,7 +1849,7 @@ pub(crate) fn lower_recipe_step_to_forge_spec(
             argv: substituted_argv,
             image: Some(recipe.image.clone()),
         },
-        where_: TaskPlacement::new(TaskLocation::Local, recipe.placement.runtime),
+        where_: TaskPlacement::new(recipe.placement.location.clone(), recipe.placement.runtime),
         timeout: if step.timeout == 0 {
             None
         } else {
@@ -1672,6 +1862,71 @@ pub(crate) fn lower_recipe_step_to_forge_spec(
         },
         mesh_access: MeshAccess::default(),
     }
+}
+
+/// Validate a remotely-placed transform recipe and return the worker-side path
+/// its output must be written to (R555-F3).
+///
+/// Three things a local recipe may do that a remote one may not, each refused
+/// here rather than at the point it would produce a wrong artifact:
+///
+/// 1. **Reference `{{YAH_TRANSFORM_IN_0}}`.** The fetched input lives on this
+///    box. [`velveteen_exec::WardenClient`] has a retrieval leg
+///    (`fetch_produced_file`) and no upload leg, so there is no transport that
+///    puts those bytes on the worker. Substituting the host path would hand
+///    the recipe a path that doesn't resolve there — and the recipes that
+///    ignore IN_0 entirely (rusty-v8-musl, whisper-bundle-tar drive their own
+///    source) are exactly the ones worth dispatching, so this is a real
+///    boundary rather than a stopgap.
+/// 2. **Declare more than one step.** Each step is a separate one-shot
+///    workload with its own container and its own produced dir — locally the
+///    steps share a filesystem, remotely they share nothing. A two-step remote
+///    recipe would silently lose whatever step 1 wrote.
+/// 3. **Declare `[placement] platform`.** That asks a *host* container runtime
+///    for foreign-arch emulation; a yubaba node has no such knob and picks
+///    architecture by scheduling instead. `RemoteForgeDriver` refuses it too —
+///    this refusal exists so the message names the recipe (R555-T7 is the
+///    ticket that collapses the per-arch recipe fork onto `mesh_tags`).
+fn remote_transform_out(recipe: &TransformRecipe, derive_key: &str) -> Result<PathBuf> {
+    if recipe.steps.len() > 1 {
+        anyhow::bail!(
+            "recipe {:?} declares {} steps and a remote placement. Each step dispatches as \
+             its own one-shot workload with its own container and produced dir, so steps \
+             cannot hand files to each other the way they do locally — collapse them into \
+             one step (the builder image is the right place for the sequencing), or run \
+             the recipe locally",
+            recipe.name,
+            recipe.steps.len(),
+        );
+    }
+    if let Some(platform) = &recipe.placement.platform {
+        anyhow::bail!(
+            "recipe {:?} declares [placement] platform = {:?} together with a remote \
+             location. `platform` asks a host container runtime for foreign-arch \
+             emulation; a remote node has no such knob and selects architecture by \
+             scheduling instead. Drop it and express the arch as mesh tags, e.g. \
+             location = {{ kind = \"remote_any\", tier = \"infra\", mesh_tags = \
+             [\"tag:build-worker\", \"tier:x86\", \"os:linux\"] }}",
+            recipe.name,
+            platform,
+        );
+    }
+    let in_0 = format!("{{{{{ENV_TRANSFORM_IN_0}}}}}");
+    for step in &recipe.steps {
+        if step.argv.iter().any(|a| a.contains(&in_0)) {
+            anyhow::bail!(
+                "recipe {:?} step {:?} references {} but is placed remotely. The fetched \
+                 input lives on this machine and there is no upload leg to the worker \
+                 (WardenClient can retrieve produced files, not send inputs), so the \
+                 binding would name a path that does not exist on the node. Either have \
+                 the recipe fetch its own input, or run it locally",
+                recipe.name,
+                step.name,
+                in_0,
+            );
+        }
+    }
+    Ok(PathBuf::from(workload_spec::forge_produced::CONTAINER_DIR).join(format!("{derive_key}.out")))
 }
 
 /// Read `path` and assert its BLAKE3 hex matches `expected_hex` (case-insensitive).
@@ -1881,23 +2136,17 @@ fn load_workload(workload_dir: &Path) -> Result<StaticAssetWorkload> {
     let path = workload_dir.join("workload.toml");
     let src =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    // R546-B7: do NOT route this through the `workload_spec::Workload` envelope.
-    // That enum derives Deserialize with only `rename_all` — no
-    // `#[serde(tag = "kind")]` — so it is EXTERNALLY tagged and only accepts the
-    // nested `[[static-asset.asset]]` shape. Every real on-disk workload.toml is
-    // flat (`kind = "static-asset"` alongside `[[asset]]`), which serde rejects
-    // with "wanted exactly 1 element, more than 1 element" — the whole document
-    // is a multi-key map where it wanted a single variant key. That broke
-    // `yah cloud apply` for EVERY static-asset component (verified against the
-    // long-published whisper catalog, not just rusty-v8).
+    // R546-B7 (RESOLVED — this comment used to say the envelope was unusable).
+    // `workload_spec::Workload` is no longer externally tagged for text
+    // formats: its hand-written Deserialize branches on `is_human_readable`, so
+    // TOML/JSON get the flat `kind`-tagged shape real files use while postcard
+    // keeps the variant-index encoding the kamaji UDS needs.
     //
-    // The envelope is not fixed here on purpose: `Workload` is also a
-    // postcard wire type on the kamaji RPC path, and postcard (non
-    // self-describing) cannot decode an internally-tagged enum — so slapping
-    // `tag = "kind"` on it risks breaking that wire. Deserializing the payload
-    // directly and checking `kind` by hand is the same thing
-    // `seed_derivation_for_target` already does successfully. See R546-B7 for
-    // the envelope-level fix.
+    // This path still probes `kind` and deserializes `StaticAssetWorkload`
+    // directly rather than matching on the envelope, because it needs to reject
+    // a non-static-asset workload with a precise message naming the kind it
+    // found — an envelope match would only say "expected variant". The bypass
+    // is now a choice, not a workaround.
     #[derive(serde::Deserialize)]
     struct KindProbe {
         kind: String,
@@ -1924,15 +2173,6 @@ fn load_workload(workload_dir: &Path) -> Result<StaticAssetWorkload> {
         .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
 
     Ok(workload)
-}
-
-fn workload_kind_str(w: &workload_spec::Workload) -> &'static str {
-    match w {
-        workload_spec::Workload::MesofactStatic(_) => "mesofact-static",
-        workload_spec::Workload::Container(_) => "container",
-        workload_spec::Workload::Almanac(_) => "almanac",
-        workload_spec::Workload::StaticAsset(_) => "static-asset",
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1972,6 +2212,8 @@ mod tests {
                 schema_version: 1,
                 shape: MirrorShape::Local,
                 providers,
+                ingress: Default::default(),
+                drivers: Default::default(),
                 asset_aliases: BTreeMap::new(),
             };
             let service = ServiceConfig {
@@ -2063,10 +2305,10 @@ kind = "static-asset"
 
     // ── Mock executor for W164 materialize-transform tests ────────────────────
 
-    use velveteen_exec::executor::{ExecEvent, ExecOutcome, ForgeExecutorError};
-    use velveteen::ForgeStatus;
     use tokio::sync::mpsc::UnboundedSender;
     use tokio::sync::Mutex;
+    use velveteen::ForgeStatus;
+    use velveteen_exec::executor::{ExecEvent, ExecOutcome, ForgeExecutorError};
 
     /// Executor that writes a caller-supplied byte string to whatever path the
     /// recipe sets `YAH_TRANSFORM_OUT` to (via the substituted argv). Returns
@@ -2142,6 +2384,56 @@ kind = "static-asset"
         }
     }
 
+    /// R546-B8: records the substituted argv and, optionally, declines to write
+    /// the output while still reporting exit 0 — the exact shape of a recipe
+    /// that chdirs and then writes its artifact to a relative path inside the
+    /// container.
+    struct ArgvCapture {
+        argv: Arc<Mutex<Vec<String>>>,
+        write_output: bool,
+    }
+
+    impl ArgvCapture {
+        fn new(write_output: bool) -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
+            let argv = Arc::new(Mutex::new(Vec::new()));
+            let me = Arc::new(Self {
+                argv: argv.clone(),
+                write_output,
+            });
+            (me, argv)
+        }
+    }
+
+    #[async_trait]
+    impl ForgeExecutor for ArgvCapture {
+        async fn execute(
+            &self,
+            spec: ForgeSpec,
+            _ctx: ExecContext,
+            _sink: Option<UnboundedSender<ExecEvent>>,
+        ) -> Result<ExecOutcome, ForgeExecutorError> {
+            let ForgeCommand::Subprocess { argv, .. } = &spec.command else {
+                return Err(ForgeExecutorError::Unsupported(
+                    "capture only handles Subprocess",
+                ));
+            };
+            *self.argv.lock().await = argv.clone();
+            if self.write_output {
+                let out = argv.iter().find(|a| a.ends_with(".tmp")).ok_or(
+                    ForgeExecutorError::Unsupported("recipe must pass a .tmp output path"),
+                )?;
+                std::fs::write(out, b"produced").map_err(ForgeExecutorError::Io)?;
+            }
+            Ok(ExecOutcome {
+                status: ForgeStatus::Done {
+                    exit_code: 0,
+                    ended_at: 0,
+                },
+                stderr_tail: String::new(),
+            })
+        }
+    }
+
     /// Write a `whisper-quantize.toml`-style recipe under
     /// `<workspace>/.yah/qed/transforms/<name>.toml`. Returns nothing — the
     /// recipe loader resolves the path itself.
@@ -2188,6 +2480,217 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
 "#
         );
         std::fs::write(transforms_dir.join(format!("{name}.toml")), toml).unwrap();
+    }
+
+    /// Write a remotely-placed recipe. `placement_extra` appends lines to the
+    /// `[placement]` table (e.g. a `platform` the remote leg must refuse) and
+    /// `steps` is the whole `[[steps]]` block, so a test can pass two of them.
+    fn write_remote_recipe(
+        workspace_root: &Path,
+        name: &str,
+        placement_extra: &str,
+        steps: &str,
+    ) {
+        let transforms_dir = workspace_root.join(".yah/qed/transforms");
+        std::fs::create_dir_all(&transforms_dir).unwrap();
+        let toml = format!(
+            r#"
+name  = "{name}"
+label = "test remote recipe"
+image = "ghcr.io/test/tool:v1@sha256:{HASH_64}"
+
+[placement]
+location = {{ kind = "remote_any", tier = "infra", mesh_tags = ["tier:x86"] }}
+runtime  = "container"
+{placement_extra}
+
+{steps}
+"#
+        );
+        std::fs::write(transforms_dir.join(format!("{name}.toml")), toml).unwrap();
+    }
+
+    /// Stands in for `RemoteForgeDriver`: records the context it was handed and
+    /// performs the retrieval half by writing the "built" bytes to
+    /// `ctx.produced.dest`, exactly as the real driver does after
+    /// `fetch_produced_file`.
+    struct RemoteMock {
+        out_bytes: Vec<u8>,
+        seen: Arc<Mutex<Option<(Vec<String>, ExecContext)>>>,
+    }
+
+    impl RemoteMock {
+        fn new(out_bytes: Vec<u8>) -> (Arc<Self>, Arc<Mutex<Option<(Vec<String>, ExecContext)>>>) {
+            let seen = Arc::new(Mutex::new(None));
+            let me = Arc::new(Self {
+                out_bytes,
+                seen: seen.clone(),
+            });
+            (me, seen)
+        }
+    }
+
+    #[async_trait]
+    impl ForgeExecutor for RemoteMock {
+        async fn execute(
+            &self,
+            spec: ForgeSpec,
+            ctx: ExecContext,
+            _sink: Option<UnboundedSender<ExecEvent>>,
+        ) -> Result<ExecOutcome, ForgeExecutorError> {
+            let ForgeCommand::Subprocess { argv, .. } = &spec.command else {
+                return Err(ForgeExecutorError::Unsupported("remote mock: Subprocess only"));
+            };
+            assert!(
+                !matches!(spec.where_.location, TaskLocation::Local),
+                "the remote mock must only ever see a remotely-placed spec",
+            );
+            if let Some(produced) = &ctx.produced {
+                std::fs::write(&produced.dest, &self.out_bytes).map_err(ForgeExecutorError::Io)?;
+            }
+            *self.seen.lock().await = Some((argv.clone(), ctx));
+            Ok(ExecOutcome {
+                status: ForgeStatus::Done {
+                    exit_code: 0,
+                    ended_at: 0,
+                },
+                stderr_tail: String::new(),
+            })
+        }
+    }
+
+    /// R555-F3, the whole point: a remotely-placed recipe binds its output to
+    /// the worker's durable produced dir, and the bytes come back to the local
+    /// derivation cache so the publish leg above is untouched.
+    #[tokio::test]
+    async fn a_remote_recipe_binds_out_on_the_worker_and_lands_the_bytes_locally() {
+        let fx = Fixture::new(minio_slot());
+        write_remote_recipe(
+            &fx.workspace_root,
+            "remote-recipe",
+            "",
+            "[[steps]]\nname = \"build\"\nargv = [\"build.sh\", \"{{YAH_TRANSFORM_OUT}}\"]",
+        );
+        let out_bytes = b"remotely built".to_vec();
+        let out_hash = blake3_hex(&out_bytes);
+        let (mock, seen) = RemoteMock::new(out_bytes.clone());
+        let executor: Arc<dyn ForgeExecutor> = mock;
+
+        let fetch_path = fx.workspace_root.join(".yah/cache/derive/fetch/in.bin");
+        std::fs::create_dir_all(fetch_path.parent().unwrap()).unwrap();
+        std::fs::write(&fetch_path, b"anchor").unwrap();
+
+        let landed = materialize_transform(
+            &TransformSpec {
+                recipe: "remote-recipe".to_string(),
+                params: BTreeMap::new(),
+            },
+            &fetch_path,
+            &blake3_hex(b"anchor"),
+            &out_hash,
+            &fx.workspace_root.join(".yah/cache/derive/transform"),
+            &fx.workspace_root,
+            executor.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&landed).unwrap(), out_bytes);
+
+        let seen = seen.lock().await;
+        let (argv, ctx) = seen.as_ref().expect("the remote step ran");
+        let bound_out = argv.last().expect("argv carries the OUT binding");
+        assert!(
+            bound_out.starts_with(workload_spec::forge_produced::CONTAINER_DIR),
+            "OUT must be bound under the worker's durable produced dir, got {bound_out}",
+        );
+        let produced = ctx.produced.as_ref().expect("retrieval must be requested");
+        assert_eq!(produced.remote_path, PathBuf::from(bound_out));
+        // A host path handed to a remote workdir names a directory that does
+        // not exist on the node.
+        assert!(ctx.cwd.is_none(), "no host cwd may travel to a worker");
+    }
+
+    /// The fetched input lives on this box and there is no upload leg, so a
+    /// remote recipe that reads it would be handed an unresolvable path.
+    #[tokio::test]
+    async fn a_remote_recipe_reading_the_fetched_input_is_refused() {
+        let fx = Fixture::new(minio_slot());
+        write_remote_recipe(
+            &fx.workspace_root,
+            "needs-input",
+            "",
+            "[[steps]]\nname = \"build\"\nargv = [\"tool\", \"{{YAH_TRANSFORM_IN_0}}\", \"{{YAH_TRANSFORM_OUT}}\"]",
+        );
+        let msg = remote_refusal(&fx, "needs-input").await;
+        assert!(msg.contains("YAH_TRANSFORM_IN_0"), "got: {msg}");
+        assert!(msg.contains("no upload leg"), "got: {msg}");
+    }
+
+    /// Steps share a filesystem locally and share nothing remotely.
+    #[tokio::test]
+    async fn a_multi_step_remote_recipe_is_refused() {
+        let fx = Fixture::new(minio_slot());
+        write_remote_recipe(
+            &fx.workspace_root,
+            "two-steps",
+            "",
+            "[[steps]]\nname = \"one\"\nargv = [\"a\"]\n\n[[steps]]\nname = \"two\"\nargv = [\"b\", \"{{YAH_TRANSFORM_OUT}}\"]",
+        );
+        let msg = remote_refusal(&fx, "two-steps").await;
+        assert!(msg.contains("one-shot workload"), "got: {msg}");
+    }
+
+    /// `platform` is host-emulation; remote picks arch by scheduling. Silently
+    /// dropping it is how R546 got a wrong-arch artifact in the first place.
+    #[tokio::test]
+    async fn a_remote_recipe_declaring_a_platform_is_refused_and_named_mesh_tags() {
+        let fx = Fixture::new(minio_slot());
+        write_remote_recipe(
+            &fx.workspace_root,
+            "emulated",
+            "platform = \"linux/amd64\"",
+            "[[steps]]\nname = \"build\"\nargv = [\"build.sh\", \"{{YAH_TRANSFORM_OUT}}\"]",
+        );
+        let msg = remote_refusal(&fx, "emulated").await;
+        assert!(msg.contains("mesh_tags"), "got: {msg}");
+    }
+
+    /// Run `recipe` through `materialize_transform` with an executor that
+    /// panics if reached, and return the refusal message. Every caller here
+    /// asserts the recipe is rejected *before* anything is dispatched.
+    async fn remote_refusal(fx: &Fixture, recipe: &str) -> String {
+        struct NeverRuns;
+        #[async_trait]
+        impl ForgeExecutor for NeverRuns {
+            async fn execute(
+                &self,
+                _spec: ForgeSpec,
+                _ctx: ExecContext,
+                _sink: Option<UnboundedSender<ExecEvent>>,
+            ) -> Result<ExecOutcome, ForgeExecutorError> {
+                panic!("the recipe must be refused before dispatch");
+            }
+        }
+        let fetch_path = fx.workspace_root.join(".yah/cache/derive/fetch/in.bin");
+        std::fs::create_dir_all(fetch_path.parent().unwrap()).unwrap();
+        std::fs::write(&fetch_path, b"anchor").unwrap();
+        let executor: Arc<dyn ForgeExecutor> = Arc::new(NeverRuns);
+        let err = materialize_transform(
+            &TransformSpec {
+                recipe: recipe.to_string(),
+                params: BTreeMap::new(),
+            },
+            &fetch_path,
+            &blake3_hex(b"anchor"),
+            &blake3_hex(b"whatever"),
+            &fx.workspace_root.join(".yah/cache/derive/transform"),
+            &fx.workspace_root,
+            executor.as_ref(),
+        )
+        .await
+        .expect_err("remote recipe must be refused");
+        format!("{err:#}")
     }
 
     // ── Slot validation ───────────────────────────────────────────────────────
@@ -2421,10 +2924,16 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
         let other = "b".repeat(64);
 
         // Same bytes → genuine no-op, safe to skip the PUT.
-        assert!(RemoteObject::Present { blake3: Some(expected.clone()) }.matches(&expected));
+        assert!(RemoteObject::Present {
+            blake3: Some(expected.clone())
+        }
+        .matches(&expected));
 
         // Different bytes → MUST NOT be treated as synced. This is the bug.
-        assert!(!RemoteObject::Present { blake3: Some(other) }.matches(&expected));
+        assert!(!RemoteObject::Present {
+            blake3: Some(other)
+        }
+        .matches(&expected));
 
         // Absent → nothing to match.
         assert!(!RemoteObject::Absent.matches(&expected));
@@ -2439,8 +2948,14 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
     fn unstamped_remote_object_is_not_a_match_but_does_exist() {
         let expected = "c".repeat(64);
         let legacy = RemoteObject::Present { blake3: None };
-        assert!(!legacy.matches(&expected), "unstamped object must not be trusted as current");
-        assert!(legacy.exists(), "it does exist — caller re-publishes rather than treating as absent");
+        assert!(
+            !legacy.matches(&expected),
+            "unstamped object must not be trusted as current"
+        );
+        assert!(
+            legacy.exists(),
+            "it does exist — caller re-publishes rather than treating as absent"
+        );
     }
 
     /// Hashes may have been authored in either case; comparison goes through
@@ -2450,7 +2965,10 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
         let lower = "abcdef".repeat(10) + "abcd";
         let upper = lower.to_uppercase();
         assert_eq!(lower.len(), 64);
-        assert!(RemoteObject::Present { blake3: Some(upper) }.matches(&lower));
+        assert!(RemoteObject::Present {
+            blake3: Some(upper)
+        }
+        .matches(&lower));
     }
 
     // ── Prune candidate detection ─────────────────────────────────────────────
@@ -2815,7 +3333,7 @@ argv = ["./tool", "{{{{YAH_TRANSFORM_IN_0}}}}", "{{{{YAH_TRANSFORM_OUT}}}}"]
     /// R546-T3 qed→W164 bridge: seeding the derivation cache from a pre-built
     /// artifact makes the NEXT `materialize_transform` a HIT that returns the
     /// seeded bytes without running the recipe. This is the whole point —
-    /// offload the arch-locked, expensive build to a fleet worker (P018), retrieve
+    /// offload the arch-locked, expensive build to a fleet worker (rusty-v8-musl), retrieve
     /// its tar (R590-F6), seed the cache, and let `yah cloud apply` publish the
     /// pre-built bytes instead of re-building under emulation.
     #[tokio::test]
@@ -3072,6 +3590,153 @@ output_blake3 = "{sentinel}"
         );
     }
 
+    /// R546-B6: the fetched-input hash is the FOURTH paste-back value. Seeding
+    /// used to compute it, key the derivation on it, and drop it — leaving
+    /// `[asset.derive.fetch].blake3` at the sentinel, which makes
+    /// `lock_skip_hash` decline at its first guard for everyone but the seeding
+    /// machine (whose local action cache masks it).
+    #[tokio::test]
+    async fn seed_surfaces_fetched_input_hash_and_pin_state() {
+        let fx = Fixture::new(minio_slot());
+        write_recipe(&fx.workspace_root, "pinned");
+
+        // Warm the fetch cache so materialize_fetch takes its HIT path — no
+        // network, and the committed pin is already correct (Pinned arm).
+        let fetch_bytes = b"upstream source tarball".to_vec();
+        let fetch_hash = blake3_hex(&fetch_bytes);
+        let fetch_cache = fx.workspace_root.join(".yah/cache/derive/fetch");
+        std::fs::create_dir_all(&fetch_cache).unwrap();
+        std::fs::write(fetch_cache.join(format!("{fetch_hash}.bin")), &fetch_bytes).unwrap();
+
+        let sentinel = "0".repeat(64);
+        let workload_path = fx.workspace_root.join("workload.toml");
+        std::fs::write(
+            &workload_path,
+            format!(
+                r#"kind = "static-asset"
+schema_version = "V1"
+
+[[asset]]
+filename = "rusty-v8/x86_64.tar.gz"
+blake3   = "{sentinel}"
+
+[asset.derive.fetch]
+url     = "https://example/v8.tar.gz"
+blake3  = "{fetch_hash}"
+license = "mit"
+
+[asset.derive.transform]
+recipe = "pinned"
+params = {{ target = "x86_64-unknown-linux-musl" }}
+"#
+            ),
+        )
+        .unwrap();
+
+        let prebuilt = fx.workspace_root.join("prebuilt.tar.gz");
+        std::fs::write(&prebuilt, b"prebuilt rusty_v8 tarball").unwrap();
+
+        let seeded = seed_derivation_for_target(
+            &fx.workspace_root,
+            &workload_path,
+            "x86_64-unknown-linux-musl",
+            &prebuilt,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            seeded.fetch_blake3, fetch_hash,
+            "the hash the derivation key was keyed on must be surfaced for paste-back",
+        );
+        assert_eq!(seeded.fetch_pin, Some(FetchPinState::Pinned));
+
+        // And it really is the key input: recomputing from the surfaced value
+        // reproduces the seeded lock's input_hash.
+        let recipe_bk = recipe_blake3(&fx.workspace_root, "pinned").await.unwrap();
+        let mut params = BTreeMap::new();
+        params.insert(
+            "target".to_string(),
+            "x86_64-unknown-linux-musl".to_string(),
+        );
+        assert_eq!(
+            derivation_key(&seeded.fetch_blake3, &recipe_bk, &params),
+            seeded.derive_key,
+        );
+    }
+
+    /// R546-B6: the three pin verdicts the seed command reports on. `Sentinel`
+    /// is the disarmed case the ticket was filed for; `Mismatch` catches a
+    /// moved version anchor before the operator pastes a lock that can only
+    /// ever decline on input drift.
+    #[test]
+    fn classify_fetch_pin_covers_all_three_verdicts() {
+        let fetched = blake3_hex(b"upstream");
+        assert_eq!(
+            classify_fetch_pin(&"0".repeat(64), &fetched),
+            FetchPinState::Sentinel,
+        );
+        assert_eq!(
+            classify_fetch_pin(&fetched.to_uppercase(), &fetched),
+            FetchPinState::Pinned,
+            "hash comparison is case-insensitive like the rest of the reconciler",
+        );
+        let stale = blake3_hex(b"a different upstream");
+        assert_eq!(
+            classify_fetch_pin(&stale, &fetched),
+            FetchPinState::Mismatch {
+                committed: stale.clone()
+            },
+        );
+    }
+
+    /// R546-B12: a clean reconcile must SAY something. The failure this guards
+    /// is not a wrong line, it is an absent one — a successful publish and a
+    /// successful no-op printing identically (i.e. nothing), which is what made
+    /// the blind `yah cloud status` view so costly to notice.
+    #[test]
+    fn sync_notes_distinguish_publish_from_no_op_and_are_never_empty() {
+        // Published.
+        let mut report = StaticAssetSyncReport::default();
+        report.uploaded.push("a/one.bin".to_string());
+        let notes = render_sync_notes(&report);
+        assert!(
+            notes.iter().any(|n| n.contains("published 1 asset")),
+            "{notes:?}"
+        );
+        assert!(notes.iter().any(|n| n.contains("a/one.bin")), "{notes:?}");
+
+        // No-op: everything already current. Must NOT look like a publish, and
+        // must not be silent.
+        let mut report = StaticAssetSyncReport::default();
+        report.already_synced.push("a/one.bin".to_string());
+        let notes = render_sync_notes(&report);
+        assert!(
+            notes.iter().any(|n| n.contains("already current")),
+            "{notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|n| n.contains("published")),
+            "a no-op must not read as a publish: {notes:?}"
+        );
+
+        // Bootstrap discoveries are paste-back values — the operator needs the
+        // hashes themselves, not a count.
+        let mut report = StaticAssetSyncReport::default();
+        report.bootstrapped.push(BootstrappedHash {
+            filename: "a/one.bin".into(),
+            kind: BootstrapHashKind::Output,
+            hash: HASH_64.to_string(),
+        });
+        let notes = render_sync_notes(&report);
+        assert!(notes.iter().any(|n| n.contains(HASH_64)), "{notes:?}");
+
+        // The degenerate case still speaks.
+        let notes = render_sync_notes(&StaticAssetSyncReport::default());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("nothing to reconcile"), "{notes:?}");
+    }
+
     #[test]
     fn bootstrap_output_key_input_variant() {
         let b = BootstrappedHash {
@@ -3082,6 +3747,119 @@ output_blake3 = "{sentinel}"
         assert_eq!(
             bootstrap_output_key(&b),
             "discovered_input_hash:whisper/coreml.tar.gz",
+        );
+    }
+
+    /// R546-B8: both recipe bindings must be ABSOLUTE, even when the caller
+    /// passes a relative workspace root.
+    ///
+    /// The fixture deliberately uses `TempDir::new_in(".")` rather than the
+    /// usual absolute tempdir — that is the whole point. `yah cloud apply`
+    /// defaults `--path` to `"."`, so `cache_dir` came out relative
+    /// (`./.yah/cache/derive/transform/<key>.tmp`) and got handed to the recipe
+    /// verbatim. A relative OUT survives only while the recipe stays in its
+    /// cwd, which is why the whisper recipes never tripped it; rusty-v8's
+    /// build-v8.sh chdirs into a scratch dir to build V8, so it wrote the
+    /// finished tar to `<scratch>/./.yah/cache/...` inside the container and the
+    /// bytes died with it — after a ~2h build, with the step reporting exit 0.
+    ///
+    /// An absolute-tempdir fixture cannot catch this: `cache_dir` is then
+    /// absolute either way and the assertion passes against the buggy code too.
+    #[tokio::test]
+    async fn transform_bindings_are_absolute_from_a_relative_workspace_root() {
+        // `TempDir::new_in(".")` hands back an ABSOLUTE path, so rebuild the
+        // relative form by hand — cargo runs tests with cwd at the package root,
+        // so `./<name>` resolves to the same directory.
+        let tmp = tempfile::TempDir::new_in(".").expect("tempdir beside cwd");
+        let workspace_root = Path::new(".").join(tmp.path().file_name().unwrap());
+        assert!(
+            workspace_root.is_relative(),
+            "fixture must reproduce the relative-root case, got {}",
+            workspace_root.display(),
+        );
+
+        write_recipe(&workspace_root, "noop-recipe");
+        let cache_dir = workspace_root.join(".yah/cache/derive/transform");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let fetch_path = workspace_root.join(".yah/cache/derive/fetch/in.bin");
+        std::fs::create_dir_all(fetch_path.parent().unwrap()).unwrap();
+        std::fs::write(&fetch_path, b"fetch bytes").unwrap();
+
+        let (capture, argv) = ArgvCapture::new(true);
+        let executor: Arc<dyn ForgeExecutor> = capture;
+        let transform = TransformSpec {
+            recipe: "noop-recipe".to_string(),
+            params: BTreeMap::new(),
+        };
+
+        materialize_transform(
+            &transform,
+            &fetch_path,
+            &blake3_hex(b"fetch bytes"),
+            ZERO_SENTINEL_HEX, // bootstrap: accept whatever hash comes out
+            &cache_dir,
+            &workspace_root,
+            executor.as_ref(),
+        )
+        .await
+        .expect("transform must succeed");
+
+        // Recipe argv is ["./tool", "{{YAH_TRANSFORM_IN_0}}", "{{YAH_TRANSFORM_OUT}}"].
+        let argv = argv.lock().await.clone();
+        assert_eq!(argv.len(), 3, "unexpected argv shape: {argv:?}");
+        assert!(
+            Path::new(&argv[1]).is_absolute(),
+            "{ENV_TRANSFORM_IN_0} binding must be absolute, got {:?}",
+            argv[1],
+        );
+        assert!(
+            Path::new(&argv[2]).is_absolute(),
+            "{ENV_TRANSFORM_OUT} binding must be absolute, got {:?}",
+            argv[2],
+        );
+    }
+
+    /// R546-B8 hardening: a recipe that exits 0 without writing its artifact
+    /// must be named as such. Before this, the missing file surfaced as
+    /// `reading transform output …: No such file or directory` on a path under
+    /// `.yah/cache/`, which reads like cache corruption and sends the reader
+    /// into the wrong subsystem.
+    #[tokio::test]
+    async fn transform_that_writes_no_output_names_the_recipe_contract() {
+        let fx = Fixture::new(minio_slot());
+        write_recipe(&fx.workspace_root, "writes-nothing");
+        let cache_dir = fx.workspace_root.join(".yah/cache/derive/transform");
+        let fetch_path = fx.workspace_root.join(".yah/cache/derive/fetch/in.bin");
+        std::fs::create_dir_all(fetch_path.parent().unwrap()).unwrap();
+        std::fs::write(&fetch_path, b"fetch bytes").unwrap();
+
+        // Exit 0, write nothing — exactly what the relative-OUT bug looked like
+        // from the reconciler's side.
+        let (capture, _) = ArgvCapture::new(false);
+        let executor: Arc<dyn ForgeExecutor> = capture;
+        let transform = TransformSpec {
+            recipe: "writes-nothing".to_string(),
+            params: BTreeMap::new(),
+        };
+
+        let err = materialize_transform(
+            &transform,
+            &fetch_path,
+            &blake3_hex(b"fetch bytes"),
+            ZERO_SENTINEL_HEX,
+            &cache_dir,
+            &fx.workspace_root,
+            executor.as_ref(),
+        )
+        .await
+        .expect_err("a recipe that writes nothing must fail");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("produced no output"), "{msg}");
+        assert!(msg.contains("writes-nothing"), "{msg}");
+        assert!(
+            !msg.contains("No such file or directory"),
+            "must not leak the raw io error that reads like cache corruption: {msg}",
         );
     }
 

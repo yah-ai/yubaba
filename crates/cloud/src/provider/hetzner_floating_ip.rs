@@ -23,7 +23,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::floating_ip::{reconcile_assignment, FloatingIpProvider, FloatingIpState, FloatingIpTarget};
+use super::floating_ip::{
+    reconcile_assignment, FloatingIpProvider, FloatingIpState, FloatingIpTarget,
+};
 use crate::config::MachineConfig;
 use crate::envoy::floating_ip::{
     FloatingIpAssign, FloatingIpAssignInput, FloatingIpAssignOutput, FloatingIpStatus,
@@ -280,7 +282,10 @@ mod tests {
             zone: None,
             arch: None,
             bucket: None,
-            hostkey_fingerprint: None,
+            vendor: None,
+            nickname: None,
+            legacy_hostkey_fingerprint: None,
+            registration: Default::default(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -363,7 +368,9 @@ mod tests {
         let client = HetznerFloatingIp::new("test-token").with_base_url(base);
         let machine = hil_machine("edge-a");
 
-        let outcome = on_ingress_owner_changed(&client, &machine, "42").await.unwrap();
+        let outcome = on_ingress_owner_changed(&client, &machine, "42")
+            .await
+            .unwrap();
         assert!(outcome.reassigned, "owner flip must drive a reassign");
         assert_eq!(outcome.attached_to, "555");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -378,9 +385,18 @@ mod tests {
         let client = HetznerFloatingIp::new("test-token").with_base_url(base);
         let machine = hil_machine("edge-a");
 
-        let outcome = on_ingress_owner_changed(&client, &machine, "42").await.unwrap();
-        assert!(!outcome.reassigned, "re-applying the same owner must be a no-op");
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "must not call the reassign endpoint");
+        let outcome = on_ingress_owner_changed(&client, &machine, "42")
+            .await
+            .unwrap();
+        assert!(
+            !outcome.reassigned,
+            "re-applying the same owner must be a no-op"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "must not call the reassign endpoint"
+        );
 
         handle.abort();
     }
@@ -396,8 +412,15 @@ mod tests {
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("zone"), "expected a zone-mismatch error, got: {msg}");
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "zone mismatch must never call reassign");
+        assert!(
+            msg.contains("zone"),
+            "expected a zone-mismatch error, got: {msg}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "zone mismatch must never call reassign"
+        );
 
         handle.abort();
     }

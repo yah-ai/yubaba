@@ -27,7 +27,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::floating_ip::{reconcile_assignment, FloatingIpProvider, FloatingIpState, FloatingIpTarget};
+use super::floating_ip::{
+    reconcile_assignment, FloatingIpProvider, FloatingIpState, FloatingIpTarget,
+};
 use crate::config::MachineConfig;
 use crate::envoy::floating_ip::{
     FloatingIpAssign, FloatingIpAssignInput, FloatingIpAssignOutput, FloatingIpStatus,
@@ -275,7 +277,10 @@ mod tests {
             zone: None,
             arch: None,
             bucket: None,
-            hostkey_fingerprint: None,
+            vendor: None,
+            nickname: None,
+            legacy_hostkey_fingerprint: None,
+            registration: Default::default(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -315,15 +320,18 @@ mod tests {
         let ip_move_route = {
             let routed_to = routed_to.clone();
             let calls = move_calls.clone();
-            axum::routing::post(move |axum::extract::Path(service_name): axum::extract::Path<String>, axum::Json(_body): axum::Json<serde_json::Value>| {
-                let routed_to = routed_to.clone();
-                let calls = calls.clone();
-                async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    *routed_to.lock().unwrap() = Some(service_name);
-                    axum::Json(serde_json::json!({}))
-                }
-            })
+            axum::routing::post(
+                move |axum::extract::Path(service_name): axum::extract::Path<String>,
+                      axum::Json(_body): axum::Json<serde_json::Value>| {
+                    let routed_to = routed_to.clone();
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        *routed_to.lock().unwrap() = Some(service_name);
+                        axum::Json(serde_json::json!({}))
+                    }
+                },
+            )
         };
 
         let app = axum::Router::new()
@@ -365,7 +373,10 @@ mod tests {
         let outcome = on_ingress_owner_changed(&client, &machine, "51.81.85.200")
             .await
             .unwrap();
-        assert!(!outcome.reassigned, "re-applying the same owner must be a no-op");
+        assert!(
+            !outcome.reassigned,
+            "re-applying the same owner must be a no-op"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0, "must not call ipMove");
 
         handle.abort();
@@ -382,8 +393,15 @@ mod tests {
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("zone"), "expected a zone-mismatch error, got: {msg}");
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "region mismatch must never call ipMove");
+        assert!(
+            msg.contains("zone"),
+            "expected a zone-mismatch error, got: {msg}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "region mismatch must never call ipMove"
+        );
 
         handle.abort();
     }

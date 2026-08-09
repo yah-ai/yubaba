@@ -209,21 +209,49 @@ async fn reload_once(
             .collect()
     };
 
-    let resolver = match ClusterResolver::from_kek_file(sm.clone(), kek_path, SECRET_STORE_ROOT) {
-        Ok(r) => r,
+    // Load the KEK once for the pass, but build a resolver *per workload*: the
+    // R706 access check is bound to the consumer identity, so a single shared
+    // resolver would be asking on the wrong workload's behalf.
+    let kek = match crate::secrets::load_cluster_kek(kek_path) {
+        Ok(k) => k,
         Err(e) => {
             tracing::warn!(
                 error = %e,
-                "secret_reload: cannot build cluster resolver (KEK unreadable?); \
-                 skipping this rotation pass"
+                "secret_reload: cannot load the node KEK; skipping this rotation pass"
             );
             return;
         }
     };
 
     for (ident, entry) in entries {
+        let resolver = ClusterResolver::new(
+            sm.clone(),
+            kek.clone(),
+            crate::secrets::LocalFileResolver::new(SECRET_STORE_ROOT),
+            workload_spec::secrets::SecretConsumer::of(&entry.spec),
+        );
         let resolved = match resolve_secrets(&entry.file_mounts, &resolver) {
             Ok(r) => r,
+            // R706 / W294 decision 5: a rule edit that revokes a *running*
+            // workload takes effect on its next deploy, not by tearing it down
+            // mid-flight. The plaintext is already in the container's tmpfs
+            // bind, so "revoke now" means "kill the workload" — which would make
+            // a typo in an access rule a production-outage weapon. Instead the
+            // rotation stops for this workload (it will never see a newer
+            // value) and says so loudly, once per bump, distinctly from the
+            // transient arm below.
+            Err(workload_spec::secrets::SecretError::Forbidden { name }) => {
+                tracing::warn!(
+                    ident = %ident,
+                    secret = %name,
+                    workload = %entry.spec.name,
+                    "secret_reload: this workload is NO LONGER ADMITTED to a cluster secret it \
+                     currently has mounted. Its existing plaintext stays live and stops being \
+                     rotated; access actually ends on its next deploy. Redeploy or destroy it to \
+                     complete the revocation."
+                );
+                continue;
+            }
             Err(e) => {
                 // A partial replicated write (key present, cert not yet) or a
                 // decrypt failure — skip and retry on the next bump. Digest is
@@ -289,8 +317,10 @@ mod tests {
     use super::*;
 
     use kamaji::fake::FakeRuntime;
-    use openraft::storage::RaftStateMachine;
-    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
+    use openraft::entry::RaftEntry;
+    use openraft::storage::{EntryResponder, RaftStateMachine};
+    use openraft::type_config::alias::{CommittedLeaderIdOf, EntryOf, LogIdOf};
+    use openraft::vote::RaftLeaderId;
     use workload_spec::{ImageRef, MeshIdent, SecretRef, SecretTarget, TierTag, WorkloadSpec};
 
     use crate::raft::{YubabaRaftConfig, YubabaRequest, YubabaStateMachine};
@@ -340,24 +370,62 @@ mod tests {
         spec
     }
 
-    fn put_secret(index: u64, name: &str, plaintext: &[u8]) -> Entry<YubabaRaftConfig> {
-        let rec = seal_cluster_secret(&KEK, plaintext, index);
-        Entry {
-            log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
-            payload: EntryPayload::Normal(YubabaRequest::PutSecret {
+    /// The consumer identity every fixture in this module deploys as.
+    ///
+    /// **Derived from the spec, not spelled out.** `WorkloadSpec::for_forge`
+    /// names the workload `forge-<id>`, not `<id>`, so a hardcoded `"ingress"`
+    /// here silently produces a rule that admits nobody and every rotation
+    /// assertion fails for the wrong reason.
+    fn ingress_consumer() -> workload_spec::secrets::SecretConsumer {
+        workload_spec::secrets::SecretConsumer::of(&ingress_spec("ingress"))
+    }
+
+    fn ingress_access() -> workload_spec::secrets::SecretAccess {
+        workload_spec::secrets::SecretAccess::Workloads(vec![
+            workload_spec::secrets::WorkloadMatch::workload(ingress_spec("ingress").name),
+        ])
+    }
+
+    fn put_secret(index: u64, name: &str, plaintext: &[u8]) -> EntryOf<YubabaRaftConfig> {
+        let rec = seal_cluster_secret(&KEK, plaintext, index, ingress_access());
+        // openraft 0.10 builds entries through the RaftEntry trait rather than
+        // by struct literal — `Entry` gained three more generics and the
+        // committed-leader-id type now comes from the type config.
+        let log_id = LogIdOf::<YubabaRaftConfig>::new(
+            CommittedLeaderIdOf::<YubabaRaftConfig>::new(1, 1),
+            index,
+        );
+        EntryOf::<YubabaRaftConfig>::new_normal(
+            log_id,
+            YubabaRequest::PutSecret {
                 name: name.into(),
                 ciphertext: rec.ciphertext,
                 nonce: rec.nonce,
                 updated_at: rec.updated_at,
-            }),
-        }
+                access: rec.access,
+                digest: rec.digest,
+            },
+        )
+    }
+
+    /// Apply one entry to `sm`. openraft 0.10's `apply` takes a *stream* of
+    /// `EntryResponder`s rather than an iterator of entries; same shape as the
+    /// helper in `raft::store`'s own tests.
+    async fn apply_one(sm: &mut YubabaStateMachine, entry: EntryOf<YubabaRaftConfig>) {
+        let item: Result<EntryResponder<YubabaRaftConfig>, std::io::Error> = Ok((entry, None));
+        sm.apply(tokio_stream::iter(vec![item])).await.unwrap();
     }
 
     /// Compute the digest a workload's cluster File mounts resolve to against
     /// the current state — mirrors what the deploy handler seeds at registration.
     fn digest_now(sm: &YubabaStateMachine, mounts: &[SecretMount]) -> u64 {
-        let resolver =
-            ClusterResolver::from_kek_file(sm.clone(), kek_path(), SECRET_STORE_ROOT).unwrap();
+        let resolver = ClusterResolver::from_kek_file(
+            sm.clone(),
+            kek_path(),
+            SECRET_STORE_ROOT,
+            ingress_consumer(),
+        )
+        .unwrap();
         content_digest(&resolve_secrets(mounts, &resolver).unwrap())
     }
 
@@ -387,10 +455,8 @@ mod tests {
         let mut sm = YubabaStateMachine::open(tmp.path().join("raft"))
             .await
             .unwrap();
-        sm.apply([put_secret(1, CERT_KEY, b"CERT-V1")])
-            .await
-            .unwrap();
-        sm.apply([put_secret(2, KEY_KEY, b"KEY-V1")]).await.unwrap();
+        apply_one(&mut sm, put_secret(1, CERT_KEY, b"CERT-V1")).await;
+        apply_one(&mut sm, put_secret(2, KEY_KEY, b"KEY-V1")).await;
 
         // Pretend the workload was already materialized: its host tmpfs files
         // exist with the v1 material (so the test asserts a *rewrite*).
@@ -422,9 +488,7 @@ mod tests {
         );
 
         // Rotate the cert (key unchanged) → the workload's combined digest moves.
-        sm.apply([put_secret(3, CERT_KEY, b"CERT-V2-rotated")])
-            .await
-            .unwrap();
+        apply_one(&mut sm, put_secret(3, CERT_KEY, b"CERT-V2-rotated")).await;
         reload_once(&sm, &kek, &mount_root, &fake, &registry).await;
 
         assert_eq!(
@@ -461,7 +525,7 @@ mod tests {
             .await
             .unwrap();
         // Only the key is present — the cert record never replicated.
-        sm.apply([put_secret(1, KEY_KEY, b"KEY-V1")]).await.unwrap();
+        apply_one(&mut sm, put_secret(1, KEY_KEY, b"KEY-V1")).await;
 
         let mounts = vec![cert_mount(), key_mount()];
         let registry: SecretWorkloadRegistry = Default::default();

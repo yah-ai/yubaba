@@ -19,7 +19,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::floating_ip::{reconcile_assignment, FloatingIpProvider, FloatingIpState, FloatingIpTarget};
+use super::floating_ip::{
+    reconcile_assignment, FloatingIpProvider, FloatingIpState, FloatingIpTarget,
+};
 use crate::config::MachineConfig;
 use crate::envoy::floating_ip::{
     FloatingIpAssign, FloatingIpAssignInput, FloatingIpAssignOutput, FloatingIpStatus,
@@ -255,7 +257,10 @@ mod tests {
             zone: None,
             arch: None,
             bucket: None,
-            hostkey_fingerprint: None,
+            vendor: None,
+            nickname: None,
+            legacy_hostkey_fingerprint: None,
+            registration: Default::default(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -332,8 +337,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingress_owner_flip_drives_exactly_one_reassign_call() {
-        let (base, calls, handle) =
-            spawn_mock("ewr", "ewr", Some("old-instance".into())).await;
+        let (base, calls, handle) = spawn_mock("ewr", "ewr", Some("old-instance".into())).await;
         let client = VultrFloatingIp::new("test-api-key").with_base_url(base);
         let machine = ewr_machine("edge-c");
 
@@ -349,15 +353,17 @@ mod tests {
 
     #[tokio::test]
     async fn reapplying_the_same_owner_is_a_zero_call_noop() {
-        let (base, calls, handle) =
-            spawn_mock("ewr", "ewr", Some("inst-789".into())).await;
+        let (base, calls, handle) = spawn_mock("ewr", "ewr", Some("inst-789".into())).await;
         let client = VultrFloatingIp::new("test-api-key").with_base_url(base);
         let machine = ewr_machine("edge-c");
 
         let outcome = on_ingress_owner_changed(&client, &machine, "res-ip-1")
             .await
             .unwrap();
-        assert!(!outcome.reassigned, "re-applying the same owner must be a no-op");
+        assert!(
+            !outcome.reassigned,
+            "re-applying the same owner must be a no-op"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0, "must not call attach");
 
         handle.abort();
@@ -374,8 +380,15 @@ mod tests {
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("zone"), "expected a zone-mismatch error, got: {msg}");
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "region mismatch must never call attach");
+        assert!(
+            msg.contains("zone"),
+            "expected a zone-mismatch error, got: {msg}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "region mismatch must never call attach"
+        );
 
         handle.abort();
     }

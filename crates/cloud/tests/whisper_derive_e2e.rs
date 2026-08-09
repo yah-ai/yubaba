@@ -40,11 +40,13 @@ use cloud::{
     MirrorConfig, MirrorProviderSlot, MirrorShape, Provider, ProviderScope, ReconcileCtx,
     Reconciler, ServiceComponent, ServiceConfig, StaticAssetReconciler,
 };
-use velveteen_exec::executor::{ExecContext, ExecEvent, ExecOutcome, ForgeExecutor, ForgeExecutorError};
-use velveteen::{ForgeCommand, ForgeStatus};
 use tempfile::tempdir;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
+use velveteen::{ForgeCommand, ForgeStatus};
+use velveteen_exec::executor::{
+    ExecContext, ExecEvent, ExecOutcome, ForgeExecutor, ForgeExecutorError,
+};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -239,6 +241,8 @@ impl TestWorkspace {
                 schema_version: 1,
                 shape: MirrorShape::Local,
                 providers,
+                ingress: Default::default(),
+                drivers: Default::default(),
                 asset_aliases: BTreeMap::new(),
             },
             workspace_root,
@@ -261,19 +265,19 @@ impl TestWorkspace {
     /// The transform recipe is `test-copy` (written by `write_recipe`).
     fn write_workload(&self, upstream_url: &str, fetch_hash: &str, output_hash: &str) {
         let content = format!(
-            r#"[static-asset]
+            r#"kind = "static-asset"
 schema_version = "V1"
 
-[[static-asset.asset]]
+[[asset]]
 filename = "model.bin"
 blake3 = "{output_hash}"
 
-[static-asset.asset.derive.fetch]
+[asset.derive.fetch]
 url     = "{upstream_url}"
 blake3  = "{fetch_hash}"
 license = "mit"
 
-[static-asset.asset.derive.transform]
+[asset.derive.transform]
 recipe = "test-copy"
 params = {{}}
 "#

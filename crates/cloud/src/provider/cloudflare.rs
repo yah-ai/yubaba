@@ -686,6 +686,63 @@ impl CloudflareClient {
         })
     }
 
+    /// Read a tunnel's remotely-managed configuration body as raw JSON
+    /// (R594-F11).
+    ///
+    /// Returns the `result.config` object — the thing a PUT round-trips — or an
+    /// empty object when the tunnel has never been configured. Deliberately
+    /// untyped: the `ingress` list is the only key this crate owns, and every
+    /// sibling (`warp-routing`, `originRequest`, …) must survive a
+    /// read-modify-write untouched.
+    ///
+    /// Requires: `Cloudflare Tunnel: Read`.
+    pub async fn tunnel_configuration(
+        &self,
+        account_id: &str,
+        tunnel_id: &str,
+    ) -> Result<serde_json::Value> {
+        let path = format!("/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations");
+        let resp: CfSingle<serde_json::Value> = self.cf_get(&path).await?;
+        self.ok(&resp.success, &resp.errors)?;
+        let config = resp
+            .result
+            .as_ref()
+            .and_then(|r| r.get("config"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        // A tunnel configured with an explicit JSON `null` config reads back as
+        // Value::Null, which has no object to insert `ingress` into.
+        Ok(if config.is_object() {
+            config
+        } else {
+            serde_json::json!({})
+        })
+    }
+
+    /// Replace a tunnel's remotely-managed configuration (R594-F11).
+    ///
+    /// `config` is the whole config body, not a patch — Cloudflare replaces it
+    /// wholesale, which is why callers must GET-merge-PUT rather than PUT a
+    /// freshly-built list. See
+    /// [`reconciler::ingress::ensure_tunnel_ingress`](crate::reconciler::ingress::ensure_tunnel_ingress).
+    ///
+    /// Requires: `Cloudflare Tunnel: Edit`.
+    pub async fn put_tunnel_configuration(
+        &self,
+        account_id: &str,
+        tunnel_id: &str,
+        config: &serde_json::Value,
+    ) -> Result<()> {
+        #[derive(Serialize)]
+        struct ConfigBody<'a> {
+            config: &'a serde_json::Value,
+        }
+        let path = format!("/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations");
+        let resp: CfSingle<serde_json::Value> = self.cf_put(&path, &ConfigBody { config }).await?;
+        self.ok(&resp.success, &resp.errors)?;
+        Ok(())
+    }
+
     /// Create a new R2 bucket under `account_id`.
     /// Requires: `Account: Cloudflare R2: Edit`.
     pub async fn create_r2_bucket(

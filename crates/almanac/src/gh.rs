@@ -3,7 +3,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, USER_AGENT};
 use serde::Deserialize;
 
 use crate::feed::{Release, ReleaseAsset, ReleaseFeed};
-use crate::sources::{ReleaseSource, SourceError};
+use crate::sources::{decode_json, ReleaseSource, SourceError};
 
 /// Fetches releases from the GitHub Releases API.
 ///
@@ -44,7 +44,7 @@ impl ReleaseSource for GhReleases {
     async fn fetch(&self) -> Result<ReleaseFeed, SourceError> {
         let client = Self::client().map_err(SourceError::Http)?;
         let url = format!("https://api.github.com/repos/{}/releases", self.repo);
-        let resp: Vec<GhRelease> = client.get(&url).send().await?.json().await?;
+        let resp: Vec<GhRelease> = decode_json(client.get(&url).send().await?).await?;
         let releases = resp.into_iter().filter_map(into_release).collect();
         Ok(ReleaseFeed { fetched_at: Utc::now(), releases })
     }
@@ -61,7 +61,13 @@ fn into_release(gh: GhRelease) -> Option<Release> {
         platform: platform_from_filename(&a.name),
         filename: a.name,
         url: a.browser_download_url,
+        // The GitHub releases *list* endpoint carries no digest for an asset,
+        // in any algorithm — so this source publishes no hash rather than an
+        // untagged one.
+        hash: None,
+        bootstrap_hash: None,
         blake3: None,
+        sha256: None,
         license: None,
         size_bytes: Some(a.size),
     });

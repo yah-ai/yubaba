@@ -227,14 +227,14 @@ mod tests {
 
     fn workload_with_fetch_only(fetch_hash: &str, output_hash: &str) -> String {
         format!(
-            r#"[static-asset]
+            r#"kind = "static-asset"
 schema_version = "V1"
 
-[[static-asset.asset]]
+[[asset]]
 filename = "model.bin"
 blake3 = "{output_hash}"
 
-[static-asset.asset.derive.fetch]
+[asset.derive.fetch]
 url = "https://example.com/model.bin"
 blake3 = "{fetch_hash}"
 license = "mit"
@@ -244,19 +244,19 @@ license = "mit"
 
     fn workload_with_fetch_and_transform(fetch_hash: &str, output_hash: &str) -> String {
         format!(
-            r#"[static-asset]
+            r#"kind = "static-asset"
 schema_version = "V1"
 
-[[static-asset.asset]]
+[[asset]]
 filename = "model.bin"
 blake3 = "{output_hash}"
 
-[static-asset.asset.derive.fetch]
+[asset.derive.fetch]
 url = "https://example.com/model.bin"
 blake3 = "{fetch_hash}"
 license = "mit"
 
-[static-asset.asset.derive.transform]
+[asset.derive.transform]
 recipe = "quantize"
 "#
         )

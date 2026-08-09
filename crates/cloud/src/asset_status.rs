@@ -26,9 +26,21 @@ pub fn build_status_json(
     filter_app: Option<&str>,
 ) -> serde_json::Value {
     // 1. Load cloud config for the services list.
+    // R546-B12: every failure below used to be swallowed with `continue`, so a
+    // workspace whose components all failed to parse rendered identically to
+    // one that declared none. Collect them instead and surface them in the
+    // report; see the CLI's `print_asset_status_report` for the same fix on the
+    // human-facing path.
+    let mut problems: Vec<String> = Vec::new();
+
     let cfg = match CloudConfig::load(workspace_root) {
         Ok(c) => c,
-        Err(_) => return empty_report(workspace_root),
+        Err(e) => {
+            return empty_report_with_problems(
+                workspace_root,
+                vec![format!("cannot load workspace cloud config: {e}")],
+            )
+        }
     };
 
     // 2. Replay the journal.
@@ -60,23 +72,40 @@ pub fn build_status_json(
             let workload_path = workspace_root.join(&component.path).join("workload.toml");
             let src = match std::fs::read_to_string(&workload_path) {
                 Ok(s) => s,
-                Err(_) => continue,
-            };
-            let workload: workload_spec::Workload = match toml::from_str(&src) {
-                Ok(w) => w,
-                Err(_) => continue,
-            };
-            if let workload_spec::Workload::StaticAsset(saw) = workload {
-                for (alias, filename) in &saw.aliases {
-                    alias_to_asset.insert(alias.clone(), (svc_name.clone(), filename.clone()));
+                Err(e) => {
+                    problems.push(format!(
+                        "{svc_name}/{}: cannot read {}: {e}",
+                        component.id,
+                        workload_path.display()
+                    ));
+                    continue;
                 }
-                components.push((
-                    svc_name.clone(),
-                    component.id.clone(),
-                    saw.assets,
-                    saw.aliases,
-                ));
+            };
+            // `component.kind` is already checked above, so parse
+            // `StaticAssetWorkload` directly — the envelope would only re-derive
+            // a discriminator this loop already knows. (R546-B7 fixed the
+            // envelope itself; it accepts the flat on-disk shape now, so this is
+            // a shortcut rather than the workaround it started as.)
+            let saw: workload_spec::StaticAssetWorkload = match toml::from_str(&src) {
+                Ok(w) => w,
+                Err(e) => {
+                    problems.push(format!(
+                        "{svc_name}/{}: cannot parse {}: {e}",
+                        component.id,
+                        workload_path.display()
+                    ));
+                    continue;
+                }
+            };
+            for (alias, filename) in &saw.aliases {
+                alias_to_asset.insert(alias.clone(), (svc_name.clone(), filename.clone()));
             }
+            components.push((
+                svc_name.clone(),
+                component.id.clone(),
+                saw.assets,
+                saw.aliases,
+            ));
         }
     }
 
@@ -216,16 +245,21 @@ pub fn build_status_json(
         "workspace": workspace_root.display().to_string(),
         "services": services_arr,
         "apps": apps_arr,
+        "problems": problems,
     })
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-fn empty_report(workspace_root: &Path) -> serde_json::Value {
+/// R546-B12: an empty report that says WHY it is empty. `problems` is always
+/// present (empty when clean) so a consumer can distinguish "nothing declared"
+/// from "everything declared failed to load".
+fn empty_report_with_problems(workspace_root: &Path, problems: Vec<String>) -> serde_json::Value {
     serde_json::json!({
         "workspace": workspace_root.display().to_string(),
         "services": [],
         "apps": [],
+        "problems": problems,
     })
 }
 

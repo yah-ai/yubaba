@@ -34,7 +34,7 @@ use axum::{
 use serde::Deserialize;
 use tokio::sync::mpsc;
 
-use crate::config::{ConfigError, FeedLoader, OnChangeConfig};
+use crate::config::{ConfigError, FeedLoader};
 
 /// Sender half of the revalidation channel. Clone and pass into `router()`.
 pub type RevalidateTx = mpsc::Sender<String>;
@@ -136,8 +136,12 @@ async fn revalidate_handler(
                 return StatusCode::INTERNAL_SERVER_ERROR;
             }
             Ok(cfg) => {
+                // Every `on_change` variant names a service, including the
+                // render-free `reload` (R707-F4): this gate reads `on_change`
+                // for the feed's *identity*, not for what it will render, so a
+                // feed with nothing to rebuild still has to declare who owns it.
                 let bound_service = match &cfg.feed.emit.on_change {
-                    Some(OnChangeConfig::MesofactRebuild { service, .. }) => service.as_str(),
+                    Some(on_change) => on_change.service(),
                     None => {
                         tracing::warn!(
                             feed = %body.feed,
@@ -308,6 +312,50 @@ mod tests {
         let (tx, _rx) = mpsc::channel(4);
         let app = router(tx, None, Some(bind(tmp.path(), "dev-yah")));
         let resp = post_json(app,r#"{"feed":"releases"}"#).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// R707-F4: a `reload` feed has no route to render, and the gate must still
+    /// admit it. `on_change` is the mirror binding first and the action second —
+    /// a feed that rebuilds nothing is not a feed that belongs to nobody.
+    #[tokio::test]
+    async fn a_render_free_reload_feed_still_binds_and_passes() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("fleet.toml"),
+            "[feed]\nname = \"fleet\"\n\n\
+             [feed.source]\nkind = \"gh-releases\"\nrepo = \"o/r\"\n\n\
+             [feed.trigger]\nkind = \"webhook\"\n\n\
+             [feed.emit]\nartifact = \"out.json\"\n\n\
+             [feed.emit.on_change]\nkind = \"reload\"\nservice = \"yah-cloud-admin\"\n",
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let app = router(tx, None, Some(bind(tmp.path(), "yah-cloud-admin")));
+        let resp = post_json(app, r#"{"feed":"fleet"}"#).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(rx.try_recv().unwrap(), "fleet");
+    }
+
+    /// ...and the gate is still a gate for it: a `reload` bound elsewhere is
+    /// rejected exactly like a `mesofact-rebuild` bound elsewhere. Dropping
+    /// `on_change` to "simplify" a render-free feed is what would have deleted
+    /// this.
+    #[tokio::test]
+    async fn a_reload_feed_bound_to_another_service_returns_422() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("fleet.toml"),
+            "[feed]\nname = \"fleet\"\n\n\
+             [feed.source]\nkind = \"gh-releases\"\nrepo = \"o/r\"\n\n\
+             [feed.trigger]\nkind = \"webhook\"\n\n\
+             [feed.emit]\nartifact = \"out.json\"\n\n\
+             [feed.emit.on_change]\nkind = \"reload\"\nservice = \"someone-else\"\n",
+        )
+        .unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let app = router(tx, None, Some(bind(tmp.path(), "yah-cloud-admin")));
+        let resp = post_json(app, r#"{"feed":"fleet"}"#).await;
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 

@@ -562,16 +562,16 @@ mod tests {
         write_static_asset_workload(
             &root.join("comp-a"),
             &format!(
-                "[static-asset]\nschema_version = \"V1\"\n\n\
-                 [[static-asset.asset]]\nfilename = \"a/one.bin\"\nsource = \"src/one.bin\"\nblake3 = \"{HASH_64}\"\n\n\
-                 [[static-asset.asset]]\nfilename = \"a/two.bin\"\nsource = \"src/two.bin\"\nblake3 = \"{HASH_64}\"\n"
+                "kind = \"static-asset\"\nschema_version = \"V1\"\n\n\
+                 [[asset]]\nfilename = \"a/one.bin\"\nsource = \"src/one.bin\"\nblake3 = \"{HASH_64}\"\n\n\
+                 [[asset]]\nfilename = \"a/two.bin\"\nsource = \"src/two.bin\"\nblake3 = \"{HASH_64}\"\n"
             ),
         );
         write_static_asset_workload(
             &root.join("comp-b"),
             &format!(
-                "[static-asset]\nschema_version = \"V1\"\n\n\
-                 [[static-asset.asset]]\nfilename = \"b/three.bin\"\nsource = \"src/three.bin\"\nblake3 = \"{HASH_64}\"\n"
+                "kind = \"static-asset\"\nschema_version = \"V1\"\n\n\
+                 [[asset]]\nfilename = \"b/three.bin\"\nsource = \"src/three.bin\"\nblake3 = \"{HASH_64}\"\n"
             ),
         );
         let svc = svc_with_components(
@@ -596,8 +596,8 @@ mod tests {
         write_static_asset_workload(
             &root.join("assets"),
             &format!(
-                "[static-asset]\nschema_version = \"V1\"\n\n\
-                 [[static-asset.asset]]\nfilename = \"x.bin\"\nsource = \"x.bin\"\nblake3 = \"{HASH_64}\"\n"
+                "kind = \"static-asset\"\nschema_version = \"V1\"\n\n\
+                 [[asset]]\nfilename = \"x.bin\"\nsource = \"x.bin\"\nblake3 = \"{HASH_64}\"\n"
             ),
         );
         let mut svc = svc_with_components("mixed", vec![asset_component("assets", "assets")]);
@@ -632,7 +632,7 @@ mod tests {
         std::fs::create_dir_all(root.join("oops")).unwrap();
         std::fs::write(
             root.join("oops/workload.toml"),
-            "[almanac]\nschema_version = \"V1\"\ncommand = \"true\"\ncadence = \"once\"\n",
+            "kind = \"almanac\"\nschema_version = \"V1\"\ncommand = \"true\"\ncadence = \"once\"\n",
         )
         .unwrap();
         let svc = svc_with_components("oops", vec![asset_component("oops", "oops")]);

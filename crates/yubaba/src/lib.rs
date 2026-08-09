@@ -163,16 +163,16 @@
 //! @yah:verify("test ! -f crates/yah/yubaba/src/runtime/fake.rs  # orphaned dup deleted")
 //! @yah:verify("! grep -r 'yubaba::runtime::ContainerRuntime\\|yubaba::runtime::containerd::\\|yubaba::runtime::fake::\\|yubaba::runtime::docker::\\|yubaba::constable_client::' crates/yah/yubaba/src/ crates/yah/yubaba/tests/ crates/yah/yubaba-test-harness/src/ app/yah/  # no remaining shim refs in source")
 //!
-//! @yah:ticket(R556-F7-T3, "yubaba: advertise local scryer in /services discovery (one entry, no proxy)")
+//! @yah:ticket(R556-T10, "yubaba: advertise local scryer in /services discovery (one entry, no proxy)")
 //! @yah:status(review)
 //! @yah:at(2026-06-30T06:24:56Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:phase(P1)
-//! @yah:parent(R556-F7)
+//! @yah:parent(R556)
 //! @yah:next("When kamaji is running a scryer on this node, add a /services entry: {name:'scryer', endpoint:'http://<tailnet-ip>:6543', capabilities:['events.query','events.aggregate'], managed_by:'kamaji'} per W264 §Discovery. Existing get_services route at oss/yubaba/crates/yubaba/src/lib.rs:579.")
 //! @yah:next("Endpoint discovery entry is tag-gated (it leaks endpoint location); the data-path ACL stays at scryer's HTTP listener (W264 §Trust boundary).")
 //! @yah:next("No proxy route — yubaba is not in the query data path. Consumers connect to scryer directly using the advertised endpoint.")
-//! @yah:next("Sequencing gotcha: ship scryer's HTTP listener (R556-F7-T2) before this entry resolves to a live endpoint.")
+//! @yah:next("Sequencing gotcha: ship scryer's HTTP listener (R556-T9) before this entry resolves to a live endpoint.")
 //! @yah:next("Tier: Thief — single discovery entry added to an existing surface; rote integration, no novel logic.")
 //! @arch:see(.yah/docs/working/W264-kamaji-managed-scryer.md)
 //!
@@ -276,9 +276,9 @@
 //! @yah:next("tag:build-worker on us-west-015: this ticket removes the deploy-path blocker, but adding the tag still needs the node on 0.8.20 + a docker daemon reachable by the runtime account (per R626-F1's note). Separate infra step.")
 //!
 //! @yah:relay(R635, "Rename acme-engine (squatted on crates.io at 0.4.0) to a yah- name; unblocks yubaba publish")
-//! @yah:at(2026-07-23T03:25:03Z)
-//! @yah:status(open)
-//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:status(review)
+//! @yah:at(2026-07-24T05:00:55Z)
+//! @yah:assignee(bundle-anthropic-miravel)
 //! @yah:parent(Q538)
 //! @yah:next("Verified against the crates.io sparse index 2026-07-22: `acme-engine` exists but holds only 0.4.0, published by an unrelated project. Our oss/passway crate declares 0.8.20, so the version can never resolve from the registry — root Cargo.toml already calls this bridge 'load-bearing until (if ever) we publish under our own name'.")
 //! @yah:next("This is the SOLE remaining blocker on publishing the `yubaba` crate (R542). Everything else yubaba depends on is already on crates.io at 0.8.20: yah-workload-spec, yah-local-driver, kamaji, kamaji-proto, mshr, and yubaba-client (publishable as of R542).")
@@ -286,10 +286,39 @@
 //! @yah:next("Then fill description/keywords/categories on the renamed crate, cargo publish --dry-run --allow-dirty -p <name>, and hand back to R542 to flip yubaba's publish flag.")
 //! @yah:verify("cargo publish --dry-run --allow-dirty -p <renamed acme crate> exits 0")
 //! @yah:verify("cargo check -p yubaba (from oss/yubaba) is clean after the rename")
+//! @yah:handoff("VERIFIED COMPLETE — the rename landed in commit ebfdd3f2 (already in the tree, not authored by this session). oss/passway/crates/acme-engine now packages as `passway-acme` (name chosen by the operator, scoped like kamaji-proto/srcgraph-core) with `[lib] name = \"acme_engine\"`, so zero .rs changed at any consumer.")
+//! @yah:handoff("Consumers alias via `package =`: root Cargo.toml [patch.crates-io] key `passway-acme = { path = \"oss/passway/crates/acme-engine\" }` (Cargo.toml:737), oss/yubaba/Cargo.toml's sibling patch key (line 35), and yubaba's own dependency line `acme-engine = { package = \"passway-acme\", version = \"0.8.21\" }` (oss/yubaba/crates/yubaba/Cargo.toml:85).")
+//! @yah:handoff("Description/keywords/categories were already filled on the renamed crate (acme-engine/Cargo.toml:13-15). yubaba's Cargo.toml carries no publish=false — the R542 gate is cleared, per its own in-manifest comment at line 11-14.")
+//! @yah:handoff("This session's contribution: found the work already landed but not reflected on the board, re-verified all three claims (sparse-index 404, publish --dry-run, cargo check) fresh, and closes the loop so R542 (blocked_by R635) can proceed.")
+//! @yah:handoff("Tree anchor at handoff: ccee2a6b17b85dc6c9ffc42fcf4e528120a83673 — the shared tree as I left it. Diff against it (`git diff ccee2a6b17b85dc6c9ffc42fcf4e528120a83673..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:next("Nothing further needed on this ticket's side — R542 can proceed once this lands in review.")
+//! @yah:verify("crates.io sparse index confirms passway-acme genuinely free: https://index.crates.io/pa/ss/passway-acme -> 404, re-checked 2026-07-24")
+//! @yah:verify("cargo publish --dry-run --allow-dirty -p passway-acme (from oss/passway) — packages, verifies, compiles, exits 0")
+//! @yah:verify("cargo check -p yubaba (from oss/yubaba) — clean, 0 errors")
 
 pub mod acme_issuer;
 pub mod cheers_client;
+/// The cluster-compatibility epochs this build declares (W275 / R625-F2) —
+/// `cluster_protocol` (wire) and `state_epoch` (on-disk), read at compile time
+/// from the same `cluster-epochs.json` the release manifest is built from.
+pub mod cluster_epoch;
+/// The camp-RPC lane of the yah control plane (R609-F2): serve a
+/// workspace's `yah camp --stdio` JSON-RPC to a NodeId dial, so a desktop
+/// reaches a BYO VPS exactly as it reaches a managed rig. Opt-in via
+/// `serve --camp-rpc-root <PATH>`.
+pub mod camp_rpc;
+/// The deployment-wide rules this cluster runs under — voter admission,
+/// external-ingress ownership, raft timings — named as a value instead of
+/// hardcoded at the sites that obey them (R118-T9).
+pub mod cluster_policy;
+/// The yah control plane (R609-F1): an `mshr::Endpoint` bound on this
+/// machine's hostkey, so yah-aware callers dial the node by `NodeId` over
+/// NAT-punched QUIC instead of by IP/SSH. Opt-in via `serve --control-plane`.
+pub mod control_plane;
 pub mod deploy;
+/// The "is that node still there?" port and its default raft-heartbeat impl
+/// (R118-T9). Deployments with a second evidence channel supply their own.
+pub mod failure_detector;
 pub mod identity;
 pub mod leader;
 pub mod litestream;
@@ -312,7 +341,7 @@ use axum::{
     http::StatusCode,
     middleware::{self, Next},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use openraft::async_runtime::watch::WatchReceiver;
@@ -323,6 +352,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cheers_client::CheersClient;
+use cluster_policy::{ClusterPolicy, PromotionVerdict};
+use failure_detector::FailureDetector;
 use kamaji::sibling::KamajiClient;
 use kamaji::Kamaji as ContainerRuntime;
 use workload_spec::LifecycleArchetype;
@@ -402,6 +433,18 @@ pub struct ServerState {
     /// Directory for `compose.yml` + `Caddyfile` (R040-F7).
     /// Defaults to [`DEFAULT_COMPOSE_DIR`]; override in tests via a tempdir.
     pub compose_dir: PathBuf,
+    /// R646-B1: where `download_headscale_binary` fetches the headscale binary
+    /// from. `None` (the default) means the upstream GitHub release URL for the
+    /// requested version — see [`headscale_linux_download_url`].
+    ///
+    /// Exists because `/headscale/deploy` and `/headscale/bootstrap` otherwise
+    /// pull ~30MB off the public internet on the request path, which made every
+    /// test touching those routes both slow and network-dependent: their outcome
+    /// flipped between 200 and 500 with the weather, and against a client with a
+    /// request timeout (`cloud_client`'s 5s) it surfaced as a transport error
+    /// rather than as either. Tests point this at a `file://` fixture, which
+    /// keeps the real curl/chmod/systemd path under test with a local source.
+    pub headscale_download_url: Option<String>,
     /// R556-F7-T3: local scryer endpoint advertised via `/services`.
     ///
     /// Set to the kamaji-managed scryer's tailnet-bound HTTP base URL (e.g.
@@ -417,6 +460,25 @@ pub struct ServerState {
     /// `GET /mesh/leader-health` to check "am I the current leader?"
     /// without re-passing the ID through every handler.
     pub node_id: Option<raft::YubabaNodeId>,
+
+    /// R118-T9: the rules this cluster runs under — whether learners can be
+    /// promoted to voters, whether the raft leader carries the cluster's
+    /// external identity, and what network the raft timers are sized for.
+    ///
+    /// Every decision point reads the *field* that answers its question; there
+    /// is deliberately nothing here that says which preset built the value, so
+    /// no handler can grow an `if this_is_a_gallery` branch. Defaults to
+    /// [`ClusterPolicy::fleet`] — the behaviour yubaba had before the policy
+    /// was named. See [`cluster_policy`] for why this shape.
+    pub cluster_policy: ClusterPolicy,
+
+    /// R118-T9: how this node answers "is that peer still there?".
+    ///
+    /// `None` until wired (`main.rs` attaches a
+    /// [`RaftHeartbeatDetector`](failure_detector::RaftHeartbeatDetector)
+    /// whenever raft is configured). `GET /raft/status` omits its liveness
+    /// section rather than guessing when no detector is attached.
+    pub failure_detector: Option<Arc<dyn FailureDetector>>,
 
     /// R600-F6 (W273): read handle to the raft-replicated cluster-secret map
     /// (R600-F1/F2), used at admission to resolve `SecretRef::Cluster` File
@@ -611,10 +673,82 @@ pub struct ServerState {
     /// `GET /pond/state?ident=...` to drive its adopt path.
     pub pond_registry: Arc<pond::PondRegistry>,
 
+    /// R594-F3/F6: upstream-discovery read-model — serving workload →
+    /// mesh-IP:port + health, for an ingress proxy to consume. Always
+    /// present; populated by `deploy_workload_spec`, retracted by
+    /// `destroy_workload`, and health-refreshed by
+    /// [`service_records::run`]'s sweep.
+    ///
+    /// Backed by a port ledger beside `identity.json` (see
+    /// [`service_records`] §The port ledger) so records survive a yubaba
+    /// restart without redeploying every serving workload — ports are
+    /// admission-time knowledge that `list_workloads()` cannot re-derive.
+    pub service_records: Arc<service_records::ServiceRecords>,
+
+    /// R609-F1: the yah control-plane endpoint, bound on this machine's
+    /// hostkey so yah-aware callers can dial it by `NodeId` (see
+    /// [`control_plane`]). `None` unless the daemon was started with
+    /// `serve --control-plane` — single-node dev and the containerized pond
+    /// path have no use for it and shouldn't pay for a second socket.
+    ///
+    /// Held here rather than dropped into the accept task so later phases
+    /// have a handle to it: R609-F2's desktop RPC surface registers a second
+    /// ALPN on this same endpoint, and `/identity` reads its presence to
+    /// advertise that the node is dialable at all.
+    pub control_plane: Option<mshr::Endpoint>,
+
+    /// R609-F2: which lanes [`control_plane`] is actually serving on that
+    /// endpoint. Kept alongside the endpoint so `/identity` advertises
+    /// exactly the ALPNs a caller may dial — derived from the same value
+    /// that built the handler map, never re-stated.
+    pub control_plane_planes: control_plane::Planes,
+
     /// Monotonically increasing counter for stub mesh-IP allocation.
     /// Allocates from `100.64.0.1` upward (CGNAT range per RFC 6598).
     /// Replaced by raft-consensus assignment in R091-F6.
     next_mesh_ip: AtomicU32,
+
+    /// This **node's own** mesh address — the one yubaba itself is bound to
+    /// (R599-F12). Set from `--bind` in `main.rs`; `None` when yubaba is bound
+    /// to loopback, to `0.0.0.0`, or to a non-IP host, i.e. whenever there is
+    /// no mesh IP plane to place anything on.
+    ///
+    /// Distinct from [`Self::alloc_mesh_ip`], and the distinction is the whole
+    /// point: an allocated address belongs to *one workload* and is only
+    /// meaningful to a backend that gives the workload its own network
+    /// namespace. A **natively forked** workload — the W272 bundle path — is a
+    /// plain host process, so the only address it can successfully bind is one
+    /// the node already holds. That is this one.
+    node_mesh_ip: Option<std::net::Ipv4Addr>,
+}
+
+/// Extract this node's own mesh address from a `--bind` argument (R599-F12).
+///
+/// Accepts `"<ip>:<port>"` or a bare `"<ip>"`. Returns `None` — meaning "this
+/// node has no mesh IP plane, keep binding loopback" — for anything a workload
+/// could not usefully be reached at from another node:
+///
+/// - `0.0.0.0` / `[::]`: a wildcard is not an address anything can be told to
+///   dial, and handing it to a native workload would publish a bind that is
+///   also reachable on the node's *public* interface.
+/// - loopback: the pre-R599-F12 behaviour, and correct on a dev host.
+/// - a hostname, or an IPv6 address: the mesh plane is IPv4 (`100.64.0.0/10`),
+///   and `MeshAssignment.mesh_ip` is an `Ipv4Addr`.
+fn parse_node_mesh_ip(bind: &str) -> Option<std::net::Ipv4Addr> {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    let ip = bind
+        .parse::<SocketAddr>()
+        .ok()
+        .map(|s| s.ip())
+        .or_else(|| bind.parse::<std::net::IpAddr>().ok())?;
+    let std::net::IpAddr::V4(v4) = ip else {
+        return None;
+    };
+    if v4 == Ipv4Addr::UNSPECIFIED || v4.is_loopback() {
+        return None;
+    }
+    Some(v4)
 }
 
 impl std::fmt::Debug for ServerState {
@@ -647,6 +781,10 @@ impl std::fmt::Debug for ServerState {
             .field(
                 "pond_local_runtime_configured",
                 &self.pond_local_runtime.is_some(),
+            )
+            .field(
+                "control_plane_node_id",
+                &self.control_plane.as_ref().map(|ep| ep.node_id()),
             )
             .finish()
     }
@@ -697,14 +835,26 @@ impl ServerState {
                 }
             }
         }
+        // R594-F6: the port ledger lives beside the hostkey/identity file, in
+        // the same operator-provisioned state dir (`--state`'s parent), so it
+        // inherits that directory's systemd StateDirectory grant rather than
+        // needing a second writable path.
+        let service_records = Arc::new(service_records::ServiceRecords::with_ledger(
+            hostkey_dir_for(&state_path).join(service_records::LEDGER_FILE_NAME),
+        ));
+
         Ok(Self {
             state_path,
             state: Mutex::new(state),
+            service_records,
             headscale_dir: PathBuf::from(DEFAULT_HEADSCALE_DIR),
             compose_dir: PathBuf::from(DEFAULT_COMPOSE_DIR),
+            headscale_download_url: None,
             scryer_endpoint: None,
             raft: None,
             node_id: None,
+            cluster_policy: ClusterPolicy::default(),
+            failure_detector: None,
             secret_state: None,
             cluster_kek_path: PathBuf::from(secrets::CLUSTER_KEK_PATH),
             secret_mount_root: PathBuf::from(deploy::secret_mount::DEFAULT_SECRET_MOUNT_ROOT),
@@ -727,9 +877,59 @@ impl ServerState {
             prometheus_url: std::env::var("YAH_PROMETHEUS_URL").ok(),
             pond_local_runtime: None,
             pond_registry: Arc::new(pond::PondRegistry::new()),
+            control_plane: None,
+            control_plane_planes: control_plane::Planes::default(),
             // Start at 100.64.0.1 (first usable in the CGNAT /10 pool).
             next_mesh_ip: AtomicU32::new(u32::from_be_bytes([100, 64, 0, 1])),
+            node_mesh_ip: None,
         })
+    }
+
+    /// Record this node's own mesh address, derived from the `--bind` argument
+    /// (R599-F12). See [`ServerState::node_mesh_ip`] for why a natively forked
+    /// workload needs this rather than an allocated per-workload address.
+    ///
+    /// Only a genuinely node-local unicast address counts: loopback,
+    /// `0.0.0.0`, and a non-IP host all mean "no mesh plane here", and are
+    /// stored as `None` so kamaji keeps the pre-R599-F12 loopback bind.
+    pub fn with_bind_addr(mut self, bind: &str) -> Self {
+        self.node_mesh_ip = parse_node_mesh_ip(bind);
+        self
+    }
+
+    /// This node's own mesh address, if it has one.
+    pub fn node_mesh_ip(&self) -> Option<std::net::Ipv4Addr> {
+        self.node_mesh_ip
+    }
+
+    /// The directory this node's hostkey — and therefore mshr's identity
+    /// file, and therefore the control-plane `NodeId` — lives in, derived
+    /// from the `--state` path. Exposed so the binary can bind the
+    /// control-plane endpoint on the same key `load` generated, rather than
+    /// re-deriving the convention at the call site (R609-F1).
+    pub fn hostkey_dir(&self) -> PathBuf {
+        hostkey_dir_for(&self.state_path)
+    }
+
+    /// R609-F1: attach the yah control-plane endpoint. Its `NodeId` is this
+    /// machine's hostkey, so callers dial the node by the same `node_id`
+    /// `GET /identity` reports.
+    pub fn with_control_plane(mut self, endpoint: mshr::Endpoint) -> Self {
+        self.control_plane = Some(endpoint);
+        self
+    }
+
+    /// R609-F2: attach the endpoint together with the lanes it serves, so
+    /// `/identity` can advertise the camp-RPC ALPN only when that lane is
+    /// actually handled.
+    pub fn with_control_plane_planes(
+        mut self,
+        endpoint: mshr::Endpoint,
+        planes: control_plane::Planes,
+    ) -> Self {
+        self.control_plane = Some(endpoint);
+        self.control_plane_planes = planes;
+        self
     }
 
     /// R374-F4: register the docker-CLI runtime yubaba uses to drive the
@@ -1053,6 +1253,31 @@ impl ServerState {
         self
     }
 
+    /// Set the [`ClusterPolicy`] this deployment runs under (R118-T9).
+    ///
+    /// Static for the life of the process — chosen by the operator at startup
+    /// (`yubaba serve --cluster-profile`), never negotiated with peers. The raft
+    /// node must be opened with the *same* policy, since its timings configure
+    /// openraft itself; see [`raft::open`].
+    pub fn with_cluster_policy(mut self, policy: ClusterPolicy) -> Self {
+        self.cluster_policy = policy;
+        self
+    }
+
+    /// Attach the [`FailureDetector`] this node answers liveness questions with
+    /// (R118-T9).
+    ///
+    /// Wired in `main.rs` to a [`RaftHeartbeatDetector`] whenever raft is
+    /// configured. A deployment with a second evidence channel (a local radio
+    /// link, a management network) supplies its own implementation here instead
+    /// of patching the raft view.
+    ///
+    /// [`RaftHeartbeatDetector`]: failure_detector::RaftHeartbeatDetector
+    pub fn with_failure_detector(mut self, detector: Arc<dyn FailureDetector>) -> Self {
+        self.failure_detector = Some(detector);
+        self
+    }
+
     /// Set this node's raft node ID — needed by [`GET /mesh/leader-health`].
     pub fn with_node_id(mut self, id: raft::YubabaNodeId) -> Self {
         self.node_id = Some(id);
@@ -1144,6 +1369,15 @@ impl ServerState {
         self
     }
 
+    /// R646-B1: override where the headscale binary is downloaded from, so a
+    /// test can exercise `/headscale/deploy` and `/headscale/bootstrap` without
+    /// reaching the internet. `url` is passed to `curl` verbatim, so a
+    /// `file://` path to a fixture works; see [`ServerState::headscale_download_url`].
+    pub fn with_headscale_download_url(mut self, url: impl Into<String>) -> Self {
+        self.headscale_download_url = Some(url.into());
+        self
+    }
+
     /// R556-F7-T3: advertise a local scryer at `url` via `/services`.
     /// Called by kamaji once it's brought the scryer service up on this node;
     /// `url` is scryer's tailnet-bound base URL (e.g. `http://100.64.0.7:6543`).
@@ -1170,6 +1404,12 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/identity", get(get_identity))
         .route("/node", get(get_node))
         .route("/node/usage", get(get_node_usage))
+        // R646: the open half of the telemetry surface — a producer publishes
+        // domain metrics this node cannot measure for itself (audio xruns, BLE
+        // advert rate) and they merge flat into `/node/usage`.
+        .route("/node/metrics", post(report_node_metrics))
+        .route("/node/metrics", get(get_node_metrics))
+        .route("/node/metrics/{source}", delete(withdraw_node_metrics))
         .route("/register-hostkey", post(register_hostkey))
         .route("/headscale/deploy", post(headscale_deploy))
         .route("/headscale/bootstrap", post(headscale_bootstrap))
@@ -1177,6 +1417,8 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         // R040-F21: Cloudflare healthcheck — 200 iff raft leader + headscale running
         .route("/mesh/leader-health", get(mesh_leader_health))
         // R040-F7: service management (R040-era compose path, superseded by /workloads)
+        // R706 (W294): metadata only — name, updated_at, access-rule summary.
+        .route("/secrets", get(list_secrets))
         .route("/services", get(get_services))
         .route("/compose", post(deploy_compose))
         // R091-F1: WorkloadSpec-based orchestration (replaces compose path)
@@ -1223,11 +1465,22 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         // (dynamic membership). `/raft/initialize` only founds a fresh cluster;
         // this is the join-an-existing-cluster path a macOS fleet node takes.
         .route("/raft/add-learner", post(raft_add_learner))
+        // R118-T9: the counterpart — promote a caught-up learner to voter, if
+        // the cluster policy's VoterAdmission allows it (the fleet's does not).
+        .route("/raft/promote-voter", post(raft_promote_voter))
         .route("/raft/write", post(raft_write))
         .route("/raft/transfer-leader", post(raft_transfer_leader))
         // R608-B11: openraft-native TransferLeader message — the leader's
         // RaftNetworkV2 posts here so the target campaigns at once.
         .route("/raft/transfer-leader-msg", post(raft_transfer_leader_msg))
+        // R594-F8: upstream discovery for an ingress proxy. `?ready=true`
+        // filters to routable records. Read-only, same mesh-bound posture as
+        // GET /workloads — this is the sovereign twin of the rented arm's
+        // "generate tunnel ingress rules from deployed workloads" API call.
+        .route(
+            service_records::DISCOVERY_PATH,
+            get(service_records::get_service_records),
+        )
         // R374-F2: pond (sim-tier mesofact-static) status surface
         .route("/pond/deploy", post(pond::deploy))
         .route("/pond/teardown", post(pond::teardown))
@@ -1377,6 +1630,7 @@ pub async fn serve(addr: &str, state: Arc<ServerState>) -> Result<()> {
     .with_context(|| format!("binding {addr}"))?;
     let local = listener.local_addr().ok();
     tracing::info!(addr = ?local, "yah-yubaba listening");
+    tokio::spawn(service_records::run(Arc::clone(&state)));
     axum::serve(listener, build_router(state))
         .await
         .context("axum::serve")
@@ -1391,6 +1645,10 @@ pub async fn serve_on_listener(
 ) -> Result<()> {
     let local = listener.local_addr().ok();
     tracing::info!(addr = ?local, "yah-yubaba listening (embedded)");
+    // R594-F6: same refresh sweep as `serve`. Spawned here rather than in
+    // `build_router` because the router is also built by tests, which want no
+    // background task; both real entry points are exactly these two.
+    tokio::spawn(service_records::run(Arc::clone(&state)));
     axum::serve(listener, build_router(state))
         .await
         .context("axum::serve")
@@ -1425,6 +1683,29 @@ struct HealthBody {
     /// probe that only reads `status` cannot tell those apart; this field is
     /// how it can.
     hostkey: &'static str,
+    /// Wire-compatibility epoch this build speaks
+    /// ([`cluster_epoch::CLUSTER_PROTOCOL`]) — may a node running this binary
+    /// sit in one raft cluster with a node running some other build. Two nodes
+    /// may mix iff these are equal (W275 "Cluster compatibility epochs").
+    ///
+    /// This is here because a **version string cannot answer that question**.
+    /// yubaba went 0.8.18 → 0.8.20 — a patch-looking bump — while the raft
+    /// snapshot route and payload changed underneath, and two different builds
+    /// both call themselves `0.8.20`. `.yah/infra/machines/*.toml` records only
+    /// the version, no build SHA, so today the only way to tell which protocol
+    /// a live voter speaks is to probe `/raft/snapshot` vs
+    /// `/raft/install-snapshot` and read the 404. This field replaces that
+    /// guesswork with a declaration (R625-F4).
+    ///
+    /// Always `Some` on a build that carries R625; the executor sees `None` from
+    /// an *older* node, and must treat that as **unproven**, never as a match.
+    cluster_protocol: u32,
+    /// On-disk state epoch ([`cluster_epoch::STATE_EPOCH`]) — can this binary
+    /// read the previous binary's raft log/snapshot, and can you roll *back* to
+    /// it. Tracked separately from `cluster_protocol` on purpose: openraft
+    /// 0.9→0.10 broke both at once, and one combined flag would have hidden the
+    /// rollback hazard (W275 §5 "Roll-back is symmetric").
+    state_epoch: u32,
 }
 
 async fn health(State(s): State<Arc<ServerState>>) -> Json<HealthBody> {
@@ -1432,6 +1713,8 @@ async fn health(State(s): State<Arc<ServerState>>) -> Json<HealthBody> {
         status: "ok",
         name: env!("CARGO_PKG_NAME"),
         version: env!("CARGO_PKG_VERSION"),
+        cluster_protocol: cluster_epoch::CLUSTER_PROTOCOL,
+        state_epoch: cluster_epoch::STATE_EPOCH,
         mode: if s.raft.is_some() {
             "clustered"
         } else {
@@ -1504,6 +1787,62 @@ async fn get_node_usage(
     Json(s.node_probe.usage(q.window_ms, committed).await)
 }
 
+/// `POST /node/metrics` — publish domain metrics this node cannot measure.
+///
+/// The open half of the telemetry surface. yubaba knows how to read CPU,
+/// memory and disk; it has no idea what an audio xrun is, and hardcoding a
+/// struct for every consumer's domain would grow a private telemetry path per
+/// downstream. A producer instead publishes `{source, metrics, ttl_ms}` here
+/// and the keys merge flat into `GET /node/usage` beside the built-in ones.
+///
+/// The body **replaces** that source's previous set, so a metric the producer
+/// stops sending disappears rather than pinning its last value. `ttl_ms`
+/// bounds how long the values are trusted if the producer goes silent — see
+/// [`node::DomainMetrics`] for why a dead producer must stop reading healthy.
+///
+/// 204 on success. 400 names the offending source or key: the producer is
+/// remote, and the response body is the only debugging channel it has.
+async fn report_node_metrics(
+    State(s): State<Arc<ServerState>>,
+    Json(report): Json<node::MetricReport>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    match s.node_probe.domain().report(report) {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )),
+    }
+}
+
+/// `GET /node/metrics` — just the domain-metric contribution to `/node/usage`.
+///
+/// Same keys the usage payload carries, without the machine measurements.
+/// Exists because verifying a push should not cost a CPU sampling window:
+/// `/node/usage` sleeps for the sample interval, and a producer confirming its
+/// own publish landed has no reason to pay for that.
+async fn get_node_metrics(
+    State(s): State<Arc<ServerState>>,
+) -> Json<std::collections::BTreeMap<String, serde_json::Value>> {
+    Json(s.node_probe.domain().snapshot())
+}
+
+/// `DELETE /node/metrics/{source}` — withdraw a source immediately.
+///
+/// The clean-shutdown path: a producer that knows it is going away says so,
+/// rather than leaving its scope to look slow for a TTL and stale for twenty
+/// more. 204 if it was there, 404 if it wasn't.
+async fn withdraw_node_metrics(
+    State(s): State<Arc<ServerState>>,
+    axum::extract::Path(source): axum::extract::Path<String>,
+) -> StatusCode {
+    if s.node_probe.domain().withdraw(&source) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
 #[derive(Serialize)]
 struct IdentityBody {
     hostkey_fingerprint: String,
@@ -1511,6 +1850,27 @@ struct IdentityBody {
     /// Hex-encoded mshr NodeId — same key as `hostkey_fingerprint`, added by
     /// R593-T2 so `/identity` reports the mshr machine identity directly.
     node_id: String,
+    /// R609-F1: ALPN of this node's yah control-plane listener, present
+    /// **only** when one is actually bound (`serve --control-plane`).
+    ///
+    /// `node_id` alone can't tell a caller whether the node is dialable over
+    /// iroh — every node has one, because it is the hostkey. This field is
+    /// the advertisement: present means "you may dial `node_id` on this
+    /// ALPN"; absent means the node is HTTP-only and a dial would hang until
+    /// it timed out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    control_plane_alpn: Option<String>,
+
+    /// R609-F2: ALPN of this node's camp-RPC lane, present **only** when
+    /// the operator enabled it (`serve --camp-rpc-root <PATH>`).
+    ///
+    /// Separate from `control_plane_alpn` rather than folded into a list
+    /// because they answer different questions: the control ALPN says "this
+    /// node is dialable at all", this one says "and it will serve you a
+    /// camp". A desktop that sees the first but not the second should show
+    /// the node as reachable and its camps as SSH-only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    camp_rpc_alpn: Option<String>,
 }
 
 async fn get_identity(State(s): State<Arc<ServerState>>) -> Result<Json<IdentityBody>, StatusCode> {
@@ -1526,6 +1886,19 @@ async fn get_identity(State(s): State<Arc<ServerState>>) -> Result<Json<Identity
                 hostkey_fingerprint: id.hostkey_fingerprint,
                 algorithm: id.algorithm,
                 node_id,
+                control_plane_alpn: s
+                    .control_plane
+                    .as_ref()
+                    .map(|_| control_plane::CONTROL_PLANE_ALPN_STR.to_string()),
+                // `camp_rpc_lane()`, not `camp_rpc`: a lane withheld for
+                // want of an admission policy (R609-F3) is not served, and
+                // advertising it would send a desktop into a dial that
+                // fails at ALPN negotiation.
+                camp_rpc_alpn: s.control_plane.as_ref().and_then(|_| {
+                    s.control_plane_planes
+                        .camp_rpc_lane()
+                        .map(|_| camp_rpc::CAMP_RPC_ALPN_STR.to_string())
+                }),
             }))
         }
         None => Err(StatusCode::NOT_FOUND),
@@ -2098,9 +2471,24 @@ async fn deploy_non_container(
             .into_response();
     };
 
-    match kamaji.deploy_envelope(&id, &workload).await {
+    // R599-F12: hand kamaji this node's own mesh address so the forked serve
+    // process binds something reachable from another node, instead of the
+    // loopback it was previously pinned to. A native workload is a plain host
+    // process with no namespace of its own, so an *allocated* per-workload
+    // address (`alloc_mesh_ip`) would simply fail to bind — the node address is
+    // the only correct answer here. `None` (dev host, `0.0.0.0`) keeps the
+    // loopback bind.
+    let mesh = s
+        .node_mesh_ip
+        .map(crate::mesh::MeshAssignment::stub);
+
+    match kamaji.deploy_envelope(&id, &workload, mesh.as_ref()).await {
         Ok(()) => {
-            tracing::info!(ident = %ident, "bundle workload deployed via kamaji");
+            tracing::info!(
+                ident = %ident,
+                bind_ip = ?s.node_mesh_ip,
+                "bundle workload deployed via kamaji"
+            );
             (
                 StatusCode::ACCEPTED,
                 Json(serde_json::json!({
@@ -2263,7 +2651,7 @@ async fn deploy_workload_spec(
         // it (GET /workloads/{ident}/produced) and reaps it on destroy. Also
         // opportunistically sweep stale produced dirs so orphans (a run whose
         // consumer never came back) don't accumulate unbounded.
-        ensure_durable_produced_dirs(&spec).await;
+        ensure_forge_state_dirs(&spec).await;
         sweep_stale_produced_dirs().await;
 
         // R600-F6 (W273): materialize File-target secret mounts into per-workload
@@ -2294,10 +2682,17 @@ async fn deploy_workload_spec(
                     )
                         .into_response();
                 };
+                // R706 (W294): bind the resolver to THIS spec's identity, so
+                // every cluster secret it reads is checked against the record's
+                // access rule. The consumer is derived from the spec yubaba is
+                // about to run — not from anything the caller asserts — so a
+                // hand-rolled deploy cannot claim to be a workload it isn't
+                // without also actually being deployed under that name.
                 match crate::secrets::ClusterResolver::from_kek_file(
                     sm.clone(),
                     &s.cluster_kek_path,
                     crate::secrets::SECRET_STORE_ROOT,
+                    workload_spec::secrets::SecretConsumer::of(&spec),
                 ) {
                     Ok(r) => Box::new(r),
                     Err(e) => {
@@ -2528,7 +2923,9 @@ async fn deploy_workload_spec(
                 let mut resp_json = serde_json::json!({
                     "status": "deployed",
                     "ident": ident,
-                    "container_id": result.container_id,
+                    // Borrowed, not moved — `result` is read again below to
+                    // publish the service record (R594-F6).
+                    "container_id": &result.container_id,
                     "mesh_ip": result.mesh_ip.to_string(),
                 });
                 if let Some(key) = preauthkey {
@@ -2565,6 +2962,27 @@ async fn deploy_workload_spec(
                         cpu_millis: spec.resources.cpu_millis,
                     },
                 );
+                // R594-F6: publish the upstream-discovery record. This is the
+                // one moment yubaba holds both halves at once — the spec's
+                // declared mesh ports and the mesh IP the backend just
+                // assigned — and `list_workloads()` carries no ports, so
+                // nothing downstream can re-derive this later (see
+                // `service_records` §The port ledger). Also writes the ledger,
+                // so the record survives a yubaba restart.
+                //
+                // Gated on a non-empty port list: a workload exposing no mesh
+                // ports can never be an ingress upstream, and admitting one
+                // would only pad the registry (and its ledger) with entries no
+                // proxy can dial — which on a qed forge node is most of them.
+                // The else-arm matters for a *redeploy* that drops its ports:
+                // without it the previous generation's record would linger and
+                // advertise a port this generation no longer serves.
+                if !spec.expose.mesh.ports.is_empty() {
+                    s.service_records
+                        .upsert_deployed(&spec, result.mesh_ip, &result.container_id);
+                } else {
+                    s.service_records.retract(&mesh_ident);
+                }
                 return (StatusCode::CREATED, Json(resp_json)).into_response();
             }
             Err(e) => {
@@ -2667,6 +3085,12 @@ async fn destroy_workload(
     // counting against `yah.committed.*` or the node slowly reports itself
     // full while sitting idle.
     s.workload_resources.lock().unwrap().remove(&ident);
+    // R594-F6: stop advertising it as an ingress upstream, and drop it from
+    // the port ledger so it does not come back on the next boot. Retract
+    // rather than delete: the record stays queryable as `Retracted` for
+    // diagnostics, and `is_ready()` — the only thing a proxy routes on — is
+    // already false. No-op when the ident was never a serving workload.
+    s.service_records.retract(&mesh_ident);
 
     // Revoke the cheers ownership row (if registered).
     let row_id = s.ownership_rows.lock().unwrap().remove(&ident);
@@ -2841,23 +3265,32 @@ async fn get_produced_file(
 /// deploy. Bounds unbounded accumulation of orphaned build tars on the worker.
 const PRODUCED_RETENTION: std::time::Duration = std::time::Duration::from_secs(60 * 60 * 24 * 3);
 
-/// Create the host-persistent produced dir(s) a forge spec declares, so runc
-/// can bind them — the OCI mapper never mkdirs a Bind source and runc refuses a
+/// Create the host-persistent state dir(s) a forge spec declares, so runc can
+/// bind them — the OCI mapper never mkdirs a Bind source and runc refuses a
 /// bind with a missing source. Best-effort: a failure is logged, not fatal (the
 /// deploy proceeds and surfaces the bind failure with its own error).
-async fn ensure_durable_produced_dirs(spec: &workload_spec::WorkloadSpec) {
-    let dir = std::path::Path::new(workload_spec::forge_produced::CONTAINER_DIR);
+///
+/// R636-B1 widened this from "the produced dir" to "any bind under the forge
+/// state root" ([`workload_spec::forge_state`]). Matching on one hardcoded
+/// container path meant every *other* forge mount had to rediscover, on a live
+/// box and minutes into a build, that nothing creates its host dir — which is
+/// exactly how the first offloaded `build-image` step died on
+/// `/var/lib/yah/qed/build-out`. The prefix check is also the security bound:
+/// a spec can only get yubaba to mkdir inside qed's own state root.
+async fn ensure_forge_state_dirs(spec: &workload_spec::WorkloadSpec) {
     for vol in &spec.volumes {
-        if vol.target == dir {
-            if let workload_spec::VolumeSource::Bind { host_path } = &vol.source {
-                if let Err(e) = tokio::fs::create_dir_all(host_path).await {
-                    tracing::warn!(
-                        dir = %host_path.display(),
-                        error = %e,
-                        "failed to create durable produced dir; forge bind mount may fail"
-                    );
-                }
-            }
+        let workload_spec::VolumeSource::Bind { host_path } = &vol.source else {
+            continue;
+        };
+        if !workload_spec::forge_state::is_forge_state_path(host_path) {
+            continue;
+        }
+        if let Err(e) = tokio::fs::create_dir_all(host_path).await {
+            tracing::warn!(
+                dir = %host_path.display(),
+                error = %e,
+                "failed to create forge state dir; forge bind mount may fail"
+            );
         }
     }
 }
@@ -3246,7 +3679,11 @@ async fn headscale_deploy(
     })?;
 
     // Download headscale binary (Linux-only; this binary runs on Hetzner machines).
-    let bin_path = download_headscale_binary(dir, &req.headscale_version)?;
+    let bin_path = download_headscale_binary(
+        dir,
+        &req.headscale_version,
+        s.headscale_download_url.as_deref(),
+    )?;
 
     // Write + start the systemd unit — best-effort on non-systemd hosts (tests, Mac).
     let svc_ok = write_and_start_headscale_unit(&bin_path, dir);
@@ -3459,7 +3896,7 @@ async fn headscale_bootstrap(
 
     // Headscale auto-generates its private/noise keys + an empty SQLite DB on
     // first `serve`; there is no state to transplant.
-    let bin_path = download_headscale_binary(dir, &version)?;
+    let bin_path = download_headscale_binary(dir, &version, s.headscale_download_url.as_deref())?;
     let svc_ok = write_and_start_headscale_unit(&bin_path, dir);
 
     // Create the default user + mint a reusable preauth key via the local
@@ -3593,12 +4030,20 @@ fn allow_headscale_ports() {
 
 /// Download the headscale binary into `dir` and mark it executable.
 /// Shared by `headscale_deploy` (state transfer) and `headscale_bootstrap`.
+///
+/// `url_override` is [`ServerState::headscale_download_url`]: when set it
+/// replaces the upstream release URL entirely (tests pass a `file://` fixture),
+/// and `version` is then unused.
 fn download_headscale_binary(
     dir: &std::path::Path,
     version: &str,
+    url_override: Option<&str>,
 ) -> Result<PathBuf, (StatusCode, String)> {
     let bin_path = dir.join("headscale");
-    let dl_url = headscale_linux_download_url(version);
+    let dl_url = match url_override {
+        Some(u) => u.to_string(),
+        None => headscale_linux_download_url(version),
+    };
     let curl_ok = std::process::Command::new("curl")
         .args(["-fsSL", "-o", &bin_path.to_string_lossy(), &dl_url])
         .status()
@@ -3901,13 +4346,55 @@ async fn raft_transfer_leader_msg(
     ))
 }
 
+/// `GET /secrets` — cluster-secret **index** (R706 / W294).
+///
+/// Names, last-write timestamps, access-rule summaries, and keyed digests
+/// (R720-F1) for every cluster secret in this node's raft replica. Never
+/// ciphertext, never plaintext — see
+/// [`raft::YubabaStateMachine::cluster_secret_index`] for why the digest is
+/// safe to serve while the ciphertext is not.
+///
+/// Backs `yah cloud secret ls`, and is how an operator confirms a rule actually
+/// landed on the fleet rather than only in the camp's declaration file.
+async fn list_secrets(State(s): State<Arc<ServerState>>) -> impl IntoResponse {
+    let Some(sm) = &s.secret_state else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "this node is not part of a raft cluster (no cluster state)",
+            })),
+        )
+            .into_response();
+    };
+    let secrets: Vec<serde_json::Value> = sm
+        .cluster_secret_index()
+        .into_iter()
+        .map(|(name, updated_at, access, digest)| {
+            serde_json::json!({
+                "name": name,
+                "updated_at": updated_at,
+                "access": access,
+                "digest": digest,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "secrets": secrets })).into_response()
+}
+
 /// `GET /raft/status` — human-readable cluster state.
+///
+/// Carries a `liveness` section when a [`FailureDetector`] is attached
+/// (R118-T9): membership tells you which peers the cluster *believes* in, and
+/// liveness tells you which of them anything has actually heard from and how
+/// long ago. The section is absent — never faked — when no detector is wired,
+/// and its `peers` map is empty on a node whose detector has no view (the
+/// raft-heartbeat detector only sees acknowledgements on the leader).
 async fn raft_status(
     State(s): State<Arc<ServerState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let raft = require_raft!(s);
     let metrics = raft.metrics().borrow_watched().clone();
-    Ok(Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "node_id": metrics.id,
         "state": format!("{:?}", metrics.state),
         "current_leader": metrics.current_leader,
@@ -3915,7 +4402,30 @@ async fn raft_status(
         "last_log_index": metrics.last_log_index,
         "last_applied": metrics.last_applied,
         "membership_config": metrics.membership_config,
-    })))
+    });
+
+    if let Some(detector) = &s.failure_detector {
+        let peers: serde_json::Map<String, serde_json::Value> = detector
+            .observe()
+            .await
+            .into_iter()
+            .map(|(node, obs)| {
+                (
+                    node.to_string(),
+                    serde_json::json!({
+                        "state": obs.liveness.as_str(),
+                        "silent_for_ms": obs.silent_for_ms,
+                    }),
+                )
+            })
+            .collect();
+        body["liveness"] = serde_json::json!({
+            "channel": detector.channel(),
+            "peers": peers,
+        });
+    }
+
+    Ok(Json(body))
 }
 
 /// `POST /raft/initialize` request — founding membership for a fresh cluster.
@@ -3978,11 +4488,15 @@ struct RaftAddLearnerRequest {
 /// learner receives full log/snapshot replication (so it holds the complete
 /// cluster state — service placement, secrets, rollout mirror — and can serve
 /// linearizable-free local reads) but does **not** vote and does **not** count
-/// toward quorum. Promotion to voter (openraft `change_membership`) is a
-/// separate, deliberate step and is intentionally NOT exposed here: a macOS
-/// home-lab fleet node stays a learner so a flaky residential-network box can
-/// never endanger the cloud voters' quorum (dovetails with the R569-F4 taint
-/// intent — schedulable, but never cluster-critical).
+/// toward quorum.
+///
+/// Promotion to voter is a separate, deliberate step ([`raft_promote_voter`])
+/// governed by [`VoterAdmission`](cluster_policy::VoterAdmission) — under the
+/// fleet policy it is refused outright, so a macOS home-lab node stays a
+/// learner and a flaky residential-network box can never endanger the cloud
+/// voters' quorum (dovetails with the R569-F4 taint intent — schedulable, but
+/// never cluster-critical). Until R118-T9 that rule lived only in this
+/// paragraph; it is now a field on [`ClusterPolicy`].
 ///
 /// Must be called on the current **leader** (only the leader can change
 /// membership). A follower returns 421 Misdirected with openraft's
@@ -4014,6 +4528,113 @@ async fn raft_add_learner(
             StatusCode::MISDIRECTED_REQUEST,
             format!(
                 "add-learner must be called on the raft leader; forward to leader \
+                 {:?} at {:?}",
+                fwd.leader_id, fwd.leader_node
+            ),
+        )),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+/// `POST /raft/promote-voter` request — promote a caught-up learner (R118-T9).
+#[derive(Deserialize)]
+struct RaftPromoteVoterRequest {
+    /// The learner's raft node id. It must already be in membership (added via
+    /// [`raft_add_learner`]) — promotion never introduces a node.
+    node_id: raft::YubabaNodeId,
+}
+
+/// `POST /raft/promote-voter` — promote an existing learner to a voter, if the
+/// cluster policy allows it (R118-T9, closing the R625-S1/R608 thread).
+///
+/// The counterpart to [`raft_add_learner`]. Whether this is allowed at all is
+/// read from [`ClusterPolicy::voter_admission`] rather than decided here: under
+/// the fleet's [`LearnerOnly`] rule every request is refused with 403 and an
+/// explanation, so the fixed founding voter set is preserved; a policy that
+/// permits promotion allows it up to its voter cap.
+///
+/// [`LearnerOnly`]: cluster_policy::VoterAdmission::LearnerOnly
+///
+/// Must be called on the current **leader** (only the leader changes
+/// membership); a follower answers 421 Misdirected with the forward hint.
+/// Status codes:
+/// - `200` — promoted, or already a voter (idempotent).
+/// - `400` — the node is not in membership at all; add it as a learner first.
+/// - `403` — refused by cluster policy. Permanent under this policy, not a retry.
+/// - `421` — not the leader; retarget at the leader named in the body.
+///
+/// The membership change is `AddVoterIds`, which upgrades an existing learner
+/// in place and leaves every other voter untouched — openraft drives the joint
+/// consensus, so quorum is never reduced below the original voter set at any
+/// point in the transition.
+async fn raft_promote_voter(
+    State(s): State<Arc<ServerState>>,
+    Json(body): Json<RaftPromoteVoterRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let raft = require_raft!(s);
+    let node = body.node_id;
+
+    let membership = raft
+        .metrics()
+        .borrow_watched()
+        .membership_config
+        .membership()
+        .clone();
+    let voters: Vec<raft::YubabaNodeId> = membership.voter_ids().collect();
+    let is_voter = voters.contains(&node);
+    let known = membership.nodes().any(|(id, _)| *id == node);
+
+    // A node the cluster has never heard of cannot be promoted — that would be
+    // an add disguised as an upgrade, skipping the log catch-up that makes a
+    // learner safe to hand a vote to.
+    if !known && !is_voter {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "node {node} is not in this cluster's membership; add it as a learner \
+                 (POST /raft/add-learner) and let it catch up before promoting it"
+            ),
+        ));
+    }
+
+    match s
+        .cluster_policy
+        .voter_admission
+        .judge(node, voters.len(), is_voter)
+    {
+        PromotionVerdict::AlreadyVoter => {
+            return Ok(Json(serde_json::json!({
+                "promoted": false,
+                "already_voter": true,
+                "node_id": node,
+                "voters": voters,
+            })));
+        }
+        PromotionVerdict::Refuse(reason) => return Err((StatusCode::FORBIDDEN, reason)),
+        PromotionVerdict::Promote => {}
+    }
+
+    let change = openraft::ChangeMembers::AddVoterIds(std::collections::BTreeSet::from([node]));
+    match raft.change_membership(change, false).await {
+        Ok(resp) => {
+            let voters: Vec<raft::YubabaNodeId> = resp
+                .membership()
+                .as_ref()
+                .map(|m| m.voter_ids().collect())
+                .unwrap_or_default();
+            tracing::info!(node_id = node, ?voters, "promoted learner to voter");
+            Ok(Json(serde_json::json!({
+                "promoted": true,
+                "node_id": node,
+                "voters": voters,
+            })))
+        }
+        Err(openraft::error::RaftError::APIError(
+            openraft::error::ClientWriteError::ForwardToLeader(fwd),
+        )) => Err((
+            StatusCode::MISDIRECTED_REQUEST,
+            format!(
+                "promote-voter must be called on the raft leader; forward to leader \
                  {:?} at {:?}",
                 fwd.leader_id, fwd.leader_node
             ),
@@ -4615,6 +5236,151 @@ mod tests {
         assert_eq!(body["yah.committed.cpu_millis"], 750);
     }
 
+    /// R646: the end-to-end producer path. A consumer publishes metrics yubaba
+    /// has no idea how to measure, and they come back out of `/node/usage`
+    /// beside the built-in ones — the whole point of the metric set being open
+    /// rather than a hardcoded struct per downstream.
+    #[tokio::test]
+    async fn published_domain_metrics_come_back_out_of_node_usage() {
+        let (_tmp, state) = fresh_state();
+        let app = build_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/node/metrics")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "source": "plinth-3",
+                            "metrics": {
+                                "noisetable.audio.xruns": 4,
+                                "noisetable.audio.deadline_misses": 0,
+                                "noisetable.ble.advert_hz": 9.5
+                            },
+                            "ttl_ms": 30000
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let body = body_json(
+            app.clone()
+                .oneshot(
+                    Request::get("/node/usage?window_ms=50")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        // Flat siblings of the machine measurements, not nested.
+        assert_eq!(body["noisetable.audio.xruns"], 4);
+        assert_eq!(body["noisetable.audio.deadline_misses"], 0);
+        assert_eq!(body["noisetable.ble.advert_hz"], 9.5);
+        assert_eq!(body["yah.metrics.plinth-3.stale"], false);
+        assert!(body["yah.metrics.plinth-3.age_ms"].is_number());
+        // The built-in half is untouched by the merge.
+        assert!(body["yah.cpu.source"].is_string());
+        assert_eq!(body["yah.committed.memory_mb"], 0);
+
+        // `GET /node/metrics` is the same contribution without paying for a
+        // CPU sampling window — the confirm-my-push path.
+        let only = body_json(
+            app.clone()
+                .oneshot(Request::get("/node/metrics").body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(only["noisetable.audio.xruns"], 4);
+        assert!(only.get("yah.cpu.source").is_none());
+
+        // Clean withdrawal removes the keys at once; a second one is a 404.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::delete("/node/metrics/plinth-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::delete("/node/metrics/plinth-3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let after = body_json(
+            app.oneshot(Request::get("/node/metrics").body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(after, serde_json::json!({}));
+    }
+
+    /// A rejected publish must name what was wrong in the response body: the
+    /// producer is remote and this is the only debugging channel it has.
+    #[tokio::test]
+    async fn a_reserved_metric_key_is_refused_with_a_named_400() {
+        let (_tmp, state) = fresh_state();
+        let app = build_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/node/metrics")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "source": "rogue",
+                            "metrics": { "system.cpu.utilization": 0.0 }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = body_json(resp).await;
+        assert!(
+            err["error"]
+                .as_str()
+                .unwrap()
+                .contains("system.cpu.utilization"),
+            "{err}"
+        );
+
+        // Nothing was written, so the real measurement is still the only
+        // `system.cpu.utilization` in the payload.
+        let usage = body_json(
+            app.oneshot(
+                Request::get("/node/usage?window_ms=50")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert!(usage.get("yah.metrics.sources").is_none());
+    }
+
     /// `GET /workloads` carries each workload's declared resource request.
     /// This is the field the scheduler's missing bin-packer needs; without it
     /// `committed` can only ever be a node-wide total.
@@ -4770,6 +5536,114 @@ mod tests {
         );
     }
 
+    /// R609-F1: `node_id` alone can't tell a caller whether the node is
+    /// dialable over iroh — every node has one, because it IS the hostkey.
+    /// A node started without `--control-plane` must therefore omit the
+    /// advertisement, so a desktop reading `/identity` doesn't dial into a
+    /// timeout.
+    #[tokio::test]
+    async fn identity_omits_the_control_plane_advert_when_none_is_bound() {
+        let (_tmp, state) = fresh_state();
+        assert!(state.control_plane.is_none());
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(Request::get("/identity").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(
+            body.get("control_plane_alpn").is_none(),
+            "an HTTP-only node must not advertise a control-plane ALPN: {body}"
+        );
+    }
+
+    /// The other half: with an endpoint bound, `/identity` advertises the
+    /// ALPN **and** the advertised `node_id` is the endpoint's own — i.e.
+    /// the value a caller reads here is the value it dials, not a
+    /// fingerprint that merely looks like one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identity_advertises_the_bound_control_plane() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = ServerState::load(tmp.path().join("identity.json")).unwrap();
+        let endpoint = control_plane::bind(&state.hostkey_dir()).await.unwrap();
+        let endpoint_node_id = endpoint.node_id().to_string();
+        let state = state.with_control_plane(endpoint.clone());
+        let app = build_router(Arc::new(state));
+
+        let resp = app
+            .oneshot(Request::get("/identity").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["control_plane_alpn"],
+            control_plane::CONTROL_PLANE_ALPN_STR
+        );
+        assert_eq!(
+            body["node_id"], endpoint_node_id,
+            "the advertised node_id must be the endpoint's own — otherwise \
+             the advert points somewhere undialable"
+        );
+
+        endpoint.close().await;
+    }
+
+    /// R609-F3: `/identity` advertises the camp-RPC lane only when the lane
+    /// is actually served. An ungated endpoint withholds it (admitting a
+    /// camp-RPC dial spawns a process), and advertising a withheld lane
+    /// would send a desktop into an ALPN negotiation that fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn identity_withholds_the_camp_rpc_advert_until_admission_gates_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let camp_rpc = Some(camp_rpc::CampRpcConfig {
+            yah_bin: "yah".into(),
+            roots: vec![tmp.path().to_path_buf()],
+        });
+
+        let ungated = control_plane::Planes {
+            camp_rpc: camp_rpc.clone(),
+            admission: control_plane::Admission::AllowAll,
+            ..control_plane::Planes::default()
+        };
+        let state = ServerState::load(tmp.path().join("identity.json")).unwrap();
+        let endpoint = control_plane::bind(&state.hostkey_dir()).await.unwrap();
+        let state = state.with_control_plane_planes(endpoint.clone(), ungated);
+        let body = body_json(
+            build_router(Arc::new(state))
+                .oneshot(Request::get("/identity").body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            body.get("camp_rpc_alpn").is_none(),
+            "an ungated node must not advertise a lane it refuses to serve: {body}"
+        );
+
+        let gated = control_plane::Planes {
+            camp_rpc,
+            admission: control_plane::Admission::entitled(
+                control_plane::Entitlement::new().allow(endpoint.node_id()),
+            ),
+            ..control_plane::Planes::default()
+        };
+        let state = ServerState::load(tmp.path().join("identity.json")).unwrap();
+        let state = state.with_control_plane_planes(endpoint.clone(), gated);
+        let body = body_json(
+            build_router(Arc::new(state))
+                .oneshot(Request::get("/identity").body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["camp_rpc_alpn"], camp_rpc::CAMP_RPC_ALPN_STR);
+
+        endpoint.close().await;
+    }
+
     #[tokio::test]
     async fn register_then_identity_returns_fingerprint() {
         let (_tmp, state) = fresh_state();
@@ -4888,14 +5762,33 @@ mod tests {
         assert!(caps.iter().any(|c| c == "events.aggregate"));
     }
 
+    /// R646-B1: write a throwaway stand-in for the headscale binary into `dir`
+    /// and return the `file://` URL for it. Paired with
+    /// `with_headscale_download_url`, this keeps the `/headscale/deploy` and
+    /// `/headscale/bootstrap` tests off the public internet — they used to curl
+    /// a ~30MB GitHub release on every run, which made them slow and made their
+    /// pass/fail depend on the network rather than on the code.
+    fn headscale_fixture_url(dir: &std::path::Path) -> String {
+        let fixture = dir.join("headscale-fixture-binary");
+        std::fs::write(&fixture, HEADSCALE_FIXTURE_BYTES).unwrap();
+        format!("file://{}", fixture.display())
+    }
+
+    const HEADSCALE_FIXTURE_BYTES: &[u8] = b"#!/bin/sh\n# not really headscale\nexit 0\n";
+
     #[tokio::test]
     async fn headscale_deploy_writes_files_to_headscale_dir() {
-        let (_tmp, state_base) = fresh_state();
+        let (tmp, state_base) = fresh_state();
         // Override headscale_dir to a temp directory so we don't touch /etc.
         let headscale_tmp = tempfile::TempDir::new().unwrap();
+        let dl_url = headscale_fixture_url(tmp.path());
         let state = {
             let state_raw = Arc::try_unwrap(state_base).unwrap();
-            Arc::new(state_raw.with_headscale_dir(headscale_tmp.path()))
+            Arc::new(
+                state_raw
+                    .with_headscale_dir(headscale_tmp.path())
+                    .with_headscale_download_url(dl_url),
+            )
         };
 
         let app = build_router(state);
@@ -4921,8 +5814,11 @@ mod tests {
             .await
             .unwrap();
 
-        // The response may fail at the curl/systemctl step, but files must be written first.
-        // We check status is either 200 (files+systemd ok) or 500 (curl/systemd unavailable).
+        // The download now comes from a local fixture, so the only remaining
+        // environment-dependent step is systemd — and that one is best-effort
+        // (`write_and_start_headscale_unit` returns false rather than erroring).
+        // 500 stays accepted for a host whose curl lacks the `file` protocol;
+        // either way the state files below must already be on disk.
         let status = resp.status();
         assert!(
             status.is_success() || status == StatusCode::INTERNAL_SERVER_ERROR,
@@ -4978,6 +5874,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// R646-B1: the anti-regression for the download seam itself. The two tests
+    /// above only assert on files the handler writes *before* the download, so
+    /// they'd still pass if `headscale_download_url` were silently ignored and
+    /// the handler went back to curling GitHub. This one reads the downloaded
+    /// binary back: it can only hold the fixture bytes if the override reached
+    /// `download_headscale_binary`.
+    #[tokio::test]
+    async fn headscale_deploy_downloads_from_url_override() {
+        let (tmp, state_base) = fresh_state();
+        let headscale_tmp = tempfile::TempDir::new().unwrap();
+        let dl_url = headscale_fixture_url(tmp.path());
+        let state = {
+            let state_raw = Arc::try_unwrap(state_base).unwrap();
+            Arc::new(
+                state_raw
+                    .with_headscale_dir(headscale_tmp.path())
+                    .with_headscale_download_url(dl_url),
+            )
+        };
+        let app = build_router(state);
+
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let req_body = serde_json::json!({
+            "headscale_version": "0.23.0",
+            "db_base64": engine.encode(b"test-db"),
+            "private_key_base64": engine.encode(b"test-private-key"),
+            "noise_key_base64": engine.encode(b"test-noise-key"),
+            "acl_policy": "---\nacls: []",
+            "server_url": "https://mesh.example.com"
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/headscale/deploy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "deploy from a local fixture should not fail at the download step"
+        );
+
+        let downloaded = headscale_tmp.path().join("headscale");
+        assert_eq!(
+            std::fs::read(&downloaded).unwrap(),
+            HEADSCALE_FIXTURE_BYTES,
+            "handler curled something other than the override URL"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&downloaded).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "downloaded binary not made executable");
+        }
     }
 
     #[tokio::test]
@@ -5038,11 +5994,16 @@ mod tests {
 
     #[tokio::test]
     async fn headscale_bootstrap_writes_config_before_start() {
-        let (_tmp, state_base) = fresh_state();
+        let (tmp, state_base) = fresh_state();
         let headscale_tmp = tempfile::TempDir::new().unwrap();
+        let dl_url = headscale_fixture_url(tmp.path());
         let state = {
             let state_raw = Arc::try_unwrap(state_base).unwrap();
-            Arc::new(state_raw.with_headscale_dir(headscale_tmp.path()))
+            Arc::new(
+                state_raw
+                    .with_headscale_dir(headscale_tmp.path())
+                    .with_headscale_download_url(dl_url),
+            )
         };
         let app = build_router(state);
 
@@ -5111,6 +6072,62 @@ mod tests {
             body.get("kamaji_version").is_none(),
             "kamaji_version must be omitted under in-process fallback, got {body}"
         );
+    }
+
+    // ── cluster compatibility epochs on /health (R625-F4) ────────────────────
+
+    #[tokio::test]
+    async fn health_declares_both_cluster_compatibility_epochs() {
+        // The point of the field: a version string cannot say which raft
+        // protocol a node speaks (two different builds both called "0.8.20"),
+        // so the rolling-upgrade preflight needs the node to *declare* it.
+        let (_tmp, state) = fresh_state();
+        let app = build_router(state);
+        let resp = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // Both present, both integers — NOT skip_serializing_if. A build that
+        // carries R625 always declares; only an older node omits them, and the
+        // executor treats that omission as unproven.
+        assert_eq!(
+            body["cluster_protocol"],
+            serde_json::json!(cluster_epoch::CLUSTER_PROTOCOL),
+            "got {body}"
+        );
+        assert_eq!(
+            body["state_epoch"],
+            serde_json::json!(cluster_epoch::STATE_EPOCH),
+            "got {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_epochs_come_from_the_declaration_file_not_the_version() {
+        // Guard against someone "simplifying" these into a derivation of
+        // CARGO_PKG_VERSION — the entire premise of W275's epoch addendum is
+        // that the compatibility boundary is NOT the product version.
+        let (_tmp, state) = fresh_state();
+        let app = build_router(state);
+        let resp = app
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let declared: serde_json::Value =
+            serde_json::from_str(include_str!("../cluster-epochs.json")).unwrap();
+        assert_eq!(body["cluster_protocol"], declared["cluster_protocol"]);
+        assert_eq!(body["state_epoch"], declared["state_epoch"]);
     }
 
     // ── compose (R040-F7) ────────────────────────────────────────────────────
@@ -6539,7 +7556,9 @@ mod bundle_deploy_tests {
                 digest: workload_spec::BlakeHash(digest.to_string()),
                 runtime: "self".into(),
                 lifecycle: workload_spec::BundleLifecycle::KeepAlive,
+                port: None,
             }),
+            revalidate_receiver: None,
         })
     }
 
@@ -6551,21 +7570,92 @@ mod bundle_deploy_tests {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
-    /// The externally-tagged envelope is what a bundle deploy must send. Pinning
-    /// the wire shape here because it is easy to get wrong: `Workload` has NO
-    /// `serde(tag = "kind")`, so the JSON nests under the variant name rather
-    /// than carrying a flat `kind` field.
+    /// The envelope shape a bundle deploy must send. Pinned here because it is
+    /// easy to get wrong, and because it CHANGED under R546-B7: `Workload` now
+    /// hand-writes `Serialize`/`Deserialize` and branches on
+    /// `is_human_readable`, so JSON is *internally* tagged on `kind` (the flat
+    /// on-disk shape) while postcard stays externally tagged (the kamaji UDS
+    /// shape R590-B3 established). This test previously asserted external
+    /// tagging for JSON and was invalidated by that change; both halves are
+    /// pinned now so a future single-shape "simplification" fails loudly on
+    /// whichever half it drops.
     #[test]
-    fn bundle_workload_json_is_externally_tagged() {
-        let json = serde_json::to_value(bundle_workload(&"a".repeat(64))).unwrap();
-        assert!(
-            json.get("mesofact-static").is_some(),
-            "expected external tagging under \"mesofact-static\", got {json}"
+    fn bundle_workload_is_kind_tagged_in_json_and_variant_indexed_on_the_wire() {
+        let w = bundle_workload(&"a".repeat(64));
+
+        let json = serde_json::to_value(&w).unwrap();
+        assert_eq!(
+            json.get("kind").and_then(|k| k.as_str()),
+            Some("mesofact-static"),
+            "JSON/TOML is internally tagged on `kind` (R546-B7), got {json}"
         );
         assert!(
-            json.get("kind").is_none(),
-            "Workload is NOT internally tagged — a flat `kind` field would not round-trip"
+            json.get("mesofact-static").is_none(),
+            "the human-readable shape is flat, not nested under the variant name"
         );
+        assert_eq!(
+            serde_json::from_value::<workload_spec::Workload>(json).unwrap(),
+            w,
+            "the shape yubaba's deploy handler parses must be the one it emits"
+        );
+
+        // The binary half — the actual frame that crosses the kamaji UDS,
+        // carrying R599-F12's mesh assignment alongside the envelope.
+        let frame = kamaji_proto::YubabaToKamaji::Deploy {
+            request_id: kamaji_proto::RequestId(1),
+            id: kamaji_proto::WorkloadId::new("yah-marketing"),
+            spec: w.clone(),
+            mesh: Some(kamaji_proto::MeshAssignment {
+                mesh_ip: std::net::Ipv4Addr::new(100, 64, 0, 3),
+                wg_private_key: String::new(),
+                wg_listen_port: 0,
+                peers: vec![],
+                netns_name: None,
+            }),
+        };
+        let bytes = kamaji_proto::encode_frame(&frame).unwrap();
+        let (decoded, _) =
+            kamaji_proto::decode_frame::<kamaji_proto::YubabaToKamaji>(&bytes).expect(
+                "postcard must stay externally tagged; internal tagging needs \
+                 deserialize_any, which postcard refuses (R590-B3)",
+            );
+        assert_eq!(decoded, frame);
+    }
+
+    /// R599-F12: which address a bundle deploy tells kamaji to bind.
+    ///
+    /// This is deliberately derived from `--bind` and *not* from
+    /// [`ServerState::alloc_mesh_ip`]. A bundle is a natively forked host
+    /// process with no network namespace of its own, so it can only bind an
+    /// address the node already holds; an allocated per-workload address would
+    /// fail with "Address not available". The wildcard and loopback cases must
+    /// stay `None` — a wildcard bind would also publish the site on the node's
+    /// *public* interface.
+    #[test]
+    fn the_node_mesh_address_comes_from_the_bind_flag_not_the_ip_allocator() {
+        use std::net::Ipv4Addr;
+
+        let (_tmp, s) = state();
+        let mesh = Arc::try_unwrap(s)
+            .map(|s| s.with_bind_addr("100.64.0.3:7443"))
+            .unwrap_or_else(|_| unreachable!("sole owner"));
+        assert_eq!(mesh.node_mesh_ip(), Some(Ipv4Addr::new(100, 64, 0, 3)));
+        // The allocator hands out a *different* address entirely — one that
+        // belongs to a workload, not to this node.
+        assert_ne!(mesh.alloc_mesh_ip(), Ipv4Addr::new(100, 64, 0, 3));
+
+        for no_mesh_plane in ["0.0.0.0:7443", "127.0.0.1:7443", "localhost:7443", "[::]:7443"] {
+            let (_t, s) = state();
+            let s = Arc::try_unwrap(s)
+                .map(|s| s.with_bind_addr(no_mesh_plane))
+                .unwrap_or_else(|_| unreachable!("sole owner"));
+            assert_eq!(
+                s.node_mesh_ip(),
+                None,
+                "{no_mesh_plane} is not an address another node can dial — \
+                 kamaji must keep binding loopback"
+            );
+        }
     }
 
     /// A bare `WorkloadSpec` must still parse as `Container`: every deployed

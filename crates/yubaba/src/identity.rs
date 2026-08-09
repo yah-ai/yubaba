@@ -310,13 +310,27 @@ pub fn load_state(path: &Path) -> Result<StateOnDisk> {
 /// before the atomic `rename` onto the target, and remove the temp on any
 /// error so a failed write never leaves `.tmp` residue beside the state file.
 pub fn save_state(path: &Path, state: &StateOnDisk) -> Result<()> {
+    atomic_write_json(path, state)
+}
+
+/// Write `value` as pretty JSON to `path`, atomically, creating parent dirs.
+///
+/// Extracted from [`save_state`] (R594-F6) so the service-record port ledger —
+/// the other small JSON file yubaba keeps beside `identity.json` — inherits the
+/// same durability properties instead of growing a second, subtly-different
+/// copy of this dance. See [`save_state`]'s doc for why the temp name is
+/// pid+counter and not a wall clock.
+pub(crate) fn atomic_write_json<T: serde::Serialize + ?Sized>(
+    path: &Path,
+    value: &T,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
     }
-    let content = serde_json::to_string_pretty(state).context("serializing state")?;
+    let content = serde_json::to_string_pretty(value).context("serializing state")?;
 
     // Unique temp name in the target's directory (same filesystem, so the
     // final `rename` is atomic): file name + pid + a process-monotonic seq.

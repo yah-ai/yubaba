@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cloud::provider::HetznerDriver;
+use yubaba::cluster_policy::ClusterPolicy;
 use yubaba::runtime::DummyRuntime;
 use yubaba_test_harness::{test_cluster, Cluster};
 
@@ -81,13 +82,14 @@ async fn spawn_joiner(id: u64) -> Joiner {
 
     // Open the raft node but never initialise it — it comes up as a lone,
     // uninitialised member waiting to be established by a leader's AppendEntries.
-    let raft = yubaba::raft::open(id, raft_dir)
+    let raft = yubaba::raft::open(id, raft_dir, &ClusterPolicy::fleet())
         .await
         .expect("open joiner raft node");
 
     let state = yubaba::ServerState::load(state_path)
         .expect("load joiner state")
         .with_runtime(Arc::new(DummyRuntime))
+        .with_cluster_policy(ClusterPolicy::fleet())
         .with_raft(raft)
         .with_node_id(id);
     let router = yubaba::build_router(Arc::new(state));

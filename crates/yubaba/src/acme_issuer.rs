@@ -39,6 +39,7 @@ use crate::raft::{
     SecretRecord, YubabaNodeId, YubabaRaft, YubabaRequest, YubabaResponse, YubabaStateMachine,
 };
 use crate::secrets::{load_cluster_kek, seal_cluster_secret, CLUSTER_KEK_PATH};
+use workload_spec::secrets::SecretAccess;
 
 /// How often the issuer polls while the fleet still has **no** cert — a cold
 /// start should mint the first cert within a minute of the issuer node winning
@@ -116,6 +117,10 @@ pub struct IssuerConfig {
     pub issue: IssueConfig,
     /// Node-local cluster KEK path — seals cert+key before `PutSecret`.
     pub kek_path: PathBuf,
+    /// R706 (W294): who may mount the issued cert+key. Stamped onto both
+    /// `SecretRecord`s so the fleet cert is not a bearer secret. Required
+    /// config — see [`parse_issuer_config`].
+    pub access: SecretAccess,
     /// Steady-state poll cadence (renewal checks) once a cert exists.
     pub check_interval: Duration,
     /// TTL on the issuer lock. Must exceed `check_interval` so the holder renews
@@ -152,6 +157,21 @@ pub fn parse_issuer_config(
     let zone_id = get("YUBABA_ACME_DNS01_CLOUDFLARE_ZONE_ID")
         .filter(|s| !s.trim().is_empty())
         .ok_or("YUBABA_ACME_DNS01_CLOUDFLARE_ZONE_ID is required")?;
+    // R706 (W294): the issuer is the one writer of a cluster secret that is not
+    // driven by an operator command, so it is the one place where an unruled
+    // record could appear by omission. There is deliberately NO default: a
+    // permissive default would make the fleet cert's private key a bearer
+    // secret again, and a deny-all default would silently produce a cert nobody
+    // can mount. Required config, rejected at parse time either way.
+    let access = parse_consumers(
+        &get("YUBABA_ACME_CONSUMERS").unwrap_or_default(),
+    )
+    .ok_or(
+        "YUBABA_ACME_CONSUMERS is required when YUBABA_ACME_DOMAIN is set: a \
+         comma-separated list of workload names allowed to mount the issued \
+         cert+key (e.g. \"ingress\"), or the literal \"any\" to store them \
+         unrestricted",
+    )?;
 
     let directory = AcmeDirectory::parse(
         &get("YUBABA_ACME_DIRECTORY").unwrap_or_else(|| "staging".to_string()),
@@ -160,6 +180,7 @@ pub fn parse_issuer_config(
         .unwrap_or_else(|| "/var/lib/yah/yubaba/acme-account.json".to_string());
     let kek_path =
         PathBuf::from(get("YUBABA_ACME_KEK_PATH").unwrap_or_else(|| CLUSTER_KEK_PATH.to_string()));
+
 
     let propagation_secs = parse_u64(&get, "YUBABA_ACME_DNS01_PROPAGATION_SECS", 10)?;
     let check_interval_secs = parse_u64(&get, "YUBABA_ACME_CHECK_INTERVAL_SECS", 43_200)?;
@@ -198,6 +219,7 @@ pub fn parse_issuer_config(
             dns01_propagation_delay: Duration::from_secs(propagation_secs),
         },
         kek_path,
+        access,
         check_interval: Duration::from_secs(check_interval_secs),
         lock_ttl: Duration::from_secs(lock_ttl_secs),
         cert_lifetime: Duration::from_secs(cert_lifetime_days * 86_400),
@@ -340,13 +362,18 @@ async fn issue_and_store(
     };
 
     let stamp = unix_now();
-    let cert_rec = seal_cluster_secret(kek, issued.cert_chain_pem.as_bytes(), stamp);
+    let cert_rec = seal_cluster_secret(
+        kek,
+        issued.cert_chain_pem.as_bytes(),
+        stamp,
+        cfg.access.clone(),
+    );
     // Copy the private-key PEM into a zeroizing buffer so the plaintext key is
     // scrubbed when it drops at the end of this fn, rather than lingering in a
     // freed `String`'s heap page (the engine hands us a plain `String`; this is
     // the issuer's own copy — the sensitive one on this node).
     let key_bytes = Zeroizing::new(issued.key_pem.into_bytes());
-    let key_rec = seal_cluster_secret(kek, &key_bytes, stamp);
+    let key_rec = seal_cluster_secret(kek, &key_bytes, stamp, cfg.access.clone());
 
     // KEY first, CERT last — deliberately, because `renewal_due` gates off the
     // CERT record's `updated_at` (see `run`). Writing the gate record last means
@@ -378,9 +405,37 @@ async fn put_secret(raft: &YubabaRaft, name: &str, rec: SecretRecord) -> anyhow:
         ciphertext: rec.ciphertext,
         nonce: rec.nonce,
         updated_at: rec.updated_at,
+        access: rec.access,
+        digest: rec.digest,
     })
     .await?;
     Ok(())
+}
+
+/// Parse `YUBABA_ACME_CONSUMERS` into a [`SecretAccess`] rule (R706 / W294).
+///
+/// - `"any"` (case-insensitive) → [`SecretAccess::AllowAny`], the deliberate
+///   unrestricted marker.
+/// - a comma-separated list of workload names → an allow-list in the singleton
+///   tenant/namespace.
+/// - empty / whitespace-only / all-empty-entries → `None`, which the caller
+///   turns into a hard config error. An empty allow-list would be a valid
+///   deny-all rule, but as a *parse result* it is far more likely a typo than an
+///   intent to issue a cert nobody can use.
+fn parse_consumers(raw: &str) -> Option<SecretAccess> {
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("any") {
+        return Some(SecretAccess::AllowAny);
+    }
+    let names: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    Some(SecretAccess::workloads(names))
 }
 
 fn unix_now() -> u64 {
@@ -459,6 +514,7 @@ mod tests {
                 "/run/secrets/cf.token",
             ),
             ("YUBABA_ACME_DNS01_CLOUDFLARE_ZONE_ID", "zone123"),
+            ("YUBABA_ACME_CONSUMERS", "ingress"),
         ]))
         .unwrap()
         .expect("config present");
@@ -489,6 +545,7 @@ mod tests {
                 "/run/secrets/cf.token",
             ),
             ("YUBABA_ACME_DNS01_CLOUDFLARE_ZONE_ID", "zone123"),
+            ("YUBABA_ACME_CONSUMERS", "ingress"),
             ("YUBABA_ACME_CHECK_INTERVAL_SECS", "600"),
             ("YUBABA_ACME_LOCK_TTL_SECS", "600"),
         ]))
@@ -507,10 +564,94 @@ mod tests {
                 "/run/secrets/cf.token",
             ),
             ("YUBABA_ACME_DNS01_CLOUDFLARE_ZONE_ID", "zone123"),
+            ("YUBABA_ACME_CONSUMERS", "ingress"),
             ("YUBABA_ACME_CHECK_INTERVAL_SECS", "s3cr3t-leak"),
         ]))
         .unwrap_err();
         assert!(!err.contains("s3cr3t-leak"), "raw value leaked: {err}");
+        // Pin that this is the error we think it is. Without a positive
+        // assertion the test passes for *any* unrelated failure — which it
+        // silently did when R706 added a required field parsed ahead of this
+        // one, and a purely-negative assertion could not notice.
+        assert!(
+            err.contains("CHECK_INTERVAL_SECS"),
+            "must be the numeric-parse error, got {err}"
+        );
+    }
+
+    // ── R706 (W294): the issued cert's access rule ──────────────────────────
+
+    #[test]
+    fn consumers_is_required_when_the_issuer_is_on() {
+        // No default is possible here: permissive would make the fleet cert's
+        // private key a bearer secret again, deny-all would mint a cert nobody
+        // can mount. So it must be stated.
+        let err = parse_issuer_config(env(&[
+            ("YUBABA_ACME_DOMAIN", "yah.dev"),
+            ("YUBABA_ACME_CONTACT_EMAIL", "ops@yah.dev"),
+            (
+                "YUBABA_ACME_DNS01_CLOUDFLARE_TOKEN_FILE",
+                "/run/secrets/cf.token",
+            ),
+            ("YUBABA_ACME_DNS01_CLOUDFLARE_ZONE_ID", "zone123"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("YUBABA_ACME_CONSUMERS"), "got {err}");
+    }
+
+    #[test]
+    fn consumers_parses_lists_and_the_any_marker() {
+        use workload_spec::secrets::SecretConsumer;
+
+        let rule = parse_consumers("ingress").unwrap();
+        assert!(rule.admits(&SecretConsumer::workload("ingress")));
+        assert!(!rule.admits(&SecretConsumer::workload("something-else")));
+
+        // Whitespace and empty entries are tolerated inside a real list.
+        let rule = parse_consumers(" ingress , passway ,, ").unwrap();
+        assert!(rule.admits(&SecretConsumer::workload("ingress")));
+        assert!(rule.admits(&SecretConsumer::workload("passway")));
+
+        // The deliberate escape hatch, case-insensitively.
+        assert_eq!(parse_consumers("any"), Some(SecretAccess::AllowAny));
+        assert_eq!(parse_consumers("ANY"), Some(SecretAccess::AllowAny));
+
+        // Nothing usable → None, which the caller turns into a config error
+        // rather than an accidental deny-all cert.
+        assert_eq!(parse_consumers(""), None);
+        assert_eq!(parse_consumers("   "), None);
+        assert_eq!(parse_consumers(" , , "), None);
+    }
+
+    #[test]
+    fn the_issued_cert_carries_its_rule() {
+        // Both records the issuer writes must be stamped — a cert with a rule
+        // and a key without one would be a half-closed door.
+        let cfg = parse_issuer_config(env(&[
+            ("YUBABA_ACME_DOMAIN", "yah.dev"),
+            ("YUBABA_ACME_CONTACT_EMAIL", "ops@yah.dev"),
+            (
+                "YUBABA_ACME_DNS01_CLOUDFLARE_TOKEN_FILE",
+                "/run/secrets/cf.token",
+            ),
+            ("YUBABA_ACME_DNS01_CLOUDFLARE_ZONE_ID", "zone123"),
+            ("YUBABA_ACME_CONSUMERS", "passway"),
+        ]))
+        .unwrap()
+        .unwrap();
+
+        let kek = [5u8; 32];
+        for record in [
+            seal_cluster_secret(&kek, b"CERTPEM", 1, cfg.access.clone()),
+            seal_cluster_secret(&kek, b"KEYPEM", 1, cfg.access.clone()),
+        ] {
+            assert!(record
+                .access
+                .admits(&workload_spec::secrets::SecretConsumer::workload("passway")));
+            assert!(!record
+                .access
+                .admits(&workload_spec::secrets::SecretConsumer::workload("other")));
+        }
     }
 
     #[test]
@@ -523,6 +664,7 @@ mod tests {
                 "/run/secrets/cf.token",
             ),
             ("YUBABA_ACME_DNS01_CLOUDFLARE_ZONE_ID", "zone123"),
+            ("YUBABA_ACME_CONSUMERS", "ingress"),
             ("YUBABA_ACME_CHECK_INTERVAL_SECS", "soon"),
         ]))
         .unwrap_err();

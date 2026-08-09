@@ -68,6 +68,66 @@
 //!
 //! macOS matters concretely: `us-west-015` (MacBook Air M2) is the fleet's
 //! first darwin node and has no `/proc` at all.
+//!
+//! # Domain metrics: pushed by the producer, not hardcoded here
+//!
+//! CPU/memory/disk are the metrics *every* node has. They are not the only
+//! metrics a node's operator cares about, and the second consumer of this
+//! endpoint proves it: a noisetable gallery installation is a small yubaba
+//! cluster whose per-plinth health question is "audio xruns, callback deadline
+//! misses, BLE advert rate", none of which yubaba can or should know how to
+//! measure.
+//!
+//! So the metric *set* is open. [`DomainMetrics`] is a registry of
+//! `source -> {key: scalar}` that anything can publish into, and
+//! [`NodeUsage`] merges it flat into the same payload. A domain metric is
+//! indistinguishable from a built-in one at the wire — `noisetable.audio.xruns`
+//! sits beside `system.cpu.utilization` and an OTLP exporter forwards both with
+//! the same rename-free loop.
+//!
+//! **Push, not pull.** There is no register-a-callback API, and that is
+//! deliberate on two counts. Both real producers are *out of process* — the
+//! noisetable design has an egress peer translating impulse-carried telemetry
+//! into this RPC (that repo's `W138` §Telemetry), and a workload publishing its
+//! own health is a separate container by construction — so an in-process
+//! closure would serve neither. And a pull callback would run on the request
+//! path, where one slow producer stalls the health endpoint for everything
+//! else. An in-process producer calls [`DomainMetrics::report`] directly; the
+//! HTTP endpoint is that same call with a transport in front of it.
+//!
+//! **Every scope carries a TTL**, because the failure that matters is a
+//! producer dying. A plinth whose audio process crashes must not keep
+//! reporting its last `xruns` value forever — that reads as healthy. Past its
+//! TTL a scope's *values* are dropped from the payload while
+//! `yah.metrics.<source>.stale` stays `true`, so "the producer went quiet" is
+//! distinguishable from "the producer never existed" (no keys at all) and from
+//! "the producer reported zero" (a value of `0`). It is the same three-state
+//! discipline the collector fields apply to an unmeasurable node.
+//!
+//! @yah:relay(R646, "yubaba per-node telemetry RPC — CPU/mem/disk plus consumer-registered domain metrics (unblocks R573-F7; second consumer is noisetable's gallery rig)")
+//! @yah:status(review)
+//! @yah:at(2026-08-02T02:15:00Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:next("R573-F7 is blocked on exactly this, with the recorded assumption 'yubaba does not yet expose per-node usage telemetry — this is blocked until that RPC lands'. This relay is that RPC.")
+//! @yah:next("TWO consumers, so build the primitive generic rather than hardcoding a metric set: yah-cloud wants CPU/mem/disk for the InfraView machine cards; noisetable's gallery installations want per-plinth health PLUS domain metrics (audio xruns, callback deadline misses, BLE advert rate).")
+//! @yah:next("Let the consumer REGISTER domain metrics instead of hardcoding a struct — otherwise every downstream grows a private telemetry path that duplicates the fleet one.")
+//! @yah:next("Cross-camp context: filed from the noisetable camp, where an art installation is literally a small yubaba cluster. See that repo's .yah/docs/working/W138-installation-as-a-cluster.md §Telemetry.")
+//! @arch:see(.yah/docs/working/W243-byo-static-node-infra.md)
+//! @yah:handoff("The relay's own @yah:assumes was FALSE and is now removed: a telemetry surface DID already exist. GET /node (measured specs) and GET /node/usage (CPU/mem/disk/load + committed workload requests) were already built, wired into ServerState.node_probe, and consumed end-to-end by cloud_client::CloudClient::{node,node_usage} and yah_fleet_metrics::YubabaProbe. What was genuinely missing was the OTHER half the ticket named — consumer-registered domain metrics — and that is what this pass built.")
+//! @yah:handoff("node.rs: DomainMetrics, a source -> {flat dotted key: scalar} registry that anything can publish into, merged FLAT into NodeUsage via #[serde(flatten)]. noisetable.audio.xruns is a sibling of system.cpu.utilization on the wire, so an OTLP exporter stays the same rename-free loop the module docs promise. Producer type is MetricValue (scalar-only untagged enum); the NodeUsage capture is serde_json::Value so an older client still parses a newer node.")
+//! @yah:handoff("Push, not register-a-callback — recorded in the module docs with the reasoning. Both real producers are out of process (noisetable's W138 has an egress peer translating impulse-carried telemetry into this RPC; a workload publishing its own health is a separate container), so an in-process closure would serve neither, and a pull callback would run on the request path where one slow producer stalls the health endpoint. An in-process producer calls DomainMetrics::report directly — same primitive, no transport.")
+//! @yah:handoff("Every scope carries a TTL because the failure that matters is a producer DYING: a crashed plinth must not keep reporting its last xruns forever. Past TTL the values are withheld while yah.metrics.<source>.stale stays true, so 'went quiet' is distinguishable from 'never existed' (no keys) and from 'reported zero' (a 0 value). Long-dead scopes are evicted after 20x TTL so a churning producer cannot leak.")
+//! @yah:handoff("HTTP: POST /node/metrics (publish; 204, or 400 naming the offending source/key), GET /node/metrics (the same keys without paying for a CPU sampling window — the confirm-my-push path), DELETE /node/metrics/{source} (clean shutdown; 204/404). Reserved prefixes system./host./os./yah. are refused WHOLE rather than per-key, since dropping one key of a batch leaves the producer believing it published.")
+//! @yah:handoff("cloud-client: NodeUsage gained the flattened domain map plus domain_metric/metric_sources/metric_source_is_stale/metric_source_age_ms, and CloudClient gained report_node_metrics/node_metrics/withdraw_node_metrics with mirrored MetricReport/MetricValue types. yah-fleet-metrics re-exports cloud_client::NodeUsage, so the fleet snapshot carries domain metrics with no change there.")
+//! @yah:handoff("NODE_SCHEMA_VERSION deliberately NOT bumped — every change is additive, which is exactly the case the version comment says does not bump.")
+//! @yah:verify("cd oss/yubaba && cargo test -p yubaba --lib  # 294 passed, 0 failed")
+//! @yah:verify("cargo test -p cloud-client --lib  # 28 passed, 1 failed — the failure is deploy_headscale_round_trips_via_yubaba, PRE-EXISTING and filed as R646-B1")
+//! @yah:verify("cargo test -p yah-fleet-metrics -p yah-cloud-admin  # 61 passed, 0 failed")
+//! @yah:verify("The end-to-end assertion is cloud-client's domain_metrics_round_trip_from_yubaba: it spawns a REAL yubaba, publishes through the typed client, and reads the values back off /node/usage — so a rename drift between the two hand-written mirrors fails the build instead of silently publishing into nothing.")
+//! @yah:gotcha("oss/yubaba/crates/yubaba/src/lib.rs was co-edited: @Ashguard:hydra is live on R609 and has uncommitted R609-F1 control-plane work in the same file (new pub mod control_plane, a ServerState.control_plane field, and an untracked src/control_plane.rs). No semantic overlap with R646 — my edits are the routing import, three /node/metrics routes, three handlers and two tests — and R646 needed no ServerState field at all because DomainMetrics hangs off NodeProbe. Nothing was reverted or reshaped on their side.")
+//! @yah:gotcha("Unrelated pre-existing breakage seen while checking dependents: cargo check -p yah fails at app/yah/cli/src/camp.rs:8535 with 'cannot find PARTY_POST in module rpc::method' — a peer's half-landed party-post RPC (both camp.rs and crates/yah/rpc/src/lib.rs are dirty). Left alone per shared-tree discipline; it does not block R646, and every crate this relay touches (yubaba, cloud-client, yah-fleet-metrics, yah-cloud-admin, yah-hub, yah-agent-tools) builds and tests green.")
+//! @yah:next("R573-F7 is unblocked and its now-false assumes was removed; two @yah:next entries were added there naming the exact client call and the two traps (system.cpu.utilization is a 0..1 fraction not a percentage; check yah.cpu.source, which is the loadavg APPROXIMATION on the fleet's darwin node).")
+//! @yah:next("Second consumer (cross-camp, noisetable): the egress peer publishes with POST /node/metrics on its own cadence, ttl_ms set to a small multiple of that cadence, one source per plinth. Keys are producer-owned in full — use a noisetable. prefix; system./host./os./yah. are refused. A report REPLACES that source's previous set, so a metric it stops sending disappears rather than pinning its last value, and an empty metrics map is a legal heartbeat.")
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -90,6 +150,42 @@ const DEFAULT_WINDOW_MS: u64 = 200;
 /// counters is noise); the ceiling keeps a poll from pinning an HTTP worker.
 const MIN_WINDOW_MS: u64 = 50;
 const MAX_WINDOW_MS: u64 = 5_000;
+
+/// How long a domain-metric scope's values stay trustworthy when the producer
+/// didn't say. 30s is a compromise: long enough that a producer publishing on a
+/// 10s cadence survives one missed beat, short enough that a dead producer
+/// stops looking healthy inside a dashboard refresh.
+const DEFAULT_METRIC_TTL_MS: u64 = 30_000;
+
+/// Bounds on a producer-declared TTL. The floor stops a producer from making
+/// its own metrics permanently stale by asking for a window shorter than its
+/// publish jitter; the ceiling stops "never expire" being requested by
+/// spelling it `u64::MAX`.
+const MIN_METRIC_TTL_MS: u64 = 1_000;
+const MAX_METRIC_TTL_MS: u64 = 3_600_000;
+
+/// A scope is *forgotten* — not merely stale — once it has been silent for this
+/// many times its TTL. Staleness is a reportable state and must persist long
+/// enough for an operator to see it; unbounded retention of dead scopes is a
+/// leak. At the default TTL this is 10 minutes of visible "gone quiet" before
+/// the source disappears entirely.
+const METRIC_EVICT_TTL_MULTIPLE: u64 = 20;
+
+/// Caps on what one node will hold, so a looping producer costs bounded memory
+/// rather than the process.
+const MAX_METRIC_SOURCES: usize = 64;
+const MAX_METRICS_PER_SOURCE: usize = 128;
+const MAX_METRIC_SOURCE_LEN: usize = 64;
+const MAX_METRIC_KEY_LEN: usize = 128;
+
+/// Key prefixes owned by the built-in payload.
+///
+/// Domain metrics merge *flat* into [`NodeUsage`], so a producer publishing
+/// `system.cpu.utilization` would shadow the real reading with a duplicate JSON
+/// key. Rejecting the report — loudly, naming the key — is the only honest
+/// outcome; silently dropping one key of a batch leaves the producer believing
+/// it published.
+const RESERVED_METRIC_PREFIXES: [&str; 4] = ["system.", "host.", "os.", "yah."];
 
 /// Which measurement backend answered.
 ///
@@ -375,6 +471,21 @@ pub struct NodeUsage {
 
     #[serde(rename = "yah.collected_at_unix_ms")]
     pub collected_at_unix_ms: u64,
+
+    /// Consumer-registered domain metrics, merged **flat** into this payload —
+    /// `noisetable.audio.xruns` is a sibling of `system.cpu.utilization`, not a
+    /// nested object, so an exporter needs no special case for it. See
+    /// [`DomainMetrics::snapshot`] for the `yah.metrics.*` staleness keys that
+    /// come with them.
+    ///
+    /// Typed as `serde_json::Value` rather than [`MetricValue`] on purpose:
+    /// this is also the *capture* for any key a newer node emits that this
+    /// build doesn't know about, and rejecting an unknown field would break the
+    /// newer-node/older-client compatibility every other field here preserves
+    /// by being `Option`. Producers push the scalar-only [`MetricValue`]; the
+    /// wire is deliberately more permissive than the ingest.
+    #[serde(flatten)]
+    pub domain: BTreeMap<String, serde_json::Value>,
 }
 
 /// Per-workload resource request, as admitted by this node.
@@ -459,6 +570,367 @@ pub fn enrich_workloads(registry: &ResourceRegistry, workloads: &mut serde_json:
     }
 }
 
+// ---------------------------------------------------------------------------
+// Domain metrics
+// ---------------------------------------------------------------------------
+
+/// One domain-metric value.
+///
+/// Scalars only, and untagged so the JSON is a bare `3`, `0.41`, `true` or
+/// `"degraded"` — i.e. exactly a valid OTLP attribute value, matching what the
+/// built-in fields emit. Objects and arrays are rejected at ingest: a nested
+/// value has no flat-dotted spelling, and letting one through would make the
+/// "every key is already an OTLP attribute key" property false for the whole
+/// payload rather than just that key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum MetricValue {
+    Bool(bool),
+    U64(u64),
+    I64(i64),
+    F64(f64),
+    Text(String),
+}
+
+impl From<bool> for MetricValue {
+    fn from(v: bool) -> Self {
+        MetricValue::Bool(v)
+    }
+}
+impl From<u64> for MetricValue {
+    fn from(v: u64) -> Self {
+        MetricValue::U64(v)
+    }
+}
+impl From<u32> for MetricValue {
+    fn from(v: u32) -> Self {
+        MetricValue::U64(v.into())
+    }
+}
+impl From<i64> for MetricValue {
+    fn from(v: i64) -> Self {
+        MetricValue::I64(v)
+    }
+}
+impl From<f64> for MetricValue {
+    fn from(v: f64) -> Self {
+        MetricValue::F64(v)
+    }
+}
+impl From<String> for MetricValue {
+    fn from(v: String) -> Self {
+        MetricValue::Text(v)
+    }
+}
+impl From<&str> for MetricValue {
+    fn from(v: &str) -> Self {
+        MetricValue::Text(v.to_string())
+    }
+}
+
+impl From<MetricValue> for serde_json::Value {
+    fn from(v: MetricValue) -> Self {
+        match v {
+            MetricValue::Bool(b) => b.into(),
+            MetricValue::U64(n) => n.into(),
+            MetricValue::I64(n) => n.into(),
+            // A non-finite float has no JSON spelling; serde_json renders it
+            // null. Do that explicitly rather than at the serializer's
+            // discretion — a NaN xrun rate is a producer bug and null is how
+            // the rest of this payload spells "no reading".
+            MetricValue::F64(f) => serde_json::Number::from_f64(f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            MetricValue::Text(s) => s.into(),
+        }
+    }
+}
+
+/// A producer's publish: everything it wants this node to report on its behalf,
+/// as a full replacement of that source's previous set.
+///
+/// Replace rather than merge, because merge cannot express deletion — a
+/// producer that stops emitting a metric would leave the last value pinned
+/// until the whole scope expired.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MetricReport {
+    /// Who is publishing, e.g. `plinth-3-audio`. Namespaces the staleness keys
+    /// and scopes the replacement; does NOT prefix the metric keys, which the
+    /// producer owns in full.
+    pub source: String,
+
+    /// `key -> value`. Keys are the flat dotted names as they will appear in
+    /// the payload (`noisetable.audio.xruns`); see [`RESERVED_METRIC_PREFIXES`]
+    /// for the ones a producer may not use.
+    ///
+    /// An empty map is legal and means "alive, nothing to report" — a
+    /// heartbeat that keeps the source non-stale.
+    #[serde(default)]
+    pub metrics: BTreeMap<String, MetricValue>,
+
+    /// How long these values stay trustworthy, clamped to
+    /// `[MIN_METRIC_TTL_MS, MAX_METRIC_TTL_MS]`. Defaults to
+    /// [`DEFAULT_METRIC_TTL_MS`]; set it to a small multiple of your publish
+    /// interval.
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
+}
+
+/// Why a [`MetricReport`] was refused.
+///
+/// Every variant names the offending value, because the producer is remote and
+/// a 400 body is the only debugging channel it has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetricRejection {
+    /// `source` was empty, over-long, or contained something outside
+    /// `[A-Za-z0-9._-]`.
+    BadSource { source: String, why: &'static str },
+    /// A metric key was empty, over-long, or contained whitespace/control
+    /// characters.
+    BadKey { key: String, why: &'static str },
+    /// A metric key collided with a built-in namespace.
+    ReservedKey { key: String, prefix: &'static str },
+    /// This one report carried more than [`MAX_METRICS_PER_SOURCE`] keys.
+    TooManyMetrics { count: usize, limit: usize },
+    /// A *new* source arrived with [`MAX_METRIC_SOURCES`] already live.
+    /// Existing sources can still update; only registration is refused.
+    TooManySources { limit: usize },
+}
+
+impl std::fmt::Display for MetricRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetricRejection::BadSource { source, why } => {
+                write!(f, "invalid metric source {source:?}: {why}")
+            }
+            MetricRejection::BadKey { key, why } => {
+                write!(f, "invalid metric key {key:?}: {why}")
+            }
+            MetricRejection::ReservedKey { key, prefix } => write!(
+                f,
+                "metric key {key:?} uses the reserved prefix {prefix:?} — that namespace \
+                 belongs to the built-in node payload and a duplicate key would shadow it"
+            ),
+            MetricRejection::TooManyMetrics { count, limit } => {
+                write!(f, "report carries {count} metrics, limit is {limit}")
+            }
+            MetricRejection::TooManySources { limit } => write!(
+                f,
+                "node already holds {limit} metric sources; existing sources may still \
+                 update, but no new source can register until one is withdrawn or evicted"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MetricRejection {}
+
+/// One source's most recent publish, plus when it landed.
+#[derive(Debug, Clone, PartialEq)]
+struct MetricScope {
+    metrics: BTreeMap<String, MetricValue>,
+    reported_at_unix_ms: u64,
+    ttl_ms: u64,
+}
+
+impl MetricScope {
+    fn age_ms(&self, now: u64) -> u64 {
+        now.saturating_sub(self.reported_at_unix_ms)
+    }
+    fn is_stale(&self, now: u64) -> bool {
+        self.age_ms(now) > self.ttl_ms
+    }
+    fn is_evictable(&self, now: u64) -> bool {
+        self.age_ms(now) > self.ttl_ms.saturating_mul(METRIC_EVICT_TTL_MULTIPLE)
+    }
+}
+
+/// The consumer-registered half of the telemetry surface — see the module docs
+/// for why the metric set is open and why publishing is a push.
+///
+/// In-memory and per-process, exactly like [`ResourceRegistry`]: a yubaba
+/// restart empties it and every producer re-publishes on its next tick. That is
+/// the right lifetime for a liveness signal — persisting the last-known xrun
+/// count across a restart would republish a measurement nobody is standing
+/// behind any more.
+#[derive(Debug, Default)]
+pub struct DomainMetrics {
+    sources: Mutex<BTreeMap<String, MetricScope>>,
+}
+
+impl DomainMetrics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Accept a producer's publish, replacing that source's previous set.
+    pub fn report(&self, report: MetricReport) -> Result<(), MetricRejection> {
+        validate_source(&report.source)?;
+        if report.metrics.len() > MAX_METRICS_PER_SOURCE {
+            return Err(MetricRejection::TooManyMetrics {
+                count: report.metrics.len(),
+                limit: MAX_METRICS_PER_SOURCE,
+            });
+        }
+        for key in report.metrics.keys() {
+            validate_key(key)?;
+        }
+
+        let ttl_ms = report
+            .ttl_ms
+            .unwrap_or(DEFAULT_METRIC_TTL_MS)
+            .clamp(MIN_METRIC_TTL_MS, MAX_METRIC_TTL_MS);
+        let now = now_ms();
+
+        let mut guard = self.lock();
+        // Evict first, so a source that churned out frees the slot for the one
+        // arriving now rather than the cap being held by the dead.
+        guard.retain(|_, scope| !scope.is_evictable(now));
+        if !guard.contains_key(&report.source) && guard.len() >= MAX_METRIC_SOURCES {
+            return Err(MetricRejection::TooManySources {
+                limit: MAX_METRIC_SOURCES,
+            });
+        }
+        guard.insert(
+            report.source,
+            MetricScope {
+                metrics: report.metrics,
+                reported_at_unix_ms: now,
+                ttl_ms,
+            },
+        );
+        Ok(())
+    }
+
+    /// Drop a source immediately. Returns whether it was there.
+    ///
+    /// The clean-shutdown counterpart to TTL expiry: a producer that knows it
+    /// is going away says so, instead of leaving a scope to look merely slow
+    /// for a TTL and then stale for twenty more.
+    pub fn withdraw(&self, source: &str) -> bool {
+        self.lock().remove(source).is_some()
+    }
+
+    /// The flat payload contribution — metric keys plus per-source staleness.
+    ///
+    /// Emitted for every live source, stale or not:
+    ///
+    /// - `yah.metrics.<source>.age_ms` — ms since that source last published.
+    /// - `yah.metrics.<source>.stale` — always present, so a consumer never has
+    ///   to read absence as `false` (absence means the source is gone, which is
+    ///   a different fact).
+    ///
+    /// Plus `yah.metrics.sources` (the live source names) and, when two sources
+    /// publish the same key, `yah.metrics.collisions`. A collision is a
+    /// producer-side namespacing bug; the payload keeps one value
+    /// (alphabetically-last source wins, since sources are iterated in order)
+    /// and names the key rather than letting the loss be silent.
+    pub fn snapshot(&self) -> BTreeMap<String, serde_json::Value> {
+        let now = now_ms();
+        let mut guard = self.lock();
+        guard.retain(|_, scope| !scope.is_evictable(now));
+
+        let mut out: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+        if guard.is_empty() {
+            return out;
+        }
+        let mut collisions: Vec<String> = Vec::new();
+        let mut names: Vec<serde_json::Value> = Vec::new();
+
+        for (source, scope) in guard.iter() {
+            names.push(source.as_str().into());
+            let stale = scope.is_stale(now);
+            out.insert(
+                format!("yah.metrics.{source}.age_ms"),
+                scope.age_ms(now).into(),
+            );
+            out.insert(format!("yah.metrics.{source}.stale"), stale.into());
+            if stale {
+                continue;
+            }
+            for (key, value) in &scope.metrics {
+                if out.insert(key.clone(), value.clone().into()).is_some() {
+                    collisions.push(key.clone());
+                }
+            }
+        }
+
+        out.insert("yah.metrics.sources".into(), names.into());
+        if !collisions.is_empty() {
+            // Three sources colliding on two keys pushes them interleaved, so
+            // sort before dedup — `dedup` alone only collapses neighbours.
+            collisions.sort_unstable();
+            collisions.dedup();
+            let collisions: Vec<serde_json::Value> =
+                collisions.into_iter().map(Into::into).collect();
+            out.insert("yah.metrics.collisions".into(), collisions.into());
+        }
+        out
+    }
+
+    /// A poisoned registry means a panic mid-report. Metrics are what an
+    /// operator reaches for while diagnosing that panic, so recover the map
+    /// rather than propagating into a health endpoint — same call as
+    /// [`committed_totals`].
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, MetricScope>> {
+        match self.sources.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+fn validate_source(source: &str) -> Result<(), MetricRejection> {
+    let bad = |why: &'static str| {
+        Err(MetricRejection::BadSource {
+            source: source.to_string(),
+            why,
+        })
+    };
+    if source.is_empty() {
+        return bad("must not be empty");
+    }
+    if source.len() > MAX_METRIC_SOURCE_LEN {
+        return bad("longer than 64 bytes");
+    }
+    // The name is interpolated into `yah.metrics.<source>.age_ms`, so anything
+    // outside this set could produce a key a consumer cannot split back apart.
+    if !source
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return bad("must be ASCII alphanumeric, '.', '_' or '-'");
+    }
+    Ok(())
+}
+
+fn validate_key(key: &str) -> Result<(), MetricRejection> {
+    let bad = |why: &'static str| {
+        Err(MetricRejection::BadKey {
+            key: key.to_string(),
+            why,
+        })
+    };
+    if key.is_empty() {
+        return bad("must not be empty");
+    }
+    if key.len() > MAX_METRIC_KEY_LEN {
+        return bad("longer than 128 bytes");
+    }
+    if key.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return bad("must not contain whitespace or control characters");
+    }
+    for prefix in RESERVED_METRIC_PREFIXES {
+        if key.starts_with(prefix) {
+            return Err(MetricRejection::ReservedKey {
+                key: key.to_string(),
+                prefix,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// A point-in-time read of the CPU tick counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CpuSample {
@@ -499,11 +971,24 @@ struct CpuSample {
 pub struct NodeProbe {
     specs: std::sync::OnceLock<NodeSpecs>,
     last_cpu: Mutex<Option<CpuSample>>,
+    domain: DomainMetrics,
 }
 
 impl NodeProbe {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The consumer-registered metric registry this probe merges into every
+    /// usage sample.
+    ///
+    /// Lives here rather than beside it on `ServerState` because it is the same
+    /// kind of thing as the cached specs and the last CPU sample: per-node
+    /// measurement state whose only consumer is [`Self::usage`]. Hanging it off
+    /// the probe means a producer's push cannot be wired up without the read
+    /// path picking it up.
+    pub fn domain(&self) -> &DomainMetrics {
+        &self.domain
     }
 
     /// Node specs, collected once and cached.
@@ -545,6 +1030,7 @@ impl NodeProbe {
             sample_window_ms,
             collector: collector.as_str().into(),
             collected_at_unix_ms: now_ms(),
+            domain: self.domain.snapshot(),
         }
     }
 
@@ -976,6 +1462,370 @@ fn parse_proc_stat(text: &str) -> Option<CpuSample> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Domain metrics ─────────────────────────────────────────────────────
+
+    fn report(source: &str, metrics: &[(&str, MetricValue)]) -> MetricReport {
+        MetricReport {
+            source: source.into(),
+            metrics: metrics
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect(),
+            ttl_ms: None,
+        }
+    }
+
+    #[test]
+    fn domain_metrics_merge_flat_into_the_usage_payload() {
+        let reg = DomainMetrics::new();
+        reg.report(report(
+            "plinth-3",
+            &[
+                ("noisetable.audio.xruns", 4u64.into()),
+                ("noisetable.audio.deadline_misses", 0u64.into()),
+                ("noisetable.ble.advert_hz", 9.5f64.into()),
+            ],
+        ))
+        .unwrap();
+
+        let snap = reg.snapshot();
+        // Flat, unprefixed, exactly as the producer named them — a sibling of
+        // `system.cpu.utilization`, not a nested object.
+        assert_eq!(snap["noisetable.audio.xruns"], serde_json::json!(4));
+        assert_eq!(snap["noisetable.ble.advert_hz"], serde_json::json!(9.5));
+        // Zero survives as zero. It is a measurement, not an absence.
+        assert_eq!(
+            snap["noisetable.audio.deadline_misses"],
+            serde_json::json!(0)
+        );
+        assert_eq!(snap["yah.metrics.sources"], serde_json::json!(["plinth-3"]));
+        assert_eq!(snap["yah.metrics.plinth-3.stale"], serde_json::json!(false));
+        assert!(snap.contains_key("yah.metrics.plinth-3.age_ms"));
+    }
+
+    /// The failure that matters: the producer died. Its last values must stop
+    /// being reported, while the fact that it exists and has gone quiet must
+    /// not — "crashed" and "never here" are different states.
+    #[test]
+    fn a_stale_source_drops_its_values_but_not_its_staleness() {
+        let reg = DomainMetrics::new();
+        reg.report(report(
+            "plinth-3",
+            &[("noisetable.audio.xruns", 4u64.into())],
+        ))
+        .unwrap();
+        // Backdate the publish past its TTL without sleeping through one.
+        {
+            let mut guard = reg.lock();
+            let scope = guard.get_mut("plinth-3").unwrap();
+            scope.reported_at_unix_ms = scope.reported_at_unix_ms.saturating_sub(60_000);
+        }
+
+        let snap = reg.snapshot();
+        assert!(
+            !snap.contains_key("noisetable.audio.xruns"),
+            "a dead producer's last value must not keep reading healthy"
+        );
+        assert_eq!(snap["yah.metrics.plinth-3.stale"], serde_json::json!(true));
+        assert!(snap["yah.metrics.plinth-3.age_ms"].as_u64().unwrap() >= 60_000);
+        assert_eq!(snap["yah.metrics.sources"], serde_json::json!(["plinth-3"]));
+    }
+
+    /// Staleness is visible for a bounded time, then the scope is forgotten —
+    /// otherwise a churning producer leaks a scope per identity forever.
+    #[test]
+    fn a_long_dead_source_is_evicted_entirely() {
+        let reg = DomainMetrics::new();
+        reg.report(report("gone", &[("x.y", 1u64.into())])).unwrap();
+        {
+            let mut guard = reg.lock();
+            let scope = guard.get_mut("gone").unwrap();
+            // Past DEFAULT_METRIC_TTL_MS * METRIC_EVICT_TTL_MULTIPLE.
+            scope.reported_at_unix_ms = scope
+                .reported_at_unix_ms
+                .saturating_sub(DEFAULT_METRIC_TTL_MS * METRIC_EVICT_TTL_MULTIPLE + 1);
+        }
+        assert!(
+            reg.snapshot().is_empty(),
+            "an evicted source leaves no keys at all — absence is how a consumer reads 'gone'"
+        );
+    }
+
+    #[test]
+    fn a_report_replaces_the_previous_set_rather_than_merging() {
+        let reg = DomainMetrics::new();
+        reg.report(report(
+            "p",
+            &[("a.one", 1u64.into()), ("a.two", 2u64.into())],
+        ))
+        .unwrap();
+        reg.report(report("p", &[("a.one", 9u64.into())])).unwrap();
+
+        let snap = reg.snapshot();
+        assert_eq!(snap["a.one"], serde_json::json!(9));
+        assert!(
+            !snap.contains_key("a.two"),
+            "merge semantics cannot express deletion; a metric the producer \
+             stopped sending must disappear"
+        );
+    }
+
+    #[test]
+    fn withdraw_removes_a_source_immediately() {
+        let reg = DomainMetrics::new();
+        reg.report(report("p", &[("a.one", 1u64.into())])).unwrap();
+        assert!(reg.withdraw("p"));
+        assert!(reg.snapshot().is_empty());
+        // Idempotent — a second shutdown signal is not an error worth raising.
+        assert!(!reg.withdraw("p"));
+    }
+
+    /// An empty report is a heartbeat: the producer is alive and has nothing
+    /// to say. It must keep the source non-stale.
+    #[test]
+    fn an_empty_report_is_a_heartbeat() {
+        let reg = DomainMetrics::new();
+        reg.report(report("p", &[])).unwrap();
+        let snap = reg.snapshot();
+        assert_eq!(snap["yah.metrics.p.stale"], serde_json::json!(false));
+        assert_eq!(snap["yah.metrics.sources"], serde_json::json!(["p"]));
+    }
+
+    /// Domain metrics merge flat, so a producer claiming a built-in key would
+    /// emit a duplicate JSON key and shadow a real measurement. Refuse the
+    /// whole report — dropping one key of a batch would leave the producer
+    /// believing it published.
+    #[test]
+    fn reserved_prefixes_are_refused_by_name() {
+        let reg = DomainMetrics::new();
+        for key in [
+            "system.cpu.utilization",
+            "host.arch",
+            "os.type",
+            "yah.collector",
+        ] {
+            let err = reg
+                .report(report("p", &[(key, 1u64.into())]))
+                .expect_err("{key} must be refused");
+            assert!(
+                matches!(err, MetricRejection::ReservedKey { .. }),
+                "got {err:?}"
+            );
+            assert!(err.to_string().contains(key), "the 400 must name the key");
+        }
+        assert!(reg.snapshot().is_empty(), "a refused report writes nothing");
+    }
+
+    #[test]
+    fn a_source_name_must_survive_being_interpolated_into_a_key() {
+        let reg = DomainMetrics::new();
+        assert!(matches!(
+            reg.report(report("", &[])),
+            Err(MetricRejection::BadSource { .. })
+        ));
+        assert!(matches!(
+            reg.report(report("has space", &[])),
+            Err(MetricRejection::BadSource { .. })
+        ));
+        assert!(matches!(
+            reg.report(report(&"x".repeat(MAX_METRIC_SOURCE_LEN + 1), &[])),
+            Err(MetricRejection::BadSource { .. })
+        ));
+        // The shapes a real producer uses.
+        reg.report(report("plinth-3.audio", &[])).unwrap();
+        reg.report(report("egress_peer", &[])).unwrap();
+    }
+
+    #[test]
+    fn a_metric_key_must_not_be_empty_oversized_or_whitespaced() {
+        let reg = DomainMetrics::new();
+        for key in ["", "has space", "tab\there"] {
+            assert!(
+                matches!(
+                    reg.report(report("p", &[(key, 1u64.into())])),
+                    Err(MetricRejection::BadKey { .. })
+                ),
+                "{key:?} must be refused"
+            );
+        }
+        let long = "x".repeat(MAX_METRIC_KEY_LEN + 1);
+        assert!(matches!(
+            reg.report(report("p", &[(long.as_str(), 1u64.into())])),
+            Err(MetricRejection::BadKey { .. })
+        ));
+    }
+
+    #[test]
+    fn a_looping_producer_costs_bounded_memory() {
+        let reg = DomainMetrics::new();
+        let many: Vec<(String, MetricValue)> = (0..=MAX_METRICS_PER_SOURCE)
+            .map(|i| (format!("d.k{i}"), MetricValue::U64(i as u64)))
+            .collect();
+        let over = MetricReport {
+            source: "p".into(),
+            metrics: many.into_iter().collect(),
+            ttl_ms: None,
+        };
+        assert!(matches!(
+            reg.report(over),
+            Err(MetricRejection::TooManyMetrics { .. })
+        ));
+
+        for i in 0..MAX_METRIC_SOURCES {
+            reg.report(report(&format!("s{i}"), &[])).unwrap();
+        }
+        assert!(matches!(
+            reg.report(report("one-too-many", &[])),
+            Err(MetricRejection::TooManySources { .. })
+        ));
+        // A source already registered can still update at the cap — refusing
+        // that would silently freeze every live producer's readings.
+        reg.report(report("s0", &[("d.k", 1u64.into())])).unwrap();
+        assert_eq!(reg.snapshot()["d.k"], serde_json::json!(1));
+    }
+
+    /// Two producers publishing the same key is a namespacing bug on their
+    /// side. The payload can only carry one value, so name the loss instead of
+    /// letting it be silent.
+    #[test]
+    fn a_key_collision_between_sources_is_reported() {
+        let reg = DomainMetrics::new();
+        reg.report(report("aaa", &[("shared.key", 1u64.into())]))
+            .unwrap();
+        reg.report(report("zzz", &[("shared.key", 2u64.into())]))
+            .unwrap();
+        let snap = reg.snapshot();
+        assert_eq!(
+            snap["yah.metrics.collisions"],
+            serde_json::json!(["shared.key"])
+        );
+        // Alphabetically-last source wins, deterministically.
+        assert_eq!(snap["shared.key"], serde_json::json!(2));
+
+        // Three sources over two keys push their collisions interleaved; each
+        // key must still be named once.
+        let reg = DomainMetrics::new();
+        for source in ["aaa", "bbb", "ccc"] {
+            reg.report(report(
+                source,
+                &[("k.one", 1u64.into()), ("k.two", 2u64.into())],
+            ))
+            .unwrap();
+        }
+        assert_eq!(
+            reg.snapshot()["yah.metrics.collisions"],
+            serde_json::json!(["k.one", "k.two"])
+        );
+    }
+
+    #[test]
+    fn ttl_is_clamped_to_a_usable_range() {
+        let reg = DomainMetrics::new();
+        for (requested, expected) in [
+            (Some(0), MIN_METRIC_TTL_MS),
+            (Some(u64::MAX), MAX_METRIC_TTL_MS),
+            (Some(5_000), 5_000),
+            (None, DEFAULT_METRIC_TTL_MS),
+        ] {
+            reg.report(MetricReport {
+                source: "p".into(),
+                metrics: BTreeMap::new(),
+                ttl_ms: requested,
+            })
+            .unwrap();
+            assert_eq!(reg.lock()["p"].ttl_ms, expected, "requested {requested:?}");
+        }
+    }
+
+    /// The values serialize as bare JSON scalars, so every key in the merged
+    /// payload is a valid OTLP attribute pair with no translation layer.
+    #[test]
+    fn metric_values_serialize_as_bare_scalars() {
+        assert_eq!(
+            serde_json::to_value(MetricValue::U64(7)).unwrap(),
+            serde_json::json!(7)
+        );
+        assert_eq!(
+            serde_json::to_value(MetricValue::F64(0.5)).unwrap(),
+            serde_json::json!(0.5)
+        );
+        assert_eq!(
+            serde_json::to_value(MetricValue::Bool(true)).unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            serde_json::to_value(MetricValue::Text("degraded".into())).unwrap(),
+            serde_json::json!("degraded")
+        );
+        // A NaN has no JSON spelling; null is how the rest of this payload
+        // says "no reading" rather than whatever the serializer would choose.
+        assert_eq!(
+            serde_json::Value::from(MetricValue::F64(f64::NAN)),
+            serde_json::Value::Null
+        );
+    }
+
+    /// A producer's JSON scalars must land on the right variant, since that is
+    /// what the untagged enum's ordering decides.
+    #[test]
+    fn metric_values_deserialize_from_bare_scalars() {
+        let parsed: MetricReport = serde_json::from_str(
+            r#"{"source":"p","metrics":{"a":3,"b":-3,"c":1.5,"d":true,"e":"x"}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.metrics["a"], MetricValue::U64(3));
+        assert_eq!(parsed.metrics["b"], MetricValue::I64(-3));
+        assert_eq!(parsed.metrics["c"], MetricValue::F64(1.5));
+        assert_eq!(parsed.metrics["d"], MetricValue::Bool(true));
+        assert_eq!(parsed.metrics["e"], MetricValue::Text("x".into()));
+        // Objects and arrays have no flat-dotted spelling and must not parse.
+        assert!(
+            serde_json::from_str::<MetricReport>(r#"{"source":"p","metrics":{"a":{"b":1}}}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<MetricReport>(r#"{"source":"p","metrics":{"a":[1,2]}}"#)
+                .is_err()
+        );
+    }
+
+    /// The flattened `domain` map is also the capture for keys this build does
+    /// not know about, so an older client can still read a newer node.
+    #[test]
+    fn node_usage_round_trips_domain_keys_flat() {
+        let usage = NodeUsage {
+            schema_version: NODE_SCHEMA_VERSION,
+            cpu_source: "procstat".into(),
+            collector: "procfs".into(),
+            domain: [("noisetable.audio.xruns".to_string(), serde_json::json!(4))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&usage).unwrap();
+        // Flat sibling of the built-in keys, not nested under `domain`.
+        assert_eq!(json["noisetable.audio.xruns"], serde_json::json!(4));
+        assert!(json.get("domain").is_none());
+        assert_eq!(json["yah.cpu.source"], serde_json::json!("procstat"));
+
+        let back: NodeUsage = serde_json::from_value(json).unwrap();
+        assert_eq!(back, usage);
+
+        // An unknown key from a newer node lands in `domain` rather than
+        // failing the parse.
+        let newer: NodeUsage = serde_json::from_str(
+            r#"{"schema_version":1,"yah.cpu.source":"procstat","yah.collector":"procfs",
+                "yah.collected_at_unix_ms":0,"yah.workloads.count":0,
+                "yah.committed.memory_mb":0,"yah.committed.cpu_millis":0,
+                "some.future.field":{"nested":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            newer.domain["some.future.field"],
+            serde_json::json!({"nested":true})
+        );
+    }
 
     #[test]
     fn otel_arch_maps_the_semconv_vocabulary() {

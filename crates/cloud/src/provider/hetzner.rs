@@ -52,11 +52,11 @@ use super::{
 };
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use yah_hetzner::{HetznerClient, HetznerCreateServerSpec};
 use local_driver::s3_sign::{
     sign_s3_delete_bucket, sign_s3_head_bucket, sign_s3_put_bucket, sign_s3_put_bucket_acl,
 };
 use reqwest::StatusCode;
+use yah_hetzner::{HetznerClient, HetznerCreateServerSpec};
 
 /// Hetzner Cloud + Object Storage driver for Phase-1 mirror bootstrap.
 ///

@@ -60,6 +60,14 @@ packages:
   - ufw
 
 runcmd:
+  # Disk bounds FIRST, before anything on this box starts writing. yah doctrine:
+  # no process ever grows on disk without an explicit ceiling — a full disk takes
+  # the node down no matter how good the software above it is. Debian's journald
+  # default is 10% of the filesystem (capped at 4G), which is a fraction, not a
+  # bound. RuntimeMaxUse also bounds RAM, since /run is tmpfs.
+  - mkdir -p /etc/systemd/journald.conf.d
+  - sh -c 'printf "[Journal]\nSystemMaxUse=500M\nSystemKeepFree=1G\nSystemMaxFileSize=50M\nRuntimeMaxUse=64M\n" > /etc/systemd/journald.conf.d/10-yah-disk-bounds.conf'
+  - systemctl restart systemd-journald
   # containerd — kamaji's container backend. Installed unpinned: yubaba drives
   # it over a stable gRPC API, and an exact apt version pin matches neither the
   # Debian repo's suffixed versions (e.g. 1.6.20~ds1) nor newer point releases,

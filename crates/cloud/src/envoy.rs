@@ -330,9 +330,9 @@ pub fn default_adapters() -> Vec<std::sync::Arc<dyn EnvoyAdapter>> {
 
     if let Ok(Some(token)) = fob::get_or_env("digitalocean-api-token", "DIGITALOCEAN_TOKEN") {
         let client = crate::provider::DigitalOceanClient::new(token);
-        adapters.push(std::sync::Arc::new(crate::provider::DigitalOceanEnvoy::new(
-            client,
-        )));
+        adapters.push(std::sync::Arc::new(
+            crate::provider::DigitalOceanEnvoy::new(client),
+        ));
     }
 
     adapters
@@ -479,7 +479,11 @@ mod tests {
     #[test]
     fn known_verb_descriptors_all_have_nonempty_schemas() {
         for d in known_verb_descriptors() {
-            assert!(d.input_schema.is_object(), "{}: input schema not an object", d.id);
+            assert!(
+                d.input_schema.is_object(),
+                "{}: input schema not an object",
+                d.id
+            );
         }
     }
 

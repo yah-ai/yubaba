@@ -17,12 +17,13 @@
 use std::time::{Duration, Instant};
 
 use openraft::async_runtime::watch::WatchReceiver;
+use yubaba::cluster_policy::ClusterPolicy;
 use yubaba::raft::{self, YubabaRaft, YubabaRequest, YubabaResponse};
 
 /// Poll the raft metrics until `node_id` is the current leader, or panic after
 /// `timeout`. A single-node cluster self-elects within one election timeout
-/// (election_timeout_max = 3s in [`raft::open_with_state_machine`]), so a 10s
-/// budget is comfortable headroom.
+/// (`ClusterPolicy::fleet()`'s election_timeout_max is 3s), so a 10s budget is
+/// comfortable headroom.
 async fn wait_for_leader(raft: &YubabaRaft, node_id: raft::YubabaNodeId, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -57,7 +58,9 @@ fn voter_count(raft: &YubabaRaft) -> usize {
 #[tokio::test]
 async fn single_node_bootstrap_forms_a_live_one_voter_cluster() {
     let dir = tempfile::tempdir().unwrap();
-    let raft = raft::open(1, dir.path().to_path_buf()).await.unwrap();
+    let raft = raft::open(1, dir.path().to_path_buf(), &ClusterPolicy::fleet())
+        .await
+        .unwrap();
 
     // Fresh node: bootstrap performs the init and reports it did.
     let performed = raft::bootstrap_single_node(&raft, 1, "100.64.0.1:7443")
@@ -107,7 +110,9 @@ async fn bootstrap_is_idempotent_across_restart() {
 
     // First boot: initialise, elect, then shut down cleanly.
     {
-        let raft = raft::open(7, dir.path().to_path_buf()).await.unwrap();
+        let raft = raft::open(7, dir.path().to_path_buf(), &ClusterPolicy::fleet())
+            .await
+            .unwrap();
         assert!(
             raft::bootstrap_single_node(&raft, 7, "100.64.0.7:7443")
                 .await
@@ -120,7 +125,9 @@ async fn bootstrap_is_idempotent_across_restart() {
 
     // Restart from the same state dir: vote/log state persisted, so bootstrap
     // is a no-op and the node picks its leadership back up.
-    let raft = raft::open(7, dir.path().to_path_buf()).await.unwrap();
+    let raft = raft::open(7, dir.path().to_path_buf(), &ClusterPolicy::fleet())
+        .await
+        .unwrap();
     let performed = raft::bootstrap_single_node(&raft, 7, "100.64.0.7:7443")
         .await
         .expect("re-bootstrap after restart does not error");

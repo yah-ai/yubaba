@@ -81,8 +81,7 @@ impl ConfigRoot {
         let marker: RootMarker = if marker_path.exists() {
             let text = std::fs::read_to_string(&marker_path)
                 .with_context(|| format!("reading {}", marker_path.display()))?;
-            toml::from_str(&text)
-                .with_context(|| format!("parsing {}", marker_path.display()))?
+            toml::from_str(&text).with_context(|| format!("parsing {}", marker_path.display()))?
         } else {
             RootMarker::default()
         };
@@ -217,11 +216,7 @@ pub fn discover(parent: &Path) -> Result<Vec<ConfigRoot>> {
         .with_context(|| format!("reading {}", parent.display()))?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .map_or(false, |n| n.starts_with('.'))
-        })
+        .filter(|e| e.file_name().to_str().map_or(false, |n| n.starts_with('.')))
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
@@ -246,9 +241,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("service.toml"),
-            format!(
-                "schema_version = 1\nname = \"{name}\"\ndomain = \"{name}.example\"\n"
-            ),
+            format!("schema_version = 1\nname = \"{name}\"\ndomain = \"{name}.example\"\n"),
         )
         .unwrap();
     }

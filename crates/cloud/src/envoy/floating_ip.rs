@@ -178,7 +178,10 @@ mod tests {
             attached_to: "123".into(),
         };
         let wire = serde_json::to_value(&out).unwrap();
-        assert_eq!(wire, serde_json::json!({ "reassigned": true, "attached_to": "123" }));
+        assert_eq!(
+            wire,
+            serde_json::json!({ "reassigned": true, "attached_to": "123" })
+        );
     }
 
     #[test]

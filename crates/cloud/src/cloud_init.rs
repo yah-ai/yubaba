@@ -53,8 +53,38 @@
 //! @yah:assignee(agent:claude)
 //! @yah:parent(R589)
 //! @yah:handoff("Hard-cut warden→yubaba across the provision-path emitters (no shims/aliases). cloud_init.rs: RenderInput fields warden_url/warden_sha256/warden_channel/warden_cosign_identity_regexp → yubaba_*; placeholders {{YAH_WARDEN_URL}}/{{YAH_WARDEN_SHA256}}/{{WARDEN_CHANNEL}}/{{UFW_WARDEN_RULE}} → {{YAH_YUBABA_URL}}/{{YAH_YUBABA_SHA256}}/{{YUBABA_CHANNEL}}/{{UFW_YUBABA_RULE}}; PLACEHOLDER_WARDEN_URL/SHA256 → PLACEHOLDER_YUBABA_URL/SHA256; DEFAULT_WARDEN_CHANNEL → DEFAULT_YUBABA_CHANNEL; compute_warden_sha256() → compute_yubaba_sha256(). templates/mirror.yml + its workspace-canonical twin .yah/infra/cloud-init/mirror.yml (drift-tested against each other) got matching placeholder/env renames, incl. the systemd drop-in's Environment=WARDEN_CHANNEL→YUBABA_CHANNEL. provision.rs's build_request() params + release_manifest.rs's WardenReleaseManifest→YubabaReleaseManifest / DEFAULT_WARDEN_COSIGN_IDENTITY→DEFAULT_YUBABA_COSIGN_IDENTITY followed (they feed straight into RenderInput). yubaba-test-harness/src/lib.rs: YAH_WARDEN_URL/SHA256 env vars → YAH_YUBABA_URL/SHA256, plus the local build_smoke_cloud_init()/wait_for_warden_health() helpers renamed to match. local_docker.rs's cloud_init_boots_warden_service test renamed + its template placeholders updated. Cross-crate consumers outside oss/yubaba also updated in the same pass (real compile deps, not board-protocol scope creep): app/yah/cli/src/{cloud.rs,cli.rs,yubaba_fetch.rs} + tests/camp_yubaba_fetch.rs. Fenced OFF (belongs to R592-T4, wire-layer type/client renames): WardenHandle, YubabaRaft, YubabaRequest, WardenRoute wire types in yubaba/raft/*, yubaba-test-harness's WardenHandle, and camp.rs's WardenContainerSpec/build_warden_run_spec/DEFAULT_WARDEN_IMAGE/DEFAULT_WARDEN_HTTP_PORT/read_warden_pond_port/WardenDeploy (pond continuous-deploy runtime, not the cloud-init provisioning path). Also left untouched: name-neutral state paths (/var/lib/yah-cloud/identity.json, /run/constable/constable.sock) per this ticket's own scope fence, and stale warden_test_harness/warden_test_macros doc-comment crate names in yubaba-test-macros (pre-existing drift from an earlier, unrelated crate rename — not provision-path env/template residue). Verify: cargo check/test -p cloud -p yubaba-test-harness (oss/yubaba workspace) clean; cargo check -p yah + cargo test -p yah --lib yubaba_fetch:: + --test camp_yubaba_fetch clean from repo root. Zero remaining WARDEN_ env/placeholder refs in the provision path (grep-verified).")
+//!
+//! @yah:relay(R702, "Bounded disk everywhere — no process on a yah box grows without an explicit ceiling")
+//! @yah:at(2026-08-03T01:29:40Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:next("DOCTRINE (operator, 2026-08-02, emphatic): a full disk brings the best software to its knees, and apps - Docker especially - love to eat all the space. Every single process that ever runs on a yah box must be explicitly forbidden from unbounded growth. A default that happens to be a fraction of the disk is NOT a bound. This relay makes that auditable rather than aspirational.")
+//! @yah:next("DONE ALREADY, not part of the remaining children: journald bounded on all three cloud nodes via /etc/systemd/journald.conf.d/10-yah-disk-bounds.conf (SystemMaxUse=500M, SystemKeepFree=1G, SystemMaxFileSize=50M, RuntimeMaxUse=64M) and the same block added to the TOP of runcmd in BOTH twin cloud-init templates (oss/yubaba/crates/cloud/templates/mirror.yml + .yah/infra/cloud-init/mirror.yml) so it lands before anything else on the box starts writing. us-south-001 went 755.5M -> 483M on restart. RuntimeMaxUse matters twice over: /run is tmpfs, so it bounds RAM too.")
+//! @yah:next("Children to file as work begins: (F) kamaji bundle-cache budget - THE live unbounded one, see gotcha; (T) containerd image/snapshot GC policy; (T) apt archive + old-kernel retention; (T) surface per-node disk headroom in yubaba node status so pressure is visible before it is fatal; (D) a W doc carrying the doctrine plus a review checklist item - every new on-disk writer declares its ceiling at the same time it declares the path.")
+//! @yah:gotcha("LIVE UNBOUNDED CACHE IN OUR OWN CODE, RIGHT NOW. kamaji's mesofact bundle cache has working, unit-tested LRU eviction (BundleCache::evict_to_budget, oss/yah-base/crates/mesofact-bundle/src/store.rs:243) that is DISABLED in production: BundleBackend::cache_budget defaults to 0 (oss/kamaji/crates/kamaji-bin/src/server.rs:297) and 0 explicitly means 'unbounded, eviction off' (store.rs:207). There is no --bundle-cache-budget CLI flag in kamaji-bin/src/main.rs, and the live drop-in /etc/systemd/system/kamaji.service.d/20-bundle.conf on us-east-001 passes only --bundle-cache-dir and --bundle-origin. Net effect: every release wave materializes a new digest-keyed tree under /var/lib/yah/kamaji/bundles/ and NOTHING ever removes the old one. Only 6.3M on east today because there have been few waves - it grows monotonically with release count, forever.")
+//! @yah:gotcha("Fix shape for that child: add the flag, and make the DEFAULT non-zero rather than shipping another opt-in bound (an opt-in ceiling is how this happened). If 0-means-unbounded stays as an escape hatch it should require passing 0 explicitly, so the default path is always bounded.")
+//! @yah:gotcha("Measured baseline 2026-08-02 for whoever picks this up. us-south-001 (30G disk, 1 vCPU / 961MB): 7.2G used, /var 1.4G of which journal 755M, /var/lib/apt 295M, /var/cache 177M. us-east-001 (99G): 2.0G used, /usr 1.1G, /var 786M, containerd 154M, kamaji bundles 6.3M. us-west-001 (99G): 1.9G used. Nothing is near full today - this relay is about the derivative, not the current level.")
+//! @yah:verify("cargo test -p yah-cloud --lib cloud_init  # 25/25 pass after the template edit, incl. embedded_template_matches_workspace_canonical (twin-drift guard) and rendered_runcmd_entries_are_all_strings (the colon-space YAML footgun guard) - ALREADY GREEN 2026-08-02")
+//! @yah:verify("Audit gate for closing this relay: on a freshly provisioned node, every path under /var that any yah-owned process writes to has a named ceiling, and each ceiling is asserted somewhere (unit test, systemd directive, or config) rather than assumed.")
+//! @yah:verify("journalctl --disk-usage on each cloud node stays under 500M across a week of normal operation.")
+//! @yah:assumes("The LAN/appliance nodes (us-west-011/013/014/015) need the same treatment and probably need it MORE (us-west-014 is the arm64 Pi appliance prototype - SD-card-class storage). They were not touched in the 2026-08-02 pass, which covered only the three cloud VMs.")
+//! @yah:gotcha("us-west-014 (Pi 5) VERIFIED 2026-08-02 and it is a two-filesystem box, which changes what 'bounded' means there. The NVMe design IS implemented and working - /dev/nvme0n1p1 is bind-mounted onto /var/lib/docker, /var/lib/yah-cloud and /srv/build, plus an 8 GB swapfile (enabled, 0 used), 234 G at 4%. But `/` is a 2.5 G SD-backed ext4 at 68% with ~745 M free, and /var itself is NOT on the NVMe - only those three subdirectories are. So /var/log (123 M) and /var/cache apt (170 M) sit on the tightest filesystem in the fleet. journald capped at 200M/400M-keepfree there (deliberately smaller than the cloud nodes' 500M). The general rule for this box: anything new writing under /var lands on the SD unless it gets its own bind, so a per-node ceiling has to be sized to the filesystem it actually lands on, not copied from the cloud nodes.")
+//! @yah:gotcha("Docker on us-west-014 is the ONE docker install in the fleet that is already safe by placement (data-root bind-mounted to a 234 G NVMe at 4%). Do not let that make the containerd/docker GC child look optional - the cloud nodes have containerd on the root filesystem with no GC policy (154 M on us-east-001 today).")
+//! @yah:handoff("PI APPLIANCE IMAGE BOUNDED (2026-08-02), ahead of flashing us-west-011 + us-west-013. Two unbounded growers ship with stock docker and both hit build workers hardest: json-file logging defaults to no max-size/max-file, and the BuildKit cache grows forever without builder.gc. Neither had any config - /etc/docker/daemon.json did not exist on us-west-014 or in the image layer. Added to .yah/infra/pi-image/layer/yah-build-worker.yaml: a mkdir -p hook plus a baked /etc/docker/daemon.json (json-file, max-size 10m, max-file 3, builder.gc enabled with defaultKeepStorage 20GB) and /etc/systemd/journald.conf.d/10-yah-disk-bounds.conf at 200M/400M-keepfree/25M-maxfile/32M-runtime. Layer YAML re-parses (14 hooks) and the emitted JSON body validates.")
+//! @yah:handoff("LOCKSTEP DEBT PAID. mirror.yml's new journald runcmd block obliged a matching change in its documented twin .yah/infra/cloud-init/stand-up-yubaba.sh (the SSH-deliverable transcription used for LAN nodes, W257 step 6). Written WRITE-IF-ABSENT on purpose: the standup default is the cloud-node 500M, but the Pi image bakes a tighter 200M sized to its 2.5 G SD root, and the standup runs AFTER first boot - an unconditional write would have silently regressed every Pi it touched. An existing ceiling always wins and the script echoes what it kept. bash -n clean.")
+//! @yah:handoff("W257 runbook step 5 gained a disk-ceiling verification block. The load-bearing assertion is `systemctl is-active docker`: dockerd refuses to start on a daemon.json it cannot parse, and a docker-less build worker is the entire purpose of the node gone. Runbook names the likely culprit after a docker bump (defaultKeepStorage deprecated in favour of builder.gc.policy in 27+; trixie ships 26.1.5, which honours the old key).")
+//! @yah:handoff("X86 FLEET PROVISIONING LANDED (2026-08-02), and it closes the arch-specific-ceiling gap this relay opened. New .yah/infra/preseed/{yah-x86-worker.cfg, build-iso.sh, .gitignore}. Deliberately the SAME shape as the Pi path rather than a new idiom: a Debian container does the work, the operator key is injected at build time instead of committed, and one artifact provisions every x86 box with per-box identity applied after install. build-iso.sh caches the stock trixie amd64 netinst, renders the preseed with ~/.ssh/yah.pub substituted for @@SSH_PUBKEY@@, injects it into the installer initrd (so the install is hands-off with no boot prompt to type at), regenerates md5sum.txt, and repacks a UEFI hybrid ISO with xorriso. Neither path is a roll-your-own distro - one configures rpi-image-gen, the other configures debian-installer.")
+//! @yah:handoff("PARTITIONING IS THE STRUCTURAL HALF OF THIS RELAY, and the preseed is where it finally gets decided up front instead of discovered. Separate LVs for /, /var and /var/lib/docker on VG `yah`, ~40 GB left unallocated for online lvextend. A runaway BuildKit cache now fills /var/lib/docker and NOTHING else - root stays writable, sshd keeps accepting, journald keeps recording, the box stays reachable to clean up. That is the backstop for a MISSING ceiling; it does not replace the ceilings, which the preseed late_command also writes (journald 500M + docker daemon.json with log rotation and builder.gc at 100GB, sized to the 512 GB disk).")
+//! @yah:handoff("DOCKER CEILING IS NO LONGER A PROPERTY OF ONE IMAGE. stand-up-yubaba.sh now applies /etc/docker/daemon.json write-if-absent on any node where docker is present (it installs containerd, not docker, so this is a conditional), and restarts docker THERE so a parse failure surfaces during standup rather than at the next reboot - dockerd refuses to start on a daemon.json it cannot parse. Three provisioning paths now converge on the same ceilings: Pi image (baked), preseed late_command (baked), standup script (retrofit). bash -n clean on both scripts.")
+//! @yah:handoff("Scaffolded .yah/infra/machines/us-west-012.toml for the GEEKOM A5 (Ryzen 7 5825U 8C/16T, 16 GB, 512 GB NVMe): tier:x86 + os:linux + build-worker/qed, taints copied from us-west-002 for day one. Recorded WHY it is a better tier:x86 host than 002 - 002 is a WSL2 box that sleeps and reboots with Windows, this is dedicated always-on Debian - so dropping no-server/no-appliance later is a deliberate re-decision rather than drift. Stays no-voter regardless: a residential uplink must never be able to stall the raft. allocatable is from the vendor spec with an explicit instruction to re-verify via nproc + free -m on the box, since the OVH nodes shipped wrong for months. Parses: cargo test -p yah-cloud --lib machine 24/24, `yah cloud validate` ok.")
+//! @yah:verify("UNPROVEN, and the one thing to watch: the partman-auto/expert_recipe in yah-x86-worker.cfg has never been run. A malformed recipe fails mid-install with an error that does not always name the offending stanza. Watch the first install of any ISO revision; once it completes cleanly the same ISO is proven for every later box. It also assumes ONE disk (early_command picks `list-devices disk | head -n1`), so a two-disk box needs the target pinned.")
+//! @yah:verify("UNPROVEN: build-iso.sh has not been executed - the initrd inject + xorriso repack path is written but not run, and the ISO URL pins DEBIAN_VERSION=13.1.0 which should be bumped to whatever trixie point release is current at build time (override with the env var).")
+//! @yah:verify("Cheap de-risk available before touching hardware: boot the built ISO in QEMU against a scratch qcow2 and let the unattended install run to completion. That proves the recipe, the initrd inject and the late_command without burning a USB or a trip to the box.")
+//! @yah:handoff("RENUMBERED (operator correction, 2026-08-02): the GEEKOM mini PC is us-west-003, NOT us-west-012 — the 01x block is reserved for the small LAN/appliance class and another Pi is taking 012. The convention is by HARDWARE CLASS, not arrival order: 00x = PC/server (001 OVH VPS, 002 WSL2 gamer box, 003 GEEKOM), 01x = small LAN boxes (011-014 Pis, 015 arm64 Mac). Recorded at the top of us-west-003.toml and in W257, because it is not derivable from the existing files and it is what tells a reader which of the two provisioning paths a node took. The us-west-012.toml scaffold was untracked and never committed, so it was removed rather than renamed; no stale refs remain (grep clean, `yah cloud validate` ok).")
+//! @yah:gotcha("LAN IP for us-west-003 is ASSUMED, not confirmed. W257's convention is us-west-0NN -> 192.168.10.NN and it holds for every 01x node, but the only existing 00x LAN box breaks it: us-west-002 sits at 192.168.10.30, not .2. The scaffold uses .3 with a CONFIRM-BEFORE-BRING-UP note inline. If the 00x block actually lives in the .3x range on the router, .3 is wrong and both [connect].address and [connect].ssh need correcting before step 4.")
 
 use crate::config::MachineConfig;
+use crate::release_manifest::ReleaseTrust;
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -132,9 +162,11 @@ pub const COSIGN_SHA256_AMD64: &str =
 pub const COSIGN_SHA256_ARM64: &str =
     "3b2e2e3854d0356c45fe6607047526ccd04742d20bd44afb5be91fa2a6e7cb4a";
 /// Sigstore Fulcio OIDC issuer for GitHub-Actions-rooted keyless signing.
-/// Matches what `.github/workflows/release.yml`'s `cosign sign-blob` step
-/// emits (R330-F19).
-pub const COSIGN_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
+/// Re-exported from [`crate::release_manifest`], which owns the canonical
+/// copy — the shell verify path here and the Rust verify path in the yah CLI
+/// must pin the same issuer or one of them silently accepts the other's
+/// rejects (R605-F1).
+pub use crate::release_manifest::COSIGN_OIDC_ISSUER;
 
 /// Load the cloud-init template for a workspace.
 ///
@@ -276,7 +308,12 @@ fn build_cloudflared_block(token: &str) -> String {
 /// matching what `release.yml` publishes alongside the canonical artifact
 /// (R330-F19). Architecture is detected at boot via `dpkg --print-architecture`
 /// so one rendered template serves both x86_64 and aarch64 Hetzner machines.
-fn build_cosign_verify_block(yubaba_url: &str, identity_regexp: &str) -> String {
+///
+/// R605-F1: `identity_spec` is parsed as a [`ReleaseTrust`], so a fleet whose
+/// releases are cut on QED (key-based cosign, no Fulcio) provisions by setting
+/// `key:<pubkey-ref>` — the `.cert` fetch drops out with it, because a
+/// key-based signature has no certificate to download.
+fn build_cosign_verify_block(yubaba_url: &str, identity_spec: &str) -> String {
     // ARCH + SHA must be set, checked, and consumed inside the same `sh -c`
     // process — cloud-init runcmd entries are independent shells, so a
     // multi-step download-then-verify-then-install split would lose the
@@ -302,16 +339,36 @@ fn build_cosign_verify_block(yubaba_url: &str, identity_regexp: &str) -> String 
         arm64 = COSIGN_SHA256_ARM64,
         ver = COSIGN_VERSION
     );
-    [
+    let trust = ReleaseTrust::parse(identity_spec);
+    // Single-quote each flag value: the regexp arm carries backslashes and `^`
+    // that the boot shell would otherwise eat, and the key arm carries a URI.
+    // Neither may contain a `'` — a spec that does is an operator error, not a
+    // case to escape, since it can't be a valid identity regexp or key ref.
+    let trust_flags = trust
+        .verify_flags()
+        .chunks(2)
+        .map(|kv| format!("{} '{}'", kv[0], kv.get(1).map_or("", |v| v.as_str())))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut lines = vec![
         install_and_verify_cosign,
         format!("  - curl -fsSL -o /tmp/yah-yubaba.tar.gz.sig {yubaba_url}.sig"),
-        format!("  - curl -fsSL -o /tmp/yah-yubaba.tar.gz.cert {yubaba_url}.cert"),
-        format!(
-            "  - cosign verify-blob --certificate-identity-regexp '{identity_regexp}' --certificate-oidc-issuer {issuer} --certificate /tmp/yah-yubaba.tar.gz.cert --signature /tmp/yah-yubaba.tar.gz.sig /tmp/yah-yubaba.tar.gz",
-            issuer = COSIGN_OIDC_ISSUER
-        ),
-    ]
-    .join("\n")
+    ];
+    if trust.needs_certificate() {
+        lines.push(format!(
+            "  - curl -fsSL -o /tmp/yah-yubaba.tar.gz.cert {yubaba_url}.cert"
+        ));
+    }
+    let cert_flag = if trust.needs_certificate() {
+        " --certificate /tmp/yah-yubaba.tar.gz.cert"
+    } else {
+        ""
+    };
+    lines.push(format!(
+        "  - cosign verify-blob {trust_flags}{cert_flag} --signature /tmp/yah-yubaba.tar.gz.sig /tmp/yah-yubaba.tar.gz"
+    ));
+    lines.join("\n")
 }
 
 /// Build the tailscaled operator-bridge block for `runcmd`.
@@ -418,7 +475,10 @@ mod tests {
                 name: "noisetable-assets-pdx-1".into(),
                 public_read: false,
             }),
-            hostkey_fingerprint: None,
+            vendor: None,
+            nickname: None,
+            legacy_hostkey_fingerprint: None,
+            registration: Default::default(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -905,6 +965,53 @@ mod tests {
             assert!(
                 line.starts_with("  - "),
                 "cosign block line is not a runcmd list entry: {line:?}"
+            );
+        }
+    }
+
+    /// R605-F1: a fleet whose releases are cut on QED verifies against a
+    /// pinned public key, not a Fulcio certificate identity. The `.cert`
+    /// fetch must drop out with it — the release publishes no `.cert`, so
+    /// leaving the curl in place would fail the boot before cosign ever runs.
+    #[test]
+    fn render_with_key_trust_emits_key_verify_and_no_cert_fetch() {
+        let machine = sample_machine();
+        let mut input = minimal_input(&machine);
+        input.yubaba_url = "https://cdn.yah.dev/yubaba/0.9.0/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz".into();
+        input.yubaba_cosign_identity_regexp =
+            Some("key:https://cdn.yah.dev/keys/yah-release.pub".into());
+        let out = render(DEFAULT_TEMPLATE, &input).unwrap();
+
+        assert!(
+            out.contains(
+                "cosign verify-blob --key 'https://cdn.yah.dev/keys/yah-release.pub' \
+                 --signature /tmp/yah-yubaba.tar.gz.sig"
+            ),
+            "key-based verify-blob line missing:\n{out}"
+        );
+        assert!(
+            !out.contains("--certificate-identity-regexp"),
+            "keyless flags must not survive into a key-trust render"
+        );
+        assert!(
+            !out.contains(&format!("{}.cert", input.yubaba_url)),
+            "key-based signatures have no .cert sibling to fetch"
+        );
+        // Still a well-formed runcmd sequence.
+        for line in out.lines().filter(|l| l.contains("cosign")) {
+            let stripped = line.trim_start();
+            if stripped.starts_with('#') || stripped.is_empty() {
+                continue;
+            }
+            assert!(
+                line.starts_with("  - "),
+                "cosign block line is not a runcmd list entry: {line:?}"
+            );
+            // R330-F28 pothole #12: a `: ` anywhere makes cloud-init read the
+            // entry as a YAML mapping and skip the whole runcmd block.
+            assert!(
+                !line.contains(": "),
+                "colon-space in runcmd entry would break cloud-init parsing: {line:?}"
             );
         }
     }

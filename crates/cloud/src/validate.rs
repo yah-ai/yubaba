@@ -352,8 +352,8 @@ mod tests {
             .map(|(k, v)| format!("\"{k}\" = \"{v}\"\n"))
             .collect();
         let content = format!(
-            "[static-asset]\nschema_version = \"V1\"\n\
-             [static-asset.aliases]\n{alias_lines}"
+            "kind = \"static-asset\"\nschema_version = \"V1\"\n\
+             [aliases]\n{alias_lines}"
         );
         std::fs::write(dir.join("workload.toml"), content).unwrap();
     }

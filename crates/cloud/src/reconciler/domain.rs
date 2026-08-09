@@ -1,14 +1,20 @@
 //! Domain-level reconciler — `.yah/domains/*.toml` → live Cloudflare state.
 //!
-//! Today's only shape is the **R2 custom-domain** binding: a domain whose
-//! `cdn_bucket` field names an R2 bucket and which has no `[[routes]]`.
-//! Cloudflare's R2 Custom Domains API binds the hostname to the bucket and
-//! writes the CNAME into the parent zone automatically when the zone lives
-//! on the same account — no DNS-side call is needed here.
+//! Today's only shape is the **R2 custom-domain** binding: a domain that
+//! declares `front_door = "bucket-direct"` (R594-F12) and names an R2 bucket
+//! in `cdn_bucket`. Cloudflare's R2 Custom Domains API binds the hostname to
+//! the bucket and writes the CNAME into the parent zone automatically when
+//! the zone lives on the same account — no DNS-side call is needed here.
 //!
-//! Worker-routed domains (e.g. `yah-dev.toml`, `app-yah-dev.toml`, which
-//! carry `[[routes]]`) are out of scope for this module; they get DNS +
-//! route management through the Worker reconciler.
+//! Domains with `front_door = "worker"` (e.g. `yah-dev.toml`,
+//! `app-yah-dev.toml`) are out of scope for this shape; they get DNS + route
+//! management through the Worker reconciler below. `front_door = "passway"`
+//! is the sovereign-ingress path (W267) and has no reconciler here yet.
+//!
+//! Before R594-F12 the shape was *inferred* from the absence of `[[routes]]`,
+//! which meant a route-carrying manifest bound straight to R2 was accepted
+//! and silently skipped by this pass. The discriminator is now declared and
+//! validated at load.
 
 use std::path::Path;
 
@@ -92,7 +98,7 @@ fn parent_zone_name(domain: &str) -> &str {
 // Workers Custom Domains API. This is the routed-domain shape the apply loop
 // currently Skips.
 
-use crate::config::{DomainConfig, DomainRoute, RouteMode};
+use crate::config::{DomainConfig, DomainRoute, FrontDoor, RouteMode};
 use crate::provider::cloudflare::WorkerBinding;
 use crate::reconciler::mesofact_static::WORKER_SCRIPT;
 use std::collections::BTreeMap;
@@ -141,6 +147,20 @@ pub fn plan_domain_worker(
     cdn_base: &str,
     env: &str,
 ) -> Result<DomainWorkerPlan> {
+    // R594-F12: refuse to synthesize a Worker for a domain that declared a
+    // different front door. Without this the plan succeeds and deploys a
+    // Worker that never receives traffic (bucket-direct) or that duplicates
+    // the sovereign ingress (passway).
+    if domain.front_door != FrontDoor::Worker {
+        anyhow::bail!(
+            "domain {} ({}) declares front_door = \"{}\" — only \"worker\" \
+             domains get a generated Cloudflare Worker",
+            domain.name,
+            domain.domain,
+            domain.front_door.as_str()
+        );
+    }
+
     // First static route wins (v1 alias tier serves one site per subdomain).
     let component = domain
         .routes
@@ -223,14 +243,19 @@ pub async fn deploy_domain_worker(
         .zone_id_for_name(zone)
         .await
         .with_context(|| format!("resolving zone id for {zone:?}"))?;
-    cf.upsert_worker_custom_domain(&account_id, &zone_id, &plan.custom_domain, &plan.worker_name)
-        .await
-        .with_context(|| {
-            format!(
-                "binding {} to Worker {}",
-                plan.custom_domain, plan.worker_name
-            )
-        })?;
+    cf.upsert_worker_custom_domain(
+        &account_id,
+        &zone_id,
+        &plan.custom_domain,
+        &plan.worker_name,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "binding {} to Worker {}",
+            plan.custom_domain, plan.worker_name
+        )
+    })?;
     info!(domain = %plan.custom_domain, worker = %plan.worker_name, "alias-tier custom domain bound");
     Ok(())
 }
@@ -323,6 +348,9 @@ pub fn plan_alias_claim(
         schema_version: 1,
         name: stem,
         domain,
+        // R594-F12: every tenant manifest is Worker-served (R561-F3 binds the
+        // subdomain as a custom domain on the generated Worker).
+        front_door: FrontDoor::Worker,
         cdn_bucket: tier.bucket().to_string(),
         worker_bundle_path: None,
         routes: vec![DomainRoute {
@@ -356,7 +384,7 @@ mod tests {
     }
 
     use super::{plan_domain_worker, DomainWorkerPlan};
-    use crate::config::{DomainConfig, DomainRoute, RouteMode};
+    use crate::config::{DomainConfig, DomainRoute, FrontDoor, RouteMode};
 
     fn net_tier_manifest() -> DomainConfig {
         // Mirrors .yah/domains/scrabcake-net-yah-dev.toml.
@@ -364,6 +392,7 @@ mod tests {
             schema_version: 1,
             name: "scrabcake-net-yah-dev".into(),
             domain: "scrabcake.net.yah.dev".into(),
+            front_door: FrontDoor::Worker,
             cdn_bucket: "net-yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
@@ -404,6 +433,21 @@ mod tests {
         let plan =
             plan_domain_worker(&net_tier_manifest(), "https://cdn.net.yah.dev/", "cloud").unwrap();
         assert_eq!(plan.asset_origin, "https://cdn.net.yah.dev/scrabcake/cloud");
+    }
+
+    /// R594-F12: a manifest that declares a different front door must not
+    /// get a Cloudflare Worker synthesized behind its back — the Worker
+    /// would deploy and then never receive traffic.
+    #[test]
+    fn plan_bails_when_front_door_is_not_worker() {
+        for door in [FrontDoor::BucketDirect, FrontDoor::Passway] {
+            let mut dom = net_tier_manifest();
+            dom.front_door = door;
+            let err = plan_domain_worker(&dom, "https://cdn.net.yah.dev", "cloud").unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("front_door"), "{msg}");
+            assert!(msg.contains(door.as_str()), "{msg}");
+        }
     }
 
     #[test]

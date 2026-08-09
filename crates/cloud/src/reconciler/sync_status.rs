@@ -430,8 +430,10 @@ fn provider_kind_label(kind: Provider) -> String {
         Provider::Static => "static",
         Provider::LocalStatic => "local-static",
         Provider::LocalContainer => "local-container",
+        Provider::LocalProcess => "local-process",
         Provider::MiniflareContainer => "miniflare-container",
         Provider::MinioContainer => "minio-container",
+        Provider::LocalPgDev => "local-pg-dev",
     }
     .to_string()
 }

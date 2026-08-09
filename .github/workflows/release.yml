@@ -1,42 +1,1964 @@
+# @yah:ticket(R299-T8, "Reduce GHA to thin shim around yah qed run release-build (tag-trigger)")
+# @yah:assignee(agent:claude)
+# @yah:at(2026-05-23T01:47:10Z)
+# @yah:status(review)
+# @yah:phase(P3)
+# @yah:parent(R299)
+# @arch:see(.yah/docs/working/yah-qed.md)
+# @yah:depends_on(R299-T6)
+# @yah:handoff("Removed forge-image GHA job (crates/yah/forge/ deleted in R299-T1, Dockerfile no longer exists). Wired smoke job to call `cargo run -p yah --locked -- qed run provider-smoke --provider=$PROVIDER` — GHA selects provider from secrets, qed executes pipeline logic. Added Trigger::Tag{pattern:\"v*.*.*\"} to builtin_release_build() so the trigger is declared in qed. Updated release.yml header with qed transition plan comment. 16 tests pass including release-build tag trigger assertion.")
+# @yah:verify("cargo test -p qed  # 16 tests pass")
+# @yah:verify("grep -c 'forge-image' .github/workflows/release.yml  # should print 0")
+# @yah:verify("grep 'yah qed run provider-smoke' .github/workflows/release.yml  # should match the smoke step")
+#
+# @yah:ticket(R381-T7, "Release pipeline fan-out: replace single forge-image GHA job with per-catalog-image matrix")
+# @yah:assignee(agent:claude)
+# @yah:at(2026-06-01T21:07:41Z)
+# @yah:status(review)
+# @yah:parent(R381)
+# @yah:next("Today's forge-image job builds + pushes one image. Replace with a matrix strategy over the catalog manifest (T1) — each entry gets built, signed, pushed to ghcr.io/yah-ai/<name>.")
+# @yah:next("Collect digests into a YAH_IMAGE_CATALOG_DIGESTS env (JSON map { name: digest }) baked into the release build of the yah binary. Replaces the single FORGE_MINIMAL_DIGEST env.")
+# @yah:next("Sigstore keyless signing stays per-image (same identity regex pattern as today's forge-minimal).")
+# @yah:next("P1 catalog scope (per W148 phase plan): yah-base + yah-rust-bun + yah-python. Defer yah-cuda + yah-node + yah-bun standalone to P2/P3.")
+# @yah:handoff("Release pipeline fan-out landed. Three new jobs in .github/workflows/release.yml: image-yah-base + image-yah-rust + image-yah-rust-bun. Each: checkout → docker/setup-buildx-action@v3 → docker/login-action@v3 (ghcr.io, ${{ github.actor }} + GITHUB_TOKEN) → docker/build-push-action@v5 with push=true and dual tags (`:latest` + `:${tag}`) → sigstore/cosign-installer@v3 → keyless OIDC `cosign sign --yes ghcr.io/yah-ai/<name>@<digest>`. Permissions per job: contents:read, packages:write, id-token:write (Sigstore OIDC). image-yah-rust-bun has `needs: [smoke, image-yah-rust]` because its Dockerfile FROM ghcr.io/yah-ai/yah-rust:latest — it cannot start until yah-rust is pushed; the other two run in parallel after smoke. Each job emits `outputs.digest` (sha256:...) from build-push-action's standard output, which the three binary release jobs (cli-release, yubaba-release, camp-release) consume as a job-level env block: YAH_BASE_DIGEST / YAH_RUST_DIGEST / YAH_RUST_BUN_DIGEST. These names match task::default_image's option_env! constants from T8, so the digests bake into the binary's compile-time defaults. Design choice (gotcha T7): per-image envs, NOT a single YAH_IMAGE_CATALOG_DIGESTS JSON blob — simpler, matches T8's option_env! discipline, no const-context JSON parsing. cli/yubaba/camp release jobs each grew `needs: [smoke, image-yah-base, image-yah-rust, image-yah-rust-bun]` and a multi-line if: clause that hard-requires image jobs to succeed (failing fast on supply-chain trouble). desktop-release does NOT consume digests — it's a Tauri bundle, not a default_forge_image() consumer; left untouched. P1 scope shipped: yah-base + yah-rust + yah-rust-bun. yah-python / yah-bun / yah-node / yah-cuda land in P2/P3 by adding more image-yah-* jobs here and threading each into the env block. actionlint .github/workflows/release.yml clean for the new jobs (only pre-existing shellcheck warnings on the untouched updater-manifest job survive). Untestable locally — the pipeline only exercises on a real release tag push, and a typo only manifests there; reviewer should diff jobs against an existing one before tagging.")
+# @yah:next("P2 catalog growth (yah-python first per W148 phase plan): add catalog.toml entry, drop in oss/qed/crates/qed/images/yah-python/Dockerfile, add YAH_PYTHON_DIGEST const + catalog_digest() arm in task::default_image, then add an image-yah-python GHA job here and wire YAH_PYTHON_DIGEST into the three binary release jobs' env blocks. One ticket per new image keeps the PR small.")
+# @yah:next("Cosign verification end-to-end: the #[ignore] pull-and-verify test in default_image.rs::pull was rewired to YAH_RUST_BUN_DIGEST in T8. After the first release run produces a signed digest, run the test locally with `YAH_RUST_BUN_DIGEST=sha256:<hash> cargo test -p task default_image::pull -- --include-ignored` to confirm the OIDC identity regex still matches.")
+# @yah:next("If the cosign keyless step regresses (Sigstore Fulcio quota, OIDC scope change), the binary builds still succeed but the supply-chain story breaks silently. Worth a follow-up: a post-publish job that re-runs `cosign verify` against the just-pushed digest as a gate before cli-release starts. Currently signing is best-effort — a failed sign step fails the job (good) but a missing signature doesn't fail downstream pulls (because the consumer code path doesn't enforce verification).")
+# @yah:verify("actionlint .github/workflows/release.yml  # only pre-existing shellcheck warnings on updater-manifest survive")
+# @yah:verify("grep -c 'image-yah-' .github/workflows/release.yml  # should print >= 12 (3 jobs * 4+ refs each)")
+# @yah:verify("On next release tag push: confirm image-yah-base + image-yah-rust + image-yah-rust-bun all succeed and push to ghcr.io/yah-ai/<name>:<tag>; confirm cosign sign emits a signature attestation; confirm cli/yubaba/camp release jobs build with the YAH_*_DIGEST env populated (check cargo build env in the runner log)")
+#
+# @yah:ticket(R435-T6, "Author `release-build` recipe + thin `release.yml` (signing/notarization remain ci-only)")
+# @yah:status(review)
+# @yah:assignee(agent:claude)
+# @yah:at(2026-06-21T00:40:33Z)
+# @yah:phase(P4)
+# @yah:parent(R435)
+# @yah:verify("A test tag pushed to a release branch runs the workflow green end-to-end")
+# @yah:verify("Compare resulting artifacts byte-for-byte (or hash-for-hash) against a pre-refactor build")
+# @yah:gotcha("release.yml has signing identity + notarization secrets — do not regress secret handling while refactoring")
+# @yah:gotcha("Don't break the existing release path; if in doubt, stage behind a `--qed` opt-in branch of the workflow")
+# @arch:see(.yah/docs/working/W155-qed-recipe-discipline.md)
+# @yah:handoff("SLICE 1 of the cargo-build half landed (ticket says 'go in slices'). New: scripts/cross-build-guarded.sh (leaf-glue: cargo fetch + cross build + hard-fail on cross's silent 'Falling back to' host build) and .yah/qed/release-build.toml (recipe name=release-build, placement=ci-only, concurrency_key=cargo-target, 5 required params package/target/bin/features/workdir). camp-build in release.yml rewired: inline guarded cross-build replaced by `cargo build -p yah --locked` (dispatcher) + `yah qed run release-build --param ...` exactly per the T4/T5 pattern. Job-level digest env (YAH_*_DIGEST) still flows into cross via inherited process env (W155 §4); packaging/upload/sign/publish all stay in GHA. Verified locally: bash -n clean; recipe parses through the real loader (`yah qed pipelines` lists release-build with right label/step); release.yml parses + the folded `--param features=` renders correctly; placement_gate.rs confirms ci-only×CI(GITHUB_ACTIONS)→Allow; qed.rs split_once('=') accepts empty values as present for the required-param check.")
+# @yah:next("FOLLOW-UP SLICES (recipe+script already serve all of these; only the GHA wiring remains): yubaba-build → two `yah qed run release-build` calls (package=yubaba and package=kamaji, features=containerd-integration, workdir=oss/yubaba); mesofact-dev-build → package=almanac bin=almanac-serve workdir=oss/yubaba + package=issue-tracker workdir=. ; cli-build → musl legs use the recipe (features=all-image), but its x86_64-unknown-linux-gnu leg is a NATIVE `cargo build` (use_cross=false) and must STAY inline — the recipe is cross-only.")
+# @yah:next("ARCHITECTURAL DECISION NEEDED (P013): .yah/qed/release.toml wraps THIS workflow via the native qed-gha runtime (W200/W201). So camp-build's `yah qed run release-build` step becomes a qed-run nested inside the qed-gha runtime when P013 runs. Confirm the runtime translates a `yah qed run` step correctly (or that nesting is intended) before replicating to the other 3 jobs.")
+# @yah:next("TAG-ONLY VERIFY (cannot run locally): push a test tag to a release branch, confirm camp-build goes green via the recipe, and compare the yah-camp artifact hash-for-hash against a pre-refactor build.")
+# @yah:cleanup("Ticket premise partly stale: 'yubaba-release recipe already exists; the workflow should just call it' — P007-yubaba-release was COLLAPSED into release.toml (R499-T2), so no standalone yubaba-release recipe exists; the new release-build recipe serves yubaba too.")
+# @yah:cleanup("The ticket's @arch:see points to .yah/docs/working/W155-qed-recipe-discipline.md but the discipline doc was renumbered to W170-qed-recipe-discipline.md (per placement_gate.rs:8). Repoint when convenient.")
+#
+# Board tickets for this file (R330-F24 release split, R516 qed_gha artifact
+# correctness) have their AUTHORITATIVE @yah: annotations in
+# .yah/docs/working/W203-yubaba-bootstrap-channel.md — NOT here. The camp
+# daemon's kg indexer does not scan YAML #-comments, so any @yah:ticket block
+# placed in this file is invisible to the board UI and unarchivable via the
+# daemon. Do not re-add @yah: ticket/relay blocks here until the YAML-extraction
+# indexer gap is fixed.
+#
+# @yah:ticket(R330-S26, "Benchmark musl+mimalloc vs gnu; go musl-only for CLI download if it wins")
+# @yah:at(2026-06-20T08:21:47Z)
+# @yah:kind(spike)
+# @yah:status(review)
+# @yah:assignee(agent:claude)
+# @yah:parent(R330)
+# @yah:gotcha("CLI no longer links V8 — mesofact-dev de-embedded in R490-F2 (app/yah/cli/Cargo.toml:143), so the CLI download is a plain Rust binary. V8/static-link concerns belong to mesofact (already musl-only) and are OUT of scope here.")
+# @yah:gotcha("STACK SAFETY IS THE GATE, not the benchmark. Codebase sets ZERO explicit stack sizes today (no stack_size/thread_stack_size/RUST_MIN_STACK). glibc default = 8MB/thread, musl default = ~128KB/thread. We already hit stack limits on glibc's 8MB, so musl-only WITHOUT stack fixes is a hard regression on spawned threads. Main thread is fine (kernel/ulimit ~8MB); only spawned threads bite.")
+# @yah:gotcha("DNS/NSS almost certainly a non-issue: yah resolves public DNS (Anthropic/OpenRouter, cdn.yah.dev, R2, GitHub) via resolv.conf which musl handles identically; mesh peers use tailscale0 IP. musl only diverges on NSS plugins (sssd/LDAP/NIS, mDNS/.local) which yah doesn't use. Confirm-only, not expected to block.")
+# @yah:gotcha("mimalloc #[global_allocator] only redirects Rust allocations; C/FFI deps keep using musl malloc. Fine for the V8-less CLI.")
+# @yah:next("PREREQ/GATE — stack safety under musl: (a) add link-time backstop `-Wl,-z,stacksize=8388608` to musl RUSTFLAGS so unaudited spawns still get 8MB; (b) audit spawn sites and set explicit stacks: std::thread::Builder::stack_size, tokio Builder::thread_stack_size, rayon ThreadPoolBuilder::stack_size. Acceptance: full agent-runtime smoke passes on a musl build with no stack overflow.")
+# @yah:next("Add mimalloc as #[global_allocator] in app/yah/cli (mimalloc = \"0.1\"; musl cross image already has a C toolchain to build it).")
+# @yah:next("BENCHMARK 3-way on the agent-runtime workload: gnu+glibc-malloc vs musl+mallocng vs musl+mimalloc. Measure throughput + p50/p99 latency + RSS.")
+# @yah:next("DECISION: if musl+mimalloc >= gnu, drop x86_64-unknown-linux-gnu from the cli-build + publish-cli matrices in release.yml and ship musl-only (CLI already builds musl; smoke runs on it).")
+# @yah:next("DOWNLOAD PAGE (ties to R157/R330 two-view): per-platform cards surface exactly ONE artifact per platform (musl static = universal, no GLIBC_2.xx forward-compat trap). Any retained gnu artifact goes only in the below-the-fold full list, never a card.")
+# @yah:next("DNS/NSS confirm: verify nothing depends on .local/mDNS or enterprise NSS and mesh addressing stays IP-or-resolv.conf. Cheap; expected pass.")
+# @yah:verify("A musl CLI build with stack backstop + mimalloc passes the full agent-runtime smoke with zero stack overflows")
+# @yah:verify("Benchmark report committed comparing gnu vs musl vs musl+mimalloc (throughput, p50/p99, RSS) on the agent workload")
+# @yah:verify("If musl wins: grep -c 'x86_64-unknown-linux-gnu' .github/workflows/release.yml shows the target removed from cli-build + publish-cli matrices")
+# @yah:handoff("Stack-safety audit + mimalloc DONE and verified natively (real code, not a musl-only claim): added app/yah/cli/src/stack_safety.rs (thread_stack_size=8MiB helpers for tokio Runtime construction) and converted all 41 tokio::runtime::Runtime::new() call sites plus the 5 Builder::new_current_thread() chains across the CLI (agent.rs, almanac.rs, camp.rs, cli.rs, cloud.rs, eval.rs, ghcr.rs, mesh.rs, qed.rs, serve.rs, bin/yah-image-mcp.rs) to use it; fixed the one real (non-test) std::thread::spawn with no stack size in the CLI's dependency graph (crates/yah/tower/src/storage.rs RuleStore::watch, now thread::Builder with 8MiB) verified via cargo test -p tower --test storage: 18/18 pass. Added mimalloc = 0.1 as #[global_allocator] in lib.rs (covers all CLI bins via Cargo's implicit lib-dep). Added a link-time -Wl,-z,stacksize=8388608 backstop for both musl targets in .cargo/config.toml, documented honestly as best-effort (only provably covers the main thread, not pthread defaults). Verified stack_safety.rs + mimalloc wiring in an isolated scratch crate (compiles, runs, unit tests incl. a deep-recursion-through-spawn_blocking pass) since a full cargo check -p yah could not get a clean run in this shared tree (unrelated, pre-existing, actively-changing peer WIP breaks it: PipelineRunner::with_branch missing on camp.rs/qed.rs, AgentEvent/RunnerSessionInit missing dispatch_kind on runner+hub -- none of it mine, confirmed via git diff against HEAD, not touched). BENCHMARK: NOT completed, and this is an honest gap not a fabrication -- musl cross tooling (cross, docker, both musl rustup targets, pre-built cross-custom-yah images) and ollama with pulled models are genuinely present in this sandbox, but the shared source tree does not compile right now for unrelated reasons, so there is no buildable yah binary (gnu or musl) to benchmark. DNS/NSS confirm-only check: passed, no real .local/mDNS/NSS dependency found in the CLI's reachable code. release.yml target matrix: untouched per instructions (no measured data to justify it). Also: this exact annotation block is on a file the codebase's own comment above flags as YAML-comment blocks the kg indexer can't scan/rewrite -- yah board move/handoff commands silently dropped the status write here (pre-existing tooling gap, confirmed predating this session at commit fbe6ff0), so this @yah:status(review) + this handoff were added by direct hand-edit as a workaround.")
+#
+# @yah:relay(R587, "Desktop auto-update: QED desktop-release publishes signed bundles + latest.json to R2; app checks cdn.yah.dev")
+# @yah:at(2026-07-01T06:46:23Z)
+# @yah:status(open)
+# @yah:assignee(agent:bundle-anthropic-glimmerstone)
+# @yah:handoff("R703-T5 re-scope (2026-08-05): T3 is DONE — app/yah/desktop/tauri.conf.json:52 already reads https://cdn.yah.dev/yah-desktop/latest.json.")
+# @yah:handoff("T1/T2 described a cdn.yah.dev/desktop/<version>/<triple>/ layout that never shipped. What DID ship is the yah-desktop/ prefix written by scripts/publish-desktop.sh, called from .yah/qed/desktop-release.toml's terminal publish step.")
+# @yah:handoff("T1/T2's implementation is therefore done in code; what was missing is that nobody had ever RUN it. That run is R703-T5, not this relay. T4 is the only genuine remaining work here.")
+#
+
 name: release
 
-# Publish this workspace's crates to crates.io when a vX.Y.Z tag is pushed.
-# Auth is crates.io Trusted Publishing (OIDC) — no token is stored in the repo.
-# Each publishable crate must have a Trusted Publisher configured on crates.io:
-#   owner = yah-ai/<repo>, workflow = release.yml.
+# Tag-driven release pipeline (R330-F24 three-layer shape):
 #
-# This mirror is an export of the yah monorepo's oss/<name> subtree; edit the
-# workflow there, not here.
+#   Build layer (no irreversible side-effects)
+#     image-yah-*         push only :smoke-<sha> (no sign)
+#     cli-build           upload binaries as workflow artifacts
+#                         (3 linux + 2 darwin triples — R638-F1)
+#     yubaba-build        upload binaries + tarball artifacts
+#     camp-build          upload binaries as workflow artifacts
+#     mesofact-build      mesofact + mesofact-dev tarball, 4 blessed V8 triples
+#
+#   Smoke gate (the prepublish quality contract)
+#     smoke               downloads cli-build's x86_64-musl tarball, runs
+#                         `./yah qed run provider-smoke --param provider=$PROVIDER`
+#                         — verifies the exact bytes about to ship
+#
+#   Publish layer (gated on smoke; all irreversible operations)
+#     publish-image-*     imagetools-alias smoke-tag → :latest + :<tag>; cosign sign
+#     publish-cli         sign-blob + R2 cp + GH Release upload + fragment emit
+#     publish-yubaba      sign-blob + R2 cp + GH Release upload + fragment emit
+#     publish-camp        softprops upload to GH Release
+#     publish-mesofact    sign-blob + R2 cp + GH Release upload + fragment emit
+#     yubaba-release-manifest    merge fragments, R2 publish
+#     cli-release-manifest       merge fragments → cdn.yah.dev/yah/latest.json
+#                                (what `yah.dev/install.sh | sh` resolves with
+#                                 NO arguments — R638-F1)
+#     mesofact-release-manifest  merge fragments → cdn.yah.dev/mesofact/latest.json
+#                                (`… | sh -s -- mesofact`)
+#
+# Release jobs (cli + yubaba + camp + desktop) each upload artifacts to one
+# GitHub Release keyed on the pushed tag. softprops/action-gh-release@v2 and
+# tauri-apps/tauri-action@v0 both create-or-reuse a release by tag_name, so
+# concurrent jobs converge on a single release rather than racing to clobber.
+#
+# Transition plan (yah-qed.md §Relationship to GHA):
+#   Phase 2 — qed pipelines run on yubaba for non-release checks; GHA for signing.
+#   Phase 3 — cli/yubaba/camp build jobs replaced by `yah qed run release-build`
+#             once qed supports cross-compilation target params. Desktop + signing
+#             stays in GHA permanently (requires Apple certs + macOS runner).
+#
+# Spec: .yah/arch/authored/release-pipeline.md
+# Ticket: R038-F2 (original), R330-F24 (build/publish split)
 
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*.*.*'
+  # Manual trigger for dry-running the workflow against a hand-picked tag
+  # without having to push a real `v*.*.*`.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v0.0.1-test). Must already exist on the repo.'
+        required: true
+        type: string
+      skip_smoke:
+        description: 'Skip the live cloud smoke test (use only when a provider is down or smoke is being debugged separately).'
+        required: false
+        type: boolean
+        default: false
 
+# Releases need contents:write to create-or-update the GitHub Release object
+# and upload assets. Per-job permissions narrow further — build jobs only get
+# packages:write + id-token:write when they actually push to ghcr.
 permissions:
-  contents: read
-  id-token: write   # required for crates.io Trusted Publishing (OIDC)
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # The sparse crates.io index is fetched over HTTP; a single transient blip
+  # otherwise fails the request outright. This bit us via `cross`: cross 0.2.5's
+  # `cargo metadata` probe loses a race with a cold index, fails, and *silently*
+  # falls back to a host `cargo` build — which then dies deep in ring with a
+  # cryptic "aarch64-linux-musl-gcc not found" (the musl cross-gcc only exists
+  # inside cross's container). Retry the index fetch instead.
+  CARGO_NET_RETRY: "10"
 
 jobs:
-  publish:
+  # ===========================================================================
+  # BUILD LAYER — produce artifacts, no irreversible side-effects.
+  #
+  # Image build jobs push to ghcr.io/yah-ai/<name>:smoke-<github.sha> only; no
+  # canonical :latest or :<tag> push, no cosign sign. Binary build jobs upload
+  # tarballs + raw binaries as workflow artifacts. The smoke gate consumes
+  # cli-build's artifact; the publish layer consumes everything.
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # image-yah-base / image-yah-rust / image-yah-rust-bun (single-arch)
+  #
+  # FROM chain: rust-bun → rust → base. The base + rust jobs run in parallel,
+  # rust-bun waits on rust. Each pushes only :smoke-<sha> — no sign step here.
+  # ---------------------------------------------------------------------------
+  image-yah-base:
+    name: image / yah-base (build)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push yah-base (:smoke-<sha> only)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: oss/qed/crates/qed/images/yah-base
+          file: oss/qed/crates/qed/images/yah-base/Dockerfile
+          push: true
+          tags: ghcr.io/yah-ai/yah-base:smoke-${{ github.sha }}
+
+  image-yah-rust:
+    name: image / yah-rust (build)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push yah-rust (:smoke-<sha> only)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: oss/qed/crates/qed/images/yah-rust
+          file: oss/qed/crates/qed/images/yah-rust/Dockerfile
+          push: true
+          tags: ghcr.io/yah-ai/yah-rust:smoke-${{ github.sha }}
+
+  image-yah-rust-bun:
+    name: image / yah-rust-bun (build)
+    # FROM the rust image built in THIS run: the Dockerfile's RUST_BASE arg
+    # (default :latest) is overridden below to :smoke-<sha>, the tag image-yah-rust
+    # just pushed. This builds rust-bun against the exact, current rust bytes —
+    # no dependency on a prior release's :latest (which doesn't exist on a first
+    # or fresh-registry release; that gap caused the v0.8.12 "yah-rust:latest:
+    # not found" failure). `needs: [image-yah-rust]` guarantees the smoke tag
+    # exists before this job pulls it.
+    needs: [image-yah-rust]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push yah-rust-bun (:smoke-<sha> only)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: oss/qed/crates/qed/images/yah-rust-bun
+          file: oss/qed/crates/qed/images/yah-rust-bun/Dockerfile
+          push: true
+          tags: ghcr.io/yah-ai/yah-rust-bun:smoke-${{ github.sha }}
+          # FROM the rust image built in THIS run (not a prior release's
+          # :latest), via the Dockerfile's RUST_BASE arg. Removes the
+          # bootstrap dependency on :latest existing beforehand.
+          build-args: |
+            RUST_BASE=ghcr.io/yah-ai/yah-rust:smoke-${{ github.sha }}
+
+  # ---------------------------------------------------------------------------
+  # image-rusty-v8-musl-builder (single-arch, build only) — R546-T1
+  #
+  # The expensive-leg builder image for the rusty-v8-musl transform recipe
+  # (V8 from source → musl static lib; depot_tools + clang + musl cross). Like
+  # the base/rust jobs it runs in parallel and pushes only :smoke-<sha>; the
+  # publish job aliases + signs. Pinned linux/amd64 (matches the recipe's
+  # [placement] platform); the aarch64-musl cross lives inside the image.
+  #
+  # NOT consumed by default_forge_image() — no digest is threaded into the
+  # binary release jobs. The published @sha256 is pasted by an operator into
+  # .yah/qed/transforms/rusty-v8-musl.toml's `image =` line (R546-T1 sign-off).
+  # ---------------------------------------------------------------------------
+  image-rusty-v8-musl-builder:
+    name: image / rusty-v8-musl-builder (build)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push rusty-v8-musl-builder (:smoke-<sha> only)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: oss/qed/crates/qed/images/rusty-v8-musl-builder
+          file: oss/qed/crates/qed/images/rusty-v8-musl-builder/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/yah-ai/rusty-v8-musl-builder:smoke-${{ github.sha }}
+
+  # ---------------------------------------------------------------------------
+  # yubaba-build (was yubaba-release)
+  #
+  # Cross-compiles yah-yubaba + kamaji for the two musl targets. Uploads
+  # binaries as workflow artifacts for image-yah-yubaba, plus the cloud-init
+  # tarball as a separate artifact for publish-yubaba. No sign-blob, no R2 cp,
+  # no GH Release upload — all of that moved to publish-yubaba.
+  # ---------------------------------------------------------------------------
+  yubaba-build:
+    name: yubaba / ${{ matrix.target }} (build)
+    needs: [image-yah-base, image-yah-rust, image-yah-rust-bun]
+    runs-on: ubuntu-latest
+    # Same digest env as cli-build — yubaba bakes the same option_env!
+    # constants for default_forge_image() consumers downstream. The smoke-tag
+    # digest is the same digest that publish-image-* will alias to :latest /
+    # :<tag>, so the baked-in digest stays valid.
+    env:
+      YAH_BASE_DIGEST: ${{ needs.image-yah-base.outputs.digest }}
+      YAH_RUST_DIGEST: ${{ needs.image-yah-rust.outputs.digest }}
+      YAH_RUST_BUN_DIGEST: ${{ needs.image-yah-rust-bun.outputs.digest }}
+      # Bind-mounted into the cross build container (oss/yubaba/Cross.toml
+      # `volumes`) so the ../qed path deps resolve — see that file's comment.
+      YAH_REPO_ROOT: ${{ github.workspace }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: yubaba-${{ matrix.target }}
+          # yubaba lives in oss/yubaba; kamaji now lives in its own oss/kamaji
+          # workspace (extracted from yubaba). Cache both target dirs.
+          workspaces: |
+            oss/yubaba
+            oss/kamaji
 
-      - name: build & test
-        run: cargo test --workspace
+      - name: Install cross
+        run: cargo install cross --locked
 
-      - name: authenticate to crates.io (OIDC)
-        uses: rust-lang/crates-io-auth-action@v1
-        id: auth
+      - name: Build yubaba (static musl)
+        # yubaba is a member of the oss/yubaba workspace (excluded from the yah
+        # root workspace), so build from there — `cross -p yubaba` from the repo
+        # root fails with "cannot specify features for packages outside of
+        # workspace". oss/yubaba/Cross.toml supplies the protoc pre-build hook.
+        # Binary target is `yubaba` (matches the systemd units' /usr/local/bin/yubaba).
+        working-directory: oss/yubaba
+        # See cli-build: warm the index + hard-fail on cross's silent host fallback.
+        # pipefail so cross's exit code isn't swallowed by the `| tee` pipe.
+        run: |
+          set -o pipefail
+          cargo fetch
+          cross build --release -p yubaba --locked --features containerd-integration --target ${{ matrix.target }} 2>&1 | tee cross-build.log
+          ! grep -qF 'Falling back to' cross-build.log
 
-      - name: publish workspace (dependency-ordered)
-        # cargo >= 1.90 publishes interdependent workspace members in order and
-        # waits for propagation between them; publish=false members are skipped.
-        run: cargo publish --workspace
+      - name: Build kamaji (static musl)
+        # R406-T13: yubaba + kamaji ship as siblings under one yubaba.slice
+        # (W154). kamaji was extracted into its own oss/kamaji workspace, so it
+        # is no longer a member of oss/yubaba — build from oss/kamaji. The
+        # `kamaji` binary is produced by the `kamaji-bin` crate.
+        # oss/kamaji/Cross.toml supplies the protoc pre-build hook + repo-root mount.
+        working-directory: oss/kamaji
+        # See cli-build: warm the index + hard-fail on cross's silent host fallback.
+        # pipefail so cross's exit code isn't swallowed by the `| tee` pipe.
+        run: |
+          set -o pipefail
+          cargo fetch
+          cross build --release -p kamaji-bin --locked --features containerd-integration --target ${{ matrix.target }} 2>&1 | tee cross-build.log
+          ! grep -qF 'Falling back to' cross-build.log
+
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="yubaba-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          # yubaba from oss/yubaba/target, kamaji from oss/kamaji/target.
+          cp "oss/yubaba/target/${{ matrix.target }}/release/yubaba" "$STAGE/"
+          cp "oss/kamaji/target/${{ matrix.target }}/release/kamaji" "$STAGE/"
+          # systemd unit files for the sibling-supervisor ship path (W154).
+          cp app/yah/cli/resources/yubaba.service "$STAGE/"
+          cp app/yah/cli/resources/kamaji.service "$STAGE/"
+          cp app/yah/cli/resources/yubaba.slice "$STAGE/"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          ls -la "$STAGE.tar.gz"
+          # Flat dir of just the two binaries for the image job's artifact —
+          # they come from different target dirs, so stage them together to keep
+          # the uploaded artifact flat (yubaba + kamaji at the root).
+          mkdir -p bins
+          cp "oss/yubaba/target/${{ matrix.target }}/release/yubaba" bins/
+          cp "oss/kamaji/target/${{ matrix.target }}/release/kamaji" bins/
+
+      # Tarball artifact for publish-yubaba (sign-blob + R2 cp + GH Release).
+      - name: Upload yubaba tarball as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yubaba-tarball-${{ matrix.target }}
+          path: yubaba-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+      # Raw binaries for image-yah-yubaba's container COPY.
+      - name: Upload yubaba binaries as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yubaba-bins-${{ matrix.target }}
+          # The Package archive step staged both binaries into ./bins so the
+          # artifact stays flat (yubaba + kamaji at the root) — image-yah-yubaba's
+          # `chmod ctx/<arch>/<bin>` depends on that.
+          path: |
+            bins/yubaba
+            bins/kamaji
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # image-yah-yubaba (multi-arch, build only)
+  #
+  # Layers yubaba-build's binaries onto debian:bookworm-slim. Pushes only
+  # :smoke-<sha>; publish-image-yubaba aliases + signs.
+  # ---------------------------------------------------------------------------
+  image-yah-yubaba:
+    name: image / yah-yubaba (build)
+    needs: [yubaba-build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download yubaba binaries (amd64)
+        uses: actions/download-artifact@v4
+        with:
+          name: yubaba-bins-x86_64-unknown-linux-musl
+          path: ctx/amd64
+
+      - name: Download yubaba binaries (arm64)
+        uses: actions/download-artifact@v4
+        with:
+          name: yubaba-bins-aarch64-unknown-linux-musl
+          path: ctx/arm64
+
+      - name: Assemble build context
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp oss/qed/crates/qed/images/yah-yubaba/Dockerfile ctx/
+          cp oss/qed/crates/qed/images/yah-yubaba/pond-supervise.sh ctx/
+          chmod +x ctx/amd64/yubaba ctx/amd64/kamaji
+          chmod +x ctx/arm64/yubaba ctx/arm64/kamaji
+          ls -la ctx/ ctx/amd64/ ctx/arm64/
+
+      - name: Build + push yah-yubaba multi-arch (:smoke-<sha> only)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ctx
+          file: ctx/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/yah-ai/yah-yubaba:smoke-${{ github.sha }}
+          provenance: false
+
+  # ---------------------------------------------------------------------------
+  # image-yah-miniflare (multi-arch, build only)
+  # ---------------------------------------------------------------------------
+  image-yah-miniflare:
+    name: image / yah-miniflare (build)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push yah-miniflare multi-arch (:smoke-<sha> only)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: oss/qed/crates/qed/images/yah-miniflare/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/yah-ai/yah-miniflare:smoke-${{ github.sha }}
+          provenance: false
+
+  # ---------------------------------------------------------------------------
+  # cli-build (was cli-release)
+  #
+  # Cross-compiles the four CLI binaries for three linux targets. Uploads
+  # tarballs as workflow artifacts only. GH Release upload moved to publish-cli.
+  # The x86_64-unknown-linux-musl artifact is what smoke downloads.
+  # ---------------------------------------------------------------------------
+  cli-build:
+    name: cli / ${{ matrix.target }} (build)
+    needs: [image-yah-base, image-yah-rust, image-yah-rust-bun, image-yah-yubaba, image-yah-miniflare]
+    runs-on: ${{ matrix.os }}
+    env:
+      YAH_BASE_DIGEST: ${{ needs.image-yah-base.outputs.digest }}
+      YAH_RUST_DIGEST: ${{ needs.image-yah-rust.outputs.digest }}
+      YAH_RUST_BUN_DIGEST: ${{ needs.image-yah-rust-bun.outputs.digest }}
+      YAH_WARDEN_DIGEST: ${{ needs.image-yah-yubaba.outputs.digest }}
+      YAH_MINIFLARE_DIGEST: ${{ needs.image-yah-miniflare.outputs.digest }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+            use_cross: false
+            use_target_flag: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive_ext: tar.gz
+            use_cross: true
+            use_target_flag: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            archive_ext: tar.gz
+            use_cross: true
+            use_target_flag: true
+          # R638-F1 — darwin legs. macOS is the primary audience for a
+          # `curl … | sh` one-liner, and cli-build shipped none until now, so
+          # `sh -s -- yah` on a mac resolved a manifest with no entry for the
+          # host triple. Neither leg uses `cross` (it publishes no
+          # apple-darwin images, ever); the Apple SDK on macos-14 carries both
+          # arch slices, so an arm64 runner emits x86_64-apple-darwin natively.
+          # These reuse the existing "Build (native, --target)" step — until
+          # now no matrix entry selected it.
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+            use_cross: false
+            use_target_flag: true
+          - os: macos-14
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+            use_cross: false
+            use_target_flag: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.use_target_flag && matrix.target || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.target }}
+
+      # R638-F1 DECISION — install nasm on darwin rather than narrow the
+      # feature set there. `--features all-image` pulls mozjpeg-encode, whose
+      # build script shells out to nasm for the x86 SIMD kernels; the plain
+      # `cargo build -p yah --locked` at DEFAULT features that mesofact-build
+      # runs on macOS needs none, so narrowing WAS available. It was rejected:
+      # a `yah` whose codec support (avif encode / jxl decode / mozjpeg) is a
+      # function of which OS the release runner used is a capability split that
+      # only shows up at runtime, on the platform this whole ticket exists to
+      # serve. Two `brew install nasm` steps (~15s, cached in the runner image
+      # more often than not) buy identical binaries on every triple. If you are
+      # re-litigating this to shave CI minutes: narrow ALL triples or none.
+      - name: Install nasm (mozjpeg-encode requires nasm at build)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nasm
+
+      - name: Install nasm (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --locked
+
+      # R638-F1 DECISION — cli-build stays INLINE, unlike camp-build and
+      # mesofact-build which delegate to `yah qed run release-build`. release-build's
+      # cross-only carve-out is gone (R560-F1), so the recipe *could* serve
+      # every leg here. It is not worth it for this one job: the recipe is
+      # dispatched by the `yah` binary, which is the very thing this job
+      # builds, so delegating means a full debug build of `yah` on every leg
+      # before the release build starts — the same crate compiled twice per
+      # matrix entry. mesofact-build pays that because its dispatcher and its
+      # product are different crates. Revisit only if a prebuilt dispatcher is
+      # available to CI without compiling it.
+      - name: Build (native, no --target)
+        if: matrix.use_cross != true && matrix.use_target_flag != true
+        run: cargo build --release -p yah --locked --features all-image
+
+      - name: Build (native, --target)
+        if: matrix.use_cross != true && matrix.use_target_flag == true
+        run: cargo build --release -p yah --locked --features all-image --target ${{ matrix.target }}
+
+      - name: Build (musl via cross)
+        if: matrix.use_cross
+        # cross 0.2.5 silently degrades to a HOST `cargo` build when its
+        # `cargo metadata` probe fails (e.g. it loses a race with a cold
+        # crates.io index). The host build then dies in ring's build script
+        # because the musl cross-gcc lives only inside cross's container, which
+        # reads as a confusing toolchain bug. Warm the index so the probe
+        # resolves locally, and hard-fail if cross falls back anyway rather than
+        # emit (or worse, ship) a non-cross binary.
+        run: |
+          cargo fetch
+          cross build --release -p yah --locked --features all-image --target ${{ matrix.target }} 2>&1 | tee cross-build.log
+          ! grep -qF 'Falling back to' cross-build.log
+
+      - name: Package archive
+        shell: bash
+        run: |
+          STAGE="cli-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          if [ "${{ matrix.use_target_flag }}" = "true" ]; then
+            SRC="target/${{ matrix.target }}/release"
+          else
+            SRC="target/release"
+          fi
+          for bin in yah yahh yahb yaha; do
+            cp "$SRC/$bin" "$STAGE/"
+          done
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          ls -la "$STAGE.tar.gz"
+
+      - name: Upload cli tarball as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-tarball-${{ matrix.target }}
+          path: cli-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # camp-build (was camp-release)
+  # ---------------------------------------------------------------------------
+  camp-build:
+    name: camp / ${{ matrix.target }} (build)
+    needs: [image-yah-base, image-yah-rust, image-yah-rust-bun, image-yah-yubaba, image-yah-miniflare]
+    runs-on: ubuntu-latest
+    env:
+      YAH_BASE_DIGEST: ${{ needs.image-yah-base.outputs.digest }}
+      YAH_RUST_DIGEST: ${{ needs.image-yah-rust.outputs.digest }}
+      YAH_RUST_BUN_DIGEST: ${{ needs.image-yah-rust-bun.outputs.digest }}
+      YAH_WARDEN_DIGEST: ${{ needs.image-yah-yubaba.outputs.digest }}
+      YAH_MINIFLARE_DIGEST: ${{ needs.image-yah-miniflare.outputs.digest }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: camp-${{ matrix.target }}
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      # W155/W170 + R435-T6: the inline guarded cross-build moved into
+      # .yah/qed/release-build.toml (scripts/cross-build-guarded.sh). GHA
+      # stays the runner — install cross (above), build the dispatcher binary,
+      # then delegate the actual cross-compile to the `release-build` recipe.
+      # The job-level digest env block flows into `cross build` via the
+      # inherited process env; the recipe names no digests (W155 §4). placement
+      # = ci-only is satisfied here ($GITHUB_ACTIONS=true ⇒ RunnerEnv::Ci).
+      - name: build yah CLI (recipe dispatcher)
+        run: cargo build -p yah --locked
+      - name: yah qed run release-build (yah-camp / ${{ matrix.target }})
+        run: >
+          ./target/debug/yah qed run release-build
+          --param package=yah
+          --param target=${{ matrix.target }}
+          --param bin=yah-camp
+          --param features=
+          --param workdir=.
+
+      - name: Package archive
+        shell: bash
+        run: |
+          STAGE="camp-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          cp "target/${{ matrix.target }}/release/yah-camp" "$STAGE/"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          ls -la "$STAGE.tar.gz"
+
+      - name: Upload camp tarball as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: camp-tarball-${{ matrix.target }}
+          path: camp-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # mesofact-build (R560-F1)
+  #
+  # There was NO mesofact build in this workflow before this job: R535-T3
+  # deleted the last one (`mesofact-dev-build`) along with the retired
+  # yah-mesofact-dev tini image. This job is the mesofact framework's only CI
+  # build, and it exists so a TSX-only tenant can install the runtime without a
+  # cargo toolchain (W236 tier-1 enablement) — `install.sh` and the /releases
+  # page both consume what lands here.
+  #
+  # TWO BINARIES, TWO CRATES, DELIBERATELY (W225 §2a). `mesofact` is the prod
+  # binary (subcommands serve|proxy|publish) built from the facade at the
+  # `deploy` feature preset; `mesofact-dev` is a SEPARATE binary from a separate
+  # crate carrying the file watcher + dev S3 surface. Folding dev into the prod
+  # binary would put `notify` + `s3s` back into the prod dependency closure and
+  # re-break the §2 dev/prod boundary that W225's "DEFECT" section just fixed.
+  # They ship in one tarball; they are not one binary.
+  #
+  # `--features deploy` is the whole point of the preset: it is the single
+  # definition of what ships, shared with Dockerfile.ssr-runtime, so the
+  # container and any from-source consumer cannot drift. Never hand-list the
+  # feature set here.
+  #
+  # TARGET MATRIX — the four BLESSED rusty_v8 tiers. `deploy` → `ssr` →
+  # deno_core → the `v8` crate, whose build.rs *downloads* a prebuilt
+  # librusty_v8.a rather than compiling V8 (W225 §2a: "the V8 boundary is a CDN
+  # link, not a compile"). Upstream deno publishes that prebuilt for exactly
+  # these four triples, so all four are free. The two musl triples are NOT here
+  # on purpose: no upstream musl prebuilt exists, our own is tracked by
+  # R546/rusty-v8-musl, and R546-B11 records that the currently-published musl bytes do
+  # not link against deno_core — so a musl leg today would silently fall back to
+  # a ~1h49m from-source V8 compile per target. Add them as a sibling once
+  # R546-B11/T5 are green.
+  #
+  # The linux legs go through `cross` so the aarch64 leg cross-compiles from an
+  # x86_64 runner without hand-managing a sysroot. They do NOT do so for glibc
+  # compatibility — measured 2026-07-24, cross's `:main` images are Ubuntu 24.04
+  # / glibc 2.39, identical to ubuntu-latest (its `:0.2.5` images are glibc 2.23,
+  # too old to run the pinned 1.97.0 toolchain, and there is nothing published in
+  # between). The produced binary's real floor is GLIBC_2.39, which does not run
+  # on Debian 12 / Ubuntu 22.04 / RHEL 9. That is a REAL open defect in what
+  # these two legs ship — see R639, which is expected to replace the cross
+  # routing with an explicit-floor toolchain rather than tune it.
+  #
+  # The darwin legs cannot use cross at all — it has no apple-darwin images — so
+  # they run on macOS and scripts/cross-build-guarded.sh switches to
+  # `cargo --target` for them.
+  # ---------------------------------------------------------------------------
+  mesofact-build:
+    name: mesofact / ${{ matrix.target }} (build)
+    runs-on: ${{ matrix.os }}
+    env:
+      # Bind-mounted into the cross build container (oss/mesofact/Cross.toml
+      # `volumes`) so mesofact's path deps that escape its own workspace —
+      # ../../../yah-base/crates/mesofact-bundle and ../../../cheers/crates/* —
+      # resolve inside the container. Without it the gnu legs die with "failed
+      # to find a workspace root". Same mechanism as yubaba-build's ../qed
+      # mount. Harmless on the darwin legs, which never enter a container.
+      YAH_REPO_ROOT: ${{ github.workspace }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-14
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mesofact-${{ matrix.target }}
+          # oss/mesofact is its own Cargo workspace (excluded from the yah root
+          # workspace), so its target dir is oss/mesofact/target. The root
+          # workspace is cached too — this job builds the `yah` dispatcher there.
+          workspaces: |
+            .
+            oss/mesofact
+
+      - name: Install cross
+        # Darwin legs build natively (see the job comment); cross is a Linux
+        # container cross-compiler and is neither needed nor installable-useful
+        # on the macOS runners.
+        if: runner.os == 'Linux'
+        run: cargo install cross --locked
+
+      # W155/W170 + R435-T6: the guarded build idiom lives in
+      # .yah/qed/release-build.toml (scripts/cross-build-guarded.sh). GHA
+      # stays the runner; the recipe does the compile. placement = ci-only is
+      # satisfied here ($GITHUB_ACTIONS=true ⇒ RunnerEnv::Ci).
+      - name: build yah CLI (recipe dispatcher)
+        run: cargo build -p yah --locked
+
+      # Leg A — the PROD binary. features=deploy (the shipped preset), bin
+      # pinned to `mesofact` so a future extra [[bin]] in the facade can't
+      # silently join the release.
+      - name: yah qed run release-build (mesofact / ${{ matrix.target }})
+        run: >
+          ./target/debug/yah qed run release-build
+          --param package=mesofact
+          --param target=${{ matrix.target }}
+          --param bin=mesofact
+          --param features=deploy
+          --param workdir=oss/mesofact
+
+      # Leg B — the DEV binary, from its own crate. Default features (= ssr);
+      # it must NOT be built with `deploy`, which is the prod facade's preset.
+      - name: yah qed run release-build (mesofact-dev / ${{ matrix.target }})
+        run: >
+          ./target/debug/yah qed run release-build
+          --param package=mesofact-dev
+          --param target=${{ matrix.target }}
+          --param bin=mesofact-dev
+          --param features=
+          --param workdir=oss/mesofact
+
+      # W225 §2 boundary, enforced in CI rather than asserted in a doc. The
+      # prod binary's dependency closure must contain zero dev affordances; if
+      # someone re-merges the crates or adds a stray dep, this fails the release
+      # instead of shipping a prod binary with a file watcher in it.
+      - name: Assert prod closure carries no dev affordances (W225 §2)
+        working-directory: oss/mesofact
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo tree -p mesofact --features deploy -e normal > deploy-tree.txt
+          if grep -nE 'mesofact-dev|notify|s3s' deploy-tree.txt; then
+            echo "::error::mesofact --features deploy links dev affordances (W225 §2)" >&2
+            exit 1
+          fi
+          echo "prod closure clean: no mesofact-dev / notify / s3s"
+
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="mesofact-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          SRC="oss/mesofact/target/${{ matrix.target }}/release"
+          cp "$SRC/mesofact"     "$STAGE/"
+          cp "$SRC/mesofact-dev" "$STAGE/"
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          ls -la "$STAGE.tar.gz"
+
+      - name: Upload mesofact tarball as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesofact-tarball-${{ matrix.target }}
+          path: mesofact-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  # ===========================================================================
+  # SMOKE GATE — runs the freshly-built `yah` binary against a live provider.
+  #
+  # Downloads cli-build's x86_64-unknown-linux-musl tarball, untars, runs
+  # `./yah qed run provider-smoke --param provider=$PROVIDER`. Zero cargo build on the
+  # critical path. Verifies the exact bytes about to ship.
+  #
+  # Skips on:
+  #   - pre-release tags (`v1.2.3-rc1`, …) — build/pipeline validation only
+  #   - workflow_dispatch with skip_smoke=true — emergency override
+  #
+  # Downstream publish jobs gate on `needs.smoke.result != 'failure'`, so a
+  # *skipped* smoke (rc tag, opt-out) doesn't block publish, but a *failed*
+  # smoke does.
+  # ===========================================================================
+  smoke:
+    name: live-smoke / deepseek
+    needs: [cli-build]
+    runs-on: ubuntu-latest
+    if: |
+      (github.event_name == 'push' && !contains(github.ref_name, '-')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.skip_smoke != true)
+    steps:
+      # Checkout brings `.yah/qed/provider-smoke.toml` (and any
+      # sub-pipelines it references) onto disk so `yah qed run provider-smoke`
+      # resolves the pipeline via PipelineLoader. Without this, the runner's cwd
+      # has only the downloaded CLI tarball and the run errors
+      # `Pipeline not found: provider-smoke` (config.rs — neither
+      # `.yah/qed/P*-provider-smoke.toml` nor
+      # `.github/workflows/provider-smoke.yml` is present). Renamed from `smoke`
+      # in R707: four other camp pipelines are also smokes, and this one tests
+      # agent-provider liveness specifically. On QED, this step is a no-op via the checkout override
+      # (camp root IS the workspace; we don't re-clone over a live tree).
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download cli tarball (x86_64-musl)
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-tarball-x86_64-unknown-linux-musl
+          path: .
+
+      - name: Extract and run smoke pipeline
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          STAGE="cli-${{ github.ref_name }}-x86_64-unknown-linux-musl"
+          tar -xzf "${STAGE}.tar.gz"
+          # Provider priority: deepseek (good cache) → openrouter → groq → openai.
+          if [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+            PROVIDER=deepseek
+          elif [ -n "${OPENROUTER_API_KEY:-}" ]; then
+            PROVIDER=openrouter
+          elif [ -n "${GROQ_API_KEY:-}" ]; then
+            PROVIDER=groq
+          elif [ -n "${OPENAI_API_KEY:-}" ]; then
+            PROVIDER=openai
+          else
+            echo "::error::No API keys found: DEEPSEEK_API_KEY, OPENROUTER_API_KEY, GROQ_API_KEY, or OPENAI_API_KEY"
+            exit 1
+          fi
+          echo "→ Running smoke pipeline via built yah binary (provider: $PROVIDER)"
+          "./${STAGE}/yah" qed run provider-smoke --param provider=$PROVIDER
+
+  # ===========================================================================
+  # PUBLISH LAYER — all irreversible side-effects gated on smoke.
+  #
+  # `if: always() && needs.smoke.result != 'failure' && needs.smoke.result != 'cancelled'`
+  # so skipped smoke (rc tag / skip_smoke=true) still publishes; failed/cancelled
+  # smoke blocks every publish job.
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # publish-image-* — alias :smoke-<sha> to :latest + :<tag>, then cosign sign.
+  #
+  # `docker buildx imagetools create` is a registry-side manifest alias — no
+  # rebuild, no re-push of bytes; the canonical tags point at the exact digest
+  # smoke verified. cosign sign then targets that same digest with keyless OIDC.
+  # ---------------------------------------------------------------------------
+  publish-image-base:
+    name: image / yah-base (publish)
+    needs: [smoke, image-yah-base]
+    if: |
+      always()
+      && needs.smoke.result != 'failure'
+      && needs.smoke.result != 'cancelled'
+      && needs.image-yah-base.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Alias :smoke-<sha> → :latest + :<tag>
+        env:
+          DIGEST: ${{ needs.image-yah-base.outputs.digest }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "ghcr.io/yah-ai/yah-base:latest" \
+            -t "ghcr.io/yah-ai/yah-base:${TAG}" \
+            "ghcr.io/yah-ai/yah-base@${DIGEST}"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign yah-base (keyless OIDC)
+        env:
+          DIGEST: ${{ needs.image-yah-base.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/yah-ai/yah-base@${DIGEST}"
+
+  publish-image-rust:
+    name: image / yah-rust (publish)
+    needs: [smoke, image-yah-rust]
+    if: |
+      always()
+      && needs.smoke.result != 'failure'
+      && needs.smoke.result != 'cancelled'
+      && needs.image-yah-rust.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Alias :smoke-<sha> → :latest + :<tag>
+        env:
+          DIGEST: ${{ needs.image-yah-rust.outputs.digest }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "ghcr.io/yah-ai/yah-rust:latest" \
+            -t "ghcr.io/yah-ai/yah-rust:${TAG}" \
+            "ghcr.io/yah-ai/yah-rust@${DIGEST}"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign yah-rust (keyless OIDC)
+        env:
+          DIGEST: ${{ needs.image-yah-rust.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/yah-ai/yah-rust@${DIGEST}"
+
+  publish-image-rust-bun:
+    name: image / yah-rust-bun (publish)
+    needs: [smoke, image-yah-rust-bun]
+    if: |
+      always()
+      && needs.smoke.result != 'failure'
+      && needs.smoke.result != 'cancelled'
+      && needs.image-yah-rust-bun.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Alias :smoke-<sha> → :latest + :<tag>
+        env:
+          DIGEST: ${{ needs.image-yah-rust-bun.outputs.digest }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "ghcr.io/yah-ai/yah-rust-bun:latest" \
+            -t "ghcr.io/yah-ai/yah-rust-bun:${TAG}" \
+            "ghcr.io/yah-ai/yah-rust-bun@${DIGEST}"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign yah-rust-bun (keyless OIDC)
+        env:
+          DIGEST: ${{ needs.image-yah-rust-bun.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/yah-ai/yah-rust-bun@${DIGEST}"
+
+  publish-image-rusty-v8-musl-builder:
+    name: image / rusty-v8-musl-builder (publish)
+    needs: [smoke, image-rusty-v8-musl-builder]
+    if: |
+      always()
+      && needs.smoke.result != 'failure'
+      && needs.smoke.result != 'cancelled'
+      && needs.image-rusty-v8-musl-builder.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Alias :smoke-<sha> → :latest + :<tag>
+        env:
+          DIGEST: ${{ needs.image-rusty-v8-musl-builder.outputs.digest }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "ghcr.io/yah-ai/rusty-v8-musl-builder:latest" \
+            -t "ghcr.io/yah-ai/rusty-v8-musl-builder:${TAG}" \
+            "ghcr.io/yah-ai/rusty-v8-musl-builder@${DIGEST}"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign rusty-v8-musl-builder (keyless OIDC)
+        env:
+          DIGEST: ${{ needs.image-rusty-v8-musl-builder.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/yah-ai/rusty-v8-musl-builder@${DIGEST}"
+
+  publish-image-yubaba:
+    name: image / yah-yubaba (publish)
+    needs: [smoke, image-yah-yubaba]
+    if: |
+      always()
+      && needs.smoke.result != 'failure'
+      && needs.smoke.result != 'cancelled'
+      && needs.image-yah-yubaba.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Alias :smoke-<sha> → :latest + :<tag>
+        env:
+          DIGEST: ${{ needs.image-yah-yubaba.outputs.digest }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "ghcr.io/yah-ai/yah-yubaba:latest" \
+            -t "ghcr.io/yah-ai/yah-yubaba:${TAG}" \
+            "ghcr.io/yah-ai/yah-yubaba@${DIGEST}"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign yah-yubaba (keyless OIDC)
+        env:
+          DIGEST: ${{ needs.image-yah-yubaba.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/yah-ai/yah-yubaba@${DIGEST}"
+
+  publish-image-miniflare:
+    name: image / yah-miniflare (publish)
+    needs: [smoke, image-yah-miniflare]
+    if: |
+      always()
+      && needs.smoke.result != 'failure'
+      && needs.smoke.result != 'cancelled'
+      && needs.image-yah-miniflare.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Alias :smoke-<sha> → :latest + :<tag>
+        env:
+          DIGEST: ${{ needs.image-yah-miniflare.outputs.digest }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            -t "ghcr.io/yah-ai/yah-miniflare:latest" \
+            -t "ghcr.io/yah-ai/yah-miniflare:${TAG}" \
+            "ghcr.io/yah-ai/yah-miniflare@${DIGEST}"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign yah-miniflare (keyless OIDC)
+        env:
+          DIGEST: ${{ needs.image-yah-miniflare.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/yah-ai/yah-miniflare@${DIGEST}"
+
+  # ---------------------------------------------------------------------------
+  # publish-cli (R638-F1) — sign-blob + R2 cp + GH Release + fragment emit.
+  #
+  # Was GH-Release-upload only, which is why `curl yah.dev/install.sh | sh -s --
+  # yah` 404'd: install.sh resolves cdn.yah.dev/<pkg>/latest.json and nothing
+  # ever wrote yah/latest.json. Same three-part shape as publish-mesofact /
+  # publish-yubaba, and deliberately the SAME R2 layout as R587-T1's desktop
+  # publish (`<name>/<version>/<triple>/` immutable bytes + one mutable
+  # latest.json pointer) — install.sh is generic over <pkg> precisely so this
+  # needed no installer changes beyond the default package.
+  #
+  # NOTE the on-disk artifact is `cli-<tag>-<triple>.tar.gz` (the historical
+  # name, kept so the GH Release asset names don't churn) while the R2 object
+  # is `yah-<triple>.tar.gz` under the `yah/` prefix. install.sh takes the
+  # filename from the manifest url, and untars with --strip-components=1, so
+  # the stage dir inside (`cli-<tag>-<triple>/`) is irrelevant to it.
+  # ---------------------------------------------------------------------------
+  publish-cli:
+    name: cli / ${{ matrix.target }} (publish)
+    needs: [smoke, cli-build]
+    if: |
+      always()
+      && needs.smoke.result != 'failure'
+      && needs.smoke.result != 'cancelled'
+      && needs.cli-build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - name: Download cli tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-tarball-${{ matrix.target }}
+          path: .
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign tarball (cosign sign-blob, keyless OIDC)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARBALL="cli-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          cosign sign-blob --yes \
+            --output-signature "${TARBALL}.sig" \
+            --output-certificate "${TARBALL}.cert" \
+            "${TARBALL}"
+          ls -la "${TARBALL}" "${TARBALL}.sig" "${TARBALL}.cert"
+
+      - name: Publish tarball + signatures to R2 (yah-dev / cdn.yah.dev)
+        if: startsWith(github.ref_name, 'v') || github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_KEY }}
+          AWS_DEFAULT_REGION: auto
+          CF_R2_ACCOUNT_ID: ${{ secrets.CF_R2_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${REF#v}"
+          TRIPLE="${{ matrix.target }}"
+          SRC="cli-${REF}-${TRIPLE}.tar.gz"
+          KEY_PREFIX="yah/${VERSION}/${TRIPLE}"
+          DEST_NAME="yah-${TRIPLE}.tar.gz"
+          ENDPOINT="https://${CF_R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp "${SRC}"      "s3://yah-dev/${KEY_PREFIX}/${DEST_NAME}"      --endpoint-url "${ENDPOINT}"
+          aws s3 cp "${SRC}.sig"  "s3://yah-dev/${KEY_PREFIX}/${DEST_NAME}.sig"  --endpoint-url "${ENDPOINT}"
+          aws s3 cp "${SRC}.cert" "s3://yah-dev/${KEY_PREFIX}/${DEST_NAME}.cert" --endpoint-url "${ENDPOINT}"
+
+      # ── WHY EVERY PUBLISH LEG COMPUTES TWO HASHES (R330-F40) ─────────────────
+      #
+      # Read this before "simplifying" it down to one. Its absence here is the
+      # root cause of the whole R330-F40 thread: nothing in this file ever said
+      # why sha256 was chosen, so the answer had to be reconstructed downstream
+      # by the consumer that got bitten by it.
+      #
+      # POLICY: BLAKE3 is THE yah asset hash. One algorithm across the whole
+      # ecosystem — xlb, the blob store, kg ids, the desktop updater's
+      # `blake3:<hex>` blob refs, the x-amz-meta-blake3 asset stamps. If you are
+      # asking "which hash identifies this artifact", the answer is blake3, and
+      # `hash` below is where it lives.
+      #
+      # SHA-256 IS NOT A SECOND IDENTITY. It is a bootstrap-verification aid for
+      # exactly one consumer: `curl yah.dev/install.sh | sh`. A bare POSIX box
+      # has three ways to check sha256 (sha256sum / shasum -a 256 / openssl dgst)
+      # and zero to check blake3 — so verifying blake3 there would mean first
+      # downloading an unverified b3sum to verify with, which is circular and
+      # strictly worse. That is the ONE place the one-algorithm policy cannot
+      # reach, and `bootstrap_hash` is scoped to it by its own name.
+      #
+      # BOTH ARE TAGGED (`blake3:…` / `sha256:…`) so no consumer ever infers an
+      # algorithm from a field name. Bare hex is what produces a pile of digests
+      # nobody can tell apart when one of them is computed wrong.
+      #
+      # The bare `sha256` key is DEPRECATED and kept only because every
+      # `install.sh` already in the wild reads `.triples[$t].sha256`. Delete it
+      # once those age out — and delete "sha256" from LEGACY_BARE_HEX_PATHS in
+      # oss/yubaba/crates/almanac/src/feed.rs at the same time, which is what
+      # arms the guard test against it coming back.
+      #
+      # Same fragment shape publish-mesofact emits — a superset of the
+      # ReleaseAsset the marketing /releases page renders
+      # (app/yah/web/marketing/src/releases.ts). The two musl `platform` keys
+      # were added to that page's PLATFORM_LABELS by this ticket; gnu and musl
+      # must NOT collapse onto one key, or the page lists two different
+      # binaries as the same platform.
+      - name: Install b3sum (blake3 is the canonical asset hash)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v b3sum >/dev/null 2>&1; then
+            sudo apt-get update -qq || true
+            sudo apt-get install -y -qq b3sum || cargo install b3sum --locked
+          fi
+          command -v b3sum >/dev/null 2>&1 || {
+            echo "::error::b3sum unavailable — refusing to publish an artifact with no blake3 identity"
+            exit 1
+          }
+          b3sum --version
+
+      - name: Emit per-triple manifest fragment
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${REF#v}"
+          TRIPLE="${{ matrix.target }}"
+          SRC="cli-${REF}-${TRIPLE}.tar.gz"
+          DEST_NAME="yah-${TRIPLE}.tar.gz"
+          URL="https://cdn.yah.dev/yah/${VERSION}/${TRIPLE}/${DEST_NAME}"
+          case "${TRIPLE}" in
+            aarch64-apple-darwin)       PLATFORM="macos-arm64" ;;
+            x86_64-apple-darwin)        PLATFORM="macos-x86_64" ;;
+            x86_64-unknown-linux-gnu)   PLATFORM="linux-x86_64" ;;
+            x86_64-unknown-linux-musl)  PLATFORM="linux-x86_64-musl" ;;
+            aarch64-unknown-linux-musl) PLATFORM="linux-aarch64-musl" ;;
+            *) echo "::error::no PLATFORM_LABELS key for ${TRIPLE}" >&2; exit 1 ;;
+          esac
+          SIZE=$(stat -c%s "${SRC}")
+          BLAKE3=$(b3sum --no-names "${SRC}")
+          SHA256=$(sha256sum "${SRC}" | awk '{print $1}')
+          # A hash that is absent or malformed must stop the publish here. The
+          # alternative — shipping the artifact with the key omitted — is what
+          # scripts/publish-desktop.sh used to do, and it silently produced
+          # public downloads that nobody could verify.
+          [[ "${BLAKE3}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::b3sum produced '${BLAKE3}' for ${SRC}"; exit 1; }
+          [[ "${SHA256}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::sha256sum produced '${SHA256}' for ${SRC}"; exit 1; }
+          mkdir -p fragments
+          jq -n \
+            --arg triple "${TRIPLE}" --arg platform "${PLATFORM}" \
+            --arg filename "${DEST_NAME}" --arg url "${URL}" \
+            --arg hash "blake3:${BLAKE3}" --arg bootstrap "sha256:${SHA256}" \
+            --arg sha256 "${SHA256}" --argjson size "${SIZE}" \
+            '{triple: $triple, platform: $platform, filename: $filename,
+              url: $url, hash: $hash, bootstrap_hash: $bootstrap,
+              sha256: $sha256, size_bytes: $size,
+              sig_url: ($url + ".sig"), cert_url: ($url + ".cert"),
+              bins: ["yah", "yahh", "yahb", "yaha"]}' \
+            > "fragments/${TRIPLE}.json"
+          cat "fragments/${TRIPLE}.json"
+
+      - name: Upload manifest fragment as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-manifest-fragment-${{ matrix.target }}
+          path: fragments/${{ matrix.target }}.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            cli-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            cli-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sig
+            cli-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.cert
+          fail_on_unmatched_files: true
+
+  # ---------------------------------------------------------------------------
+  # cli-release-manifest (R638-F1) — merge per-triple fragments → `yah/latest.json`,
+  # the pointer `curl yah.dev/install.sh | sh` resolves with no arguments.
+  #
+  # Two objects, same split as mesofact-release-manifest / R587-T1: an IMMUTABLE
+  # per-version manifest that stays cacheable forever, and one MUTABLE
+  # latest.json that just re-points. The pointer flip IS the release.
+  # ---------------------------------------------------------------------------
+  cli-release-manifest:
+    name: cli / release-manifest
+    needs: [publish-cli]
+    if: |
+      needs.publish-cli.result == 'success'
+      && (startsWith(github.ref_name, 'v') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cli-manifest-fragment-*
+          path: fragments
+          merge-multiple: true
+
+      - name: Build latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${REF#v}"
+          ls -la fragments/
+          # Fail rather than publish a partial pointer: install.sh resolves the
+          # user's triple out of this map, so a missing leg is a silent
+          # "unsupported platform" for everyone on it. Keep this count in sync
+          # with publish-cli's matrix.
+          shopt -s nullglob
+          frags=(fragments/*.json)
+          if [ "${#frags[@]}" -ne 5 ]; then
+            echo "::error::expected 5 cli triples, got ${#frags[@]}" >&2
+            exit 1
+          fi
+          jq -n --arg name yah --arg v "${VERSION}" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{name: $name, version: $v, pub_date: $pub_date,
+              triples: (reduce inputs as $f ({}; .[$f.triple] = ($f | del(.triple))))}' \
+            fragments/*.json > latest.json
+          cat latest.json
+
+      - name: Publish manifests to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_KEY }}
+          AWS_DEFAULT_REGION: auto
+          CF_R2_ACCOUNT_ID: ${{ secrets.CF_R2_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${REF#v}"
+          ENDPOINT="https://${CF_R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          # Immutable per-version copy — safe to cache forever.
+          aws s3 cp latest.json \
+            "s3://yah-dev/yah/${VERSION}/manifest.json" \
+            --endpoint-url "${ENDPOINT}" \
+            --content-type application/json \
+            --cache-control "public, max-age=31536000, immutable"
+          # The mutable pointer install.sh reads. Written LAST so a failed
+          # per-version upload never leaves the pointer aimed at nothing.
+          aws s3 cp latest.json \
+            s3://yah-dev/yah/latest.json \
+            --endpoint-url "${ENDPOINT}" \
+            --content-type application/json \
+            --cache-control "no-cache, max-age=0"
+
+  # ---------------------------------------------------------------------------
+  # publish-yubaba — sign-blob + R2 cp + GH Release upload + manifest fragment.
+  #
+  # Downloads yubaba-build's tarball artifacts, signs with cosign sign-blob
+  # (keyless OIDC), uploads tarball + .sig + .cert to R2 (canonical path per
+  # the retired yubaba-release wrapper), uploads to GH Release (back-compat),
+  # emits per-triple manifest
+  # fragment as a workflow artifact for yubaba-release-manifest.
+  # ---------------------------------------------------------------------------
+  publish-yubaba:
+    name: yubaba / ${{ matrix.target }} (publish)
+    needs: [smoke, yubaba-build]
+    if: |
+      always()
+      && needs.smoke.result != 'failure'
+      && needs.smoke.result != 'cancelled'
+      && needs.yubaba-build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - name: Download yubaba tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: yubaba-tarball-${{ matrix.target }}
+          path: .
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign tarball (cosign sign-blob, keyless OIDC)
+        shell: bash
+        run: |
+          TARBALL="yubaba-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          cosign sign-blob --yes \
+            --output-signature "${TARBALL}.sig" \
+            --output-certificate "${TARBALL}.cert" \
+            "${TARBALL}"
+          ls -la "${TARBALL}" "${TARBALL}.sig" "${TARBALL}.cert"
+
+      # Canonical R2 layout, inherited from the retired yubaba-release wrapper
+      # (now folded into .yah/qed/release.toml):
+      #   yubaba/<version>/<triple>/yah-yubaba-<triple>.tar.gz
+      # served at https://cdn.yah.dev/yubaba/...
+      - name: Publish tarball + signatures to R2 (yah-dev / cdn.yah.dev)
+        if: startsWith(github.ref_name, 'v') || github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_KEY }}
+          AWS_DEFAULT_REGION: auto
+          CF_R2_ACCOUNT_ID: ${{ secrets.CF_R2_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${REF#v}"
+          TRIPLE="${{ matrix.target }}"
+          SRC="yubaba-${REF}-${TRIPLE}.tar.gz"
+          KEY_PREFIX="yubaba/${VERSION}/${TRIPLE}"
+          DEST_NAME="yubaba-${TRIPLE}.tar.gz"
+          ENDPOINT="https://${CF_R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp "${SRC}"        "s3://yah-dev/${KEY_PREFIX}/${DEST_NAME}"        --endpoint-url "${ENDPOINT}"
+          aws s3 cp "${SRC}.sig"    "s3://yah-dev/${KEY_PREFIX}/${DEST_NAME}.sig"    --endpoint-url "${ENDPOINT}"
+          aws s3 cp "${SRC}.cert"   "s3://yah-dev/${KEY_PREFIX}/${DEST_NAME}.cert"   --endpoint-url "${ENDPOINT}"
+
+      # `hash` (blake3, identity) + `bootstrap_hash` (sha256, curl|sh aid) +
+      # the deprecated bare `sha256`: see the long rationale block on
+      # publish-cli's fragment step above. Do not drop one without reading it.
+      - name: Install b3sum (blake3 is the canonical asset hash)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v b3sum >/dev/null 2>&1; then
+            sudo apt-get update -qq || true
+            sudo apt-get install -y -qq b3sum || cargo install b3sum --locked
+          fi
+          command -v b3sum >/dev/null 2>&1 || {
+            echo "::error::b3sum unavailable — refusing to publish an artifact with no blake3 identity"
+            exit 1
+          }
+          b3sum --version
+
+      - name: Emit per-triple manifest fragment
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${REF#v}"
+          TRIPLE="${{ matrix.target }}"
+          SRC="yubaba-${REF}-${TRIPLE}.tar.gz"
+          BASE_URL="https://cdn.yah.dev/yubaba/${VERSION}/${TRIPLE}/yubaba-${TRIPLE}.tar.gz"
+          SIZE=$(stat -c%s "${SRC}")
+          BLAKE3=$(b3sum --no-names "${SRC}")
+          SHA256=$(sha256sum "${SRC}" | awk '{print $1}')
+          [[ "${BLAKE3}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::b3sum produced '${BLAKE3}' for ${SRC}"; exit 1; }
+          [[ "${SHA256}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::sha256sum produced '${SHA256}' for ${SRC}"; exit 1; }
+          mkdir -p fragments
+          cat > "fragments/${TRIPLE}.json" <<EOF
+          {
+            "triple": "${TRIPLE}",
+            "url": "${BASE_URL}",
+            "size": ${SIZE},
+            "hash": "blake3:${BLAKE3}",
+            "bootstrap_hash": "sha256:${SHA256}",
+            "sha256": "${SHA256}",
+            "sig_url": "${BASE_URL}.sig",
+            "cert_url": "${BASE_URL}.cert"
+          }
+          EOF
+          cat "fragments/${TRIPLE}.json"
+
+      - name: Upload manifest fragment as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yubaba-manifest-fragment-${{ matrix.target }}
+          path: fragments/${{ matrix.target }}.json
+          if-no-files-found: error
+          retention-days: 1
+
+      # Back-compat: keep uploading to GitHub Releases during transition to R2
+      # canon. Drop once consumers (cloud-init, deploy-remote.sh) are entirely
+      # off the gh-release URL shape.
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            yubaba-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            yubaba-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sig
+            yubaba-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.cert
+          fail_on_unmatched_files: true
+
+  # ---------------------------------------------------------------------------
+  # publish-camp — download camp-build's tarballs, upload to GH Release.
+  # ---------------------------------------------------------------------------
+  publish-camp:
+    name: camp / ${{ matrix.target }} (publish)
+    needs: [smoke, camp-build]
+    if: |
+      always()
+      && needs.smoke.result != 'failure'
+      && needs.smoke.result != 'cancelled'
+      && needs.camp-build.result == 'success'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - name: Download camp tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: camp-tarball-${{ matrix.target }}
+          path: .
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: camp-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          fail_on_unmatched_files: true
+
+  # ---------------------------------------------------------------------------
+  # yubaba-release-manifest — merge per-triple fragments + publish to R2.
+  # ---------------------------------------------------------------------------
+  yubaba-release-manifest:
+    name: yubaba / release-manifest
+    needs: [publish-yubaba]
+    if: |
+      needs.publish-yubaba.result == 'success'
+      && (startsWith(github.ref_name, 'v') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Checked out for cluster-epochs.json — the epochs are declared in-tree,
+      # not carried by the build artifacts.
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: yubaba-manifest-fragment-*
+          path: fragments
+          merge-multiple: true
+
+      # R625-F2 / W275: cluster_protocol (wire) + state_epoch (on-disk) are
+      # release-wide, not per-triple, so they are merged in here rather than in
+      # the per-triple fragments. They come from the SAME file the yubaba binary
+      # parses at compile time (src/cluster_epoch.rs `include_str!`s it), so the
+      # published manifest cannot drift from what the deployed node reports on
+      # /health. Missing or non-integer values fail this job rather than
+      # publishing a manifest that silently declares nothing.
+      - name: Build release-manifest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${REF#v}"
+          EPOCHS="oss/yubaba/crates/yubaba/cluster-epochs.json"
+          test -f "${EPOCHS}" || { echo "missing ${EPOCHS}" >&2; exit 1; }
+          CLUSTER_PROTOCOL=$(jq -e '.cluster_protocol | numbers' "${EPOCHS}")
+          STATE_EPOCH=$(jq -e '.state_epoch | numbers' "${EPOCHS}")
+          ls -la fragments/
+          jq -n --arg v "${VERSION}" \
+            --argjson cp "${CLUSTER_PROTOCOL}" \
+            --argjson se "${STATE_EPOCH}" \
+            '{version: $v, cluster_protocol: $cp, state_epoch: $se,
+              triples: (reduce inputs as $f ({}; .[$f.triple] = ($f | del(.triple))))}' \
+            fragments/*.json > release-manifest.json
+          cat release-manifest.json
+
+      - name: Publish release-manifest.json to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_KEY }}
+          AWS_DEFAULT_REGION: auto
+          CF_R2_ACCOUNT_ID: ${{ secrets.CF_R2_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          ENDPOINT="https://${CF_R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp release-manifest.json \
+            s3://yah-dev/yubaba/release-manifest.json \
+            --endpoint-url "${ENDPOINT}" \
+            --content-type application/json \
+            --cache-control "no-cache, max-age=0"
+
+  # ---------------------------------------------------------------------------
+  # publish-mesofact (R560-F1) — sign-blob + R2 cp + GH Release + fragment emit.
+  #
+  # Same three-part shape as publish-yubaba, and deliberately the SAME R2 layout
+  # as R587-T1's desktop publish (`<name>/<version>/<triple>/` immutable bytes +
+  # one mutable `latest.json` pointer) rather than a second parallel layout —
+  # `install.sh` resolves any package through that one convention.
+  # ---------------------------------------------------------------------------
+  publish-mesofact:
+    name: mesofact / ${{ matrix.target }} (publish)
+    needs: [smoke, mesofact-build]
+    if: |
+      always()
+      && needs.smoke.result != 'failure'
+      && needs.smoke.result != 'cancelled'
+      && needs.mesofact-build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - name: Download mesofact tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: mesofact-tarball-${{ matrix.target }}
+          path: .
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Sign tarball (cosign sign-blob, keyless OIDC)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARBALL="mesofact-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+          cosign sign-blob --yes \
+            --output-signature "${TARBALL}.sig" \
+            --output-certificate "${TARBALL}.cert" \
+            "${TARBALL}"
+          ls -la "${TARBALL}" "${TARBALL}.sig" "${TARBALL}.cert"
+
+      - name: Publish tarball + signatures to R2 (yah-dev / cdn.yah.dev)
+        if: startsWith(github.ref_name, 'v') || github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_KEY }}
+          AWS_DEFAULT_REGION: auto
+          CF_R2_ACCOUNT_ID: ${{ secrets.CF_R2_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${REF#v}"
+          TRIPLE="${{ matrix.target }}"
+          SRC="mesofact-${REF}-${TRIPLE}.tar.gz"
+          KEY_PREFIX="mesofact/${VERSION}/${TRIPLE}"
+          DEST_NAME="mesofact-${TRIPLE}.tar.gz"
+          ENDPOINT="https://${CF_R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp "${SRC}"      "s3://yah-dev/${KEY_PREFIX}/${DEST_NAME}"      --endpoint-url "${ENDPOINT}"
+          aws s3 cp "${SRC}.sig"  "s3://yah-dev/${KEY_PREFIX}/${DEST_NAME}.sig"  --endpoint-url "${ENDPOINT}"
+          aws s3 cp "${SRC}.cert" "s3://yah-dev/${KEY_PREFIX}/${DEST_NAME}.cert" --endpoint-url "${ENDPOINT}"
+
+      # The fragment is a superset of the ReleaseAsset shape the marketing
+      # /releases page already renders (platform / filename / url / hash /
+      # size_bytes — app/yah/web/marketing/src/releases.ts), so R330's feed
+      # producer can map a triple straight onto an asset with no reshaping.
+      # `platform` uses that page's PLATFORM_LABELS keys, which cover exactly
+      # these four triples.
+      #
+      # `hash` (blake3, identity) + `bootstrap_hash` (sha256, curl|sh aid) +
+      # the deprecated bare `sha256`: see the long rationale block on
+      # publish-cli's fragment step above. Do not drop one without reading it.
+      - name: Install b3sum (blake3 is the canonical asset hash)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v b3sum >/dev/null 2>&1; then
+            sudo apt-get update -qq || true
+            sudo apt-get install -y -qq b3sum || cargo install b3sum --locked
+          fi
+          command -v b3sum >/dev/null 2>&1 || {
+            echo "::error::b3sum unavailable — refusing to publish an artifact with no blake3 identity"
+            exit 1
+          }
+          b3sum --version
+
+      - name: Emit per-triple manifest fragment
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${REF#v}"
+          TRIPLE="${{ matrix.target }}"
+          SRC="mesofact-${REF}-${TRIPLE}.tar.gz"
+          DEST_NAME="mesofact-${TRIPLE}.tar.gz"
+          URL="https://cdn.yah.dev/mesofact/${VERSION}/${TRIPLE}/${DEST_NAME}"
+          case "${TRIPLE}" in
+            aarch64-apple-darwin)       PLATFORM="macos-arm64" ;;
+            x86_64-apple-darwin)        PLATFORM="macos-x86_64" ;;
+            x86_64-unknown-linux-gnu)   PLATFORM="linux-x86_64" ;;
+            aarch64-unknown-linux-gnu)  PLATFORM="linux-aarch64" ;;
+            *) echo "::error::no PLATFORM_LABELS key for ${TRIPLE}" >&2; exit 1 ;;
+          esac
+          SIZE=$(stat -c%s "${SRC}")
+          BLAKE3=$(b3sum --no-names "${SRC}")
+          SHA256=$(sha256sum "${SRC}" | awk '{print $1}')
+          [[ "${BLAKE3}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::b3sum produced '${BLAKE3}' for ${SRC}"; exit 1; }
+          [[ "${SHA256}" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::sha256sum produced '${SHA256}' for ${SRC}"; exit 1; }
+          mkdir -p fragments
+          jq -n \
+            --arg triple "${TRIPLE}" --arg platform "${PLATFORM}" \
+            --arg filename "${DEST_NAME}" --arg url "${URL}" \
+            --arg hash "blake3:${BLAKE3}" --arg bootstrap "sha256:${SHA256}" \
+            --arg sha256 "${SHA256}" --argjson size "${SIZE}" \
+            '{triple: $triple, platform: $platform, filename: $filename,
+              url: $url, hash: $hash, bootstrap_hash: $bootstrap,
+              sha256: $sha256, size_bytes: $size,
+              sig_url: ($url + ".sig"), cert_url: ($url + ".cert"),
+              bins: ["mesofact", "mesofact-dev"]}' \
+            > "fragments/${TRIPLE}.json"
+          cat "fragments/${TRIPLE}.json"
+
+      - name: Upload manifest fragment as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesofact-manifest-fragment-${{ matrix.target }}
+          path: fragments/${{ matrix.target }}.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            mesofact-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            mesofact-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sig
+            mesofact-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.cert
+          fail_on_unmatched_files: true
+
+  # ---------------------------------------------------------------------------
+  # mesofact-release-manifest — merge per-triple fragments → the pointer
+  # `install.sh` resolves.
+  #
+  # Two objects, on purpose (same split R587-T1/T2 chose for desktop): an
+  # IMMUTABLE per-version manifest that stays cacheable forever, and one MUTABLE
+  # `latest.json` at a fixed key that just re-points. That is the whole
+  # atomic-release model — the bytes under <version>/ are append-only and the
+  # pointer flip is the release.
+  # ---------------------------------------------------------------------------
+  mesofact-release-manifest:
+    name: mesofact / release-manifest
+    needs: [publish-mesofact]
+    if: |
+      needs.publish-mesofact.result == 'success'
+      && (startsWith(github.ref_name, 'v') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mesofact-manifest-fragment-*
+          path: fragments
+          merge-multiple: true
+
+      - name: Build latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${REF#v}"
+          ls -la fragments/
+          # Fail rather than publish a partial pointer: install.sh resolves the
+          # user's triple out of this map, so a missing leg is a silent
+          # "unsupported platform" for everyone on it.
+          shopt -s nullglob
+          frags=(fragments/*.json)
+          if [ "${#frags[@]}" -ne 4 ]; then
+            echo "::error::expected 4 mesofact triples, got ${#frags[@]}" >&2
+            exit 1
+          fi
+          jq -n --arg name mesofact --arg v "${VERSION}" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{name: $name, version: $v, pub_date: $pub_date,
+              triples: (reduce inputs as $f ({}; .[$f.triple] = ($f | del(.triple))))}' \
+            fragments/*.json > latest.json
+          cat latest.json
+
+      - name: Publish manifests to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_KEY }}
+          AWS_DEFAULT_REGION: auto
+          CF_R2_ACCOUNT_ID: ${{ secrets.CF_R2_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${REF#v}"
+          ENDPOINT="https://${CF_R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          # Immutable per-version copy — safe to cache forever.
+          aws s3 cp latest.json \
+            "s3://yah-dev/mesofact/${VERSION}/manifest.json" \
+            --endpoint-url "${ENDPOINT}" \
+            --content-type application/json \
+            --cache-control "public, max-age=31536000, immutable"
+          # The mutable pointer install.sh reads. Written LAST so a failed
+          # per-version upload never leaves the pointer aimed at nothing.
+          aws s3 cp latest.json \
+            s3://yah-dev/mesofact/latest.json \
+            --endpoint-url "${ENDPOINT}" \
+            --content-type application/json \
+            --cache-control "no-cache, max-age=0"
+
+  # ---------------------------------------------------------------------------
+  # Desktop bundles + Tauri updater manifest live OUTSIDE GHA.
+  #
+  # QED's `desktop-release` task signs + bundles the Tauri app locally (or via
+  # cloud-rented mac runners) and uploads to the GitHub Release alongside the
+  # CLI/yubaba/camp tarballs that this workflow produces. The `latest.json`
+  # auto-updater manifest is composed by QED as part of that same task so the
+  # signature/url shape stays under one owner.
+  #
+  # GHA's release scope is: containers + linux CLIs + linux daemons. Adding
+  # macOS back would require either GitHub-paid macOS runners (~$0.08/min) or
+  # a cheap-mac-rental cloud path we own; the latter is the chosen direction.
+  # ---------------------------------------------------------------------------

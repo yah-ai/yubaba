@@ -461,6 +461,8 @@ account_id = "test-account"
                 schema_version: 1,
                 shape: MirrorShape::SingleMachine,
                 providers: mirror_providers,
+                ingress: Default::default(),
+                drivers: Default::default(),
                 asset_aliases: Default::default(),
             };
             let service = ServiceConfig {

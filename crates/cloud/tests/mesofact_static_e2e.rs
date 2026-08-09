@@ -82,6 +82,8 @@ async fn local_static_reconciler_brings_up_app_yah_web() {
         schema_version: 1,
         shape: MirrorShape::Local,
         providers,
+        ingress: Default::default(),
+        drivers: Default::default(),
         asset_aliases: Default::default(),
     };
 

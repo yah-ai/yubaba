@@ -1,0 +1,58 @@
+{
+  "cluster_protocol": 3,
+  "cluster_protocol_surface": "899bcce046e26ffd0233f21ac6a01a62459e599b68a4a582bf4618bcfd4daddc",
+  "cluster_protocol_history": {
+    "1": "openraft 0.9 — snapshot at POST /raft/install-snapshot, chunked stream {vote, meta, offset, data, done}; leader handoff at /raft/trigger-elect",
+    "2": "openraft 0.10 — snapshot at POST /raft/snapshot, whole-snapshot (vote, meta, Vec<u8>); leader handoff at /raft/transfer-leader-msg. Bumped by commit 4a10c3d (2026-07-17). vote + append-entries stayed wire-compatible across this bump (measured, R625-S1); the snapshot path did not.",
+    "3": "R706 (W294) — cluster secrets carry an ACCESS RULE. YubabaRequest::PutSecret and SecretRecord each gained `access: SecretAccess` (#[serde(default)] = deny-all). Nothing fails to PARSE in either direction, which is exactly why this needed a bump rather than a re-record: a mixed cluster is silently mis-authorized, not visibly broken. An epoch-2 node replicating an epoch-3 PutSecret drops the unknown `access` field on the floor and, having no check of its own, keeps serving that secret to ANY workload that names it — so the authorization guarantee R706 exists to create does not hold cluster-wide until every node is on 3. (The reverse direction is safe: an epoch-3 node applying an epoch-2 PutSecret defaults to deny-all and refuses, which is loud and re-fixable with `yah cloud secret put`.) Cheap moment to take: the fleet had zero cluster secrets and no node had a cluster KEK when this landed. CLUSTER_PROTOCOL is advertised on GET /health and in the signed release manifest — it is not a hard join gate — so this does not mechanically block a rolling upgrade; it makes the mixed window visible to the operator, which is the whole point here."
+  },
+  "state_epoch": 2,
+  "state_epoch_surface": "3f3f7f6b35d9916ee69c352f59c35e34532e34598a0dc658188b2ad280cbbc55",
+  "state_epoch_history": {
+    "1": "openraft 0.9 storage-v1 on-disk raft log + snapshot layout",
+    "2": "openraft 0.10 storage-v2 on-disk raft log + snapshot layout. Bumped by commit 4a10c3d (2026-07-17)."
+  },
+
+  "surface_rerecords": [
+    {
+      "at": "2026-08-07",
+      "axes": ["cluster_protocol", "state_epoch"],
+      "verdict": "NOT BREAKING — hashes re-recorded, cluster_protocol left at 3, state_epoch left at 2",
+      "cause": "R720-F1 (W294) / R625-B6. `digest: Option<Vec<u8>>` added to SecretRecord (raft/mod.rs) and to YubabaRequest::PutSecret, both #[serde(default)]. raft/store.rs's cluster_secret_index() gained a fourth (digest, hex-encoded) column plus a local hex_encode helper.",
+      "why_not_a_bump": [
+        "Unlike R706's `access` (history \"3\"), digest carries NO enforcement path — nothing anywhere gates a decision on its presence or absence. It is a read-only, keyed diagnostic value surfaced on GET /secrets purely for `yah cloud secret status` (R720-T2) to compare a camp's declaration against what the fleet is serving. Its own doc comment states the contract: `None` means 'predates digests', never 'matches' — so a node that drops the unknown field, or one reading a record that never had one, both land on the SAME documented state (unknown(pre-digest)), not a silent lie and not a security bypass. That is the structural difference from access, whose absence changed what a mount-time gate actually enforced.",
+        "Wire direction (cluster_protocol), re-verified by reading network.rs and lib.rs rather than assumed: every raft RPC (append-entries, vote, snapshot) goes over reqwest .json()/axum Json<T> — serde_json IS the wire format, confirming R625-S1's finding still holds. No #[serde(deny_unknown_fields)] anywhere in the SecretRecord / PutSecret / YubabaRequest chain (grepped). An epoch-3 node receiving an epoch-4 leader's replicated PutSecret silently drops the unknown `digest` key; an epoch-4 node receiving an epoch-3 leader's PutSecret defaults digest to None via #[serde(default)]. Every node in the cluster applies the identical replicated log bytes in the identical order — openraft's consistency model is 'same log, same order, same apply()', not per-node content negotiation — so there is no state-machine divergence risk here, only a per-node representation gap that IS what None already means.",
+        "Disk direction (state_epoch), same method: store.rs persists both raft_log.json and raft_state.json via serde_json::to_string — the same self-describing format as the wire, confirmed by reading the actual persist_log/persist_vote code and the module's own doc comment, not inferred from convention. An epoch-4 binary reads an epoch-3 snapshot/log (digest absent -> None); an epoch-3 binary reads an epoch-4 snapshot/log (digest present, silently dropped — the old binary never had a use for it). Neither direction errors, and rollback is genuinely reversible: a downgraded node keeps serving every existing secret exactly as before, just without the drift-check precision digest adds.",
+        "raft/store.rs's contribution to this axis's hash is the same shape the 2026-08-03 entry already recorded for cluster_secret_index() itself: a read-only accessor over the secrets map, in the hash only because the whole file is a surface input, touching no serialisation path. This change extends that same accessor with one more hex-encoded column.",
+        "openraft pin unchanged at =0.10.0-alpha.30."
+      ],
+      "residual_risk": "None security-relevant, unlike R706's access-rule gap — no authorization or mount decision reads digest. The only user-visible effect of a mixed cluster is that `yah cloud secret status` reports unknown(pre-digest) instead of in-sync/drifted for a record written by a pre-digest node, which is the designed degrade path this field exists to make honest, not a defect. It self-heals the next time that secret is re-shipped with `yah cloud secret put` from a fully-rolled camp."
+    },
+    {
+      "at": "2026-08-03",
+      "axes": ["state_epoch"],
+      "verdict": "NOT BREAKING — hash re-recorded, state_epoch left at 2 (cluster_protocol was BUMPED to 3 in the same change; see its history entry)",
+      "cause": "R706 (W294). `access: SecretAccess` added to SecretRecord (a durable type in raft/mod.rs) and `cluster_secret_index()` added to raft/store.rs, so both of this axis's file inputs moved.",
+      "why_not_a_bump": [
+        "This axis asks whether the new binary can read the old raft log/snapshot AND whether you can roll BACK. Both hold. The snapshot is serde_json over YubabaState; the new field is #[serde(default)], so an epoch-3 binary reads an epoch-2 snapshot (every secret lands on the deny-all default) and an epoch-2 binary reads an epoch-3 snapshot (it ignores the unknown field). Neither errors, and the log/snapshot LAYOUT is unchanged — no new file, no new framing, no openraft storage change.",
+        "raft/store.rs gained only `cluster_secret_index()`, a read-only accessor over the already-existing secrets map. It touches no serialisation path; it is in this axis's hash purely because the whole file is an input.",
+        "The rollback is genuinely reversible in the sense this axis means: an operator who downgrades gets a readable store back. What they LOSE on downgrade is rule enforcement, and that is a wire/build-compatibility fact, which is why it is priced into cluster_protocol 3 rather than here. Keeping the two verdicts separate is the point of having two axes — see the R625 note that they have already been observed to move independently.",
+        "openraft pin unchanged at =0.10.0-alpha.30."
+      ],
+      "residual_risk": "A downgraded (epoch-2) node silently stops enforcing access rules on secrets already in its store. That is flagged by cluster_protocol 3, not by this axis, but an operator reading only state_epoch would not see it — hence this note."
+    },
+    {
+      "at": "2026-08-02",
+      "axes": ["cluster_protocol", "state_epoch"],
+      "verdict": "NOT BREAKING — hashes re-recorded, both epochs left at 2",
+      "cause": "R118-T9 (ClusterPolicy). Drift had been sitting committed since ac30043c while the hashes were last recorded at 83beb361, two commits earlier.",
+      "why_not_a_bump": [
+        "raft/mod.rs: the only non-comment change is that open()/open_with_state_machine() gained a `policy: &ClusterPolicy` parameter and the hardcoded openraft Config literal became policy.timing.to_openraft_config(). Election/heartbeat timings are per-node LOCAL config — raft never negotiates them with peers — so they cannot make two builds unable to share a cluster. ClusterPolicy::fleet() (the clap default) is RaftTiming::wan() = heartbeat 500 / election 1500-3000, byte-identical to the literals it replaced, so the deployed fleet's behaviour is unchanged too.",
+        "lib.rs route table: R118-T9 ADDED POST /raft/promote-voter (+ handler raft_promote_voter). Additive and operator-facing, not peer-dialed — raft/network.rs is the client half that decides which URLs a node POSTs its peers, and its non-comment content is unchanged. The membership change it triggers is openraft's ordinary AddVoterIds joint consensus, which both builds already implement; only the HTTP trigger is new. An old-build node in a mixed cluster answers 404 to promote-voter, which is a missing operator capability, not a membership incompatibility.",
+        "state_epoch specifically: raft/store.rs (log store + state machine + snapshot serialisation) is UNCHANGED since the last recording, and the durable types in raft/mod.rs are untouched — only the in-memory openraft runtime Config moved. On-disk layout is identical, so the roll stays reversible.",
+        "openraft pin unchanged at =0.10.0-alpha.30. The Cargo.toml diff removes only the dev-dependency `openraft_09` (R625-S1's mixed-version interop test, deleted with the test per the 2026-07-25 operator decision to put every node on 0.10). Dev-only; never linked into the shipped lib."
+      ],
+      "residual_risk": "Mismatched --cluster-profile ACROSS NODES (fleet WAN timings vs rig LAN timings) is a real misconfiguration — a rig node campaigns ~3x more eagerly — but it is an operator error at launch, not a build-compatibility fact, and this axis asks whether two BUILDS can share a cluster. Both builds default to --cluster-profile fleet."
+    }
+  ]
+}

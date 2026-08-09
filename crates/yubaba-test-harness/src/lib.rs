@@ -72,6 +72,17 @@ use cloud::provider::{MachineProvider, ServerId};
 use openraft::async_runtime::watch::WatchReceiver;
 use openraft::BasicNode;
 use workload_spec::{MeshIdent, WorkloadSpec};
+use yubaba::cluster_policy::ClusterPolicy;
+use yubaba::failure_detector::RaftHeartbeatDetector;
+
+/// The [`ClusterPolicy`] harness clusters run under.
+///
+/// The fleet preset, deliberately: the harness exists to exercise the shipped
+/// fleet's behaviour, so its clusters must obey the shipped fleet's rules
+/// (learner-only admission, WAN election timings). A test that needs different
+/// rules builds its nodes itself rather than reconfiguring the harness out from
+/// under every other test.
+const HARNESS_POLICY: ClusterPolicy = ClusterPolicy::fleet();
 
 // ── NetworkDegrade ────────────────────────────────────────────────────────────
 
@@ -390,8 +401,10 @@ impl Cluster {
         let runtime = node.runtime.clone()
             .ok_or_else(|| anyhow::anyhow!("restart_node: node {idx} has no runtime"))?;
 
-        // Re-open the raft node from persisted state.
-        let raft = yubaba::raft::open(node_id, raft_dir)
+        // Re-open the raft node from persisted state, under the same policy the
+        // cluster was founded with — a restarting node that changed its raft
+        // timings would campaign against peers that had not.
+        let raft = yubaba::raft::open(node_id, raft_dir, &HARNESS_POLICY)
             .await
             .with_context(|| format!("restart_node: re-open raft for node {idx}"))?;
 
@@ -399,8 +412,13 @@ impl Cluster {
             yubaba::ServerState::load(state_path)
                 .with_context(|| format!("restart_node: load state for node {idx}"))?
                 .with_runtime(runtime)
+                .with_cluster_policy(HARNESS_POLICY)
                 .with_raft(raft.clone())
-                .with_node_id(node_id),
+                .with_node_id(node_id)
+                .with_failure_detector(Arc::new(RaftHeartbeatDetector::new(
+                    raft.clone(),
+                    HARNESS_POLICY.liveness_thresholds(),
+                ))),
         );
 
         // Rebind on the same port. The killed task dropped the listener, so
@@ -574,7 +592,7 @@ where
             std::fs::create_dir_all(&raft_dir)
                 .with_context(|| format!("creating raft dir for node {i}"))?;
             let node_id = (i as u64) + 1; // 1-indexed
-            let raft = yubaba::raft::open(node_id, raft_dir.clone())
+            let raft = yubaba::raft::open(node_id, raft_dir.clone(), &HARNESS_POLICY)
                 .await
                 .with_context(|| format!("opening raft node {node_id}"))?;
             raft_nodes.push(Some(raft));
@@ -603,8 +621,13 @@ where
 
         if let (Some(raft), Some(nid)) = (&raft_nodes[i], node_id_opt) {
             srv_state = srv_state
+                .with_cluster_policy(HARNESS_POLICY)
                 .with_raft(raft.clone())
-                .with_node_id(nid);
+                .with_node_id(nid)
+                .with_failure_detector(Arc::new(RaftHeartbeatDetector::new(
+                    raft.clone(),
+                    HARNESS_POLICY.liveness_thresholds(),
+                )));
         }
 
         let state = Arc::new(srv_state);

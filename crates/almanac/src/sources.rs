@@ -61,6 +61,41 @@ pub enum SourceError {
     Http(#[from] reqwest::Error),
     #[error("response parse error: {0}")]
     Parse(String),
+    #[error("{status} from {url}")]
+    Status { url: String, status: reqwest::StatusCode },
+    /// An authenticated source could not assemble its credentials. Carries the
+    /// *reference* that failed (a variable name or a path), never a value.
+    #[error("credential resolution failed — {0}")]
+    Credential(String),
+    /// An authenticated source reached its object store and the read failed.
+    /// Distinct from [`SourceError::Credential`] because the fixes differ: this
+    /// one is a bucket, a key, or a scope, not a missing secret.
+    #[error("reading {key} from bucket {bucket}: {detail}")]
+    ObjectRead { bucket: String, key: String, detail: String },
+}
+
+/// Decode a JSON response, failing with the HTTP status when it is not 2xx.
+///
+/// Every source goes through this instead of a bare `.json()` because a bare
+/// `.json()` MISREPORTS the common failure. The body of a 404 is an HTML error
+/// page or a GitHub error object, so `.json::<T>()` on it fails with reqwest's
+/// "error decoding response body" — which names neither the status nor the
+/// URL, and reads like a schema bug in code that is fine.
+///
+/// That masking is not hypothetical. `.yah/almanac/releases.toml` pointed at a
+/// private repo's releases API for two months; the anonymous 404 surfaced only
+/// as that decode error, and the feed's emptiness read as a parsing problem
+/// rather than a permissions one until someone curled the URL by hand
+/// (R330-T32). Checking the status first costs one branch and makes the log
+/// line say what actually happened.
+pub(crate) async fn decode_json<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+) -> Result<T, SourceError> {
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(SourceError::Status { url: resp.url().to_string(), status });
+    }
+    resp.json().await.map_err(SourceError::Http)
 }
 
 /// Adapter trait: fetch the current release list from one authoritative source.
@@ -72,4 +107,83 @@ pub trait ReleaseSource: Send + Sync {
     async fn fetch(&self) -> Result<ReleaseFeed, SourceError>;
     /// Short identifier used in log messages and error context.
     fn source_id(&self) -> &str;
+}
+
+/// What a source produced this run — the bytes [`crate::runner::FeedRunner`]
+/// writes to the artifact.
+///
+/// Two arms because almanac owns exactly one wire schema and no more.
+/// [`ReleaseFeed`] is a schema *this crate* defines, so every release adapter
+/// normalizes into it and the presenter never learns which one ran. A feed whose
+/// consumer owns its own schema (the fleet index — publisher and reader are both
+/// `yah_fleet_metrics`, pinned to each other by a round-trip test) gets nothing
+/// from a translation layer in the middle and would gain a place to drift, so
+/// almanac transports those bytes and stays out of it.
+///
+/// Serializes **untagged**: the artifact holds the payload itself, never an
+/// almanac-shaped wrapper around it. A consumer parsing the emitted file cannot
+/// tell which arm produced it, which is the point.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(untagged)]
+pub enum FeedPayload {
+    /// A normalized release list — every `gh-releases` / `r2-*` public source.
+    Releases(ReleaseFeed),
+    /// Verbatim JSON from a source whose consumer owns the schema.
+    ///
+    /// Still *parsed* rather than copied as bytes: an error page or a truncated
+    /// read must fail the run instead of landing in the artifact, and a
+    /// re-serialization is also what makes the change-detector compare values
+    /// rather than incidental whitespace.
+    Passthrough(serde_json::Value),
+}
+
+impl FeedPayload {
+    /// The artifact bytes for this payload.
+    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
+        match self {
+            Self::Releases(feed) => serde_json::to_string_pretty(feed),
+            Self::Passthrough(value) => serde_json::to_string_pretty(value),
+        }
+    }
+
+    /// The release list, when this payload is one. `None` for a passthrough —
+    /// callers that only exist to render releases should skip rather than
+    /// invent an empty feed.
+    pub fn releases(&self) -> Option<&ReleaseFeed> {
+        match self {
+            Self::Releases(feed) => Some(feed),
+            Self::Passthrough(_) => None,
+        }
+    }
+
+    /// Count for log lines: releases in a release feed, `None` for passthrough
+    /// (whose element count is the consumer's business, not almanac's).
+    pub fn release_count(&self) -> Option<usize> {
+        self.releases().map(|f| f.releases.len())
+    }
+}
+
+/// Adapter trait one level up from [`ReleaseSource`]: fetch whatever this feed
+/// carries.
+///
+/// [`ReleaseSource`] is the release-shaped special case and stays the trait an
+/// adapter implements — every existing source gets this one for free through the
+/// blanket impl below, and none of them changed. A source whose payload is not a
+/// release list (see [`FeedPayload::Passthrough`]) implements `FeedSource`
+/// directly.
+#[async_trait]
+pub trait FeedSource: Send + Sync {
+    async fn fetch_payload(&self) -> Result<FeedPayload, SourceError>;
+    /// Short identifier used in log messages and error context.
+    fn source_id(&self) -> &str;
+}
+
+#[async_trait]
+impl<T: ReleaseSource> FeedSource for T {
+    async fn fetch_payload(&self) -> Result<FeedPayload, SourceError> {
+        Ok(FeedPayload::Releases(ReleaseSource::fetch(self).await?))
+    }
+    fn source_id(&self) -> &str {
+        ReleaseSource::source_id(self)
+    }
 }

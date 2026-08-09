@@ -241,21 +241,14 @@ use workload_spec::{
     ResourceLimits, RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
 };
 
+use super::native_support::{
+    capture_paths, native_spec, sanitize_ident, spawn_native_log_supervisor, NATIVE_IDENTITY_DIGEST,
+};
 use super::{
     into_running, pond, slot_field_u16, wait_for_port, LogBuffer, ReconcileCtx, Reconciler,
     RunningWorkload,
 };
 use crate::{MirrorProviderSlot, Provider};
-
-/// Native workloads are a fork+exec of an already-present host binary — the
-/// kamaji Native backend treats `ImageRef` as identity metadata only and
-/// never pulls. The schema still demands a valid-format digest, so native
-/// specs stamp a fixed all-zeros marker: impossible for any real image, so a
-/// leak into a registry-pull path surfaces obviously. (Mirrors
-/// `workload_spec::testing::TEST_DIGEST` without reaching into a test-only
-/// helper from production code.)
-const NATIVE_IDENTITY_DIGEST: &str =
-    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Workload kind this reconciler handles. Matches `ServiceComponent.kind`
 /// and the `kind = "..."` line in `workload.toml`.
@@ -580,7 +573,9 @@ impl MesofactStaticReconciler {
         if let Some(actual_port) = jit_port {
             if actual_port != port {
                 let actual_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), actual_port);
-                if let Some(adopted) = try_adopt_identified(actual_addr, svc, comp, "dynamic").await? {
+                if let Some(adopted) =
+                    try_adopt_identified(actual_addr, svc, comp, "dynamic").await?
+                {
                     return Ok(adopted);
                 }
             }
@@ -691,7 +686,7 @@ impl MesofactStaticReconciler {
             ctx.component.id.clone(),
         ];
         argv.extend(self.local_static.extra_args.iter().cloned());
-        let spec = native_mesofact_spec(&ident_str, argv);
+        let spec = native_spec(&ident_str, argv, Vec::new());
 
         let runtime = Arc::new(NativeRuntime::new(&state_dir));
         let mesh = MeshAssignment::inlined(Ipv4Addr::LOCALHOST);
@@ -716,10 +711,7 @@ impl MesofactStaticReconciler {
                 )
             })?;
 
-        // Mirror NativeRuntime's capture layout (documented in native.rs).
-        let workload_log_dir = state_dir.join(&ident_str);
-        let stdout_path = workload_log_dir.join("stdout.log");
-        let stderr_path = workload_log_dir.join("stderr.log");
+        let (stdout_path, stderr_path) = capture_paths(&state_dir, &ident_str);
 
         // Wait for the server to bind. If it doesn't, tear it down and return
         // an error so the caller doesn't hand the UI a dead URL.
@@ -906,20 +898,167 @@ impl MesofactStaticReconciler {
             }
             .await;
 
+            // R703-B4 — how loudly this fails depends on whether the Worker is
+            // the door the public actually comes through.
+            //
+            // It was unconditionally non-fatal, and that is how the yah.dev
+            // Worker ended up 19 days behind the router bundle in-tree: the
+            // token lacked `Workers Scripts: Edit`, every apply warned into a
+            // logger the CLI never installed, and every apply reported ok. A
+            // front door that cannot be updated is not a warning — it is the
+            // failure. When the zone's manifest declares `front_door =
+            // "worker"`, a failed deploy is fatal.
+            //
+            // For any other declared front door the Worker is a warm rollback
+            // lever rather than the live door, so a warning remains right: it
+            // should not be able to fail an apply for a surface serving no
+            // traffic.
             if let Err(e) = worker_result {
+                let is_live_front_door = matches!(
+                    super::publish_beacon::declared_front_door(ctx.workspace_root, &zone),
+                    Some((_, crate::config::FrontDoor::Worker))
+                );
+                if is_live_front_door {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "deploying the Cloudflare Worker for {zone} (script {worker_name}).\n\
+                         \n\
+                         .yah/domains/*.toml declares front_door = \"worker\" for this zone, so \
+                         this Worker IS the public front door — it cannot be left at whatever \
+                         version happens to be deployed. The publish above succeeded; what \
+                         failed is updating the thing that serves it.\n\
+                         \n\
+                         An `Authentication error` here means the configured Cloudflare \
+                         token cannot touch Workers. Test that DIRECTLY — a token-validity \
+                         check will not tell you, because the token is almost certainly \
+                         valid and merely under-scoped:\n\
+                         \n\
+                           curl -sS -H \"Authorization: Bearer $(yah keys get <slot>)\" \\\n\
+                             https://api.cloudflare.com/client/v4/accounts/<acct>/workers/scripts\n\
+                         \n\
+                         DO NOT reach for https://api.cloudflare.com/client/v4/user/tokens/verify \
+                         to triage this. An account-scoped token (`cfat_` prefix) is rejected \
+                         there with a flat `code 1000, Invalid API Token`, which reads \
+                         exactly like a revoked credential and sends you hunting for a token \
+                         that is fine. That misdiagnosis has now happened twice. The valid \
+                         health check for an account token is \
+                         /accounts/<acct>/tokens/verify.\n\
+                         \n\
+                         THE FIX, if the workers/scripts GET is denied: mint a token that \
+                         carries the grants, rather than editing one by hand —\n\
+                         \n\
+                           yah cloud cf token create --zone <zone> \\\n\
+                             --store-slot cloudflare-mesofact-static \\\n\
+                             --bootstrap-slot <a slot holding API Tokens: Edit>\n\
+                         \n\
+                         then point `credentials` in .yah/infra/providers/cloudflare.toml at \
+                         that slot. It builds MESOFACT_STATIC_GRANTS, which includes \
+                         `Workers Scripts: Write` (account) and `Workers Routes: Write` \
+                         (zone). The command's own summary line prints only five scopes and \
+                         omits both — that text is stale, the policy is not.\n\
+                         \n\
+                         Whatever the cause, it is silent everywhere else: the R2 publish \
+                         uses separate S3 keys and keeps working, so the bucket stays \
+                         current while the Worker — the thing that serves it — freezes."
+                        )
+                    });
+                }
                 warn!(
                     zone,
                     worker_name,
                     error = %e,
-                    "CF Worker deploy/route failed (non-fatal) — \
+                    "CF Worker deploy/route failed (non-fatal — this zone's declared \
+                     front door is not the Worker, so it serves no traffic today) — \
                      ensure cloudflare-api-token has Workers Scripts: Edit \
                      and Zone Workers Routes: Edit scope"
                 );
             }
         }
 
+        // R703-B4 — the publish is not the deliverable; the served page is.
+        self.verify_serving(ctx, slot_fields, &zone, &asset_origin, &report.beacon)
+            .await?;
+
         Ok(RunningWorkload::adopted("mesofact-static", "static", None)
             .with_public_url(format!("https://{zone}")))
+    }
+
+    /// Fetch the just-written publish beacon back through the origin and the
+    /// public front door, and fail the apply if the front door is serving
+    /// anything else.
+    ///
+    /// R703-B4. Everything upstream of here reports success on the *write*:
+    /// R2 accepted the objects, the Worker API accepted the script, the apply
+    /// exits 0. None of that is evidence that the bytes reached a reader, and
+    /// twice now they did not — once because a declared-but-unready bundle
+    /// tier disabled this chain, once because the apex had been cut over to an
+    /// origin nothing republishes. Both presented as HTTP 200 on a stale page.
+    ///
+    /// The origin probe is checked first and separately on purpose: it splits
+    /// "the publish did not land" from "the publish landed and the front door
+    /// is elsewhere", which are different tickets with identical symptoms.
+    async fn verify_serving(
+        &self,
+        ctx: &ReconcileCtx<'_>,
+        slot_fields: &std::collections::BTreeMap<String, toml::Value>,
+        zone: &str,
+        asset_origin: &str,
+        beacon: &super::publish_beacon::PublishBeacon,
+    ) -> Result<()> {
+        use super::publish_beacon as pb;
+
+        // Opt-out for a deliberately in-flight front-door migration. Declared
+        // in config rather than passed as a CLI flag so that turning it off is
+        // a reviewable diff next to a comment naming the ticket, not an
+        // invocation habit that quietly becomes permanent.
+        let verify = slot_fields
+            .get("verify_serving")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if !verify {
+            warn!(
+                zone,
+                "verify_serving = false — publish NOT checked against the live \
+                 front door; the site can go stale without this apply failing"
+            );
+            return Ok(());
+        }
+
+        let verdict = pb::check_serving(
+            ctx.workspace_root,
+            zone,
+            Some(asset_origin),
+            beacon,
+            pb::EDGE_PROBE_ATTEMPTS,
+            pb::EDGE_PROBE_DELAY,
+        )
+        .await;
+
+        if verdict.is_ok() {
+            info!(
+                zone,
+                digest = %beacon.digest,
+                files = beacon.files,
+                "front door is serving this publish"
+            );
+            return Ok(());
+        }
+
+        // A stale or absent front door means the deployed Worker (if any) may
+        // be older than the bundle this build embeds, and the local hash cache
+        // would otherwise skip redeploying it forever — that cache is a claim
+        // about the live Worker made from an untracked file on one laptop.
+        // Drop the entry so the next apply cannot take the skip branch.
+        if !verdict.front_door.is_match() {
+            let worker_name = slot_fields
+                .get("worker_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}-worker", ctx.service.name));
+            forget_worker_script_hash(ctx.workspace_root, &worker_name);
+        }
+
+        Err(verdict.into_error(beacon))
     }
 }
 
@@ -1207,6 +1346,39 @@ fn write_worker_script_hash(
     )
 }
 
+/// Drop a Worker's cached script hash so the next reconcile redeploys it.
+///
+/// R703-B4. The cache at `.yah/jit/worker-script-hashes.json` is an untracked
+/// local file asserting something about a *remote* Worker, so it can be right
+/// on one machine and wrong on the next — and while it is wrong, every apply
+/// takes the "unchanged — skipping redeploy" branch and the live Worker never
+/// catches up. It sat 19 days behind the in-tree router bundle that way. When
+/// the front door is demonstrably not serving the current publish, the cache
+/// has lost the right to be believed.
+///
+/// Best-effort: a cache we could not clear only costs one more manual redeploy,
+/// and the serving check that called us is already returning an error.
+fn forget_worker_script_hash(workspace_root: &std::path::Path, worker_name: &str) {
+    let path = workspace_root.join(".yah/jit/worker-script-hashes.json");
+    let Ok(s) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&s) else {
+        return;
+    };
+    if map.remove(worker_name).is_none() {
+        return;
+    }
+    let _ = std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default(),
+    );
+    warn!(
+        worker_name,
+        "cleared cached Worker script hash — next apply will redeploy the script"
+    );
+}
+
 /// Return `true` when a Unix-domain socket at `path` accepts connections.
 /// Uses a blocking connect so it can be called from sync or async context
 /// without spawning a task. The connect attempt is instantaneous for a live
@@ -1316,171 +1488,12 @@ pub fn read_jit_port(workspace_root: &std::path::Path, svc: &str, component: &st
         .and_then(|n| u16::try_from(n).ok())
 }
 
-/// Sanitize `service`/`component` into a [`MeshIdent`] that is DNS-segment
-/// shaped (kamaji contract) and safe as a filesystem path component
-/// (NativeRuntime joins it under its state dir for log capture). Lowercase;
-/// every non-alphanumeric collapses to `-`.
+/// mesofact-dev's ident namespace: `mesofact-dev-<service>-<component>`,
+/// sanitized by [`sanitize_ident`] into a slug that is both DNS-segment shaped
+/// (kamaji's contract) and safe as a path component (NativeRuntime joins it
+/// under its state dir).
 fn native_ident(service: &str, component: &str) -> String {
-    let raw = format!("mesofact-dev-{service}-{component}");
-    raw.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() {
-                ch.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
-/// Lower a mesofact-dev invocation to a native [`WorkloadSpec`]. `argv[0]` is
-/// the host binary; the remaining entries are its arguments (kamaji's
-/// Native backend uses container `command` semantics — see
-/// `constable_core::native`). `image` is identity metadata only: native never
-/// pulls, so it carries the [`NATIVE_IDENTITY_DIGEST`] marker.
-fn native_mesofact_spec(ident: &str, argv: Vec<String>) -> WorkloadSpec {
-    WorkloadSpec {
-        schema_version: SchemaVersion::V1,
-        name: ident.to_string(),
-        image: ImageRef {
-            registry: "localhost".to_string(),
-            repository: format!("native/{ident}"),
-            tag: "dev".to_string(),
-            digest: NATIVE_IDENTITY_DIGEST.to_string(),
-        },
-        tier: TierTag("dev".to_string()),
-        replicas: 1,
-        command: Some(argv),
-        entrypoint: None,
-        workdir: None,
-        user: None,
-        env: Vec::<EnvVar>::new(),
-        secrets: vec![],
-        volumes: vec![],
-        resources: ResourceLimits {
-            memory_mb: 512,
-            cpu_millis: 512,
-            ephemeral_storage_mb: 512,
-        },
-        depends_on: vec![],
-        healthcheck: None,
-        restart_policy: RestartPolicy::Never,
-        archetype: None,
-        stop_policy: StopPolicy {
-            signal: 15,
-            grace_period: Millis::from_secs(5),
-        },
-        expose: ExposeSpec {
-            mesh: MeshExpose {
-                identity: MeshIdent(ident.to_string()),
-                ports: vec![],
-                allow_from: vec![],
-            },
-            public: None,
-            operator: None,
-        },
-        tenant: TenantId::singleton(),
-        namespace: NamespaceId::singleton(),
-        labels: Default::default(),
-        annotations: Default::default(),
-    }
-}
-
-/// Supervisor task for a kamaji-native mesofact-dev workload.
-///
-/// NativeRuntime captures stdout/stderr to files with no follow, but the
-/// Run-tab expects a live [`LogBuffer`]. This task incrementally tails both
-/// capture files into `log_buf`, watches for a terminal child state, and on
-/// shutdown (operator signal or self-exit) tears the workload down. Returned
-/// as the `RunningWorkload` supervisor so the existing lifecycle contract is
-/// unchanged.
-fn spawn_native_log_supervisor(
-    runtime: Arc<NativeRuntime>,
-    ident: MeshIdent,
-    log_buf: LogBuffer,
-    stdout_path: PathBuf,
-    stderr_path: PathBuf,
-    mut shutdown_rx: oneshot::Receiver<()>,
-) -> tokio::task::JoinHandle<Result<()>> {
-    tokio::spawn(async move {
-        let mut out_tail = FileTail::new(stdout_path);
-        let mut err_tail = FileTail::new(stderr_path);
-        loop {
-            tokio::select! {
-                _ = &mut shutdown_rx => {
-                    out_tail.drain_into(&log_buf).await;
-                    err_tail.drain_into(&log_buf).await;
-                    runtime.teardown_workload(&ident).await.ok();
-                    return Ok(());
-                }
-                _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                    out_tail.drain_into(&log_buf).await;
-                    err_tail.drain_into(&log_buf).await;
-                    match runtime.get_workload(&ident).await {
-                        // Still running — keep tailing.
-                        Ok(Some(state)) if !state.status.is_terminal() => {}
-                        // Exited on its own — final drain, then stop.
-                        Ok(Some(_)) => {
-                            out_tail.drain_into(&log_buf).await;
-                            err_tail.drain_into(&log_buf).await;
-                            return Ok(());
-                        }
-                        // Torn down elsewhere or runtime gone — stop.
-                        Ok(None) | Err(_) => return Ok(()),
-                    }
-                }
-            }
-        }
-    })
-}
-
-/// Incremental line-oriented tail of a capture file. Tracks the byte offset
-/// already consumed plus any partial trailing line, so each drain emits only
-/// whole new lines into the [`LogBuffer`].
-struct FileTail {
-    path: PathBuf,
-    offset: u64,
-    partial: String,
-}
-
-impl FileTail {
-    fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            offset: 0,
-            partial: String::new(),
-        }
-    }
-
-    async fn drain_into(&mut self, log_buf: &LogBuffer) {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let Ok(mut file) = tokio::fs::File::open(&self.path).await else {
-            return;
-        };
-        if file
-            .seek(std::io::SeekFrom::Start(self.offset))
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let mut buf = Vec::new();
-        let Ok(n) = file.read_to_end(&mut buf).await else {
-            return;
-        };
-        if n == 0 {
-            return;
-        }
-        self.offset += n as u64;
-        // Carry any incomplete trailing line over to the next drain.
-        self.partial.push_str(&String::from_utf8_lossy(&buf));
-        while let Some(idx) = self.partial.find('\n') {
-            let line: String = self.partial.drain(..=idx).collect();
-            log_buf
-                .push(line.trim_end_matches(['\n', '\r']).to_string())
-                .await;
-        }
-    }
+    sanitize_ident(&format!("mesofact-dev-{service}-{component}"))
 }
 
 #[cfg(test)]
@@ -1529,6 +1542,8 @@ out_dir = "dist"
                 schema_version: 1,
                 shape: MirrorShape::Local,
                 providers,
+                ingress: Default::default(),
+                drivers: Default::default(),
                 asset_aliases: Default::default(),
             };
             let service = ServiceConfig {
@@ -1906,11 +1921,11 @@ account_id = "test-account"
         assert_eq!(native_ident("Foo.Bar", "a/b"), "mesofact-dev-foo-bar-a-b");
     }
 
-    /// R490-F2: native_mesofact_spec lowers argv into the Native backend's
+    /// R490-F2: the mesofact-dev invocation lowers into the Native backend's
     /// container-`command` shape with the no-pull identity digest.
     #[test]
     fn native_mesofact_spec_lowers_argv_and_identity() {
-        let spec = native_mesofact_spec(
+        let spec = native_spec(
             "mesofact-dev-site-static",
             vec![
                 "/bin/mesofact-dev".into(),
@@ -1918,6 +1933,7 @@ account_id = "test-account"
                 "--port".into(),
                 "4321".into(),
             ],
+            Vec::new(),
         );
         assert_eq!(spec.name, "mesofact-dev-site-static");
         assert_eq!(spec.entrypoint, None);
@@ -1925,38 +1941,6 @@ account_id = "test-account"
         assert_eq!(spec.expose.mesh.identity.0, "mesofact-dev-site-static");
         assert_eq!(spec.image.digest, NATIVE_IDENTITY_DIGEST);
         assert_eq!(spec.replicas, 1);
-    }
-
-    /// R490-F2: FileTail emits only whole lines and carries a partial trailing
-    /// line over to the next drain (the Run-tab log bridge over kamaji's
-    /// file capture).
-    #[tokio::test]
-    async fn file_tail_emits_whole_lines_and_carries_partial() {
-        use tokio::io::AsyncWriteExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("stdout.log");
-        let log = LogBuffer::new();
-        let mut tail = FileTail::new(path.clone());
-
-        // No file yet → no-op, no lines.
-        tail.drain_into(&log).await;
-        let (l0, c0) = log.since(0).await;
-        assert!(l0.is_empty());
-
-        // Two whole lines + a partial third (no trailing newline).
-        let mut f = tokio::fs::File::create(&path).await.unwrap();
-        f.write_all(b"alpha\nbeta\npar").await.unwrap();
-        f.flush().await.unwrap();
-        tail.drain_into(&log).await;
-        let (l1, c1) = log.since(c0).await;
-        assert_eq!(l1, vec!["alpha".to_string(), "beta".to_string()]);
-
-        // Completing the partial line surfaces it whole on the next drain.
-        f.write_all(b"tial\ngamma\n").await.unwrap();
-        f.flush().await.unwrap();
-        tail.drain_into(&log).await;
-        let (l2, _) = log.since(c1).await;
-        assert_eq!(l2, vec!["partial".to_string(), "gamma".to_string()]);
     }
 
     /// Wait-for-port: bind a local TCP listener in-process, confirm
@@ -2156,9 +2140,9 @@ account_id = "test-account"
     // ---------- W165: BuildMode → ForgeSpec lowering (R438-T6) ----------
 
     use std::sync::Mutex as StdMutex;
-    use velveteen_exec::executor::{ExecEvent, ExecOutcome, ForgeExecutorError};
-    use velveteen::ForgeStatus;
     use tokio::sync::mpsc::UnboundedSender;
+    use velveteen::ForgeStatus;
+    use velveteen_exec::executor::{ExecEvent, ExecOutcome, ForgeExecutorError};
 
     /// Captures the [`ForgeSpec`] handed to `execute(...)` and returns
     /// success without spawning anything.
@@ -2617,8 +2601,10 @@ digest = "{digest}"
         let fx = Fixture::new(cloudflare_reference_slot(), /*write_workload*/ true);
         let reconciler = MesofactStaticReconciler::new();
 
-        let revalidate_err =
-            reconciler.revalidate_static(fx.ctx(), "/releases").await.unwrap_err();
+        let revalidate_err = reconciler
+            .revalidate_static(fx.ctx(), "/releases")
+            .await
+            .unwrap_err();
         let up_err = reconciler.up(fx.ctx()).await.unwrap_err();
 
         assert_eq!(
@@ -2637,7 +2623,10 @@ digest = "{digest}"
         let fx = Fixture::new(local_static_slot(0), /*write_workload*/ false);
         let (capture, captured) = CaptureExecutor::new();
         let reconciler = MesofactStaticReconciler::new().with_executor(capture.clone());
-        let err = reconciler.revalidate_static(fx.ctx(), "/releases").await.unwrap_err();
+        let err = reconciler
+            .revalidate_static(fx.ctx(), "/releases")
+            .await
+            .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("workload.toml"), "got: {msg}");
         assert!(
@@ -2687,13 +2676,20 @@ render_command = "echo render {route} --all"
                 assert!(image.is_none(), "host_side render carries no image");
                 assert_eq!(
                     argv,
-                    &vec!["sh".to_string(), "-c".into(), "echo render /issues/:id --all".into()],
+                    &vec![
+                        "sh".to_string(),
+                        "-c".into(),
+                        "echo render /issues/:id --all".into()
+                    ],
                     "route pattern substituted into {{route}}"
                 );
             }
             other => panic!("expected Subprocess, got {other:?}"),
         }
-        assert_eq!(ctx.cwd.as_deref(), Some(fx.workspace_root.join("app/web").as_path()));
+        assert_eq!(
+            ctx.cwd.as_deref(),
+            Some(fx.workspace_root.join("app/web").as_path())
+        );
     }
 
     #[tokio::test]
@@ -2749,10 +2745,7 @@ render_command = "echo render {route} --all"
                 let json = json.clone();
                 async move {
                     match json {
-                        Some(b) => (
-                            [(reqwest::header::CONTENT_TYPE, "application/json")],
-                            b,
-                        )
+                        Some(b) => ([(reqwest::header::CONTENT_TYPE, "application/json")], b)
                             .into_response(),
                         None => axum::http::StatusCode::NOT_FOUND.into_response(),
                     }

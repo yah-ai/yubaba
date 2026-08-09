@@ -279,6 +279,24 @@
 //! @yah:next("Deeper durable direction -- fold the cloud-direct up_pond path into yubaba's supervised lifecycle so host-side orphans become structurally impossible -- remains the R374 thesis; this guard hardens the residual unsupervised path R455-F1 explicitly left on the bun shim (pond_smoke + `yah cloud mirror up`).")
 //! @yah:verify("cargo test -p cloud --lib reconciler::pond  # 36/36 pass (9 new sim-port tests: reapable host-vs-container-vs-wrong-port classification, ps-parse robustness, char-safe truncation, live-listener probe, ok-on-free, bail-on-foreign-holder)")
 //! @yah:verify("Signature validated live: real orphan argv `--socket-addr=entry=127.0.0.1:4323` matches the reap filter; the container-published :4323 shows 0 host-ps matches (container binds 0.0.0.0) -> guard bails with the actionable message and never reaps a container")
+//!
+//! @yah:relay(R659, "Pond hostname + TLS front door (passway on :443, mkcert wildcard for *.pond.localhost)")
+//! @yah:at(2026-08-03T00:46:25Z)
+//! @yah:kind(spike)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:next("Frame: pond is plain HTTP end to end (dev_url = http://127.0.0.1:{sim_port}, pond.rs:602) with a hand-assigned miniflare port per <service,env> (4322 marketing, 4323 dashboard). Give it real hostnames + browser-trusted TLS so the operator hits https://yah-dashboard.pond.localhost instead of remembering a port.")
+//! @yah:next("Direction: passway on :443 as the pond front door, one Host per <service,env> via its existing PASSWAY_UPSTREAMS=<hostname>=<addr> fan-in syntax; mkcert supplies a wildcard leaf that acme-engine structurally cannot issue for a non-public name. passway already takes the cert as opaque paths (PASSWAY_TLS_CERT / PASSWAY_TLS_KEY), so issuer-pluggability needs no new seam.")
+//! @yah:next("Payoff beyond dev sugar: W267 'Two front doors, one render contract' records that the passway (grey/orange) door is NOT symmetric with the Worker door - no per-path routing, no bucket serving - and pond today rehearses only the Worker door. passway-in-pond makes the second front door locally testable.")
+//! @yah:next("Spike decides: (a) *.pond.localhost (zero DNS config) vs a real *.pond.yah.dev A 127.0.0.1 record on the zone we already own (precedent: alias tiers net.yah.dev / com.yah.dev, domain.rs:256); (b) passway-in-front vs miniflare terminating directly - the pinned miniflare 3.20250718.3 already accepts https / httpsCertPath / httpsKeyPath, ~6 lines in miniflare-sim.mjs, but that buys https WITHOUT hostname routing; (c) cost against the W142 few-second-cold / sub-second-warm spinup budget.")
+//! @yah:gotcha("SCOPE FENCE - browser-facing pond ONLY. This has zero mesh implications and must not grow any. W268 is explicit: 'Do not bolt rustls-mTLS onto yubaba's axum surface; move intra-mesh RPC onto mshr QUIC ... mutual machine authentication is intrinsic.' R593-T7 (raft/network.rs:25, parked on R277) adds 'no interim mTLS bolt-on'. mkcert is a browser-trust tool; every lane where both ends are our own code stays on NodeId pinning, not a CA. Adding a local CA to the mesh would introduce a third trust root exactly while W268 collapses three Ed25519 machine identities into one.")
+//! @yah:gotcha("Do NOT use a .local hostname - macOS mDNSResponder claims *.local (RFC 6762) and /etc/hosts has no wildcards, so per-service hosts entries do not scale either.")
+//! @yah:gotcha("mkcert is a Go binary, not a library: `mkcert -install` needs sudo once and writes to the macOS keychain + NSS/Firefox stores. Shell out and detect-and-instruct when absent; never auto-sudo from camp bootstrap. The pure-Rust alternative (mint a CA with rcgen, already in-tree via instant-acme's rcgen feature) makes issuance trivial and leaves cross-store trust install - mkcert's actual value - unsolved.")
+//! @yah:gotcha("Key hygiene: CA stays in the operator's login keychain, leaf + key land gitignored under .yah/infra/pond/<svc>-<env>/. Never commit a key, and do not consider publishing a shared wildcard key (the localhost.direct pattern) - LE revokes those.")
+//! @yah:verify("Resolution check before committing to *.pond.localhost: `dscacheutil -q host -a name yah-dashboard.pond.localhost` and `curl -sv https://yah-dashboard.pond.localhost` - browsers special-case *.localhost, non-browser clients going through getaddrinfo may not.")
+//! @yah:verify("Two pond services up at once, each reachable by its own https:// hostname on :443, with no hand-assigned port anywhere in the operator-visible path.")
+//! @yah:verify("Cold + warm pond spinup measured against the W142 budget (few-second cold / sub-second warm) with the front door in place.")
+//! @yah:assumes("Pond keeps emulating a real front door rather than collapsing to a bare static server - i.e. W267's grey/orange path stays a live target, not a retired one.")
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -539,8 +557,8 @@ pub async fn up_pond(
     // bring-up serves an empty bucket and every request 404s. Skipped with a
     // warning when the workload has no built dist yet — the serve stack still
     // comes up and adopts whatever is already in the bucket.
-    let out_dir =
-        super::mesofact_static::read_workload_out_dir(&ctx.workload_dir()).unwrap_or_else(|| "dist".to_string());
+    let out_dir = super::mesofact_static::read_workload_out_dir(&ctx.workload_dir())
+        .unwrap_or_else(|| "dist".to_string());
     let dist_dir = ctx.workload_dir().join(&out_dir);
     if dist_dir.exists() {
         let report = super::pond_publish::publish_to_pond(
@@ -1120,8 +1138,7 @@ fn resolve_worker_node_modules(workspace_root: &std::path::Path) -> Option<PathB
 /// the yah source tree get zero-download spinup; those who don't fall back to
 /// the bare `"miniflare"` specifier (which requires a lazy npm install).
 pub fn resolve_miniflare_import(workspace_root: &std::path::Path) -> Option<String> {
-    let index =
-        resolve_worker_node_modules(workspace_root)?.join("miniflare/dist/src/index.js");
+    let index = resolve_worker_node_modules(workspace_root)?.join("miniflare/dist/src/index.js");
     if index.exists() {
         Some(index.to_string_lossy().into_owned())
     } else {
@@ -1169,9 +1186,9 @@ fn port_has_listener(host: &str, port: u16) -> bool {
     let Ok(addrs) = (host, port).to_socket_addrs() else {
         return false;
     };
-    addrs.into_iter().any(|addr| {
-        TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
-    })
+    addrs
+        .into_iter()
+        .any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok())
 }
 
 /// `(pid, cmdline)` for every host `workerd` process whose argv references
@@ -1459,7 +1476,10 @@ pub async fn teardown_warden_pond(port: u16, ident: &str) -> Result<bool> {
                 .json()
                 .await
                 .context("parsing yubaba /pond/teardown response")?;
-            Ok(body.get("removed").and_then(|v| v.as_bool()).unwrap_or(false))
+            Ok(body
+                .get("removed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false))
         }
         s => {
             let body = resp.text().await.unwrap_or_default();
@@ -1530,7 +1550,20 @@ mod tests {
         let hits = scan_workerd_procs(ps, 4323);
         // Only the workerd whose argv mentions :4323 — minio + the 4322 workerd
         // + the non-workerd daemon are excluded.
-        assert_eq!(hits, vec![(3232, ps.lines().next().unwrap().trim_start().split_once(' ').unwrap().1.to_string())]);
+        assert_eq!(
+            hits,
+            vec![(
+                3232,
+                ps.lines()
+                    .next()
+                    .unwrap()
+                    .trim_start()
+                    .split_once(' ')
+                    .unwrap()
+                    .1
+                    .to_string()
+            )]
+        );
     }
 
     #[test]
@@ -1556,8 +1589,27 @@ mod tests {
         let bound = listener.local_addr().unwrap().port();
         assert!(port_has_listener("127.0.0.1", bound));
         drop(listener);
-        // A now-unbound ephemeral port refuses connects.
-        assert!(!port_has_listener("127.0.0.1", bound));
+
+        // A now-unbound ephemeral port refuses connects — but only if nothing
+        // else grabbed it in between. Cargo runs this module's tests in parallel
+        // threads and `ensure_sim_port_free_ok_when_unbound` below draws from the
+        // same ephemeral range, so a single-shot assertion here loses that race
+        // often enough to make the crate's suite intermittently red (R706 drive-by:
+        // it passed in isolation and failed in the full run).
+        //
+        // Re-drawing a fresh port on collision keeps exactly what this asserts —
+        // that `port_has_listener` says false when nothing listens — while making
+        // the check independent of who else is binding concurrently.
+        let mut port = bound;
+        for _ in 0..16 {
+            if !port_has_listener("127.0.0.1", port) {
+                return;
+            }
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            port = l.local_addr().unwrap().port();
+            drop(l);
+        }
+        panic!("no free ephemeral port observed in 16 draws (last tried {port})");
     }
 
     #[tokio::test]
@@ -1578,7 +1630,10 @@ mod tests {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let err = ensure_sim_port_free(port).await.unwrap_err().to_string();
-        assert!(err.contains(&format!("pond sim port {port} is already in use")), "got: {err}");
+        assert!(
+            err.contains(&format!("pond sim port {port} is already in use")),
+            "got: {err}"
+        );
         assert!(err.contains("Stop the other pond mirror"), "got: {err}");
     }
 
@@ -1640,6 +1695,8 @@ mod tests {
             schema_version: 1,
             shape: crate::MirrorShape::Local,
             providers: BTreeMap::new(),
+            ingress: Default::default(),
+            drivers: Default::default(),
             asset_aliases: Default::default(),
         };
         let ctx = ReconcileCtx {
@@ -1707,6 +1764,8 @@ mod tests {
             schema_version: 1,
             shape: crate::MirrorShape::Local,
             providers: BTreeMap::new(),
+            ingress: Default::default(),
+            drivers: Default::default(),
             asset_aliases: Default::default(),
         };
         let ctx = ReconcileCtx {
@@ -1786,6 +1845,8 @@ mod tests {
             schema_version: 1,
             shape: crate::MirrorShape::Local,
             providers: BTreeMap::new(),
+            ingress: Default::default(),
+            drivers: Default::default(),
             asset_aliases: Default::default(),
         };
         let ctx = ReconcileCtx {
@@ -1863,6 +1924,8 @@ mod tests {
             schema_version: 1,
             shape: crate::MirrorShape::Local,
             providers: BTreeMap::new(),
+            ingress: Default::default(),
+            drivers: Default::default(),
             asset_aliases: Default::default(),
         };
         let ctx = ReconcileCtx {
@@ -1934,6 +1997,8 @@ mod tests {
             schema_version: 1,
             shape: crate::MirrorShape::Local,
             providers: BTreeMap::new(),
+            ingress: Default::default(),
+            drivers: Default::default(),
             asset_aliases: Default::default(),
         };
         let ctx = ReconcileCtx {

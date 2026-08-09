@@ -72,6 +72,30 @@ fn live_yah_workspace_loads_cleanly() {
     assert_eq!(app_yah_dev.domain, "app.yah.dev");
     assert_eq!(app_yah_dev.cdn_bucket, "yah-app-dev");
 
+    // R594-F12: every shipped manifest declares its front door, and the
+    // declaration agrees with the route table (CloudConfig::load already
+    // enforced the agreement — this pins the *values*, so a manifest that
+    // flips cdn.yah.dev to Worker-served, or drops yah.dev's Worker, is
+    // loud). cdn.yah.dev being bucket-direct is W175's verdict and correct:
+    // a pure asset tier does not want clean URLs, SPA fallback or branded
+    // errors.
+    assert_eq!(
+        cfg.domain("cdn-yah-dev").map(|d| d.front_door),
+        Some(cloud::config::FrontDoor::BucketDirect),
+        "cdn.yah.dev must stay an R2 custom domain (W175)"
+    );
+    for name in ["yah-dev", "app-yah-dev", "scrabcake-net-yah-dev"] {
+        let dom = cfg
+            .domain(name)
+            .unwrap_or_else(|| panic!("{name} domain missing"));
+        assert!(
+            dom.front_door.is_route_driven(),
+            "{name} serves a route table, so its front door must be \
+             worker or passway (found {})",
+            dom.front_door.as_str()
+        );
+    }
+
     // R343-T1 wired yah-dashboard into app-yah-dev. The cross-ref validator
     // in CloudConfig::load already checked that the component exists, but we
     // pin the service + route entry so a rename or deletion is loud here too.

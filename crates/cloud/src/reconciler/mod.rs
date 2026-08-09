@@ -77,17 +77,21 @@ use workload_spec::{NamespaceId, TenantId};
 
 use crate::{GitSource, MirrorConfig, MirrorProviderSlot, ServiceComponent, ServiceConfig};
 
-pub(crate) mod cf_creds;
 pub mod bundle_store;
+pub(crate) mod cf_creds;
 pub mod cloudflare_worker;
 pub mod container;
 pub mod derive_cache_prune;
 pub mod domain;
+pub mod ingress;
+pub mod local_process;
 pub mod mesofact_bundle;
-pub mod mesofact_runner;
 pub mod mesofact_static;
+mod native_support;
+pub mod pg_driver;
 pub mod pond;
 pub mod pond_publish;
+pub mod publish_beacon;
 pub mod r2_publish;
 pub mod static_asset;
 pub mod static_asset_prune;
@@ -104,11 +108,15 @@ pub use derive_cache_prune::{
     DeriveCacheLiveHashes, DerivePruneCandidate,
 };
 pub use domain::ensure_r2_custom_domain;
+pub use ingress::{
+    declared as ingress_declared, ensure_tunnel_ingress, plan_ingress, publish_tunnel_ingress,
+    IngressPlan, IngressRule, TunnelIngressOutcome,
+};
+pub use local_process::LocalProcessReconciler;
 pub use mesofact_bundle::{
-    resolve_bundle_machines, BundleSlot, MesofactBundleReconciler,
+    resolve_bundle_machines, BundleSlot, MesofactBundleReconciler, RevalidateSlot,
     SLOT_ROLE as BUNDLE_SLOT_ROLE,
 };
-pub use mesofact_runner::{resolve_runner_machine, MesofactRunnerReconciler};
 pub use mesofact_static::{LocalStaticOptions, MesofactStaticReconciler};
 pub use pond::{PondOptions, PondState};
 pub use pond_publish::{derive_minio_key, publish_to_pond, PondPublishReport};
@@ -292,6 +300,31 @@ impl<'a> ReconcileCtx<'a> {
     }
 }
 
+/// An explicit teardown hook for a workload this process did not spawn as a
+/// child — see [`RunningWorkload::with_teardown`] (R714-B1).
+///
+/// Boxed rather than a generic parameter because [`RunningWorkload`] is stored
+/// in heterogeneous collections (the desktop's mirror registry) and cannot
+/// carry a type parameter.
+/// `Sync` on the boxed closure is load-bearing, not belt-and-braces: without
+/// it `RunningWorkload` stops being `Sync`, so `&RunningWorkload` stops being
+/// `Send`, and every desktop `#[tauri::command]` that holds one across an
+/// `.await` (`mirror_run_logs` iterates the registry's handles) fails to
+/// compile with "future cannot be sent between threads safely". The captures a
+/// teardown needs — a container name and a workspace root — are `Sync` anyway.
+type TeardownFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>;
+type TeardownFn = Box<dyn FnOnce() -> TeardownFuture + Send + Sync + 'static>;
+
+/// Newtype so [`RunningWorkload`] can keep its `#[derive(Debug)]` — a boxed
+/// closure is not `Debug`.
+struct Teardown(TeardownFn);
+
+impl std::fmt::Debug for Teardown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Teardown(<fn>)")
+    }
+}
+
 /// Handle to a workload that's been brought up. Owns the lifecycle: drop
 /// or call [`RunningWorkload::shutdown`] to take it back down.
 #[derive(Debug)]
@@ -314,12 +347,34 @@ pub struct RunningWorkload {
     /// `None` for workloads that don't capture stdio (e.g. container-backed).
     pub log_buffer: Option<LogBuffer>,
 
+    /// R546-B12: human-readable lines the reconciler wants the operator to see
+    /// on THIS run — what it actually did, not what is configured. A clean
+    /// static-asset reconcile used to print nothing at all, so a successful
+    /// publish and a successful no-op were indistinguishable at the apply
+    /// surface, and the one view that would have disambiguated them (`yah cloud
+    /// status`) was itself blind.
+    ///
+    /// Deliberately NOT on [`RunningWorkloadSummary`]: that type is serialized
+    /// across the process boundary to the desktop UI, and this is per-run
+    /// console output, not state the UI should cache.
+    pub notes: Vec<String>,
+
     /// Sender that signals the supervisor task to tear down. Closing the
     /// channel (drop) is equivalent to sending — supervisor exits on
     /// channel close.
     shutdown: Option<oneshot::Sender<()>>,
     /// Joinable task that owns any child process and reaps it on signal.
     supervisor: Option<tokio::task::JoinHandle<Result<()>>>,
+    /// R714-B1: teardown for a workload that runs OUTSIDE this process, so
+    /// there is no child to reap and no supervisor to signal.
+    ///
+    /// Deliberately run from [`RunningWorkload::shutdown`] only, never from
+    /// `Drop`. The two are different intents and conflating them breaks both
+    /// directions: a container the desktop started is meant to outlive the
+    /// desktop (the next launch re-adopts it with `adopt_only`), so quitting
+    /// the app must not `docker rm -f` it; but the ■ button IS an explicit
+    /// stop, and must.
+    teardown: Option<Teardown>,
 }
 
 impl RunningWorkload {
@@ -338,9 +393,36 @@ impl RunningWorkload {
             public_url: None,
             console_url: None,
             log_buffer: None,
+            notes: Vec::new(),
             shutdown: None,
             supervisor: None,
+            teardown: None,
         }
+    }
+
+    /// Attach an explicit teardown to a handle for an externally-running
+    /// workload (R714-B1).
+    ///
+    /// `adopted()` alone gives a handle whose `shutdown()` is a documented
+    /// no-op. That is right for workloads another process owns and will keep
+    /// re-asserting (pond containers under camp's yubaba), and wrong for ones
+    /// this process started and nobody else will ever stop — for those the ■
+    /// button reported success while the container kept running.
+    ///
+    /// `teardown` runs on `shutdown()` and NOT on `Drop`; see [`Self::teardown`].
+    pub fn with_teardown<F, Fut>(mut self, teardown: F) -> Self
+    where
+        F: FnOnce() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        self.teardown = Some(Teardown(Box::new(move || Box::pin(teardown()))));
+        self
+    }
+
+    /// Attach per-run operator-facing lines (R546-B12). See [`Self::notes`].
+    pub fn with_notes(mut self, notes: Vec<String>) -> Self {
+        self.notes = notes;
+        self
     }
 
     /// Set the public URL for a published workload (e.g. `"https://yah.dev"`).
@@ -356,7 +438,12 @@ impl RunningWorkload {
         self
     }
 
-    /// Gracefully tear down: signal the supervisor, await its exit.
+    /// Gracefully tear down: signal the supervisor, await its exit, then run
+    /// any explicit teardown hook.
+    ///
+    /// The hook runs LAST and its error propagates. A stop that could not tear
+    /// the workload down must surface as an error, never as a silent success —
+    /// that silence is the whole of R714-B1.
     pub async fn shutdown(mut self) -> Result<()> {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
@@ -366,6 +453,9 @@ impl RunningWorkload {
                 .await
                 .context("joining workload supervisor")?
                 .context("workload supervisor")?;
+        }
+        if let Some(Teardown(hook)) = self.teardown.take() {
+            hook().await.context("workload teardown")?;
         }
         Ok(())
     }
@@ -412,7 +502,12 @@ pub fn workload_kind(workload_dir: &Path) -> Result<String> {
 /// clones when `dir/.git` is absent, otherwise fetches the pinned ref and
 /// force-checks-it-out. Uses the system `git` so it inherits the operator's
 /// credential helpers / SSH agent — no in-process git library.
-async fn materialize_git_source(git: &GitSource, dir: &Path) -> Result<()> {
+///
+/// `pub` (R615-T3 / W274): `yah infra sync` reuses this verbatim for
+/// `InfraSourceKind::Git` sources rather than a second shallow-clone-or-pull
+/// implementation — same "one git-source shape, reused" discipline R615-F1
+/// already applied to the type.
+pub async fn materialize_git_source(git: &GitSource, dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
     async fn run_git(args: &[&std::ffi::OsStr]) -> Result<()> {
@@ -497,8 +592,10 @@ pub(crate) fn into_running(
         public_url,
         console_url: None,
         log_buffer,
+        notes: Vec::new(),
         shutdown: Some(shutdown),
         supervisor: Some(supervisor),
+        teardown: None,
     }
 }
 
@@ -594,6 +691,8 @@ mod source_seam_tests {
             schema_version: 1,
             shape: crate::MirrorShape::Local,
             providers: BTreeMap::new(),
+            ingress: Default::default(),
+            drivers: Default::default(),
             asset_aliases: BTreeMap::new(),
         }
     }
@@ -686,5 +785,105 @@ mod source_seam_tests {
         // Second call takes the update path and stays green (idempotent).
         materialize_git_source(&source, &dest).await.unwrap();
         assert!(dest.join("hello.txt").is_file());
+    }
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    //! R714-B1 — the explicit-teardown contract on [`RunningWorkload`].
+    //!
+    //! These are about WHEN the hook runs, not what it does. The bug being
+    //! fixed was a `shutdown()` that reported success having done nothing, and
+    //! the trap in fixing it is a `Drop` that tears down a container which is
+    //! supposed to survive the process.
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn counting() -> (RunningWorkload, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let w = RunningWorkload::adopted("container", "compute", None)
+            .with_teardown(move || {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            });
+        (w, hits)
+    }
+
+    /// Attaching a teardown must not cost `RunningWorkload` its auto traits.
+    /// The desktop stores these handles in a shared registry and its Tauri
+    /// commands iterate them across `.await` points, which needs `Sync` — a
+    /// hook that is `Send` but not `Sync` takes it away here and surfaces two
+    /// crates over as "future cannot be sent between threads safely", with a
+    /// span pointing at `mirror_run_logs` rather than at this file.
+    #[test]
+    fn a_teardown_does_not_cost_the_handle_send_or_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<RunningWorkload>();
+    }
+
+    #[tokio::test]
+    async fn shutdown_runs_the_teardown() {
+        let (w, hits) = counting();
+        w.shutdown().await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_handle_does_NOT_run_the_teardown() {
+        // A container this process started is meant to outlive it — the next
+        // launch re-adopts it. Quitting the app must not `docker rm -f` it.
+        let (w, hits) = counting();
+        drop(w);
+        // Yield so a stray spawned task would have had a chance to run.
+        tokio::task::yield_now().await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failing_teardown_makes_shutdown_fail() {
+        // The whole of R714-B1: a stop that could not tear the workload down
+        // must not report success.
+        let w = RunningWorkload::adopted("container", "compute", None)
+            .with_teardown(|| async { anyhow::bail!("docker stop refused") });
+        let err = w.shutdown().await.unwrap_err();
+        assert!(format!("{err:#}").contains("docker stop refused"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn an_adopted_handle_without_a_teardown_still_shuts_down_cleanly() {
+        // Pond containers are owned by camp's yubaba and stop through
+        // `workload.stop`; their no-op shutdown is correct and must stay.
+        let w = RunningWorkload::adopted("mesofact-static", "static", None);
+        w.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_teardown_runs_after_the_supervisor_is_joined() {
+        // Ordering matters for a workload that has both: reap the child first,
+        // then remove the container it was talking to.
+        let order = Arc::new(AsyncMutex::new(Vec::<&'static str>::new()));
+        let (tx, rx) = oneshot::channel::<()>();
+        let sup_order = order.clone();
+        let supervisor = tokio::spawn(async move {
+            let _ = rx.await;
+            sup_order.lock().await.push("supervisor");
+            Ok(())
+        });
+        let hook_order = order.clone();
+        let w = into_running("container", "compute", None, None, None, tx, supervisor)
+            .with_teardown(move || {
+                let hook_order = hook_order.clone();
+                async move {
+                    hook_order.lock().await.push("teardown");
+                    Ok(())
+                }
+            });
+
+        w.shutdown().await.unwrap();
+        assert_eq!(*order.lock().await, vec!["supervisor", "teardown"]);
     }
 }

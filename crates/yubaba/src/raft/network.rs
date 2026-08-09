@@ -8,9 +8,16 @@
 //! The snapshot path was `/raft/install-snapshot` through openraft 0.9 and was
 //! renamed with the 0.10 bump (both in commit 4a10c3d). There is deliberately no
 //! back-compat alias, so 0.9 and 0.10 nodes cannot exchange snapshots in either
-//! direction — see `tests/mixed_version_wire_interop.rs` (R625-S1) for the
-//! measured blast radius, which is narrower than it sounds: vote and
-//! append-entries stay wire-compatible both ways.
+//! direction. R625-S1 measured that blast radius and found it narrower than it
+//! sounds — vote and append-entries stay wire-compatible both ways — and its
+//! findings are recorded in the annotation block below and in W275.
+//!
+//! The test that produced them (`tests/mixed_version_wire_interop.rs`) and the
+//! `openraft_09` dev-dependency it needed are **deleted** as of R118-T9:
+//! operator decision (leif, 2026-07-25) puts every node on 0.10.0-alpha.30 and
+//! accepts the fleet breakage, so there is no mixed window left to characterise
+//! and nothing for a 0.9 decoder to prove. Restoring the test means restoring
+//! the dev-dep; the findings it produced stand on their own.
 //!
 //! `YubabaNetworkFactory` is the per-node factory; `YubabaNetwork` is
 //! the per-peer connection handle.  Both are cheaply clone-able.
@@ -31,6 +38,9 @@
 //! @yah:handoff("COMPLETE AS SCOPED (2026-07-22, Ashguard/dove). This ticket's stated deliverable was to BIND wave 2 to the R277 roadmap at the renamed target — explicitly 'not to start it'. That binding is now done: R277's F3 bullet (oss/yubaba/crates/yubaba/src/raft/mod.rs:19) read 'consume xlb-net::Endpoint ... (xlb-net 0.1 published)', naming a crate path that stopped existing when W268 wave 2 promoted it; it now names mshr::Endpoint at oss/mshr/crates/mshr (`pub use endpoint::Endpoint`, src/lib.rs:28) with the rename provenance inline. R277's picker-upper is no longer sent to a dead path. mod.rs was clean in git at edit time (no peer WIP); the edit is doc-comment-only so it cannot affect compilation.")
 //! @yah:handoff("WHY THIS IS NOT STILL PARKED ON R277: the R277 gate governs the transport IMPLEMENTATION (replacing the HTTP-over-Tailscale YubabaNetwork/YubabaNetworkFactory in network.rs with a mshr QUIC transport) — that work is R277-F3's, not this ticket's. Conflating the two is what kept T7 parked across two prior sessions with the binding itself already achievable in minutes. The implementation instruction is preserved where it belongs: on R277's F3 bullet. Do NOT re-file this as a blocked ticket.")
 //! @yah:handoff("The 2026-07-21 verification of the R570 dep-correction stands and is folded into @yah:next. Tree anchor: 7e945040ed37afe1a6cfdd0f1cb32d0ac23fd3cb — quote this SHA, not 'HEAD', in any revert instruction.")
+//! @yah:next("EFFICIENCY SCOPE for whoever unparks this (measured 2026-08-02, read-only ps/free over ssh): tailscaled is the single largest process on every cloud node — 85.2 MB RSS on us-west-001, 83.9 MB on us-south-001, 83.4 MB on us-east-001 — against yubaba at 32-57 MB and passway at 13 MB. On us-south-001 (Vultr 1 vCPU / 1 GB, 961 MB usable, 570 MB available) that is ~9% of RAM for the mesh datapath, and tailscale on Linux runs wireguard-go in userspace over a TUN device, so mesh packet crypto is Go-userspace CPU too. The QUIC move is therefore a memory/CPU story as well as an auth story.")
+//! @yah:next("ASK TO ANSWER BEFORE THE MOVE LANDS, not after: once yubaba<->yubaba RPC is on mshr QUIC, what still REQUIRES the tailnet? Known remaining users today are (a) workload-to-workload traffic bound to mesh IPs (the compose recipes / pg_hba + ufw snippets in mesh_service.rs) and (b) ssh control-plane rolls. If those are the only two, the control plane keeps paying tailscaled's full cost for a datapath it no longer uses, AND every mshr dial that picks a 100.64/10 direct addr is QUIC-TLS nested inside WireGuard — encrypted twice for one hop. Not an argument to drop the tailnet (MagicDNS, ACLs, NAT traversal, key rotation are why Headscale is there); an argument to decide deliberately which lanes keep it rather than inheriting both layers by default.")
+//! @yah:assumes("Encrypt-exactly-once-per-hop is the intended fleet posture. Already load-bearing elsewhere: PASSWAY_UPSTREAM_TLS defaults false with the reason written in the source as 'mesh is already encrypted' (oss/passway/crates/passway/src/main.rs:31), and yubaba's control HTTP on :7443 is plaintext behind the tailnet by the same logic.")
 //!
 //! @yah:ticket(R625-S1, "Falsify openraft 0.9<->0.10 mixed-cluster interop before the first live roll")
 //! @yah:status(review)

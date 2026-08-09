@@ -30,13 +30,29 @@
 //! # Environment passed into the container.
 //! [run.env]
 //! YAH_CLOUD_ADMIN_ADDR = "0.0.0.0:4325"
+//!
+//! # Bind mounts. `host` is relative to the workspace root (absolute paths are
+//! # taken as-is); `read_only` defaults to true.
+//! [[run.mounts]]
+//! host = ".yah/infra"
+//! container = "/workspace/.yah/infra"
 //! ```
+//!
+//! Mounts exist because a runtime image is a *binary*, not a checkout: the
+//! multi-stage build that produces it deliberately drops the workspace after
+//! the compile, so a service whose job is to read workspace config
+//! (yah-cloud-admin reads `.yah/infra/machines/*.toml`) came up rendering an
+//! empty fleet — running, healthy, and describing a fleet of zero machines,
+//! which is the worst possible failure for a monitor (R568-T7).
 //!
 //! Scope (R602-T1): the **local** tier only. Non-`local` mirror shapes bail
 //! with a pointer to `yah cloud workload deploy` (the yubaba-mediated cloud
 //! tier), which is a separate surface.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -125,6 +141,29 @@ struct RunSpec {
     /// Environment variables passed into the container.
     #[serde(default)]
     env: BTreeMap<String, String>,
+    /// Bind mounts from the workspace into the container.
+    #[serde(default)]
+    mounts: Vec<MountSpec>,
+}
+
+/// One `[[run.mounts]]` entry.
+#[derive(Debug, Deserialize)]
+struct MountSpec {
+    /// Host path. Relative paths resolve against the workspace root — the
+    /// declaration lives in the repo, so it should read like a repo path and
+    /// stay valid on whichever machine the operator runs it from.
+    host: String,
+    /// Absolute path inside the container.
+    container: String,
+    /// Default `true`. A workspace mount is config the service *reads*; a
+    /// writable default would let a container mutate the operator's checkout
+    /// as a side effect of running, so opting into that has to be explicit.
+    #[serde(default = "default_read_only")]
+    read_only: bool,
+}
+
+fn default_read_only() -> bool {
+    true
 }
 
 #[async_trait]
@@ -178,7 +217,8 @@ impl Reconciler for ContainerReconciler {
                         "container",
                         SLOT,
                         Some(format!("http://127.0.0.1:{hp}")),
-                    ))
+                    )
+                    .with_teardown(teardown_for(&ctx, name.clone())))
                 }
                 other => bail!(
                     "adopt_only: no running container named {name} for component {} \
@@ -217,6 +257,7 @@ impl Reconciler for ContainerReconciler {
             ContainerRunSpec::new(&ctx.service.name, ctx.env, &ctx.component.id, image);
         run_spec.ports = vec![(host_port, container_port)];
         run_spec.env = spec.run.env.clone();
+        run_spec.volumes = resolve_mounts(&spec.run.mounts, ctx.workspace_root)?;
         runtime
             .run(&run_spec)
             .await
@@ -232,7 +273,48 @@ impl Reconciler for ContainerReconciler {
             "container",
             SLOT,
             Some(format!("http://127.0.0.1:{actual}")),
-        ))
+        )
+        .with_teardown(teardown_for(&ctx, name.clone())))
+    }
+}
+
+/// Grace period for the stop half of the teardown before the container is
+/// removed. Matches what an operator expects from a ■ button: long enough for
+/// a well-behaved server to close listeners, short enough not to look hung.
+const TEARDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Build the explicit teardown for a container-kind workload (R714-B1).
+///
+/// Before this, `up()` handed back a bare `RunningWorkload::adopted()`, whose
+/// `shutdown()` is a documented no-op. Nothing else covered the gap either:
+/// the desktop's pond teardown half gates on a `Provider::MiniflareContainer`
+/// static slot, and a plain `kind = container` mirror declares no static slot,
+/// so its ident list came back empty and the loop body never ran. The ■ button
+/// removed the registry entry, called the no-op, and returned success with the
+/// container still up.
+///
+/// The runtime is re-detected inside the hook rather than captured: the hook
+/// outlives the borrowed [`ReconcileCtx`], and re-running the same lookup
+/// `up()` did means both halves agree on which daemon they mean even if the
+/// operator switched runtimes in between.
+/// The `Sync` in the return bound is required by [`RunningWorkload::with_teardown`]
+/// — see the note on its `TeardownFn` alias for why a non-`Sync` hook breaks
+/// every desktop Tauri command that touches the mirror registry.
+fn teardown_for(
+    ctx: &ReconcileCtx<'_>,
+    name: String,
+) -> impl FnOnce() -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync + 'static {
+    let workspace_root = ctx.workspace_root.to_path_buf();
+    move || {
+        Box::pin(async move {
+            let runtime = detect_local_runtime_at(&workspace_root)
+                .await
+                .context("detecting local container runtime for teardown")?;
+            runtime
+                .stop_and_remove(&name, TEARDOWN_GRACE)
+                .await
+                .with_context(|| format!("stopping container {name}"))
+        })
     }
 }
 
@@ -240,8 +322,8 @@ impl Reconciler for ContainerReconciler {
 /// `[run]` sections.
 fn load_container_component(ctx: &ReconcileCtx<'_>) -> Result<ContainerComponent> {
     let path = ctx.workload_dir().join("workload.toml");
-    let src = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let src =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))
 }
 
@@ -250,12 +332,62 @@ fn default_image_tag(service: &str, component: &str) -> String {
     format!("yah-local/{service}-{component}:dev")
 }
 
+/// Turn `[[run.mounts]]` into `docker run -v` pairs, resolved against the
+/// workspace root.
+///
+/// A missing host path is a hard error rather than a skipped mount. Docker
+/// would happily create an empty directory in its place, and the container
+/// would then start, pass health checks, and serve whatever "no config found"
+/// means for that service — a deploy that looks green while the thing it was
+/// supposed to read isn't there.
+///
+/// The `:ro` suffix rides on the container-path string because
+/// `ContainerRunSpec::docker_run_args` emits `-v <host>:<container>` verbatim;
+/// that is docker's own mount-option syntax, not a hack around the type.
+fn resolve_mounts(
+    mounts: &[MountSpec],
+    workspace_root: &std::path::Path,
+) -> Result<Vec<(std::path::PathBuf, String)>> {
+    mounts
+        .iter()
+        .map(|m| {
+            let host = std::path::Path::new(&m.host);
+            let host = if host.is_absolute() {
+                host.to_path_buf()
+            } else {
+                workspace_root.join(host)
+            };
+            if !host.exists() {
+                bail!(
+                    "mount source {} does not exist (declared as `{}` in workload.toml \
+                     [[run.mounts]]) — the container would silently get an empty directory",
+                    host.display(),
+                    m.host,
+                );
+            }
+            let target = if m.read_only {
+                format!("{}:ro", m.container)
+            } else {
+                m.container.clone()
+            };
+            Ok((host, target))
+        })
+        .collect()
+}
+
 /// Detect the workspace's `local-container` runtime, the same way the pond
 /// primitives do — find the `kind = "local-container"` provider (orbstack.toml
 /// et al.) and probe its sockets. `ReconcileCtx` doesn't carry `CloudConfig`,
 /// so we reload it from the workspace root.
 async fn detect_local_runtime(ctx: &ReconcileCtx<'_>) -> Result<LocalRuntime> {
-    let cfg = CloudConfig::load(ctx.workspace_root)
+    detect_local_runtime_at(ctx.workspace_root).await
+}
+
+/// Same lookup keyed on the workspace root alone, so the R714-B1 teardown hook
+/// — which outlives the borrowed [`ReconcileCtx`] — can re-detect the runtime
+/// without capturing it.
+async fn detect_local_runtime_at(workspace_root: &std::path::Path) -> Result<LocalRuntime> {
+    let cfg = CloudConfig::load(workspace_root)
         .context("loading CloudConfig for local-container provider lookup")?;
     let provider = cfg
         .providers
@@ -265,7 +397,7 @@ async fn detect_local_runtime(ctx: &ReconcileCtx<'_>) -> Result<LocalRuntime> {
             format!(
                 "no `kind = \"local-container\"` provider declared in {}/.yah/infra/providers/ — \
                  the container reconciler needs orbstack.toml or equivalent",
-                ctx.workspace_root.display(),
+                workspace_root.display(),
             )
         })?;
     let local_spec = local_container_spec_from_provider(provider)?;
@@ -299,7 +431,10 @@ YAH_CLOUD_ADMIN_DEV_ANON = "1"
         let c: ContainerComponent = toml::from_str(src).unwrap();
         assert_eq!(c.build.dockerfile, "Dockerfile");
         assert_eq!(c.build.context.as_deref(), Some("."));
-        assert_eq!(c.build.image.as_deref(), Some("yah-local/yah-cloud-admin:dev"));
+        assert_eq!(
+            c.build.image.as_deref(),
+            Some("yah-local/yah-cloud-admin:dev")
+        );
         assert_eq!(c.run.port, Some(4325));
         assert_eq!(c.run.host_port, Some(4325));
         assert_eq!(
@@ -307,9 +442,73 @@ YAH_CLOUD_ADMIN_DEV_ANON = "1"
             Some("0.0.0.0:4325")
         );
         assert_eq!(
-            c.run.env.get("YAH_CLOUD_ADMIN_DEV_ANON").map(String::as_str),
+            c.run
+                .env
+                .get("YAH_CLOUD_ADMIN_DEV_ANON")
+                .map(String::as_str),
             Some("1")
         );
+    }
+
+    #[test]
+    fn mounts_resolve_against_the_workspace_root_and_default_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".yah/infra")).unwrap();
+        let src = r#"
+[run]
+port = 4325
+[[run.mounts]]
+host = ".yah/infra"
+container = "/workspace/.yah/infra"
+"#;
+        let c: ContainerComponent = toml::from_str(src).unwrap();
+        let out = resolve_mounts(&c.run.mounts, tmp.path()).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, tmp.path().join(".yah/infra"));
+        assert_eq!(out[0].1, "/workspace/.yah/infra:ro");
+    }
+
+    #[test]
+    fn a_writable_mount_must_be_asked_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("state")).unwrap();
+        let src = r#"
+[run]
+port = 1
+[[run.mounts]]
+host = "state"
+container = "/var/lib/state"
+read_only = false
+"#;
+        let c: ContainerComponent = toml::from_str(src).unwrap();
+        let out = resolve_mounts(&c.run.mounts, tmp.path()).unwrap();
+        assert_eq!(out[0].1, "/var/lib/state");
+    }
+
+    /// Docker would invent an empty directory here; a monitor mounting a
+    /// non-existent inventory must fail the deploy, not render zero machines.
+    #[test]
+    fn a_missing_mount_source_fails_the_reconcile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = r#"
+[run]
+port = 1
+[[run.mounts]]
+host = "nope"
+container = "/nope"
+"#;
+        let c: ContainerComponent = toml::from_str(src).unwrap();
+        let err = resolve_mounts(&c.run.mounts, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn no_mounts_declared_is_no_volumes() {
+        let c: ContainerComponent = toml::from_str("[run]\nport = 1\n").unwrap();
+        assert!(c.run.mounts.is_empty());
+        assert!(resolve_mounts(&c.run.mounts, std::path::Path::new("/"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -329,6 +528,23 @@ port = 8080
         assert!(c.run.env.is_empty());
     }
 
+    /// R714-B1: the teardown must target the container `run()` actually
+    /// created. `LocalRuntime::stop_and_remove` is a documented no-op on a
+    /// container that doesn't exist, so if these two names ever drift apart
+    /// the ■ button goes back to reporting success while the container runs —
+    /// and it does so silently, with no error to surface. `up()` feeds the
+    /// same `(service, env, component.id)` triple to both; this pins that.
+    #[test]
+    fn the_teardown_name_matches_the_name_run_created() {
+        let (service, env, component) = ("yah-cloud-admin", "pond", "cloud-admin");
+        let run_spec = ContainerRunSpec::new(service, env, component, "img:dev");
+        let teardown_target = canonical_name(service, env, component);
+        assert_eq!(
+            run_spec.name, teardown_target,
+            "teardown would docker-stop a name that was never created"
+        );
+    }
+
     #[test]
     fn default_image_tag_derives_from_service_and_component() {
         assert_eq!(
@@ -341,7 +557,8 @@ port = 8080
     fn run_spec_publishes_declared_ports_and_env() {
         // The docker_run_args wiring a live reconcile would emit, exercised
         // without a docker socket.
-        let mut run_spec = ContainerRunSpec::new("yah-cloud-admin", "dev", "cloud-admin", "img:dev");
+        let mut run_spec =
+            ContainerRunSpec::new("yah-cloud-admin", "dev", "cloud-admin", "img:dev");
         run_spec.ports = vec![(4325, 4325)];
         run_spec.env.insert("K".into(), "V".into());
         let args = run_spec.docker_run_args();
@@ -349,6 +566,9 @@ port = 8080
         let joined = args.join(" ");
         assert!(joined.contains("-p 4325:4325"), "args: {joined}");
         assert!(joined.contains("-e K=V"), "args: {joined}");
-        assert!(joined.ends_with("img:dev"), "image is the final arg: {joined}");
+        assert!(
+            joined.ends_with("img:dev"),
+            "image is the final arg: {joined}"
+        );
     }
 }

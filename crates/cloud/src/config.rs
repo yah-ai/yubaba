@@ -34,8 +34,9 @@
 //! @arch:see(.yah/docs/working/W274-linked-infra-sources.md)
 //!
 //! @yah:ticket(R615-F1, "InfraSource types + SourcesConfig::load(infra_dir) parsing .yah/infra/sources.toml")
-//! @yah:at(2026-07-20T18:18:20Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:at(2026-08-08T19:55:57Z)
 //! @yah:phase(P1)
 //! @yah:parent(R615)
 //! @yah:next("Add InfraSourceKind { Path { path }, Git(GitSource) } + InfraSource { owner, kind, mode, select } to cloud/src/config.rs. Reuse the existing GitSource (config.rs:1205, { repo, ref, subdir }) verbatim — do not invent a second git-source shape.")
@@ -44,10 +45,18 @@
 //! @yah:verify("cargo check -p cloud && cargo test -p cloud")
 //! @arch:see(.yah/docs/working/W274-linked-infra-sources.md)
 //! @yah:tier(Cleric)
+//! @yah:handoff("InfraSourceKind{Path{path},Git(GitSource)} + SourceMode{ReadOnly,Manage} + InfraSource{owner,kind,mode,select} + SourcesConfig{schema_version,source} all landed in oss/yubaba/crates/cloud/src/config.rs (after default_git_ref, ~line 1550). GitSource reused verbatim -- Git(GitSource) wraps the existing R561 type unchanged, no second git-source shape. InfraSourceKind is internally tagged (#[serde(tag=\"kind\", rename_all=\"kebab-case\")]) and flattened into InfraSource so a [[source]] table reads exactly like W274's example: owner/kind/path-or-repo+ref+subdir/mode/select all at one table level. mode: SourceMode defaults ReadOnly via #[serde(default)] on the field (enum, not bool, per the ticket's own instruction -- Manage is the explicit escape hatch). SourcesConfig::load(infra_dir) returns Ok(default()) -- schema_version=1, empty source list -- when sources.toml is absent; only parses+errors when the file exists and is malformed.")
+//! @yah:handoff("Tree anchor 85801e7f. Pathspec: oss/yubaba/crates/cloud/src/config.rs (only file touched). Tests: cargo test -p yah-cloud --lib (from oss/yubaba) 710 passed / 0 failed / 4 ignored, +6 new over the 704 baseline your R707-T6 verification recorded (sources_load_is_empty_when_the_file_is_absent, sources_parses_a_path_kind_exactly_like_w274s_example, sources_parses_a_git_kind_reusing_gitsource_verbatim, sources_mode_defaults_to_read_only_and_manage_is_explicit, sources_preserves_declaration_order, sources_round_trips_through_serialize). cargo check -p cloud also green (implied by the test build).")
+//! @yah:handoff("Tree anchor at handoff: 85801e7f6b76b369c0c8ecd2e5c7874990cd9286 — the shared tree as I left it. Diff against it (`git diff 85801e7f6b76b369c0c8ecd2e5c7874990cd9286..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:next("R615-F2 picks this straight up: overlay these sources into CloudConfig::load, tagging origin{owner,source} and merging camp-local-wins-on-collision.")
+//! @yah:handoff("Verified pre-existing work: InfraSourceKind{Path,Git(GitSource)} + SourceMode + InfraSource + SourcesConfig all present in oss/yubaba/crates/cloud/src/config.rs at tree anchor 871fde1c, matching the inline @yah:handoff notes already on this ticket. GitSource reused verbatim, no second git-source shape. This session added no new code -- only ran verification and closed the board state, which a prior session left stuck in `open` despite the work being done (code + handoff notes landed, but board.review/handoff was never called).")
+//! @yah:verify("cargo check -p yah-cloud -- clean (2 pre-existing unrelated warnings)")
+//! @yah:verify("cargo test -p yah-cloud --lib -- 723 passed; 0 failed; 4 ignored (from oss/yubaba)")
 //!
 //! @yah:ticket(R615-F2, "Overlay loader: resolve sources in CloudConfig::load, tag origin, camp-local wins on collision")
-//! @yah:at(2026-07-20T18:18:30Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:at(2026-08-08T19:56:05Z)
 //! @yah:phase(P1)
 //! @yah:parent(R615)
 //! @yah:next("In CloudConfig::load, after loading camp-local machines/providers/rules, resolve each source to an infra root (git sources read from the .yah/cache/infra/ sync cache — load stays offline), load that root's machines/providers/rules, tag each entry with origin { owner, source }, and overlay UNDER camp-local. Camp-local wins on name collision.")
@@ -58,12 +67,25 @@
 //! @arch:see(.yah/docs/working/W274-linked-infra-sources.md)
 //! @yah:depends_on(R615-F1)
 //! @yah:tier(Warrior)
+//! @yah:handoff("Overlay landed in CloudConfig::load (oss/yubaba/crates/cloud/src/config.rs). After camp-local machines/providers/legacy-merge finish, SourcesConfig::load(paths::infra_dir(workspace_root)) resolves + overlay_infra_sources() merges each source's machines/providers UNDER what's already there -- camp-local wins any name collision, and among sources themselves the earlier-declared one wins (both proven by dedicated tests). Provenance is NOT a field on MachineConfig/ProviderConfig: added CloudConfig.machine_origins/provider_origins: BTreeMap<String, InfraOrigin> instead, keyed by name/id. Reason recorded in a doc comment on InfraOrigin -- MachineConfig/ProviderConfig are constructed by struct literal in test helpers across several crates (including crates/yah/agent-tools/src/cloud_tools.rs, which is fenced/live-owned this session), so widening either shape would have forced an edit there for zero semantic gain; origin is a property of the LOAD, not the machine.")
+//! @yah:handoff("GOTCHA closed: added load_dir_tolerant<T>() -- a per-file-tolerant sibling of the existing (strict) load_dir -- so one unparseable foreign machine/provider (schema skew) skips-with-a-tracing::warn! and never sinks the rest of that source's directory or this camp's own load. Proven by one_unparseable_foreign_machine_does_not_sink_the_rest_of_the_directory_or_the_load. load_dir itself is untouched -- camp-local files still hard-fail on a bad TOML, which is correct, only borrowed roots get the tolerant path.")
+//! @yah:handoff("Git sources: InfraSource::infra_root() resolves kind=path to <workspace_root>/<path>/.yah/infra (live tree, no I/O beyond building the path) and kind=git to paths::infra_source_cache_dir(workspace_root, owner)/infra -- a NEW path helper in paths.rs, also what R615-T3's `yah infra sync` target directory must be so the two line up. An unsynced git source (cache dir absent) overlays nothing and is explicitly NOT an error (test: an_unsynced_git_source_overlays_nothing_and_is_not_an_error) -- load() stays fully offline as W274 §3 requires.")
+//! @yah:handoff("select filtering implemented for machines only (name exact-match or literal mesh_tags membership -- not a glob engine, matches W274's own example verbatim) via machine_matches_select(); does NOT apply to providers -- documented as a deliberate choice, nothing in W274 or the ticket describes a provider-scoped filter.")
+//! @yah:handoff("EXPLICIT DECISION on the config.rs:575-equivalent gotcha (now load_from_config_dir): sources overlay does NOT apply there. Multi-root sibling config dirs (W206 layout (b)) are a second config root INSIDE the same camp, not a second camp -- .yah/infra/sources.toml is tied to paths::infra_dir(workspace_root) specifically, which has no well-defined meaning for an arbitrary config_dir. Documented in the function's doc comment and proven by load_from_config_dir_never_applies_sources_overlay (a sources.toml at the real workspace root does NOT leak into a load_from_config_dir call against a sibling .noisetable/ dir under that same root).")
+//! @yah:handoff("Tree anchor 85801e7f. Pathspec: oss/yubaba/crates/cloud/src/config.rs, oss/yubaba/crates/cloud/src/paths.rs (added infra_source_cache_dir + 1 test), oss/yubaba/crates/cloud/src/reconciler/mesofact_bundle.rs (CloudConfig test-literal fixed for the 2 new fields), app/yah/cli/src/cloud.rs (3 CloudConfig test-literal sites fixed, same reason). Tests: cargo test -p yah-cloud --lib (from oss/yubaba) 720 passed / 0 failed / 4 ignored, +10 over R615-F1's 710 baseline (9 overlay tests in config.rs + 1 in paths.rs). cargo build -p yah --lib (repo root) green -- confirms nothing downstream (agent-tools, cloud.rs, hub) broke from CloudConfig's two new fields.")
+//! @yah:handoff("Tree anchor at handoff: 85801e7f6b76b369c0c8ecd2e5c7874990cd9286 — the shared tree as I left it. Diff against it (`git diff 85801e7f6b76b369c0c8ecd2e5c7874990cd9286..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:next("R615-T3 (yah infra sync) is unblocked and has everything it needs: paths::infra_source_cache_dir(workspace_root, owner) is the exact target directory to clone/pull git sources into, already matching what F2's overlay reads from.")
+//! @yah:next("R615-F4 (Infra tab origin badge, not in my assigned lane) can read CloudConfig.machine_origins/provider_origins directly -- no further backend plumbing needed for the badge itself.")
+//! @yah:handoff("Verified pre-existing work: overlay landed in CloudConfig::load (oss/yubaba/crates/cloud/src/config.rs) at tree anchor 871fde1c -- SourcesConfig::load resolves sources, overlay_infra_sources() merges under camp-local with camp-local-wins and earlier-source-wins collision rules, machine_origins/provider_origins BTreeMaps added to CloudConfig, load_dir_tolerant() added for per-file-tolerant foreign schema skew, InfraSource::infra_root() resolves path/git kinds, load_from_config_dir explicitly does NOT get the overlay (documented). Matches this ticket's own inline @yah:handoff notes. This session added no new code -- only ran verification and closed board state that a prior session left stuck in `open` despite the work being done.")
+//! @yah:verify("cargo check -p yah-cloud -- clean (2 pre-existing unrelated warnings)")
+//! @yah:verify("cargo test -p yah-cloud --lib -- 723 passed; 0 failed; 4 ignored (from oss/yubaba), includes overlay tests + load_dir_tolerant test + infra_source_cache_dir test in paths.rs")
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use thiserror::Error;
+use workload_spec::secrets::SecretAccess;
 use workload_spec::{validate, LifecycleArchetype, TenantId, WorkloadSpec};
 
 /// Static node capacity declaration on `machine.toml` (R572-F3).
@@ -81,12 +103,88 @@ pub struct NodeAllocatable {
     pub cpu_millis: u32,
 }
 
-/// Per-machine TOML from `.yah/cloud/machines/<name>.toml`.
+/// `[registration]` — facts **observed** about a running box, written by the
+/// fleet rather than declared by an operator (R707-T1).
+///
+/// The rest of `machine.toml` is *declaration*: intent, operator-authored,
+/// reviewed and diffed like any other source. This block is the other half —
+/// what the box turned out to be once it booted and joined. Keeping the two
+/// apart is what lets the published fleet index (R707-F3) say which half it is
+/// carrying; publishing them under one schema would bake the confusion into a
+/// permanent record.
+///
+/// The split is a **provenance** boundary, not a trust or reach one:
+/// - *Declaration* answers "what did we ask for" — `name`, `region`, `arch`,
+///   `mesh_tags`, `[allocatable]`, and the declared reach in [`ConnectSpec`].
+/// - *Registration* answers "what did we observe" — the hostkey TOFU'd at
+///   attach, the mesh address headscale assigned at join.
+///
+/// It stays in the git-tracked TOML on purpose. Registration is not local
+/// scratch state: every consumer needs the mesh address to dial a node, so it
+/// has to travel with the declaration. (`.yah/infra/state/machines/<name>.json`
+/// — [`crate::state::MachineState`] — remains the *gitignored* sidecar for
+/// provider-side derivatives that nobody but this camp needs.)
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct MachineRegistration {
+    /// Yubaba's ed25519 `/identity` fingerprint, TOFU-recorded by
+    /// `yah cloud machine attach` on first contact (`SHA256:…`). An observed
+    /// property of a running process — not the operator's intent — which is
+    /// why it moved out of the top level here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostkey_fingerprint: Option<String>,
+    /// Mesh (headscale/tailnet) IPv4 assigned at join, e.g. `"100.64.0.1"`.
+    /// Bare address, not a URL: the *port* is declared reach and lives on
+    /// [`ConnectSpec::yubaba_port`]. [`MachineConfig::yubaba_url`] composes the
+    /// two. Absent until the node has joined the mesh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_ipv4: Option<String>,
+    /// RFC3339 timestamp of the mesh join that produced `mesh_ipv4`. Free-form
+    /// audit; nothing keys off it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined_at: Option<String>,
+}
+
+impl MachineRegistration {
+    /// True when nothing has been observed yet — used to omit the whole
+    /// `[registration]` table from a serialized machine TOML.
+    pub fn is_empty(&self) -> bool {
+        self.hostkey_fingerprint.is_none() && self.mesh_ipv4.is_none() && self.joined_at.is_none()
+    }
+}
+
+/// Per-machine TOML from `.yah/infra/machines/<name>.toml`.
+///
+/// Two halves, split by provenance (R707-T1): everything here is *declaration*
+/// — operator intent under review and blame — except [`registration`], which
+/// carries what the fleet observed. See [`MachineRegistration`] for why the
+/// boundary is drawn there and what depends on it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct MachineConfig {
     pub name: String,
     pub provider: String,
+    /// Who the hardware actually comes from (`"ovh"`, `"vultr"`, `"on-prem"`).
+    ///
+    /// Deliberately *not* [`provider`](Self::provider), which selects the
+    /// auto-provision driver: a box we rented by hand and brought up over SSH
+    /// is `provider = "static"` for its whole life, and writing the vendor
+    /// there instead would flip it driver-backed and make
+    /// [`validate`](Self::validate) demand `location` + `server_type` it has no
+    /// answer for. The two axes genuinely differ — vendor is who bills you,
+    /// `provider` is who yah can call an API against.
+    ///
+    /// Worth recording because vendor-scoped policy is invisible in every other
+    /// field and decides real work: outbound port 25, rDNS/PTR control, IP
+    /// reputation, egress billing. It survived only in TOML prose until now,
+    /// which made it ungreppable at exactly the moment you need it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+    /// Human label for the box (`"gamer"`, `"the GEEKOM"`). Free-form and never
+    /// matched on — [`name`](Self::name) stays the identity everywhere. This is
+    /// only so operators and agents can say which box they mean out loud.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
     /// Provider DC code (e.g. Hetzner `"hil"`). **Provisioning-only**: required
     /// iff the provider has an auto-provision driver ([`provider_has_machine_driver`]);
     /// a BYO `static` node we brought up over SSH has no such code. Optional at
@@ -130,7 +228,19 @@ pub struct MachineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
     pub bucket: Option<BucketSpec>,
-    pub hostkey_fingerprint: Option<String>,
+    /// **Legacy location, superseded by `[registration].hostkey_fingerprint`**
+    /// (R707-T1). Still deserialized so machine TOMLs written before the split
+    /// keep parsing; never *read* directly — go through
+    /// [`MachineConfig::hostkey_fingerprint`], which prefers the registration
+    /// block. [`MachineConfig::normalize`] folds this into `registration`, and
+    /// [`MachineConfig::save`] normalizes before writing, so a load→save cycle
+    /// migrates the file rather than dropping the value.
+    #[serde(
+        rename = "hostkey_fingerprint",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub legacy_hostkey_fingerprint: Option<String>,
     /// Provider-side SSH-key IDs (Hetzner: from `GET /v1/ssh_keys`)
     /// authorized for `root` at create time. Defaults to empty for
     /// backwards-compat with existing machine declarations; an empty
@@ -172,6 +282,10 @@ pub struct MachineConfig {
     /// requirement marker the ingress appliance (W267) demands.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub taints: Vec<String>,
+    /// `[registration]` — the observed half (R707-T1). Empty until the box has
+    /// been attached / mesh-joined. See [`MachineRegistration`].
+    #[serde(default, skip_serializing_if = "MachineRegistration::is_empty")]
+    pub registration: MachineRegistration,
 }
 
 /// True iff `provider` has an auto-provision driver (create/destroy via API).
@@ -220,32 +334,185 @@ impl MachineConfig {
         Ok(())
     }
 
+    /// Yubaba's TOFU'd hostkey fingerprint, from `[registration]` and falling
+    /// back to the pre-R707-T1 top-level field. **The only read path** — a
+    /// caller that reaches for `legacy_hostkey_fingerprint` directly sees
+    /// `None` on every migrated machine.
+    pub fn hostkey_fingerprint(&self) -> Option<&str> {
+        self.registration
+            .hostkey_fingerprint
+            .as_deref()
+            .or(self.legacy_hostkey_fingerprint.as_deref())
+    }
+
+    /// Record (or clear) the observed hostkey fingerprint. Writes
+    /// `[registration]` and drops any pre-R707-T1 top-level value, so the two
+    /// locations can never disagree after a writeback.
+    pub fn set_hostkey_fingerprint(&mut self, fingerprint: Option<String>) {
+        self.registration.hostkey_fingerprint = fingerprint;
+        self.legacy_hostkey_fingerprint = None;
+    }
+
+    /// Mesh (tailnet) IPv4 for this node, or `None` pre-mesh.
+    ///
+    /// Prefers `[registration].mesh_ipv4`; falls back to the host of a legacy
+    /// `[connect].yubaba` URL when that host is in the `100.64.0.0/10` CGNAT
+    /// range the mesh uses. A loopback placeholder (`http://127.0.0.1:7443`,
+    /// meaning "pre-mesh, reachable only through an SSH tunnel") is *not* a
+    /// mesh address and yields `None`.
+    pub fn mesh_ipv4(&self) -> Option<&str> {
+        if let Some(ip) = self.registration.mesh_ipv4.as_deref() {
+            return Some(ip);
+        }
+        let url = self.connect.as_ref()?.yubaba.as_deref()?;
+        mesh_ipv4_from_url(url)
+    }
+
+    /// Base URL for this node's yubaba, or `None` when it declares no reach.
+    ///
+    /// A declared `[connect].yubaba` wins whenever present — full stop, not
+    /// only for the pre-mesh loopback placeholder. `[registration].mesh_ipv4`
+    /// + `[connect].yubaba_port` is the *derivation* used only when nothing is
+    /// declared (R707-T6 / W295).
+    ///
+    /// This was narrower once: a declared literal won only when there was no
+    /// registered mesh address, on the reasoning that the loopback placeholder
+    /// (`http://127.0.0.1:7443`, "reach me through the SSH tunnel") is a
+    /// genuine declaration and not a stale observation. That reasoning still
+    /// holds — it just never considered a *non-loopback* literal coexisting
+    /// with a mesh address, which is exactly R608-F18's forcing case:
+    /// us-west-014 is mesh-joined (`mesh_ipv4`) but its raft peers are
+    /// LAN-only, so `rollout::yubaba::membership_to_nodes` needs the LAN
+    /// literal, not the mesh-derived URL, to match the raft membership
+    /// address. A declared literal is *always* the more specific statement —
+    /// whether it says "SSH tunnel only" or "reach me on the LAN" — and
+    /// `mesh_ipv4` is only ever a convenience for the common case where
+    /// nothing more specific was declared. There is no third state to add: the
+    /// fields already say everything needed, only their precedence was wrong
+    /// for a declared-and-mesh-joined node.
+    pub fn yubaba_url(&self) -> Option<String> {
+        let connect = self.connect.as_ref()?;
+        if let Some(literal) = &connect.yubaba {
+            return Some(literal.clone());
+        }
+        let ip = self.registration.mesh_ipv4.as_deref()?;
+        Some(format!("http://{ip}:{}", connect.yubaba_port()))
+    }
+
+    /// Fold the pre-R707-T1 top-level `hostkey_fingerprint` into
+    /// `[registration]`, and lift a mesh IP out of a legacy `[connect].yubaba`
+    /// URL. Idempotent; a machine already on the split shape is untouched.
+    ///
+    /// [`save`](Self::save) calls this, so writing a machine TOML migrates it
+    /// rather than round-tripping the old shape back out.
+    pub fn normalize(&mut self) {
+        if let Some(fp) = self.legacy_hostkey_fingerprint.take() {
+            self.registration.hostkey_fingerprint.get_or_insert(fp);
+        }
+        if self.registration.mesh_ipv4.is_none() {
+            if let Some(ip) = self
+                .connect
+                .as_ref()
+                .and_then(|c| c.yubaba.as_deref())
+                .and_then(mesh_ipv4_from_url)
+                .map(str::to_string)
+            {
+                self.registration.mesh_ipv4 = Some(ip);
+                // The URL was pure derivation from mesh IP + port; keep only
+                // the declared half so the two can't drift apart.
+                if let Some(c) = self.connect.as_mut() {
+                    c.yubaba = None;
+                }
+            }
+        }
+    }
+
     /// Persist to `<cloud_dir>/machines/<name>.toml`, creating the dir if needed.
+    ///
+    /// ⚠ Serializes the struct, so **operator comments in the target file are
+    /// lost**. Pre-existing behaviour, not introduced here, but it is why
+    /// registration writeback (`yah cloud machine attach`) goes through
+    /// [`crate::state::MachineState`] and the comment-preserving path in the
+    /// CLI rather than calling this on a hand-authored inventory file.
     pub fn save(&self, cloud_dir: &Path) -> Result<()> {
         let dir = cloud_dir.join("machines");
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join(format!("{}.toml", self.name));
-        let s = toml::to_string_pretty(self)
+        let mut normalized = self.clone();
+        normalized.normalize();
+        let s = toml::to_string_pretty(&normalized)
             .with_context(|| format!("serializing machine {}", self.name))?;
         std::fs::write(&path, s).with_context(|| format!("writing {}", path.display()))
     }
 }
 
-/// Reach descriptor for a BYO `static` node (no provider API). Lives under
+/// Host of an `http://host:port` URL iff it is a mesh (headscale) IPv4 in the
+/// `100.64.0.0/10` CGNAT range. String-level rather than URL-parsed: the
+/// inventory format is stable and this crate carries no URL dependency (same
+/// reasoning as `fleet_metrics::extract_host` and
+/// `hub::coordinator::is_loopback_url`).
+fn mesh_ipv4_from_url(url: &str) -> Option<&str> {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host = after_scheme.split(['/', ':']).next()?;
+    let ip: std::net::Ipv4Addr = host.parse().ok()?;
+    let [a, b, ..] = ip.octets();
+    // 100.64.0.0/10 ⇒ first octet 100, second octet 64..=127.
+    (a == 100 && (64..=127).contains(&b)).then_some(host)
+}
+
+/// Declared **reach** for a BYO `static` node (no provider API). Lives under
 /// `[connect]` in the machine TOML.
+///
+/// Reach only — how the camp gets to the box. *Permission* is a separate axis
+/// that belongs to cheers' scopes (W295 §"Deliberately deferred"); the two
+/// collapse in practice today (mesh membership grants everything) and the data
+/// model must not fuse them, so do not add an authorization field here.
+///
+/// `address` and `ssh` stay whole, literal, operator-authored strings even
+/// though their values often *look* derived. They are not: us-west-001 dials
+/// SSH over its public IP while us-west-002 was deliberately repointed at its
+/// tailnet IP (R608-F10) precisely because the LAN address is unreachable
+/// off-LAN. Decomposing them into user + host and recomposing would silently
+/// undo per-machine decisions like that one. `yubaba` is the field that *was*
+/// derived — mesh IP plus a fixed port, rewritten by mesh-join — so that is
+/// where R707-T1 cut.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ConnectSpec {
-    /// Reachable IPv4/host for the box, e.g. `"45.32.194.254"`.
+    /// Reachable IPv4/host for the box, e.g. `"45.32.194.254"`. Declared: which
+    /// of a machine's several addresses the camp should use is an operator
+    /// choice (public IP vs. LAN IP vs. tailnet IP).
     pub address: String,
     /// SSH target the camp dials for bootstrap + (pre-mesh) tunneled deploys,
-    /// e.g. `"root@45.32.194.254"` or `"debian@15.204.89.240"`. Uses the
-    /// operator's `~/.ssh/yah` key.
+    /// e.g. `"root@45.32.194.254"` or `"struc@100.64.0.4"`. Uses the operator's
+    /// `~/.ssh/yah` key. Declared, whole — see the type doc.
     pub ssh: String,
-    /// Yubaba RPC URL. Loopback (`"http://127.0.0.1:7443"`) until the WireGuard
-    /// mesh lands — reached via an SSH tunnel to `ssh`. Rebinds to the mesh IP
-    /// in the post-mesh world (W242 P2).
-    pub yubaba: String,
+    /// Port yubaba listens on. Declared reach; defaults to 7443 when omitted,
+    /// which is every machine in the fleet today. Composed with the *observed*
+    /// [`MachineRegistration::mesh_ipv4`] by [`MachineConfig::yubaba_url`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yubaba_port: Option<u16>,
+    /// Explicit yubaba base URL, overriding the composed form.
+    ///
+    /// Two live uses, both genuine declarations: a pre-mesh node saying
+    /// `"http://127.0.0.1:7443"` — "I have no mesh address; reach me through
+    /// the SSH tunnel to `ssh`" — and any node whose yubaba is not at
+    /// `mesh_ipv4:port`. A URL here whose host *is* a mesh IP is the
+    /// pre-R707-T1 shape; [`MachineConfig::normalize`] lifts it into
+    /// `[registration].mesh_ipv4` and clears this field so the two cannot
+    /// drift apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yubaba: Option<String>,
+}
+
+/// Default yubaba listen port, used when `[connect].yubaba_port` is omitted.
+pub const DEFAULT_YUBABA_PORT: u16 = 7443;
+
+impl ConnectSpec {
+    /// Declared yubaba port, defaulting to [`DEFAULT_YUBABA_PORT`].
+    pub fn yubaba_port(&self) -> u16 {
+        self.yubaba_port.unwrap_or(DEFAULT_YUBABA_PORT)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -505,6 +772,16 @@ pub struct CloudConfig {
     pub machines: Vec<MachineConfig>,
     /// `.yah/infra/providers/<id>.toml`
     pub providers: Vec<ProviderConfig>,
+    /// Provenance for every entry in `machines` that came from a linked
+    /// `.yah/infra/sources.toml` source rather than this camp's own
+    /// `.yah/infra/machines/` (R615-F2 / W274). Keyed by
+    /// [`MachineConfig::name`]; a name absent here is camp-local. Empty from
+    /// [`CloudConfig::load_from_config_dir`] — see its doc for why sources
+    /// don't apply to multi-root sibling trees.
+    pub machine_origins: BTreeMap<String, InfraOrigin>,
+    /// Same as [`machine_origins`](Self::machine_origins), keyed by
+    /// [`ProviderConfig::id`].
+    pub provider_origins: BTreeMap<String, InfraOrigin>,
     /// `.yah/services/<svc>/` — service.toml plus mirrors/<env>.toml.
     pub services: BTreeMap<String, ServiceWithMirrors>,
     /// `.yah/domains/<name>.toml` — public-facing routing manifests
@@ -536,7 +813,7 @@ impl CloudConfig {
     /// `mirror.providers.X.use = "<id>"` must resolve to a real provider
     /// declared under `.yah/infra/providers/`.
     pub fn load(workspace_root: &Path) -> Result<Self> {
-        let providers = load_providers(&crate::paths::providers_dir(workspace_root))?;
+        let mut providers = load_providers(&crate::paths::providers_dir(workspace_root))?;
         let services = load_services(&crate::paths::services_dir(workspace_root), workspace_root)?;
         let domains = load_domains(&crate::paths::domains_dir(workspace_root))?;
 
@@ -545,7 +822,7 @@ impl CloudConfig {
         // Legacy `.yah/cloud/` reads — empty in post-B1 workspaces. Wrapped in
         // a helper so a missing tree is silent (no error, no warning).
         let cloud_dir = crate::paths::legacy_cloud_dir(workspace_root);
-        let (legacy_machines, legacy_mirrors, workloads, topology, legacy_services) =
+        let (legacy_machines, legacy_mirrors, legacy_workloads, topology, legacy_services) =
             if cloud_dir.exists() {
                 (
                     load_dir::<MachineConfig>(cloud_dir.join("machines"))?,
@@ -557,6 +834,23 @@ impl CloudConfig {
             } else {
                 Default::default()
             };
+
+        // Workloads come from `.yah/infra/workloads/` (R215+). R568-T7: before
+        // that path was read here, this field was populated *only* from the
+        // legacy tree above — which R222-B1 emptied — so `cfg.workload(name)`
+        // resolved nothing in every post-R215 camp and `yah cloud workload
+        // deploy` could not find any declaration at all. The bug survived
+        // because the only workloads ever deployed were forge/QED runs, which
+        // build their spec in memory and never come through here. Same
+        // dedupe-by-name shape as machines below: R215+ wins.
+        let mut workloads = load_workloads(crate::paths::workloads_dir(workspace_root))?;
+        let workload_names: std::collections::HashSet<String> =
+            workloads.iter().map(|w| w.spec.name.clone()).collect();
+        for w in legacy_workloads {
+            if !workload_names.contains(&w.spec.name) {
+                workloads.push(w);
+            }
+        }
 
         // Machines come from `.yah/infra/machines/` (R215+); the pre-R215
         // tree shouldn't have any since B1 moved them, but if it does we
@@ -570,10 +864,30 @@ impl CloudConfig {
             }
         }
 
+        // R615-F2: overlay every linked `.yah/infra/sources.toml` source's
+        // machines/providers UNDER what's already loaded above, so camp-local
+        // (including the legacy-tree entries just merged in) always wins on a
+        // name collision. `SourcesConfig::load` itself never touches the
+        // network — git sources are read from `yah infra sync`'s cache
+        // (R615-T3), so this call keeps `load()`'s whole offline contract.
+        let sources = SourcesConfig::load(&crate::paths::infra_dir(workspace_root))?;
+        let mut machine_origins = BTreeMap::new();
+        let mut provider_origins = BTreeMap::new();
+        overlay_infra_sources(
+            workspace_root,
+            &sources,
+            &mut machines,
+            &mut providers,
+            &mut machine_origins,
+            &mut provider_origins,
+        );
+
         Ok(Self {
             workspace_root: workspace_root.to_path_buf(),
             machines,
             providers,
+            machine_origins,
+            provider_origins,
             services,
             domains,
             legacy_mirrors,
@@ -594,8 +908,21 @@ impl CloudConfig {
     /// [`CloudConfig::load`] uses. The legacy `.yah/cloud/` reads are skipped —
     /// multi-root deployments are post-R215 by construction — so `legacy_*`,
     /// `workloads`, and `topology` come back empty. Machines are read from
-    /// `config_dir/infra/machines` with no `inherit_machines` redirect (sibling
-    /// trees declare their own inventory or none).
+    /// `config_dir/infra/machines` directly (sibling trees declare their own
+    /// inventory or none).
+    ///
+    /// R615-F2 decision, explicit rather than silent: **sources.toml overlay
+    /// does NOT apply here.** This function
+    /// exists specifically because a multi-root sibling tree (W206 layout
+    /// (b), e.g. `.noisetable/`) is a *second config root inside the same
+    /// camp*, not a second camp — `config_dir` is already wherever the
+    /// caller decided this tree's infra lives, and `.yah/infra/sources.toml`
+    /// (singular, tied to `paths::infra_dir(workspace_root)`) has no
+    /// well-defined meaning for an arbitrary `config_dir` that isn't that
+    /// path. A sibling tree that wants borrowed infra declares its own
+    /// `sources.toml` under whichever root actually calls
+    /// [`CloudConfig::load`] for it; `machine_origins`/`provider_origins`
+    /// come back empty here, not wrong — there is nothing to overlay.
     pub fn load_from_config_dir(config_dir: &Path, workspace_root: &Path) -> Result<Self> {
         let providers = load_providers(&config_dir.join("infra").join("providers"))?;
         let services = load_services(&config_dir.join("services"), workspace_root)?;
@@ -609,6 +936,8 @@ impl CloudConfig {
             workspace_root: workspace_root.to_path_buf(),
             machines,
             providers,
+            machine_origins: BTreeMap::new(),
+            provider_origins: BTreeMap::new(),
             services,
             domains,
             legacy_mirrors: vec![],
@@ -1051,13 +1380,28 @@ fn load_topology(path: std::path::PathBuf) -> Result<TopologyConfig> {
     toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))
 }
 
+/// R555-S1: entries are sorted by file name before parsing, so "declaration
+/// order in `.yah/infra/machines/` breaks ties" — the contract
+/// [`CloudConfig::admit_workload`] documents — is actually true. `read_dir`
+/// yields filesystem order, which is unspecified and differs between APFS and
+/// a hashed-dir ext4; without the sort, *which* of two equally-matching nodes a
+/// workload admits to could change when an unrelated file is added to the
+/// directory. That was latent while each tag set had one match and became
+/// observable the day us-west-003 joined us-west-002 on
+/// `[tag:build-worker, tier:x86, os:linux]`. Same sort `load_providers` has
+/// always done.
 fn load_dir<T: for<'de> Deserialize<'de>>(dir: std::path::PathBuf) -> Result<Vec<T>> {
     if !dir.exists() {
         return Ok(vec![]);
     }
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("reading {}", dir.display()))?;
+    entries.sort_by_key(|e| e.file_name());
+
     let mut items = vec![];
-    for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry?;
+    for entry in entries {
         let path = entry.path();
         if path.extension().map_or(false, |e| e == "toml") {
             let src = std::fs::read_to_string(&path)
@@ -1117,6 +1461,12 @@ pub enum Provider {
     /// provider file under `.yah/infra/providers/` so the discovery hints +
     /// runtime override sit in one place.
     LocalContainer,
+    /// Dev-tier compute: the component runs as a kamaji-supervised host
+    /// process against the operator's real workspace, no container and no
+    /// build step per edit. Inline-only — it carries no credentials, and
+    /// "the machine you are sitting at" is not an account to point at.
+    /// See `reconciler::local_process`.
+    LocalProcess,
     /// Containerized miniflare (workerd subprocess) fronting MinIO — the
     /// pond-tier stand-in for a CF Worker + R2 static surface. Inline-only;
     /// the reconciler spawns miniflare via the JS runtime and starts a MinIO
@@ -1127,6 +1477,20 @@ pub enum Provider {
     /// container on the local-container runtime and auto-creates the declared
     /// bucket on first up.
     MinioContainer,
+    /// Dev-tier PostgreSQL — a real server speaking real pgwire on loopback,
+    /// supervised by kamaji as the `yah-pg-dev` workload (W265, R584-F1). No
+    /// docker daemon: the driver fetches a per-arch PostgreSQL tarball on first
+    /// run and `initdb`s a cluster under `.yah/infra/state/dev/pg/`.
+    ///
+    /// Inline-only — it carries no credentials worth a provider file (the
+    /// cluster is loopback-bound with a fixed dev password). Declared under
+    /// [`MirrorConfig::drivers`], not `providers`:
+    ///
+    /// ```toml
+    /// [drivers.pg]
+    /// kind = "local-pg-dev"
+    /// ```
+    LocalPgDev,
 }
 
 /// A provider account/runtime binding from `.yah/infra/providers/<id>.toml`.
@@ -1247,6 +1611,309 @@ pub struct GitSource {
 
 fn default_git_ref() -> String {
     "main".to_string()
+}
+
+/// How to reach an external infra root (R615-F1 / W274, "linked infra
+/// sources"): a filesystem link to a sibling camp's live tree, or a git
+/// checkout of an extracted infra repo.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum InfraSourceKind {
+    /// Filesystem link — reads the owner's live tree. The dev-loop shortcut,
+    /// and the whole story until W274's "infra as its own repo" end-state.
+    /// `path` is relative to *this* camp's root; infra is read from
+    /// `<path>/.yah/infra/`.
+    Path {
+        path: String,
+    },
+    /// Git link — reused verbatim from [`GitSource`] (R561, "BYO git"),
+    /// lifted here from "a component's code" to "a camp's infra registry."
+    /// Loading stays offline (W274 §3): `yah infra sync` (R615-T3) is what
+    /// clones/pulls this into `.yah/cache/infra/<owner>/`; `CloudConfig::load`
+    /// only ever reads that cache, never the network.
+    Git(GitSource),
+}
+
+/// Write-gate for a linked [`InfraSource`] (R615-F1 / W274).
+///
+/// An enum, not a bool: the two states today are "borrower renders/plans but
+/// cannot reconcile" and "this camp genuinely co-administers the shared
+/// root," and a future read-write-with-approval tier is a third variant, not
+/// a renamed boolean.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum SourceMode {
+    /// Borrower can render and plan against the linked entries but cannot
+    /// reconcile/mutate them — the owner remains the single manager. Default:
+    /// a borrower is opt-in to write access, never opt-out of the safe state.
+    #[default]
+    ReadOnly,
+    /// Escape hatch for a camp that genuinely co-administers a shared root.
+    Manage,
+}
+
+/// One `[[source]]` entry in `.yah/infra/sources.toml` (R615-F1 / W274) — an
+/// external infra root this camp borrows machines/providers from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct InfraSource {
+    /// Logical owner name, badged in the Infra tab (e.g. `"yah"`). Distinct
+    /// from any camp/repo name the `kind` resolves through — this is what an
+    /// operator sees on a borrowed row, not a path.
+    pub owner: String,
+    #[serde(flatten)]
+    pub kind: InfraSourceKind,
+    #[serde(default)]
+    pub mode: SourceMode,
+    /// Optional filter — name globs or mesh-tag selectors — to borrow a
+    /// subset of the source root rather than everything it declares. Empty
+    /// (the default) borrows everything.
+    #[serde(default)]
+    pub select: Vec<String>,
+}
+
+fn default_sources_schema_version() -> u32 {
+    1
+}
+
+/// `.yah/infra/sources.toml` — the ordered list of external infra roots this
+/// camp borrows from (R615-F1 / W274).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct SourcesConfig {
+    #[serde(default = "default_sources_schema_version")]
+    pub schema_version: u32,
+    /// `[[source]]` entries, in declaration order — overlay order matters
+    /// when two linked sources both name the same machine (R615-F2).
+    #[serde(default, rename = "source")]
+    pub source: Vec<InfraSource>,
+}
+
+impl Default for SourcesConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: default_sources_schema_version(),
+            source: Vec::new(),
+        }
+    }
+}
+
+impl SourcesConfig {
+    /// Load `<infra_dir>/sources.toml`. A missing file is not an error —
+    /// every camp without linked infra has none, which today is every camp —
+    /// and yields an empty source list rather than `Err`.
+    pub fn load(infra_dir: &Path) -> Result<Self> {
+        let path = infra_dir.join("sources.toml");
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let src =
+            std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))
+    }
+}
+
+impl InfraSource {
+    /// Human-readable descriptor of *which* source this is, for
+    /// [`InfraOrigin::source`] — distinguishes two linked sources from the
+    /// same owner. Never includes credentials: `GitSource.repo` is a clone
+    /// URL (https/ssh), the same thing R561 already treats as safe to log,
+    /// with any real secret resolved separately via `keystore://` (W274's
+    /// own precedent).
+    fn describe(&self) -> String {
+        match &self.kind {
+            InfraSourceKind::Path { path } => format!("path:{path}"),
+            InfraSourceKind::Git(g) => format!("git:{}@{}", g.repo, g.r#ref),
+        }
+    }
+
+    /// Resolve this source to an infra root directory (R615-F2 / W274 §3).
+    /// Does no I/O and touches no network: `path` sources read the owner's
+    /// live tree directly; `git` sources read wherever `yah infra sync`
+    /// (R615-T3) last synced to, which may not exist yet (an unsynced git
+    /// source overlays nothing, not an error — see [`load_dir_tolerant`]).
+    ///
+    /// `git.subdir` (reused verbatim from [`GitSource`]/R561) is honoured
+    /// exactly like the component case: the checkout root when unset, or
+    /// `<checkout>/<subdir>` when set — e.g. `subdir = "infra"` for a
+    /// monorepo whose infra registry lives under `infra/` rather than at the
+    /// clone's root. `yah infra sync` (R615-T3) clones into the *checkout*
+    /// root ([`crate::paths::infra_source_cache_dir`]), never into a
+    /// subdir-suffixed path, so this is the one place that appends `subdir`.
+    fn infra_root(&self, workspace_root: &Path) -> std::path::PathBuf {
+        match &self.kind {
+            InfraSourceKind::Path { path } => workspace_root.join(path).join(".yah").join("infra"),
+            InfraSourceKind::Git(g) => {
+                let checkout = crate::paths::infra_source_cache_dir(workspace_root, &self.owner);
+                match g.subdir.as_deref() {
+                    Some(subdir) => checkout.join(subdir),
+                    None => checkout,
+                }
+            }
+        }
+    }
+}
+
+/// Provenance for a [`MachineConfig`] or [`ProviderConfig`] pulled in from a
+/// linked `.yah/infra/sources.toml` entry, rather than declared in this
+/// camp's own `.yah/infra/` (R615-F2 / W274).
+///
+/// Lives in [`CloudConfig::machine_origins`] / `provider_origins`, keyed by
+/// name/id, rather than as a field on `MachineConfig`/`ProviderConfig`
+/// themselves: those two types are constructed by struct literal in test
+/// helpers across several crates (including ones this ticket has no reason to
+/// touch), so widening either shape would ripple out past this crate for no
+/// semantic gain — origin is a property of *this load*, not an inherent
+/// property of the machine/provider. A name absent from the map is
+/// camp-local; present means borrowed, and the Infra tab (R615-F4) / reconcile
+/// gating (`InfraSource::mode`, copied onto `mode` below) read it from here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct InfraOrigin {
+    /// The [`InfraSource::owner`] that supplied this entry, e.g. `"yah"`.
+    pub owner: String,
+    /// Which source, rendered — see [`InfraSource::describe`].
+    pub source: String,
+    /// The write-gate that applied when this entry was overlaid — copied
+    /// from [`InfraSource::mode`] so a caller holding just the machine/
+    /// provider doesn't need the source list in hand to know it's borrowed
+    /// read-only.
+    pub mode: SourceMode,
+}
+
+/// Like [`load_dir`], but tolerant **per file**: a foreign infra root (an
+/// owner's live tree, or a synced git checkout) can carry entries this
+/// binary's `T` predates — noisetable's pre-migration machines used an older
+/// schema than yah's, and the reverse will happen too as each side evolves
+/// independently. One unparseable file on a source this camp doesn't own must
+/// never sink every other entry in the same directory, let alone this camp's
+/// own load (R615-F2 gotcha). Contrast [`load_dir`], which stays strict for
+/// camp-local files, where a malformed TOML genuinely should be a hard error.
+///
+/// Returns the entries that parsed, plus `(path, error)` for every file that
+/// didn't — the caller logs those, it doesn't drop them silently. A missing
+/// or unreadable directory yields `(vec![], vec![])`, same "no entries" as
+/// `load_dir`'s `!dir.exists()` case (an unsynced git source, or a source
+/// root with no `providers/` at all, are both normal, not warnings).
+fn load_dir_tolerant<T: for<'de> Deserialize<'de>>(
+    dir: &Path,
+) -> (Vec<T>, Vec<(std::path::PathBuf, anyhow::Error)>) {
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut entries: Vec<_> = read_dir.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    let mut items = Vec::new();
+    let mut skipped = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        if path.extension().map_or(true, |e| e != "toml") {
+            continue;
+        }
+        let parsed = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))
+            .and_then(|src| {
+                toml::from_str::<T>(&src).with_context(|| format!("parsing {}", path.display()))
+            });
+        match parsed {
+            Ok(item) => items.push(item),
+            Err(e) => skipped.push((path, e)),
+        }
+    }
+    (items, skipped)
+}
+
+/// Whether a borrowed machine passes an [`InfraSource::select`] filter
+/// (R615-F2 / W274). Empty `select` borrows everything. A non-empty `select`
+/// entry matches either the machine's exact `name` or literal membership in
+/// its `mesh_tags` — the one shape W274's own example uses
+/// (`select = ["tag:cloud-runner"]`). Not a glob engine: mesh tags are
+/// already flat strings compared for exact equality everywhere else in this
+/// crate (see `resolve_machine_by_mesh_tags`), so a select entry is that same
+/// comparison, not a new pattern language.
+fn machine_matches_select(machine: &MachineConfig, select: &[String]) -> bool {
+    select.is_empty()
+        || select
+            .iter()
+            .any(|s| *s == machine.name || machine.mesh_tags.contains(s))
+}
+
+/// Overlay every linked `.yah/infra/sources.toml` source's machines and
+/// providers into `machines`/`providers`, recording provenance into
+/// `machine_origins`/`provider_origins` (R615-F2 / W274). Must be called
+/// AFTER camp-local entries are already in both vectors and both origin maps
+/// are seeded with every camp-local name/id already `HashSet`-tracked as
+/// "seen": collision resolution is "first writer wins," so seeding with
+/// camp-local first is what makes camp-local win over every source, and an
+/// earlier source win over a later one.
+///
+/// `select` filters which machines a source contributes; it does not apply
+/// to providers (nothing in W274 or the source ticket describes a
+/// provider-scoped filter — every provider a source declares either overlays
+/// whole or, on a name collision, doesn't).
+fn overlay_infra_sources(
+    workspace_root: &Path,
+    sources: &SourcesConfig,
+    machines: &mut Vec<MachineConfig>,
+    providers: &mut Vec<ProviderConfig>,
+    machine_origins: &mut BTreeMap<String, InfraOrigin>,
+    provider_origins: &mut BTreeMap<String, InfraOrigin>,
+) {
+    let mut seen_machine_names: std::collections::HashSet<String> =
+        machines.iter().map(|m| m.name.clone()).collect();
+    let mut seen_provider_ids: std::collections::HashSet<String> =
+        providers.iter().map(|p| p.id.clone()).collect();
+
+    for source in &sources.source {
+        let root = source.infra_root(workspace_root);
+        let origin = InfraOrigin {
+            owner: source.owner.clone(),
+            source: source.describe(),
+            mode: source.mode,
+        };
+
+        let (foreign_machines, skipped) = load_dir_tolerant::<MachineConfig>(&root.join("machines"));
+        for (path, e) in skipped {
+            tracing::warn!(
+                "infra source {:?} ({}): skipping unparseable machine {}: {e:#}",
+                source.owner,
+                root.display(),
+                path.display()
+            );
+        }
+        for m in foreign_machines {
+            if seen_machine_names.contains(&m.name) {
+                continue; // camp-local, or an earlier source, already claimed this name
+            }
+            if !machine_matches_select(&m, &source.select) {
+                continue;
+            }
+            seen_machine_names.insert(m.name.clone());
+            machine_origins.insert(m.name.clone(), origin.clone());
+            machines.push(m);
+        }
+
+        let (foreign_providers, skipped) = load_dir_tolerant::<ProviderConfig>(&root.join("providers"));
+        for (path, e) in skipped {
+            tracing::warn!(
+                "infra source {:?} ({}): skipping unparseable provider {}: {e:#}",
+                source.owner,
+                root.display(),
+                path.display()
+            );
+        }
+        for p in foreign_providers {
+            if seen_provider_ids.contains(&p.id) {
+                continue;
+            }
+            seen_provider_ids.insert(p.id.clone());
+            provider_origins.insert(p.id.clone(), origin.clone());
+            providers.push(p);
+        }
+    }
 }
 
 /// One component of a [`ServiceConfig`]. The `kind` (e.g. `"mesofact-static"`,
@@ -1402,8 +2069,8 @@ impl CampCloudDbs {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let src =
-            std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let src = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
         toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))
     }
 }
@@ -1422,6 +2089,55 @@ pub enum MirrorShape {
     MultiMachine,
 }
 
+/// Which public-ingress provider fronts this mirror's compute (W267, R594-F11).
+///
+/// Both arms answer exactly one question — *given these local workload ports,
+/// make them publicly reachable at these hostnames* — and they differ only in
+/// where the ingress rules live and who supervises the front door:
+///
+/// | | [`CloudflareTunnel`](Self::CloudflareTunnel) | [`Passway`](Self::Passway) |
+/// |---|---|---|
+/// | Ingress rules live | Cloudflare's API (token-form tunnels are remotely-managed) | the pingora `Backends` set in the proxy process |
+/// | How they get there | an API call per deployed workload | passway polls `GET /service-records?ready=true` |
+/// | Front door lifecycle | a kamaji-supervised `cloudflared` appliance | a kamaji-supervised passway appliance |
+///
+/// Flipping this field is the whole tier ladder: rented edge → sovereign edge
+/// is a one-line mirror edit, not a rewrite. The provider owns **addressing**
+/// and never **rendering** — the W173 render cube stays in mesofact's manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum IngressProvider {
+    /// No public front door for this mirror. The default: a mirror that
+    /// publishes to R2 behind a Worker, or a mesh-only compute tier, has no
+    /// ingress provider to reconcile.
+    #[default]
+    None,
+    /// Rented edge — `cloudflared` dials *out* from the node to Cloudflare's
+    /// edge. Zero inbound ports, no TLS to manage on the box, hostname rules
+    /// held in Cloudflare's API.
+    CloudflareTunnel,
+    /// Sovereign edge — passway terminates TLS on the node and load-balances
+    /// an upstream set discovered from yubaba's service records.
+    Passway,
+}
+
+impl IngressProvider {
+    /// `true` when this mirror declares a front door that has to be reconciled.
+    pub fn is_declared(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    /// Kebab-case wire name, as it appears in `mirrors/<env>.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::CloudflareTunnel => "cloudflare-tunnel",
+            Self::Passway => "passway",
+        }
+    }
+}
+
 /// A service mirror — the projection of a [`ServiceConfig`] onto concrete
 /// infra. Lives at `.yah/services/<svc>/mirrors/<env>.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1429,11 +2145,41 @@ pub enum MirrorShape {
 pub struct MirrorConfig {
     pub schema_version: u32,
     pub shape: MirrorShape,
+    /// Public-ingress provider fronting this mirror (W267). Defaults to
+    /// [`IngressProvider::None`].
+    ///
+    /// Declared at mirror scope rather than per provider slot because a front
+    /// door does **fan-in**: one `cloudflared` (or one passway) on a node
+    /// multiplexes every hostname→port rule the mirror needs, so pinning it to
+    /// a single slot would mint one edge connection per slot for no gain.
+    #[serde(default, skip_serializing_if = "not_declared")]
+    pub ingress: IngressProvider,
     /// Provider slots, keyed by role (`"static"`, `"compute"`, …). Each value
     /// either references a provider declared under `.yah/infra/providers/` or
     /// inlines a local-only provider (no creds, no infra file).
     #[serde(default)]
     pub providers: BTreeMap<String, MirrorProviderSlot>,
+    /// Capability→driver bindings, keyed by **capability** (`"pg"`, `"s3"`, …)
+    /// rather than by slot role (W265 §Drivers).
+    ///
+    /// This is the generalization of [`Self::providers`]: `providers.static` /
+    /// `providers.object_store` are the special case where the slot name and
+    /// the capability happen to coincide, and keying by capability is what stops
+    /// the slot enum growing one arm per tier-specific implementation. A service
+    /// says "I need pg"; the mirror says which implementation of pg *this tier*
+    /// uses; the app talks the same wire protocol either way and never forks.
+    ///
+    /// ```toml
+    /// [drivers.pg]
+    /// kind = "local-pg-dev"     # dev  — kamaji-supervised loopback postgres
+    /// ```
+    ///
+    /// Additive in P1: `drivers` lands *alongside* `providers`, and migrating
+    /// the existing `providers.static` / `providers.object_store` declarations
+    /// over is a separate pass (W265 §"Open follow-ups"). A mirror that declares
+    /// neither is unchanged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub drivers: BTreeMap<String, MirrorProviderSlot>,
     /// Per-environment alias overrides for `kind = "static-asset"` components.
     ///
     /// Keys are logical names (e.g. `"whisper-default"`); values must be
@@ -1442,6 +2188,12 @@ pub struct MirrorConfig {
     /// from the catalog. Validated against the workload catalog at sync time.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub asset_aliases: BTreeMap<String, String>,
+}
+
+/// `skip_serializing_if` predicate for [`MirrorConfig::ingress`] — an
+/// undeclared front door round-trips as an absent key, not `ingress = "none"`.
+fn not_declared(ingress: &IngressProvider) -> bool {
+    !ingress.is_declared()
 }
 
 impl MirrorConfig {
@@ -1720,6 +2472,61 @@ impl RequiredSpec {
     }
 }
 
+/// Which front door actually serves a domain's requests (R594-F12).
+///
+/// Every domain manifest must say this out loud. Before it existed the
+/// difference between "R2 serves this hostname directly" and "a Worker
+/// serves it" was expressed *only* by whether the file happened to carry
+/// `[[routes]]` — so binding a route-carrying domain straight to R2 was
+/// accepted silently and served 200s on its SSG half while losing clean
+/// URLs, SPA shell fallback, deferred-route pointers and branded error
+/// pages. All of those live in the Worker
+/// (`oss/mesofact/packages/mesofact-edge/src/router.ts`) or in
+/// mesofact-serve; an R2 custom domain has none of them.
+///
+/// The vocabulary mirrors `scripts/cf-apex-mode.sh` (worker | grey | orange)
+/// — this moves the choice into the config where it can be checked instead
+/// of living in one bash script.
+///
+/// A front door does **fan-in** only. The render cube (SSG / SPA / SSR /
+/// deferred / 404) is mesofact's manifest, not this one — see W173 and
+/// `.yah/docs/working/W267-sovereign-public-ingress.md`
+/// §"Two front doors, one render contract".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum FrontDoor {
+    /// Cloudflare R2 custom domain. Requests hit R2 objects with edge
+    /// caching and nothing else — no clean URLs, no SPA fallback, no
+    /// branded errors. Correct for a pure asset tier (W175's verdict for
+    /// `cdn.yah.dev`) and wrong for anything that renders pages.
+    /// Implies zero `[[routes]]` and no `worker_bundle_path`.
+    BucketDirect,
+    /// Cloudflare Worker generated from this manifest's route table.
+    Worker,
+    /// Sovereign L7 ingress — the `passway` proxy on yah-owned metal
+    /// (`oss/passway`, W267). Same route table as `worker`; different
+    /// machine terminates TLS.
+    Passway,
+}
+
+impl FrontDoor {
+    /// Whether this front door consumes the manifest's `[[routes]]` table.
+    /// `bucket-direct` does not; the other two are nothing without it.
+    pub fn is_route_driven(self) -> bool {
+        matches!(self, FrontDoor::Worker | FrontDoor::Passway)
+    }
+
+    /// The manifest spelling, for error messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FrontDoor::BucketDirect => "bucket-direct",
+            FrontDoor::Worker => "worker",
+            FrontDoor::Passway => "passway",
+        }
+    }
+}
+
 /// A routing manifest for one domain, from `.yah/domains/<name>.toml`.
 ///
 /// The domain manifest is the *only* place that knows about path routing:
@@ -1737,6 +2544,11 @@ pub struct DomainConfig {
     /// The fully-qualified domain this manifest routes for. Example:
     /// `"yah.dev"`, `"app.yah.dev"`.
     pub domain: String,
+    /// Which front door serves this domain (R594-F12). **Required** — a
+    /// default here would silently re-create the defect the field exists to
+    /// close. Cross-checked against `routes` / `worker_bundle_path` by
+    /// [`DomainConfig::validate_front_door`] at load time.
+    pub front_door: FrontDoor,
     /// Public CDN bucket name. Static-mode route components publish into
     /// this bucket. Owned by the domain, *not* by any single service.
     pub cdn_bucket: String,
@@ -1805,11 +2617,67 @@ fn default_redirect_status() -> u16 {
 }
 
 impl DomainConfig {
-    /// Parse a single `.yah/domains/<name>.toml`.
+    /// Parse a single `.yah/domains/<name>.toml`, rejecting a manifest whose
+    /// declared front door contradicts its route table
+    /// ([`Self::validate_front_door`]).
     pub fn load(path: &Path) -> Result<Self> {
         let src =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))
+        let dom: Self =
+            toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
+        dom.validate_front_door()
+            .with_context(|| format!("validating {}", path.display()))?;
+        Ok(dom)
+    }
+
+    /// R594-F12 — the front door must agree with the rest of the manifest.
+    ///
+    /// - `bucket-direct` is an R2 custom domain: a Worker route table would
+    ///   never be consulted, so declaring one means the author expected
+    ///   Worker behaviour (clean URLs, SPA fallback, branded errors) from a
+    ///   surface that cannot provide it. Rejected rather than silently
+    ///   ignored. Same for `worker_bundle_path` — nothing would deploy it.
+    /// - `worker` / `passway` with an empty route table is a silent 404
+    ///   machine: the front door exists, has nothing to serve, and every
+    ///   request falls through to the catch-all.
+    ///
+    /// Called from [`Self::load`], so both [`CloudConfig::load`] and
+    /// [`CloudConfig::load_from_config_dir`] enforce it.
+    pub fn validate_front_door(&self) -> Result<()> {
+        match self.front_door {
+            FrontDoor::BucketDirect => {
+                if let Some(route) = self.routes.first() {
+                    anyhow::bail!(
+                        "front_door = \"bucket-direct\" but routes[0].path = \"{}\" — \
+                         an R2 custom domain never consults a route table, so this \
+                         route would silently do nothing (no clean URLs, no SPA \
+                         fallback, no branded errors). Set front_door = \"worker\" \
+                         (or \"passway\") to keep the routes, or drop the [[routes]] \
+                         to keep the bucket-direct binding.",
+                        route.path
+                    );
+                }
+                if let Some(path) = &self.worker_bundle_path {
+                    anyhow::bail!(
+                        "front_door = \"bucket-direct\" but worker_bundle_path = \
+                         \"{path}\" — nothing deploys a Worker bundle for a domain \
+                         bound straight to R2"
+                    );
+                }
+            }
+            FrontDoor::Worker | FrontDoor::Passway => {
+                if self.routes.is_empty() {
+                    anyhow::bail!(
+                        "front_door = \"{}\" but [[routes]] is empty — a front door \
+                         with no route table is a silent 404 machine. Declare at \
+                         least one route, or set front_door = \"bucket-direct\" if \
+                         this domain really is served straight from R2.",
+                        self.front_door.as_str()
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Persist to `.yah/domains/<name>.toml`, creating the domains
@@ -1845,6 +2713,334 @@ impl RouteMode {
     }
 }
 
+// ─── Service-group vault (R706 / W294) ───────────────────────────────────────
+
+/// A camp's declaration of one cluster secret, from
+/// `.yah/infra/secrets/<slug>.toml`.
+///
+/// This is the *authoring* side of the fleet's cluster-secret store: it names
+/// where the value lives in the camp (a `fob` vault slot), what the fleet should
+/// call it, and — the point of R706 — which workloads are allowed to mount it.
+///
+/// The declaration is not itself the enforcement point. `yah cloud secret put`
+/// reads this file, seals the vault value under the cluster KEK, and ships the
+/// ciphertext **with its access rule** into raft; yubaba's `ClusterResolver`
+/// evaluates the rule on the node at mount time. Deleting this file does not
+/// revoke anything — the record in raft is the live authority. That asymmetry is
+/// deliberate: a rule that lived only in a git-tracked camp file would be
+/// trivially bypassed by anyone who could reach the fleet without the camp.
+///
+/// ```toml
+/// #:schema ../../schema/secret.toml.schema.json
+/// schema_version = 1
+/// name = "cheers/cloud-admin/verify-key"
+/// vault_slot = "cheers-cloud-admin-verify-key"
+/// description = "Ed25519 public key yah-cloud-admin verifies operator PASETOs with"
+///
+/// [access]
+/// workloads = [{ workload = "yah-cloud-admin" }]
+///
+/// [target]
+/// kind = "file"
+/// path = "/run/secrets/cheers-verify.key"
+/// mode = 0o400
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct SecretConfig {
+    pub schema_version: u32,
+
+    /// Logical cluster-secret key, as `SecretRef::Cluster { name }` spells it —
+    /// e.g. `"tls/yah.dev/cert"`, `"cheers/cloud-admin/verify-key"`. May contain
+    /// `/`; the file stem is a filesystem-safe slug and carries no meaning.
+    pub name: String,
+
+    /// The `fob` vault slot in this camp holding the plaintext value. Read by
+    /// `yah cloud secret put` at ship time and never recorded anywhere else — in
+    /// particular the value is not in this file, so the declaration is safe to
+    /// commit.
+    pub vault_slot: String,
+
+    /// Human note for `yah cloud secret ls`. What this secret is and who minted
+    /// it — the thing nobody remembers 6 months later.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// How the vault slot's text decodes into the bytes the consumer expects.
+    ///
+    /// `fob` slots hold strings, but plenty of real secrets are **binary** — an
+    /// Ed25519 key is exactly 32 raw bytes, and `yah-cloud-admin` rejects a key
+    /// file of any other length. Without this field the only way to ship such a
+    /// key would be to hope its bytes happened to be valid UTF-8, which for a
+    /// random key they are not.
+    ///
+    /// Defaults to [`SecretEncoding::Utf8`] — the right answer for tokens,
+    /// passwords, and PEM, which is most secrets.
+    #[serde(default)]
+    pub encoding: SecretEncoding,
+
+    /// Who may mount it. Stamped onto the raft record verbatim.
+    ///
+    /// Defaults to [`SecretAccess::default`] — the deny-all empty allow-list. A
+    /// declaration that forgets this field produces a secret nobody can mount,
+    /// which is the correct direction to fail in.
+    #[serde(default)]
+    pub access: SecretAccess,
+
+    /// Advisory: the mount shape a consuming workload should declare. Not
+    /// enforced — yubaba honours whatever the `WorkloadSpec` asks for — but it
+    /// lets `yah cloud secret put` print the exact `SecretMount` to paste, so
+    /// the consumer and the declaration can't drift on path or mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<SecretTargetDecl>,
+}
+
+/// How a [`SecretConfig`]'s vault text becomes the bytes delivered to the
+/// container (R706 / W294).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum SecretEncoding {
+    /// Ship the vault string's UTF-8 bytes verbatim. Tokens, passwords, PEM.
+    #[default]
+    Utf8,
+    /// The vault string is hex; ship the decoded bytes. Use for binary key
+    /// material — e.g. a raw Ed25519 key, which must land as exactly 32 bytes.
+    Hex,
+}
+
+/// Advisory mount shape on a [`SecretConfig`]. Mirrors
+/// `workload_spec::SecretTarget` in a TOML-friendly, externally-tagged-free
+/// shape (a `kind` discriminator reads better in a hand-written manifest than
+/// serde's default enum encoding).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum SecretTargetDecl {
+    /// Mounted as a tmpfs-backed file inside the container.
+    File {
+        /// Absolute path inside the container.
+        path: String,
+        /// Unix permission bits. Defaults to `0o400` (owner-read-only).
+        #[serde(default = "default_secret_mode")]
+        mode: u32,
+    },
+    /// Injected as an environment variable. Prefer `file` — env vars leak
+    /// through subprocess environments and log dumps.
+    EnvVar { name: String },
+}
+
+fn default_secret_mode() -> u32 {
+    0o400
+}
+
+impl SecretTargetDecl {
+    /// The `workload_spec` target this declaration describes.
+    pub fn to_target(&self) -> workload_spec::SecretTarget {
+        match self {
+            Self::File { path, mode } => workload_spec::SecretTarget::File {
+                path: path.into(),
+                mode: *mode,
+            },
+            Self::EnvVar { name } => workload_spec::SecretTarget::EnvVar { name: name.clone() },
+        }
+    }
+}
+
+impl SecretConfig {
+    /// Parse a single `.yah/infra/secrets/<slug>.toml`.
+    pub fn load(path: &Path) -> Result<Self> {
+        let src =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let cfg: Self =
+            toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
+        cfg.validate()
+            .with_context(|| format!("validating {}", path.display()))?;
+        Ok(cfg)
+    }
+
+    /// Load every declaration in `dir`, keyed by logical secret name. A missing
+    /// directory is an empty map (a camp with no cluster secrets is normal).
+    ///
+    /// Two files declaring the same `name` is a hard error, not a last-writer-
+    /// wins merge: they would race to define the access rule for one record, and
+    /// whichever lost would look correct in git while being inert on the fleet.
+    pub fn load_dir(dir: &Path) -> Result<BTreeMap<String, Self>> {
+        let mut out: BTreeMap<String, Self> = BTreeMap::new();
+        if !dir.exists() {
+            return Ok(out);
+        }
+        for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+            let path = entry?.path();
+            if path.extension().is_none_or(|e| e != "toml") {
+                continue;
+            }
+            let cfg = Self::load(&path)?;
+            if let Some(prev) = out.insert(cfg.name.clone(), cfg) {
+                anyhow::bail!(
+                    "two secret declarations both claim name {:?} (one of them is {}); \
+                     a cluster secret must have exactly one declaration so its access \
+                     rule has one author",
+                    prev.name,
+                    path.display()
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reject declarations that would produce an unusable or dangerous record.
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            anyhow::bail!("`name` must not be empty");
+        }
+        if self.vault_slot.trim().is_empty() {
+            anyhow::bail!(
+                "`vault_slot` must not be empty — it names the fob slot holding the value"
+            );
+        }
+        // A deny-all rule is a *valid* record (it is the fail-closed default the
+        // resolver relies on) but it is never a useful thing to deliberately
+        // ship, so catching it here saves an operator the round-trip of
+        // deploying a workload that mysteriously can't see its own secret.
+        if let SecretAccess::Workloads(entries) = &self.access {
+            if entries.is_empty() {
+                anyhow::bail!(
+                    "`[access]` admits nobody: list the workloads allowed to mount {:?} \
+                     (e.g. `workloads = [{{ workload = \"my-service\" }}]`), or set \
+                     `access = \"allow_any\"` to store it unrestricted",
+                    self.name
+                );
+            }
+            if let Some(bad) = entries.iter().find(|e| e.workload.trim().is_empty()) {
+                anyhow::bail!("`[access]` entry has an empty `workload` name: {bad:?}");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod secret_config_tests {
+    use super::*;
+
+    fn parse(body: &str) -> Result<SecretConfig> {
+        let cfg: SecretConfig = toml::from_str(body)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    #[test]
+    fn minimal_declaration_parses_with_narrow_defaults() {
+        let cfg = parse(
+            r#"
+schema_version = 1
+name = "svc/token"
+vault_slot = "svc-token"
+[access]
+workloads = [{ workload = "svc" }]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.encoding, SecretEncoding::Utf8, "text is the default");
+        assert!(cfg.target.is_none());
+        // The omitted tenant/namespace must narrow to the singletons, not widen
+        // to a wildcard.
+        assert!(cfg
+            .access
+            .admits(&workload_spec::secrets::SecretConsumer::workload("svc")));
+        assert!(!cfg
+            .access
+            .admits(&workload_spec::secrets::SecretConsumer::workload("other")));
+    }
+
+    #[test]
+    fn allow_any_is_spelled_as_a_bare_string() {
+        // The operator-facing spelling, pinned: `access = "allow_any"`.
+        let cfg = parse(
+            r#"
+schema_version = 1
+name = "public/thing"
+vault_slot = "slot"
+access = "allow_any"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.access, SecretAccess::AllowAny);
+    }
+
+    #[test]
+    fn a_declaration_with_no_access_block_is_rejected() {
+        // Omitting `[access]` defaults to deny-all, which is the correct
+        // *runtime* default but never a correct authoring intent — so it must
+        // not silently produce a secret nobody can mount.
+        let err = parse(
+            r#"
+schema_version = 1
+name = "svc/token"
+vault_slot = "svc-token"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("admits nobody"), "got {err}");
+    }
+
+    #[test]
+    fn empty_name_or_slot_is_rejected() {
+        assert!(parse(
+            r#"
+schema_version = 1
+name = ""
+vault_slot = "slot"
+access = "allow_any"
+"#
+        )
+        .is_err());
+        assert!(parse(
+            r#"
+schema_version = 1
+name = "x"
+vault_slot = "  "
+access = "allow_any"
+"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn target_declaration_maps_onto_the_workload_spec_type() {
+        let cfg = parse(
+            r#"
+schema_version = 1
+name = "svc/token"
+vault_slot = "slot"
+access = "allow_any"
+[target]
+kind = "file"
+path = "/run/secrets/t"
+"#,
+        )
+        .unwrap();
+        match cfg.target.unwrap().to_target() {
+            workload_spec::SecretTarget::File { path, mode } => {
+                assert_eq!(path, std::path::PathBuf::from("/run/secrets/t"));
+                assert_eq!(mode, 0o400, "owner-read-only by default");
+            }
+            other => panic!("expected File, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_dir_is_empty_for_a_camp_with_no_secrets() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(SecretConfig::load_dir(&tmp.path().join("nope"))
+            .unwrap()
+            .is_empty());
+    }
+}
+
 /// Split a `"<service>/<component-id>"` ref. Returns `None` if the ref
 /// isn't shaped like `service/component`.
 fn split_component_ref(s: &str) -> Option<(&str, &str)> {
@@ -1872,7 +3068,10 @@ mod tests {
             zone: None,
             arch: None,
             bucket: None,
-            hostkey_fingerprint: None,
+            vendor: None,
+            nickname: None,
+            legacy_hostkey_fingerprint: None,
+            registration: Default::default(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -1902,6 +3101,8 @@ mod tests {
             workspace_root: PathBuf::new(),
             machines,
             providers: vec![],
+            machine_origins: BTreeMap::new(),
+            provider_origins: BTreeMap::new(),
             services: BTreeMap::new(),
             domains: BTreeMap::new(),
             legacy_mirrors: vec![],
@@ -1962,7 +3163,10 @@ auth_token_env = "SCRABCAKE_TURSO_TOKEN"
         assert_eq!(svc.db.pond[0].port, Some(5433));
         assert_eq!(svc.db.pond[0].kind, PondDbKind::Turso); // default
         assert_eq!(svc.db.pond[1].kind, PondDbKind::Postgres);
-        assert_eq!(svc.db.cloud[0].auth_token_env.as_deref(), Some("SCRABCAKE_TURSO_TOKEN"));
+        assert_eq!(
+            svc.db.cloud[0].auth_token_env.as_deref(),
+            Some("SCRABCAKE_TURSO_TOKEN")
+        );
     }
 
     #[test]
@@ -1972,7 +3176,10 @@ auth_token_env = "SCRABCAKE_TURSO_TOKEN"
         assert!(svc.db.is_empty());
         // And an empty [db] must not appear when re-serialized.
         let out = toml::to_string(&svc).unwrap();
-        assert!(!out.contains("[db"), "empty db table should be skipped: {out}");
+        assert!(
+            !out.contains("[db"),
+            "empty db table should be skipped: {out}"
+        );
     }
 
     #[test]
@@ -2068,6 +3275,47 @@ url = "postgres://shared/analytics"
         )]);
         let ws = ws_with_selector(Some("tag:build-worker,tier:x86"));
         assert!(cfg.admit_workload(&ws).is_err());
+    }
+
+    /// R555-S1 regression: with TWO nodes carrying the same tag set, which one
+    /// admits must be decided by *declaration order* (file name), which is the
+    /// contract `admit_workload` documents — not by `read_dir` order, which is
+    /// filesystem-dependent and can change when an unrelated file appears in
+    /// the directory. Written creation-order-reversed so a filesystem that
+    /// yields creation order (rather than sorted order) trips it without the
+    /// sort in `load_dir`.
+    ///
+    /// Live consequence this guards: `.yah/infra/machines/` carries both
+    /// us-west-002 and us-west-003 on `[tag:build-worker, tier:x86, os:linux]`,
+    /// so an x86 QED offload has two equal candidates. Unstable selection means
+    /// a retried build cannot be relied on to land back on the node whose
+    /// working state it left behind.
+    #[test]
+    fn equally_matching_machines_admit_in_file_name_order() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let machines = tmp.path().join(".yah").join("infra").join("machines");
+        std::fs::create_dir_all(&machines).unwrap();
+        let toml_for = |name: &str| {
+            format!(
+                r#"name = "{name}"
+provider = "static"
+mesh_tags = ["tag:build-worker", "tier:x86"]
+"#
+            )
+        };
+        // Reverse-of-sorted creation order on purpose.
+        std::fs::write(machines.join("b-second.toml"), toml_for("b-second")).unwrap();
+        std::fs::write(machines.join("a-first.toml"), toml_for("a-first")).unwrap();
+
+        let cfg = CloudConfig::load(tmp.path()).unwrap();
+        assert_eq!(
+            cfg.machines.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["a-first", "b-second"],
+            "machines must load in file-name order, not read_dir order"
+        );
+
+        let ws = ws_with_selector(Some("tag:build-worker,tier:x86"));
+        assert_eq!(cfg.admit_workload(&ws).unwrap().name, "a-first");
     }
 
     #[test]
@@ -2206,7 +3454,10 @@ mesh_tags = ["tag:cloud-runner"]
                 name: "test-assets-pdx-1".into(),
                 public_read: false,
             }),
-            hostkey_fingerprint: None,
+            vendor: None,
+            nickname: None,
+            legacy_hostkey_fingerprint: None,
+            registration: Default::default(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -2407,7 +3658,10 @@ mesh_tags = ["tag:cloud-runner"]
                 name: "noisetable-assets-pdx-1".into(),
                 public_read: false,
             }),
-            hostkey_fingerprint: None,
+            vendor: None,
+            nickname: None,
+            legacy_hostkey_fingerprint: None,
+            registration: Default::default(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -2588,6 +3842,137 @@ mesh_tags = ["tag:cloud-runner"]
         assert_eq!(cfg.workload("asset-registry").unwrap().spec.replicas, 1);
     }
 
+    /// Minimal valid spec for the R215+ loader tests below. Kept as a helper so
+    /// the two tests differ only in *where* the file lands, which is the whole
+    /// thing under test.
+    #[cfg(test)]
+    fn minimal_spec(name: &str, replicas: u32) -> workload_spec::WorkloadSpec {
+        use workload_spec::{
+            ExposeSpec, ImageRef, MeshExpose, MeshIdent, NamespaceId, ResourceLimits,
+            RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
+        };
+        WorkloadSpec {
+            schema_version: SchemaVersion::V1,
+            name: name.into(),
+            image: ImageRef {
+                registry: "cr.yah.dev".into(),
+                repository: name.into(),
+                tag: "v1".into(),
+                digest: workload_spec::testing::test_digest(),
+            },
+            tier: TierTag("infra".into()),
+            replicas,
+            command: None,
+            entrypoint: None,
+            workdir: None,
+            user: None,
+            env: vec![],
+            secrets: vec![],
+            volumes: vec![],
+            resources: ResourceLimits {
+                memory_mb: 256,
+                cpu_millis: 250,
+                ephemeral_storage_mb: 128,
+            },
+            depends_on: vec![],
+            healthcheck: None,
+            restart_policy: RestartPolicy::Always,
+            archetype: None,
+            stop_policy: StopPolicy {
+                signal: 15,
+                grace_period: workload_spec::Millis::from_secs(10),
+            },
+            expose: ExposeSpec {
+                mesh: MeshExpose {
+                    identity: MeshIdent(name.into()),
+                    ports: vec![4325],
+                    allow_from: vec![],
+                },
+                public: None,
+                operator: None,
+            },
+            tenant: TenantId::singleton(),
+            namespace: NamespaceId::singleton(),
+            labels: Default::default(),
+            annotations: Default::default(),
+        }
+    }
+
+    /// R568-T7. Workloads must load from the R215+ tree.
+    ///
+    /// Before the fix this function tested, `CloudConfig::load` read workloads
+    /// ONLY from the pre-R215 `.yah/cloud/workloads/` — which R222-B1 emptied —
+    /// so in any modern camp `cfg.workload(name)` returned `None` for every
+    /// name and the entire `yah cloud workload …` surface was unreachable. The
+    /// CLI's own error text has said `.yah/infra/workloads/` throughout, so the
+    /// bug read as "you must have typoed the filename".
+    ///
+    /// Note the fixture writes NO legacy `.yah/cloud/` dir at all: that is the
+    /// shape of a real post-R215 camp, and it is exactly the shape the old code
+    /// could not serve.
+    #[test]
+    fn workloads_load_from_the_infra_tree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let dir = crate::paths::workloads_dir(root);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("yah-cloud-admin.toml"),
+            toml::to_string_pretty(&minimal_spec("yah-cloud-admin", 1)).unwrap(),
+        )
+        .unwrap();
+
+        let cfg = CloudConfig::load(root).unwrap();
+        assert_eq!(cfg.workloads.len(), 1);
+        assert_eq!(
+            cfg.workload("yah-cloud-admin").unwrap().spec.replicas,
+            1,
+            "a workload declared under .yah/infra/workloads/ must be resolvable by name"
+        );
+    }
+
+    /// A camp mid-migration can have both trees. R215+ wins on a name
+    /// collision — same precedence the machine loader applies — so moving a
+    /// declaration into `.yah/infra/workloads/` takes effect immediately
+    /// instead of being silently shadowed by the copy left behind.
+    #[test]
+    fn infra_workload_shadows_the_legacy_copy_of_the_same_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let legacy = make_legacy_cloud_dir(root);
+        std::fs::create_dir_all(legacy.join("workloads")).unwrap();
+        std::fs::write(
+            legacy.join("workloads/shared.toml"),
+            toml::to_string_pretty(&minimal_spec("shared", 9)).unwrap(),
+        )
+        .unwrap();
+        // Legacy-only name, to prove the old tree is still read rather than
+        // replaced wholesale.
+        std::fs::write(
+            legacy.join("workloads/legacy-only.toml"),
+            toml::to_string_pretty(&minimal_spec("legacy-only", 3)).unwrap(),
+        )
+        .unwrap();
+
+        let infra = crate::paths::workloads_dir(root);
+        std::fs::create_dir_all(&infra).unwrap();
+        std::fs::write(
+            infra.join("shared.toml"),
+            toml::to_string_pretty(&minimal_spec("shared", 1)).unwrap(),
+        )
+        .unwrap();
+
+        let cfg = CloudConfig::load(root).unwrap();
+        assert_eq!(cfg.workloads.len(), 2, "one `shared`, plus `legacy-only`");
+        assert_eq!(
+            cfg.workload("shared").unwrap().spec.replicas,
+            1,
+            "the .yah/infra/ copy must win over the legacy one"
+        );
+        assert_eq!(cfg.workload("legacy-only").unwrap().spec.replicas, 3);
+    }
+
     #[test]
     fn workload_loader_rejects_bad_spec() {
         use workload_spec::{
@@ -2750,7 +4135,10 @@ mesh_tags = ["tag:cloud-runner"]
             zone: None,
             arch: None,
             bucket: None,
-            hostkey_fingerprint: None,
+            vendor: None,
+            nickname: None,
+            legacy_hostkey_fingerprint: None,
+            registration: Default::default(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -2761,15 +4149,13 @@ mesh_tags = ["tag:cloud-runner"]
         machine.save(root).unwrap();
 
         // Simulate A4: write back the hostkey fingerprint after provision.
-        machine.hostkey_fingerprint = Some("SHA256:abc123".into());
+        // R707-T1: registration is the write target; the accessor is the read.
+        machine.registration.hostkey_fingerprint = Some("SHA256:abc123".into());
         machine.save(root).unwrap();
 
         let reloaded: Vec<MachineConfig> = load_dir(root.join("machines")).unwrap();
         assert_eq!(reloaded.len(), 1);
-        assert_eq!(
-            reloaded[0].hostkey_fingerprint.as_deref(),
-            Some("SHA256:abc123")
-        );
+        assert_eq!(reloaded[0].hostkey_fingerprint(), Some("SHA256:abc123"));
     }
 
     // ─── New-shape (R222 B2) parse tests ────────────────────────────────────
@@ -3138,10 +4524,247 @@ arch = "x86_64"
         assert_eq!(cfg.location(), ""); // accessor defaults empty
         let c = cfg.connect.as_ref().expect("connect block");
         assert_eq!(c.ssh, "root@45.32.194.254");
-        assert_eq!(c.yubaba, "http://127.0.0.1:7443");
+        // Loopback is a *declared* reach placeholder, so it stays in [connect]
+        // verbatim and composes straight through (R707-T1).
+        assert_eq!(c.yubaba.as_deref(), Some("http://127.0.0.1:7443"));
+        assert_eq!(cfg.yubaba_url().as_deref(), Some("http://127.0.0.1:7443"));
+        assert_eq!(cfg.mesh_ipv4(), None);
         // Static providers have no driver, so validate() is a no-op pass.
         assert!(!provider_has_machine_driver(&cfg.provider));
         cfg.validate().unwrap();
+    }
+
+    // ─── R707-T1: declaration / registration split ──────────────────────────
+
+    /// The pre-split shape — top-level `hostkey_fingerprint`, mesh IP baked
+    /// into `[connect].yubaba` — must keep parsing, and must read back through
+    /// the accessors identically. Every machine TOML in the fleet was written
+    /// this way, and other camps' inventories still are.
+    #[test]
+    fn legacy_shape_still_parses_and_reads_through_accessors() {
+        let src = r#"
+name = "us-west-001"
+provider = "static"
+region = "us-west"
+arch = "x86_64"
+mesh_tags = ["tag:cloud-runner"]
+hostkey_fingerprint = "SHA256:dmpq"
+
+[connect]
+address = "15.204.89.240"
+ssh = "debian@15.204.89.240"
+yubaba = "http://100.64.0.1:7443"
+"#;
+        let cfg: MachineConfig = toml::from_str(src).unwrap();
+        assert_eq!(cfg.hostkey_fingerprint(), Some("SHA256:dmpq"));
+        assert_eq!(cfg.mesh_ipv4(), Some("100.64.0.1"));
+        assert_eq!(cfg.yubaba_url().as_deref(), Some("http://100.64.0.1:7443"));
+    }
+
+    /// The post-split shape reads identically to the legacy one above — same
+    /// three accessor answers from a file that separates the two halves. This
+    /// is the "unchanged in meaning" guarantee the fleet migration rests on.
+    #[test]
+    fn split_shape_is_equivalent_to_legacy_shape() {
+        let legacy = r#"
+name = "m"
+provider = "static"
+mesh_tags = []
+hostkey_fingerprint = "SHA256:dmpq"
+
+[connect]
+address = "15.204.89.240"
+ssh = "debian@15.204.89.240"
+yubaba = "http://100.64.0.1:7443"
+"#;
+        let split = r#"
+name = "m"
+provider = "static"
+mesh_tags = []
+
+[connect]
+address = "15.204.89.240"
+ssh = "debian@15.204.89.240"
+
+[registration]
+hostkey_fingerprint = "SHA256:dmpq"
+mesh_ipv4 = "100.64.0.1"
+"#;
+        let old: MachineConfig = toml::from_str(legacy).unwrap();
+        let new: MachineConfig = toml::from_str(split).unwrap();
+        assert_eq!(old.hostkey_fingerprint(), new.hostkey_fingerprint());
+        assert_eq!(old.mesh_ipv4(), new.mesh_ipv4());
+        assert_eq!(old.yubaba_url(), new.yubaba_url());
+    }
+
+    /// A non-default `[connect].yubaba_port` is declared reach and composes
+    /// with the observed mesh address rather than being pinned into a URL.
+    #[test]
+    fn declared_port_composes_with_observed_mesh_address() {
+        let src = r#"
+name = "m"
+provider = "static"
+mesh_tags = []
+
+[connect]
+address = "10.0.0.1"
+ssh = "yah@10.0.0.1"
+yubaba_port = 9443
+
+[registration]
+mesh_ipv4 = "100.64.0.9"
+"#;
+        let cfg: MachineConfig = toml::from_str(src).unwrap();
+        assert_eq!(cfg.connect.as_ref().unwrap().yubaba_port(), 9443);
+        assert_eq!(cfg.yubaba_url().as_deref(), Some("http://100.64.0.9:9443"));
+    }
+
+    /// R707-T6: the case no other test here exercises — a node that declares
+    /// BOTH a non-loopback `[connect].yubaba` literal AND a registered
+    /// `mesh_ipv4` (us-west-014's shape: mesh-joined, but its raft peers are
+    /// LAN-only so the literal is what `rollout::yubaba::membership_to_nodes`
+    /// needs). The declared literal must win — that's the whole point of the
+    /// flip; before it, `mesh_ipv4` unconditionally won and this node's LAN
+    /// URL was unreachable through `yubaba_url()`.
+    #[test]
+    fn a_declared_literal_wins_over_a_registered_mesh_address() {
+        let src = r#"
+name = "us-west-014"
+provider = "static"
+mesh_tags = []
+
+[connect]
+address = "192.168.10.14"
+ssh = "yah@192.168.10.14"
+yubaba = "http://192.168.10.14:7443"
+
+[registration]
+mesh_ipv4 = "100.64.0.6"
+"#;
+        let cfg: MachineConfig = toml::from_str(src).unwrap();
+        assert_eq!(cfg.mesh_ipv4(), Some("100.64.0.6"), "still mesh-joined");
+        assert_eq!(
+            cfg.yubaba_url().as_deref(),
+            Some("http://192.168.10.14:7443"),
+            "the declared LAN literal must win over the registered mesh address"
+        );
+    }
+
+    /// `normalize` migrates in place: the legacy fingerprint moves into
+    /// `[registration]`, the mesh IP is lifted out of the URL, and the derived
+    /// `[connect].yubaba` is cleared so the two halves cannot drift.
+    #[test]
+    fn normalize_migrates_legacy_fields_and_is_idempotent() {
+        let src = r#"
+name = "m"
+provider = "static"
+mesh_tags = []
+hostkey_fingerprint = "SHA256:dmpq"
+
+[connect]
+address = "15.204.89.240"
+ssh = "debian@15.204.89.240"
+yubaba = "http://100.64.0.1:7443"
+"#;
+        let mut cfg: MachineConfig = toml::from_str(src).unwrap();
+        cfg.normalize();
+        assert!(cfg.legacy_hostkey_fingerprint.is_none());
+        assert_eq!(
+            cfg.registration.hostkey_fingerprint.as_deref(),
+            Some("SHA256:dmpq")
+        );
+        assert_eq!(cfg.registration.mesh_ipv4.as_deref(), Some("100.64.0.1"));
+        assert!(cfg.connect.as_ref().unwrap().yubaba.is_none());
+        // Accessors still answer the same, and re-running changes nothing.
+        assert_eq!(cfg.yubaba_url().as_deref(), Some("http://100.64.0.1:7443"));
+        let once = format!("{cfg:?}");
+        cfg.normalize();
+        assert_eq!(once, format!("{cfg:?}"));
+    }
+
+    /// A loopback `[connect].yubaba` is a declaration ("no mesh address yet —
+    /// reach me through the SSH tunnel"), not a stale observation, so
+    /// `normalize` must leave it alone. us-west-003/011/013 depend on this.
+    #[test]
+    fn normalize_leaves_pre_mesh_loopback_declaration_intact() {
+        let src = r#"
+name = "m"
+provider = "static"
+mesh_tags = []
+
+[connect]
+address = "192.168.10.11"
+ssh = "yah@192.168.10.11"
+yubaba = "http://127.0.0.1:7443"
+"#;
+        let mut cfg: MachineConfig = toml::from_str(src).unwrap();
+        cfg.normalize();
+        assert_eq!(
+            cfg.connect.as_ref().unwrap().yubaba.as_deref(),
+            Some("http://127.0.0.1:7443")
+        );
+        assert!(cfg.registration.is_empty());
+        assert_eq!(cfg.mesh_ipv4(), None);
+    }
+
+    /// `save` normalizes, so a legacy file that round-trips through the writer
+    /// comes back on the split shape with nothing lost — the property that
+    /// keeps `yah cloud machine attach` from re-emitting the old layout.
+    #[test]
+    fn save_writes_the_split_shape_from_a_legacy_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let src = r#"
+name = "m"
+provider = "static"
+mesh_tags = []
+hostkey_fingerprint = "SHA256:dmpq"
+
+[connect]
+address = "15.204.89.240"
+ssh = "debian@15.204.89.240"
+yubaba = "http://100.64.0.1:7443"
+"#;
+        let cfg: MachineConfig = toml::from_str(src).unwrap();
+        cfg.save(root).unwrap();
+
+        let written = std::fs::read_to_string(root.join("machines/m.toml")).unwrap();
+        let reg_at = written
+            .find("[registration]")
+            .unwrap_or_else(|| panic!("no [registration] table: {written}"));
+        let fp_at = written
+            .find("hostkey_fingerprint")
+            .unwrap_or_else(|| panic!("fingerprint dropped: {written}"));
+        assert!(
+            fp_at > reg_at,
+            "legacy top-level field must not be re-emitted: {written}"
+        );
+        assert!(
+            !written.contains("yubaba ="),
+            "derived URL must not be re-emitted alongside mesh_ipv4: {written}"
+        );
+
+        let reloaded: MachineConfig = toml::from_str(&written).unwrap();
+        assert_eq!(reloaded.hostkey_fingerprint(), Some("SHA256:dmpq"));
+        assert_eq!(
+            reloaded.yubaba_url().as_deref(),
+            Some("http://100.64.0.1:7443")
+        );
+    }
+
+    /// `[registration]` is omitted entirely for a machine nothing has been
+    /// observed about — a scaffolded declaration stays clean.
+    #[test]
+    fn empty_registration_is_omitted_on_serialize() {
+        let src = r#"
+name = "m"
+provider = "static"
+mesh_tags = []
+"#;
+        let cfg: MachineConfig = toml::from_str(src).unwrap();
+        assert!(cfg.registration.is_empty());
+        let out = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!out.contains("[registration]"), "{out}");
     }
 
     #[test]
@@ -3511,6 +5134,8 @@ routes = "./routes.ts"
             schema_version: 1,
             shape: MirrorShape::SingleMachine,
             providers: providers_map,
+            ingress: Default::default(),
+            drivers: Default::default(),
             asset_aliases: Default::default(),
         };
         // Save with canonical name; legacy "prod" is normalised to "cloud" on load.
@@ -3550,6 +5175,8 @@ routes = "./routes.ts"
             schema_version: 1,
             shape: MirrorShape::Local,
             providers: BTreeMap::new(),
+            ingress: Default::default(),
+            drivers: Default::default(),
             asset_aliases: Default::default(),
         }
         .save(root, "dev-yah", "local")
@@ -3586,6 +5213,8 @@ routes = "./routes.ts"
                 schema_version: 1,
                 shape: MirrorShape::Local,
                 providers: BTreeMap::new(),
+                ingress: Default::default(),
+                drivers: Default::default(),
                 asset_aliases: Default::default(),
             }
             .save(root, "dev-yah", env)
@@ -3631,6 +5260,7 @@ routes = "./routes.ts"
             schema_version: 1,
             name: "yah-dev".into(),
             domain: "yah.dev".into(),
+            front_door: FrontDoor::Worker,
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: Some(".yah/workers/yah-dev/".into()),
             routes: vec![
@@ -3671,6 +5301,7 @@ routes = "./routes.ts"
 schema_version = 1
 name = "yah-dev"
 domain = "yah.dev"
+front_door = "worker"
 cdn_bucket = "yah-dev"
 
 [[routes]]
@@ -3702,6 +5333,7 @@ target = "https://yah.dev/blog"
             schema_version: 1,
             name: "yah-dev".into(),
             domain: "yah.dev".into(),
+            front_door: FrontDoor::Worker,
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
@@ -3733,6 +5365,7 @@ target = "https://yah.dev/blog"
             schema_version: 1,
             name: "yah-dev".into(),
             domain: "yah.dev".into(),
+            front_door: FrontDoor::BucketDirect,
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![],
@@ -3741,6 +5374,180 @@ target = "https://yah.dev/blog"
         assert!(DomainConfig::delete(root, "yah-dev").unwrap());
         assert!(!DomainConfig::delete(root, "yah-dev").unwrap());
     }
+
+    // ---- R594-F12: front-door discriminator ------------------------------
+
+    /// Write a raw domain manifest so the tests exercise the deserialize +
+    /// validate path, not a hand-built struct that skipped serde.
+    fn write_domain_toml(root: &Path, stem: &str, body: &str) {
+        let dir = root.join(".yah").join("domains");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{stem}.toml")), body).unwrap();
+    }
+
+    #[test]
+    fn front_door_is_required() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_marketing_service(root);
+        write_domain_toml(
+            root,
+            "yah-dev",
+            r#"
+schema_version = 1
+name = "yah-dev"
+domain = "yah.dev"
+cdn_bucket = "yah-dev"
+[[routes]]
+path = "/*"
+mode = "static"
+component = "yah-marketing/site"
+"#,
+        );
+        let err = CloudConfig::load(root).unwrap_err().to_string();
+        // serde's own missing-field message; the point is that omitting the
+        // discriminator is not a silently-defaulted state.
+        assert!(err.contains("yah-dev.toml"), "{err}");
+    }
+
+    #[test]
+    fn bucket_direct_with_routes_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_marketing_service(root);
+        write_domain_toml(
+            root,
+            "cdn-yah-dev",
+            r#"
+schema_version = 1
+name = "cdn-yah-dev"
+domain = "cdn.yah.dev"
+front_door = "bucket-direct"
+cdn_bucket = "yah-dev"
+[[routes]]
+path = "/docs/*"
+mode = "static"
+component = "yah-marketing/site"
+"#,
+        );
+        let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
+        assert!(err.contains("front_door"), "{err}");
+        assert!(err.contains("/docs/*"), "{err}");
+    }
+
+    #[test]
+    fn bucket_direct_with_worker_bundle_path_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_domain_toml(
+            root,
+            "cdn-yah-dev",
+            r#"
+schema_version = 1
+name = "cdn-yah-dev"
+domain = "cdn.yah.dev"
+front_door = "bucket-direct"
+cdn_bucket = "yah-dev"
+worker_bundle_path = ".yah/workers/cdn-yah-dev/"
+"#,
+        );
+        let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
+        assert!(err.contains("worker_bundle_path"), "{err}");
+    }
+
+    #[test]
+    fn worker_with_no_routes_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_domain_toml(
+            root,
+            "yah-dev",
+            r#"
+schema_version = 1
+name = "yah-dev"
+domain = "yah.dev"
+front_door = "worker"
+cdn_bucket = "yah-dev"
+"#,
+        );
+        let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
+        assert!(err.contains("front_door = \"worker\""), "{err}");
+        assert!(err.contains("404"), "{err}");
+    }
+
+    #[test]
+    fn passway_with_no_routes_is_rejected_too() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_domain_toml(
+            root,
+            "yah-dev",
+            r#"
+schema_version = 1
+name = "yah-dev"
+domain = "yah.dev"
+front_door = "passway"
+cdn_bucket = "yah-dev"
+"#,
+        );
+        let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
+        assert!(err.contains("front_door = \"passway\""), "{err}");
+    }
+
+    #[test]
+    fn bucket_direct_without_routes_loads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        // Exactly the shape .yah/domains/cdn-yah-dev.toml ships (W175: a pure
+        // asset tier deliberately has no Worker behaviours).
+        write_domain_toml(
+            root,
+            "cdn-yah-dev",
+            r#"
+schema_version = 1
+name = "cdn-yah-dev"
+domain = "cdn.yah.dev"
+front_door = "bucket-direct"
+cdn_bucket = "yah-dev"
+"#,
+        );
+        let cfg = CloudConfig::load(root).unwrap();
+        let dom = cfg.domain("cdn-yah-dev").expect("cdn-yah-dev domain");
+        assert_eq!(dom.front_door, FrontDoor::BucketDirect);
+        assert!(!dom.front_door.is_route_driven());
+    }
+
+    #[test]
+    fn front_door_round_trips_through_save() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_marketing_service(root);
+        let dom = DomainConfig {
+            schema_version: 1,
+            name: "yah-dev".into(),
+            domain: "yah.dev".into(),
+            front_door: FrontDoor::Passway,
+            cdn_bucket: "yah-dev".into(),
+            worker_bundle_path: None,
+            routes: vec![DomainRoute {
+                path: "/*".into(),
+                mode: RouteMode::Static {
+                    component: "yah-marketing/site".into(),
+                },
+            }],
+        };
+        dom.save(root).unwrap();
+        let cfg = CloudConfig::load(root).unwrap();
+        assert_eq!(
+            cfg.domain("yah-dev").unwrap().front_door,
+            FrontDoor::Passway
+        );
+    }
+
+    // The four manifests this repo actually ships are asserted in
+    // `tests/live_workspace_smoke.rs` — that's the only place with a
+    // depth-agnostic path to the live `.yah/` tree and a skip path for the
+    // standalone mirror checkout.
 
     #[test]
     fn cross_ref_bails_on_missing_service() {
@@ -3751,6 +5558,7 @@ target = "https://yah.dev/blog"
             schema_version: 1,
             name: "yah-dev".into(),
             domain: "yah.dev".into(),
+            front_door: FrontDoor::Worker,
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
@@ -3778,6 +5586,7 @@ target = "https://yah.dev/blog"
             schema_version: 1,
             name: "yah-dev".into(),
             domain: "yah.dev".into(),
+            front_door: FrontDoor::Worker,
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
@@ -3805,6 +5614,7 @@ target = "https://yah.dev/blog"
             schema_version: 1,
             name: "yah-dev".into(),
             domain: "yah.dev".into(),
+            front_door: FrontDoor::Worker,
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
@@ -3831,6 +5641,7 @@ target = "https://yah.dev/blog"
             schema_version: 1,
             name: "yah-dev".into(),
             domain: "yah.dev".into(),
+            front_door: FrontDoor::Worker,
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
@@ -3859,6 +5670,7 @@ target = "https://yah.dev/blog"
             r#"schema_version = 1
 name = "different-name"
 domain = "yah.dev"
+front_door = "bucket-direct"
 cdn_bucket = "yah-dev"
 "#,
         )
@@ -3883,6 +5695,7 @@ cdn_bucket = "yah-dev"
             schema_version: 1,
             name: "tenant-net-yah-dev".into(),
             domain: "tenant.net.yah.dev".into(),
+            front_door: FrontDoor::Worker,
             cdn_bucket: "net-yah-dev".into(), // shared per-tier bucket
             worker_bundle_path: None,
             routes: vec![DomainRoute {
@@ -3954,7 +5767,10 @@ taints = ["no-appliance"]
     fn machine_allocatable_skipped_when_none() {
         let m = make_machine("node", vec![]);
         let s = toml::to_string(&m).unwrap();
-        assert!(!s.contains("allocatable"), "None allocatable must be omitted: {s}");
+        assert!(
+            !s.contains("allocatable"),
+            "None allocatable must be omitted: {s}"
+        );
         assert!(!s.contains("taints"), "empty taints must be omitted: {s}");
     }
 
@@ -3982,7 +5798,10 @@ taints = ["no-server", "no-appliance", "no-voter"]
         taints: Vec<&str>,
     ) -> MachineConfig {
         MachineConfig {
-            allocatable: Some(NodeAllocatable { memory_mb, cpu_millis }),
+            allocatable: Some(NodeAllocatable {
+                memory_mb,
+                cpu_millis,
+            }),
             taints: taints.into_iter().map(String::from).collect(),
             ..make_machine(name, vec![])
         }
@@ -4002,7 +5821,11 @@ taints = ["no-server", "no-appliance", "no-voter"]
             vec![],
         );
         ws.archetype = Some(LifecycleArchetype::Server);
-        ws.resources = ResourceLimits { memory_mb, cpu_millis, ephemeral_storage_mb: 0 };
+        ws.resources = ResourceLimits {
+            memory_mb,
+            cpu_millis,
+            ephemeral_storage_mb: 0,
+        };
         ws
     }
 
@@ -4088,7 +5911,12 @@ taints = ["no-server", "no-appliance", "no-voter"]
             .insert(REQUIRES_TAINT_ANNOTATION.into(), PUBLIC_IP_TAINT.into());
 
         // Node without the taint: rejected.
-        let cfg = make_empty_cfg(vec![make_machine_with_capacity("no-pip", 2048, 2000, vec![])]);
+        let cfg = make_empty_cfg(vec![make_machine_with_capacity(
+            "no-pip",
+            2048,
+            2000,
+            vec![],
+        )]);
         assert!(cfg.admit_workload(&ws).is_err());
 
         // Node with the taint: accepted.
@@ -4109,11 +5937,12 @@ taints = ["no-server", "no-appliance", "no-voter"]
         // us-west-002: no-server, no-appliance, no-voter → appliance rejected
         let cfg = make_empty_cfg(vec![
             make_machine_with_capacity("us-south-001", 512, 1000, vec!["no-appliance"]),
-            make_machine_with_capacity("us-west-002", 16384, 8000, vec![
-                "no-server",
-                "no-appliance",
-                "no-voter",
-            ]),
+            make_machine_with_capacity(
+                "us-west-002",
+                16384,
+                8000,
+                vec!["no-server", "no-appliance", "no-voter"],
+            ),
             make_machine_with_capacity("us-west-001", 4096, 4000, vec![]),
         ]);
         let ws = appliance_spec_ws(256, 500);
@@ -4127,11 +5956,12 @@ taints = ["no-server", "no-appliance", "no-voter"]
         // Jobs should prefer (or at least land on) the job-only box.
         let cfg = make_empty_cfg(vec![
             make_machine_with_capacity("us-west-001", 4096, 4000, vec![]),
-            make_machine_with_capacity("us-west-002", 16384, 8000, vec![
-                "no-server",
-                "no-appliance",
-                "no-voter",
-            ]),
+            make_machine_with_capacity(
+                "us-west-002",
+                16384,
+                8000,
+                vec!["no-server", "no-appliance", "no-voter"],
+            ),
         ]);
         let mut ws = server_spec(256, 500);
         ws.archetype = Some(LifecycleArchetype::Job);
@@ -4179,7 +6009,9 @@ taints = ["no-server", "no-appliance", "no-voter"]
         // Same for an Appliance (pinned/stateful cloud-critical) workload.
         let cfg = fleet();
         assert_eq!(
-            cfg.admit_workload(&appliance_spec_ws(256, 500)).unwrap().name,
+            cfg.admit_workload(&appliance_spec_ws(256, 500))
+                .unwrap()
+                .name,
             "us-west-001",
             "an Appliance workload must never land on the no-appliance Mac node"
         );
@@ -4187,8 +6019,12 @@ taints = ["no-server", "no-appliance", "no-voter"]
         // Sharpest repulsion proof: with ONLY the Mac in the fleet, a
         // cloud-critical Server workload is rejected outright — the taint keeps
         // it off even when that means nowhere to run.
-        let mac_only =
-            make_empty_cfg(vec![make_machine_with_capacity("us-west-015", 24576, 8000, mac_taints.clone())]);
+        let mac_only = make_empty_cfg(vec![make_machine_with_capacity(
+            "us-west-015",
+            24576,
+            8000,
+            mac_taints.clone(),
+        )]);
         assert!(
             mac_only.admit_workload(&server_spec(256, 500)).is_err(),
             "a Server workload must be repelled from a Mac-only fleet, not admitted"
@@ -4203,5 +6039,479 @@ taints = ["no-server", "no-appliance", "no-voter"]
             "us-west-015",
             "a build Job must still be admitted on the Mac build-worker"
         );
+    }
+
+    // ─── R615-F1: linked infra sources (`.yah/infra/sources.toml`) ─────────
+
+    #[test]
+    fn sources_load_is_empty_when_the_file_is_absent() {
+        // "Every camp without linked infra has none" — which today is every
+        // camp — must not be an error.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = SourcesConfig::load(tmp.path()).unwrap();
+        assert_eq!(cfg, SourcesConfig::default());
+        assert!(cfg.source.is_empty());
+        assert_eq!(cfg.schema_version, 1);
+    }
+
+    #[test]
+    fn sources_parses_a_path_kind_exactly_like_w274s_example() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("sources.toml"),
+            r#"
+schema_version = 1
+
+[[source]]
+owner = "yah"
+kind  = "path"
+path  = "../yah"
+mode  = "read-only"
+"#,
+        )
+        .unwrap();
+        let cfg = SourcesConfig::load(tmp.path()).unwrap();
+        assert_eq!(cfg.source.len(), 1);
+        let s = &cfg.source[0];
+        assert_eq!(s.owner, "yah");
+        assert_eq!(s.mode, SourceMode::ReadOnly);
+        assert!(s.select.is_empty());
+        match &s.kind {
+            InfraSourceKind::Path { path } => assert_eq!(path, "../yah"),
+            other => panic!("expected Path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sources_parses_a_git_kind_reusing_gitsource_verbatim() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("sources.toml"),
+            r#"
+schema_version = 1
+
+[[source]]
+owner  = "yah"
+kind   = "git"
+repo   = "git@github.com:yah-ai/infra.git"
+ref    = "main"
+subdir = "infra"
+select = ["tag:cloud-runner"]
+mode   = "read-only"
+"#,
+        )
+        .unwrap();
+        let cfg = SourcesConfig::load(tmp.path()).unwrap();
+        assert_eq!(cfg.source.len(), 1);
+        let s = &cfg.source[0];
+        assert_eq!(s.select, vec!["tag:cloud-runner".to_string()]);
+        match &s.kind {
+            InfraSourceKind::Git(git) => {
+                assert_eq!(git.repo, "git@github.com:yah-ai/infra.git");
+                assert_eq!(git.r#ref, "main");
+                assert_eq!(git.subdir.as_deref(), Some("infra"));
+            }
+            other => panic!("expected Git, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sources_mode_defaults_to_read_only_and_manage_is_explicit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("sources.toml"),
+            r#"
+schema_version = 1
+
+[[source]]
+owner = "a"
+kind  = "path"
+path  = "../a"
+
+[[source]]
+owner = "b"
+kind  = "path"
+path  = "../b"
+mode  = "manage"
+"#,
+        )
+        .unwrap();
+        let cfg = SourcesConfig::load(tmp.path()).unwrap();
+        assert_eq!(cfg.source[0].mode, SourceMode::ReadOnly, "omitted mode = read-only");
+        assert_eq!(cfg.source[1].mode, SourceMode::Manage);
+    }
+
+    #[test]
+    fn sources_preserves_declaration_order() {
+        // Overlay order matters (R615-F2) when two sources name the same
+        // machine — the list must round-trip in file order, not be reordered
+        // by owner or kind.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("sources.toml"),
+            r#"
+schema_version = 1
+
+[[source]]
+owner = "second"
+kind  = "path"
+path  = "../second"
+
+[[source]]
+owner = "first"
+kind  = "path"
+path  = "../first"
+"#,
+        )
+        .unwrap();
+        let cfg = SourcesConfig::load(tmp.path()).unwrap();
+        let owners: Vec<&str> = cfg.source.iter().map(|s| s.owner.as_str()).collect();
+        assert_eq!(owners, vec!["second", "first"]);
+    }
+
+    #[test]
+    fn sources_round_trips_through_serialize() {
+        let cfg = SourcesConfig {
+            schema_version: 1,
+            source: vec![
+                InfraSource {
+                    owner: "yah".into(),
+                    kind: InfraSourceKind::Path {
+                        path: "../yah".into(),
+                    },
+                    mode: SourceMode::ReadOnly,
+                    select: vec![],
+                },
+                InfraSource {
+                    owner: "yah".into(),
+                    kind: InfraSourceKind::Git(GitSource {
+                        repo: "git@github.com:yah-ai/infra.git".into(),
+                        r#ref: "main".into(),
+                        subdir: Some("infra".into()),
+                    }),
+                    mode: SourceMode::Manage,
+                    select: vec!["tag:cloud-runner".into()],
+                },
+            ],
+        };
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        let reloaded: SourcesConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(reloaded, cfg, "round-trip through TOML must be lossless:\n{toml_str}");
+    }
+
+    // ─── R615-F2: overlay loader in CloudConfig::load ───────────────────────
+
+    fn write_min_machine(dir: &Path, name: &str, extra_toml: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        // `extra_toml` supplies `mesh_tags` when the caller cares about it;
+        // otherwise default to the empty list. Never hardcode `mesh_tags`
+        // here as well as in `extra_toml` -- TOML rejects a duplicate key.
+        let mesh_tags = if extra_toml.contains("mesh_tags") {
+            String::new()
+        } else {
+            "mesh_tags = []\n".to_string()
+        };
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            format!("name = \"{name}\"\nprovider = \"static\"\n{mesh_tags}{extra_toml}"),
+        )
+        .unwrap();
+    }
+
+    fn write_min_provider(dir: &Path, id: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{id}.toml")),
+            format!("schema_version = 1\nid = \"{id}\"\nkind = \"static\"\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_sources_toml(camp_root: &Path, body: &str) {
+        let dir = camp_root.join(".yah/infra");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sources.toml"), body).unwrap();
+    }
+
+    #[test]
+    fn load_with_no_sources_toml_is_unchanged() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_min_machine(&tmp.path().join(".yah/infra/machines"), "local-1", "");
+        let cfg = CloudConfig::load(tmp.path()).unwrap();
+        assert_eq!(cfg.machines.len(), 1);
+        assert!(cfg.machine_origins.is_empty());
+        assert!(cfg.provider_origins.is_empty());
+    }
+
+    #[test]
+    fn path_source_overlays_machines_and_providers_tagged_with_origin() {
+        let camp = tempfile::TempDir::new().unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+        write_min_machine(&other.path().join(".yah/infra/machines"), "borrowed-1", "");
+        write_min_provider(&other.path().join(".yah/infra/providers"), "borrowed-provider");
+        write_sources_toml(
+            camp.path(),
+            &format!(
+                "schema_version = 1\n\n[[source]]\nowner = \"other\"\nkind = \"path\"\npath = \"{}\"\n",
+                other.path().display()
+            ),
+        );
+
+        let cfg = CloudConfig::load(camp.path()).unwrap();
+        assert_eq!(cfg.machines.len(), 1);
+        assert_eq!(cfg.machines[0].name, "borrowed-1");
+        assert_eq!(cfg.providers.len(), 1);
+        assert_eq!(cfg.providers[0].id, "borrowed-provider");
+
+        let origin = cfg.machine_origins.get("borrowed-1").expect("origin recorded");
+        assert_eq!(origin.owner, "other");
+        assert_eq!(origin.mode, SourceMode::ReadOnly);
+        assert!(origin.source.starts_with("path:"));
+        assert_eq!(
+            cfg.provider_origins.get("borrowed-provider").unwrap().owner,
+            "other"
+        );
+    }
+
+    #[test]
+    fn camp_local_wins_on_name_collision_and_carries_no_origin() {
+        let camp = tempfile::TempDir::new().unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+        // Both declare a machine named "shared" -- camp-local's copy must win,
+        // and it must never gain an origin tag.
+        write_min_machine(&camp.path().join(".yah/infra/machines"), "shared", "");
+        write_min_machine(
+            &other.path().join(".yah/infra/machines"),
+            "shared",
+            "nickname = \"the borrowed one\"\n",
+        );
+        write_sources_toml(
+            camp.path(),
+            &format!(
+                "schema_version = 1\n\n[[source]]\nowner = \"other\"\nkind = \"path\"\npath = \"{}\"\n",
+                other.path().display()
+            ),
+        );
+
+        let cfg = CloudConfig::load(camp.path()).unwrap();
+        assert_eq!(cfg.machines.len(), 1, "the name collides, so exactly one entry");
+        assert_eq!(cfg.machines[0].nickname, None, "camp-local's copy, not the borrowed one");
+        assert!(
+            !cfg.machine_origins.contains_key("shared"),
+            "camp-local entries never carry an origin tag"
+        );
+    }
+
+    #[test]
+    fn an_earlier_source_wins_over_a_later_one_on_collision() {
+        let camp = tempfile::TempDir::new().unwrap();
+        let first = tempfile::TempDir::new().unwrap();
+        let second = tempfile::TempDir::new().unwrap();
+        write_min_machine(&first.path().join(".yah/infra/machines"), "dup", "");
+        write_min_machine(&second.path().join(".yah/infra/machines"), "dup", "");
+        write_sources_toml(
+            camp.path(),
+            &format!(
+                "schema_version = 1\n\n[[source]]\nowner = \"first\"\nkind = \"path\"\npath = \"{}\"\n\n[[source]]\nowner = \"second\"\nkind = \"path\"\npath = \"{}\"\n",
+                first.path().display(),
+                second.path().display()
+            ),
+        );
+
+        let cfg = CloudConfig::load(camp.path()).unwrap();
+        assert_eq!(cfg.machines.len(), 1);
+        assert_eq!(cfg.machine_origins.get("dup").unwrap().owner, "first");
+    }
+
+    #[test]
+    fn select_filters_borrowed_machines_by_name_or_mesh_tag() {
+        let camp = tempfile::TempDir::new().unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+        write_min_machine(&other.path().join(".yah/infra/machines"), "runner-1", "mesh_tags = [\"tag:cloud-runner\"]\n");
+        write_min_machine(&other.path().join(".yah/infra/machines"), "excluded-1", "");
+        write_sources_toml(
+            camp.path(),
+            &format!(
+                "schema_version = 1\n\n[[source]]\nowner = \"other\"\nkind = \"path\"\npath = \"{}\"\nselect = [\"tag:cloud-runner\"]\n",
+                other.path().display()
+            ),
+        );
+
+        let cfg = CloudConfig::load(camp.path()).unwrap();
+        assert_eq!(cfg.machines.len(), 1);
+        assert_eq!(cfg.machines[0].name, "runner-1");
+    }
+
+    #[test]
+    fn one_unparseable_foreign_machine_does_not_sink_the_rest_of_the_directory_or_the_load() {
+        let camp = tempfile::TempDir::new().unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+        let dir = other.path().join(".yah/infra/machines");
+        write_min_machine(&dir, "good", "");
+        // Schema-skew gotcha: a foreign machine this binary's MachineConfig
+        // can't parse at all (not just an unknown field -- MachineConfig has
+        // no deny_unknown_fields, so this has to fail on a TYPE, not a name).
+        std::fs::write(dir.join("bad.toml"), "name = 1\nprovider = 2\n").unwrap();
+        write_sources_toml(
+            camp.path(),
+            &format!(
+                "schema_version = 1\n\n[[source]]\nowner = \"other\"\nkind = \"path\"\npath = \"{}\"\n",
+                other.path().display()
+            ),
+        );
+
+        // Must not error at all -- camp-local load must never fail because a
+        // source it doesn't own has one bad file.
+        let cfg = CloudConfig::load(camp.path()).unwrap();
+        assert_eq!(cfg.machines.len(), 1, "the good entry still loads");
+        assert_eq!(cfg.machines[0].name, "good");
+    }
+
+    #[test]
+    fn an_unsynced_git_source_overlays_nothing_and_is_not_an_error() {
+        // No `yah infra sync` (R615-T3) has ever run, so the cache dir this
+        // resolves to doesn't exist. Must be silent, not fatal.
+        let camp = tempfile::TempDir::new().unwrap();
+        write_sources_toml(
+            camp.path(),
+            "schema_version = 1\n\n[[source]]\nowner = \"yah\"\nkind = \"git\"\nrepo = \"git@github.com:yah-ai/infra.git\"\nref = \"main\"\n",
+        );
+        let cfg = CloudConfig::load(camp.path()).unwrap();
+        assert!(cfg.machines.is_empty());
+        assert!(cfg.machine_origins.is_empty());
+    }
+
+    #[test]
+    fn a_synced_git_source_reads_from_the_cache_dir_not_the_repo_path() {
+        // No `subdir` declared -- the checkout ROOT is the infra root.
+        let camp = tempfile::TempDir::new().unwrap();
+        let cache = crate::paths::infra_source_cache_dir(camp.path(), "yah");
+        write_min_machine(&cache.join("machines"), "synced-1", "");
+        write_sources_toml(
+            camp.path(),
+            "schema_version = 1\n\n[[source]]\nowner = \"yah\"\nkind = \"git\"\nrepo = \"git@github.com:yah-ai/infra.git\"\nref = \"main\"\n",
+        );
+        let cfg = CloudConfig::load(camp.path()).unwrap();
+        assert_eq!(cfg.machines.len(), 1);
+        assert_eq!(cfg.machines[0].name, "synced-1");
+        assert!(cfg.machine_origins.get("synced-1").unwrap().source.starts_with("git:"));
+    }
+
+    #[test]
+    fn a_git_sources_subdir_is_honoured_like_the_component_case() {
+        // W274's own example declares `subdir = "infra"` for a monorepo whose
+        // registry lives under a subdirectory of the clone rather than at its
+        // root -- prove `infra_root` actually reads it, not just `.subdir` on
+        // GitSource parsing (R615-F1 already covers that half).
+        let camp = tempfile::TempDir::new().unwrap();
+        let cache = crate::paths::infra_source_cache_dir(camp.path(), "yah");
+        write_min_machine(&cache.join("infra").join("machines"), "subdir-1", "");
+        // Also plant a decoy at the checkout root to prove the root itself is
+        // NOT read when a subdir is declared.
+        write_min_machine(&cache.join("machines"), "root-decoy", "");
+        write_sources_toml(
+            camp.path(),
+            "schema_version = 1\n\n[[source]]\nowner = \"yah\"\nkind = \"git\"\nrepo = \"git@github.com:yah-ai/infra.git\"\nref = \"main\"\nsubdir = \"infra\"\n",
+        );
+        let cfg = CloudConfig::load(camp.path()).unwrap();
+        assert_eq!(cfg.machines.len(), 1);
+        assert_eq!(cfg.machines[0].name, "subdir-1");
+    }
+
+    #[test]
+    fn load_from_config_dir_never_applies_sources_overlay() {
+        // R615-F2's explicit decision: multi-root sibling trees don't inherit
+        // the classic .yah/infra/sources.toml. Prove it rather than assert it
+        // silently -- a sources.toml sitting at workspace_root/.yah/infra/
+        // must NOT leak into a load_from_config_dir call even though both
+        // share the same workspace_root.
+        let camp = tempfile::TempDir::new().unwrap();
+        let other = tempfile::TempDir::new().unwrap();
+        write_min_machine(&other.path().join(".yah/infra/machines"), "borrowed-1", "");
+        write_sources_toml(
+            camp.path(),
+            &format!(
+                "schema_version = 1\n\n[[source]]\nowner = \"other\"\nkind = \"path\"\npath = \"{}\"\n",
+                other.path().display()
+            ),
+        );
+        let sibling_config_dir = camp.path().join(".noisetable");
+        std::fs::create_dir_all(&sibling_config_dir).unwrap();
+
+        let cfg = CloudConfig::load_from_config_dir(&sibling_config_dir, camp.path()).unwrap();
+        assert!(cfg.machines.is_empty(), "sources.toml must not apply here");
+        assert!(cfg.machine_origins.is_empty());
+    }
+
+    // ─── R615-T5: `inherit_machines` retirement — cutover proof ────────────
+
+    /// The successor to R615-T5's parity proof. That earlier pair of tests
+    /// asserted the legacy `[infra].inherit_machines` redirect and an
+    /// equivalent `kind = "path"` source resolved the same machine set, and
+    /// that the two coexisted without duplicating rows. Both claims were about
+    /// a mechanism that no longer exists, so they retired with it — what has
+    /// to hold *now* is the other half of the same guarantee: a camp that
+    /// declares only `sources.toml` resolves the shared root exactly as the
+    /// redirect used to, and a stale `inherit_machines` key left behind in
+    /// `camp.toml` changes nothing.
+    ///
+    /// That stale-key case is not hypothetical: it is precisely the state a
+    /// camp is in between the code cutover and someone tidying its
+    /// `camp.toml`, and a silent re-resolution there would double-count the
+    /// borrowed nodes or hide their origin badge.
+    #[test]
+    fn a_stale_inherit_machines_key_does_not_change_what_sources_toml_resolves() {
+        let shared = tempfile::TempDir::new().unwrap();
+        write_min_machine(&shared.path().join(".yah/infra/machines"), "shared-node-1", "");
+        write_min_machine(&shared.path().join(".yah/infra/machines"), "shared-node-2", "");
+
+        let sources_toml = format!(
+            "schema_version = 1\n\n[[source]]\nowner = \"yah\"\nkind = \"path\"\npath = \"{}\"\nmode = \"read-only\"\n",
+            shared.path().display()
+        );
+
+        // Camp A: migrated cleanly — sources.toml only.
+        let clean = tempfile::TempDir::new().unwrap();
+        write_sources_toml(clean.path(), &sources_toml);
+
+        // Camp B: mid-migration — same source, plus the retired key still
+        // sitting in camp.toml pointing at the same root.
+        let stale = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(stale.path().join(".yah")).unwrap();
+        std::fs::write(
+            stale.path().join(".yah/camp.toml"),
+            format!(
+                "[infra]\ninherit_machines = \"{}\"\n",
+                shared.path().display()
+            ),
+        )
+        .unwrap();
+        write_sources_toml(stale.path(), &sources_toml);
+
+        let via_clean = CloudConfig::load(clean.path()).unwrap();
+        let via_stale = CloudConfig::load(stale.path()).unwrap();
+
+        let names = |cfg: &CloudConfig| {
+            let mut v: Vec<String> = cfg.machines.iter().map(|m| m.name.clone()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            names(&via_clean),
+            names(&via_stale),
+            "a leftover inherit_machines key must be inert — the retired redirect is gone"
+        );
+        assert_eq!(names(&via_clean), vec!["shared-node-1", "shared-node-2"]);
+
+        // And both are *borrowed*, not camp-local. This is the operator-facing
+        // win the stopgap could never deliver: under the old redirect these
+        // resolved with no origin at all, indistinguishable from locally-owned
+        // nodes.
+        assert_eq!(via_clean.machine_origins.len(), 2);
+        assert_eq!(via_stale.machine_origins.len(), 2);
+        for origin in via_stale.machine_origins.values() {
+            assert_eq!(origin.owner, "yah");
+            assert_eq!(origin.mode, SourceMode::ReadOnly);
+        }
     }
 }

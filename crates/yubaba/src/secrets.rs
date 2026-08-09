@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
-use workload_spec::secrets::{SecretError, SecretResolver};
+use workload_spec::secrets::{SecretAccess, SecretConsumer, SecretError, SecretResolver};
 use workload_spec::{SecretMount, SecretRef, SecretTarget};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -125,38 +125,55 @@ impl ClusterSecretStore for YubabaStateMachine {
 /// The KEK is held for the resolver's lifetime as [`Zeroizing`] key material
 /// (scrubbed on drop), is never logged, and never leaves the node. Every
 /// failure mode — missing secret, wrong KEK, tampered ciphertext, malformed
-/// nonce — fails closed with an error that carries only the logical secret
-/// name.
+/// nonce, **denied by access rule** — fails closed with an error that carries
+/// only the logical secret name.
+///
+/// R706 (W294): the resolver is bound to a [`SecretConsumer`] — the identity of
+/// the workload it is resolving *for* — and every `Cluster` read is checked
+/// against the record's [`SecretAccess`] rule before the KEK is touched. The
+/// consumer is a required constructor argument on purpose: there is no way to
+/// build a cluster resolver that skips the check, so a future call site cannot
+/// accidentally reintroduce the bearer-reference behaviour by forgetting to
+/// opt in.
 pub struct ClusterResolver<S: ClusterSecretStore> {
     store: S,
     kek: Zeroizing<[u8; 32]>,
     local: LocalFileResolver,
+    consumer: SecretConsumer,
 }
 
 impl<S: ClusterSecretStore> ClusterResolver<S> {
-    /// Build a resolver from an already-loaded 32-byte KEK. Prefer
-    /// [`ClusterResolver::from_kek_file`] in production; this constructor exists
-    /// for tests and callers that hold the key by other means.
+    /// Build a resolver from an already-loaded 32-byte KEK, serving `consumer`.
+    /// Prefer [`ClusterResolver::from_kek_file`] in production; this constructor
+    /// exists for tests and callers that hold the key by other means.
     ///
     /// Accepts anything convertible into `Zeroizing<[u8; 32]>` so a caller
     /// holding the key in a `Zeroizing` wrapper (e.g. from [`load_cluster_kek`])
     /// can move it in without materialising an unprotected plain-array copy on
     /// the stack.
-    pub fn new(store: S, kek: impl Into<Zeroizing<[u8; 32]>>, local: LocalFileResolver) -> Self {
+    pub fn new(
+        store: S,
+        kek: impl Into<Zeroizing<[u8; 32]>>,
+        local: LocalFileResolver,
+        consumer: SecretConsumer,
+    ) -> Self {
         Self {
             store,
             kek: kek.into(),
             local,
+            consumer,
         }
     }
 
     /// Load the node-local KEK from `kek_path` and build a resolver whose
     /// `LocalFile` arm is rooted at `local_store_root` (production default:
-    /// [`SECRET_STORE_ROOT`]). Fails closed if the KEK is missing or malformed.
+    /// [`SECRET_STORE_ROOT`]) and whose `Cluster` arm serves `consumer`. Fails
+    /// closed if the KEK is missing or malformed.
     pub fn from_kek_file(
         store: S,
         kek_path: impl AsRef<Path>,
         local_store_root: impl Into<PathBuf>,
+        consumer: SecretConsumer,
     ) -> Result<Self, SecretError> {
         // Move the `Zeroizing`-wrapped key straight in — no plain-array copy.
         let kek = load_cluster_kek(kek_path.as_ref())?;
@@ -164,6 +181,7 @@ impl<S: ClusterSecretStore> ClusterResolver<S> {
             store,
             kek,
             LocalFileResolver::new(local_store_root),
+            consumer,
         ))
     }
 
@@ -177,6 +195,26 @@ impl<S: ClusterSecretStore> ClusterResolver<S> {
             .ok_or_else(|| SecretError::ClusterNotFound {
                 name: name.to_string(),
             })?;
+
+        // R706: authorize BEFORE decrypting. Ordering matters — a denied read
+        // must not exercise the KEK at all, so a rule violation cannot be
+        // distinguished from a missing secret by timing either.
+        if !rec.access.admits(&self.consumer) {
+            // Logged on the node (the operator's own audit trail); the error
+            // returned to the deploying caller is deliberately identical to
+            // ClusterNotFound so a probing spec cannot map the namespace.
+            tracing::warn!(
+                secret = %name,
+                workload = %self.consumer.workload,
+                tenant = %self.consumer.tenant.0,
+                namespace = %self.consumer.namespace.0,
+                rule = %rec.access.summary(),
+                "cluster secret refused: workload is not admitted by the secret's access rule"
+            );
+            return Err(SecretError::Forbidden {
+                name: name.to_string(),
+            });
+        }
 
         // GCM nonces are 12 bytes. A record with any other nonce length is
         // treated as a decrypt failure rather than panicking in `from_slice`.
@@ -212,6 +250,7 @@ impl<S: ClusterSecretStore> std::fmt::Debug for ClusterResolver<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClusterResolver")
             .field("kek", &"<redacted>")
+            .field("consumer", &self.consumer)
             .finish_non_exhaustive()
     }
 }
@@ -257,18 +296,34 @@ pub fn load_cluster_kek(path: &Path) -> Result<Zeroizing<[u8; 32]>, SecretError>
 /// Returns the record directly: AES-256-GCM encryption of KB-scale PEM cannot
 /// fail (the only `aead` error is a plaintext-length overflow far beyond any
 /// cert), so there is no fail path to surface here.
-pub fn seal_cluster_secret(kek: &[u8; 32], plaintext: &[u8], updated_at: u64) -> SecretRecord {
-    use aes_gcm::aead::{AeadCore, OsRng};
-
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(kek));
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext)
-        .expect("AES-256-GCM seal of a KB-scale secret cannot fail on length");
+///
+/// R706 (W294): `access` is a required argument, not an `Option` with a
+/// convenient default. Sealing and authorizing are the same decision — whoever
+/// knows what this plaintext *is* is the only party who knows who should get it
+/// — so the type refuses to let a caller produce a record and leave the rule
+/// for later. "Later" is how an unruled secret gets into raft.
+/// The cipher work itself lives in `workload_spec::secrets::seal` (R706), shared
+/// with the camp-side `yah cloud secret put`. Two writers, one nonce discipline.
+/// This wrapper only adds the storage-record fields yubaba's raft layer owns.
+///
+/// `digest` lands on `None` (R720-F1): the drift check the digest exists for
+/// compares a fleet record against a camp *declaration*, and an ACME-issued
+/// cert is never declared by a camp — it is minted here, on the node, and has
+/// nothing to drift against. `None` is `yah cloud secret status`'s
+/// `unknown(pre-digest)` bucket, which exists for exactly this case.
+pub fn seal_cluster_secret(
+    kek: &[u8; 32],
+    plaintext: &[u8],
+    updated_at: u64,
+    access: SecretAccess,
+) -> SecretRecord {
+    let sealed = workload_spec::secrets::seal(kek, plaintext);
     SecretRecord {
-        ciphertext,
-        nonce: nonce.to_vec(),
+        ciphertext: sealed.ciphertext,
+        nonce: sealed.nonce,
         updated_at,
+        access,
+        digest: None,
     }
 }
 
@@ -607,9 +662,31 @@ mod tests {
     const TLS_PEM: &[u8] =
         b"-----BEGIN CERTIFICATE-----\nMIIB...fleet-shared\n-----END CERTIFICATE-----\n";
 
-    /// AES-256-GCM-seal `plaintext` under `kek`/`nonce` into a `SecretRecord`,
-    /// mirroring what the F3 issuer writes into raft.
+    /// The workload every fixture below deploys as. Both the sealed records and
+    /// the resolvers are built for this identity, so the existing R600 tests run
+    /// through the R706 access check rather than around it.
+    const TEST_WORKLOAD: &str = "ingress";
+
+    fn test_access() -> SecretAccess {
+        SecretAccess::workloads([TEST_WORKLOAD])
+    }
+
+    fn test_consumer() -> SecretConsumer {
+        SecretConsumer::workload(TEST_WORKLOAD)
+    }
+
+    /// AES-256-GCM-seal `plaintext` under `kek`/`nonce` into a `SecretRecord`
+    /// admitting [`TEST_WORKLOAD`], mirroring what the F3 issuer writes into raft.
     fn seal(kek: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8]) -> SecretRecord {
+        seal_with(kek, nonce, plaintext, test_access())
+    }
+
+    fn seal_with(
+        kek: &[u8; 32],
+        nonce: &[u8; 12],
+        plaintext: &[u8],
+        access: SecretAccess,
+    ) -> SecretRecord {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(kek));
         let ciphertext = cipher
             .encrypt(Nonce::from_slice(nonce), plaintext)
@@ -618,6 +695,8 @@ mod tests {
             ciphertext,
             nonce: nonce.to_vec(),
             updated_at: 0,
+            access,
+            digest: None,
         }
     }
 
@@ -651,7 +730,7 @@ mod tests {
         // An empty local root — these tests only exercise the Cluster arm unless
         // they populate the store dir explicitly.
         let root = tempfile::TempDir::new().unwrap();
-        ClusterResolver::new(store, kek, LocalFileResolver::new(root.path()))
+        ClusterResolver::new(store, kek, LocalFileResolver::new(root.path()), test_consumer())
     }
 
     #[test]
@@ -766,6 +845,7 @@ mod tests {
             FakeClusterStore::new(),
             TEST_KEK,
             LocalFileResolver::new(tmp.path()),
+            test_consumer(),
         );
 
         let bytes = resolver
@@ -814,7 +894,7 @@ mod tests {
     fn seal_then_resolver_open_round_trips() {
         // The issuer seals; a consumer node opens with the same KEK — the exact
         // fleet path (F3 write → raft → F2 read).
-        let rec = seal_cluster_secret(&TEST_KEK, TLS_PEM, 1234);
+        let rec = seal_cluster_secret(&TEST_KEK, TLS_PEM, 1234, test_access());
         assert_eq!(rec.nonce.len(), 12, "GCM nonce is 12 bytes");
         assert_eq!(rec.updated_at, 1234);
         assert_ne!(
@@ -836,8 +916,8 @@ mod tests {
     #[test]
     fn seal_draws_a_fresh_nonce_each_call() {
         // Re-sealing identical plaintext (a renewal) must never reuse a nonce.
-        let a = seal_cluster_secret(&TEST_KEK, TLS_PEM, 0);
-        let b = seal_cluster_secret(&TEST_KEK, TLS_PEM, 0);
+        let a = seal_cluster_secret(&TEST_KEK, TLS_PEM, 0, test_access());
+        let b = seal_cluster_secret(&TEST_KEK, TLS_PEM, 0, test_access());
         assert_ne!(a.nonce, b.nonce, "nonce must be random per seal");
         assert_ne!(
             a.ciphertext, b.ciphertext,
@@ -848,7 +928,7 @@ mod tests {
     #[test]
     fn seal_under_one_kek_does_not_open_under_another() {
         // A record sealed with KEK-A must fail closed against KEK-B.
-        let rec = seal_cluster_secret(&TEST_KEK, TLS_PEM, 0);
+        let rec = seal_cluster_secret(&TEST_KEK, TLS_PEM, 0, test_access());
         let store = FakeClusterStore::new().with("tls/yah.dev", rec);
         let resolver = cluster_resolver(store, [0x11u8; 32]);
         let err = resolver
@@ -860,5 +940,186 @@ mod tests {
             matches!(err, SecretError::ClusterDecrypt { .. }),
             "got {err}"
         );
+    }
+
+    // ── Access rules (R706 / W294) ──────────────────────────────────────────
+
+    /// Build a resolver for a workload *other* than the one the fixtures admit.
+    fn resolver_for(
+        store: FakeClusterStore,
+        workload: &str,
+    ) -> ClusterResolver<FakeClusterStore> {
+        let root = tempfile::TempDir::new().unwrap();
+        ClusterResolver::new(
+            store,
+            TEST_KEK,
+            LocalFileResolver::new(root.path()),
+            SecretConsumer::workload(workload),
+        )
+    }
+
+    #[test]
+    fn unadmitted_workload_is_refused() {
+        // The record admits "ingress"; "impostor" names it and gets nothing.
+        let store =
+            FakeClusterStore::new().with("tls/yah.dev", seal(&TEST_KEK, &TEST_NONCE, TLS_PEM));
+        let resolver = resolver_for(store, "impostor");
+
+        let err = resolver
+            .resolve(&SecretRef::Cluster {
+                name: "tls/yah.dev".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, SecretError::Forbidden { .. }),
+            "unadmitted workload must be refused, got {err}"
+        );
+    }
+
+    #[test]
+    fn refusal_is_indistinguishable_from_absence() {
+        // The whole point of the Forbidden arm's duplicated message: a workload
+        // spec must not be usable as an oracle for which secrets exist.
+        let store =
+            FakeClusterStore::new().with("tls/yah.dev", seal(&TEST_KEK, &TEST_NONCE, TLS_PEM));
+        let denied = resolver_for(store, "impostor")
+            .resolve(&SecretRef::Cluster {
+                name: "tls/yah.dev".into(),
+            })
+            .unwrap_err()
+            .to_string();
+
+        // Same probe against a name that genuinely doesn't exist.
+        let absent = resolver_for(FakeClusterStore::new(), "impostor")
+            .resolve(&SecretRef::Cluster {
+                name: "tls/yah.dev".into(),
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            denied, absent,
+            "a denied read must be externally identical to a missing one"
+        );
+    }
+
+    #[test]
+    fn unruled_legacy_record_is_refused_not_granted() {
+        // A record from before R706 carries no rule. It must fail CLOSED.
+        // Built the way a legacy record actually arrives — deserialized from a
+        // snapshot written without the field.
+        let sealed = seal(&TEST_KEK, &TEST_NONCE, TLS_PEM);
+        let legacy_json = serde_json::json!({
+            "ciphertext": sealed.ciphertext,
+            "nonce": sealed.nonce,
+            "updated_at": 0,
+        });
+        let legacy: SecretRecord = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(
+            legacy.access,
+            SecretAccess::default(),
+            "missing field lands on the deny-all default"
+        );
+
+        // Even the workload the fixture normally admits gets nothing.
+        let store = FakeClusterStore::new().with("tls/yah.dev", legacy);
+        let err = cluster_resolver(store, TEST_KEK)
+            .resolve(&SecretRef::Cluster {
+                name: "tls/yah.dev".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, SecretError::Forbidden { .. }),
+            "an unruled legacy secret must be refused, got {err}"
+        );
+    }
+
+    #[test]
+    fn allow_any_serves_every_workload() {
+        // The deliberate escape hatch still works — otherwise the fail-closed
+        // default would have no usable release valve.
+        let rec = seal_with(&TEST_KEK, &TEST_NONCE, TLS_PEM, SecretAccess::AllowAny);
+        let store = FakeClusterStore::new().with("tls/yah.dev", rec);
+        let bytes = resolver_for(store, "anybody-at-all")
+            .resolve(&SecretRef::Cluster {
+                name: "tls/yah.dev".into(),
+            })
+            .unwrap();
+        assert_eq!(bytes, TLS_PEM);
+    }
+
+    #[test]
+    fn authorization_runs_before_decryption() {
+        // Ordering pin: a denied read must not touch the KEK. Seal under KEK-A
+        // and hand the resolver KEK-B — if the check ran *after* decrypt we'd
+        // see ClusterDecrypt, and a denied caller would learn from the error
+        // whether the node could have opened the record.
+        let rec = seal(&TEST_KEK, &TEST_NONCE, TLS_PEM); // admits "ingress"
+        let store = FakeClusterStore::new().with("tls/yah.dev", rec);
+        let root = tempfile::TempDir::new().unwrap();
+        let resolver = ClusterResolver::new(
+            store,
+            [0x11u8; 32], // wrong KEK
+            LocalFileResolver::new(root.path()),
+            SecretConsumer::workload("impostor"), // and unadmitted
+        );
+
+        let err = resolver
+            .resolve(&SecretRef::Cluster {
+                name: "tls/yah.dev".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, SecretError::Forbidden { .. }),
+            "the rule check must short-circuit before the KEK is used, got {err}"
+        );
+    }
+
+    #[test]
+    fn a_different_tenant_is_a_different_consumer() {
+        // Same workload name, different tenant → refused. Rule entries default
+        // to the singleton tenant, and that default narrows rather than widens.
+        let store =
+            FakeClusterStore::new().with("tls/yah.dev", seal(&TEST_KEK, &TEST_NONCE, TLS_PEM));
+        let root = tempfile::TempDir::new().unwrap();
+        let resolver = ClusterResolver::new(
+            store,
+            TEST_KEK,
+            LocalFileResolver::new(root.path()),
+            SecretConsumer {
+                workload: TEST_WORKLOAD.into(),
+                tenant: workload_spec::TenantId("acme".into()),
+                namespace: workload_spec::NamespaceId::singleton(),
+            },
+        );
+
+        let err = resolver
+            .resolve(&SecretRef::Cluster {
+                name: "tls/yah.dev".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, SecretError::Forbidden { .. }), "got {err}");
+    }
+
+    #[test]
+    fn local_file_secrets_are_not_subject_to_cluster_rules() {
+        // Access rules guard the *cluster* store. Per-machine LocalFile secrets
+        // are already scoped by being on that machine's disk; an unadmitted
+        // consumer identity must not start failing them.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("api-key"), b"token123").unwrap();
+        let resolver = ClusterResolver::new(
+            FakeClusterStore::new(),
+            TEST_KEK,
+            LocalFileResolver::new(tmp.path()),
+            SecretConsumer::workload("some-other-workload"),
+        );
+
+        let bytes = resolver
+            .resolve(&SecretRef::LocalFile {
+                path: "api-key".into(),
+            })
+            .unwrap();
+        assert_eq!(bytes, b"token123");
     }
 }

@@ -53,8 +53,26 @@
 //! @yah:verify("Round-trip yah cloud mirror up dev-yah --env prod twice: second run logs skipped=N uploaded=0")
 //! @yah:depends_on(R498-F2)
 //! @yah:tier(Cleric)
+//!
+//! @yah:ticket(R703-T10, "mesofact static publish still uploads every site file with no Cache-Control — classify hashed assets vs HTML")
+//! @yah:status(review)
+//! @yah:at(2026-08-09T20:09:04Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R703)
+//! @yah:next("The upload loop in publish_to_r2 (the spawn_blocking s.put near r2_publish.rs:220) still calls plain ObjectStore::put, so every HTML page and asset in a mesofact static publish lands in R2 with no Cache-Control. R703-B8 built the seam (ObjectStore::put_cached plus CACHE_CONTROL_IMMUTABLE / CACHE_CONTROL_NO_CACHE) and used it for the publish beacon only.")
+//! @yah:next("Missing piece is the classification rule, which is why B8 stopped short: an .html at a fixed route is no-cache, a content-hashed asset is immutable, everything else needs a defensible default. Get HTML wrong and yah.dev serves a stale page from browser caches with no way to bust it. Decide against what the mesofact builder actually emits (hashed filenames or not), do not assume.")
+//! @yah:next("MANIFEST_KEY (_yah-manifest.json) is also a mutable pointer written by plain put, but nothing outside the reconciler fetches it, so it is cosmetic - fold it in while here.")
+//! @yah:gotcha("Not urgent: cdn.yah.dev answers cf-cache-status DYNAMIC on this zone today, so Cloudflare's edge is not caching these objects regardless. The exposure is browser caches and any future edge-cache rule.")
+//! @yah:handoff("Every object a mesofact static publish uploads now carries a Cache-Control. The rule is one function, cache_control_for(rel) in r2_publish.rs, and it is grounded rather than guessed: dist/hydrate/ is the ONLY output the builder content-hashes, via the <key>.[hash].js / <key>.chunk-[hash].js naming in mesofact-build's bundle.rs and its TS twin. Those get immutable; every other key - the prerendered .html pages, install.sh, illustrations/*.webp, manifest.json, tag-index.json - is a fixed key the next publish rewrites in place, so they get no-cache.")
+//! @yah:handoff("The directory alone does not earn immutable: the filename must also carry a hash-shaped trailing segment (8+ base62 before the .js). A hand-dropped hydrate/app.js is not content-addressed and a year-long immutable cache on it would be unrecoverable. Unknown falls to no-cache in every branch - guessing 'cacheable' fails much worse than guessing 'not'.")
+//! @yah:handoff("MANIFEST_KEY (_yah-manifest.json) folded in as no-cache too. Cosmetic, since nothing outside the reconciler fetches it, but leaving one directive-less mutable pointer behind invites the next reader to copy the pattern.")
+//! @yah:handoff("I overstated this ticket's uncertainty when I filed it an hour ago. 'Needs a rule, not a guess' implied an operator call; it was a fact readable from the four built dist trees and the bundler's naming config.")
+//! @yah:verify("cargo test -p yah-cloud --lib r2_publish -> 10 pass, 0 fail (3 new: hydrate bundles immutable, fixed keys no-cache, non-hash-named hydrate files stay no-cache)")
+//! @yah:verify("cargo test -p yah-cloud --lib -> 744 pass, 0 fail (was 741)")
+//! @yah:verify("cargo check --workspace clean on root and oss/yubaba")
+//! @yah:verify("Classifier test inputs are REAL filenames read from the built dist trees on 2026-08-09 - hydrate/issues.ervzmehh.js and hydrate/rigs_id.uxTuqN9d.js from marketing/dashboard, plus index.html, install.sh, illustrations/yah-table-dark.webp, manifest.json, tag-index.json - not invented ones")
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -63,6 +81,7 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 use yah_object_store::{ObjectStore as _, R2ObjectStore};
 
+use super::publish_beacon::{PublishBeacon, BEACON_KEY};
 use crate::provider::cloudflare::CloudflareClient;
 
 /// Bucket key for the per-bucket publish manifest. Starts with `_` to avoid
@@ -79,6 +98,43 @@ pub use yah_object_store::r2::{
     R2_ACCESS_KEY_ENV, R2_ACCESS_KEY_SLOT, R2_SECRET_KEY_ENV, R2_SECRET_KEY_SLOT,
 };
 
+/// `Cache-Control` for one published object, keyed off the dist-relative path
+/// (R703-T10 — the rest of R703-B8's seam).
+///
+/// Only ONE class of file in a mesofact dist is safe to cache forever, and it
+/// is not guessable from the extension: `dist/hydrate/` is the sole output the
+/// builder content-hashes, via the `<key>.[hash].js` / `<key>.chunk-[hash].js`
+/// naming in `mesofact-build`'s `bundle.rs` (and its TS twin). Everything else
+/// — the prerendered `.html` pages, `install.sh`, the `illustrations/*.webp`,
+/// `manifest.json`, `tag-index.json` — sits at a FIXED key that the next
+/// publish rewrites in place, so an immutable directive there is a promise the
+/// bytes cannot keep: yah.dev would serve a stale page out of browser caches
+/// with no way to bust it short of renaming the route.
+///
+/// The hash-shaped-filename check is belt and braces on top of the directory:
+/// a plain `hydrate/app.js` (someone bypassing the bundler, a hand-dropped
+/// polyfill) is NOT content-addressed, and a year-long immutable cache on it
+/// would be unrecoverable. Unknown ⇒ `no-cache`, always — the failure mode of
+/// guessing "cacheable" is much worse than the failure mode of guessing "not".
+fn cache_control_for(rel: &str) -> &'static str {
+    let hashed = rel
+        .strip_prefix("hydrate/")
+        .and_then(|f| f.rsplit_once('.'))
+        // `<name>.<hash>.js` → after dropping `.js`, the trailing dot-segment
+        // is the hash. Bun emits 8+ chars of base62; require that rather than
+        // "has two dots", so `app.min.js` is not mistaken for hashed output.
+        .and_then(|(stem, ext)| (ext == "js").then_some(stem))
+        .and_then(|stem| stem.rsplit_once('.'))
+        .is_some_and(|(_, tok)| {
+            tok.len() >= 8 && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        });
+    if hashed {
+        yah_object_store::CACHE_CONTROL_IMMUTABLE
+    } else {
+        yah_object_store::CACHE_CONTROL_NO_CACHE
+    }
+}
+
 /// Options for the CDN cache-tag purge step after upload.
 /// Omit to skip purge (publish only, no CDN invalidation).
 pub struct R2PurgeOpts {
@@ -90,7 +146,11 @@ pub struct R2PurgeOpts {
 }
 
 /// Summary of a completed R2 publish.
-#[derive(Debug, Clone, Default)]
+///
+/// Not `Default`: a report with an empty [`PublishBeacon`] would describe a
+/// publish that never happened, and the beacon's whole job is to be
+/// impossible to confuse with one.
+#[derive(Debug, Clone)]
 pub struct R2PublishReport {
     /// Object keys successfully uploaded to R2.
     pub uploaded: Vec<String>,
@@ -99,6 +159,12 @@ pub struct R2PublishReport {
     /// Cache tags purged from the CDN after upload. Empty when no purge opts
     /// were provided or when `dist/tag-index.json` has no tags.
     pub purged_tags: Vec<String>,
+    /// R703-B4 — what this publish claims it put in the bucket, written to
+    /// `<prefix>/.well-known/yah-publish.json` as the *last* object of the
+    /// run. Fetch it back through a front door to find out whether that front
+    /// door is serving this publish or something older; see
+    /// [`super::publish_beacon`].
+    pub beacon: PublishBeacon,
 }
 
 /// Upload every file in `dist_dir` to `<bucket>/` in the given R2 account,
@@ -206,12 +272,13 @@ pub async fn publish_to_r2(
 
         let s = Arc::clone(&store);
         let key_clone = key.clone();
-        tokio::task::spawn_blocking(move || s.put(&key_clone, body))
+        let cc = cache_control_for(stripped);
+        tokio::task::spawn_blocking(move || s.put_cached(&key_clone, body, cc))
             .await
             .context("PUT task panicked")?
             .with_context(|| format!("PUT {key}"))?;
 
-        debug!(key, "uploaded");
+        debug!(key, cache_control = cc, "uploaded");
         uploaded.push(key.clone());
         new_manifest.insert(key, body_hash);
     }
@@ -222,9 +289,20 @@ pub async fn publish_to_r2(
         let s = Arc::clone(&store);
         let manifest_bytes =
             serde_json::to_vec(&new_manifest).context("serializing publish manifest")?;
-        tokio::task::spawn_blocking(move || s.put(MANIFEST_KEY, manifest_bytes))
-            .await
-            .context("manifest PUT task panicked")?
+        tokio::task::spawn_blocking(move || {
+            // A fixed key rewritten by every publish (R703-T10). Nothing
+            // outside this reconciler ever fetches it, so the directive is
+            // cosmetic — but a mutable pointer with no directive is exactly
+            // the pattern being removed, and leaving one behind invites the
+            // next reader to copy it.
+            s.put_cached(
+                MANIFEST_KEY,
+                manifest_bytes,
+                yah_object_store::CACHE_CONTROL_NO_CACHE,
+            )
+        })
+        .await
+        .context("manifest PUT task panicked")?
     } {
         tracing::warn!(error = %e, "failed to save publish manifest (non-fatal) — next run will re-upload all objects");
     }
@@ -233,6 +311,51 @@ pub async fn publish_to_r2(
         uploaded = uploaded.len(),
         skipped = skipped.len(),
         "R2 upload complete"
+    );
+
+    // R703-B4 — publish beacon, written LAST and unconditionally.
+    //
+    // Last, because its presence is then also evidence that the run reached
+    // the end rather than dying halfway through the file loop. Unconditionally
+    // (no manifest skip), because a run where every object was skipped as
+    // unchanged still needs to refresh `published_at` — otherwise "the front
+    // door is three weeks behind" and "nothing has changed in three weeks"
+    // look identical from the outside.
+    //
+    // Fatal on failure, unlike the manifest write above: the manifest is an
+    // optimisation, but a missing beacon disables the serving check that is
+    // this object's entire reason to exist, and a publish whose verification
+    // silently switched itself off is the exact failure being fixed here.
+    let contents: BTreeMap<String, String> = new_manifest
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let beacon = PublishBeacon::new(key_prefix.unwrap_or_default(), &contents);
+    let beacon_key = match key_prefix {
+        Some(p) => format!("{}/{}", p.trim_end_matches('/'), BEACON_KEY),
+        None => BEACON_KEY.to_string(),
+    };
+    {
+        let s = Arc::clone(&store);
+        let bytes = serde_json::to_vec(&beacon).context("serializing publish beacon")?;
+        let key = beacon_key.clone();
+        // R703-B8 — `no-cache`, and of everything this function uploads it is
+        // the object that most needs it. The beacon is the freshness oracle the
+        // serving check reads back through the public front door; a cached copy
+        // makes a stale site verify green, which is worse than having no check.
+        // Every other object now carries one too — see `cache_control_for`.
+        tokio::task::spawn_blocking(move || {
+            s.put_cached(&key, bytes, yah_object_store::CACHE_CONTROL_NO_CACHE)
+        })
+        .await
+        .context("beacon PUT task panicked")?
+        .with_context(|| format!("PUT {beacon_key}"))?;
+    }
+    info!(
+        digest = %beacon.digest,
+        files = beacon.files,
+        key = %beacon_key,
+        "publish beacon written"
     );
 
     // CDN cache-tag purge.
@@ -278,6 +401,7 @@ pub async fn publish_to_r2(
         uploaded,
         skipped,
         purged_tags,
+        beacon,
     })
 }
 
@@ -411,5 +535,63 @@ mod tests {
     fn load_manifest_empty_on_bad_json() {
         let bad: PublishManifest = serde_json::from_slice(b"not json").unwrap_or_default();
         assert!(bad.is_empty());
+    }
+
+    // ── Cache-Control classification (R703-T10) ─────────────────────────────
+
+    /// Pinned against REAL filenames read out of the built dist trees on
+    /// 2026-08-09, not invented ones — the whole rule rests on which files the
+    /// builder content-hashes, so a test over made-up names would prove nothing.
+    #[test]
+    fn only_content_hashed_hydrate_bundles_are_immutable() {
+        // app/yah/web/marketing/dist/hydrate/ and dashboard's, verbatim.
+        for k in [
+            "hydrate/issues.ervzmehh.js",
+            "hydrate/issues.BdKFYN8Z.js",
+            "hydrate/rigs_id.uxTuqN9d.js",
+            "hydrate/index.CStDXFd1.js",
+            "hydrate/index.chunk-CStDXFd1.js",
+        ] {
+            assert_eq!(
+                cache_control_for(k),
+                "public, max-age=31536000, immutable",
+                "{k}"
+            );
+        }
+    }
+
+    /// Every fixed key the same publish uploads. These are rewritten in place
+    /// by the next publish, so `immutable` here is a promise the bytes cannot
+    /// keep — a stale yah.dev page with no way to bust it.
+    #[test]
+    fn fixed_keys_are_no_cache() {
+        for k in [
+            "index.html",
+            "releases.html",
+            "404.html",
+            "install.sh",
+            "illustrations/yah-table-dark.webp",
+            "manifest.json",
+            "tag-index.json",
+            ".well-known/yah-publish.json",
+        ] {
+            assert_eq!(cache_control_for(k), "no-cache, max-age=0", "{k}");
+        }
+    }
+
+    /// The directory alone is not enough. A hand-dropped or non-bundler file
+    /// under `hydrate/` is not content-addressed, and a year-long immutable
+    /// cache on it would be unrecoverable — unknown must fall to `no-cache`.
+    #[test]
+    fn hydrate_files_that_are_not_hash_named_stay_no_cache() {
+        for k in [
+            "hydrate/app.js",        // no hash segment at all
+            "hydrate/app.min.js",    // a second dot, but `min` is not a hash
+            "hydrate/app.abc.js",    // too short to be one either
+            "hydrate/vendor.LICENSE",// not even a .js
+            "hydrate/readme.md",
+        ] {
+            assert_eq!(cache_control_for(k), "no-cache, max-age=0", "{k}");
+        }
     }
 }

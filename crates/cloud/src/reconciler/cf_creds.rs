@@ -150,9 +150,7 @@ impl CfProvider {
     pub fn api_token(&self) -> Result<String> {
         let (slot, env) = self.api_token_slot()?;
         fob::get_or_env(&slot, &env)
-            .with_context(|| {
-                format!("resolving `{slot}` for provider `{}`", self.provider_id)
-            })?
+            .with_context(|| format!("resolving `{slot}` for provider `{}`", self.provider_id))?
             .with_context(|| {
                 format!("`{slot}` not found — `yah keys set {slot} <token>` or export {env}")
             })
@@ -294,7 +292,10 @@ mod tests {
         // No `credentials` field → falls back to the global default slot/env.
         assert_eq!(
             p.api_token_slot().unwrap(),
-            ("cloudflare-api-token".to_string(), "CLOUDFLARE_API_TOKEN".to_string())
+            (
+                "cloudflare-api-token".to_string(),
+                "CLOUDFLARE_API_TOKEN".to_string()
+            )
         );
     }
 
@@ -309,13 +310,19 @@ mod tests {
         let p = CfProvider::resolve(tmp.path(), "cloudflare-scrabcake").unwrap();
         assert_eq!(
             p.api_token_slot().unwrap(),
-            ("cf-token-scrabcake".to_string(), "CF_TOKEN_SCRABCAKE".to_string())
+            (
+                "cf-token-scrabcake".to_string(),
+                "CF_TOKEN_SCRABCAKE".to_string()
+            )
         );
         // Declared r2_access_key overrides; r2_secret_key falls back to global.
         let (a_slot, a_env) = p
             .field_slot("r2_access_key", "default-access", "DEFAULT_ACCESS")
             .unwrap();
-        assert_eq!((a_slot.as_str(), a_env.as_str()), ("scrab-r2-access", "SCRAB_R2_ACCESS"));
+        assert_eq!(
+            (a_slot.as_str(), a_env.as_str()),
+            ("scrab-r2-access", "SCRAB_R2_ACCESS")
+        );
         let (s_slot, _) = p
             .field_slot("r2_secret_key", "default-secret", "DEFAULT_SECRET")
             .unwrap();
@@ -356,7 +363,9 @@ mod tests {
             "noacct",
             "schema_version = 1\nid = \"noacct\"\nkind = \"cloudflare\"\n",
         );
-        let err = CfProvider::resolve(tmp.path(), "noacct").unwrap_err().to_string();
+        let err = CfProvider::resolve(tmp.path(), "noacct")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("account_id"), "got: {err}");
         let _ = BTreeMap::<String, String>::new();
     }
@@ -393,7 +402,10 @@ r2_access_key = \"keystore://nt-r2-access\"
         // No scope, no top-level credentials → historical global slot.
         assert_eq!(
             p.api_token_slot().unwrap(),
-            ("cloudflare-api-token".to_string(), "CLOUDFLARE_API_TOKEN".to_string())
+            (
+                "cloudflare-api-token".to_string(),
+                "CLOUDFLARE_API_TOKEN".to_string()
+            )
         );
     }
 
@@ -413,7 +425,10 @@ r2_access_key = \"keystore://nt-r2-access\"
         // Explicit per-namespace credentials win over any derived slot.
         assert_eq!(
             p.api_token_slot().unwrap(),
-            ("cf-token-noisetable".to_string(), "CF_TOKEN_NOISETABLE".to_string())
+            (
+                "cf-token-noisetable".to_string(),
+                "CF_TOKEN_NOISETABLE".to_string()
+            )
         );
         // r2_access_key overridden in the ns section; r2_secret_key unset → the
         // scope-derived default slot (not the bare global).
@@ -422,7 +437,11 @@ r2_access_key = \"keystore://nt-r2-access\"
             .unwrap();
         assert_eq!(a_slot, "nt-r2-access");
         let (s_slot, s_env) = p
-            .field_slot("r2_secret_key", "cloudflare-r2-secret-key", "CLOUDFLARE_R2_SECRET_KEY")
+            .field_slot(
+                "r2_secret_key",
+                "cloudflare-r2-secret-key",
+                "CLOUDFLARE_R2_SECRET_KEY",
+            )
             .unwrap();
         assert_eq!(s_slot, "noisetable-cloudflare-r2-secret-key");
         assert_eq!(s_env, "NOISETABLE_CLOUDFLARE_R2_SECRET_KEY");

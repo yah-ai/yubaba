@@ -2,11 +2,10 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::config::{FeedConfig, OnChangeConfig, SourceConfig};
-use crate::feed::ReleaseFeed;
 use crate::gh::GhReleases;
-use crate::r2::R2Channel;
+use crate::r2::{R2Channel, R2Index, R2Private, R2Triples};
 use crate::sink::{FeedSink, SinkError, SinkTarget};
-use crate::sources::{ReleaseSource, SourceError};
+use crate::sources::{FeedPayload, FeedSource, SourceError};
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
@@ -23,8 +22,9 @@ pub enum RunnerError {
 pub struct RunResult {
     /// Where the artifact landed (local file or tenant object key).
     pub destination: SinkTarget,
-    /// The feed that was written.
-    pub feed: ReleaseFeed,
+    /// What was fetched and written. `payload` rather than `feed` since R707-F4:
+    /// not every feed carries a release list (see [`FeedPayload`]).
+    pub payload: FeedPayload,
     /// Downstream action to fire (caller's responsibility to dispatch).
     pub on_change: Option<OnChangeConfig>,
 }
@@ -54,11 +54,11 @@ impl FeedRunner {
     }
 
     pub async fn run(&self) -> Result<RunResult, RunnerError> {
-        let source = make_source(&self.config.feed.source);
+        let source = make_source(&self.config.feed.source).await?;
         tracing::info!(source = source.source_id(), feed = %self.config.feed.name, "fetching feed");
-        let feed = source.fetch().await?;
+        let payload = source.fetch_payload().await?;
 
-        let json = serde_json::to_string_pretty(&feed)?;
+        let json = payload.to_json_pretty()?;
 
         // Did anything actually change? `emit.on_change` is documented as
         // firing "when the artifact changes", but firing it unconditionally
@@ -70,13 +70,13 @@ impl FeedRunner {
         //
         // `fetched_at` is excluded from the comparison because it is wall-clock
         // and would differ on every run, defeating the check entirely.
-        let changed = self.artifact_changed(&feed);
+        let changed = self.artifact_changed(&payload);
 
         let destination = self.sink.write(json.into_bytes()).await?;
 
         tracing::info!(
             destination = %destination,
-            releases = feed.releases.len(),
+            releases = payload.release_count(),
             changed,
             "artifact written"
         );
@@ -91,7 +91,7 @@ impl FeedRunner {
             None
         };
 
-        Ok(RunResult { destination, feed, on_change })
+        Ok(RunResult { destination, payload, on_change })
     }
 
     /// Whether the feed content differs from what is already at the sink.
@@ -101,7 +101,7 @@ impl FeedRunner {
     /// (fire on_change) rather than risk suppressing a real change. Being
     /// wrong in that direction costs a redundant rebuild; being wrong the
     /// other way silently serves stale bytes.
-    fn artifact_changed(&self, feed: &ReleaseFeed) -> bool {
+    fn artifact_changed(&self, payload: &FeedPayload) -> bool {
         let FeedSink::LocalFile(ref path) = self.sink else {
             return true;
         };
@@ -112,13 +112,26 @@ impl FeedRunner {
         // the whole Release tree: the wire form is what downstream actually
         // consumes, so it is the honest thing to diff, and it keeps this check
         // from constraining the derives on feed.rs's public types.
-        match serde_json::from_slice::<ReleaseFeed>(&existing) {
-            // Compare the payload, NOT fetched_at (see run()).
-            Ok(prev) => {
-                serde_json::to_value(&prev.releases).ok()
-                    != serde_json::to_value(&feed.releases).ok()
+        match payload {
+            FeedPayload::Releases(feed) => {
+                match serde_json::from_slice::<crate::feed::ReleaseFeed>(&existing) {
+                    // Compare the payload, NOT fetched_at (see run()).
+                    Ok(prev) => {
+                        serde_json::to_value(&prev.releases).ok()
+                            != serde_json::to_value(&feed.releases).ok()
+                    }
+                    Err(_) => true, // unparseable/corrupt — rewrite and rebuild
+                }
             }
-            Err(_) => true, // unparseable/corrupt — rewrite and rebuild
+            // No field to exclude here, and none should be invented. The
+            // wall-clock exclusion above exists because *almanac* stamps
+            // `fetched_at` on every fetch; a passthrough payload is stamped by
+            // its own producer, which runs only when the thing it publishes
+            // actually changed. Skipping a field on this side would mean
+            // guessing at a schema this crate deliberately does not own.
+            FeedPayload::Passthrough(value) => {
+                serde_json::from_slice::<serde_json::Value>(&existing).ok().as_ref() != Some(value)
+            }
         }
     }
 
@@ -156,6 +169,14 @@ on_change = { kind = "mesofact-rebuild", service = "svc", route = "/releases" }
         FeedRunner::new(cfg, root)
     }
 
+    use crate::feed::ReleaseFeed;
+
+    /// Every release feed reaches `artifact_changed` wrapped — the wrapper is
+    /// what lets a passthrough feed share the same change-suppression.
+    fn payload(version: &str) -> FeedPayload {
+        FeedPayload::Releases(feed_with(version))
+    }
+
     fn feed_with(version: &str) -> ReleaseFeed {
         ReleaseFeed {
             fetched_at: Utc::now(),
@@ -172,7 +193,7 @@ on_change = { kind = "mesofact-rebuild", service = "svc", route = "/releases" }
     #[test]
     fn missing_artifact_counts_as_changed() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(runner_for(tmp.path()).artifact_changed(&feed_with("1.0.0")));
+        assert!(runner_for(tmp.path()).artifact_changed(&payload("1.0.0")));
     }
 
     #[test]
@@ -191,7 +212,7 @@ on_change = { kind = "mesofact-rebuild", service = "svc", route = "/releases" }
         // full rebuild + publish + purge.
         let second = feed_with("1.0.0");
         assert_ne!(first.fetched_at, second.fetched_at, "precondition");
-        assert!(!r.artifact_changed(&second));
+        assert!(!r.artifact_changed(&FeedPayload::Releases(second)));
     }
 
     #[test]
@@ -203,7 +224,7 @@ on_change = { kind = "mesofact-rebuild", service = "svc", route = "/releases" }
             serde_json::to_string_pretty(&feed_with("1.0.0")).unwrap(),
         )
         .unwrap();
-        assert!(r.artifact_changed(&feed_with("1.0.1")));
+        assert!(r.artifact_changed(&payload("1.0.1")));
     }
 
     #[test]
@@ -211,12 +232,98 @@ on_change = { kind = "mesofact-rebuild", service = "svc", route = "/releases" }
         let tmp = tempfile::tempdir().unwrap();
         let r = runner_for(tmp.path());
         std::fs::write(tmp.path().join("out.json"), b"{not json").unwrap();
-        assert!(r.artifact_changed(&feed_with("1.0.0")));
+        assert!(r.artifact_changed(&payload("1.0.0")));
+    }
+
+    // ── passthrough feeds get the same change suppression (R707-F4) ──────────
+
+    fn fleet_index(commit: &str) -> FeedPayload {
+        FeedPayload::Passthrough(serde_json::json!({
+            "schema_version": 1,
+            "source_commit": commit,
+            "generated_at": "2026-08-05T00:00:00Z",
+            "machines": [{"name": "us-west-001"}],
+        }))
+    }
+
+    /// The whole reason change-suppression matters for a passthrough feed: a
+    /// poke that found nothing new must not tell every consumer to re-read.
+    #[test]
+    fn an_identical_passthrough_payload_is_not_a_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = runner_for(tmp.path());
+        std::fs::write(
+            tmp.path().join("out.json"),
+            fleet_index("abc123").to_json_pretty().unwrap(),
+        )
+        .unwrap();
+        assert!(!r.artifact_changed(&fleet_index("abc123")));
+    }
+
+    /// ...but a real republish is, and the whole value is compared — there is no
+    /// almanac-side field exclusion for a schema almanac does not own.
+    #[test]
+    fn a_different_passthrough_payload_is_a_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = runner_for(tmp.path());
+        std::fs::write(
+            tmp.path().join("out.json"),
+            fleet_index("abc123").to_json_pretty().unwrap(),
+        )
+        .unwrap();
+        assert!(r.artifact_changed(&fleet_index("def456")));
+    }
+
+    /// The artifact holds the payload itself, not an almanac wrapper around it.
+    /// A consumer parsing the emitted file must not have to know almanac ran.
+    #[test]
+    fn a_passthrough_artifact_is_the_payload_verbatim() {
+        let rendered = fleet_index("abc123").to_json_pretty().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["source_commit"], "abc123");
+        assert_eq!(parsed["machines"][0]["name"], "us-west-001");
+        assert!(
+            parsed.get("releases").is_none() && parsed.get("fetched_at").is_none(),
+            "no release-feed envelope may be wrapped around a passthrough payload: {rendered}"
+        );
+    }
+
+    /// A corrupt artifact is a change on this path too — the same
+    /// rewrite-and-recover direction the release path takes.
+    #[test]
+    fn a_corrupt_artifact_counts_as_changed_for_passthrough_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = runner_for(tmp.path());
+        std::fs::write(tmp.path().join("out.json"), b"<html>403</html>").unwrap();
+        assert!(r.artifact_changed(&fleet_index("abc123")));
     }
 }
 
-fn make_source(cfg: &SourceConfig) -> Box<dyn ReleaseSource> {
-    match cfg {
+/// Build the adapter a feed's `source` declares.
+///
+/// Fallible *and* async only because of the authenticated arm. Every public
+/// source is a URL and a name, built infallibly and instantly. The private one:
+///
+/// - resolves a credential reference off the filesystem or the environment, and
+///   a missing secret must surface as *this reference did not resolve* rather
+///   than as a `403` from the edge three layers down; and
+/// - **must not be constructed on an async worker.** `R2ObjectStore` is backed
+///   by a `reqwest::blocking::Client`, and building one spins up a temporary
+///   tokio runtime and drops it, which panics outright with "Cannot drop a
+///   runtime in a context where blocking is not allowed" when it happens inside
+///   a future. Not a lint and not a slow path — the feed's very first run aborts
+///   the task. Hence `spawn_blocking` around the whole construction, matching
+///   what [`crate::sink`] already does around the write.
+async fn make_source(cfg: &SourceConfig) -> Result<Box<dyn FeedSource>, SourceError> {
+    if matches!(cfg, SourceConfig::R2Private { .. }) {
+        let cfg = cfg.clone();
+        return tokio::task::spawn_blocking(move || make_private_source(&cfg))
+            .await
+            .map_err(|e| {
+                SourceError::Credential(format!("source construction task panicked: {e}"))
+            })?;
+    }
+    Ok(match cfg {
         SourceConfig::GhReleases { repo } => Box::new(GhReleases::new(repo)),
         SourceConfig::R2Channel { binary, base_url } => {
             Box::new(R2Channel::new(binary, base_url))
@@ -225,5 +332,48 @@ fn make_source(cfg: &SourceConfig) -> Box<dyn ReleaseSource> {
             url,
             id.clone().unwrap_or_else(|| "r2-manifest".to_string()),
         )),
-    }
+        SourceConfig::R2Triples { url, id } => Box::new(R2Triples::at_url(
+            url,
+            id.clone().unwrap_or_else(|| "r2-triples".to_string()),
+        )),
+        SourceConfig::R2Index { url, id } => Box::new(R2Index::at_url(
+            url,
+            id.clone().unwrap_or_else(|| "r2-index".to_string()),
+        )),
+        // Handled above, off the async worker.
+        SourceConfig::R2Private { .. } => unreachable!("routed through make_private_source"),
+    })
+}
+
+/// The blocking half of [`make_source`] — credential reads and the
+/// `reqwest::blocking` client build. Runs on a blocking thread; see the caller
+/// for why that is load-bearing rather than tidy.
+fn make_private_source(cfg: &SourceConfig) -> Result<Box<dyn FeedSource>, SourceError> {
+    let SourceConfig::R2Private {
+        account_id,
+        bucket,
+        key,
+        access_key_id,
+        secret_access_key,
+        endpoint,
+        id,
+    } = cfg
+    else {
+        unreachable!("only called for SourceConfig::R2Private")
+    };
+    let access = access_key_id
+        .resolve("access_key_id")
+        .map_err(SourceError::Credential)?;
+    let secret = secret_access_key
+        .resolve("secret_access_key")
+        .map_err(SourceError::Credential)?;
+    Ok(Box::new(R2Private::new(
+        id.clone().unwrap_or_else(|| "r2-private".to_string()),
+        account_id,
+        bucket,
+        key,
+        &access,
+        &secret,
+        endpoint.as_deref(),
+    )?))
 }

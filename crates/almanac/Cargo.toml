@@ -19,6 +19,12 @@ path = "src/lib.rs"
 name = "almanac-serve"
 path = "src/bin/serve.rs"
 
+# The on-node feed-fetch tier (R330-F31). Server-free by construction — see
+# `src/fetch.rs` for why the fetcher survives W225 §4's receiver retirement.
+[[bin]]
+name = "almanac-feed"
+path = "src/bin/feed.rs"
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -32,8 +38,8 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 anyhow = "1.0"
-workload-spec = { package = "yah-workload-spec", version = "0.8.21" }
-yah-object-store = { version = "0.8.21" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.22" }
+yah-object-store = { version = "0.8.22" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

@@ -16,6 +16,13 @@
 //!    (`/mesh/leader-health` automatically returns 503 once headscale stops,
 //!    so Cloudflare stops routing to this node without an extra step.)
 //!
+//! Both halves are gated on
+//! [`IngressOwnership::FollowsRaftLeader`](crate::cluster_policy::IngressOwnership)
+//! (R118-T9). "The raft leader is also the external-ingress owner" is a rule
+//! about a deployment that has clients outside the mesh, not a fact about
+//! consensus — a cluster with no external identity to move still elects a
+//! leader, it just has nothing for the leader to carry.
+//!
 //! The watcher exits cleanly when the raft metrics channel closes (daemon
 //! shutdown).  It is tolerant of systemctl/litestream errors — it logs them
 //! but does not panic, since a follower that fails to stop headscale will
@@ -77,10 +84,24 @@ async fn run(node_id: YubabaNodeId, raft: YubabaRaft, state: Arc<ServerState>) {
 
         if is_leader != prev_is_leader {
             info!(node_id, is_leader, "raft leader state changed");
-            if is_leader {
-                on_became_leader(node_id, &raft, &state).await;
+            // R118-T9: whether the cluster's *external* identity rides along
+            // with raft leadership is a policy decision, not a property of
+            // leadership. A cluster whose clients are all inside the mesh has
+            // no external identity to move, and coupling gateway election to
+            // consensus election lets a flaky uplink churn leadership.
+            if state.cluster_policy.ingress_ownership.follows_raft_leader() {
+                if is_leader {
+                    on_became_leader(node_id, &raft, &state).await;
+                } else {
+                    on_lost_leader(&state).await;
+                }
             } else {
-                on_lost_leader(&state).await;
+                info!(
+                    node_id,
+                    is_leader,
+                    "cluster policy does not tie external ingress to raft leadership — \
+                     no ingress transition"
+                );
             }
             prev_is_leader = is_leader;
         }

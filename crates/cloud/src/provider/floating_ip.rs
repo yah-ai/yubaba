@@ -220,7 +220,10 @@ mod tests {
             zone: None,
             arch: None,
             bucket: None,
-            hostkey_fingerprint: None,
+            vendor: None,
+            nickname: None,
+            legacy_hostkey_fingerprint: None,
+            registration: Default::default(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -293,7 +296,10 @@ mod tests {
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("zone"), "expected a zone-mismatch message, got: {msg}");
+        assert!(
+            msg.contains("zone"),
+            "expected a zone-mismatch message, got: {msg}"
+        );
         assert_eq!(
             provider.reassign_calls.load(Ordering::SeqCst),
             0,

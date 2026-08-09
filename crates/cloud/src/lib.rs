@@ -224,6 +224,9 @@ pub mod almanac_dispatch;
 pub mod app_manifest;
 pub mod asset_journal;
 pub mod asset_status;
+#[cfg(test)]
+mod asset_status_tests;
+pub mod capability;
 pub mod cloud_init;
 pub mod compose;
 pub mod config;
@@ -244,34 +247,33 @@ pub mod reconciler;
 pub mod release_manifest;
 pub mod state;
 pub mod status;
-pub mod tenant;
 pub mod validate;
 
 pub use almanac_dispatch::dispatch_on_change;
 pub use asset_journal::{AssetState, AssetStatusEvent, AssetStatusJournal};
+pub use capability::Capability;
 pub use compose::{generate_compose_bundle, ComposeBundle};
 pub use config::{
     BucketLogEntry, CampCloudDbs, CloudConfig, CloudDb, ConnectSpec, DbCatalog, DevDb, GitSource,
-    LegacyMirrorConfig, LegacyServiceConfig, MachineConfig, MirrorAssignment, MirrorConfig,
-    MirrorProviderSlot, MirrorShape, PondDb, PondDbKind, Provider, ProviderConfig, ServiceComponent,
-    ServiceConfig, TopologyConfig, WorkloadConfig, WorkloadConfigError,
+    IngressProvider, LegacyMirrorConfig, LegacyServiceConfig, MachineConfig, MirrorAssignment,
+    MirrorConfig, MirrorProviderSlot, MirrorShape, PondDb, PondDbKind, Provider, ProviderConfig,
+    ServiceComponent, ServiceConfig, TopologyConfig, WorkloadConfig, WorkloadConfigError,
 };
+pub use local_driver::pond_warden::{warden_container_label, warden_container_name};
 pub use local_driver::{
     canonical_label, canonical_name, ContainerRunSpec, ContainerState, CustomDockerHostProvider,
     DetectedRuntime, LocalContainerSpec, LocalDockerRuntime, LocalRuntime, OwnedContainer,
     RuntimePref, RuntimeProvider, SocketRuntimeProvider, LABEL_KEY, NAME_PREFIX,
 };
-pub use local_driver::pond_warden::{warden_container_label, warden_container_name};
 pub use local_driver_glue::local_container_spec_from_provider;
 pub use provider::{
     on_ingress_owner_changed, reconcile_assignment, BucketAcl, BucketRef, CfAccountInfo,
-    CloudflareClient, CloudflareEnvoy, CreateR2BucketResult, CreateTokenResult,
-    CreateTunnelResult, DigitalOceanEnvoy, FloatingIpAssignOutcome, FloatingIpProvider,
-    FloatingIpState, FloatingIpTarget, GrantScope, HetznerDriver, HetznerEnvoy, HetznerFloatingIp,
-    Location, MachineProvider, OvhFloatingIp, ProjectId, R2BucketInfo, R2CustomDomain, ServerId,
-    ServerSpec, ServerStatus, ServerSummary, TokenGrant, TunnelConnState, TunnelDnsRecord,
-    TunnelDriftRow, TunnelDriftState, VultrFloatingIp, WorkerDeployResult,
-    MESOFACT_STATIC_GRANTS,
+    CloudflareClient, CloudflareEnvoy, CreateR2BucketResult, CreateTokenResult, CreateTunnelResult,
+    DigitalOceanEnvoy, FloatingIpAssignOutcome, FloatingIpProvider, FloatingIpState,
+    FloatingIpTarget, GrantScope, HetznerDriver, HetznerEnvoy, HetznerFloatingIp, Location,
+    MachineProvider, OvhFloatingIp, ProjectId, R2BucketInfo, R2CustomDomain, ServerId, ServerSpec,
+    ServerStatus, ServerSummary, TokenGrant, TunnelConnState, TunnelDnsRecord, TunnelDriftRow,
+    TunnelDriftState, VultrFloatingIp, WorkerDeployResult, MESOFACT_STATIC_GRANTS,
 };
 #[cfg(feature = "local-docker")]
 pub use provider::{LocalDockerEnvoy, LocalDockerProvider};
@@ -279,17 +281,12 @@ pub use reconciler::{
     collect_live_derive_hashes, compute_derive_cache_candidates, compute_live_set,
     compute_prune_candidates, compute_service, derive_minio_key, execute_derive_cache_prune,
     execute_prune, load_service_and_mirror, mesofact_static::WORKER_SCRIPT, new_sync_id,
-    pond::MINIFLARE_SIM_SCRIPT, publish_to_pond, resolve_runner_machine, summarize, CellStatus,
-    CloudflareWorkerReconciler, ContainerOptions, ContainerReconciler, DeriveCacheLiveHashes,
-    DerivePruneCandidate, DriftEntry,
-    HealthState, LocalStaticOptions, MesofactRunnerReconciler, MesofactStaticReconciler,
-    MirrorObservation, PondOptions, PondPublishReport, PondState, PruneCandidate, PruneOutcome,
-    PruneReport, ProviderScope, ReconcileCtx, Reconciler, RunningWorkload, RunningWorkloadSummary,
-    Runtime,
-    ServiceStatus, StaticAssetReconciler, StatusSummary, SyncHistoryEntry, SyncOutcome, SyncState,
-    WireContainerStatus,
+    pond::MINIFLARE_SIM_SCRIPT, publish_to_pond, summarize, CellStatus, CloudflareWorkerReconciler,
+    ContainerOptions, ContainerReconciler, DeriveCacheLiveHashes, DerivePruneCandidate, DriftEntry,
+    HealthState, LocalProcessReconciler, LocalStaticOptions, MesofactStaticReconciler,
+    MirrorObservation, PondOptions, PondPublishReport, PondState, ProviderScope, PruneCandidate,
+    PruneOutcome, PruneReport, ReconcileCtx, Reconciler, RunningWorkload, RunningWorkloadSummary,
+    Runtime, ServiceStatus, StaticAssetReconciler, StatusSummary, SyncHistoryEntry, SyncOutcome,
+    SyncState, WireContainerStatus,
 };
 pub use status::{collect_machine_report, AgentProbe, DriftFinding, MachineReport};
-pub use tenant::{
-    load_tenants, TenantBinding, TenantConfig, TenantError, TenantFeed, TenantOutput,
-};
