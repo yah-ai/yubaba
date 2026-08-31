@@ -14,7 +14,8 @@
 //! Gated on `YAH_LOCAL_SIM_E2E=1` to match `pond_smoke`.
 //!
 //! ```bash
-//! YAH_LOCAL_SIM_E2E=1 cargo test -p yubaba --test pond_reconciler_smoke -- --nocapture
+//! YAH_LOCAL_SIM_E2E=1 cargo test -p yubaba --test main \
+//!     -- pond_reconciler_smoke:: --nocapture
 //! ```
 //!
 //! The test uses a randomised container name + bucket so concurrent runs +

@@ -14,11 +14,13 @@
 //!   "version": "0.9.0",
 //!   "triples": {
 //!     "x86_64-unknown-linux-musl": {
-//!       "url":      "https://cdn.yah.dev/yubaba/0.9.0/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz",
-//!       "size":     2345678,
-//!       "sha256":   "abc…",
-//!       "sig_url":  "https://cdn.yah.dev/yubaba/.../...tar.gz.sig",
-//!       "cert_url": "https://cdn.yah.dev/yubaba/.../...tar.gz.cert"
+//!       "url":         "https://cdn.yah.dev/yubaba/0.9.0/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz",
+//!       "size":        2345678,
+//!       "sha256":      "abc…",
+//!       // cosign 3.x shape. Manifests cut by the cosign-2.x pipeline carry
+//!       // "sig_url"/"cert_url" here instead — both shapes parse, see
+//!       // [`ManifestTripleEntry`].
+//!       "bundle_url":  "https://cdn.yah.dev/yubaba/.../...tar.gz.sigstore.json"
 //!     },
 //!     "aarch64-unknown-linux-musl": { … }
 //!   }
@@ -120,15 +122,13 @@ impl ReleaseTrust {
         }
     }
 
-    /// Whether verification consumes the `.cert` sidecar. Key-based signatures
-    /// have no Fulcio certificate, so a consumer must not fail the download
-    /// when the release published no `.cert` alongside the `.sig`.
-    pub fn needs_certificate(&self) -> bool {
-        matches!(self, Self::Keyless { .. })
-    }
-
     /// The `cosign verify-blob` flags this trust model contributes, in order.
-    /// The caller appends `--signature`/`--certificate`/the blob itself.
+    /// The caller appends `--bundle <path>`/the blob itself. cosign 3.x's
+    /// bundle format carries the signature (and, for keyless, the Fulcio
+    /// certificate + transparency proof) as ONE file, so there is no
+    /// separate `.cert` sidecar to conditionally fetch any more — the old
+    /// `needs_certificate()` distinction that gated a `.cert` download is
+    /// gone with it.
     pub fn verify_flags(&self) -> Vec<String> {
         match self {
             Self::Keyless {
@@ -140,20 +140,96 @@ impl ReleaseTrust {
                 "--certificate-oidc-issuer".into(),
                 oidc_issuer.clone(),
             ],
-            Self::Key { key_ref } => vec!["--key".into(), key_ref.clone()],
+            // `--insecure-ignore-tlog`: key-based signing deliberately signs
+            // with no transparency-log upload (W235 — the entire point of
+            // key trust is working with no public-Sigstore-infra dependency,
+            // and an org's release artifacts should not be named in a public
+            // log by default). cosign's verify side has to be told the same
+            // thing, or it hard-fails expecting an inclusion proof that was
+            // never produced. cosign's own naming call this flag "insecure";
+            // for this trust arm it is the correct, intended mode, not a
+            // downgrade — see the R605-F1 signing-key incident this is
+            // paired with (a bare sign-blob call defaults to tlog upload
+            // even in key mode, which is the actual insecure surprise).
+            Self::Key { key_ref } => vec![
+                "--key".into(),
+                key_ref.clone(),
+                "--insecure-ignore-tlog".into(),
+            ],
         }
     }
 }
 
-/// One per-triple entry in the manifest. Field order matches what
-/// release.yml's `Emit per-triple manifest fragment` step writes.
+/// One per-triple entry in the manifest.
+///
+/// TWO SIGNATURE SHAPES EXIST IN THE WILD and this type has to read both, so
+/// every signature field is optional. Until R755-T4 measured it (2026-08-26)
+/// this struct required `bundle_url` and the doc comment here claimed the field
+/// order matched what release.yml's `Emit per-triple manifest fragment` step
+/// writes. It did not, and never had: that step emits `sig_url`/`cert_url` and
+/// no `bundle_url` at all. The consequence was total — `fetch_release_manifest`
+/// hard-failed with `missing field bundle_url` against the ONLY manifest ever
+/// published, so `yah cloud rollout plan` could not resolve any release, ever.
+/// Every test in this module used a hand-written fixture carrying `bundle_url`,
+/// which is precisely why fixtures alone never caught it; see
+/// `parses_the_real_published_manifest_bytes` for the regression that would
+/// have, and `scripts/release-manifest-rehearsal.sh`'s header for the same
+/// lesson stated in advance.
+///
+///   * `bundle_url` — cosign 3.x sigstore bundle: signature + certificate +
+///     transparency proof in one file. What the verify path wants.
+///   * `sig_url` / `cert_url` — cosign 2.x detached signature and Fulcio cert.
+///     What release.yml (pinned to cosign v2.6.5) actually emits today, and
+///     what every published manifest through 0.8.20 carries.
+///
+/// Unknown fields (`hash`, `bootstrap_hash`) are ignored by serde, so the
+/// richer fragment shape release.yml writes round-trips without a schema bump.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestTripleEntry {
     pub url: String,
     pub size: u64,
     pub sha256: String,
-    pub sig_url: String,
-    pub cert_url: String,
+    /// cosign 3.x sigstore-bundle URL. Absent on manifests cut by the
+    /// cosign-2.x pipeline — use [`ManifestTripleEntry::bundle`] rather than
+    /// reading this directly, so a missing bundle is a named refusal instead of
+    /// an empty URL handed to `curl`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_url: Option<String>,
+    /// cosign 2.x detached signature URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sig_url: Option<String>,
+    /// cosign 2.x Fulcio certificate URL. Empty string in key-trust mode —
+    /// release.yml writes `""` rather than omitting the key (R605-F1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_url: Option<String>,
+}
+
+impl ManifestTripleEntry {
+    /// The sigstore-bundle URL, or a refusal naming why verification cannot
+    /// proceed. Never returns an empty string: an entry that carries only the
+    /// cosign-2.x `sig_url`/`cert_url` pair has no bundle to verify against,
+    /// and silently fetching `""` would surface as an unrelated curl error at
+    /// the wrong layer.
+    pub fn bundle(&self) -> Result<&str> {
+        match self.bundle_url.as_deref().filter(|u| !u.is_empty()) {
+            Some(url) => Ok(url),
+            None if self.sig_url.is_some() => bail!(
+                "release-manifest entry for {} carries a cosign 2.x detached \
+                 signature (sig_url) but no sigstore bundle_url, and the verify \
+                 path needs a bundle. This manifest was cut by the cosign-v2.6.5 \
+                 pipeline in .github/workflows/release.yml; a release cut with \
+                 cosign 3.x publishes bundle_url instead. Pass --yubaba-url + \
+                 --yubaba-sha256 to install without manifest-driven verification.",
+                self.url
+            ),
+            None => bail!(
+                "release-manifest entry for {} declares no signature at all \
+                 (neither bundle_url nor sig_url) — refusing to install \
+                 unverified bytes",
+                self.url
+            ),
+        }
+    }
 }
 
 /// Top-level shape of `release-manifest.json`.
@@ -300,9 +376,8 @@ mod tests {
     }
 
     #[test]
-    fn verify_flags_and_cert_need_track_the_arm() {
+    fn verify_flags_track_the_arm() {
         let keyless = ReleaseTrust::parse(DEFAULT_YUBABA_COSIGN_IDENTITY);
-        assert!(keyless.needs_certificate());
         assert_eq!(
             keyless.verify_flags(),
             vec![
@@ -314,10 +389,13 @@ mod tests {
         );
 
         let keyed = ReleaseTrust::parse("key:cosign.pub");
-        assert!(!keyed.needs_certificate());
         assert_eq!(
             keyed.verify_flags(),
-            vec!["--key".to_string(), "cosign.pub".to_string()]
+            vec![
+                "--key".to_string(),
+                "cosign.pub".to_string(),
+                "--insecure-ignore-tlog".to_string(),
+            ]
         );
     }
 
@@ -372,8 +450,7 @@ mod tests {
                     "url": "https://cdn.yah.dev/yubaba/0.9.0/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz",
                     "size": 2345678,
                     "sha256": "abc123",
-                    "sig_url": "https://cdn.yah.dev/yubaba/0.9.0/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz.sig",
-                    "cert_url": "https://cdn.yah.dev/yubaba/0.9.0/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz.cert"
+                    "bundle_url": "https://cdn.yah.dev/yubaba/0.9.0/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz.sigstore.json"
                 }
             }
         }"#;
@@ -385,13 +462,98 @@ mod tests {
         let entry = parsed.entry("x86_64-unknown-linux-musl").unwrap();
         assert_eq!(entry.size, 2345678);
         assert_eq!(entry.sha256, "abc123");
-        assert!(entry.sig_url.ends_with(".tar.gz.sig"));
-        assert!(entry.cert_url.ends_with(".tar.gz.cert"));
+        assert!(entry.bundle().unwrap().ends_with(".tar.gz.sigstore.json"));
+    }
+
+    /// The regression the hand-written fixtures above could never catch.
+    ///
+    /// These are the VERBATIM bytes served at
+    /// `https://cdn.yah.dev/yubaba/release-manifest.json` (fetched 2026-08-26,
+    /// version 0.8.20 — the only yubaba manifest ever published). Every other
+    /// fixture in this module was written against the type instead of against
+    /// the pipeline, so all of them carried `bundle_url` and all of them passed
+    /// while `fetch_release_manifest` was failing in production with
+    /// `missing field bundle_url` — reproduced live via
+    /// `yah cloud rollout plan --to 0.8.20 --node us-west-003`.
+    ///
+    /// If a future schema change breaks real published manifests again, this is
+    /// the test that goes red. Do not "fix" it by editing the JSON to match the
+    /// type; re-fetch the live manifest and make the type read it.
+    #[test]
+    fn parses_the_real_published_manifest_bytes() {
+        let raw = r#"{
+  "version": "0.8.20",
+  "triples": {
+    "aarch64-unknown-linux-musl": {
+      "url": "https://cdn.yah.dev/yubaba/0.8.20/aarch64-unknown-linux-musl/yubaba-aarch64-unknown-linux-musl.tar.gz",
+      "size": 9780352,
+      "sha256": "be8bb1602cd8827cb8aa5c56639a84c03d47508405b3baee5aa004a7d0787797",
+      "sig_url": "https://cdn.yah.dev/yubaba/0.8.20/aarch64-unknown-linux-musl/yubaba-aarch64-unknown-linux-musl.tar.gz.sig",
+      "cert_url": "https://cdn.yah.dev/yubaba/0.8.20/aarch64-unknown-linux-musl/yubaba-aarch64-unknown-linux-musl.tar.gz.cert"
+    },
+    "x86_64-unknown-linux-musl": {
+      "url": "https://cdn.yah.dev/yubaba/0.8.20/x86_64-unknown-linux-musl/yubaba-x86_64-unknown-linux-musl.tar.gz",
+      "size": 10067454,
+      "sha256": "ce1978cf9d7362621290265e87e0bdb55de4b2410b6c8c6931c3cf806a462767",
+      "sig_url": "https://cdn.yah.dev/yubaba/0.8.20/x86_64-unknown-linux-musl/yubaba-x86_64-unknown-linux-musl.tar.gz.sig",
+      "cert_url": "https://cdn.yah.dev/yubaba/0.8.20/x86_64-unknown-linux-musl/yubaba-x86_64-unknown-linux-musl.tar.gz.cert"
+    }
+  }
+}"#;
+        let parsed: YubabaReleaseManifest =
+            serde_json::from_str(raw).expect("the live published manifest must parse");
+        assert_eq!(parsed.version, "0.8.20");
+        assert_eq!(parsed.triples.len(), 2);
+        // Predates R625-F2, so it declares neither epoch. Absent is "unproven",
+        // never "compatible" — see ClusterEpochs.
+        assert_eq!(parsed.cluster_protocol, None);
+        assert_eq!(parsed.state_epoch, None);
+
+        let entry = parsed.entry("x86_64-unknown-linux-musl").unwrap();
+        assert_eq!(entry.size, 10_067_454);
+        assert!(entry.sig_url.as_deref().unwrap().ends_with(".tar.gz.sig"));
+        assert!(entry.bundle_url.is_none());
+
+        // No bundle to verify against — and the refusal must SAY that, rather
+        // than let an empty URL reach the fetcher.
+        let err = entry.bundle().unwrap_err().to_string();
+        assert!(err.contains("sig_url"), "names the shape it found: {err}");
+        assert!(err.contains("bundle_url"), "names what it wanted: {err}");
+    }
+
+    /// The richer per-triple shape release.yml's fragment step actually writes:
+    /// extra `hash` / `bootstrap_hash` keys, and `cert_url: ""` in key-trust
+    /// mode (R605-F1). Unknown keys are ignored; the empty cert is preserved
+    /// rather than mistaken for a missing field.
+    #[test]
+    fn parses_the_release_yml_fragment_shape() {
+        let raw = r#"{
+            "version": "0.8.29",
+            "cluster_protocol": 5,
+            "state_epoch": 2,
+            "triples": {
+                "x86_64-unknown-linux-musl": {
+                    "url": "https://cdn.yah.dev/yubaba/0.8.29/x86_64-unknown-linux-musl/yubaba-x86_64-unknown-linux-musl.tar.gz",
+                    "size": 10000000,
+                    "hash": "blake3:aa",
+                    "bootstrap_hash": "sha256:bb",
+                    "sha256": "bb",
+                    "sig_url": "https://cdn.yah.dev/yubaba/0.8.29/x86_64-unknown-linux-musl/yubaba-x86_64-unknown-linux-musl.tar.gz.sig",
+                    "cert_url": ""
+                }
+            }
+        }"#;
+        let parsed: YubabaReleaseManifest = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.cluster_protocol, Some(5));
+        let entry = parsed.entry("x86_64-unknown-linux-musl").unwrap();
+        assert_eq!(entry.sha256, "bb");
+        assert_eq!(entry.cert_url.as_deref(), Some(""));
+        assert!(entry.bundle().is_err());
     }
 
     #[test]
     fn manifest_entry_missing_triple_lists_available() {
-        let raw = r#"{"version":"0.9.0","triples":{"x86_64-unknown-linux-musl":{"url":"u","size":1,"sha256":"s","sig_url":"u.sig","cert_url":"u.cert"}}}"#;
+        let raw = r#"{"version":"0.9.0","triples":{"x86_64-unknown-linux-musl":{"url":"u","size":1,"sha256":"s","bundle_url":"u.sigstore.json"}}}"#;
         let parsed: YubabaReleaseManifest = serde_json::from_str(raw).unwrap();
         let err = parsed
             .entry("aarch64-unknown-linux-musl")
@@ -415,7 +577,7 @@ mod tests {
             "state_epoch": 2,
             "triples": {
                 "x86_64-unknown-linux-musl": {
-                    "url": "u", "size": 1, "sha256": "s", "sig_url": "a", "cert_url": "b"
+                    "url": "u", "size": 1, "sha256": "s", "bundle_url": "b"
                 }
             }
         }"#;

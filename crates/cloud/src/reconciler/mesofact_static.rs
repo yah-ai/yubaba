@@ -538,7 +538,7 @@ impl MesofactStaticReconciler {
             if let Some((build, build_mode)) = read_mesofact_build(&workload_dir)? {
                 if let Some(render_command) = &build.render_command {
                     let render = BuildConfig {
-                        command: render_command.replace("{route}", route),
+                        command: Some(render_command.replace("{route}", route)),
                         out_dir: build.out_dir.clone(),
                         render_command: None,
                     };
@@ -814,7 +814,8 @@ impl MesofactStaticReconciler {
         let out_dir = read_workload_out_dir(&workload_dir).unwrap_or_else(|| "dist".to_string());
         let dist_dir = workload_dir.join(&out_dir);
 
-        let mirror_prefix = format!("{}/{}", ctx.service.name, ctx.env);
+        let mirror_prefix =
+            publish_prefix(&ctx.service.name, ctx.env, ctx.component.mount.as_deref());
         let report = publish_to_r2(
             &dist_dir,
             &account_id,
@@ -847,7 +848,13 @@ impl MesofactStaticReconciler {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("{}-worker", ctx.service.name));
-            let bindings = worker_config_bindings(&mode, &asset_origin);
+            let backends = BackendOrigins::from_slot_fields(slot_fields);
+            let route_headers = crate::config::route_headers_for_service(
+                ctx.workspace_root,
+                &ctx.service.name,
+            )?;
+            let bindings =
+                worker_config_bindings(&mode, &asset_origin, &backends, &route_headers);
             let worker_bindings: Vec<WorkerBinding<'_>> = bindings
                 .iter()
                 .map(|(k, v)| WorkerBinding::PlainText {
@@ -1120,20 +1127,27 @@ fn read_mesofact_build(workload_dir: &std::path::Path) -> Result<Option<(BuildCo
 ///   bind-mounts `workload_dir` as the container's working directory via
 ///   the [`ExecContext`] passed alongside.
 ///
+/// `None` when the manifest declares no `build.command` (R838-B1) — there is
+/// no subprocess to lower, because the project builds through the in-process
+/// `mesofact-dev` pipeline rather than an external bundler. Callers skip the
+/// build step rather than lowering an empty `sh -c ""`, which would "succeed"
+/// having produced nothing.
+///
 /// Pure function: no I/O, no subprocess. Exposed at `pub(crate)` for
 /// golden-test parity with the recipe-lowering helper (R438-T7).
 pub(crate) fn lower_build_to_forge_spec(
     workload_dir: &std::path::Path,
     build: &BuildConfig,
     build_mode: &BuildMode,
-) -> ForgeSpec {
+) -> Option<ForgeSpec> {
+    let command = build.command.clone()?;
     let (image, runtime) = match build_mode {
         BuildMode::HostSide => (None, TaskRuntime::Native),
         BuildMode::InContainer { image } => (Some(image.clone()), TaskRuntime::Container),
     };
-    ForgeSpec {
+    Some(ForgeSpec {
         command: ForgeCommand::Subprocess {
-            argv: vec!["sh".into(), "-c".into(), build.command.clone()],
+            argv: vec!["sh".into(), "-c".into(), command],
             image,
         },
         where_: TaskPlacement::new(TaskLocation::Local, runtime),
@@ -1144,13 +1158,18 @@ pub(crate) fn lower_build_to_forge_spec(
             shift: "build".into(),
         },
         mesh_access: MeshAccess::default(),
-    }
+    })
 }
 
 /// Lower (`build`, `build_mode`) to a [`ForgeSpec`] and run it through the
 /// supplied [`ForgeExecutor`] (W165). Thin wrapper over
 /// [`lower_build_to_forge_spec`] — separated so the lowering is testable
 /// without spawning a subprocess.
+///
+/// A manifest with no `build.command` is a no-op here (R838-B1): the project
+/// has no external bundler step, so there is nothing for this reconciler to
+/// shell out to. Same outcome as a workload with no `workload.toml` at all,
+/// which `rebuild_static` has always skipped.
 async fn run_build(
     workload_dir: &std::path::Path,
     build: &BuildConfig,
@@ -1161,15 +1180,25 @@ async fn run_build(
         BuildMode::HostSide => "host_side",
         BuildMode::InContainer { .. } => "in_container",
     };
+    let Some(spec) = lower_build_to_forge_spec(workload_dir, build, build_mode) else {
+        tracing::info!(
+            workload = %workload_dir.display(),
+            "workload.toml declares no [build] command — skipping the build step \
+             (the project builds in-process)"
+        );
+        return Ok(());
+    };
+    let cmd_str = build
+        .command
+        .clone()
+        .expect("lower_build_to_forge_spec returns Some only when command is Some");
     tracing::info!(
         workload = %workload_dir.display(),
-        cmd = %build.command,
+        cmd = %cmd_str,
         mode = mode_tag,
         "running mesofact-static build"
     );
 
-    let spec = lower_build_to_forge_spec(workload_dir, build, build_mode);
-    let cmd_str = build.command.clone();
     let exec_ctx = ExecContext::default().with_cwd(workload_dir.to_path_buf());
 
     let outcome = executor
@@ -1268,11 +1297,75 @@ pub fn parse_worker_mode(
     }
 }
 
+/// Backend origins the edge router proxies `/api/*` prefixes to (R455-T4).
+///
+/// Distinct from `SSR_ORIGIN`: SSR proxies *page* routes to a renderer, these
+/// proxy *API* routes to a service that owns state. Both are read off the
+/// mirror's static slot (`issues_origin` / `backend_origin`).
+///
+/// These MUST be emitted here rather than set by hand on the Worker. Every
+/// apply re-uploads the whole binding list, so a binding this function does
+/// not produce is *deleted* on the next `yah cloud apply` — which is how a
+/// hand-set `ISSUES_ORIGIN` silently reverts to a 404 (R330-F13, R752-B2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackendOrigins {
+    /// `ISSUES_ORIGIN` — issue-tracker surface; `/api/issues*` proxied here.
+    pub issues: String,
+    /// `MESOFACT_BACKEND_ORIGIN` — almanac surface; `/api/releases*`.
+    pub releases: String,
+}
+
+impl BackendOrigins {
+    /// Read the optional backend-origin fields off a mirror's static slot.
+    /// Absent or empty → an empty binding, and the router's `env.X &&` guard
+    /// leaves that prefix unrouted (a real 404, never a half-configured proxy).
+    pub fn from_slot_fields(fields: &std::collections::BTreeMap<String, toml::Value>) -> Self {
+        let field = |name: &str| {
+            fields
+                .get(name)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim_end_matches('/')
+                .to_string()
+        };
+        Self {
+            issues: field("issues_origin"),
+            releases: field("backend_origin"),
+        }
+    }
+}
+
+/// The R2 key prefix a static component publishes under (R746).
+///
+/// `<service>/<env>` for an unmounted component — every pre-R746 component, and
+/// the only shape `asset_origin` in a mirror manifest is written against.
+/// `mount` appends its normalized form, which is what lets two static
+/// components of one service coexist: before it, both wrote `index.html` to the
+/// same key and the second deploy of the day silently replaced the first site
+/// with the other.
+///
+/// The front door resolves a request by its own path (`${ASSET_ORIGIN}/<path>`),
+/// so the mount is simultaneously the storage prefix and the URL prefix — by
+/// construction, not by two manifests agreeing.
+fn publish_prefix(service: &str, env: &str, mount: Option<&str>) -> String {
+    let base = format!("{service}/{env}");
+    match mount.map(crate::config::normalize_mount) {
+        None => base,
+        Some(m) if m.is_empty() => base,
+        Some(m) => format!("{base}/{m}"),
+    }
+}
+
 /// Build the plain_text Worker binding values for the given routing mode.
 ///
 /// These are uploaded alongside [`WORKER_SCRIPT`] as `plain_text` bindings
 /// and appear as `env.ASSET_ORIGIN`, `env.WORKER_MODE`, etc. inside the Worker.
-fn worker_config_bindings(mode: &WorkerMode, asset_origin: &str) -> Vec<(String, String)> {
+fn worker_config_bindings(
+    mode: &WorkerMode,
+    asset_origin: &str,
+    backends: &BackendOrigins,
+    route_headers: &str,
+) -> Vec<(String, String)> {
     let (mode_str, ssr_origin, ssr_prefixes) = match mode {
         WorkerMode::Static => ("static", String::new(), "[]".to_string()),
         WorkerMode::Spa => ("spa", String::new(), "[]".to_string()),
@@ -1300,6 +1393,16 @@ fn worker_config_bindings(mode: &WorkerMode, asset_origin: &str) -> Vec<(String,
         ("WORKER_MODE".to_string(), mode_str.to_string()),
         ("SSR_ORIGIN".to_string(), ssr_origin),
         ("SSR_PREFIXES".to_string(), ssr_prefixes),
+        ("ISSUES_ORIGIN".to_string(), backends.issues.clone()),
+        (
+            "MESOFACT_BACKEND_ORIGIN".to_string(),
+            backends.releases.clone(),
+        ),
+        // R746: per-route response headers, straight from the domain manifest's
+        // route table (`DomainConfig::route_headers_json`). `"[]"` when no
+        // domain routes this service or none of its routes declare headers —
+        // the Worker then leaves every response untouched.
+        ("ROUTE_HEADERS".to_string(), route_headers.to_string()),
     ]
 }
 
@@ -1543,6 +1646,7 @@ out_dir = "dist"
                 shape: MirrorShape::Local,
                 providers,
                 ingress: Default::default(),
+                ingress_machines: Vec::new(),
                 drivers: Default::default(),
                 asset_aliases: Default::default(),
             };
@@ -1554,6 +1658,7 @@ out_dir = "dist"
                 db: crate::DbCatalog::default(),
             };
             let component = ServiceComponent {
+                mount: None,
                 id: "site".to_string(),
                 kind: "mesofact-static".to_string(),
                 path: "app/web".to_string(),
@@ -1678,6 +1783,40 @@ kind = "container"
         let err = reconciler.up(fx.ctx()).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("providers.static"), "got: {msg}");
+    }
+
+    /// R602-B4 follow-up: a service with two static-kind components sharing
+    /// one mirror (e.g. `site` + `app`) must be able to give them distinct
+    /// ports. `slot()` resolves the component-qualified key
+    /// (`"static:<id>"`) before the bare role, so `providers."static:site"`
+    /// wins over `providers.static` for a component whose id is `site`.
+    #[test]
+    fn slot_prefers_component_qualified_key_over_bare_role() {
+        let mut fx = Fixture::new(local_static_slot(4321), true);
+        fx.mirror
+            .providers
+            .insert("static:site".to_string(), local_static_slot(9999));
+        let slot = fx.ctx().slot("static").expect("slot present");
+        let MirrorProviderSlot::Inline { fields, .. } = slot else {
+            panic!("expected inline slot");
+        };
+        assert_eq!(slot_field_u16(fields, "port"), Some(9999));
+    }
+
+    /// A component whose id has no qualified entry falls back to the bare
+    /// role — the pre-existing single-slot-per-mirror behavior is unchanged
+    /// for services that never declared a qualified key.
+    #[test]
+    fn slot_falls_back_to_bare_role_for_unqualified_component() {
+        let mut fx = Fixture::new(local_static_slot(4321), true);
+        fx.mirror
+            .providers
+            .insert("static:other-component".to_string(), local_static_slot(9999));
+        let slot = fx.ctx().slot("static").expect("slot present");
+        let MirrorProviderSlot::Inline { fields, .. } = slot else {
+            panic!("expected inline slot");
+        };
+        assert_eq!(slot_field_u16(fields, "port"), Some(4321));
     }
 
     fn miniflare_container_slot(port: u16) -> MirrorProviderSlot {
@@ -2013,28 +2152,140 @@ account_id = "test-account"
         );
     }
 
+    /// The binding is only useful if the vendored bundle actually reads it —
+    /// `scripts/check-worker-bundle.sh` keeps the two in sync, and this catches
+    /// a bundle vendored from before R746.
+    #[test]
+    fn bundled_worker_reads_route_headers() {
+        assert!(
+            WORKER_SCRIPT.contains("ROUTE_HEADERS"),
+            "bundled Worker must apply per-route response headers; got: {WORKER_SCRIPT}"
+        );
+    }
+
+    // ── R746: component mount → publish prefix ──
+
+    #[test]
+    fn unmounted_component_publishes_at_the_service_root() {
+        assert_eq!(publish_prefix("noisetable-marketing", "cloud", None), "noisetable-marketing/cloud");
+    }
+
+    #[test]
+    fn a_mount_extends_the_prefix_and_is_slash_insensitive() {
+        for m in ["/app", "app", "app/", "/app/"] {
+            assert_eq!(
+                publish_prefix("noisetable-marketing", "cloud", Some(m)),
+                "noisetable-marketing/cloud/app",
+                "mount {m:?}"
+            );
+        }
+    }
+
+    /// A root mount is the same thing as no mount — not a trailing-slash key
+    /// prefix, which would publish every asset one directory too deep.
+    #[test]
+    fn a_root_mount_is_the_service_root() {
+        assert_eq!(publish_prefix("svc", "cloud", Some("/")), "svc/cloud");
+        assert_eq!(publish_prefix("svc", "cloud", Some("")), "svc/cloud");
+    }
+
+    /// The whole point: two static components of one service must not collide.
+    #[test]
+    fn two_components_of_one_service_get_disjoint_prefixes() {
+        let site = publish_prefix("noisetable-marketing", "cloud", None);
+        let app = publish_prefix("noisetable-marketing", "cloud", Some("/app"));
+        assert_ne!(site, app);
+        assert!(app.starts_with(&format!("{site}/")), "{app} under {site}");
+    }
+
+    #[test]
+    fn config_bindings_carry_the_route_header_table() {
+        let table = r#"[{"path":"/app/*","headers":{"Cross-Origin-Opener-Policy":"same-origin"}}]"#;
+        let b: std::collections::HashMap<_, _> = worker_config_bindings(
+            &WorkerMode::Static,
+            "https://assets.example.com",
+            &BackendOrigins::default(),
+            table,
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(b["ROUTE_HEADERS"], table);
+    }
+
     #[test]
     fn config_bindings_static_mode() {
-        let b: std::collections::HashMap<_, _> =
-            worker_config_bindings(&WorkerMode::Static, "https://assets.example.com")
-                .into_iter()
-                .collect();
+        let b: std::collections::HashMap<_, _> = worker_config_bindings(
+            &WorkerMode::Static,
+            "https://assets.example.com",
+            &BackendOrigins::default(),
+            "[]",
+        )
+        .into_iter()
+        .collect();
         assert_eq!(b["WORKER_MODE"], "static");
         assert_eq!(b["ASSET_ORIGIN"], "https://assets.example.com");
         // Pointer origin defaults to the asset origin (W270 §3).
         assert_eq!(b["POINTER_ORIGIN"], "https://assets.example.com");
         assert_eq!(b["SSR_ORIGIN"], "");
         assert_eq!(b["SSR_PREFIXES"], "[]");
+        // Undeclared backends are emitted EMPTY, not omitted: the binding list
+        // is authoritative, so an omitted key would leave a stale value from an
+        // earlier deploy in place.
+        assert_eq!(b["ISSUES_ORIGIN"], "");
+        assert_eq!(b["MESOFACT_BACKEND_ORIGIN"], "");
     }
 
     #[test]
     fn config_bindings_spa_mode() {
-        let b: std::collections::HashMap<_, _> =
-            worker_config_bindings(&WorkerMode::Spa, "https://assets.example.com")
-                .into_iter()
-                .collect();
+        let b: std::collections::HashMap<_, _> = worker_config_bindings(
+            &WorkerMode::Spa,
+            "https://assets.example.com",
+            &BackendOrigins::default(),
+            "[]",
+        )
+        .into_iter()
+        .collect();
         assert_eq!(b["WORKER_MODE"], "spa");
         assert_eq!(b["SSR_ORIGIN"], "");
+    }
+
+    /// R330-F13: `/api/issues*` reaches the issue-tracker only when the static
+    /// slot's `issues_origin` becomes an `ISSUES_ORIGIN` Worker binding.
+    #[test]
+    fn config_bindings_carry_backend_origins() {
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "issues_origin".to_string(),
+            // Trailing slash trimmed — the router concatenates "/issues".
+            toml::Value::String("https://issues.example.com/".to_string()),
+        );
+        fields.insert(
+            "backend_origin".to_string(),
+            toml::Value::String("https://almanac.example.com".to_string()),
+        );
+        let backends = BackendOrigins::from_slot_fields(&fields);
+        assert_eq!(backends.issues, "https://issues.example.com");
+
+        let b: std::collections::HashMap<_, _> = worker_config_bindings(
+            &WorkerMode::Static,
+            "https://assets.example.com",
+            &backends,
+            "[]",
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(b["ISSUES_ORIGIN"], "https://issues.example.com");
+        assert_eq!(b["MESOFACT_BACKEND_ORIGIN"], "https://almanac.example.com");
+    }
+
+    /// The vendored bundle must actually read the binding this reconciler now
+    /// emits — otherwise the config lands and nothing routes.
+    #[test]
+    fn worker_script_reads_issues_origin() {
+        assert!(
+            WORKER_SCRIPT.contains("ISSUES_ORIGIN"),
+            "bundled Worker must route /api/issues* via ISSUES_ORIGIN"
+        );
     }
 
     #[test]
@@ -2043,10 +2294,14 @@ account_id = "test-account"
             origin_url: "https://ssr.example.com".to_string(),
             prefixes: vec!["/api/".to_string(), "/rpc/".to_string()],
         };
-        let b: std::collections::HashMap<_, _> =
-            worker_config_bindings(&mode, "https://assets.example.com")
-                .into_iter()
-                .collect();
+        let b: std::collections::HashMap<_, _> = worker_config_bindings(
+            &mode,
+            "https://assets.example.com",
+            &BackendOrigins::default(),
+            "[]",
+        )
+        .into_iter()
+        .collect();
         assert_eq!(b["WORKER_MODE"], "ssr");
         assert_eq!(b["SSR_ORIGIN"], "https://ssr.example.com");
         let prefixes: Vec<String> = serde_json::from_str(&b["SSR_PREFIXES"]).unwrap();
@@ -2208,7 +2463,7 @@ account_id = "test-account"
     fn host_side_build() -> (BuildConfig, BuildMode) {
         (
             BuildConfig {
-                command: "bun run build".into(),
+                command: Some("bun run build".into()),
                 out_dir: PathBuf::from("dist"),
                 render_command: None,
             },
@@ -2225,7 +2480,7 @@ account_id = "test-account"
         };
         (
             BuildConfig {
-                command: "bun run build".into(),
+                command: Some("bun run build".into()),
                 out_dir: PathBuf::from("dist"),
                 render_command: None,
             },
@@ -2325,7 +2580,7 @@ out_dir = "dist"
         )
         .unwrap();
         let (build, mode) = read_mesofact_build(tmp.path()).unwrap().unwrap();
-        assert_eq!(build.command, "bun run build");
+        assert_eq!(build.command.as_deref(), Some("bun run build"));
         assert_eq!(build.out_dir, PathBuf::from("dist"));
         assert!(matches!(mode, BuildMode::HostSide));
     }
@@ -2355,7 +2610,7 @@ digest = "{digest}"
         )
         .unwrap();
         let (build, mode) = read_mesofact_build(tmp.path()).unwrap().unwrap();
-        assert_eq!(build.command, "bun run build");
+        assert_eq!(build.command.as_deref(), Some("bun run build"));
         match mode {
             BuildMode::InContainer { image } => {
                 assert_eq!(image.registry, "ghcr.io");
@@ -2410,6 +2665,82 @@ kind = "static-asset"
     async fn read_mesofact_build_returns_none_when_file_absent() {
         let tmp = tempdir().unwrap();
         assert!(read_mesofact_build(tmp.path()).unwrap().is_none());
+    }
+
+    /// R838-B1: a `[build]` table declaring only `out_dir` is the shape
+    /// `mesofact new` scaffolds — the project builds through the in-process
+    /// pipeline and has no shell command to run.
+    #[tokio::test]
+    async fn read_mesofact_build_accepts_a_build_table_with_no_command() {
+        let tmp = tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("workload.toml"),
+            r#"schema_version = 1
+kind = "mesofact-static"
+routes = "./mesofact.routes.ts"
+
+[build]
+out_dir = "dist"
+"#,
+        )
+        .unwrap();
+        let (build, mode) = read_mesofact_build(tmp.path()).unwrap().unwrap();
+        assert_eq!(build.command, None);
+        assert_eq!(build.out_dir, PathBuf::from("dist"));
+        assert!(matches!(mode, BuildMode::HostSide));
+    }
+
+    /// R838-B1: no `build.command` → no build step, not `sh -c ""`.
+    ///
+    /// An empty shell command exits 0 having produced nothing, so the
+    /// reconciler would report a successful build and then publish whatever
+    /// stale bytes were in `out_dir`. The skip has to happen at the lowering,
+    /// which is what `lower_build_to_forge_spec` returning `None` pins.
+    #[tokio::test]
+    async fn rebuild_static_skips_the_build_step_when_no_command_is_declared() {
+        let fx = Fixture::new(cloudflare_reference_slot(), /*write_workload*/ false);
+        let workload_dir = fx.workspace_root.join("app/web");
+        std::fs::write(
+            workload_dir.join("workload.toml"),
+            r#"schema_version = 1
+kind = "mesofact-static"
+routes = "./mesofact.routes.ts"
+
+[build]
+out_dir = "dist"
+"#,
+        )
+        .unwrap();
+
+        let (capture, captured) = CaptureExecutor::new();
+        let reconciler = MesofactStaticReconciler::new().with_executor(capture.clone());
+
+        // As in the sibling tests, up_cloudflare_r2 fails for want of provider
+        // config — but only AFTER the build step would have run.
+        let _ = reconciler.rebuild_static(fx.ctx()).await;
+
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "a manifest with no build.command must dispatch nothing to the executor"
+        );
+    }
+
+    /// The lowering itself is the seam, so pin it directly too — a future
+    /// caller that reaches `lower_build_to_forge_spec` without going through
+    /// `run_build` inherits the same refusal.
+    #[test]
+    fn lowering_a_build_with_no_command_yields_no_forge_spec() {
+        let build = BuildConfig {
+            command: None,
+            out_dir: PathBuf::from("dist"),
+            render_command: None,
+        };
+        assert!(lower_build_to_forge_spec(
+            std::path::Path::new("/workspace/app/web"),
+            &build,
+            &BuildMode::HostSide,
+        )
+        .is_none());
     }
 
     #[tokio::test]
@@ -2727,7 +3058,10 @@ render_command = "echo render {route} --all"
             matches!(build_mode, BuildMode::InContainer { .. }),
             "expected BuildMode::InContainer but got {build_mode:?}",
         );
-        assert!(!build.command.is_empty(), "build.command must be non-empty");
+        assert!(
+            build.command.as_deref().is_some_and(|c| !c.is_empty()),
+            "build.command must be declared and non-empty"
+        );
     }
 
     /// Spin up a throwaway loopback server that answers `/__mesofact/info` with

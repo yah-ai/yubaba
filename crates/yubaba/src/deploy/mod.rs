@@ -22,7 +22,17 @@
 //! @yah:next("Support window parsing (5m, 10m) for gate.window field")
 //! @arch:see(.yah/docs/working/W140-yah-yubaba-ci-cd.md)
 //! @yah:handoff("PrometheusGateEvaluator in yubaba/src/rollout/gate.rs. Queries /api/v1/query (instant). Metric name → PromQL template mapping for http_5xx_rate + p95_latency_ms; custom metrics pass through verbatim. Condition parsing: < <= > >=. 9 unit tests all green.")
+//!
+//! @yah:relay(R784, "deploy/env_validate.rs's CfTunnel/stage_cf_tunnel pipeline is fully tested but has zero production callers — decide keep-and-wire vs delete")
+//! @yah:status(review)
+//! @yah:assignee(bundle-anthropic-miravel)
+//! @yah:at(2026-08-19T06:27:10Z)
+//! @yah:kind(spike)
+//! @yah:handoff("DELETE (option b): env_validate.rs's 4-stage gate (image pull -> healthcheck -> mesh peering -> CF tunnel) doesn't match how deploy_workload_spec actually deploys -- it delegates pull/healthcheck to the backend and returns immediately; MeshAssignment::stub (oss/kamaji/crates/kamaji/src/lib.rs:180) is a legacy alias for the no-WireGuard sentinel, not a raft-peering wait; no production impl of any of the 4 traits (ImageSource/HealthcheckProber/MeshPeering/CfTunnel) exists anywhere -- only test fakes. CF tunnel specifically: R780 already proved the real mechanism is reconciler::ingress::ensure_tunnel_ingress, external to yubaba -- wiring stage_cf_tunnel would stand up a THIRD CF mechanism, which this ticket's own next-steps said not to do.")
+//! @yah:handoff("Deleted oss/yubaba/crates/yubaba/src/deploy/env_validate.rs entirely; removed `pub mod env_validate;` from deploy/mod.rs and moved this ticket's annotation there (the deleted file was its only source anchor). Left A054's R090-F4 historical planning record untouched -- rewriting frozen history would falsify it, not correct it.")
+//! @yah:handoff("Adjacent, NOT touched (separable, out of scope): deploy/mesh_resolve.rs (F6's FromMesh resolver) also has zero callers in lib.rs by the same grep -- candidate for a follow-up ticket.")
+//! @yah:verify("cargo check -p yubaba: clean build after removal (2026-08-19)")
+//! @yah:verify("cargo test -p yubaba --lib: 492 passed, 0 failed (2026-08-19) -- confirms nothing else referenced the deleted env_validate module")
 
-pub mod env_validate;
 pub mod mesh_resolve;
 pub mod secret_mount;

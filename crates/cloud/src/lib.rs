@@ -219,6 +219,26 @@
 //! @yah:verify("bun run typecheck — no new errors (6 pre-existing unchanged)")
 //!
 //! @arch:see(.yah/docs/working/W193-asset-dependency-status-surface.md)
+//!
+//! @yah:ticket(R743-T7, "yah-cloud: 5 test binaries to 1 (or 2 — pond_smoke may stay isolated)")
+//! @yah:at(2026-08-11T01:18:56Z)
+//! @yah:status(review)
+//! @yah:phase(P2)
+//! @yah:parent(R743)
+//! @yah:next("tests/main.rs mod'ing the siblings + autotests = false and [[test]] name = \"main\" in oss/yubaba/crates/cloud/Cargo.toml.")
+//! @yah:verify("cargo test -p yah-cloud -- --list count unchanged; three green runs. One commit — oss subtree.")
+//! @yah:gotcha("tests/pond_smoke.rs:198 is the only real fixed-port bind in the whole in-scope set — MinIO on http://127.0.0.1:9000, an external dependency it does not own. It is a legitimate deliberate-isolation candidate: if merging it makes the suite flaky or order-dependent, keep it as its own [[test]] target and say so on the ticket rather than force-merging.")
+//! @yah:gotcha("pond_smoke.rs and mesofact_static_e2e.rs both host live @yah: annotations.")
+//! @yah:handoff("LANDED: 5 test binaries → 2. New tests/main.rs mods live_workspace_smoke, mesofact_static_e2e, pg_driver_live and whisper_derive_e2e; Cargo.toml gains autotests = false plus explicit [[test]] main (tests/main.rs) and [[test]] pond_smoke (tests/pond_smoke.rs). Files were mod'd, not concatenated, so mesofact_static_e2e.rs's live R441-B2 annotation block stays where the harvester expects it and CARGO_MANIFEST_DIR (which three of the four walk up from) is unchanged. autotests = false only gates [[test]] discovery — examples/load_probe.rs is still autodiscovered. Test names gained a module prefix (e.g. whisper_derive_e2e::derive_pipeline_upload_skip_prune_reproducibility); substring filters still match, but `--test <file-stem>` for the four merged files is now `--test main -- <module>::`.")
+//! @yah:handoff("ISOLATION DECISION: pond_smoke STAYS its own [[test]] target — 2 targets, not 1, and deliberately so. Three reasons, strongest first. (1) DECISIVE: .yah/qed/pond-smoke.toml's `pond-spinup-budget` step shells out to `cargo test --release --locked -p cloud --test pond_smoke -- --nocapture`. Folding pond_smoke into `main` turns that committed pipeline step into a hard cargo error, and that file is outside this crate (peer-owned path, not mine to edit). (2) It is the only test in the crate that reaches a FIXED external address — MinIO at http://127.0.0.1:9000 (pond_smoke.rs:199) — and the only one that creates/`docker rm -f`s named containers in a Drop guard, so its blast radius on failure is outside the process and a standalone runnable handle is worth keeping. xtask/src/lib.rs's @yah:assumes census independently found this to be the ONLY real port bind across all ten in-scope crates. (3) It is benchmark-shaped and libtest parallelises within one binary: both its tests assert wall-clock budgets (WARM_RESTART_BUDGET 3s, WARDEN_COLD_BUDGET 5s, COLD_START_BUDGET 15s). Merging would drop whisper_derive_e2e (two in-process axum servers + BLAKE3 + tempdir IO, ungated) and live_workspace_smoke (a full CloudConfig::load walk of the real workspace, ungated) onto sibling threads inside that measurement window, and the pipeline runs it --nocapture for the timing report, which merging would interleave with every other test's output. The four that DID merge have no such conflict: read-only fs, 127.0.0.1:0 ephemeral ports, tempdirs, and no process-global state (no set_var / set_current_dir / top-level statics anywhere in the set).")
+//! @yah:verify("BASELINE (HEAD layout, cargo test -p yah-cloud -- --list, run with the change temporarily reverted): 6 test binaries — lib 924 tests; live_workspace_smoke 1; mesofact_static_e2e 1; pg_driver_live 1; pond_smoke 2; whisper_derive_e2e 1; Doc-tests cloud 1. Integration total 6 across 5 binaries.")
+//! @yah:verify("AFTER (same command, exit 0): lib 924 tests; tests/main.rs 4 tests; tests/pond_smoke.rs 2 tests; Doc-tests cloud 1. Integration total 6 across 2 binaries — COUNT UNCHANGED, every one of the 6 names accounted for, now module-prefixed inside main.")
+//! @yah:verify("THREE GREEN RUNS: cargo test -p yah-cloud --test main --test pond_smoke, three consecutive times — main 3 passed / 0 failed / 1 ignored, pond_smoke 2 passed / 0 failed, all three runs identical. No order-dependence observed.")
+//! @yah:verify("HONEST SCOPE OF WHAT ACTUALLY EXECUTED (confirmed with -- --nocapture, container has no docker / no live pg / no mesofact-dev binary): REALLY RAN — live_workspace_smoke::live_yah_workspace_loads_cleanly (real CloudConfig::load of the checked-in .yah/ tree, real assertions) and whisper_derive_e2e::derive_pipeline_upload_skip_prune_reproducibility (in-process axum fake-S3 + fake upstream on 127.0.0.1:0, all three runs). SELF-SKIPPED at runtime — mesofact_static_e2e (prints 'skipping: set YAH_RECONCILER_E2E_BIN'), pond_smoke::pond_spinup_budget and pond_smoke::warden_container_spinup_budget (both print 'SKIP: set YAH_LOCAL_SIM_E2E=1', need orbstack/colima/docker). IGNORED — pg_driver_live (#[ignore], needs a built yah-pg-dev binary + network). So the live/e2e legs were compiled and linked but NOT exercised here; the pipeline steps that do exercise them are unchanged for pond_smoke and reachable as `--test main -- mesofact_static_e2e::` for the merged one.")
+//! @yah:gotcha("PRE-EXISTING, NOT CAUSED BY THIS TICKET: .yah/qed/local-sim-smoke.toml's only step runs `cargo test -p cloud --test local_sim_smoke`, but tests/local_sim_smoke.rs does not exist and `git log --all` finds it at neither oss/yubaba/crates/cloud/tests/ nor the pre-OSS crates/yah/cloud/tests/ path. That pipeline was already dangling before this change (it most likely wants pond_smoke). Left alone: .yah/qed/ is outside this crate. Flagging it because autotests = false makes a target-name typo fail identically to this, and the next person to hit it should not blame R743-T7.")
+//! @yah:gotcha("Historical @yah:verify strings on already-landed tickets still cite the retired per-file target names — `--test whisper_derive_e2e` (reconciler/static_asset.rs:46,118), `--test mesofact_static_e2e` (the R441-B2 block inside tests/mesofact_static_e2e.rs itself). Those are landed records, not live invocations, so they were deliberately NOT rewritten; the working form is now `cargo test -p yah-cloud --test main -- <module>::`.")
+//! @yah:gotcha("CONTAINER, not code: the first attempt at the post-change --list died with `error: linking with cc failed … ld terminated with signal 7 [Bus error]` on both the merged `main` target and the untouched `lib test` target. Root cause was the container's root filesystem at 100% (8.0K free) — oss/yubaba/target alone was 23G with no cargo-orphan-gc installed here to reclaim it. Cleared by deleting the regenerable incremental caches (oss/yubaba/target/debug/incremental, target/debug/incremental) while no cargo was running; the listing then exited 0. Worth knowing because the failure mode reads exactly like the R770 orphan-gc symptom described in CLAUDE.md but is plain ENOSPC.")
+//! @yah:tier(Warrior)
 
 pub mod almanac_dispatch;
 pub mod app_manifest;
@@ -239,8 +259,10 @@ pub mod identities;
 pub mod local_driver_glue;
 pub mod mesh;
 pub mod mesh_service;
+pub mod migrate;
 pub mod multi_root;
 pub mod paths;
+pub mod proc_control;
 pub mod provider;
 pub mod provision;
 pub mod reconciler;
@@ -255,7 +277,8 @@ pub use capability::Capability;
 pub use compose::{generate_compose_bundle, ComposeBundle};
 pub use config::{
     BucketLogEntry, CampCloudDbs, CloudConfig, CloudDb, ConnectSpec, DbCatalog, DevDb, GitSource,
-    IngressProvider, LegacyMirrorConfig, LegacyServiceConfig, MachineConfig, MirrorAssignment,
+    IngressDecl, IngressEdge, IngressProvider, LegacyMirrorConfig, LegacyServiceConfig,
+    MachineConfig, MirrorAssignment,
     MirrorConfig, MirrorProviderSlot, MirrorShape, PondDb, PondDbKind, Provider, ProviderConfig,
     ServiceComponent, ServiceConfig, TopologyConfig, WorkloadConfig, WorkloadConfigError,
 };

@@ -33,7 +33,43 @@ use crate::secrets::{resolve_secrets, ContainerSecrets};
 /// Default RAM-backed root for materialized secret files. `/run` is a tmpfs on
 /// systemd nodes, so decrypted PEM never touches disk. Each workload gets a
 /// `<root>/<ident>/` subdir, reaped on workload destroy.
-pub const DEFAULT_SECRET_MOUNT_ROOT: &str = "/run/yah/secrets";
+///
+/// Re-exported from `workload_spec::secret_mount` rather than defined here
+/// (R555-F5): admission has to recompute these host paths to recognise the
+/// rewrite this module performs, so the derivation had to become visible to
+/// both sides. The behaviour is unchanged — same root, same two collapses.
+pub use workload_spec::secret_mount::HOST_ROOT as DEFAULT_SECRET_MOUNT_ROOT;
+use workload_spec::secret_mount::{host_file_name, sanitize_component};
+
+/// The identity a cluster secret's access rule is evaluated against (R555-F5).
+///
+/// `grant` must be what `workload_spec::admission::check_grant` returned for
+/// this same spec — i.e. a document that has already passed attribution,
+/// signature and coverage. Passing an unverified grant here would make
+/// [`SecretAccess::Recipes`](workload_spec::secrets::SecretAccess::Recipes)
+/// bearer-authorized, which is the hole R706 closed for the workload case.
+///
+/// Split out of the deploy handler so the rule is testable without a router:
+/// the whole security property is "recipe identity iff verified grant", and
+/// that is one branch worth pinning.
+pub fn consumer_for(
+    spec: &WorkloadSpec,
+    grant: Option<&workload_spec::admission::AdmissionGrant>,
+) -> workload_spec::secrets::SecretConsumer {
+    let consumer = workload_spec::secrets::SecretConsumer::of(spec);
+    match (grant, workload_spec::admission::grant_key(spec)) {
+        (Some(grant), Some(key)) => {
+            consumer.admitted_as(workload_spec::secrets::RecipeIdentity {
+                recipe: grant.recipe.clone(),
+                key: key.clone(),
+            })
+        }
+        // No grant, or a grant whose key annotation went missing between
+        // verification and here: no recipe identity, so only workload rules and
+        // `allow_any` can admit this run.
+        _ => consumer,
+    }
+}
 
 /// Materialize every `SecretTarget::File` mount in `spec` into a per-workload
 /// tmpfs file and rewrite it as a read-only `Bind` volume. Returns the number
@@ -191,53 +227,6 @@ fn set_mode(path: &Path, mode: u32) {
     let _ = (path, mode);
 }
 
-/// Collapse a value into a single safe path component: every char outside
-/// `[A-Za-z0-9_-]` becomes `_` (dots included, so `.` / `..` can never
-/// traverse). Empty input maps to `_`.
-fn sanitize_component(s: &str) -> String {
-    let mapped: String = s
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if mapped.is_empty() {
-        "_".into()
-    } else {
-        mapped
-    }
-}
-
-/// Derive a collision-free host filename from a container target path: strip
-/// the leading `/`, keep `.` for extensions, and replace path separators (and
-/// any other non-`[A-Za-z0-9_.-]` char) with `_`. A target that reduces to
-/// nothing or a dots-only name falls back to `secret`. The result is always a
-/// single flat filename (no separators), so it cannot traverse out of the
-/// per-workload dir.
-fn host_file_name(target: &Path) -> String {
-    let raw = target.to_string_lossy();
-    let trimmed = raw.trim_start_matches('/');
-    let mapped: String = trimmed
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if mapped.is_empty() || mapped.chars().all(|c| c == '.') {
-        "secret".into()
-    } else {
-        mapped
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -313,6 +302,52 @@ mod tests {
         );
         spec.secrets = secrets;
         spec
+    }
+
+    // ── consumer identity (R555-F5) ──────────────────────────────────────────
+
+    fn a_grant(recipe: &str) -> workload_spec::admission::AdmissionGrant {
+        workload_spec::admission::AdmissionGrant::from_spec(recipe, &spec_with_secrets(vec![]))
+    }
+
+    #[test]
+    fn a_verified_grant_gives_the_run_its_recipe_identity() {
+        use workload_spec::secrets::{SecretAccess, SecretConsumer};
+
+        let key = "3d".repeat(32);
+        let mut spec = spec_with_secrets(vec![]);
+        let grant = a_grant("rusty-v8-musl");
+        workload_spec::admission::attach(&mut spec, &grant.encode(), "sig", &key);
+
+        let consumer = consumer_for(&spec, Some(&grant));
+        let rule = SecretAccess::recipes([("rusty-v8-musl", key.as_str())]);
+        assert!(rule.admits(&consumer));
+        // And the ephemeral half is untouched: the workload name is still the
+        // per-run forge ident, which is exactly why the recipe rule is needed.
+        assert_eq!(consumer.workload, SecretConsumer::of(&spec).workload);
+        assert!(consumer.workload.starts_with("forge-"));
+    }
+
+    #[test]
+    fn an_unverified_spec_gets_no_recipe_identity() {
+        use workload_spec::secrets::SecretAccess;
+
+        // The annotations are present and say what an attacker would want them
+        // to say; what is absent is the `Some(grant)` that only verification
+        // produces.
+        let key = "3d".repeat(32);
+        let mut spec = spec_with_secrets(vec![]);
+        workload_spec::admission::attach(&mut spec, &a_grant("rusty-v8-musl").encode(), "sig", &key);
+
+        let consumer = consumer_for(&spec, None);
+        assert_eq!(consumer.recipe, None);
+        assert!(!SecretAccess::recipes([("rusty-v8-musl", key.as_str())]).admits(&consumer));
+    }
+
+    #[test]
+    fn an_ordinary_workload_is_unchanged_by_this() {
+        let consumer = consumer_for(&spec_with_secrets(vec![]), None);
+        assert_eq!(consumer, workload_spec::secrets::SecretConsumer::of(&spec_with_secrets(vec![])));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! `POST /raft/add-learner`.
 //!
 //! Part of R569-F3 — the canonical `@yah:ticket` annotation lives in
-//! `.yah/docs/working/W255-headless-macos-yubaba-node.md`; the endpoint it
+//! `.yah/docs/working/W301-headless-macos-yubaba-node.md`; the endpoint it
 //! documents is implemented in `src/lib.rs`. This suite is credential-free and
 //! containerd-free: it stands up a real 3-voter openraft cluster over loopback
 //! HTTP (via the harness), then stands up a **separate, uninitialised** yubaba
@@ -10,7 +10,7 @@
 //! `--raft-node-id 4` but no `raft init` and no `--bootstrap-single-node` — and
 //! joins it to the live cluster as a learner.
 //!
-//! It asserts the W255 join contract:
+//! It asserts the W301 join contract:
 //! - the leader accepts `POST /raft/add-learner` (200),
 //! - the joiner receives replicated state (its `/raft/status` learns the leader
 //!   and its `last_applied` advances past the membership entry) — i.e. the
@@ -23,7 +23,7 @@
 //!   change membership).
 //!
 //! ```bash
-//! cargo test -p yubaba --test raft_add_learner
+//! cargo test -p yubaba --test main -- raft_add_learner::
 //! ```
 
 use std::sync::Arc;

@@ -1,4 +1,8 @@
 // src/manifest.ts
+function buildPageRoot(manifest) {
+  const id = manifest?.build_id;
+  return typeof id === "string" && id.length > 0 ? `${id}/html` : null;
+}
 async function loadManifest(assetOrigin) {
   try {
     const resp = await fetch(`${assetOrigin}/manifest.json`);
@@ -91,76 +95,95 @@ async function resolvePointer(pointerOrigin, key) {
 
 // src/router.ts
 var IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
+var PAGE_CACHE_CONTROL = "no-cache";
 var router_default = {
   async fetch(request, env) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-    const resilience = parseResilience(env.SSR_RESILIENCE);
-    if (env.ISSUES_ORIGIN && path.startsWith("/api/issues")) {
-      const target = env.ISSUES_ORIGIN + "/issues" + path.slice("/api/issues".length) + url.search;
+    const resp = await route(request, env);
+    return applyRouteHeaders(resp, new URL(request.url).pathname, env.ROUTE_HEADERS);
+  }
+};
+async function route(request, env) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  const resilience = parseResilience(env.SSR_RESILIENCE);
+  if (env.ISSUES_ORIGIN && path.startsWith("/api/issues")) {
+    const target = env.ISSUES_ORIGIN + "/issues" + path.slice("/api/issues".length) + url.search;
+    return proxyWithResilience(request, target, policyFor(resilience, path));
+  }
+  if (env.MESOFACT_BACKEND_ORIGIN && path.startsWith("/api/releases")) {
+    const target = env.MESOFACT_BACKEND_ORIGIN + "/releases" + path.slice("/api/releases".length) + url.search;
+    return proxyWithResilience(request, target, policyFor(resilience, path));
+  }
+  if (env.WORKER_MODE === "ssr" && env.SSR_ORIGIN) {
+    let prefixes = [];
+    try {
+      prefixes = JSON.parse(env.SSR_PREFIXES);
+    } catch {}
+    const matched = prefixes.find((p) => path === p || path.startsWith(p.endsWith("/") ? p : p + "/"));
+    if (matched) {
+      const target = env.SSR_ORIGIN + path + url.search;
       return proxyWithResilience(request, target, policyFor(resilience, path));
     }
-    if (env.MESOFACT_BACKEND_ORIGIN && path.startsWith("/api/releases")) {
-      const target = env.MESOFACT_BACKEND_ORIGIN + "/releases" + path.slice("/api/releases".length) + url.search;
-      return proxyWithResilience(request, target, policyFor(resilience, path));
-    }
-    if (env.WORKER_MODE === "ssr" && env.SSR_ORIGIN) {
-      let prefixes = [];
-      try {
-        prefixes = JSON.parse(env.SSR_PREFIXES);
-      } catch {}
-      const matched = prefixes.find((p) => path === p || path.startsWith(p.endsWith("/") ? p : p + "/"));
-      if (matched) {
-        const target = env.SSR_ORIGIN + path + url.search;
-        return proxyWithResilience(request, target, policyFor(resilience, path));
-      }
-    }
-    if (path.startsWith("/uploads/")) {
-      if (!env.UPLOAD_ORIGIN) {
-        return new Response("Not Found", { status: 404 });
-      }
-      const uploadResp = await fetch(`${env.UPLOAD_ORIGIN}/${path.slice(1)}`);
-      if (uploadResp.ok) {
-        return uploadResp;
-      }
+  }
+  if (path.startsWith("/uploads/")) {
+    if (!env.UPLOAD_ORIGIN) {
       return new Response("Not Found", { status: 404 });
     }
-    let key;
-    if (path === "/" || path.endsWith("/")) {
-      key = (path === "/" ? "" : path.slice(1)) + "index.html";
-    } else {
-      key = path.slice(1);
+    const uploadResp = await fetch(`${env.UPLOAD_ORIGIN}/${path.slice(1)}`);
+    if (uploadResp.ok) {
+      return uploadResp;
     }
-    const assetResp = await fetch(`${env.ASSET_ORIGIN}/${key}`);
-    if (assetResp.ok) {
-      return assetResp;
-    }
-    const manifest = await loadManifest(env.ASSET_ORIGIN);
-    if (matchesDeferredRoute(manifest, path)) {
-      return serveInstance(env, path, manifest);
-    }
-    const lastSegment = key.slice(key.lastIndexOf("/") + 1);
-    if (!lastSegment.includes(".")) {
-      for (const candidate of [`${key}.html`, `${key}/index.html`]) {
-        const cleanResp = await fetch(`${env.ASSET_ORIGIN}/${candidate}`);
-        if (cleanResp.ok) {
-          return cleanResp;
+    return new Response("Not Found", { status: 404 });
+  }
+  let key;
+  if (path === "/" || path.endsWith("/")) {
+    key = (path === "/" ? "" : path.slice(1)) + "index.html";
+  } else {
+    key = path.slice(1);
+  }
+  let manifest = null;
+  let manifestLoaded = false;
+  if (isPageKey(key)) {
+    manifest = await loadManifest(env.ASSET_ORIGIN);
+    manifestLoaded = true;
+    const pageRoot = buildPageRoot(manifest);
+    if (pageRoot) {
+      for (const candidate of assetCandidates(key)) {
+        const resp = await fetch(`${env.ASSET_ORIGIN}/${pageRoot}/${candidate}`);
+        if (resp.ok) {
+          return routePage(resp);
         }
       }
     }
-    if (env.WORKER_MODE === "static") {
-      return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
+  }
+  const assetResp = await fetch(`${env.ASSET_ORIGIN}/${key}`);
+  if (assetResp.ok) {
+    return assetResp;
+  }
+  if (!manifestLoaded) {
+    manifest = await loadManifest(env.ASSET_ORIGIN);
+  }
+  if (matchesDeferredRoute(manifest, path)) {
+    return serveInstance(env, path, manifest);
+  }
+  for (const candidate of assetCandidates(key).slice(1)) {
+    const cleanResp = await fetch(`${env.ASSET_ORIGIN}/${candidate}`);
+    if (cleanResp.ok) {
+      return cleanResp;
     }
-    const shellResp = await fetch(`${env.ASSET_ORIGIN}/index.html`);
-    if (shellResp.ok) {
-      return new Response(shellResp.body, {
-        status: 200,
-        headers: shellResp.headers
-      });
-    }
+  }
+  if (env.WORKER_MODE === "static") {
     return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
   }
-};
+  const shellResp = await fetch(`${env.ASSET_ORIGIN}/index.html`);
+  if (shellResp.ok) {
+    return new Response(shellResp.body, {
+      status: 200,
+      headers: shellResp.headers
+    });
+  }
+  return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
+}
 async function serveInstance(env, path, manifest) {
   const pointerOrigin = env.POINTER_ORIGIN || env.ASSET_ORIGIN;
   const key = path.slice(1);
@@ -202,14 +225,26 @@ async function errorResponse(status, assetOrigin, errorRoutes, fallbackText) {
   }
   return new Response(fallbackText ?? defaultStatusText(status), { status });
 }
+function isPageKey(key) {
+  const last = key.slice(key.lastIndexOf("/") + 1);
+  return !last.includes(".") || last.endsWith(".html");
+}
+function assetCandidates(key) {
+  const last = key.slice(key.lastIndexOf("/") + 1);
+  if (last.includes("."))
+    return [key];
+  return [key, `${key}.html`, `${key}/index.html`];
+}
+function routePage(resp) {
+  const headers = new Headers(resp.headers);
+  headers.set("Cache-Control", PAGE_CACHE_CONTROL);
+  return new Response(resp.body, { status: resp.status, headers });
+}
 function routeToAssetKeys(routePath) {
   const rel = routePath.replace(/^\/+/, "");
   if (rel === "")
     return ["index.html"];
-  const last = rel.split("/").pop() ?? "";
-  if (last.includes("."))
-    return [rel];
-  return [rel, `${rel}.html`, `${rel}/index.html`];
+  return assetCandidates(rel);
 }
 function defaultStatusText(status) {
   if (status === 410)
@@ -217,6 +252,54 @@ function defaultStatusText(status) {
   if (status >= 500)
     return "Internal Server Error";
   return "Not Found";
+}
+var NULL_BODY_STATUS = new Set([101, 103, 204, 205, 304]);
+var routeHeaderCache;
+function applyRouteHeaders(resp, path, raw) {
+  const matched = parseRouteHeaders(raw).find((r) => matchesRoutePattern(r.path, path));
+  if (!matched)
+    return resp;
+  const entries = Object.entries(matched.headers);
+  if (entries.length === 0)
+    return resp;
+  const headers = new Headers(resp.headers);
+  for (const [name, value] of entries)
+    headers.set(name, value);
+  return new Response(NULL_BODY_STATUS.has(resp.status) ? null : resp.body, {
+    status: resp.status,
+    statusText: resp.statusText,
+    headers
+  });
+}
+function parseRouteHeaders(raw) {
+  if (!raw)
+    return [];
+  if (routeHeaderCache?.raw === raw)
+    return routeHeaderCache.rules;
+  let rules = [];
+  try {
+    const v = JSON.parse(raw);
+    if (Array.isArray(v))
+      rules = v.filter(isRouteHeaderRule);
+  } catch {
+    rules = [];
+  }
+  routeHeaderCache = { raw, rules };
+  return rules;
+}
+function isRouteHeaderRule(v) {
+  if (!v || typeof v !== "object")
+    return false;
+  const r = v;
+  return typeof r.path === "string" && !!r.headers && typeof r.headers === "object";
+}
+function matchesRoutePattern(pattern, path) {
+  if (!pattern.endsWith("*"))
+    return path === pattern;
+  const prefix = pattern.slice(0, -1).replace(/\/+$/, "");
+  if (prefix === "")
+    return true;
+  return path === prefix || path.startsWith(prefix + "/");
 }
 function parseResilience(raw) {
   if (!raw)

@@ -64,13 +64,22 @@ fn golden_recipe() -> TransformRecipe {
             ],
             timeout: 600,
         }],
+        // Unsigned recipe — `admission` carries the kamaji admission-gate
+        // signature (R555-F4 / W235 §(c)) and is absent on a locally-declared
+        // one. This golden pins the LOWERING shape, which the signature does
+        // not participate in.
+        admission: None,
+        // No `[[secrets]]` — a local recipe cannot have any (yubaba resolves
+        // them on the node that runs the workload, and there is no node here;
+        // `materialize_transform` refuses the combination by name). R555-F5.
+        secrets: vec![],
     }
 }
 
 fn golden_build_in_container() -> (BuildConfig, BuildMode) {
     (
         BuildConfig {
-            command: "bun run build".into(),
+            command: Some("bun run build".into()),
             out_dir: PathBuf::from("dist"),
             render_command: None,
         },
@@ -83,7 +92,7 @@ fn golden_build_in_container() -> (BuildConfig, BuildMode) {
 fn golden_build_host_side() -> (BuildConfig, BuildMode) {
     (
         BuildConfig {
-            command: "bun run build".into(),
+            command: Some("bun run build".into()),
             out_dir: PathBuf::from("dist"),
             render_command: None,
         },
@@ -207,7 +216,7 @@ fn golden_remote_recipe_step_keeps_its_placement() {
     let mut recipe = golden_recipe();
     recipe.placement.location = RecipeLocation::RemoteAny {
         tier: workload_spec::TierTag("infra".into()),
-        mesh_tags: vec!["tier:x86".into()],
+        mesh_tags: vec!["arch:x86".into()],
     };
     let step = &recipe.steps[0];
 
@@ -217,7 +226,7 @@ fn golden_remote_recipe_step_keeps_its_placement() {
         spec.where_.location,
         TaskLocation::RemoteAny {
             tier: workload_spec::TierTag("infra".into()),
-            mesh_tags: vec!["tier:x86".into()],
+            mesh_tags: vec!["arch:x86".into()],
         },
         "recipe placement must lower straight through, not re-pin to Local"
     );
@@ -250,7 +259,8 @@ fn golden_build_in_container_lowers_to_pinned_local_container_subprocess() {
     let workload_dir = PathBuf::from("/workspace/app/web");
     let (build, mode) = golden_build_in_container();
 
-    let spec = lower_build_to_forge_spec(&workload_dir, &build, &mode);
+    let spec = lower_build_to_forge_spec(&workload_dir, &build, &mode)
+        .expect("a golden fixture declares a build.command");
 
     // Quadrant — same as the recipe lowering.
     assert_subprocess_local_container_pinned(&spec);
@@ -292,7 +302,8 @@ fn golden_build_host_side_lowers_to_native_quadrant_without_image() {
     let workload_dir = PathBuf::from("/workspace/app/web");
     let (build, mode) = golden_build_host_side();
 
-    let spec = lower_build_to_forge_spec(&workload_dir, &build, &mode);
+    let spec = lower_build_to_forge_spec(&workload_dir, &build, &mode)
+        .expect("a golden fixture declares a build.command");
 
     assert_eq!(spec.where_.location, TaskLocation::Local);
     assert_eq!(
@@ -330,7 +341,8 @@ fn parity_recipe_and_build_in_container_share_quadrant() {
 
     let workload_dir = PathBuf::from("/workspace/app/web");
     let (build, mode) = golden_build_in_container();
-    let build_spec = lower_build_to_forge_spec(&workload_dir, &build, &mode);
+    let build_spec = lower_build_to_forge_spec(&workload_dir, &build, &mode)
+        .expect("a golden fixture declares a build.command");
 
     // Both share the quadrant shape.
     assert_subprocess_local_container_pinned(&recipe_spec);

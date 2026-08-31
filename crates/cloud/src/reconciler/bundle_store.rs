@@ -79,6 +79,7 @@ mod tests {
         content.insert("app/index.html".to_string(), BundleHash::of(b"<html>"));
         let manifest = BundleManifest {
             schema_version: SCHEMA_VERSION,
+            requires_contract: yah_mesofact_bundle::BUNDLE_CONTRACT_VERSION,
             name: "yah-marketing".to_string(),
             runtime: BundleRuntime::Mesofact {
                 version: "0.8.18".into(),

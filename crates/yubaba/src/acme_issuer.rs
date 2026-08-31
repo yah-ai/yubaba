@@ -38,6 +38,7 @@ use zeroize::Zeroizing;
 use crate::raft::{
     SecretRecord, YubabaNodeId, YubabaRaft, YubabaRequest, YubabaResponse, YubabaStateMachine,
 };
+use crate::cert_store::{CertStoreConfig, ObjectCertStore};
 use crate::secrets::{load_cluster_kek, seal_cluster_secret, CLUSTER_KEK_PATH};
 use workload_spec::secrets::SecretAccess;
 
@@ -130,6 +131,18 @@ pub struct IssuerConfig {
     pub cert_lifetime: Duration,
     /// Renew when within this margin of expiry (default 30d).
     pub renew_before: Duration,
+    /// R779 (W267): also write the sealed pair to an object store, when the node
+    /// is configured with one ([`crate::cert_store::CertStoreConfig::parse`]).
+    ///
+    /// Additive, not a replacement: the fleet wildcard is *one* KB-scale record
+    /// and raft is exactly the right home for it. The mirror exists because a
+    /// free-tier edge node fronting 10k domains is not a raft member and so
+    /// cannot read a cluster secret at all — the object store is how cert
+    /// material reaches it, and R779's DECISION 1 puts the per-domain certs
+    /// there for the separate reason that 10k of them would rewrite the whole
+    /// raft state on every `PutSecret`. `None` on an unconfigured node, which
+    /// then behaves exactly as it did before R779.
+    pub cert_store: Option<CertStoreConfig>,
 }
 
 /// Parse the issuer config from a `key -> value` lookup (a pure function over
@@ -163,10 +176,7 @@ pub fn parse_issuer_config(
     // permissive default would make the fleet cert's private key a bearer
     // secret again, and a deny-all default would silently produce a cert nobody
     // can mount. Required config, rejected at parse time either way.
-    let access = parse_consumers(
-        &get("YUBABA_ACME_CONSUMERS").unwrap_or_default(),
-    )
-    .ok_or(
+    let access = parse_consumers(&get("YUBABA_ACME_CONSUMERS").unwrap_or_default()).ok_or(
         "YUBABA_ACME_CONSUMERS is required when YUBABA_ACME_DOMAIN is set: a \
          comma-separated list of workload names allowed to mount the issued \
          cert+key (e.g. \"ingress\"), or the literal \"any\" to store them \
@@ -180,7 +190,6 @@ pub fn parse_issuer_config(
         .unwrap_or_else(|| "/var/lib/yah/yubaba/acme-account.json".to_string());
     let kek_path =
         PathBuf::from(get("YUBABA_ACME_KEK_PATH").unwrap_or_else(|| CLUSTER_KEK_PATH.to_string()));
-
 
     let propagation_secs = parse_u64(&get, "YUBABA_ACME_DNS01_PROPAGATION_SECS", 10)?;
     let check_interval_secs = parse_u64(&get, "YUBABA_ACME_CHECK_INTERVAL_SECS", 43_200)?;
@@ -215,6 +224,11 @@ pub fn parse_issuer_config(
             challenge: AcmeChallengeKind::Dns01Cloudflare {
                 token_file,
                 zone_id,
+                // The fleet wildcard is issued for a zone we own outright, so
+                // the challenge record goes at `_acme-challenge.<domain>` in
+                // that zone. Delegation (R779) is only for *custom tenant*
+                // domains — see [`crate::domain_issuer`].
+                delegate_zone: None,
             },
             dns01_propagation_delay: Duration::from_secs(propagation_secs),
         },
@@ -224,6 +238,7 @@ pub fn parse_issuer_config(
         lock_ttl: Duration::from_secs(lock_ttl_secs),
         cert_lifetime: Duration::from_secs(cert_lifetime_days * 86_400),
         renew_before: Duration::from_secs(renew_before_days * 86_400),
+        cert_store: CertStoreConfig::parse(&get)?,
     }))
 }
 
@@ -266,6 +281,30 @@ async fn run(node_id: YubabaNodeId, raft: YubabaRaft, sm: YubabaStateMachine, cf
             );
             return;
         }
+    };
+    // R779: build the object-store mirror once, up front. A misconfigured or
+    // unreachable bucket disables the mirror and is loud about it — it must not
+    // stop the fleet cert from renewing, which is what returning here would do.
+    let mirror = match &cfg.cert_store {
+        None => None,
+        Some(store_cfg) => match store_cfg.connect(&cfg.issue.directory.url()) {
+            Ok(store) => {
+                info!(
+                    bucket = %store_cfg.bucket,
+                    issuer = %store.issuer(),
+                    "acme issuer: mirroring the sealed pair to the object cert store"
+                );
+                Some(store)
+            }
+            Err(e) => {
+                error!(
+                    bucket = %store_cfg.bucket,
+                    "acme issuer: object cert store unavailable — mirroring disabled, \
+                     raft writes continue: {e}"
+                );
+                None
+            }
+        },
     };
     let owner = node_id.to_string();
     let lock_key = issuer_lock_key(&cfg.domain);
@@ -319,7 +358,8 @@ async fn run(node_id: YubabaNodeId, raft: YubabaRaft, sm: YubabaStateMachine, cf
             };
 
             if decide_issuer_action(lock_won, renewal_due) == IssuerAction::Issue {
-                store_consistent = issue_and_store(&raft, &kek, &cfg, &cert_key, &key_key).await;
+                store_consistent =
+                    issue_and_store(&raft, &kek, &cfg, mirror.as_ref(), &cert_key, &key_key).await;
             }
         }
 
@@ -347,6 +387,7 @@ async fn issue_and_store(
     raft: &YubabaRaft,
     kek: &[u8; 32],
     cfg: &IssuerConfig,
+    mirror: Option<&ObjectCertStore>,
     cert_key: &str,
     key_key: &str,
 ) -> bool {
@@ -380,12 +421,12 @@ async fn issue_and_store(
     // a partial failure leaves the cert stale/absent, so `renewal_due` stays
     // true and the next tick re-issues and heals — the store never gets wedged
     // with a fresh cert paired to a stale key.
-    if let Err(e) = put_secret(raft, key_key, key_rec).await {
+    if let Err(e) = put_secret(raft, key_key, key_rec.clone()).await {
         // Key write is first, so nothing was overwritten — store still consistent.
         error!("acme issuer: PutSecret(key) failed (prior state intact): {e}");
         return true;
     }
-    if let Err(e) = put_secret(raft, cert_key, cert_rec).await {
+    if let Err(e) = put_secret(raft, cert_key, cert_rec.clone()).await {
         error!(
             "acme issuer: PutSecret(cert) failed AFTER the key write — store has a \
              new key against the old cert; retrying promptly to heal: {e}"
@@ -396,7 +437,57 @@ async fn issue_and_store(
         domain = %cfg.domain,
         "acme issuer: sealed cert+key written to cluster store — replicating to all nodes"
     );
+
+    // R779: mirror to the object store, after raft. Ordered this way on purpose
+    // — raft is the store the live fleet resolves from today, so it must not
+    // wait on an R2 round-trip, and a mirror failure must not be able to make
+    // `renewal_due` retry an order that already succeeded. A missed mirror heals
+    // on the next renewal; a repeated ACME order does not heal, it burns the
+    // account's rate limit.
+    mirror_pair(mirror, cfg, cert_key, key_key, cert_rec, key_rec).await;
     true
+}
+
+/// Write the sealed pair to the object cert store on a blocking thread.
+///
+/// [`ObjectCertStore`] is synchronous (the object-store trait is, so the whole
+/// tree's R2 consumers share one client shape), and this call site is inside a
+/// tokio task — so it goes through `spawn_blocking` rather than stalling a
+/// worker on an HTTPS round-trip. Every failure is logged and swallowed: see the
+/// caller for why a mirror failure must not fail the issuance.
+async fn mirror_pair(
+    mirror: Option<&ObjectCertStore>,
+    cfg: &IssuerConfig,
+    cert_key: &str,
+    key_key: &str,
+    cert_rec: SecretRecord,
+    key_rec: SecretRecord,
+) {
+    let Some(store) = mirror.cloned() else { return };
+    let (domain, cert_key, key_key) = (
+        cfg.domain.clone(),
+        cert_key.to_string(),
+        key_key.to_string(),
+    );
+    let written = tokio::task::spawn_blocking(move || {
+        store.write_pair(&cert_key, &key_key, &cert_rec, &key_rec)
+    })
+    .await;
+    match written {
+        Ok(Ok(())) => info!(
+            domain = %domain,
+            "acme issuer: sealed cert+key mirrored to the object cert store"
+        ),
+        Ok(Err(e)) => warn!(
+            domain = %domain,
+            "acme issuer: object cert store mirror failed (raft write succeeded; \
+             heals on the next renewal): {e}"
+        ),
+        Err(e) => warn!(
+            domain = %domain,
+            "acme issuer: object cert store mirror task failed: {e}"
+        ),
+    }
 }
 
 async fn put_secret(raft: &YubabaRaft, name: &str, rec: SecretRecord) -> anyhow::Result<()> {
@@ -422,7 +513,7 @@ async fn put_secret(raft: &YubabaRaft, name: &str, rec: SecretRecord) -> anyhow:
 ///   turns into a hard config error. An empty allow-list would be a valid
 ///   deny-all rule, but as a *parse result* it is far more likely a typo than an
 ///   intent to issue a cert nobody can use.
-fn parse_consumers(raw: &str) -> Option<SecretAccess> {
+pub(crate) fn parse_consumers(raw: &str) -> Option<SecretAccess> {
     let raw = raw.trim();
     if raw.eq_ignore_ascii_case("any") {
         return Some(SecretAccess::AllowAny);
@@ -480,6 +571,55 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |k| map.get(k).cloned()
+    }
+
+    // ── R779: the object cert-store mirror ──────────────────────────────────
+
+    /// The base env every issuer config needs, so a cert-store test only has to
+    /// add the keys it is actually about.
+    fn issuer_env_pairs() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("YUBABA_ACME_DOMAIN", "yah.dev"),
+            ("YUBABA_ACME_CONTACT_EMAIL", "ops@yah.dev"),
+            (
+                "YUBABA_ACME_DNS01_CLOUDFLARE_TOKEN_FILE",
+                "/run/secrets/cf.token",
+            ),
+            ("YUBABA_ACME_DNS01_CLOUDFLARE_ZONE_ID", "zone123"),
+            ("YUBABA_ACME_CONSUMERS", "ingress"),
+        ]
+    }
+
+    #[test]
+    fn cert_store_mirror_is_off_unless_a_bucket_is_named() {
+        let cfg = parse_issuer_config(env(&issuer_env_pairs())).unwrap().unwrap();
+        assert_eq!(cfg.cert_store, None);
+    }
+
+    #[test]
+    fn cert_store_mirror_parses_from_the_issuer_env() {
+        let mut pairs = issuer_env_pairs();
+        pairs.push((crate::cert_store::BUCKET_ENV, "yah-certs"));
+        pairs.push((crate::cert_store::ACCOUNT_ID_ENV, "acct123"));
+        let cfg = parse_issuer_config(env(&pairs)).unwrap().unwrap();
+        assert_eq!(
+            cfg.cert_store,
+            Some(crate::cert_store::CertStoreConfig {
+                account_id: "acct123".into(),
+                bucket: "yah-certs".into(),
+                endpoint: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_bucket_without_an_account_id_is_a_config_error() {
+        // Half-configured means an operator meant to turn this on; a silent skip
+        // surfaces weeks later as a missing cert.
+        let mut pairs = issuer_env_pairs();
+        pairs.push((crate::cert_store::BUCKET_ENV, "yah-certs"));
+        let err = parse_issuer_config(env(&pairs)).unwrap_err();
+        assert!(err.contains(crate::cert_store::ACCOUNT_ID_ENV), "got {err}");
     }
 
     #[test]

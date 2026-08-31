@@ -2,6 +2,36 @@
 //!
 //! Decoupled from the concrete provider so the CLI passes a `&dyn MachineProvider`
 //! (Hetzner in production, in-memory fakes in tests).
+//!
+//! `execute` here is called only from the operator-invoked `yah cloud machine
+//! provision` CLI (`app/yah/cli/src/cloud.rs`) — nothing in the yubaba server
+//! process calls it. `yubaba::headroom` (R737-T4) watches for when a fresh
+//! call here is warranted (N+1/N+2 warm-spare deficit) and surfaces that as a
+//! `GET /raft/status` field plus a log line; it does not call this module,
+//! deliberately — see its own doc for why.
+//!
+//! @yah:ticket(R737-T4, "N+1 headroom accounting + a background headroom-restore provisioning job that never sits on the failover path")
+//! @yah:status(review)
+//! @yah:at(2026-08-16T04:37:37Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:phase(P3)
+//! @yah:parent(R737)
+//! @yah:next("Tier: Cleric — an invariant plus an enqueue path; the hard constraint (never inline) is already the status quo to preserve.")
+//! @yah:next("VERIFIED ABSENT 2026-08-09: there is no N+1/N+2 warm-spare notion to fail over into. cloud::provision provisions on demand and nothing tracks headroom.")
+//! @yah:next("When headroom drops below N+1, ENQUEUE a background provisioning job. N+2 where a whole region can vanish.")
+//! @yah:depends_on(R737-F3)
+//! @yah:handoff("New oss/yubaba/crates/yubaba/src/headroom.rs: N+1 (N+2 across >=2 declared regions) warm-spare accounting, W253 §8. required_spare(members) derives the target from distinct MemberInfo.region values (2 once the fleet spans >=2 regions, else 1). is_spare(node,...) is the stricter predicate W253 asks for -- confirmed live (F2's TransitionTracker) + published capacity + ZERO currently-owned LIVE tenants (a node quietly carrying one small tenant is not 'held in reserve', even with room left -- that's node_headroom's job, not this). evaluate() counts spare nodes against the requirement -> HeadroomReport{spare, required}. 10 unit tests covering region-count thresholds, each spare-disqualifying condition individually (unconfirmed, unmeasured, carrying a live tenant), and the expired-lease-frees-the-node case that mirrors R737-F1's own node_load argument.")
+//! @yah:handoff("THE DESIGN CALL: does NOT call cloud::provision::execute, and does not build an in-process job queue with no consumer. Nothing in the yubaba server process has the MachineConfig/provider credentials that call needs -- those live with the operator-invoked `yah cloud machine provision` CLI (app/yah/cli/src/cloud.rs), confirmed by grep: provision::execute has exactly one call site and it is not in yubaba. Giving the control-plane daemon direct cloud-provisioning authority is a materially bigger architectural change than this ticket's own 'Cleric: an invariant plus an enqueue path' framing asks for. 'Enqueue' is scoped to: a leader-only background loop (paced at 10x election timeout -- a trend, not an emergency; scheduler.rs already owns the emergency path) evaluates the invariant, caches the verdict on ServerState.headroom (Mutex<Option<HeadroomReport>>), surfaces it as a new `headroom` section on GET /raft/status, and logs at warn on every tick a deficit persists. Wired in main.rs alongside scheduler/lease_renewal. Added a one-line pointer in provision.rs's own module doc so a future reader lands on the connection.")
+//! @yah:handoff("DISCOVERED WORK, and the reason this took far longer than the ticket's own Cleric-tier estimate: cluster_epoch_drift caught 2 UNDETECTED problems from this session's own earlier F2 and F3 work, not just from T4. raft_status (fn raft_*, a cluster_protocol surface input) had already gained F2's lease_liveness section and now T4's headroom section -- I had never run the epoch-drift gate after F2 or F3 landed. F3's three new store.rs read accessors (tenants/tenant_placement/node_admits) moved state_epoch's surface the same way the tenant_fencing_token()/tenant_ownership() precedents did (2026-08-09/10 entries). Verdict on both, matching the R734-F5 precedent exactly (same function, same additive-JSON-on-a-GET-surface shape): NOT BREAKING. Re-recorded via `cargo run -p xtask -- cluster-epochs --write` (cluster_protocol stays 5, state_epoch stays 4) and added a full surface_rerecords entry to cluster-epochs.json dated 2026-08-15 covering all three tickets' contribution to the drift in one entry.")
+//! @yah:handoff("Full verify, camp was under heavy concurrent-build load (10+ simultaneous cargo invocations across the camp against the same root workspace, confirmed via ps -- not a hang, rustc was genuinely CPU-bound, just deeply queued; several checks took 15-20 minutes to clear the lock): cargo check -p yubaba clean; cargo check -p yubaba --bin yubaba clean; cargo check -p yah-cloud clean (provision.rs doc-only edit); cargo test -p yubaba --lib = 489 passed / 0 failed (465 at F2's start -> 479 after F3+lease_renewal -> 489 after T4's 10 tests); cargo clippy -p yubaba --lib --bin yubaba: zero findings on headroom.rs or the main.rs wiring; cargo test -p xtask --test cluster_epoch_drift = 8 passed / 0 failed after re-recording (was 7/1, both axes red).")
+//! @yah:verify("cargo check -p yubaba (clean)")
+//! @yah:verify("cargo check -p yubaba --bin yubaba (clean)")
+//! @yah:verify("cargo check -p yah-cloud (clean)")
+//! @yah:verify("cargo test -p yubaba --lib = 489 passed, 0 failed, 0 ignored")
+//! @yah:verify("cargo clippy -p yubaba --lib --bin yubaba: no findings on headroom.rs, scheduler.rs, lease_renewal.rs, store.rs's new accessors, or main.rs")
+//! @yah:verify("cargo test -p xtask --test cluster_epoch_drift = 8 passed, 0 failed (cluster-epochs.json re-recorded, both axes NOT BREAKING, history entry added 2026-08-15)")
+//! @yah:gotcha("is_spare's metric is deliberately coarse: a node counts as spare only when it holds ZERO tenants, not merely 'has room for one more'. A cluster running near capacity with every node carrying at least one tenant reports 0 spare even if collectively there is plenty of headroom to absorb a single failure via partial rebalancing -- true bin-packing-aware headroom (can the union of remaining headroom absorb node X's specific tenant set) is more accurate but was out of this Cleric ticket's scope; flag this if a future ticket finds the invariant too conservative in practice.")
+//! @yah:gotcha("Nothing consumes the `headroom` GET /raft/status field yet -- no automation calls `yah cloud machine provision` off a deficit signal. That consumer (an operator runbook, or a `yah cloud auto-provision` watch command polling /raft/status) is explicitly out of this ticket's scope and unfiled; whoever wants headroom restoration to actually be automatic rather than merely visible should pick it up.")
 
 use crate::cloud_init::{self, RenderInput};
 use crate::config::MachineConfig;
@@ -130,6 +160,8 @@ mod tests {
             connect: None,
             allocatable: None,
             taints: vec![],
+            sovereign_group: None,
+            sovereign_role: None,
         }
     }
 

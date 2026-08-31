@@ -41,7 +41,7 @@ use crate::reconciler::pond::{DEFAULT_MINIO_API_PORT, DEFAULT_MINIO_PASSWORD, DE
 use crate::reconciler::static_asset::WORKLOAD_KIND;
 use crate::{MirrorProviderSlot, Provider, ServiceConfig};
 
-use local_driver::s3_sign::{sign_s3_empty_body, sign_s3_get_with_query};
+use local_driver::s3_sign::{sign_s3_get_with_query, sign_s3_no_body, uri_encode_key};
 use workload_spec::StaticAssetWorkload;
 
 /// Sidecar key the reconciler writes — never a prune candidate.
@@ -156,11 +156,15 @@ pub async fn execute_prune(
             ));
             continue;
         }
+        // R630-B1: `filename` comes back from ListObjectsV2 as a raw key, so it
+        // has to be AWS-UriEncoded before it becomes a URL — otherwise a listed
+        // key holding `:` signs one way and R2 canonicalizes another, and the
+        // DELETE 403s instead of reclaiming the object.
         let url = format!(
             "{}/{}/{}",
             backend.endpoint.trim_end_matches('/'),
             backend.bucket,
-            filename
+            uri_encode_key(filename)
         );
         match delete_object(&client, &url, &backend).await {
             Ok(()) => {
@@ -448,10 +452,18 @@ fn inner_text<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
 
 // ── S3 DeleteObject ───────────────────────────────────────────────────────────
 
+/// R630-F2, found by running a DELETE against live R2 for the first time: this
+/// signed with `sign_s3_empty_body`, which puts `content-length: 0` in the
+/// canonical headers — and reqwest/hyper strip that header off a body-less
+/// request, so R2 recomputes a different signature and answers 403
+/// `SignatureDoesNotMatch`. Exactly the trap `sign_s3_no_body`'s own doc
+/// describes for object GET/HEAD; DELETE belongs on the same signer. Nothing
+/// caught it because every test here stops at the candidate list.
 async fn delete_object(client: &reqwest::Client, url: &str, backend: &Backend) -> Result<()> {
-    let headers = sign_s3_empty_body(
+    let headers = sign_s3_no_body(
         "DELETE",
         url,
+        "",
         backend.region,
         &backend.access_key,
         &backend.secret_key,
@@ -543,6 +555,7 @@ mod tests {
 
     fn asset_component(id: &str, path: &str) -> ServiceComponent {
         ServiceComponent {
+            mount: None,
             id: id.into(),
             kind: "static-asset".into(),
             path: path.into(),
@@ -602,6 +615,7 @@ mod tests {
         );
         let mut svc = svc_with_components("mixed", vec![asset_component("assets", "assets")]);
         svc.components.push(ServiceComponent {
+            mount: None,
             id: "site".into(),
             kind: "mesofact-static".into(),
             path: "site-dir-doesnt-exist".into(),

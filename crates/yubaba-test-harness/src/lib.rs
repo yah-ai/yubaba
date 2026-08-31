@@ -75,53 +75,32 @@ use workload_spec::{MeshIdent, WorkloadSpec};
 use yubaba::cluster_policy::ClusterPolicy;
 use yubaba::failure_detector::RaftHeartbeatDetector;
 
-/// The [`ClusterPolicy`] harness clusters run under.
+/// The [`ClusterPolicy`] [`test_cluster`] founds its clusters under.
 ///
-/// The fleet preset, deliberately: the harness exists to exercise the shipped
-/// fleet's behaviour, so its clusters must obey the shipped fleet's rules
-/// (learner-only admission, WAN election timings). A test that needs different
-/// rules builds its nodes itself rather than reconfiguring the harness out from
-/// under every other test.
+/// The fleet preset, deliberately: `test_cluster` exists to exercise the
+/// shipped fleet's behaviour, so its clusters must obey the shipped fleet's
+/// rules (learner-only admission, WAN election timings). A test that needs
+/// different rules calls [`test_cluster_with_policy`] rather than reconfiguring
+/// this out from under every other test.
 const HARNESS_POLICY: ClusterPolicy = ClusterPolicy::fleet();
-
-// ── NetworkDegrade ────────────────────────────────────────────────────────────
-
-/// `tc qdisc` spec applied between cluster nodes in the local tier.
-///
-/// Requires `NET_ADMIN` capability in the machine containers. Knob:
-/// `YAH_LOCAL_NETWORK_DEGRADE=loss:5%,latency:200ms` (parsed by
-/// `LocalDockerProvider`; the harness reads it and stores here for
-/// display/logging purposes).
-#[derive(Debug, Clone, Default)]
-pub struct NetworkDegrade {
-    /// Packet loss percentage (0–100). `None` means no loss injection.
-    pub packet_loss_pct: Option<u8>,
-    /// Artificial latency in milliseconds. `None` means no latency injection.
-    pub latency_ms: Option<u32>,
-}
-
-impl NetworkDegrade {
-    /// Parse from `YAH_LOCAL_NETWORK_DEGRADE` env var format.
-    ///
-    /// Format: comma-separated `key:value` pairs, e.g.
-    /// `"loss:5%,latency:200ms"`.
-    pub fn from_env() -> Option<Self> {
-        let s = std::env::var("YAH_LOCAL_NETWORK_DEGRADE").ok()?;
-        let mut spec = Self::default();
-        for part in s.split(',') {
-            if let Some(v) = part.strip_prefix("loss:") {
-                spec.packet_loss_pct = v.trim_end_matches('%').parse().ok();
-            } else if let Some(v) = part.strip_prefix("latency:") {
-                spec.latency_ms = v.trim_end_matches("ms").parse().ok();
-            }
-        }
-        Some(spec)
-    }
-}
 
 // ── WorkloadStatus re-export ──────────────────────────────────────────────────
 
 pub use kamaji::{WorkloadState, WorkloadStatus};
+
+/// R732-T4/T5: drive the tenant streamer's tail loop against an in-process
+/// raft state machine, with no HTTP listener and no service to spawn.
+pub mod tenant_ownership;
+pub use tenant_ownership::LocalOwnership;
+
+/// R734-F2: one uninitialised node on loopback, for the routes and RPCs whose
+/// interesting behaviour happens *before* a cluster exists.
+pub mod solo_node;
+pub use solo_node::{
+    solo_node, solo_node_in_region, solo_node_in_sovereign_group, solo_node_unregistered,
+    solo_node_with_sovereign_role, SoloNode,
+    HARNESS_CAPACITY,
+};
 
 // ── MeshResponse ─────────────────────────────────────────────────────────────
 
@@ -181,10 +160,7 @@ impl WardenHandle {
     ///
     /// Returns `Ok(None)` when the workload is not yet known to this yubaba
     /// node (may appear with a short lag after deploy).
-    pub async fn get_workload_state(
-        &self,
-        ident: &MeshIdent,
-    ) -> Result<Option<WorkloadStatus>> {
+    pub async fn get_workload_state(&self, ident: &MeshIdent) -> Result<Option<WorkloadStatus>> {
         let url = format!("{}/workloads/{}/state", self.base_url, ident.0);
         let resp = self
             .client
@@ -202,10 +178,7 @@ impl WardenHandle {
             bail!("get_workload_state: HTTP {s}: {text}");
         }
 
-        let state: WorkloadState = resp
-            .json()
-            .await
-            .context("deserializing WorkloadState")?;
+        let state: WorkloadState = resp.json().await.context("deserializing WorkloadState")?;
         Ok(Some(state.status))
     }
 
@@ -273,6 +246,22 @@ struct ClusterNode {
     /// `metrics()` queries for leader detection. `None` for smoke tier or
     /// single-node local clusters.
     raft: Option<yubaba::raft::YubabaRaft>,
+    /// Read handle to the same applied state the raft node writes into, so a
+    /// test can check committed cluster state without an HTTP round-trip.
+    /// `None` for smoke tier or single-node local clusters.
+    state_machine: Option<yubaba::raft::YubabaStateMachine>,
+    /// This node's node-lease registry (R737-F2) — the evidence channel a
+    /// placement scheduler is allowed to trust, held here as well as inside
+    /// `ServerState` so a test can drive it directly with
+    /// [`Cluster::renew_lease`] instead of standing up the HTTP renewal loop.
+    /// `None` for smoke tier or single-node local clusters, matching `raft`.
+    lease_detector: Option<Arc<yubaba::lease_detector::LeaseFailureDetector>>,
+    /// This node's streamer-RPO registry (R782), held here as well as inside
+    /// `ServerState` for the same reason `lease_detector` above is — a test
+    /// drives it directly with [`Cluster::report_watermark`] instead of
+    /// standing up `tenant_streamer::rpo_report`'s HTTP client.
+    /// `None` for smoke tier or single-node local clusters, matching `raft`.
+    rpo_registry: Option<Arc<yubaba::lease_detector::RpoWatermarkRegistry>>,
     /// Raft persistence directory (local tier, multi-node). Used by
     /// `restart_node` to re-open the raft node from persisted state.
     raft_dir: Option<PathBuf>,
@@ -287,6 +276,11 @@ struct ClusterNode {
     /// Shared container runtime (local tier). Used by `restart_node` to wire
     /// the runtime into the restarted `ServerState`.
     runtime: Option<Arc<dyn kamaji::Kamaji + Send + Sync>>,
+    /// The policy this node was founded under. Carried per node rather than
+    /// read from a constant so `restart_node` re-opens with the *same* raft
+    /// timings the rest of the cluster is running — a node that came back with
+    /// different election bounds would campaign against peers that had not.
+    policy: ClusterPolicy,
 }
 
 // ── Cluster ───────────────────────────────────────────────────────────────────
@@ -295,15 +289,32 @@ struct ClusterNode {
 ///
 /// Created by [`test_cluster`]. Implements `Drop` for auto-teardown.
 ///
-/// ## Partition + quorum-loss operations (F6)
+/// ## Node-loss operations (F6)
 ///
-/// [`kill_node`] aborts the server task for one node (local tier) or stops it
-/// (smoke tier stub). [`restart_node`] re-binds on the same port and re-opens
-/// the raft node from persisted state. [`wait_for_leader`] and
-/// [`current_leader_idx`] expose the raft election state.
+/// [`Cluster::kill_node`] aborts the server task for one node (local tier) or
+/// stops it (smoke tier stub). [`Cluster::restart_node`] re-binds on the same
+/// port and re-opens the raft node from persisted state.
+/// [`Cluster::wait_for_leader`] and [`Cluster::current_leader_idx`] expose the
+/// raft election state.
+///
+/// **There is no partition primitive here, and there never was one.** The
+/// `NetworkDegrade` type this struct used to carry described a `tc qdisc` spec,
+/// but nothing read the field: it was set by a builder method and dropped. The
+/// real `tc` knob (`YAH_LOCAL_NETWORK_DEGRADE`) belongs to
+/// `cloud::provider::local_docker::LocalDockerProvider`, which puts machines in
+/// *containers* — a different tier from these in-process loopback servers,
+/// which share one network namespace and cannot be impaired with `tc` at all.
+/// The dead type is removed (R118-T1) so that gap reads as a gap.
+///
+/// This matters because `kill_node` and a partition are **not**
+/// interchangeable, and the difference is the whole safety argument for the
+/// membership ratchet (W138 / R118-F7): a powered-off node emits nothing on any
+/// channel, while an IP-partitioned node stays alive and answers a
+/// corroborating one. `kill_node` models the first. Modelling the second needs
+/// a way to cut a node's raft links while leaving it running, which is
+/// R118-F7's to build alongside the detector that consumes it.
 pub struct Cluster {
     nodes: Vec<ClusterNode>,
-    network_degrade: Option<NetworkDegrade>,
     /// Smoke tier teardown: destroy Hetzner machines + buckets. `None` for
     /// local tier (teardown is handled by `Drop` aborting tasks + dropping dirs).
     teardown: Arc<tokio::sync::Mutex<Option<TeardownFn>>>,
@@ -327,16 +338,59 @@ impl Cluster {
         self.nodes.len()
     }
 
-    /// Chain a network degradation spec onto the cluster.
+    /// Read handle to node `idx`'s locally-applied raft state, or `None` for a
+    /// smoke-tier or single-node local cluster.
     ///
-    /// Applies `tc qdisc` rules between machine containers (local tier) or
-    /// across real machines (smoke tier, via yubaba mesh config). Requires
-    /// NET_ADMIN capability in the container image for local tier.
+    /// The same `Arc<RwLock<…>>` the node's raft applies into, so a test can
+    /// assert on committed state without an HTTP round-trip — useful as the
+    /// independent oracle when the thing under test *is* an HTTP read path.
+    pub fn cluster_state(&self, idx: usize) -> Option<&yubaba::raft::YubabaStateMachine> {
+        self.nodes[idx].state_machine.as_ref()
+    }
+
+    /// Node `idx`'s raft handle — the same one its router serves from — or
+    /// `None` for a smoke-tier or single-node local cluster.
     ///
-    /// No-op if `tc` is unavailable or the tier does not support it.
-    pub fn with_network_degrade(mut self, spec: NetworkDegrade) -> Self {
-        self.network_degrade = Some(spec);
-        self
+    /// Exposed for the same reason [`crate::SoloNode::raft`] is: a test that
+    /// drives one of the daemon's background loops must hand it the handles the
+    /// daemon does. `scheduler::spawn` takes `(YubabaRaft, YubabaStateMachine,
+    /// lease detector, raft detector, rpo registry)`, and a harness that
+    /// returns only the state machine forces every such test to rebuild the
+    /// node inline and drift from what `test_cluster` actually does.
+    pub fn raft(&self, idx: usize) -> Option<&yubaba::raft::YubabaRaft> {
+        self.nodes[idx].raft.as_ref()
+    }
+
+    /// Node `idx`'s raft node id (1-indexed: node 0 → id 1), or `None` for a
+    /// smoke-tier or single-node local cluster.
+    pub fn node_id(&self, idx: usize) -> Option<u64> {
+        self.nodes[idx].node_id
+    }
+
+    /// Node `idx`'s node-lease registry (R737-F2), or `None` for a smoke-tier
+    /// or single-node local cluster.
+    ///
+    /// Prefer [`Self::renew_lease`] / [`Self::renew_leases_except`] for driving
+    /// it; this is the escape hatch for a test that needs the detector itself,
+    /// e.g. to hand it to `scheduler::spawn`.
+    pub fn lease_detector(
+        &self,
+        idx: usize,
+    ) -> Option<&Arc<yubaba::lease_detector::LeaseFailureDetector>> {
+        self.nodes[idx].lease_detector.as_ref()
+    }
+
+    /// Node `idx`'s streamer-RPO registry (R782), or `None` for a smoke-tier
+    /// or single-node local cluster.
+    ///
+    /// Prefer [`Self::report_watermark`] for driving it; this is the escape
+    /// hatch for a test that needs the registry itself, e.g. to hand it to
+    /// `scheduler::spawn`.
+    pub fn rpo_registry(
+        &self,
+        idx: usize,
+    ) -> Option<&Arc<yubaba::lease_detector::RpoWatermarkRegistry>> {
+        self.nodes[idx].rpo_registry.as_ref()
     }
 
     /// Explicitly destroy all cluster resources and await completion.
@@ -360,22 +414,57 @@ impl Cluster {
 
     // ── Partition / quorum-loss operations (F6) ───────────────────────────────
 
-    /// Kill the server at `idx` by aborting its task (local tier).
+    /// Pull the power on node `idx` (local tier): shut its raft node down and
+    /// abort its HTTP server task.
     ///
-    /// The node's raft persistence files are intact — `restart_node` can
-    /// recover from them. After calling this, the node's yubaba HTTP API is
-    /// unreachable.
+    /// The node's raft persistence files are intact — [`Self::restart_node`]
+    /// recovers from them. After this call the node's yubaba HTTP API is
+    /// unreachable *and* its raft actor is stopped.
+    ///
+    /// **Both halves are load-bearing (R118-T1).** Aborting only the server
+    /// task — which is all this used to do — models a machine whose HTTP
+    /// listener died while its raft kept running: outbound `AppendEntries`
+    /// still flow, peers still answer them over connections *it* opened, and so
+    /// a "killed" leader keeps its lease and goes on leading a cluster that can
+    /// no longer be written to. That is not a power loss, and a failover test
+    /// built on it silently asserts nothing. Killing a *follower* happened to
+    /// look right (a follower has no outbound replication to give it away),
+    /// which is why the gap survived.
+    ///
+    /// The node's raft handle is dropped here, so [`Self::current_leader_idx`]
+    /// stops reading leadership beliefs out of a machine that is meant to be
+    /// dark.
     ///
     /// A small sleep is included after abort to let the OS free the TCP port.
     pub async fn kill_node(&mut self, idx: usize) -> Result<()> {
-        let node = self.nodes.get_mut(idx)
+        let node = self
+            .nodes
+            .get_mut(idx)
             .ok_or_else(|| anyhow::anyhow!("kill_node: no node at index {idx}"))?;
+
+        // Stop raft before the listener: a raft actor that outlives its own
+        // server is exactly the half-dead state this models away.
+        if let Some(raft) = node.raft.take() {
+            raft.shutdown()
+                .await
+                .map_err(|e| anyhow::anyhow!("kill_node: raft shutdown for node {idx}: {e}"))?;
+        }
+        node.state_machine = None;
+
         if let Some(task) = node.task.take() {
             task.abort();
             // Give the OS time to release the port before a potential restart.
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         Ok(())
+    }
+
+    /// Whether node `idx` is currently running (local tier).
+    ///
+    /// False between a [`Self::kill_node`] and the matching
+    /// [`Self::restart_node`].
+    pub fn is_running(&self, idx: usize) -> bool {
+        self.nodes[idx].task.is_some()
     }
 
     /// Restart a previously killed node at `idx`.
@@ -387,38 +476,65 @@ impl Cluster {
     ///
     /// Waits for the restarted node's `/health` endpoint to respond.
     pub async fn restart_node(&mut self, idx: usize) -> Result<()> {
-        let node = self.nodes.get_mut(idx)
+        let node = self
+            .nodes
+            .get_mut(idx)
             .ok_or_else(|| anyhow::anyhow!("restart_node: no node at index {idx}"))?;
 
-        let port = node.port
+        let port = node
+            .port
             .ok_or_else(|| anyhow::anyhow!("restart_node: node {idx} has no port (smoke tier?)"))?;
-        let raft_dir = node.raft_dir.clone()
+        let raft_dir = node
+            .raft_dir
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("restart_node: node {idx} has no raft_dir"))?;
-        let node_id = node.node_id
+        let node_id = node
+            .node_id
             .ok_or_else(|| anyhow::anyhow!("restart_node: node {idx} has no node_id"))?;
-        let state_path = node.state_path.clone()
+        let state_path = node
+            .state_path
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("restart_node: node {idx} has no state_path"))?;
-        let runtime = node.runtime.clone()
+        let runtime = node
+            .runtime
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("restart_node: node {idx} has no runtime"))?;
+        let policy = node.policy;
 
         // Re-open the raft node from persisted state, under the same policy the
         // cluster was founded with — a restarting node that changed its raft
         // timings would campaign against peers that had not.
-        let raft = yubaba::raft::open(node_id, raft_dir, &HARNESS_POLICY)
-            .await
-            .with_context(|| format!("restart_node: re-open raft for node {idx}"))?;
+        let (raft, state_machine) =
+            yubaba::raft::open_with_state_machine(node_id, raft_dir, &policy)
+                .await
+                .with_context(|| format!("restart_node: re-open raft for node {idx}"))?;
+
+        // A restarted node gets a *fresh* lease registry, not the old one: the
+        // registry is this node's view of who has renewed to it, and it is
+        // deliberately raft-free (R737-F2), so it does not survive a process
+        // death any more than it would in production. A test that restarts the
+        // leader must therefore re-renew.
+        let leases = Arc::new(yubaba::lease_detector::LeaseFailureDetector::new(
+            policy.liveness_thresholds(),
+        ));
+        // Same "fresh, not preserved" posture as `leases` above — R782's
+        // registry is also deliberately raft-free.
+        let rpo_registry = Arc::new(yubaba::lease_detector::RpoWatermarkRegistry::new());
 
         let state = Arc::new(
             yubaba::ServerState::load(state_path)
                 .with_context(|| format!("restart_node: load state for node {idx}"))?
                 .with_runtime(runtime)
-                .with_cluster_policy(HARNESS_POLICY)
+                .with_cluster_policy(policy)
                 .with_raft(raft.clone())
                 .with_node_id(node_id)
+                .with_cluster_state(state_machine.clone())
                 .with_failure_detector(Arc::new(RaftHeartbeatDetector::new(
                     raft.clone(),
-                    HARNESS_POLICY.liveness_thresholds(),
-                ))),
+                    policy.liveness_thresholds(),
+                )))
+                .with_lease_detector(Arc::clone(&leases))
+                .with_rpo_registry(Arc::clone(&rpo_registry)),
         );
 
         // Rebind on the same port. The killed task dropped the listener, so
@@ -439,7 +555,70 @@ impl Cluster {
 
         node.task = Some(task);
         node.raft = Some(raft);
+        node.state_machine = Some(state_machine);
+        node.lease_detector = Some(leases);
+        node.rpo_registry = Some(rpo_registry);
         Ok(())
+    }
+
+    /// Record a node-lease renewal *from* node `from_idx` *into* node
+    /// `at_idx`'s registry (R737-F2), without the HTTP hop.
+    ///
+    /// This is the test-side substitute for
+    /// [`yubaba::lease_renewal`]'s production loop: a placement test needs to
+    /// choose exactly which nodes look alive to the leader and when, and
+    /// spawning the real loop would renew everyone unconditionally. Call it on
+    /// every tick of a wait loop for the nodes that should stay live, and
+    /// simply stop calling it for the one whose death you are staging.
+    ///
+    /// A no-op if `at_idx` has no lease detector (smoke tier / single-node).
+    pub fn renew_lease(&self, at_idx: usize, from_idx: usize) {
+        let Some(detector) = self.nodes[at_idx].lease_detector.as_ref() else {
+            return;
+        };
+        let Some(node_id) = self.nodes[from_idx].node_id else {
+            return;
+        };
+        detector.renew(node_id);
+    }
+
+    /// Record a streamer-RPO report (R782) *for* node `from_idx` *into* node
+    /// `at_idx`'s registry, without the HTTP hop — the test-side substitute
+    /// for `tenant_streamer::rpo_report::RpoReporter`, mirroring
+    /// [`Self::renew_lease`] for the same reason: a placement test needs to
+    /// choose exactly which candidate has fresh RPO evidence and when.
+    ///
+    /// A no-op if `at_idx` has no RPO registry (smoke tier / single-node).
+    pub fn report_watermark(
+        &self,
+        at_idx: usize,
+        from_idx: usize,
+        tenant: &workload_spec::TenantId,
+        watermark_age: Option<Duration>,
+    ) {
+        let Some(registry) = self.nodes[at_idx].rpo_registry.as_ref() else {
+            return;
+        };
+        let Some(node_id) = self.nodes[from_idx].node_id else {
+            return;
+        };
+        registry.report(node_id, tenant.clone(), watermark_age);
+    }
+
+    /// Renew every *running* node's lease into node `at_idx`'s registry,
+    /// except those named in `except`.
+    ///
+    /// The shape a placement test actually wants: "the whole fleet is alive
+    /// except the one I killed". Nodes stopped by [`Self::kill_node`] are
+    /// skipped automatically — a killed node cannot renew, and a test that had
+    /// to remember to exclude it by hand would silently keep a corpse alive.
+    pub fn renew_leases_except(&self, at_idx: usize, except: &[usize]) {
+        for idx in 0..self.nodes.len() {
+            if except.contains(&idx) || !self.is_running(idx) {
+                continue;
+            }
+            self.renew_lease(at_idx, idx);
+        }
     }
 
     /// Wait until a raft leader is elected in the cluster.
@@ -458,6 +637,53 @@ impl Cluster {
                 return Ok(idx);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Wait until every *live* node reports the **same** raft leader **and that
+    /// leader is itself still running**, then return its 0-based index.
+    ///
+    /// Stricter than [`Self::wait_for_leader`] on both counts, and both matter
+    /// after a failover:
+    ///
+    /// - `wait_for_leader` is satisfied by the *first* node that names any
+    ///   leader, so one lagging follower's opinion answers for the cluster;
+    /// - and neither it nor a bare agreement check notices that the node
+    ///   everyone still names is the one the test just killed. Straight after a
+    ///   kill the survivors unanimously believe in the dead leader — that
+    ///   unanimity is the *pre*-failover state, and a test that accepts it
+    ///   asserts nothing about failover at all. (This is not hypothetical: it
+    ///   is what the first run of `rig_singleton_ownership` reported.)
+    ///
+    /// Nodes killed by [`Self::kill_node`] are excluded from both the polling
+    /// set (they hold no raft handle) and the set of acceptable answers.
+    /// Errors if `timeout` elapses without such an agreement.
+    pub async fn wait_for_agreed_leader(&self, timeout: Duration) -> Result<usize> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let beliefs: Vec<Option<u64>> = self
+                .nodes
+                .iter()
+                .filter_map(|n| n.raft.as_ref())
+                .map(|raft| raft.metrics().borrow_watched().current_leader)
+                .collect();
+
+            if let Some(Some(first)) = beliefs.first().copied() {
+                // node_id is 1-indexed: node 0 → id 1.
+                let idx = (first as usize).saturating_sub(1);
+                let leader_is_running = self.nodes.get(idx).is_some_and(|n| n.raft.is_some());
+                if leader_is_running && beliefs.iter().all(|b| *b == Some(first)) {
+                    return Ok(idx);
+                }
+            }
+            if tokio::time::Instant::now() > deadline {
+                bail!(
+                    "wait_for_agreed_leader: live nodes did not agree on a live leader within \
+                     {timeout:?}; last per-node current_leader was {beliefs:?} \
+                     (node ids are 1-indexed)"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -535,10 +761,41 @@ where
     P: MachineProvider + Clone + Send + Sync + 'static,
     R: kamaji::Kamaji + 'static,
 {
+    test_cluster_with_policy(provider, runtime, nodes, HARNESS_POLICY).await
+}
+
+/// [`test_cluster`], but founding the cluster under an explicit
+/// [`ClusterPolicy`] instead of the fleet preset (R118-T1).
+///
+/// Needed because a policy is not decoration: it sets openraft's election and
+/// heartbeat bounds (`RaftTiming`), so a rig's behaviour measured on a cluster
+/// running WAN timings is a measurement of the wrong system — failover on the
+/// rig preset lands inside a second where the fleet preset takes three. It also
+/// decides whether a learner can be promoted at all, which is the entire
+/// difference the rig deployment exists to exercise.
+///
+/// The policy is applied to *every* node in the cluster and is remembered
+/// per-node, so `restart_node` brings a node back under the same timings its
+/// peers are running.
+///
+/// **Local tier only for the policy argument.** The smoke tier boots yubaba
+/// from a release binary via cloud-init, so its cluster profile is whatever
+/// that binary's `--cluster-profile` flag says; passing a policy here does not
+/// reach it, and the call falls back to the smoke path unchanged.
+pub async fn test_cluster_with_policy<P, R>(
+    provider: &P,
+    runtime: R,
+    nodes: usize,
+    policy: ClusterPolicy,
+) -> Result<Cluster>
+where
+    P: MachineProvider + Clone + Send + Sync + 'static,
+    R: kamaji::Kamaji + 'static,
+{
     if std::env::var("YAH_SMOKE").as_deref() == Ok("1") {
         test_cluster_smoke(provider, nodes).await
     } else {
-        test_cluster_local(runtime, nodes).await
+        test_cluster_local(runtime, nodes, policy).await
     }
 }
 
@@ -554,7 +811,7 @@ where
 /// Raft messages flow over HTTP between the in-process servers. The raft network
 /// uses `BasicNode.addr` = `"127.0.0.1:{port}"` which the `YubabaNetworkFactory`
 /// wraps as `"http://127.0.0.1:{port}"`.
-async fn test_cluster_local<R>(runtime: R, nodes: usize) -> Result<Cluster>
+async fn test_cluster_local<R>(runtime: R, nodes: usize, policy: ClusterPolicy) -> Result<Cluster>
 where
     R: kamaji::Kamaji + 'static,
 {
@@ -567,14 +824,16 @@ where
     let mut tmp_dirs: Vec<tempfile::TempDir> = Vec::with_capacity(nodes);
     let mut ports: Vec<u16> = Vec::with_capacity(nodes);
     let mut raft_nodes: Vec<Option<yubaba::raft::YubabaRaft>> = Vec::with_capacity(nodes);
+    let mut state_machines: Vec<Option<yubaba::raft::YubabaStateMachine>> =
+        Vec::with_capacity(nodes);
     let mut listeners: Vec<tokio::net::TcpListener> = Vec::with_capacity(nodes);
     let mut state_paths: Vec<PathBuf> = Vec::with_capacity(nodes);
     let mut raft_dirs: Vec<Option<PathBuf>> = Vec::with_capacity(nodes);
 
     // Phase 1: allocate ports + dirs, open raft nodes (for N>1).
     for i in 0..nodes {
-        let tmp = tempfile::TempDir::new()
-            .with_context(|| format!("tempdir for yubaba node {i}"))?;
+        let tmp =
+            tempfile::TempDir::new().with_context(|| format!("tempdir for yubaba node {i}"))?;
 
         let state_path = tmp.path().join("identity.json");
         state_paths.push(state_path);
@@ -592,13 +851,16 @@ where
             std::fs::create_dir_all(&raft_dir)
                 .with_context(|| format!("creating raft dir for node {i}"))?;
             let node_id = (i as u64) + 1; // 1-indexed
-            let raft = yubaba::raft::open(node_id, raft_dir.clone(), &HARNESS_POLICY)
-                .await
-                .with_context(|| format!("opening raft node {node_id}"))?;
+            let (raft, state_machine) =
+                yubaba::raft::open_with_state_machine(node_id, raft_dir.clone(), &policy)
+                    .await
+                    .with_context(|| format!("opening raft node {node_id}"))?;
             raft_nodes.push(Some(raft));
+            state_machines.push(Some(state_machine));
             raft_dirs.push(Some(raft_dir));
         } else {
             raft_nodes.push(None);
+            state_machines.push(None);
             raft_dirs.push(None);
         }
 
@@ -613,21 +875,48 @@ where
         let port = ports[i];
         let listener = listeners.remove(0); // consume in order
 
-        let node_id_opt = if nodes > 1 { Some((i as u64) + 1) } else { None };
+        let node_id_opt = if nodes > 1 {
+            Some((i as u64) + 1)
+        } else {
+            None
+        };
 
         let mut srv_state = yubaba::ServerState::load(state_path.clone())
             .with_context(|| format!("loading yubaba state for node {i}"))?
             .with_runtime(Arc::clone(&runtime));
 
+        let mut lease_detector = None;
+        let mut rpo_registry = None;
         if let (Some(raft), Some(nid)) = (&raft_nodes[i], node_id_opt) {
+            // R737-F2/T5: the same handle goes into `ServerState` (so
+            // `POST /mesh/lease-renew` and `GET /raft/status` see it) and into
+            // `ClusterNode` (so a test can renew or withhold renewals without
+            // an HTTP hop). Both are `Arc`s onto one registry — a test that
+            // renews via the handle and a node that renews over HTTP are
+            // writing the same map.
+            let leases = Arc::new(yubaba::lease_detector::LeaseFailureDetector::new(
+                policy.liveness_thresholds(),
+            ));
+            lease_detector = Some(Arc::clone(&leases));
+            // R782: same shape as `leases` above, for the streamer-RPO
+            // channel.
+            let rpo = Arc::new(yubaba::lease_detector::RpoWatermarkRegistry::new());
+            rpo_registry = Some(Arc::clone(&rpo));
             srv_state = srv_state
-                .with_cluster_policy(HARNESS_POLICY)
+                .with_cluster_policy(policy)
                 .with_raft(raft.clone())
                 .with_node_id(nid)
+                .with_cluster_state(
+                    state_machines[i]
+                        .clone()
+                        .expect("a raft node always comes with its state machine"),
+                )
                 .with_failure_detector(Arc::new(RaftHeartbeatDetector::new(
                     raft.clone(),
-                    HARNESS_POLICY.liveness_thresholds(),
-                )));
+                    policy.liveness_thresholds(),
+                )))
+                .with_lease_detector(leases)
+                .with_rpo_registry(rpo);
         }
 
         let state = Arc::new(srv_state);
@@ -641,11 +930,15 @@ where
             server_id: ServerId(format!("local-node-{i}")),
             task: Some(task),
             raft: raft_nodes[i].clone(),
+            state_machine: state_machines[i].clone(),
+            lease_detector,
+            rpo_registry,
             raft_dir: raft_dirs[i].clone(),
             port: Some(port),
             node_id: node_id_opt,
             state_path: Some(state_path),
             runtime: Some(Arc::clone(&runtime)),
+            policy,
         });
     }
 
@@ -685,7 +978,9 @@ where
         // Initialize cluster from node 0's raft. The openraft `initialize()`
         // call creates an initial membership log entry and starts the election.
         // Other nodes receive membership via AppendEntries from the leader.
-        let leader_raft = cluster_nodes[0].raft.as_ref()
+        let leader_raft = cluster_nodes[0]
+            .raft
+            .as_ref()
             .expect("node 0 must have a raft for multi-node bootstrap");
         leader_raft
             .initialize(members)
@@ -711,7 +1006,6 @@ where
 
     Ok(Cluster {
         nodes: cluster_nodes,
-        network_degrade: None,
         teardown: Arc::new(tokio::sync::Mutex::new(None)), // local tier: no smoke teardown
         _tmp_dirs: tmp_dirs,
     })
@@ -784,11 +1078,21 @@ where
             server_id,
             task: None,
             raft: None,
+            state_machine: None,
+            // Smoke-tier nodes hold their lease registry inside their own
+            // process; there is no in-process handle to reach it from here.
+            lease_detector: None,
+            // Same reasoning as `lease_detector` above.
+            rpo_registry: None,
             raft_dir: None,
             port: None,
             node_id: None,
             state_path: None,
             runtime: None,
+            // Smoke-tier nodes run a release binary whose profile came from its
+            // own `--cluster-profile` flag; this field is only read by
+            // `restart_node`, which is local-tier-only.
+            policy: HARNESS_POLICY,
         });
     }
 
@@ -812,7 +1116,6 @@ where
 
     Ok(Cluster {
         nodes: cluster_nodes,
-        network_degrade: None,
         teardown: Arc::new(tokio::sync::Mutex::new(Some(teardown))),
         _tmp_dirs: vec![],
     })

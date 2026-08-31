@@ -1,8 +1,10 @@
 [workspace]
 members = [
     "crates/hetzner",
-    "crates/almanac",
     "crates/cloud",
+    # R732-T4 (W245/W253): the per-node WAL→R2 streamer. A data-plane service,
+    # deliberately not part of the yubaba server crate — see its crate doc.
+    "crates/tenant-streamer",
     "crates/yubaba",
     "crates/yubaba-client",
     "crates/yubaba-test-harness",
@@ -11,7 +13,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.22"
+version = "0.8.29"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

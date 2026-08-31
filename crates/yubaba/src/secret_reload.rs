@@ -136,7 +136,7 @@ pub fn content_digest(secrets: &ContainerSecrets) -> u64 {
 /// upgrade loop. Returns immediately (a no-op that logs) on a node with no raft
 /// cluster state or no workload backend — nothing can rotate there.
 pub async fn run(state: Arc<ServerState>) {
-    let Some(sm) = state.secret_state.clone() else {
+    let Some(sm) = state.cluster_state.clone() else {
         tracing::debug!("secret_reload: no cluster state on this node; rotation watcher idle");
         return;
     };

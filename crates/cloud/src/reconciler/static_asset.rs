@@ -149,7 +149,7 @@ use crate::reconciler::pond::DEFAULT_MINIO_PASSWORD;
 use crate::reconciler::pond::DEFAULT_MINIO_USER;
 use crate::{MirrorProviderSlot, Provider};
 
-use local_driver::s3_sign::{sign_s3_empty_body, sign_s3_put_object};
+use local_driver::s3_sign::{sign_s3_empty_body, sign_s3_put_object, uri_encode_key};
 use velveteen::{ForgeCommand, ForgeSpec, Initiator, MeshAccess, TaskLocation, TaskPlacement};
 use velveteen_exec::transforms::{
     substitute_argv, RecipeStep, TransformRecipe, TransformRecipeLoader, ENV_TRANSFORM_IN_0,
@@ -654,7 +654,8 @@ async fn sync_assets(
         // the Nix-substituter / Bazel-remote-cache behaviour, backed by the
         // checked-in lock as the action cache and R2 as the CAS.
         if let Some(out_hash) = lock_skip_hash(entry, workspace_root).await {
-            let object_url = format!("{endpoint}/{bucket}/{}", entry.filename);
+            // R630-B1: encode at URL-construction time (see `uri_encode_key`).
+            let object_url = format!("{endpoint}/{bucket}/{}", uri_encode_key(&entry.filename));
             // R546-B10: the lock says WHAT the output should be; the bucket must
             // actually hold it. An unstamped legacy object is not evidence of a
             // match, so it falls through and rebuilds rather than blessing bytes
@@ -770,7 +771,8 @@ async fn sync_assets(
         }
 
         let key = &entry.filename;
-        let object_url = format!("{endpoint}/{bucket}/{key}");
+        // R630-B1: encode at URL-construction time (see `uri_encode_key`).
+        let object_url = format!("{endpoint}/{bucket}/{}", uri_encode_key(key));
 
         // R546-B10: skip the PUT only when the bucket demonstrably holds THESE
         // bytes. Existence alone is not enough — an object placed at this key
@@ -1460,7 +1462,10 @@ async fn materialize_transform(
     // pulled back to `tmp_output` after the step, and everything downstream
     // (exists-check, BLAKE3, rename, action cache) is untouched.
     let remote_out = match &recipe.placement.location {
-        TaskLocation::Local => None,
+        TaskLocation::Local => {
+            refuse_secrets_on_a_local_recipe(&recipe)?;
+            None
+        }
         _ => Some(remote_transform_out(&recipe, &derive_key)?),
     };
 
@@ -1510,6 +1515,26 @@ async fn materialize_transform(
             // source tree on the worker must bring it (the rusty-v8 builder
             // image clones its own).
             ctx = ctx.with_produced(remote_out.clone(), tmp_output.clone());
+            // R555-F4 / W235 §(c): a signed recipe carries its admission grant
+            // to kamaji. The grant is DERIVED from the recipe here rather than
+            // stored in the TOML, so editing what a recipe runs un-signs it;
+            // `None` for an unsigned recipe, which a node running the default
+            // `permissive` policy still admits.
+            if let Some(envelope) =
+                velveteen_exec::envelope_for_recipe_step(&recipe, step)
+                    .with_context(|| format!("deriving admission grant for recipe {:?}", recipe.name))?
+            {
+                ctx = ctx.with_admission(envelope);
+            }
+            // R555-F5: the credentials the recipe declared, mounted per run.
+            // Only ever on the remote leg — the local driver refuses them,
+            // because a dev box has no cluster secret store to resolve them
+            // from and a silently-dropped credential fails deep inside the
+            // build instead of here.
+            if !recipe.secrets.is_empty() {
+                ctx = ctx
+                    .with_secrets(recipe.secrets.iter().map(|s| s.to_mount()).collect());
+            }
         } else {
             ctx = ctx.with_cwd(workspace_abs.clone());
             // `platform` asks a HOST container runtime for foreign-arch
@@ -1906,7 +1931,7 @@ fn remote_transform_out(recipe: &TransformRecipe, derive_key: &str) -> Result<Pa
              emulation; a remote node has no such knob and selects architecture by \
              scheduling instead. Drop it and express the arch as mesh tags, e.g. \
              location = {{ kind = \"remote_any\", tier = \"infra\", mesh_tags = \
-             [\"tag:build-worker\", \"tier:x86\", \"os:linux\"] }}",
+             [\"tag:build-worker\", \"arch:x86\", \"os:linux\"] }}",
             recipe.name,
             platform,
         );
@@ -1927,6 +1952,32 @@ fn remote_transform_out(recipe: &TransformRecipe, derive_key: &str) -> Result<Pa
         }
     }
     Ok(PathBuf::from(workload_spec::forge_produced::CONTAINER_DIR).join(format!("{derive_key}.out")))
+}
+
+/// The mirror of [`remote_transform_out`]'s refusals, for the local leg: one
+/// thing a remote recipe may do that a local one may not (R555-F5).
+///
+/// Vault credentials are resolved by yubaba on the node that runs the workload,
+/// against the cluster secret store and that node's KEK. A local run has no such
+/// node, so `LocalForgeDriver` refuses `ExecContext::secrets` outright. Refused
+/// here as well so the message names the *recipe* — a `location = "local"`
+/// recipe with a `[[secrets]]` block is a mistake in the recipe, and a driver
+/// error names only the dispatch.
+fn refuse_secrets_on_a_local_recipe(recipe: &TransformRecipe) -> Result<()> {
+    if !recipe.secrets.is_empty() {
+        anyhow::bail!(
+            "recipe {:?} declares {} [[secrets]] entr{} but is placed locally. Vault \
+             credentials are resolved by yubaba on the node that runs the workload, \
+             and a local run has no such node — give the recipe a remote placement \
+             (location = {{ kind = \"remote_any\", … }}), or drop the secret and have \
+             the step read its credential from the environment it already runs in \
+             (W235 §(c) / R555-F5)",
+            recipe.name,
+            recipe.secrets.len(),
+            if recipe.secrets.len() == 1 { "y" } else { "ies" },
+        );
+    }
+    Ok(())
 }
 
 /// Read `path` and assert its BLAKE3 hex matches `expected_hex` (case-insensitive).
@@ -2213,6 +2264,7 @@ mod tests {
                 shape: MirrorShape::Local,
                 providers,
                 ingress: Default::default(),
+                ingress_machines: Vec::new(),
                 drivers: Default::default(),
                 asset_aliases: BTreeMap::new(),
             };
@@ -2224,6 +2276,7 @@ mod tests {
                 db: crate::DbCatalog::default(),
             };
             let component = ServiceComponent {
+                mount: None,
                 id: "whisper-models".to_string(),
                 kind: "static-asset".to_string(),
                 path: "app/assets/whisper".to_string(),
@@ -2500,7 +2553,7 @@ label = "test remote recipe"
 image = "ghcr.io/test/tool:v1@sha256:{HASH_64}"
 
 [placement]
-location = {{ kind = "remote_any", tier = "infra", mesh_tags = ["tier:x86"] }}
+location = {{ kind = "remote_any", tier = "infra", mesh_tags = ["arch:x86"] }}
 runtime  = "container"
 {placement_extra}
 
@@ -2639,6 +2692,95 @@ runtime  = "container"
         );
         let msg = remote_refusal(&fx, "two-steps").await;
         assert!(msg.contains("one-shot workload"), "got: {msg}");
+    }
+
+    /// R555-F5: the recipe's declared vault credentials have to reach the
+    /// driver as mounts, or the build runs without the credential it asked for
+    /// and fails as a missing-auth error deep inside itself.
+    #[tokio::test]
+    async fn a_remote_recipe_hands_its_declared_secrets_to_the_driver() {
+        let fx = Fixture::new(minio_slot());
+        write_remote_recipe(
+            &fx.workspace_root,
+            "needs-r2",
+            "",
+            "[[steps]]\nname = \"build\"\nargv = [\"build.sh\", \"{{YAH_TRANSFORM_OUT}}\"]\n\n\
+             [[secrets]]\ncluster = \"r2/write\"\npath = \"/run/yah/r2.json\"",
+        );
+        let out_bytes = b"built with a credential".to_vec();
+        let (mock, seen) = RemoteMock::new(out_bytes.clone());
+        let executor: Arc<dyn ForgeExecutor> = mock;
+
+        let fetch_path = fx.workspace_root.join(".yah/cache/derive/fetch/in.bin");
+        std::fs::create_dir_all(fetch_path.parent().unwrap()).unwrap();
+        std::fs::write(&fetch_path, b"anchor").unwrap();
+
+        materialize_transform(
+            &TransformSpec {
+                recipe: "needs-r2".to_string(),
+                params: BTreeMap::new(),
+            },
+            &fetch_path,
+            &blake3_hex(b"anchor"),
+            &blake3_hex(&out_bytes),
+            &fx.workspace_root.join(".yah/cache/derive/transform"),
+            &fx.workspace_root,
+            executor.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        let seen = seen.lock().await;
+        let (_, ctx) = seen.as_ref().expect("the remote step ran");
+        assert_eq!(
+            ctx.secrets,
+            vec![workload_spec::SecretMount {
+                source: workload_spec::SecretRef::Cluster {
+                    name: "r2/write".into()
+                },
+                target: workload_spec::SecretTarget::File {
+                    path: PathBuf::from("/run/yah/r2.json"),
+                    // Owner-only is the default a recipe gets without asking.
+                    mode: 0o400,
+                },
+            }]
+        );
+    }
+
+    /// The local mirror: yubaba resolves credentials on the node that runs the
+    /// workload, and a local run has no node. Refused by name so the operator
+    /// is pointed at the recipe rather than at a driver error.
+    #[tokio::test]
+    async fn a_local_recipe_declaring_secrets_is_refused_before_dispatch() {
+        let fx = Fixture::new(minio_slot());
+        let transforms_dir = fx.workspace_root.join(".yah/qed/transforms");
+        std::fs::create_dir_all(&transforms_dir).unwrap();
+        std::fs::write(
+            transforms_dir.join("local-with-secret.toml"),
+            format!(
+                r#"
+name  = "local-with-secret"
+label = "test local recipe"
+image = "ghcr.io/test/tool:v1@sha256:{HASH_64}"
+
+[placement]
+location = "local"
+runtime  = "container"
+
+[[steps]]
+name = "build"
+argv = ["build.sh", "{{{{YAH_TRANSFORM_OUT}}}}"]
+
+[[secrets]]
+cluster = "r2/write"
+path    = "/run/yah/r2.json"
+"#
+            ),
+        )
+        .unwrap();
+        let msg = remote_refusal(&fx, "local-with-secret").await;
+        assert!(msg.contains("placed locally"), "got: {msg}");
+        assert!(msg.contains("local-with-secret"), "got: {msg}");
     }
 
     /// `platform` is host-emulation; remote picks arch by scheduling. Silently

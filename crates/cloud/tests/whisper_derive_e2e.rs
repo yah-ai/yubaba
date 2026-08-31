@@ -229,6 +229,7 @@ impl TestWorkspace {
                 db: cloud::DbCatalog::default(),
             },
             component: ServiceComponent {
+                mount: None,
                 id: "model-assets".to_string(),
                 kind: "static-asset".to_string(),
                 path: "app/assets/model".to_string(),
@@ -242,6 +243,7 @@ impl TestWorkspace {
                 shape: MirrorShape::Local,
                 providers,
                 ingress: Default::default(),
+                ingress_machines: Vec::new(),
                 drivers: Default::default(),
                 asset_aliases: BTreeMap::new(),
             },

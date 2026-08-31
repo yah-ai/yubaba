@@ -1,22 +1,223 @@
 {
-  "cluster_protocol": 3,
-  "cluster_protocol_surface": "899bcce046e26ffd0233f21ac6a01a62459e599b68a4a582bf4618bcfd4daddc",
+  "cluster_protocol": 5,
+  "cluster_protocol_surface": "1f36fd0af18a8b14d682fe71ab8c955fb7dab0e61cf75869789d013094e3d4f8",
+  "cluster_protocol_surface_inputs": {
+    "rust-file oss/yubaba/crates/yubaba/src/raft/mod.rs": "3ed4864a337aceced297096cc808589300ada94d369c7d71418ac19595461e8b",
+    "rust-file oss/yubaba/crates/yubaba/src/raft/network.rs": "05a7635543141404f302b0b63bf8a722a103783201a349b7af54dde480eed1fe",
+    "rust-lines oss/yubaba/crates/yubaba/src/lib.rs containing /raft/": "bfd35e3b0fdefbab86e4b236a02e6bbb6234f4a2af2f0dc7fad377df4fbdcebb",
+    "rust-items oss/yubaba/crates/yubaba/src/lib.rs fn raft_*": "06b66ba6a3e952ef8be1fb7930cfaf8d39c03e87cf71993f76d4d5a5e436c405",
+    "cargo-dep oss/yubaba/crates/yubaba/Cargo.toml [openraft]": "2f157e5b8ae751caeeef44985ff36f25c2268d550b653ac00423fbd638875b5c"
+  },
   "cluster_protocol_history": {
     "1": "openraft 0.9 — snapshot at POST /raft/install-snapshot, chunked stream {vote, meta, offset, data, done}; leader handoff at /raft/trigger-elect",
     "2": "openraft 0.10 — snapshot at POST /raft/snapshot, whole-snapshot (vote, meta, Vec<u8>); leader handoff at /raft/transfer-leader-msg. Bumped by commit 4a10c3d (2026-07-17). vote + append-entries stayed wire-compatible across this bump (measured, R625-S1); the snapshot path did not.",
-    "3": "R706 (W294) — cluster secrets carry an ACCESS RULE. YubabaRequest::PutSecret and SecretRecord each gained `access: SecretAccess` (#[serde(default)] = deny-all). Nothing fails to PARSE in either direction, which is exactly why this needed a bump rather than a re-record: a mixed cluster is silently mis-authorized, not visibly broken. An epoch-2 node replicating an epoch-3 PutSecret drops the unknown `access` field on the floor and, having no check of its own, keeps serving that secret to ANY workload that names it — so the authorization guarantee R706 exists to create does not hold cluster-wide until every node is on 3. (The reverse direction is safe: an epoch-3 node applying an epoch-2 PutSecret defaults to deny-all and refuses, which is loud and re-fixable with `yah cloud secret put`.) Cheap moment to take: the fleet had zero cluster secrets and no node had a cluster KEK when this landed. CLUSTER_PROTOCOL is advertised on GET /health and in the signed release manifest — it is not a hard join gate — so this does not mechanically block a rolling upgrade; it makes the mixed window visible to the operator, which is the whole point here."
+    "3": "R706 (W294) — cluster secrets carry an ACCESS RULE. YubabaRequest::PutSecret and SecretRecord each gained `access: SecretAccess` (#[serde(default)] = deny-all). Nothing fails to PARSE in either direction, which is exactly why this needed a bump rather than a re-record: a mixed cluster is silently mis-authorized, not visibly broken. An epoch-2 node replicating an epoch-3 PutSecret drops the unknown `access` field on the floor and, having no check of its own, keeps serving that secret to ANY workload that names it — so the authorization guarantee R706 exists to create does not hold cluster-wide until every node is on 3. (The reverse direction is safe: an epoch-3 node applying an epoch-2 PutSecret defaults to deny-all and refuses, which is loud and re-fixable with `yah cloud secret put`.) Cheap moment to take: the fleet had zero cluster secrets and no node had a cluster KEK when this landed. CLUSTER_PROTOCOL is advertised on GET /health and in the signed release manifest — it is not a hard join gate — so this does not mechanically block a rolling upgrade; it makes the mixed window visible to the operator, which is the whole point here.",
+    "4": "R732-F1 (W245) — tenant fencing epochs. `YubabaRequest` gained three variants (ClaimTenant, TransferTenant, RenewTenantLease), `YubabaResponse` gained `Tenant(TenantOutcome)`, and `YubabaState` gained `tenants: BTreeMap<TenantId, TenantOwnership>` (#[serde(default)]). The discriminator against BOTH prior precedents in this file: R706's `access` and R720-F1's `digest` added struct FIELDS, which serde tolerates in both directions (no deny_unknown_fields anywhere in this chain) — R706 was bumped only because a tolerated field made a mixed cluster silently mis-authorized, and R720-F1 was correctly NOT bumped. This change adds enum VARIANTS to the replicated command type, which is a different animal: `YubabaRequest` is externally tagged with no #[serde(other)] catch-all, so an epoch-3 node receiving a replicated ClaimTenant entry over AppendEntries gets `unknown variant \"ClaimTenant\"`, cannot apply it, cannot advance its state machine past that log index, and diverges. Verified by test rather than asserted from serde's documented behaviour: raft::tests::an_unknown_request_variant_fails_to_parse_which_is_why_r732_bumped_both_epochs, which also fails loudly if anyone later adds a catch-all variant and makes this entry untrue. The break is CONDITIONAL — a mixed cluster works normally until the first tenant claim is committed — but making that window visible to the operator is exactly what advertising the epoch on GET /health is for. Reverse direction is safe: an epoch-4 node reads every epoch-3 entry unchanged. Cheap moment taken, same reasoning as history \"3\": the tenants map does not exist before this change, so no fleet has a tenant ownership record and nothing is in flight during the roll.",
+    "5": "R737-F1 (W246) — tenant PLACEMENT INTENT, separate from ownership. `YubabaRequest` gained two variants (SetTenantPlacement, ClearTenantPlacement), `YubabaState` gained `placement: BTreeMap<TenantId, TenantPlacement>` (#[serde(default)]), and `MemberInfo` + `YubabaRequest::SetMember` each gained `capacity: Option<NodeCapacity>` (#[serde(default)]). THE DISCRIMINATOR IS THE SAME ONE R732-F1 RECORDED, and it is the variants alone that force this: `YubabaRequest` is externally tagged with no #[serde(other)] catch-all, so an epoch-4 node receiving a replicated SetTenantPlacement over AppendEntries gets `unknown variant \"SetTenantPlacement\"`, cannot apply it, cannot advance past that log index, and diverges. Pinned by raft::tests::an_unknown_request_variant_fails_to_parse_which_is_why_r732_bumped_both_epochs, which covers the mechanism rather than the specific variant name. THE FIELDS DID NOT NEED IT, checked rather than assumed. `capacity` is a tolerated struct field in both directions (the R720-F1 `digest` precedent, correctly NOT bumped), and the R706 hazard — a tolerated field that makes a mixed cluster silently WRONG rather than visibly broken — does not apply here. R706 bit because an old node dropped `access` and then served the secret to anybody. An old node dropping `capacity` records None, and None is defined as capacity-UNKNOWN, which YubabaState::node_headroom refuses to schedule onto. The degradation is fail-closed: the mixed window costs placement ONTO the un-upgraded nodes, never a placement that overcommits one. Same shape as R734-F5's region residual. NOTHING READS PLACEMENT YET — the scheduler is R737-F3. This ticket lands the state model and its publisher, so the mixed window has no behaviour to be wrong about beyond the divergence the variants already force."
   },
-  "state_epoch": 2,
-  "state_epoch_surface": "3f3f7f6b35d9916ee69c352f59c35e34532e34598a0dc658188b2ad280cbbc55",
+  "state_epoch": 4,
+  "state_epoch_surface": "5d01cc38b18b4d251ed1a7b5d01fec561c3cb9bf7aed694192b5df035eaa6256",
+  "state_epoch_surface_inputs": {
+    "rust-file oss/yubaba/crates/yubaba/src/raft/mod.rs": "3ed4864a337aceced297096cc808589300ada94d369c7d71418ac19595461e8b",
+    "rust-file oss/yubaba/crates/yubaba/src/raft/store.rs": "00cfece8468673d57c98f82fba50e3277565732a9b8f75eef82ac2f86ceffb75",
+    "cargo-dep oss/yubaba/crates/yubaba/Cargo.toml [openraft]": "2f157e5b8ae751caeeef44985ff36f25c2268d550b653ac00423fbd638875b5c"
+  },
   "state_epoch_history": {
     "1": "openraft 0.9 storage-v1 on-disk raft log + snapshot layout",
-    "2": "openraft 0.10 storage-v2 on-disk raft log + snapshot layout. Bumped by commit 4a10c3d (2026-07-17)."
+    "2": "openraft 0.10 storage-v2 on-disk raft log + snapshot layout. Bumped by commit 4a10c3d (2026-07-17).",
+    "3": "R732-F1 (W245) — tenant fencing epochs, disk side of the same change as cluster_protocol \"4\". NEW-READS-OLD holds: `tenants` is #[serde(default)], so an epoch-3 binary loads a pre-R732 snapshot with an empty map — which denies every write rather than assuming ownership it has no record of (pinned by raft::tests::pre_r732_snapshot_without_tenants_field_loads_owning_nothing). ROLL BACK is what breaks, and this axis explicitly claims it. The blocker is the LOG, not the snapshot: store.rs persists raft_log.json as serde_json over `BTreeMap<u64, Entry>` whose payload is the same `YubabaRequest` enum as the wire, and load reads that map whole — so a single retained (un-purged) ClaimTenant / TransferTenant / RenewTenantLease entry makes a downgraded epoch-2 binary fail to deserialize its own log at startup. It does not lose a feature; it does not start. The snapshot direction is fine both ways (YubabaState has no deny_unknown_fields, so an old binary silently drops the `tenants` key), and openraft does eventually purge applied entries — but a snapshot does not retire a log entry the moment it is applied, so there is always a window, and 'reversible only if you are lucky about purge timing' is not what this axis promises. This is the first state_epoch bump that is not an openraft storage migration; the criterion is the axis's own claim, not the shape of the precedents. Same cheap moment as the wire axis: no fleet log contains a tenant entry today, so a rollback taken before the first claim is still clean.",
+    "4": "R737-F1 (W246) — same change, and it moves this axis for the LOG, not for the snapshot. The snapshot half is a non-event: `placement` on YubabaState and `capacity` on MemberInfo are both #[serde(default)], so an epoch-3 snapshot loads on the new binary declaring nothing and unschedulable, and a new snapshot loads on the old binary with the unknown fields dropped. What breaks is the ROLLBACK question this axis actually asks. `raft_log.json` is a BTreeMap<u64, Entry> of serde_json, and an Entry's payload is EntryPayload::Normal(YubabaRequest) — so a log that has ever carried a SetTenantPlacement cannot be deserialized by an epoch-3 binary at all, and the node does not start rather than starting wrong. Identical reasoning to R732-F1's entry on this axis; recorded again rather than cross-referenced because the next reader will be deciding about a different change and needs the mechanism, not a pointer."
   },
-
   "surface_rerecords": [
     {
+      "at": "2026-08-27",
+      "axes": [
+        "cluster_protocol"
+      ],
+      "verdict": "NOT BREAKING — cluster_protocol_surface re-recorded, the epoch stays 5. state_epoch is untouched and was already green: its recorded hash has matched the tree throughout, so nothing on the on-disk axis was ever in question here. This entry closes R829, which had the guard RED on committed main for a week and gated every CI push and every release-check run.",
+      "cause": "TWO THINGS, and separating them is the whole finding. (1) THE MECHANICAL HALF: the value this replaces, 379ebab3…, never described any committed tree. It describes the surface as it stood at commit 8b35b0a9, but it was written into this file at 145b3f5e (2026-08-20) by R782's `--write`, two commits later. Shown mechanically rather than argued: holding the other four inputs at their (unchanged) state and sweeping lib.rs across the last 60 revisions, 8b35b0a9's lib.rs is the one and only revision that reproduces 379ebab3…. The asymmetry is the tell — R782 re-recorded BOTH axes in that run and state_epoch came out correct, and state_epoch is the axis with no lib.rs input. So at write time this shared working tree carried R782's own new raft/mod.rs beside a lib.rs that predated a peer's R605-F12 edit, and the later `sync` commit swept in both. (2) THE SEMANTIC HALF, which is what was actually never adjudicated: R605-F12 (`sovereign_role`). It is the only input that moved between 8b35b0a9 and 145b3f5e on this axis — `rust-items … fn raft_*`, 18f22799… -> 06b66ba6…. R782's verdict block reasons only about its own `rpo_bound` change and does not mention sovereign_role at all, so the compatibility call for R605-F12 on the wire axis is made here for the first time.",
+      "why_not_a_bump": [
+        "IT IS THE R742-F1 SHAPE, EXACTLY — see the 2026-08-11 entry below, correctly re-recorded. Same two handlers, same mechanism, one more axis on the same gate: R742-F1 put a sovereign-GROUP gate on POST /raft/add-learner and a `sovereign_group` key on GET /raft/status; R605-F12 adds the ROLE (may this box hold a quorum seat) beside the group, read by the same `sovereign_group::judge` from the same two places.",
+        "NOTHING ON THE REPLICATION PATH MOVED. `SovereignRole` lives on `ServerState` (in-memory) and in the `/raft/status` response body; it is not a field of `YubabaRequest`, `YubabaResponse` or `YubabaState`, and raft/mod.rs, raft/network.rs and the `/raft/` route table are all byte-identical across this change (the mod.rs delta between those commits is R782's `rpo_bound`, adjudicated in the 2026-08-19 entry). Append-entries, vote, pre-vote and snapshot are unchanged, so an old-build voter and a new-build voter replicate together exactly as before. The openraft pin does not move.",
+        "THE OLD-PEER DIRECTION IS EXPLICITLY DEFAULTED, not accidentally tolerated. `sovereign_group::read_group` maps an absent `sovereign_role` key to `SovereignRole::Voter` (oss/yubaba/crates/yubaba/src/sovereign_group.rs:302), which is what declaring a group alone has always meant — so every daemon between R742-F1 and R605-F12, i.e. the entire current prod raft, is judged precisely as it was before the field existed. That is deliberate and documented at the site: refusing them would stop a stamped cluster growing until every member had been rolled, a strictly worse failure than the one the role guards.",
+        "NOT THE R706 HAZARD (a tolerated field that makes a mixed cluster silently WRONG). The role is only ever read by the node that DIALS `/raft/status`, never applied from replicated state, so an old node cannot act wrongly on it. Same reasoning the 2026-08-11 entry recorded for `sovereign_group` itself.",
+        "NEW BEHAVIOUR IS OPT-IN BY A FLAG THE OLD BUILD DOES NOT HAVE. The gate runs only on a daemon started with `--sovereign-group`; without it every path is byte-identical to epoch-5 behaviour, so upgrading a node changes nothing until an operator also changes its unit.",
+        "ROLLBACK IS FREE. Nothing is persisted — no log entry, no snapshot byte, no state-machine field — which is why state_epoch did not move and did not need to."
+      ],
+      "residual_risk": "One window, already named at the code site and not introduced by this re-record: a box whose machine.toml says `non-voter` but whose daemon predates `--sovereign-role` answers \"voter\" and this gate admits it. `cloud::judge_join` reads the TOML and refuses it on the camp side, which is where operator-driven joins go, so the node-side gate is a backstop lagging a rollout rather than an unguarded path. It closes for a given group the moment its nodes carry the flag.",
+      "attributed_by": "R829 added per-input digests to this file (`<axis>_surface_inputs`) and to the drift report, so the NEXT drift on either axis names the input that moved instead of only the total. `cargo run -p xtask -- cluster-epochs --inputs` prints them; diffing that output across two checkouts is how the 8b35b0a9 attribution above was established, and it replaces the manual git-archaeology pass this investigation otherwise costs every time.",
+      "verified_by": [
+        "cargo test -p xtask --test cluster_epoch_drift",
+        "cargo test -p xtask --lib cluster_epochs"
+      ]
+    },
+    {
+      "at": "2026-08-19",
+      "axes": [
+        "cluster_protocol",
+        "state_epoch"
+      ],
+      "verdict": "NOT BREAKING on either axis — both hashes re-recorded, cluster_protocol stays 5 and state_epoch stays 4. The only input either axis touched is raft/mod.rs (in both surfaces), and the move on it is a plain new struct FIELD, not a variant — the R720-F1 `digest` / R734-F2 `capacity` shape, correctly not bumped, not the R732-F1 / R737-F1 enum-variant shape that was. The new `POST /mesh/rpo-report` route and its `mesh_rpo_report` handler (lib.rs) do not touch either lib.rs input: cluster_protocol's route-table slice only keeps lines containing the `/raft/` needle (this route is `/mesh/…`, same reason the earlier `/mesh/lease-renew` route didn't match), and its handler-set slice only keeps top-level fns named `raft_*` (this handler is `mesh_rpo_report`).",
+      "cause": "R782 (W253 §7) — plumbing the streamer-RPO gate. `TenantPlacement` gained `rpo_bound: Option<Duration>` (#[serde(default)]) so the leader has a per-tenant target to read; the matching evidence-source half (`RpoWatermarkRegistry`, `POST /mesh/rpo-report`, `scheduler::spawn`'s new `rpo_registry` param) lives in lease_detector.rs/lib.rs/scheduler.rs, none of which are inputs to either axis — `judge_readiness`'s own arithmetic already shipped inert (R737-F2) and needed no epoch of its own then either.",
+      "why_not_a_bump": [
+        "Field, not variant — the load-bearing discriminator this file has used since R720-F1. `TenantPlacement` is a struct carried inside `YubabaRequest::SetTenantPlacement` and inside `YubabaState.placement`; adding a field to it changes neither enum's tag set, so an old node's serde simply drops the unknown key on the way in and defaults it to `None` on the way out — no `unknown variant` failure, no divergence, no inability to apply a replicated entry.",
+        "R706 hazard checked, does not apply. An old (pre-R782) node dropping `rpo_bound` reads exactly the value it already read before this ticket: `None`, which `judge_readiness` documents as vacuously satisfied. It is not silently WRONG in the R706 sense (an old node did not gain a check it then evaluates incorrectly) — it is silently the SAME as before, which is the safe direction R720-F1 / R734-F2 already established for a tolerated field.",
+        "The reverse direction (old leader, new followers, or a downgrade) is the same non-event: an old leader never reads or writes `rpo_bound` at all, so the gate simply stays inert on that leader exactly as it was before R782 — a known, documented, and safe degradation (the underlying WAL->R2 durability the gate reasons about is unaffected; only the placement scheduler's extra caution is unavailable), not a data-loss path.",
+        "cluster_protocol's lib.rs slices (route lines containing `/raft/`, top-level `fn raft_*` items) are untouched by the new `/mesh/rpo-report` route or `mesh_rpo_report` handler — identical reasoning to the 2026-08-15 entry's `/mesh/lease-renew` precedent, restated because the same shape landed again.",
+        "openraft pin unchanged at =0.10.0-alpha.30."
+      ],
+      "residual_risk": "None beyond the R734-F2 `capacity` precedent this shape mirrors exactly: a mixed cluster's only observable effect is that a declared RPO target is honoured by upgraded leaders and ignored (fail-open, not fail-wrong) by un-upgraded ones, which is the existing pre-R782 behaviour for every tenant, not a regression introduced by rolling.",
+      "verified_by": [
+        "cargo test -p xtask --test cluster_epoch_drift",
+        "cargo test -p yubaba --lib",
+        "cargo test -p yubaba --test raft_tenant_placement"
+      ]
+    },
+    {
+      "at": "2026-08-15",
+      "axes": [
+        "cluster_protocol",
+        "state_epoch"
+      ],
+      "verdict": "NOT BREAKING on either axis — both hashes re-recorded, cluster_protocol stays 5 and state_epoch stays 4. Exactly the R734-F5 shape (2026-08-11 entry above): additive JSON keys on the operator-facing raft_status handler, plus read-only accessors over already-existing state map fields. No new type, no new variant, no new field on any replicated request, no new route.",
+      "cause": "R737-F2/F3/T4 (W246, W253 §§7-8), landed across one session so the drift is recorded once rather than three times. F2's lease_detector.rs added a `lease_liveness` section to `raft_status` (fn raft_* item, lib.rs). T4's headroom.rs added a `headroom` section to the SAME function. F3's scheduler needed to walk every tenant's ownership/placement record, so raft/store.rs gained three read-only accessors: `tenants()` (whole-map clone), `tenant_placement(id)`, and `node_admits(node, demand, now)` (a passthrough to the existing `YubabaState::node_admits`, added under this ticket's own read lock rather than cloning three maps at the call site).",
+      "why_not_a_bump": [
+        "cluster_protocol's lib.rs slices are the `/raft/` route lines and the `fn raft_*` items — identical rule to the R734-F5 entry, restated because the same function moved again. The route TABLE is untouched (the new `/mesh/lease-renew` route does not match the `/raft/` needle). `raft_status`'s BODY moved twice (one section per ticket), and both changes are additive JSON keys on a GET-only operator surface — no request type changed, so no peer sends or parses anything new, and no node ever dials this endpoint of another node.",
+        "state_epoch: `tenants()`, `tenant_placement()` and `node_admits()` are read-only over fields state_epoch 4 already prices in (`YubabaState.tenants`, `.placement`, `.members`) — the exact shape the 2026-08-09 and 2026-08-10 entries recorded for `tenant_fencing_token()` and `tenant_ownership()`, correctly not bumped both times. They add no state, no request variant, no serde attribute, and no on-disk layout; what an epoch-4 binary writes to disk is byte-identical before and after.",
+        "openraft pin unchanged at =0.10.0-alpha.30."
+      ],
+      "residual_risk": "None beyond what the R734-F5 entry already names for the same function: GET /raft/status is a diagnostic surface, so an old binary in a mixed cluster simply omits the new sections rather than erroring, and a new binary reading an old peer's status omits fields that were never sent — neither side infers a wrong value from an absence.",
+      "verified_by": [
+        "cargo test -p xtask --test cluster_epoch_drift = 8 passed / 0 failed after re-recording (was 7/1 on raft_protocol_surface_matches_the_declared_epochs, both axes red)",
+        "cargo test -p yubaba --lib = 489 passed / 0 failed"
+      ]
+    },
+    {
+      "at": "2026-08-11",
+      "axes": [
+        "cluster_protocol"
+      ],
+      "verdict": "NOT BREAKING — cluster_protocol_surface re-recorded, the epoch stays 4. state_epoch is untouched: R742-F1 adds no type, no variant and no field to any replicated request or to YubabaState, and does not touch raft/mod.rs or raft/store.rs. On the wire axis it adds no route and no peer RPC payload — append-entries, vote, pre-vote, snapshot and write are byte-identical and the openraft pin does not move. What moved the hash is two `raft_*` handlers in lib.rs.",
+      "cause": "R742-F1 (W305 §F1): the sovereign-group gate on POST /raft/add-learner. `raft_status` gained a `sovereign_group` key (this node's own --sovereign-group, emitted even when null); `raft_add_learner` gained a pre-membership gate that dials the prospective learner's /raft/status, refuses 409 on a cross-group or unestablishable group, 502 when the joiner cannot be asked at all, and reports `sovereign_group_judged` on success.",
+      "why_not_a_bump": [
+        "A MIXED CLUSTER KEEPS WORKING UNCHANGED. Nothing on the replication, election or snapshot path moved, so an old-build voter and a new-build voter sit together exactly as before. The change is confined to one operator-driven membership verb and one operator-driven read.",
+        "THE NEW BEHAVIOUR IS OPT-IN BY A FLAG THE OLD BUILD DOES NOT HAVE. The gate runs only on a daemon started with --sovereign-group. Without it every response and every code path is byte-identical to epoch-4 behaviour, so upgrading a node changes nothing until an operator also changes its unit. That is also why this is not the shape of history \"3\": R706 changed what an existing replicated request MEANT, silently, with no operator action.",
+        "THE ADDITIVE FIELD IS IGNORABLE IN BOTH DIRECTIONS. `sovereign_group` on /raft/status is a new JSON key an old reader drops; a new reader treats a missing key as Unsupported and a null as Undeclared, both of which it handles explicitly. Deliberately NOT the R706 hazard: there an old node silently mis-authorized because it dropped a field it had no check for. Here the field is only ever read by the node that DIALS, never applied from replicated state, so an old node cannot act wrongly on it — it can only fail to be asked, and the asking node treats that as a refusal, which is the safe direction.",
+        "REFUSING AN UN-ROLLED JOINER IS THE INTENDED OUTCOME, not a casualty of the change. A stamped leader refuses to add a learner whose build predates the field, because it cannot establish which blast radius that box belongs to. It costs a rolling upgrade nothing that matters: growth pauses, existing membership does not.",
+        "ROLLBACK IS SYMMETRIC AND FREE. Nothing is persisted — no log entry, no snapshot byte, no state-machine field — so rolling back to an epoch-4 build drops the flag and the gate together and leaves no residue to read. This is why state_epoch did not even move."
+      ],
+      "verified_by": [
+        "cargo test -p xtask --test cluster_epoch_drift = 8 passed / 0 failed after re-recording",
+        "cargo test -p yubaba --lib = 417 passed / 0 failed; cargo test -p yubaba --test raft_sovereign_group = 8 passed / 0 failed"
+      ]
+    },
+    {
+      "at": "2026-08-11",
+      "axes": [
+        "cluster_protocol",
+        "state_epoch"
+      ],
+      "verdict": "NOT BREAKING on either axis — both hashes re-recorded, cluster_protocol stays 4 and state_epoch stays 3. R734-F5 introduces no new type, no new variant, no new field and no new route. It makes yubaba EMIT a request it never emitted before (YubabaRequest::SetMember, and RemoveMember on the removal path) and start populating MemberInfo.region, which R734-F2 added at these same epochs.",
+      "cause": "R734-F5 (W247 §2): each node registers its own member row. New src/member_registration.rs (not a surface input); raft/store.rs gained read-only `members()` / `member(node_id)`; raft/mod.rs's MemberInfo gained `PartialEq, Eq`; lib.rs's `raft_status` grew a `members` section and `raft_remove_member` grew a region-spread clause, a row-clearing pass, and two new response keys (`stale_rows`, `spread_judged`).",
+      "why_not_a_bump": [
+        "EMITTING an old variant is not a wire change. SetMember has existed since the first raft state machine and RemoveMember alongside it; both are already in every build's YubabaRequest. `region` is #[serde(default)] and was priced into BOTH axes by the R734-F2 re-record on 2026-08-10. An epoch-4 node that predates F5 applies a replicated SetMember carrying a region exactly as it always did. Contrast R732-F1, which had to bump because it added VARIANTS to the externally-tagged YubabaRequest, which an old node cannot parse and therefore cannot apply.",
+        "THE R706 HAZARD WAS CHECKED, NOT ASSUMED, and this is the one place this change differs from R734-F2. F2 could say `nothing reads MemberInfo.region`; that is no longer true — POST /raft/remove-member now refuses a removal that would leave one region holding a majority of the survivors. R706's `access` was a tolerated field that WAS bumped precisely because an enforcement path read it: an old node dropping it kept serving the secret with no check, silently defeating the guarantee. The shape that made that dangerous is absent here on three counts. (1) Nothing is dropped or defaulted in either direction — `region` round-trips through both builds; the pre-F5 node simply has no clause. (2) An old node's behaviour is IDENTICAL to the new node's own documented downgrade path (count clause only, when a survivor's region is unknown), so a mixed cluster produces an outcome the new code already produces on purpose rather than an unreachable one. (3) It is an operator-availability gate on an explicit, deliberate, one-at-a-time operator action, not a per-request authorization check on a data path — the failure mode is `a removal an upgraded node would have refused went through`, visible in the response body (`spread_judged: false` names it) and re-checkable, not a silent grant.",
+        "cluster_protocol's lib.rs slices are the `/raft/` route lines and the `fn raft_*` items. The route TABLE is untouched — no route added, removed or renamed. Two handler BODIES moved (raft_status, raft_remove_member) and both changes are additive JSON keys on operator-facing responses (`members`, `stale_rows`, `spread_judged`); no request type changed, so no peer sends or parses anything new. GET /raft/status is an operator surface, not a peer RPC — no node dials it.",
+        "state_epoch: on-disk bytes are unchanged in SHAPE. state_epoch 3 already prices in `members: BTreeMap<YubabaNodeId, MemberInfo>` with `region: Option<String>` (R734-F2). What changes is that real logs and snapshots now CONTAIN region values where before the map was empty. A downgraded pre-F2 binary reading such a log ignores the unknown `region` key (serde_json, no deny_unknown_fields anywhere in the chain) and applies the SetMember it can represent — no parse failure, no apply failure, and no divergence in any field that build knows about. `members()` / `member()` are read-only clones of an existing field, the same shape as the tenant_ownership() accessor re-recorded on 2026-08-10; `PartialEq, Eq` on MemberInfo derives no serialisation.",
+        "openraft pin unchanged at =0.10.0-alpha.30."
+      ],
+      "residual_risk": "During a roll, the member map is INCOMPLETE rather than wrong: an un-rolled node publishes no row, so it is in raft membership with no region. Every consumer must treat a missing row as `unknown`, never as `no such node` — the removal gate does (it stands the spread clause down and reports spread_judged:false), and yubaba_test_harness::solo_node_unregistered exists so that branch stays tested. The gate is therefore only fully in force once every voter is rolled, which is the same shape as the R734-T1 pre-vote residual risk: it degrades toward the pre-F5 behaviour and never below it.",
+      "concurrency_note": "The tree carried uncommitted R734-T4 work by a concurrent session (@Ashguard:blade, session:b4f7871f) when this was recorded — src/leader_pin.rs, tests/raft_leader_pin.rs, a --leader-anchor flag in main.rs, and `pub mod leader_pin;` in lib.rs. None of those are surface inputs (leader_pin.rs and main.rs are not listed; the lib.rs module declaration is neither a `/raft/` line nor a `fn raft_*` item), so the hash delta recorded here is R734-F5's alone. Verified by reading the lib.rs hunk headers, not assumed. If T4 later moves a raft_* handler it will turn this gate red again and owes its own verdict.",
+      "verified_by": [
+        "cargo test -p xtask --test cluster_epoch_drift = 8 passed / 0 failed after re-recording (was 7/1 on raft_protocol_surface_matches_the_declared_epochs, both axes red)",
+        "cargo test -p yubaba --lib = 405 passed / 0 failed",
+        "cargo test -p yubaba --test raft_member_registration = 6 passed / 0 failed (new suite)"
+      ]
+    },
+    {
+      "at": "2026-08-10",
+      "axes": [
+        "cluster_protocol"
+      ],
+      "verdict": "NOT BREAKING — hash re-recorded, cluster_protocol left at 4. This entry ALSO CORRECTS the R734-T1 entry below, which recorded Pre-Vote as enabled; it has since been switched off. See 'correction' here.",
+      "cause": "R734-T3 (W247 §4). The third membership verb: POST /raft/remove-member + fn raft_remove_member in lib.rs, which is why this axis moved. state_epoch stayed GREEN and needed no action — raft/mod.rs and store.rs are untouched, and a membership change is openraft's own log entry rather than a YubabaRequest, so nothing about what yubaba writes to disk moved.",
+      "why_not_a_bump": [
+        "PURELY ADDITIVE, AND OPERATOR-FACING. /raft/remove-member is called by an operator against the leader; no node ever dials it at a peer. An old build answers 404 to it, which is a missing operator capability rather than a membership incompatibility — exactly the precedent the 2026-08-02 entry recorded for /raft/promote-voter when R118-T9 added it.",
+        "THE MEMBERSHIP CHANGE ITSELF IS OPENRAFT'S, NOT OURS. The handler proposes ChangeMembers::RemoveVoters / RemoveNodes, and openraft drives the ordinary joint-consensus transition that BOTH builds already implement and already replicate as the same Membership log entry. No new wire type, no new payload shape, nothing added to YubabaRequest. A mixed cluster replicates a removal identically whichever build proposed it.",
+        "openraft pin unchanged at =0.10.0-alpha.30."
+      ],
+      "correction": "The 2026-08-10 R734-T1 entry below says Pre-Vote is enabled. It is NOT, as of this change: RaftTiming::to_openraft_config now sets enable_pre_vote: Some(false). Enabling it against openraft 0.10.0-alpha.30 can strand a node as leader-per-peers and not-leader-per-itself, permanently — measured with tests/raft_membership_loop.rs under load: debug builds hit openraft's own `elect() requires leadership to be relinquished` debug_assert in 5 of 8 runs, release builds (where that assert compiles out) stranded a node on current_leader [None, Some(1), Some(1)] in roughly 40% of runs, still stuck after 75 seconds. Zero occurrences in 8 debug and 8 release control runs with the flag off. Cause is upstream: openraft's handle_pre_vote_resp calls elect() guarded only on pre_candidate.is_none(), with no guard on leader.is_none(), where the real-vote path does guard. EVERYTHING ELSE FROM R734-T1 STAYS AND IS STILL LIVE — the /raft/pre-vote route, the RaftNetworkV2::pre_vote transport, and their tests. So the wire-compatibility reasoning in the T1 entry below still stands as written: the route exists and answers, and a peer that lacks it gets the documented 404-counts-as-a-grant degrade. What changed is only that yubaba does not currently SEND pre-votes, which makes a mixed cluster strictly simpler than the entry describes, never more complex.",
+      "residual_risk": "Removing members is quorum-affecting by nature, which is why the handler gates on the surviving voter count before proposing anything (odd, non-empty). The gate cannot check region spread — openraft's node type is BasicNode{addr}, so raft membership carries no region, and R734-F2's MemberInfo.region is not written by anything in production yet. A removal can therefore still worsen quorum GEOGRAPHY (e.g. taking a 1-1-1 cluster to a 1-1 that is then refused for being even, or a 2-2-1 down to a 2-1-0 that is odd but region-lopsided) without being refused. Named in the handler's doc comment rather than left implicit; it closes when member rows carry regions.",
+      "verified_by": [
+        "cargo test -p xtask --test cluster_epoch_drift = 8 passed / 0 failed after re-recording",
+        "cargo test -p yubaba --test raft_membership_loop = 5 passed / 0 failed, repeated 6x in debug and 12x in release with no flakes"
+      ]
+    },
+    {
+      "at": "2026-08-10",
+      "axes": [
+        "cluster_protocol",
+        "state_epoch"
+      ],
+      "verdict": "NOT BREAKING on either axis — both hashes re-recorded, cluster_protocol left at 4 and state_epoch left at 3",
+      "cause": "R734-F2 (W247 §2). Quorum geography. `MemberInfo` gained `region: Option<String>` and `YubabaRequest::SetMember` gained the matching `region` field, both #[serde(default)] — that is raft/mod.rs, which is an input to BOTH surfaces, which is why both moved together for the first time since the openraft 0.10 bump. The wire axis also picked up the /raft/initialize handler, which now judges the founding voter set against the new ClusterPolicy::quorum_geography and refuses a violation with 400 before openraft writes anything.",
+      "why_not_a_bump": [
+        "FIELD, NOT VARIANT — this is the whole verdict, and it is the exact discriminator history entry \"4\" (R732-F1) was written to establish. R732-F1 had to bump both axes because it added enum VARIANTS to `YubabaRequest`, which is externally tagged with no #[serde(other)]: an old node receiving a replicated ClaimTenant cannot parse it, cannot apply it, and diverges. `region` is a FIELD on an existing struct variant, and nothing in this chain carries #[serde(deny_unknown_fields)] (re-grepped). So an old node replicating a new node's SetMember silently drops the key and applies the rest; a new node reading an old SetMember defaults it to None. Same shape as R720-F1's `digest`, which was correctly NOT bumped. Pinned by test rather than asserted: raft::tests::a_pre_r734_f2_set_member_still_applies_with_no_region.",
+        "NOT THE R706 HAZARD, and this is the question worth asking rather than the one worth assuming. R706's `access` was also a tolerated struct field, and it WAS bumped — because an old node that dropped it kept serving secrets an access rule was supposed to gate, so the guarantee silently did not hold cluster-wide. The test is whether any ENFORCEMENT path reads the new field. Here nothing does: QuorumGeography::judge is called by the /raft/initialize handler on the founding REQUEST PAYLOAD, at a moment when there is no cluster and no replicated state to consult. `MemberInfo.region` is recorded state, read by no gate. An old node dropping it therefore changes no decision anywhere, which is precisely what was untrue of `access`.",
+        "STATE_EPOCH, the rollback direction — the axis's own claim, checked in both directions by a_pre_r734_f2_snapshot_loads_untagged_and_a_downgrade_reads_a_tagged_one. New-reads-old: an untagged member row loads as region None. Roll BACK is what R732-F1 could not promise, because its blocker was the LOG (store.rs persists raft_log.json as serde_json over entries carrying the same YubabaRequest enum, so one retained un-purged ClaimTenant entry stops a downgraded binary from starting). A field is not a variant: a downgraded pre-R734-F2 binary parses a region-tagged SetMember log entry and a region-tagged member row in a snapshot, dropping the key both times. The downgrade is clean, so the axis's promise holds and this is a re-record.",
+        "THE /raft/initialize SHAPE CHANGE IS OPERATOR-FACING, NOT PEER-TO-PEER. This axis asks whether two BUILDS can sit in one raft cluster; /raft/initialize is called once, by an operator, on a node that is not yet in a cluster at all — no node ever dials it. Two builds' ability to exchange append-entries, vote, pre-vote, snapshot and transfer-leader is untouched. The request also stays backward-compatible on purpose: `members` accepts both the pre-region `id -> \"host:port\"` form and the tagged object form (serde untagged), so an old operator script reaches the POLICY refusal with an actionable message about region tags rather than a 422 that reads like a JSON typo. Pinned by tests/raft_quorum_geography.rs::the_pre_region_request_shape_reaches_the_policy_refusal_not_a_parse_error.",
+        "openraft pin unchanged at =0.10.0-alpha.30."
+      ],
+      "residual_risk": "A BEHAVIOUR change an operator must know about, though not a compatibility one: under the fleet profile, `raft init` on a multi-voter cluster now REFUSES an untagged founding set, where before it succeeded. That is the deliverable rather than a side effect — W247's whole point is that an untagged bootstrap is how a cluster ends up with a quorum that dies with one datacenter — but a runbook that founds a fleet cluster without `@region` suffixes will now fail, and the fix is to add them from .yah/infra/machines/<name>.toml. A cluster-of-one and every rig-profile cluster are unaffected. Separately: nothing in production writes `MemberInfo.region` yet, because nothing writes SetMember at all (grep: the only callers are tests) — so a mixed cluster has no region rows to disagree about, and the field is currently a data model for R736-T3 and R737-F1 plus the founding-time check, not live fleet state.",
+      "verified_by": [
+        "cargo test -p xtask --test cluster_epoch_drift = 8 passed / 0 failed after re-recording",
+        "cargo test -p yubaba --lib = 384 passed / 0 failed",
+        "cargo test -p yubaba --test raft_quorum_geography = 5 passed / 0 failed"
+      ]
+    },
+    {
+      "at": "2026-08-10",
+      "axes": [
+        "cluster_protocol"
+      ],
+      "verdict": "NOT BREAKING — hash re-recorded, cluster_protocol left at 4",
+      "cause": "R734-T1 (W247). Pre-Vote turned on. Three coupled edits: `enable_pre_vote: Some(true)` in RaftTiming::to_openraft_config (cluster_policy.rs, not itself a surface input), `RaftNetworkV2::pre_vote` implemented in raft/network.rs, and a new POST /raft/pre-vote route + `fn raft_pre_vote` handler in lib.rs. The latter two are why this axis moved; state_epoch stayed GREEN and needed no action, correctly — store.rs is untouched and raft/mod.rs's non-comment content did not change, because a Pre-Vote never produces a log entry and so has no on-disk existence at all.",
+      "why_not_a_bump": [
+        "OLD DIALS NEW: an old node never sends a Pre-Vote. openraft's `enable_pre_vote` defaults to None and `get_enable_pre_vote()` reads None as false, so a pre-R734-T1 build has the feature off and its election path is byte-for-byte the one it always had. The new route is additive and simply never dialed by it. Every route an old node DOES dial — /raft/vote, /raft/append-entries, /raft/snapshot, /raft/transfer-leader-msg — is unchanged in path, payload type, and semantics.",
+        "NEW DIALS OLD: this is the direction that needed a deliberate decision, and it is handled in the client rather than left to chance. openraft counts only an affirmative `Ok(granted)` toward the Pre-Vote quorum — an `Err` is never a grant, by design, so that an isolated node cannot synthesize a quorum from its own unreachable peers. A naive implementation would therefore turn the old peer's 404 into a non-grant, and a new node could then fail to assemble a pre-vote quorum and never campaign: a mixed cluster that goes leaderless after a leader failure, which WOULD have been a bump (and a nasty one, since nothing in the logs looks like a failure). YubabaNetwork::pre_vote instead treats HTTP 404 specifically as a grant — the peer answered, it is reachable, its build just has no route — which is exactly the degrade openraft's own default `pre_vote` impl provides for a network that has not implemented the RPC. A connect failure still returns Err, so the isolated-node protection is untouched. Verified by test, not asserted: raft::network::tests::a_404_from_a_pre_r734_peer_counts_as_a_grant, a_real_refusal_survives_the_404_fallback (an honest refusal is not rewritten into a grant by an over-broad fallback), and an_unreachable_peer_is_an_error_not_a_grant.",
+        "NO NEW WIRE TYPES. /raft/pre-vote carries VoteRequest and VoteResponse — the identical types /raft/vote has always carried. This is not the R732-F1 shape (new enum variants on the replicated command type, which an old node cannot parse and so cannot apply, diverging its state machine); nothing here is replicated at all. A Pre-Vote is a question, and handling one persists no vote, changes no term, and writes no log entry — pinned by tests/raft_pre_vote.rs::a_pre_vote_probes_without_persisting_while_a_real_vote_commits, which sends the SAME request to both routes and reads the responder's term back after each.",
+        "openraft pin unchanged at =0.10.0-alpha.30."
+      ],
+      "residual_risk": "During a mixed window, a new node's Pre-Vote grants from old peers are free grants, so Pre-Vote's protection is weaker than in a fully-rolled cluster. It degrades toward the pre-R734-T1 behaviour and never below it — a free grant can only let a candidate proceed to the real election, which is what it would have done unconditionally before this change, and the real vote still respects the leader lease. So there is no window in which the fleet is worse off than it was; there is a window in which the new protection is only partial. Fully realised once every voter is rolled.",
+      "verified_by": [
+        "cargo test -p xtask --test cluster_epoch_drift = 8 passed / 0 failed after re-recording",
+        "cargo test -p yubaba --lib = 376 passed / 0 failed (372 baseline + 3 pre-vote transport tests + 1 policy test)",
+        "cargo test -p yubaba --test raft_pre_vote = 3 passed / 0 failed",
+        "The rest of the raft suites, green with Pre-Vote on: bootstrap_single_node 2/0, raft_add_learner 1/0, raft_promote_voter 2/0, raft_transfer_leader 1/0, rig_singleton_ownership 2/0 (the LAN-timing failover path), integration_mesh --features containerd-integration 7/0/1",
+        "FALSIFICATION: forcing YubabaNetwork::pre_vote to return Err(Unreachable) leaves a_dead_leader_is_still_replaced_with_pre_vote_gating_the_election hung on both survivors naming the killed node until its 30s deadline — which is simultaneously the proof that enable_pre_vote is live and that the suite would catch a broken Pre-Vote transport."
+      ]
+    },
+    {
+      "at": "2026-08-09",
+      "axes": [
+        "state_epoch"
+      ],
+      "verdict": "NOT BREAKING — hash re-recorded, state_epoch left at 3 (it was BUMPED 2 -> 3 earlier the same day by R732-F1; see its history entry \"3\")",
+      "cause": "R732-T4 (W245). raft/store.rs gained `YubabaStateMachine::tenant_fencing_token()`, a read-only accessor the in-process tenant WAL streamer calls to ask whether this node may write a given tenant.",
+      "why_not_a_bump": [
+        "Exactly the shape the 2026-08-03 entry already recorded for `cluster_secret_index()`: a read-only accessor over an already-existing field of the state map. It delegates straight to `YubabaState::tenant_fencing_token` and touches no serialisation path, no on-disk layout, no log framing. It is in this axis's hash purely because the WHOLE FILE is a surface input, which is the mechanism working as designed rather than a signal.",
+        "The durable types themselves are unchanged since the R732-F1 bump landed earlier today. `tenants: BTreeMap<TenantId, TenantOwnership>` and its `#[serde(default)]` are what state_epoch 3 already prices in; nothing about what an epoch-3 binary writes to disk moved here.",
+        "cluster_protocol was verified UNMOVED by this change and needs no action: store.rs is not one of its inputs, raft/mod.rs's non-comment content did not change (only @yah: annotations, which the hasher strips), and the lib.rs contribution is only its `/raft/` route lines and `fn raft_*` handlers — the one lib.rs edit was adding `pub mod tenant_streamer;`, which matches neither. The gate agreed: cluster_protocol stayed green while state_epoch went red.",
+        "openraft pin unchanged at =0.10.0-alpha.30. The new `turso-backup` path dependency added to the yubaba crate is not a surface input on either axis and cannot be: it is a data-plane library with no raft wire or storage involvement."
+      ],
+      "residual_risk": "None on this axis. The one thing an operator should know from this change lives elsewhere: yubaba now takes a path dependency on oss/turso-backup, which is `publish = false`, so the yubaba mirror's standalone build gains an unpublishable dep (R542/R610 territory). That is a release concern, not a cluster-compatibility one."
+    },
+    {
       "at": "2026-08-07",
-      "axes": ["cluster_protocol", "state_epoch"],
+      "axes": [
+        "cluster_protocol",
+        "state_epoch"
+      ],
       "verdict": "NOT BREAKING — hashes re-recorded, cluster_protocol left at 3, state_epoch left at 2",
       "cause": "R720-F1 (W294) / R625-B6. `digest: Option<Vec<u8>>` added to SecretRecord (raft/mod.rs) and to YubabaRequest::PutSecret, both #[serde(default)]. raft/store.rs's cluster_secret_index() gained a fourth (digest, hex-encoded) column plus a local hex_encode helper.",
       "why_not_a_bump": [
@@ -30,7 +231,9 @@
     },
     {
       "at": "2026-08-03",
-      "axes": ["state_epoch"],
+      "axes": [
+        "state_epoch"
+      ],
       "verdict": "NOT BREAKING — hash re-recorded, state_epoch left at 2 (cluster_protocol was BUMPED to 3 in the same change; see its history entry)",
       "cause": "R706 (W294). `access: SecretAccess` added to SecretRecord (a durable type in raft/mod.rs) and `cluster_secret_index()` added to raft/store.rs, so both of this axis's file inputs moved.",
       "why_not_a_bump": [
@@ -43,7 +246,10 @@
     },
     {
       "at": "2026-08-02",
-      "axes": ["cluster_protocol", "state_epoch"],
+      "axes": [
+        "cluster_protocol",
+        "state_epoch"
+      ],
       "verdict": "NOT BREAKING — hashes re-recorded, both epochs left at 2",
       "cause": "R118-T9 (ClusterPolicy). Drift had been sitting committed since ac30043c while the hashes were last recorded at 83beb361, two commits earlier.",
       "why_not_a_bump": [
@@ -53,6 +259,25 @@
         "openraft pin unchanged at =0.10.0-alpha.30. The Cargo.toml diff removes only the dev-dependency `openraft_09` (R625-S1's mixed-version interop test, deleted with the test per the 2026-07-25 operator decision to put every node on 0.10). Dev-only; never linked into the shipped lib."
       ],
       "residual_risk": "Mismatched --cluster-profile ACROSS NODES (fleet WAN timings vs rig LAN timings) is a real misconfiguration — a rig node campaigns ~3x more eagerly — but it is an operator error at launch, not a build-compatibility fact, and this axis asks whether two BUILDS can share a cluster. Both builds default to --cluster-profile fleet."
+    },
+    {
+      "at": "2026-08-10",
+      "axes": [
+        "state_epoch"
+      ],
+      "verdict": "NOT BREAKING — hash re-recorded, state_epoch left at 3. Same axis, same day, same reason as the 2026-08-09 entry above; this is the second read-only accessor added to the same already-priced-in state map.",
+      "cause": "R732-T4 (W245), rebuilt against the operator-ratified hosting shape. raft/store.rs gained `YubabaStateMachine::tenant_ownership()` — a read-only clone of an existing `YubabaState::tenants` entry, serving the diagnostic half of the new `GET /tenants/{id}` endpoint — plus `apply_for_test()`, which is `#[cfg(test)]` and therefore not in a shipped binary at all.",
+      "why_not_a_bump": [
+        "`tenant_ownership()` reads and clones an existing field. It adds no state, no request variant, no serde attribute, and no on-disk layout. What an epoch-3 binary writes to disk is byte-identical before and after. state_epoch 3 already prices in `tenants: BTreeMap<TenantId, TenantOwnership>`, which R732-F1 bumped 2 -> 3 for on 2026-08-09.",
+        "`apply_for_test()` is behind `#[cfg(test)]`. It is in the hash because the hasher reads the whole file, not because it ships. A rolling upgrade cannot observe it.",
+        "cluster_protocol stayed GREEN and needed no action, as predicted before running the gate. This change adds one route (`GET /tenants/{id}`) and one handler (`get_tenant_ownership`) to lib.rs, and that axis's lib.rs contribution is only its `/raft/` route lines and `fn raft_*` handlers — neither matches. That is correct rather than lucky: cluster_protocol governs node-to-node raft RPC compatibility, and this endpoint is a node-local service contract (yubaba -> that node's own tenant streamer), not a peer-to-peer one.",
+        "openraft pin unchanged at =0.10.0-alpha.30."
+      ],
+      "residual_risk": "None on this axis, and this entry RETIRES the release concern the 2026-08-09 entry above recorded. That entry noted that yubaba had taken a runtime path dependency on the `publish = false` turso-backup crate, giving the yubaba mirror an unpublishable dep (R542/R610). That dependency is gone: the WAL streamer is now a separate crate (`oss/yubaba/crates/tenant-streamer`) per the 2026-08-10 operator-ratified hosting shape, and the yubaba server crate links turso-backup only as a DEV-dependency, for R732-T5's chaos test. Dev-dependencies are stripped from a published package's manifest, so the mirror's standalone publishability is restored. The unpublishable-dep concern now belongs to `yubaba-tenant-streamer` alone, which is `publish = false` itself and states why.",
+      "verified_by": [
+        "cargo test -p xtask --test cluster_epoch_drift = 8 passed / 0 failed after re-recording",
+        "cargo test -p yubaba --lib = 372 passed / 0 failed (368 baseline + 4 new endpoint tests)"
+      ]
     }
   ]
 }

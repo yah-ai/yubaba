@@ -13,7 +13,7 @@
 //! ```sh
 //! cargo build -p yah-pg-dev --bin yah-pg-dev          # from the yah root
 //! YAH_PG_DEV_BIN=$PWD/target/debug/yah-pg-dev \
-//!   cargo test -p yah-cloud --test pg_driver_live -- --include-ignored --nocapture
+//!   cargo test -p yah-cloud --test main -- pg_driver_live:: --include-ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

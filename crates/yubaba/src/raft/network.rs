@@ -2,8 +2,9 @@
 //!
 //! Each peer in the yubaba cluster listens for raft RPCs on its mesh IP
 //! at the same port as the regular yubaba daemon (`:7443`).  The paths
-//! `/raft/append-entries`, `/raft/vote`, and `/raft/snapshot`
-//! are reserved for raft RPC; the rest of the yubaba API is unchanged.
+//! `/raft/append-entries`, `/raft/vote`, `/raft/pre-vote`, `/raft/snapshot`,
+//! and `/raft/transfer-leader-msg` are reserved for raft RPC; the rest of the
+//! yubaba API is unchanged.
 //!
 //! The snapshot path was `/raft/install-snapshot` through openraft 0.9 and was
 //! renamed with the 0.10 bump (both in commit 4a10c3d). There is deliberately no
@@ -114,25 +115,23 @@ pub struct YubabaNetwork {
 }
 
 impl YubabaNetwork {
-    /// POST `req` as JSON to `path` and decode the peer's `Result<Resp,
-    /// RaftError>` reply. Connection failures map to [`Unreachable`] (so openraft
-    /// backs off rather than hot-looping); other transport failures map to
-    /// [`NetworkError`]. A remote raft-level error is surfaced as `Unreachable`
-    /// too, matching the openraft v2 HTTP example.
-    async fn request<Req, Resp>(
+    /// POST `req` as JSON to `path` and hand back the peer's raw response,
+    /// whatever its status. Connection failures map to [`Unreachable`] (so
+    /// openraft backs off rather than hot-looping); other transport failures map
+    /// to [`NetworkError`].
+    ///
+    /// Split out of [`Self::request`] so [`RaftNetworkV2::pre_vote`] can see a
+    /// bare `404` — a peer whose build predates the `/raft/pre-vote` route — as
+    /// distinct from every other kind of failure, instead of having it collapsed
+    /// into an opaque `NetworkError` string it would have to sniff.
+    async fn post<Req: Serialize>(
         &self,
         path: &str,
         req: Req,
         option: &RPCOption,
-    ) -> Result<Resp, RPCError<TC>>
-    where
-        Req: Serialize,
-        Result<Resp, RaftError<TC>>: DeserializeOwned,
-    {
-        let url = format!("{}{}", self.base_url, path);
-        let resp = self
-            .client
-            .post(&url)
+    ) -> Result<reqwest::Response, RPCError<TC>> {
+        self.client
+            .post(format!("{}{}", self.base_url, path))
             .json(&req)
             .timeout(option.soft_ttl())
             .send()
@@ -143,13 +142,22 @@ impl YubabaNetwork {
                 } else {
                     RPCError::Network(NetworkError::new(&e))
                 }
-            })?;
+            })
+    }
 
+    /// Decode a peer's `Result<Resp, RaftError>` reply. A non-2xx status is a
+    /// [`NetworkError`]; a remote raft-level error is surfaced as `Unreachable`,
+    /// matching the openraft v2 HTTP example.
+    async fn decode<Resp>(&self, path: &str, resp: reqwest::Response) -> Result<Resp, RPCError<TC>>
+    where
+        Result<Resp, RaftError<TC>>: DeserializeOwned,
+    {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(RPCError::Network(NetworkError::from_string(format!(
-                "HTTP {status} from {url}: {body}"
+                "HTTP {status} from {}{path}: {body}",
+                self.base_url
             ))));
         }
 
@@ -158,6 +166,22 @@ impl YubabaNetwork {
             .await
             .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         res.map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))
+    }
+
+    /// POST `req` as JSON to `path` and decode the peer's `Result<Resp,
+    /// RaftError>` reply.
+    async fn request<Req, Resp>(
+        &self,
+        path: &str,
+        req: Req,
+        option: &RPCOption,
+    ) -> Result<Resp, RPCError<TC>>
+    where
+        Req: Serialize,
+        Result<Resp, RaftError<TC>>: DeserializeOwned,
+    {
+        let resp = self.post(path, req, option).await?;
+        self.decode(path, resp).await
     }
 }
 
@@ -178,6 +202,46 @@ impl RaftNetworkV2<TC> for YubabaNetwork {
         option: RPCOption,
     ) -> Result<VoteResponse<TC>, RPCError<TC>> {
         self.request("/raft/vote", rpc, &option).await
+    }
+
+    /// Ask the peer whether it *would* grant a vote at `rpc.vote` — R734-T1.
+    ///
+    /// Without this method the trait's default implementation synthesizes a
+    /// grant, which makes `enable_pre_vote` inert: a pre-candidate collects a
+    /// fabricated quorum and campaigns exactly as it would have with Pre-Vote
+    /// off. So the flag in
+    /// [`RaftTiming::to_openraft_config`](crate::cluster_policy::RaftTiming::to_openraft_config)
+    /// and this method are one change, not two.
+    ///
+    /// # Why a 404 is a grant and a dead socket is not
+    ///
+    /// openraft counts only `Ok(granted)` toward the Pre-Vote quorum; an `Err`
+    /// is never a grant, deliberately, so that a fully isolated node cannot
+    /// synthesize a quorum out of its own unreachable peers and inflate the
+    /// term. That rule is what makes the 404 case a *different* case: a peer
+    /// that answers `404` answered — it is reachable, its raft is running, its
+    /// build simply predates this route. Treating that as a grant is exactly
+    /// the "network has not implemented `pre_vote`" degrade the trait's default
+    /// impl provides, and it is what keeps a mixed-version cluster live: during
+    /// a roll, a new node's Pre-Vote to an old peer must not be able to strand
+    /// the cluster leaderless because the old peer has no route to answer on.
+    /// A connect failure still returns `Err`, so the isolated-node protection
+    /// is untouched.
+    ///
+    /// This is why the change needs no `cluster_protocol` bump: an old node
+    /// never sends Pre-Vote, and a new node's Pre-Vote to an old node degrades
+    /// to the pre-R734-T1 behaviour rather than failing.
+    async fn pre_vote(
+        &mut self,
+        rpc: VoteRequest<TC>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<TC>, RPCError<TC>> {
+        let candidate_vote = rpc.vote;
+        let resp = self.post("/raft/pre-vote", rpc, &option).await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(VoteResponse::new(candidate_vote, None, true));
+        }
+        self.decode("/raft/pre-vote", resp).await
     }
 
     /// Stream a full snapshot to the peer in one shot. Yubaba snapshots are
@@ -210,5 +274,133 @@ impl RaftNetworkV2<TC> for YubabaNetwork {
     ) -> Result<TransferLeaderResponse<TC>, RPCError<TC>> {
         self.request("/raft/transfer-leader-msg", req, &option)
             .await
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// R734-T1 — the three outcomes a Pre-Vote RPC can have, pinned against a real
+/// HTTP peer rather than against a mock of one.
+///
+/// The distinction being defended: openraft counts only `Ok(granted)` toward the
+/// Pre-Vote quorum, so *what we turn a failure into* decides whether Pre-Vote
+/// protects the cluster or strands it. Answering `404` (an old build) must grant;
+/// refusing to connect (a partitioned peer) must not. Getting those two the same
+/// way round is the bug this suite exists to catch, and it is invisible to a
+/// test that only checks the happy path.
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use openraft::raft::{VoteRequest, VoteResponse};
+
+    use super::*;
+
+    /// A vote at term 7 from node 2 — the hypothetical `term + 1` a
+    /// pre-candidate probes with.
+    fn candidate_vote() -> VoteOf<TC> {
+        VoteOf::<TC>::new(7, 2)
+    }
+
+    /// Serve `router` on loopback and return a [`YubabaNetwork`] pointed at it.
+    /// The server task is detached; it dies with the test runtime.
+    async fn network_against(router: Router) -> YubabaNetwork {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        YubabaNetworkFactory
+            .new_client(2, &BasicNode::new(addr.to_string()))
+            .await
+    }
+
+    /// A peer whose build predates `/raft/pre-vote` answers 404 — and that must
+    /// count as a grant, or a Pre-Vote-enabled node cannot assemble a quorum
+    /// during a rolling upgrade and the cluster stays leaderless.
+    #[tokio::test]
+    async fn a_404_from_a_pre_r734_peer_counts_as_a_grant() {
+        // Deliberately a router with no /raft/pre-vote route at all: this is the
+        // shape of an older yubaba, not a stub that returns a canned 404.
+        let mut net =
+            network_against(Router::new().route("/raft/vote", post(|| async { "" }))).await;
+
+        let resp = net
+            .pre_vote(
+                VoteRequest::new(candidate_vote(), None),
+                RPCOption::new(Duration::from_secs(5)),
+            )
+            .await
+            .expect("a 404 must not surface as a transport error");
+
+        assert!(
+            resp.is_granted_to(&candidate_vote()),
+            "a reachable peer with no pre-vote route must degrade to a grant: {resp:?}"
+        );
+    }
+
+    /// A peer that *does* implement the route and says no must be reported as a
+    /// refusal. Without this, a fallback written slightly too broadly (catching
+    /// every non-2xx, say) would turn every honest refusal into a grant and
+    /// silently disable Pre-Vote across the whole cluster.
+    #[tokio::test]
+    async fn a_real_refusal_survives_the_404_fallback() {
+        let router = Router::new().route(
+            "/raft/pre-vote",
+            post(|Json(req): Json<VoteRequest<TC>>| async move {
+                Json(Ok::<_, RaftError<TC>>(VoteResponse::<TC>::new(
+                    req.vote, None, false,
+                )))
+            }),
+        );
+        let mut net = network_against(router).await;
+
+        let resp = net
+            .pre_vote(
+                VoteRequest::new(candidate_vote(), None),
+                RPCOption::new(Duration::from_secs(5)),
+            )
+            .await
+            .expect("a served refusal is a successful RPC");
+
+        assert!(
+            !resp.vote_granted,
+            "a peer that refuses must be reported as refusing, not rewritten into a grant: \
+             {resp:?}"
+        );
+    }
+
+    /// An unreachable peer must be an `Err`, never a grant. This is the
+    /// protection openraft's own docs call out: a fully isolated node that
+    /// synthesized grants from its dead peers would assemble a quorum of one,
+    /// campaign, and inflate the term — defeating the entire feature.
+    #[tokio::test]
+    async fn an_unreachable_peer_is_an_error_not_a_grant() {
+        // Bind then drop, so the port is one nothing is listening on.
+        let addr = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback");
+            listener.local_addr().expect("local addr")
+        };
+        let mut net = YubabaNetworkFactory
+            .new_client(2, &BasicNode::new(addr.to_string()))
+            .await;
+
+        let res = net
+            .pre_vote(
+                VoteRequest::new(candidate_vote(), None),
+                RPCOption::new(Duration::from_secs(2)),
+            )
+            .await;
+
+        assert!(
+            res.is_err(),
+            "an unreachable peer must not be counted as granting a pre-vote: {res:?}"
+        );
     }
 }

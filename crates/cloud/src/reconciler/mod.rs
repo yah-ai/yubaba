@@ -90,6 +90,7 @@ pub mod mesofact_static;
 mod native_support;
 pub mod pg_driver;
 pub mod pond;
+pub mod pond_door;
 pub mod pond_publish;
 pub mod publish_beacon;
 pub mod r2_publish;
@@ -109,8 +110,9 @@ pub use derive_cache_prune::{
 };
 pub use domain::ensure_r2_custom_domain;
 pub use ingress::{
-    declared as ingress_declared, ensure_tunnel_ingress, plan_ingress, publish_tunnel_ingress,
-    IngressPlan, IngressRule, TunnelIngressOutcome,
+    collate_front_doors, declared as ingress_declared, ensure_tunnel_ingress, plan_ingress,
+    publish_tunnel_ingress, resolve_ingress_placements, Collation, IngressPlan, IngressRule,
+    NodeFrontDoor, PlannedEdge, TunnelIngressOutcome,
 };
 pub use local_process::LocalProcessReconciler;
 pub use mesofact_bundle::{
@@ -119,6 +121,11 @@ pub use mesofact_bundle::{
 };
 pub use mesofact_static::{LocalStaticOptions, MesofactStaticReconciler};
 pub use pond::{PondOptions, PondState};
+pub use pond_door::{
+    door_env, door_state_dir, ensure_pond_cert, ensure_pond_cert_as, is_root, plan_pond_door,
+    pond_hostname, resolve_passway_binary, spawn_pond_door, CertPair, PondDoorPlan,
+    DEFAULT_DOOR_PORT, POND_TLD,
+};
 pub use pond_publish::{derive_minio_key, publish_to_pond, PondPublishReport};
 pub use r2_publish::{
     publish_to_r2, R2PublishReport, R2PurgeOpts, R2_ACCESS_KEY_ENV, R2_ACCESS_KEY_SLOT,
@@ -177,6 +184,38 @@ impl LogBuffer {
         let skip = since.saturating_sub(oldest);
         let new_lines: Vec<String> = ring.lines.iter().skip(skip).cloned().collect();
         (new_lines, ring.total)
+    }
+
+    /// Current write cursor — the `total` [`Self::since`] would hand back
+    /// right now if nothing more were pushed. Lets a producer mark a boundary
+    /// (e.g. "everything before this point was the build phase") for a later
+    /// reader to seek past without re-reading lines it doesn't want.
+    pub async fn cursor(&self) -> usize {
+        self.0.lock().await.total
+    }
+}
+
+/// Shared cell for one phase-boundary cursor a reconciler can publish
+/// mid-`up()`, so a poller sees a multi-phase bring-up's internal transition
+/// (e.g. build → run) before the whole call returns — the same problem
+/// [`LogBuffer`] solves for output, for a single position instead of a ring.
+/// `None` until the reconciler reaches that phase; a caller registers one
+/// before calling `up()` to observe it live, same pattern as
+/// [`LogBuffer::clone`]-and-hand-in.
+#[derive(Debug, Clone, Default)]
+pub struct PhaseCursor(Arc<AsyncMutex<Option<usize>>>);
+
+impl PhaseCursor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn set(&self, cursor: usize) {
+        *self.0.lock().await = Some(cursor);
+    }
+
+    pub async fn get(&self) -> Option<usize> {
+        *self.0.lock().await
     }
 }
 
@@ -295,8 +334,34 @@ impl<'a> ReconcileCtx<'a> {
     }
 
     /// Look up a provider slot by role (e.g. `"static"`, `"compute"`).
+    ///
+    /// Tries the component-qualified key first (`"<role>:<component id>"`)
+    /// before falling back to the bare role. A mirror role is normally
+    /// service-wide — one `providers.static` slot serves every static-kind
+    /// component — but a service can declare more than one component with
+    /// the same role (e.g. two `mesofact-static`/`mesofact-spa` components
+    /// sharing one mirror), and those need distinct ports to ever both come
+    /// up. The qualified key is how a mirror opts a specific component out
+    /// of sharing the bare-role slot:
+    ///
+    /// ```toml
+    /// [providers."static:site"]
+    /// kind = "local-static"
+    /// port = 4331
+    ///
+    /// [providers."static:app"]
+    /// kind = "local-static"
+    /// port = 4332
+    /// ```
+    ///
+    /// A mirror with only the bare role (the common, single-component case)
+    /// is unaffected — the qualified lookup misses and falls through.
     pub fn slot(&self, role: &str) -> Option<&'a MirrorProviderSlot> {
-        self.mirror.providers.get(role)
+        let qualified = format!("{role}:{}", self.component.id);
+        self.mirror
+            .providers
+            .get(qualified.as_str())
+            .or_else(|| self.mirror.providers.get(role))
     }
 }
 
@@ -375,6 +440,24 @@ pub struct RunningWorkload {
     /// the app must not `docker rm -f` it; but the ■ button IS an explicit
     /// stop, and must.
     teardown: Option<Teardown>,
+
+    /// R715-F4: where to ask this workload for a live status document, when
+    /// it declared a process-control channel (W315). `None` for a workload
+    /// with no channel — polling is then simply skipped, not an error.
+    ///
+    /// The desktop holds `RunningWorkload` in-process (it links this crate
+    /// directly, unlike the ad-hoc `run.spawn` path which lives behind the
+    /// camp daemon's socket), so a live poll is [`crate::proc_control::fetch_status`]
+    /// called straight against this endpoint — no RPC hop, no handle registry.
+    control: Option<crate::proc_control::ControlEndpoint>,
+
+    /// [`LogBuffer`] cursor marking the end of the build phase, for a
+    /// component that was compiled before being spawned (`local-process`
+    /// with `cargo_package` set). Lines before this index in `log_buffer` are
+    /// `cargo build` output; lines at or after are the spawned process's own
+    /// stdout/stderr. `None` when nothing was built (no `cargo_package`, or a
+    /// reconciler that predates this field).
+    pub build_log_end: Option<usize>,
 }
 
 impl RunningWorkload {
@@ -397,6 +480,8 @@ impl RunningWorkload {
             shutdown: None,
             supervisor: None,
             teardown: None,
+            control: None,
+            build_log_end: None,
         }
     }
 
@@ -422,6 +507,47 @@ impl RunningWorkload {
     /// Attach per-run operator-facing lines (R546-B12). See [`Self::notes`].
     pub fn with_notes(mut self, notes: Vec<String>) -> Self {
         self.notes = notes;
+        self
+    }
+
+    /// Record where to poll this workload's process-control channel, when it
+    /// declared one (R715-F4). A no-op (leaves `control: None`) when the
+    /// argument is `None` — callers can pass the reconciler's resolved
+    /// endpoint straight through without an `if let`.
+    pub fn with_control(mut self, control: Option<crate::proc_control::ControlEndpoint>) -> Self {
+        self.control = control;
+        self
+    }
+
+    /// Ask this workload's process-control channel for a live status
+    /// document (R715-F4). `None` when no channel was declared, or when the
+    /// endpoint didn't answer — both are "nothing new to show", not errors;
+    /// see [`crate::proc_control::fetch_status`] for why a poll failure isn't
+    /// itself meaningful.
+    pub async fn poll_control(&self) -> Option<crate::proc_control::ProcStatus> {
+        let endpoint = self.control.as_ref()?;
+        crate::proc_control::fetch_status(endpoint).await.ok()
+    }
+
+    /// Whether the supervisor task that owns this workload's child process is
+    /// still running. `spawn_native_log_supervisor` (native_support.rs) exits
+    /// as soon as `NativeRuntime::get_workload` reports a terminal state —
+    /// which itself comes from a real `child.wait()` in kamaji's native
+    /// backend, so this catches a crash (segfault, panic, `SIGKILL`) the same
+    /// way it catches a clean exit, not just an unresponsive process.
+    ///
+    /// A workload with no supervisor (`RunningWorkload::adopted` — runs
+    /// outside this process, e.g. a pond container camp re-asserts) has
+    /// nothing to check here and reports alive unconditionally; its liveness
+    /// is whatever tracks it, not this handle.
+    pub fn is_alive(&self) -> bool {
+        self.supervisor.as_ref().is_none_or(|h| !h.is_finished())
+    }
+
+    /// Record where the build phase ends in `log_buffer`, for a component
+    /// that was compiled before being spawned. See [`Self::build_log_end`].
+    pub fn with_build_log_end(mut self, cursor: Option<usize>) -> Self {
+        self.build_log_end = cursor;
         self
     }
 
@@ -596,6 +722,8 @@ pub(crate) fn into_running(
         shutdown: Some(shutdown),
         supervisor: Some(supervisor),
         teardown: None,
+        control: None,
+        build_log_end: None,
     }
 }
 
@@ -644,6 +772,19 @@ pub struct RunningWorkloadSummary {
     pub dev_url: Option<String>,
     pub public_url: Option<String>,
     pub console_url: Option<String>,
+    /// Operator-facing lines from [`RunningWorkload::notes`] (R546-B12).
+    ///
+    /// These used to stop here — the summary dropped them, so every note a
+    /// reconciler attached was written into a struct nobody read. They matter
+    /// most for a workload with no `dev_url` to click (R715-T2): the notes are
+    /// then the only structured thing the Run tab has to show about it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    /// See [`RunningWorkload::build_log_end`]. Lets a log-tail consumer skip
+    /// straight to run-phase output, or show everything from 0 when the
+    /// operator wants the build log too (e.g. after a compile failure).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_log_end: Option<usize>,
 }
 
 impl From<&RunningWorkload> for RunningWorkloadSummary {
@@ -654,6 +795,8 @@ impl From<&RunningWorkload> for RunningWorkloadSummary {
             dev_url: r.dev_url.clone(),
             public_url: r.public_url.clone(),
             console_url: r.console_url.clone(),
+            notes: r.notes.clone(),
+            build_log_end: r.build_log_end,
         }
     }
 }
@@ -666,6 +809,7 @@ mod source_seam_tests {
 
     fn component(git: Option<GitSource>) -> ServiceComponent {
         ServiceComponent {
+            mount: None,
             id: "site".into(),
             kind: "mesofact-static".into(),
             path: "site".into(),
@@ -692,6 +836,7 @@ mod source_seam_tests {
             shape: crate::MirrorShape::Local,
             providers: BTreeMap::new(),
             ingress: Default::default(),
+            ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: BTreeMap::new(),
         }

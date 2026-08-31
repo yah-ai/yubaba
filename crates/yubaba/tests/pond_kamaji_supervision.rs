@@ -21,7 +21,8 @@
 //! stays green on a machine without one.
 //!
 //! ```bash
-//! cargo test -p yubaba --features docker-integration --test pond_kamaji_supervision -- --nocapture
+//! cargo test -p yubaba --features docker-integration --test main \
+//!     -- pond_kamaji_supervision:: --nocapture
 //! ```
 //!
 //! Part of R626-F2 — the ticket annotation lives in

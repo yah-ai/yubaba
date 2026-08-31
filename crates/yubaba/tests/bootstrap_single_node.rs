@@ -5,7 +5,7 @@
 //! `src/lib.rs`. This suite is the ticket's verify target:
 //!
 //! ```bash
-//! cargo test -p yubaba --test bootstrap_single_node
+//! cargo test -p yubaba --test main -- bootstrap_single_node::
 //! ```
 //!
 //! It exercises [`yubaba::raft::bootstrap_single_node`] directly (no HTTP, no

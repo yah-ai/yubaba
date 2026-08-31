@@ -150,6 +150,7 @@ async fn pond_spinup_budget() {
         .find(|c| c.kind == "mesofact-static")
         .cloned()
         .unwrap_or_else(|| ServiceComponent {
+            mount: None,
             id: "site".into(),
             kind: "mesofact-static".into(),
             path: "app/yah/web/marketing".into(),

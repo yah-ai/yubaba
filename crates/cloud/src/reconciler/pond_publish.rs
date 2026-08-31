@@ -58,7 +58,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 
-use local_driver::s3_sign::sign_s3_put_object;
+use local_driver::s3_sign::{sign_s3_put_object, uri_encode_key};
 
 /// S3 region MinIO uses regardless of actual location (AWS SigV4 requirement).
 const MINIO_REGION: &str = "us-east-1";
@@ -114,7 +114,9 @@ pub async fn publish_to_pond(
         let content_type = content_type_for(&entry);
         let content_length = body.len();
 
-        let url = format!("{endpoint}/{bucket}/{key}");
+        // R630-B1: encode at URL-construction time so the wire path and the
+        // SigV4 canonical path are the same bytes.
+        let url = format!("{endpoint}/{bucket}/{}", uri_encode_key(&key));
         let headers = sign_s3_put_object(
             &url,
             &body_hash,

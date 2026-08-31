@@ -818,8 +818,9 @@ component = "yah-marketing/site"
         );
         BundleManifest {
             schema_version: yah_mesofact_bundle::SCHEMA_VERSION,
+            requires_contract: yah_mesofact_bundle::BUNDLE_CONTRACT_VERSION,
             name: "yah-marketing".to_string(),
-            runtime: yah_mesofact_bundle::BundleRuntime::SelfContained,
+            runtime: yah_mesofact_bundle::BundleRuntime::self_contained(),
             content,
         }
     }

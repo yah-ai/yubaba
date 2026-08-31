@@ -292,6 +292,8 @@ mod tests {
             connect: None,
             allocatable: None,
             taints: vec![],
+            sovereign_group: None,
+            sovereign_role: None,
         }
     }
 

@@ -9,7 +9,7 @@
 //! ```bash
 //! # Local tier — requires a running containerd socket (Colima on macOS):
 //! cargo test -p yubaba --features containerd-integration \
-//!     --test integration_single_node
+//!     --test containerd -- integration_single_node::
 //!
 //! # Smoke tier — provisions a real Hetzner CPX-11 (est. $0.05):
 //! YAH_SMOKE=1 \
@@ -17,7 +17,7 @@
 //! YAH_WARDEN_URL=https://... \
 //! YAH_WARDEN_SHA256=<sha256> \
 //! cargo test -p yubaba --features containerd-integration \
-//!     --test integration_single_node -- --ignored
+//!     --test containerd -- integration_single_node:: --ignored
 //! ```
 //!
 //! The `__local` variant skips gracefully when neither containerd nor Colima

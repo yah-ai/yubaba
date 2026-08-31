@@ -79,13 +79,51 @@
 //! @yah:handoff("Verified pre-existing work: overlay landed in CloudConfig::load (oss/yubaba/crates/cloud/src/config.rs) at tree anchor 871fde1c -- SourcesConfig::load resolves sources, overlay_infra_sources() merges under camp-local with camp-local-wins and earlier-source-wins collision rules, machine_origins/provider_origins BTreeMaps added to CloudConfig, load_dir_tolerant() added for per-file-tolerant foreign schema skew, InfraSource::infra_root() resolves path/git kinds, load_from_config_dir explicitly does NOT get the overlay (documented). Matches this ticket's own inline @yah:handoff notes. This session added no new code -- only ran verification and closed board state that a prior session left stuck in `open` despite the work being done.")
 //! @yah:verify("cargo check -p yah-cloud -- clean (2 pre-existing unrelated warnings)")
 //! @yah:verify("cargo test -p yah-cloud --lib -- 723 passed; 0 failed; 4 ignored (from oss/yubaba), includes overlay tests + load_dir_tolerant test + infra_source_cache_dir test in paths.rs")
+//!
+//! @yah:ticket(R605-F12, "Sovereign groups have no voting axis, so non-voting membership is inexpressible and the raft guard is enforced by an absent field")
+//! @yah:status(review)
+//! @yah:at(2026-08-20T05:15:30Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R605)
+//! @arch:see(.yah/docs/working/W325-isolated-x86-build-capacity.md)
+//! @yah:next("OPERATOR INTENT (2026-08-19) that the model cannot currently record: us-west-003 is a NON-VOTING member of the us-west-001-based (prod) sovereign group, and us-west-011 is a DIFFERENT sovereign (dev) from 001/003. The dev/prod split is already declared correctly. The non-voting membership is not — us-west-003.toml declares no sovereign_group at all.")
+//! @yah:next("THE GAP: MachineConfig::sovereign_group is a single Option<String>, so membership is binary, and judge_join (oss/yubaba/crates/cloud/src/config.rs:459) permits a join IFF both sides declare the same non-None group. There is no way to say 'in this blast radius, but not quorum-eligible'.")
+//! @yah:next("WHY THAT IS ACTIVELY BAD, not just missing: today the ONLY thing refusing us-west-003 into the prod raft at the join gate is its ABSENT stamp. Its own file is emphatic it must never hold a raft node id ('a home-internet partition should never be able to stall the raft'), and that guarantee currently rests on a field nobody wrote. Stamping it prod to record the operator's real intent would REMOVE the guard. This is precisely the W305 failure mode that produced R742-T4: `no-voter` sat inert on three nodes asserting something nothing enforced.")
+//! @yah:next("PROPOSED SHAPE (recommended): a second axis, e.g. sovereign_role = voter | non-voter (default voter for back-compat, or make it required), with judge_join permitting a same-group join only for voters. Then us-west-003 stamps prod + non-voter, the intent is machine-readable, and the raft guard stops depending on omission. us-west-004 (R605-T7) would take the same shape.")
+//! @yah:next("TOUCHES TWO COPIES OF THE PREDICATE, do not fix only one: cloud::judge_join renders the camp-side refusal, but the predicate itself lives in workload_spec::sovereign::join_permitted because yubaba's POST /raft/add-learner gate asks the same question and there is deliberately no yubaba -> cloud edge. Also re-read `yubaba serve --sovereign-group`, whose node-side gate is narrower on purpose (an unset flag means 'declared nothing', not 'declared standalone').")
+//! @yah:gotcha("THE CODE AND THE OPERATOR CURRENTLY DISAGREE ABOUT 003, and a reader should know which is which before editing. judge_join's own doc comment asserts 'prod and dev are both stamped, and us-west-002/003/015 are deliberately not raft members' — i.e. R742-F1 modelled 003 as STANDALONE. The operator's model is that it is a NON-VOTING MEMBER of prod. Those are different claims, not a wording difference: standalone means no blast-radius relationship to 001 at all. Do not silently 'correct' either side; this ticket is the reconciliation.")
+//! @yah:gotcha("FLEET STATE AS DECLARED (2026-08-19): prod = us-west-001, us-south-001, us-east-001. dev = us-west-011, us-west-013, us-west-014. NO sovereign_group declared = us-west-002, us-west-003, us-west-015. Verify against the files rather than trusting this list — xtask/tests/fleet_sovereign_groups.rs pins the roster and will need updating in the same change (it also asserts the stamp parses as a TOP-LEVEL key, which matters because 003 has a long comment block before [allocatable] where a stamp would silently become a member of that table).")
+//! @yah:gotcha("SEPARATE AXIS, DO NOT ENTANGLE: mesh membership is not sovereign membership. The standing rule is ONE mesh for the entire fleet regardless of group (operator, 2026-08-19), so us-west-003 and us-west-011 enrolling in headscale is unrelated work with no design question in it — see R605-T10. A voting axis on sovereign_group must not become a reason to keep any node off the mesh.")
+//! @yah:gotcha("SHARED-TREE COLLISION, live 2026-08-20: R772 (Miravel:spade, session:ce6d74a9) is refactoring oss/yubaba/crates/cloud/src/validate.rs at the same time and the file is currently RED - error[E0425] cannot find function load_machines at validate.rs:753, a half-landed extraction of the machine-loading walk that check_inert_taints / check_retired_arch_tags / the new check_unroled_sovereign_members all duplicate. That error is NOT from this ticket. Told them by party.chat and asked them to absorb check_unroled_sovereign_members into load_machines rather than leave one holdout. Do not hand-fight the file.")
+//! @yah:gotcha("R772 ALSO BROKE THREE PRE-EXISTING INGRESS TESTS, again not this ticket: two_services_fronting_one_node_collate_into_one_front_door, a_cross_service_hostname_clash_is_reported_with_both_declarations, one_mirrors_broken_declaration_does_not_hide_the_rest - all failing with 'providers.compute.use = hetzner - no such provider'. Cause is their new CloudConfig::load(workspace_root) at validate.rs:750 inside collate_workspace_ingress; the fronted_mirror fixture declares the slot but never writes infra/providers/hetzner.toml, and CloudConfig::load runs cross_ref_validate. Left alone deliberately - peer-owned.")
+//! @yah:gotcha("TRAP THAT MADE THREE OF MY OWN TESTS PASS FOR THE WRONG REASON: the machine-lint sweeps SKIP unparseable TOMLs by design (a peer's half-written scaffold must not sink the sweep). So a test fixture missing a REQUIRED MachineConfig field - mesh_tags is the one that bites - is silently skipped, the lint finds nothing, and every assert-empty test passes vacuously. Only the one test asserting found.len() == 1 noticed. write_sovereign_machine now always writes mesh_tags = [] and carries a comment saying why. Check this before trusting any new test in cloud::validate.")
+//! @yah:verify("cargo test -p yah-workload-spec --lib sovereign (from oss/yah-base) -- 9 passed, 0 failed. Covers both new refusals (a_non_voting_member_does_not_join_its_own_group, a_non_voting_target_has_no_quorum_to_join), the back-compat pin (the_default_role_is_the_pre_r605_f12_meaning), and the one-spelling round-trip across TOML/CLI/JSON.")
+//! @yah:verify("cargo test -p yubaba --lib sovereign (from oss/yubaba) -- 13 passed, 0 failed. Includes a_non_voting_joiner_is_refused_by_role_not_by_group, a_non_voting_target_refuses_every_joiner, a_group_without_a_role_key_is_a_voter_not_a_refusal (the deployed-fleet back-compat seam), a_peer_reports_its_role_in_the_toml_spelling.")
+//! @yah:verify("cargo test -p yubaba --test raft_sovereign_group (from oss/yubaba) -- 11 passed, 0 failed, up from 8. Three new end-to-end against real single-node rafts: a_non_voting_member_of_the_same_group_is_refused, a_non_voting_leader_refuses_to_grow_its_quorum, a_node_publishes_its_role_and_the_leader_reads_it_there (which also proves the request body cannot vote a non-voter in - the leader dials the joiner).")
+//! @yah:verify("cargo test -p xtask --test fleet_sovereign_groups (from repo root) -- 2 passed, 0 failed. THE DECISIVE ONE: parses the real .yah/infra/machines/*.toml through the actual MachineConfig deserializer. Confirms us-west-003 = prod + non-voter on disk, all six pre-existing voters now stamped sovereign_role = voter explicitly, and neither key swallowed by a table header.")
+//! @yah:verify("cargo test -p yah-cloud --lib (from oss/yubaba) -- 891 passed, 3 failed, where all 3 failures were R772's ingress-collate tests and none were mine. A clean re-run is BLOCKED, not failing: R555's in-flight AdmissionGrant.secrets field breaks velveteen-exec, and yah-cloud is not a root workspace member so its dev-deps can only resolve from the oss/yubaba workspace. Re-run once R555 lands.")
+//! @yah:handoff("LANDED, operator chose the second-axis shape (Call 1 = A, 2026-08-20). sovereign_role = voter | non-voter now sits beside sovereign_group, and ONE predicate judges both: workload_spec::sovereign::join_permitted(Membership, Membership) where Membership { group: Option<&str>, role: SovereignRole }. Permitted iff same non-None group AND both sides Voter. Both copies of the predicate call it - cloud::judge_join (camp-side) and yubaba::sovereign_group::judge (node-side) - so the rule itself cannot drift; only the prose differs, which was already the R742-F1 split.")
+//! @yah:handoff("WHY THE ROLE IS CHECKED ON BOTH SIDES, since only the joiner half was asked for: a join grows a quorum and it takes two nodes. Refusing a non-voting JOINER is the us-west-003 case. Refusing a non-voting TARGET is the same assertion read from the other end - a box declared non-voting that is serving add-learner is already holding a raft seat its own declaration forbids, and permitting there would paper over the contradiction. Both refusals name the role rather than the group when the groups match, because a message reading 'cross-group join refused: prod and prod' reads as a bug in the check.")
+//! @yah:handoff("THE DEFAULT IS THE LOAD-BEARING DECISION AND IT IS DELIBERATELY PERMISSIVE. An absent sovereign_role resolves to Voter (MachineConfig::sovereign_membership, the ONE place the Option is resolved). Reason: before this field, declaring a group WAS declaring quorum eligibility, so absence has to keep meaning that or the change silently retires six live voters. The permissiveness is bounded at the other end by cloud::validate::check_unroled_sovereign_members, which makes `yah cloud validate` FAIL on a group stamp with no role beside it - so the default can be reached by choice but not by silence. MachineConfig::sovereign_role stays Option<SovereignRole> (not a defaulted plain field) precisely so that lint can tell 'chose voter' from 'never considered it'.")
+//! @yah:handoff("NODE-SIDE BACK-COMPAT SEAM, pinned by a test because it is a decision and not an oversight: a peer answering GET /raft/status with a sovereign_group but NO sovereign_role key - every yubaba built between R742-F1 and R605-F12, which today is the entire prod raft - is read as Voter, not refused. Refusing would freeze a stamped cluster's growth until every member was rolled, strictly worse than what the role guards against, and it is the same degrade-toward-prior-behaviour stance the module already took for the group. Residue, named rather than hidden in read_group's doc: a box whose machine.toml says non-voter but whose daemon predates the flag answers 'voter' and the node gate admits it. judge_join refuses it camp-side, which is where operator-driven joins go. Window closes per-group as its nodes carry the flag.")
+//! @yah:handoff("FILES: workload-spec/src/sovereign.rs (SovereignRole + Membership + role-aware join_permitted, +227). cloud/src/config.rs (sovereign_role field, sovereign_membership(), judge_join same-group role branch, SovereignRole re-exported from cloud::config). cloud/src/validate.rs (check_unroled_sovereign_members + UnroledSovereignMember). app/yah/cli/src/cloud.rs (lint wired: ERROR in `yah cloud validate`, WARNING in the apply preflight - same split as inert-taint/retired-arch-tag, because an unwritten role changes no placement decision and the machine may be declared in a tree this camp does not own). yubaba/src/{sovereign_group,lib,main}.rs (--sovereign-role flag, ServerState.sovereign_role, /raft/status publishes it always-never-null, gate both directions). yubaba-test-harness/src/solo_node.rs (solo_node_with_sovereign_role). .yah/infra/machines/*.toml (7 files). xtask/tests/fleet_sovereign_groups.rs + fleet_build_placement.rs. W325 section 3d.")
+//! @yah:handoff("ONE BEHAVIOUR CHANGE WORTH A SECOND OPINION: a node started with --sovereign-role non-voter AND a --raft-node-id now refuses EVERY add-learner. I judged that correct - it is a contradiction the operator should see loudly - but the symptom is 'joins mysteriously stop working' rather than a startup refusal. main.rs warns loudly at boot when that pair is present; I did NOT make it fatal, because refusing to start could brick a node mid-roll. Reconsider if it bites.")
+//! @yah:handoff("NOT DONE, and it is a HARD GATE: .yah/schema/machine.toml.schema.json has NOT been regenerated, so sovereign_role is absent from it and schema-drift-guard (scripts/check-schema-drift.sh, a step in .yah/qed/check.toml, run by CI on every push) WILL FAIL. Fix is `cargo run -p xtask -- emit-schemas` from the repo root - it was queued behind ~7 concurrent peer cargo builds for the whole session. Nothing else is required to make this pushable.")
+//! @yah:handoff("ALSO NOT RE-CONFIRMED: `cargo test -p yah-cloud --lib` needs a clean run. Its last real run was 891 passed / 3 failed with all three failures belonging to R772's ingress-collate work and none to this ticket. The re-run is BLOCKED not failing - R555's in-flight AdmissionGrant.secrets field breaks velveteen-exec, and yah-cloud is not a root workspace member so its dev-deps only resolve from the oss/yubaba workspace where that break lives. Re-run from oss/yubaba once R555 lands.")
+//! @yah:verify("cargo run -p xtask -- emit-schemas (from repo root) -- wrote 8 files, exit 0 after an 18m24s build queued behind ~7 concurrent peer cargo jobs. .yah/schema/machine.toml.schema.json now carries the sovereign_role property (anyOf SovereignRole | null, with the full doc comment) and the SovereignRole definition as a oneOf over the two string enums voter / non-voter. The schema-drift-guard gate for THIS ticket is closed.")
+//! @yah:gotcha("emit-schemas IS ALL-OR-NOTHING AND WILL PICK UP A PEER'S UNCOMMITTED WORK. Running it to close this ticket's machine-schema drift also regenerated .yah/schema/secret.toml.schema.json (+34) from R555-F5's in-flight SecretAccess::Recipes / RecipeMatch source. That output is CORRECT for the tree as it stands and was not hand-edited, but it means the schema diff in the working tree is not purely R605-F12's: machine.toml.schema.json (+32) is this ticket, secret.toml.schema.json (+34) is R555. Told Ashguard:spade by party.chat so they carry it with their commit rather than regenerating on top. Anyone splitting these commits needs to split the schema diff too.")
+//! @yah:handoff("ALL GATES CLOSED as of 2026-08-20. Both items listed as outstanding in the earlier handoff notes are done: emit-schemas ran (machine.toml.schema.json carries sovereign_role + the SovereignRole voter/non-voter enum, drift guard satisfied), and cargo test -p yah-cloud --lib is 896 passed / 0 failed once R555 and R772 settled. 45 tests green across workload-spec (9), yubaba lib (13), yubaba raft integration (11), yah-cloud lib (10 of this ticket's, within 896), xtask fleet (2). Ready for review. NOTE for whoever commits: the working tree's schema diff is not purely this ticket - .yah/schema/machine.toml.schema.json (+32) is R605-F12, .yah/schema/secret.toml.schema.json (+34) is R555-F5, both correct generated output from one emit-schemas run. Ashguard:spade has agreed to carry theirs.")
+//! @yah:verify("cargo test -p yah-cloud --lib (from oss/yubaba) -- 896 passed, 0 FAILED, 4 ignored. The blocked check from earlier is now clean: R555 landed the velveteen-exec and TransformRecipe.secrets fixes, R772's ingress-collate work settled (they replaced the CloudConfig::load in collate_workspace_ingress with a narrower machines-only loader, so cross_ref_validate can no longer fail the collate over an unrelated provider typo). All 45 R605-F12 tests across the four crates are green simultaneously on one tree.")
+//! @yah:verify("Confirmed by NAME rather than by total, since a passing count proves nothing about which tests ran: cargo test -p yah-cloud --lib -- role voter voting lists all ten of this ticket's cloud tests green - a_non_voting_member_is_refused_into_its_own_group, a_non_voting_target_has_no_quorum_to_grow, a_refusal_names_the_group_when_fixing_the_role_would_not_help, an_unwritten_role_still_joins_its_group, a_non_voter_is_still_in_the_group_it_names, sovereign_role_round_trips_and_is_omitted_when_unwritten, a_group_with_no_role_is_reported_with_the_declaring_file, either_stated_role_is_clean, a_machine_in_no_group_is_not_asked_for_a_role, unroled_findings_are_ordered_by_file_so_output_is_stable.")
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use thiserror::Error;
 use workload_spec::secrets::SecretAccess;
+use workload_spec::sovereign::Membership;
+pub use workload_spec::sovereign::SovereignRole;
 use workload_spec::{validate, LifecycleArchetype, TenantId, WorkloadSpec};
 
 /// Static node capacity declaration on `machine.toml` (R572-F3).
@@ -275,13 +313,87 @@ pub struct MachineConfig {
     /// to check whether a new workload fits. Absent means unconstrained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocatable: Option<NodeAllocatable>,
-    /// Repel-unless-tolerate taint keys (R572-F3). A workload must tolerate
-    /// every taint on a candidate node for the scheduler to place it there.
-    /// Examples: `"no-appliance"` prevents Appliance workloads; `"no-voter"`
-    /// prevents a node from joining quorum; `"public-ip"` is a positive
-    /// requirement marker the ingress appliance (W267) demands.
+    /// Placement taint keys (R572-F3). **There is no toleration** — a
+    /// `no-<archetype>` taint is an absolute block, not a preference
+    /// (W305/R742-T4; the pre-2026-08-11 "repel-unless-tolerate" wording here
+    /// described an `unless` that was never built).
+    ///
+    /// A key in this list influences placement in exactly one of two ways, and
+    /// [`taint_effect`] is the authority on which:
+    ///
+    /// - **repulsion** — `"no-server"` / `"no-appliance"` / `"no-job"` reject
+    ///   workloads of that [`LifecycleArchetype`] outright;
+    /// - **affinity** — a key in [`AFFINITY_TAINT_KEYS`] (today just
+    ///   `"public-ip"`) that a workload names in
+    ///   `yah.placement.requires-taint`, which then *requires* this node.
+    ///
+    /// Anything else is **inert**: it parses, it round-trips, and no scheduler
+    /// decision can ever read it. `yah cloud validate` rejects such keys
+    /// (`validate::check_inert_taints`) rather than letting them sit looking
+    /// load-bearing — which is how `no-voter` spent months asserting a
+    /// falsehood on three nodes. Facts about a node that are not placement
+    /// inputs belong in [`mesh_tags`](Self::mesh_tags) or a comment.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub taints: Vec<String>,
+    /// Which consensus group this node belongs to — W305/R742-F1. `None` means
+    /// standalone: in no group at all, which is us-west-002 and us-west-015.
+    ///
+    /// Membership is not by itself quorum eligibility; that is
+    /// [`sovereign_role`](Self::sovereign_role), added by R605-F12 because
+    /// us-west-003 is in prod's blast radius *and* must never vote in it.
+    ///
+    /// **Not a placement input.** It is deliberately absent from
+    /// [`RequiredSpec::matches`], and adding it there would be a category
+    /// error: a sovereign group is a *blast radius*, not a filter. Nothing
+    /// about "which quorum does this box vote in" should decide where a
+    /// workload runs — that is what made the fleet express three unrelated
+    /// properties through one taint list and get all three wrong (W305).
+    ///
+    /// What it *is* for is refusal. [`judge_join`] answers "may this node join
+    /// that node's cluster", and the answer is no unless both declare the same
+    /// group. Before this field the only guard was a comment in three machine
+    /// TOMLs saying "never run a raft join against this box from a shell
+    /// pointed at prod" — habit, with no mechanism behind it, which is the
+    /// same class of guard W257 §8 admitted to.
+    ///
+    /// # Why `sovereign_group` and not `raft_group`
+    ///
+    /// Raft is today's mechanism (operator, 2026-08-10). A field named for the
+    /// mechanism goes stale the day the mechanism is swapped, and every
+    /// consumer that reads it inherits the lie. `sovereign` names what the
+    /// group *has* — its own authority, its own upgrade cadence, its own
+    /// destruction — which stays true under any consensus protocol.
+    ///
+    /// Note the word already appears in this tree as prose (W267's title, the
+    /// `IngressProvider::Passway` doc comment's "sovereign edge"). That is an
+    /// adjective meaning "self-hosted, not SaaS"; this is the first time it
+    /// carries structure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sovereign_group: Option<String>,
+    /// Whether this node may hold a seat in its group's quorum — R605-F12.
+    /// Meaningless without [`sovereign_group`](Self::sovereign_group): a
+    /// standalone box has no quorum to be eligible for.
+    ///
+    /// **`None` is "not written", not a third role.** Read it through
+    /// [`sovereign_membership`](Self::sovereign_membership), which resolves the
+    /// absence to [`SovereignRole::Voter`] — what declaring a group has always
+    /// meant, so the six nodes stamped before this field keep their seats
+    /// without an edit. The distinction is kept only so
+    /// [`crate::validate::check_unroled_sovereign_members`] can tell an
+    /// operator who *chose* voter from one who never considered the question;
+    /// no join decision reads the `Option` directly.
+    ///
+    /// # Why this is not a taint
+    ///
+    /// It was, once: `no-voter` sat in [`taints`](Self::taints) on three nodes
+    /// for months, read by nothing, and R742-T4 removed it because the taint
+    /// list is a *placement* vocabulary and this is not a placement input (see
+    /// [`taint_effect`]). Nor is it a second group label. It is a modifier on
+    /// the membership this node already declares, which is why it lives beside
+    /// the group and is judged with it in one predicate,
+    /// [`workload_spec::sovereign::join_permitted`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sovereign_role: Option<SovereignRole>,
     /// `[registration]` — the observed half (R707-T1). Empty until the box has
     /// been attached / mesh-joined. See [`MachineRegistration`].
     #[serde(default, skip_serializing_if = "MachineRegistration::is_empty")]
@@ -297,7 +409,252 @@ pub fn provider_has_machine_driver(provider: &str) -> bool {
     matches!(provider, "hetzner" | "vultr" | "digitalocean")
 }
 
+/// Taint keys a workload may name in `yah.placement.requires-taint` to
+/// *require* a node (W305/R742-T4 affinity vocabulary).
+///
+/// This is a closed list on purpose. `WorkloadSpec::requires_taint` returns
+/// free text, but every producer in the tree is code — `passway_ingress.rs`
+/// and `cloudflared_ingress.rs`, both emitting
+/// [`workload_spec::PUBLIC_IP_TAINT`] — and no on-disk `workload.toml` sets the
+/// annotation at all. So the set of keys a node can usefully carry for
+/// affinity is knowable at compile time, which is what lets
+/// [`taint_effect`] call anything outside it inert instead of guessing.
+///
+/// **Adding an affinity key means adding it here**, in the same change that
+/// teaches a workload to require it. That coupling is the point: it makes the
+/// node side and the workload side impossible to land apart.
+pub const AFFINITY_TAINT_KEYS: &[&str] = &[workload_spec::PUBLIC_IP_TAINT];
+
+/// How a key in [`MachineConfig::taints`] can affect placement.
+///
+/// W305 finding 1: before R742-T4 nothing asked this question, so a key that
+/// no scheduler path could read — `"qa"`, `"no-voter"` — parsed, validated,
+/// and quietly did nothing. Both of the findings that cost real fleet state
+/// were invisible for exactly that reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaintEffect {
+    /// `"no-<archetype>"`: rejects workloads of that archetype outright. Read
+    /// by [`RequiredSpec::matches`] via `repel_archetype`.
+    Repels(LifecycleArchetype),
+    /// A key in [`AFFINITY_TAINT_KEYS`]: a workload naming it in
+    /// `yah.placement.requires-taint` is restricted to nodes carrying it.
+    Attracts,
+    /// Neither. No placement decision can read this key.
+    Inert,
+}
+
+/// Classify one node taint key. See [`TaintEffect`].
+///
+/// The repulsion half is derived from [`LifecycleArchetype::ALL`] rather than
+/// a literal list, so a fourth archetype makes `no-<its key>` live without an
+/// edit here.
+pub fn taint_effect(key: &str) -> TaintEffect {
+    if let Some(arch) = LifecycleArchetype::ALL
+        .into_iter()
+        .find(|a| key == format!("no-{}", a.taint_key()))
+    {
+        return TaintEffect::Repels(arch);
+    }
+    if AFFINITY_TAINT_KEYS.contains(&key) {
+        return TaintEffect::Attracts;
+    }
+    TaintEffect::Inert
+}
+
+/// Every key the scheduler *can* act on, sorted — for error messages that
+/// tell the operator what the legal vocabulary actually is instead of only
+/// what was wrong.
+pub fn live_taint_keys() -> Vec<String> {
+    let mut keys: Vec<String> = LifecycleArchetype::ALL
+        .into_iter()
+        .map(|a| format!("no-{}", a.taint_key()))
+        .chain(AFFINITY_TAINT_KEYS.iter().map(|k| (*k).to_string()))
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// What [`judge_join`] decided about one proposed cluster join.
+///
+/// Shaped like yubaba's `PromotionVerdict` / `GeographyVerdict` and for the
+/// same reason: the rule stays unit-testable without a live cluster, and a
+/// refusal carries its reason from the place that knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinVerdict {
+    /// Both nodes declare the same sovereign group and both are voters. The
+    /// join is within one blast radius and grows a quorum both sides are
+    /// eligible for.
+    Permit,
+    /// The join is refused. Carries an operator-readable reason naming both
+    /// declared values and the file to edit — a refusal that only says
+    /// "invalid" gets worked around rather than fixed.
+    Refuse(String),
+}
+
+/// May `joiner` join the cluster `target` belongs to? — W305/R742-F1.
+///
+/// **A join is permitted iff both nodes declare the same non-`None`
+/// [`sovereign_group`](MachineConfig::sovereign_group) and both are
+/// [`SovereignRole::Voter`].** One rule, no special cases, and it makes the
+/// declaration mandatory before any quorum grows.
+///
+/// The case this exists for is two *different* declared groups: joining a dev
+/// Pi into prod is refused rather than trusted, where today the only guard is
+/// a comment saying not to do it. But an undeclared node is refused too, and
+/// that is the deliberate half — `None` means "in no group", not "unknown", so
+/// growing prod with an unstamped box is exactly as much a cross-group join as
+/// the dev case is. Failing open there would leave the operator believing a
+/// guarantee that was never evaluated, which is the reasoning
+/// `QuorumGeography::judge` already applies to untagged voters.
+///
+/// No legitimate flow pays for that strictness: prod and dev are both stamped,
+/// and us-west-002/015 are deliberately in no group at all. Adding a real
+/// member means declaring it first, which is the point.
+///
+/// # The non-voting refusal (R605-F12)
+///
+/// Same group and still refused, when either side declares
+/// [`SovereignRole::NonVoter`]. This is the case a group label alone could not
+/// express. us-west-003 is a residential-uplink build box the operator counts
+/// as part of prod — same secrets, same upgrade cadence, same destruction — and
+/// which must never hold a prod raft seat, because a home-internet partition
+/// should not be able to stall the quorum. Until R605-F12 the only thing
+/// refusing it was its *absent* stamp, so recording the operator's real intent
+/// (`sovereign_group = "prod"`) would have removed the guard. Now the intent
+/// and the guard are the same two lines.
+///
+/// Note what this is not: the refusal here is about *voting*, and it says
+/// nothing about the mesh. One mesh spans the whole fleet regardless of group
+/// or role (operator, 2026-08-19); a non-voter is reachable, schedulable and
+/// rollable like any other node.
+///
+/// This is the **camp-side** rendering of the rule. The predicate itself lives
+/// in [`workload_spec::sovereign::join_permitted`] because yubaba's
+/// `POST /raft/add-learner` gate asks the same question and cannot see this
+/// crate (there is deliberately no yubaba → cloud edge). Only the prose is
+/// duplicated, and it has to be: a refusal here names
+/// `.yah/infra/machines/<name>.toml`, while the node-side one has no machine
+/// name in hand and must also name `yubaba serve --sovereign-group`.
+///
+/// The node-side gate is *narrower* on purpose, and the difference is worth
+/// knowing when reading either: a daemon started without `--sovereign-group`
+/// has declared nothing rather than declared standalone, so yubaba resolves
+/// that unknown before it judges, and its gate is in force only once the
+/// cluster being joined declares a group. See `yubaba::sovereign_group`.
+pub fn judge_join(joiner: &MachineConfig, target: &MachineConfig) -> JoinVerdict {
+    let stamp_hint = |m: &MachineConfig| {
+        format!(
+            "declare `sovereign_group = \"<group>\"` in .yah/infra/machines/{}.toml",
+            m.name
+        )
+    };
+    let role_hint = |m: &MachineConfig| {
+        format!(
+            "set `sovereign_role = \"voter\"` in .yah/infra/machines/{}.toml",
+            m.name
+        )
+    };
+    if workload_spec::sovereign::join_permitted(
+        joiner.sovereign_membership(),
+        target.sovereign_membership(),
+    ) {
+        return JoinVerdict::Permit;
+    }
+    let (j, t) = (
+        joiner.sovereign_group.as_deref(),
+        target.sovereign_group.as_deref(),
+    );
+    // Everything below is a refusal; the only permitted shape returned above.
+    //
+    // R605-F12: when both sides name the SAME group, the role is the only thing
+    // left that can have refused, and it gets its own message. Falling through
+    // to the arms below would print "cross-group join refused: 'us-west-003' is
+    // in "prod" and 'us-west-001' is in "prod"" — a message that reads as a bug
+    // in the check rather than a decision about the fleet.
+    //
+    // Deliberately not hoisted above the group comparison. A non-voting joiner
+    // whose target is standalone is refused for *both* reasons, and naming the
+    // role there would send the operator to fix a field that would not have
+    // made the join legal anyway.
+    if let (Some(a), Some(b)) = (j, t) {
+        if a == b {
+            for (m, side, other) in [
+                (joiner, "the joiner", &target.name),
+                (target, "the target", &joiner.name),
+            ] {
+                if m.sovereign_membership().role.is_voter() {
+                    continue;
+                }
+                return JoinVerdict::Refuse(format!(
+                    "join refused: {side} '{}' is a NON-VOTING member of sovereign group {a:?}, \
+                     the same group as '{other}'. It is inside that blast radius — same secrets, \
+                     same upgrade cadence, same destruction — but declares itself ineligible for \
+                     the quorum, so this is refused by declaration rather than by omission. If it \
+                     should genuinely vote, {}; if it should not, this refusal is the field doing \
+                     its job and the join is the thing to reconsider.",
+                    m.name,
+                    role_hint(m),
+                ));
+            }
+        }
+    }
+    match (j, t) {
+        (Some(a), Some(b)) => JoinVerdict::Refuse(format!(
+            "cross-group join refused: '{}' is in sovereign group {a:?} and '{}' is in {b:?}. \
+             These are separate blast radii — separate quorums, separate upgrade cadences, \
+             separately destroyable — and merging them is not something a join can undo. If \
+             the move is genuinely intended, restamp '{}' to {b:?} first and treat it as \
+             leaving its old group.",
+            joiner.name,
+            target.name,
+            joiner.name,
+        )),
+        (None, Some(b)) => JoinVerdict::Refuse(format!(
+            "join refused: '{}' declares no sovereign_group, so it is standalone — in no \
+             group — while '{}' is in {b:?}. That is a cross-group join, not an unchecked \
+             one. To make '{}' a member of {b:?}, {}.",
+            joiner.name,
+            target.name,
+            joiner.name,
+            stamp_hint(joiner),
+        )),
+        (Some(a), None) => JoinVerdict::Refuse(format!(
+            "join refused: '{}' is in sovereign group {a:?} but '{}' declares none, so the \
+             target is standalone and has no group to join. Either {}, or found the group on \
+             '{}' rather than growing it.",
+            joiner.name,
+            target.name,
+            stamp_hint(target),
+            joiner.name,
+        )),
+        (None, None) => JoinVerdict::Refuse(format!(
+            "join refused: neither '{}' nor '{}' declares a sovereign_group, so this join \
+             would form a group nobody declared and nothing could later reason about. Name \
+             the group on both boxes first: {}, and the same for '{}'.",
+            joiner.name,
+            target.name,
+            stamp_hint(joiner),
+            target.name,
+        )),
+    }
+}
+
 impl MachineConfig {
+    /// This node's declared place in a sovereign group, as the shared join rule
+    /// wants it — R605-F12.
+    ///
+    /// The one place `sovereign_role`'s `None` is resolved. Absence means
+    /// [`SovereignRole::Voter`], which is what declaring a group meant before
+    /// the role existed; resolving it here rather than at each call site is what
+    /// keeps the camp-side and node-side gates from disagreeing about a node
+    /// that never wrote the field.
+    pub fn sovereign_membership(&self) -> Membership<'_> {
+        Membership {
+            group: self.sovereign_group.as_deref(),
+            role: self.sovereign_role.unwrap_or_default(),
+        }
+    }
+
     /// Provider DC code, or `""` when omitted (static nodes). Most readers want
     /// a `&str`; the driver-backed provision/status paths still go through
     /// [`validate`](Self::validate) which guarantees presence for those.
@@ -334,6 +691,23 @@ impl MachineConfig {
         Ok(())
     }
 
+    /// Declared taints that no placement decision can read (W305/R742-T4).
+    ///
+    /// Deliberately **not** folded into [`validate`](Self::validate): that
+    /// guard runs on the provision/diff hot path and answers a different
+    /// question (can the driver create this server). An inert taint is a lint
+    /// — it never breaks an operation in flight, it just means the file is
+    /// asserting something the scheduler will not honour. `yah cloud validate`
+    /// is where the operator asks for that judgement; see
+    /// [`crate::validate::check_inert_taints`].
+    pub fn inert_taints(&self) -> Vec<&str> {
+        self.taints
+            .iter()
+            .filter(|t| taint_effect(t) == TaintEffect::Inert)
+            .map(String::as_str)
+            .collect()
+    }
+
     /// Yubaba's TOFU'd hostkey fingerprint, from `[registration]` and falling
     /// back to the pre-R707-T1 top-level field. **The only read path** — a
     /// caller that reaches for `legacy_hostkey_fingerprint` directly sees
@@ -368,35 +742,110 @@ impl MachineConfig {
         mesh_ipv4_from_url(url)
     }
 
-    /// Base URL for this node's yubaba, or `None` when it declares no reach.
+    /// Base URL for this node's yubaba, or `None` when no reach resolves.
     ///
-    /// A declared `[connect].yubaba` wins whenever present — full stop, not
-    /// only for the pre-mesh loopback placeholder. `[registration].mesh_ipv4`
-    /// + `[connect].yubaba_port` is the *derivation* used only when nothing is
-    /// declared (R707-T6 / W295).
-    ///
-    /// This was narrower once: a declared literal won only when there was no
-    /// registered mesh address, on the reasoning that the loopback placeholder
-    /// (`http://127.0.0.1:7443`, "reach me through the SSH tunnel") is a
-    /// genuine declaration and not a stale observation. That reasoning still
-    /// holds — it just never considered a *non-loopback* literal coexisting
-    /// with a mesh address, which is exactly R608-F18's forcing case:
-    /// us-west-014 is mesh-joined (`mesh_ipv4`) but its raft peers are
-    /// LAN-only, so `rollout::yubaba::membership_to_nodes` needs the LAN
-    /// literal, not the mesh-derived URL, to match the raft membership
-    /// address. A declared literal is *always* the more specific statement —
-    /// whether it says "SSH tunnel only" or "reach me on the LAN" — and
-    /// `mesh_ipv4` is only ever a convenience for the common case where
-    /// nothing more specific was declared. There is no third state to add: the
-    /// fields already say everything needed, only their precedence was wrong
-    /// for a declared-and-mesh-joined node.
+    /// Thin wrapper over [`reach`](Self::reach) for the many call sites that
+    /// only branch on presence. Prefer `reach` anywhere the operator sees the
+    /// outcome — a `None` here throws away a refusal that names exactly which
+    /// address is missing.
     pub fn yubaba_url(&self) -> Option<String> {
-        let connect = self.connect.as_ref()?;
+        self.reach().ok()
+    }
+
+    /// The **one** address automation dials for this node — mesh-only.
+    ///
+    /// `Err` is a *named refusal*, not an absence: a node with no mesh address
+    /// is unresolvable to every automated path, and R605-T10's whole complaint
+    /// is that this used to surface as a connect timeout against an address the
+    /// caller has no route to.
+    ///
+    /// Resolution order:
+    ///
+    /// 1. A declared `[connect].yubaba` on a **private** host (10/8,
+    ///    172.16/12, 192.168/16) is **not dialed** — see below.
+    /// 2. Any other declared `[connect].yubaba` wins verbatim. That includes
+    ///    the pre-mesh loopback placeholder (`http://127.0.0.1:7443`, "I have
+    ///    no mesh address; reach me through the SSH tunnel to `ssh`"), which is
+    ///    a genuine declaration and stays honoured.
+    /// 3. Otherwise `[registration].mesh_ipv4` composed with
+    ///    `[connect].yubaba_port`.
+    ///
+    /// **Why a LAN literal loses (R605-T10, operator 2026-08-19).** The LAN
+    /// address is an emergency break-glass route, never an official one, and
+    /// automation must ALWAYS assume the caller is not on that LAN — this camp
+    /// sits on 192.168.22.0/22 with no route to the fleet's 192.168.10.0/24 at
+    /// all. Writing one into the field every resolver dials does not sit beside
+    /// the mesh route, it *overrides* it: R707-T6 made a declared literal beat
+    /// `mesh_ipv4` outright, so us-west-011 (mesh-joined, healthy) was elected
+    /// for every aarch64 build and then dialed at an address that answers only
+    /// from inside bldg-2506.
+    ///
+    /// **What R707-T6 wanted is preserved elsewhere.** Its forcing case was
+    /// identity, not reach: the dev raft group advertises LAN addrs
+    /// (`192.168.10.11:7443`, verified live off `/raft/status` 2026-08-27), and
+    /// `rollout::yubaba::membership_to_nodes` has to map those back to declared
+    /// machines. That match now runs against [`lan_endpoint`](Self::lan_endpoint),
+    /// which is composed from the break-glass `[connect].address` metadata and
+    /// is never dialed — so the two concerns the old precedence rule fused are
+    /// split, and the literal can stop squatting a dialed field.
+    ///
+    /// The LAN address itself STAYS in the machine TOML. It is useful metadata
+    /// and the manual `ssh` path is entitled to it; it is only disconnected
+    /// from every automated process.
+    pub fn reach(&self) -> Result<String, String> {
+        let Some(connect) = self.connect.as_ref() else {
+            return Err(format!(
+                "machine {:?} declares no [connect] block, so nothing knows how to reach it \
+                 \u{2192} declare one, or leave it unprovisioned and out of placement",
+                self.name
+            ));
+        };
+        let mesh = || {
+            self.registration
+                .mesh_ipv4
+                .as_deref()
+                .map(|ip| format!("http://{ip}:{}", connect.yubaba_port()))
+        };
         if let Some(literal) = &connect.yubaba {
-            return Some(literal.clone());
+            let Some(lan) = private_ipv4_from_url(literal) else {
+                return Ok(literal.clone());
+            };
+            return mesh().ok_or_else(|| {
+                format!(
+                    "machine {:?} is unresolvable to automation: its only declared yubaba reach \
+                     is the private literal {:?} and it has no [registration].mesh_ipv4\n\
+                     \u{2192} a LAN address is an emergency break-glass route, never an official \
+                     one (R605-T10) — every automated path assumes the caller is NOT on {}/24\n\
+                     \u{2192} mesh-join the box and record `mesh_ipv4` under [registration], then \
+                     delete `[connect].yubaba` so the port composes with it",
+                    self.name,
+                    literal,
+                    lan.rsplit_once('.').map(|(net, _)| net).unwrap_or(lan),
+                )
+            });
         }
-        let ip = self.registration.mesh_ipv4.as_deref()?;
-        Some(format!("http://{ip}:{}", connect.yubaba_port()))
+        mesh().ok_or_else(|| {
+            format!(
+                "machine {:?} has no [registration].mesh_ipv4 and declares no \
+                 [connect].yubaba, so no automated path can reach it\n\
+                 \u{2192} mesh-join the box and record its tailnet address, or taint it out of \
+                 placement — do not point `[connect].yubaba` at a LAN address (R605-T10)",
+                self.name
+            )
+        })
+    }
+
+    /// The LAN `host:port` this node's yubaba answers on, composed from the
+    /// break-glass `[connect].address` metadata plus the declared port.
+    ///
+    /// **Identity only — never dial this.** It exists so a raft membership
+    /// entry that names a node by its LAN address can be mapped back to the
+    /// declared machine (`rollout::yubaba::membership_to_nodes`) without that
+    /// address having to live in a field a resolver reads. `None` when the
+    /// machine is unprovisioned.
+    pub fn lan_endpoint(&self) -> Option<String> {
+        let connect = self.connect.as_ref()?;
+        Some(format!("{}:{}", connect.address, connect.yubaba_port()))
     }
 
     /// Fold the pre-R707-T1 top-level `hostkey_fingerprint` into
@@ -452,12 +901,38 @@ impl MachineConfig {
 /// reasoning as `fleet_metrics::extract_host` and
 /// `hub::coordinator::is_loopback_url`).
 fn mesh_ipv4_from_url(url: &str) -> Option<&str> {
-    let after_scheme = url.split("://").nth(1).unwrap_or(url);
-    let host = after_scheme.split(['/', ':']).next()?;
+    let host = ipv4_host_of(url)?;
     let ip: std::net::Ipv4Addr = host.parse().ok()?;
     let [a, b, ..] = ip.octets();
     // 100.64.0.0/10 ⇒ first octet 100, second octet 64..=127.
     (a == 100 && (64..=127).contains(&b)).then_some(host)
+}
+
+/// Host of an `http://host:port` URL iff it is an **RFC1918 private** IPv4 —
+/// `10/8`, `172.16/12`, `192.168/16`. `None` for anything else, loopback and
+/// the `100.64/10` mesh range included: neither is a LAN literal.
+///
+/// The judgement R605-T10 turns on. A private literal is only ever reachable
+/// from inside one building, so it is metadata about where the box physically
+/// sits and never an address automation may dial — see
+/// [`MachineConfig::reach`] and [`crate::validate::check_lan_dial_targets`].
+pub fn private_ipv4_from_url(url: &str) -> Option<&str> {
+    let host = ipv4_host_of(url)?;
+    is_private_ipv4(host).then_some(host)
+}
+
+/// Whether a bare host string is an RFC1918 private IPv4 literal.
+pub fn is_private_ipv4(host: &str) -> bool {
+    let Ok(ip) = host.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    ip.is_private()
+}
+
+/// Bare host of a `[scheme://]host[:port][/path]` string.
+fn ipv4_host_of(url: &str) -> Option<&str> {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    after_scheme.split(['/', ':']).next()
 }
 
 /// Declared **reach** for a BYO `static` node (no provider API). Lives under
@@ -995,11 +1470,50 @@ impl CloudConfig {
                          under services/"
                     );
                 };
-                if !svc.service.components.iter().any(|c| c.id == comp_id) {
+                let Some(component) = svc.service.components.iter().find(|c| c.id == comp_id)
+                else {
                     anyhow::bail!(
                         "domains/{dom_name}.toml: routes[{idx}].component = \
                          \"{component_ref}\" — service \"{svc_name}\" has no \
                          component with id \"{comp_id}\""
+                    );
+                };
+
+                // R746: a mounted component must be routed where it publishes.
+                // The publisher writes its bundle under the mount and the front
+                // door looks a request up by its own path, so a route path and
+                // a mount that disagree produce a 404 with its cause two files
+                // away. Checked in both directions, since either one alone is
+                // the same silent miss.
+                //
+                // Static routes only: `mount` is a *storage* prefix, and a
+                // backend route proxies to an origin that owns its own paths.
+                if !matches!(route.mode, RouteMode::Static { .. }) {
+                    continue;
+                }
+                let mount = component.mount.as_deref().map(normalize_mount);
+                let route_prefix = route_path_prefix(&route.path);
+                if let Some(mount) = mount {
+                    if mount != route_prefix {
+                        anyhow::bail!(
+                            "domains/{dom_name}.toml: routes[{idx}].path = \
+                             \"{path}\" serves \"{component_ref}\", which \
+                             declares mount = \"/{mount}\" — a mounted \
+                             component publishes under its mount, so the route \
+                             must be \"/{mount}\" or \"/{mount}/*\" (or drop \
+                             the mount to serve from the service root)",
+                            path = route.path,
+                        );
+                    }
+                } else if !route_prefix.is_empty() {
+                    anyhow::bail!(
+                        "domains/{dom_name}.toml: routes[{idx}].path = \
+                         \"{path}\" serves \"{component_ref}\", which declares \
+                         no `mount` — its bundle publishes at the service root, \
+                         so nothing is stored under \"/{route_prefix}\". Set \
+                         mount = \"/{route_prefix}\" on the component, or route \
+                         it at \"/*\"",
+                        path = route.path,
                     );
                 }
             }
@@ -1035,6 +1549,50 @@ impl CloudConfig {
         self.workloads.iter().find(|w| w.spec.name == name)
     }
 
+    /// Every machine declaring `sovereign_group == group`, in declaration order.
+    ///
+    /// W305/R742-F3. A sovereign group has no file of its own — it exists only
+    /// as the set of machines that name the same string — so "which boxes are
+    /// the dev cluster" has to be *derived*, and before this it was not derived
+    /// anywhere: `yah cloud rollout plan` still takes a hand-listed
+    /// `--voter us-west-011 --voter us-west-013 …` for a fact the machine TOMLs
+    /// already state (W314 gap 1).
+    ///
+    /// **This is not placement.** Resolving a group to its members is a
+    /// *lookup*, and it stays outside [`RequiredSpec`] on purpose — see
+    /// [`MachineConfig::sovereign_group`]. `migrate` calls this to pick the
+    /// candidate set it then admits a workload against; nothing here filters
+    /// scheduling, and adding `sovereign_group` to `matches` would still be the
+    /// category error that doc warns about.
+    ///
+    /// An empty result means no machine declares `group`, which is
+    /// indistinguishable from a typo — callers should say so with
+    /// [`Self::declared_sovereign_groups`] rather than reporting "no
+    /// candidates".
+    pub fn machines_in_group(&self, group: &str) -> Vec<&MachineConfig> {
+        self.machines
+            .iter()
+            .filter(|m| m.sovereign_group.as_deref() == Some(group))
+            .collect()
+    }
+
+    /// Every distinct `sovereign_group` declared by any machine, sorted.
+    ///
+    /// Exists so a bad `--to` names the real vocabulary instead of complaining
+    /// abstractly — the same fail-loud shape [`taint_effect`]'s legal-key list
+    /// gives `check_inert_taints`. Standalone machines (`None`) contribute
+    /// nothing: "in no group" is not a group you can migrate *to*.
+    pub fn declared_sovereign_groups(&self) -> Vec<&str> {
+        let mut groups: Vec<&str> = self
+            .machines
+            .iter()
+            .filter_map(|m| m.sovereign_group.as_deref())
+            .collect();
+        groups.sort_unstable();
+        groups.dedup();
+        groups
+    }
+
     /// F16 placement v1: the first machine satisfying every hard axis of `req`
     /// (region/zone/provider membership + mesh_tags superset). Declaration order
     /// in `.yah/infra/machines/` decides ties — deterministic-greedy, no
@@ -1044,24 +1602,7 @@ impl CloudConfig {
     /// when nothing matches, so `yah cloud apply` surfaces *why* placement
     /// failed instead of a silent empty set.
     pub fn resolve_machine(&self, req: &RequiredSpec) -> Result<&MachineConfig> {
-        self.machines
-            .iter()
-            .find(|m| req.matches(m))
-            .ok_or_else(|| {
-                let candidates = if self.machines.is_empty() {
-                    "(no machines declared under .yah/infra/machines/)".to_string()
-                } else {
-                    self.machines
-                        .iter()
-                        .map(|m| m.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                anyhow::anyhow!(
-                    "no candidates matching {} — declared machines: {candidates}",
-                    req.describe()
-                )
-            })
+        resolve_machine_among(&self.machines, req)
     }
 
     /// F16 placement: first machine whose `mesh_tags` is a superset of
@@ -1085,42 +1626,171 @@ impl CloudConfig {
     /// `yah.node-selector.mesh-tags`, comma-joined).
     ///
     /// The producer side (`velveteen_exec::remote::build_workload_spec`, R594) writes
-    /// `TaskLocation::RemoteAny.mesh_tags` — e.g. `[tag:build-worker, tier:x86]`
+    /// `TaskLocation::RemoteAny.mesh_tags` — e.g. `[tag:build-worker, arch:x86]`
     /// from [`qed::platform::build_worker_mesh_tags`] — into the workload's
     /// annotations. This is the consumer: candidates are restricted to machines
     /// whose `mesh_tags` are a **superset** of the requested set, so an amd64
-    /// build lands on the `tier:x86` build-worker (us-west-002) and an arm64
-    /// build on a `tier:arm` Pi5. Declaration order in `.yah/infra/machines/`
+    /// build lands on the `arch:x86` build-worker (us-west-002) and an arm64
+    /// build on a `arch:arm` Pi5. Declaration order in `.yah/infra/machines/`
     /// breaks ties.
     ///
     /// An absent or empty annotation means "no mesh-tag constraint" — pre-R594
     /// behavior (any node), matching [`RequiredSpec::is_unconstrained`].
     ///
     /// This is the single admission seam: R572-F5 extends it with the capacity
-    /// floor (workload request fits node allocatable−committed) and
-    /// repel-unless-tolerate taints by enriching [`RequiredSpec::matches`] /
+    /// floor (workload request fits node allocatable−committed) and taint
+    /// repulsion/affinity by enriching [`RequiredSpec::matches`] /
     /// [`Self::resolve_machine`]. Do not fork a second selector.
     pub fn admit_workload(&self, ws: &WorkloadSpec) -> Result<&MachineConfig> {
-        let req = RequiredSpec {
-            mesh_tags: node_selector_mesh_tags(ws),
-            // R572-F5: capacity floor from the workload's resource request.
-            memory_mb: ws.resources.memory_mb,
-            cpu_millis: ws.resources.cpu_millis,
-            // R572-F5: taint repulsion derived from the workload's effective archetype.
-            repel_archetype: Some(ws.effective_archetype()),
-            // R572-F5: taint affinity from the requires-taint annotation.
-            requires_taint: ws.requires_taint().map(str::to_owned),
-            ..Default::default()
-        };
-        self.resolve_machine(&req)
+        self.resolve_machine(&admission_spec(ws))
+    }
+
+    /// [`Self::admit_workload`] restricted to the machines of one sovereign
+    /// group (W305/R742-F3, `yah cloud migrate --to <group>`).
+    ///
+    /// Same [`RequiredSpec`], same [`RequiredSpec::matches`], same
+    /// declaration-order tie-break — only the candidate *set* differs. That is
+    /// the whole reason this is a narrowing of the admission seam rather than a
+    /// second selector: a workload that cannot be scheduled onto a group's
+    /// boxes must fail here for exactly the reason it would fail anywhere else,
+    /// and `no-appliance` on the dev Pis (W305 finding 2) is precisely the case
+    /// that must not be silently routed around by a migration verb.
+    ///
+    /// `Err` when the group has no members *or* when no member admits `ws`; the
+    /// two are different mistakes, so callers wanting to tell them apart should
+    /// check [`Self::machines_in_group`] first.
+    pub fn admit_workload_in_group(
+        &self,
+        ws: &WorkloadSpec,
+        group: &str,
+    ) -> Result<&MachineConfig> {
+        let members = self.machines_in_group(group);
+        let empty_pool = format!(
+            "(no machine declares sovereign_group = \"{group}\" — declared groups: {})",
+            match self.declared_sovereign_groups().as_slice() {
+                [] => "(none)".to_string(),
+                gs => gs.join(", "),
+            }
+        );
+        first_match(
+            &members,
+            &admission_spec(ws),
+            &format!("machines in sovereign group '{group}'"),
+            &empty_pool,
+        )
+    }
+}
+
+/// **The** placement selector: the first candidate satisfying every axis of
+/// `req`, declaration order breaking ties, deterministic-greedy with no
+/// backtracking.
+///
+/// Every path that picks a machine goes through here, and the only thing any
+/// of them varies is *which machines are candidates* — never the predicate.
+/// [`CloudConfig::resolve_machine`] passes the whole fleet;
+/// [`CloudConfig::admit_workload_in_group`] passes one sovereign group's
+/// members. That split is the point: a candidate-set narrowing composes with
+/// the [`RequiredSpec`] axes for free, whereas expressing the same narrowing
+/// *as* an axis would put facts like blast radius into a filter they must
+/// never be in (see [`MachineConfig::sovereign_group`]).
+///
+/// So a new placement scope is a new candidate set plus a `pool` label, and a
+/// new placement *constraint* is a field on [`RequiredSpec`] — those are the
+/// two extension points, and neither is a second selector. `pool` and
+/// `empty_pool` exist only so the failure names the set it actually searched;
+/// a refusal that says "no candidates" without saying *among what* is one the
+/// operator has to reconstruct by hand.
+/// F16 placement v1 resolution over an explicit machine list — the
+/// `.machines`-only half of [`CloudConfig::resolve_machine`], for callers that
+/// have loaded just the machines tree rather than the whole cross-ref-validated
+/// config.
+///
+/// R772: `resolve_ingress_placements` (`reconciler::ingress`) is the reason
+/// this is `pub(crate)` rather than staying folded into
+/// `CloudConfig::resolve_machine` — ingress collation walks every mirror in
+/// the workspace and has no business hard-failing over an unrelated mirror's
+/// `providers.X.use = "<id>"` typo, which is what going through
+/// `CloudConfig::load`'s cross-ref validation would do. "Do not fork a second
+/// selector" (see the module doc above) still holds: this is the *same*
+/// [`first_match`], just handed a narrower candidate set than `self.machines`.
+pub(crate) fn resolve_machine_among<'a>(
+    machines: &'a [MachineConfig],
+    req: &RequiredSpec,
+) -> Result<&'a MachineConfig> {
+    let all: Vec<&MachineConfig> = machines.iter().collect();
+    first_match(
+        &all,
+        req,
+        "declared machines",
+        "(no machines declared under .yah/infra/machines/)",
+    )
+}
+
+fn first_match<'a>(
+    candidates: &[&'a MachineConfig],
+    req: &RequiredSpec,
+    pool: &str,
+    empty_pool: &str,
+) -> Result<&'a MachineConfig> {
+    candidates
+        .iter()
+        .copied()
+        .find(|m| req.matches(m))
+        .ok_or_else(|| {
+            let names = if candidates.is_empty() {
+                empty_pool.to_string()
+            } else {
+                candidates
+                    .iter()
+                    .map(|m| m.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            anyhow::anyhow!(
+                "no candidates matching {} — {pool}: {names}",
+                req.describe()
+            )
+        })
+}
+
+/// The [`RequiredSpec`] a workload is admitted against — the single place the
+/// axes are derived from a [`WorkloadSpec`].
+///
+/// Extracted from [`CloudConfig::admit_workload`] so that
+/// [`CloudConfig::admit_workload_in_group`] narrows the candidate set without
+/// restating the axes. Forking that derivation is how the two paths would
+/// silently disagree about whether a workload fits a node.
+fn admission_spec(ws: &WorkloadSpec) -> RequiredSpec {
+    RequiredSpec {
+        mesh_tags: node_selector_mesh_tags(ws),
+        // R833-F8: imperative node pin. Derived here alongside the inferred
+        // mesh tags rather than short-circuiting the resolver, so a pinned
+        // workload is still checked against capacity and taints.
+        nodes: node_selector_node(ws).into_iter().collect(),
+        // R572-F5: capacity floor from the workload's resource request.
+        //
+        // `memory_request_mb()` and NOT `resources.memory_mb`: the latter
+        // is a cgroup ceiling, and reading a ceiling as a floor made
+        // `for_forge`'s deliberately-roomy 32 GiB limit mean "only place
+        // me on a 32 GiB node". That excluded every build-worker in the
+        // fleet but one. The accessor falls back to `resources.memory_mb`
+        // when no request is declared, so specs that never set one are
+        // admitted exactly as before.
+        memory_mb: ws.memory_request_mb(),
+        cpu_millis: ws.resources.cpu_millis,
+        // R572-F5: taint repulsion derived from the workload's effective archetype.
+        repel_archetype: Some(ws.effective_archetype()),
+        // R572-F5: taint affinity from the requires-taint annotation.
+        requires_taint: ws.requires_taint().map(str::to_owned),
+        ..Default::default()
     }
 }
 
 /// Parse the R594 mesh-tag node-selector off a workload's annotations into the
 /// requested tag set. Absent annotation or empty value ⇒ empty vec ("no
 /// constraint"). Whitespace around each comma-separated tag is trimmed and
-/// empty segments are dropped, so `"tag:build-worker, tier:x86"` and
-/// `"tag:build-worker,tier:x86"` parse identically.
+/// empty segments are dropped, so `"tag:build-worker, arch:x86"` and
+/// `"tag:build-worker,arch:x86"` parse identically.
 pub fn node_selector_mesh_tags(ws: &WorkloadSpec) -> Vec<String> {
     ws.annotations
         .get(velveteen_exec::remote::NODE_SELECTOR_MESH_TAGS_ANNOTATION)
@@ -1132,6 +1802,22 @@ pub fn node_selector_mesh_tags(ws: &WorkloadSpec) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Parse the R833-F8 imperative node-selector off a workload's annotations —
+/// the single machine `name` the operator pinned the run to
+/// (`--where=node:us-west-003`). Absent or blank ⇒ `None` ("no constraint"),
+/// which is every workload built before this axis existed.
+///
+/// One node, not a list: the annotation exists to express "run it *there*", and
+/// a comma-joined set would be a worse spelling of the mesh-tag selector that
+/// already handles "any of these".
+pub fn node_selector_node(ws: &WorkloadSpec) -> Option<String> {
+    ws.annotations
+        .get(velveteen_exec::remote::NODE_SELECTOR_NODE_ANNOTATION)
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(String::from)
 }
 
 /// Load every `.yah/infra/providers/*.toml` into a [`ProviderConfig`] list.
@@ -1388,7 +2074,7 @@ fn load_topology(path: std::path::PathBuf) -> Result<TopologyConfig> {
 /// workload admits to could change when an unrelated file is added to the
 /// directory. That was latent while each tag set had one match and became
 /// observable the day us-west-003 joined us-west-002 on
-/// `[tag:build-worker, tier:x86, os:linux]`. Same sort `load_providers` has
+/// `[tag:build-worker, arch:x86, os:linux]`. Same sort `load_providers` has
 /// always done.
 fn load_dir<T: for<'de> Deserialize<'de>>(dir: std::path::PathBuf) -> Result<Vec<T>> {
     if !dir.exists() {
@@ -1938,6 +2624,26 @@ pub struct ServiceComponent {
     /// `"container-image"`, …). Drives mirror provider-slot routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publishes: Option<String>,
+    /// URL sub-path a static component's build output is published under,
+    /// relative to the service's publish prefix (R746). `None` = the service
+    /// root, which is what every pre-R746 component means.
+    ///
+    /// Static publishers lay a component's `out_dir` down at
+    /// `<bucket>/<service>/<env>/…` and the front door fetches
+    /// `${ASSET_ORIGIN}/<request path>` — the request path *is* the key. So a
+    /// service with two static components had them overwrite each other at
+    /// one prefix, and there was no way to say "this bundle serves under
+    /// /app". `mount` is that: it appends to the publish prefix, which makes
+    /// the URL sub-path and the storage sub-path the same string by
+    /// construction rather than by two manifests agreeing.
+    ///
+    /// Cross-checked against the domain route that names the component
+    /// ([`CloudConfig::cross_ref_validate`]): a component mounted at `/app`
+    /// must be routed at `/app` or `/app/*`, because a disagreement means
+    /// requests land on a prefix nothing published to — a 404 whose cause is
+    /// two files apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount: Option<String>,
     /// Sync-wave index (0-based). Components in wave 0 roll out in parallel
     /// first; the reconciler waits for all wave-N components to become healthy
     /// before starting wave N+1. Defaults to 0 (all components in one wave).
@@ -2138,6 +2844,204 @@ impl IngressProvider {
     }
 }
 
+/// One declared **edge**: a front door, the slots it fronts, and the nodes it
+/// is placed on (W305 F2).
+///
+/// A mirror declares a *list* of these, which is what lets one service mix
+/// front doors — cloudflare for the public web tier, passway for an internal or
+/// high-throughput one. Before this, [`MirrorConfig::ingress`] was a single
+/// [`IngressProvider`], so a mirror could **swap** front doors but never mix
+/// them.
+///
+/// ```toml
+/// [[ingress]]
+/// provider = "passway"
+/// machines = ["us-east-001", "us-south-001"]
+/// slots    = ["bundle"]
+///
+/// [[ingress]]
+/// provider  = "cloudflare-tunnel"
+/// hostnames = ["issues.yah.dev"]
+/// ```
+///
+/// **The per-node appliance is derived from this, never declared beside it.**
+/// An edge does invoke a cloudflared or passway process on a box, but that is a
+/// *consequence* of the service's declaration:
+/// [`collate_front_doors`](crate::reconciler::collate_front_doors) walks every
+/// service and derives what each node must run. Declaring it node-side too is
+/// what produces two sources of truth for one fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct IngressEdge {
+    /// Which front door this edge is. [`IngressProvider::None`] is rejected at
+    /// plan time — an edge that fronts with nothing is always a typo, never an
+    /// intent (write no edge instead).
+    pub provider: IngressProvider,
+    /// Nodes this front door is placed on — **independent of where the fronted
+    /// workload runs** (R330-F37).
+    ///
+    /// Empty falls back to the fronted slot's own `machine` / `machines`, which
+    /// is the co-located shape every mirror had before front-door placement was
+    /// expressible. Listing several is what lets the ingress tier and the
+    /// service tier scale independently: **N front doors over ONE deployment**,
+    /// one rendered copy, so no cache coherence to settle.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub machines: Vec<String>,
+    /// Provider slot roles this edge fronts (`"bundle"`, `"compute"`, …).
+    ///
+    /// One of the two selectors. With a single edge both may be empty, meaning
+    /// "every fronted slot" — the legacy shape. With **several** edges a
+    /// selector is mandatory on each, and the partition must be total and
+    /// disjoint: a slot claimed by no edge, or by two, is an error naming it.
+    /// An implicit catch-all across mixed front doors would silently publish a
+    /// service through the wrong one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<String>,
+    /// Public hostnames this edge fronts — the other selector, for partitioning
+    /// by what the world dials rather than by which slot serves it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hostnames: Vec<String>,
+    /// Cloudflare Tunnel id this edge publishes through, overriding the
+    /// fronting machine's [`MachineConfig::cloudflared`].
+    ///
+    /// This is W267 Gap 3's real fix, and it is the *service* side of it: a node
+    /// can join two cohorts' orange networks, and since §Granularity argues the
+    /// tunnel credential **is** the isolation boundary, which cohort a given
+    /// service fronts through is a property of the service, not of the box.
+    /// `MachineConfig.cloudflared` stays as the per-node default (one tunnel is
+    /// the common case, and the credential does live on the node), but it is no
+    /// longer the only way to say it — so the node never has to enumerate
+    /// cohorts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_id: Option<String>,
+}
+
+impl IngressEdge {
+    /// An edge with no selector — fronts every fronted slot, legal only when it
+    /// is the mirror's only edge.
+    pub fn all_slots(provider: IngressProvider, machines: Vec<String>) -> Self {
+        Self {
+            provider,
+            machines,
+            slots: Vec::new(),
+            hostnames: Vec::new(),
+            tunnel_id: None,
+        }
+    }
+
+    /// `true` when this edge names which slots/hostnames it fronts.
+    pub fn has_selector(&self) -> bool {
+        !self.slots.is_empty() || !self.hostnames.is_empty()
+    }
+
+    /// Does this edge claim the rule derived from `slot` publishing `hostname`?
+    ///
+    /// A selectorless edge claims everything; that is checked to be
+    /// unambiguous (one edge only) before this is consulted.
+    pub fn claims(&self, slot: &str, hostname: &str) -> bool {
+        if !self.has_selector() {
+            return true;
+        }
+        self.slots.iter().any(|s| s == slot) || self.hostnames.iter().any(|h| h == hostname)
+    }
+
+    /// Human-readable identity for an error message — the provider plus
+    /// whichever selector was written.
+    pub fn label(&self) -> String {
+        let sel = match (self.slots.is_empty(), self.hostnames.is_empty()) {
+            (true, true) => "no selector".to_string(),
+            (false, true) => format!("slots = {:?}", self.slots),
+            (true, false) => format!("hostnames = {:?}", self.hostnames),
+            (false, false) => format!("slots = {:?} + hostnames = {:?}", self.slots, self.hostnames),
+        };
+        format!("[[ingress]] provider = {:?} ({sel})", self.provider.as_str())
+    }
+}
+
+/// A mirror's `ingress` declaration, in either spelling.
+///
+/// The list is the general form; the bare provider is shorthand for the single
+/// edge fronting everything, and is kept rather than migrated because it is the
+/// honest spelling for the common case — one service, one front door. Both
+/// normalize to the same `Vec<IngressEdge>` through
+/// [`MirrorConfig::ingress_edges`], so nothing downstream branches on which was
+/// written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum IngressDecl {
+    /// `ingress = "passway"` — one edge fronting every fronted slot, placed by
+    /// the sibling [`MirrorConfig::ingress_machines`].
+    Provider(IngressProvider),
+    /// `[[ingress]]` — one entry per declared edge.
+    Edges(Vec<IngressEdge>),
+}
+
+/// Hand-written because `#[serde(untagged)]` throws the real error away.
+///
+/// A derived untagged `Deserialize` tries each variant and, on failure, reports
+/// only `data did not match any variant of untagged enum IngressDecl` — so a
+/// misspelled `provider = "passwya"` says nothing about providers, nothing about
+/// the legal values, and points at the `[[ingress]]` header rather than the
+/// field. Dispatching on the input shape first means each arm's own error
+/// survives: a bad string names the legal provider vocabulary, a bad edge table
+/// names the offending field.
+impl<'de> Deserialize<'de> for IngressDecl {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct DeclVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for DeclVisitor {
+            type Value = IngressDecl;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "a provider name (`ingress = \"passway\"`) or a list of edge tables \
+                     (`[[ingress]]`)",
+                )
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+                IngressProvider::deserialize(serde::de::value::StrDeserializer::new(v))
+                    .map(IngressDecl::Provider)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                Vec::<IngressEdge>::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(IngressDecl::Edges)
+            }
+        }
+
+        d.deserialize_any(DeclVisitor)
+    }
+}
+
+/// No front door — the shape of every mirror that publishes to R2 behind a
+/// Worker, or runs a mesh-only compute tier.
+impl Default for IngressDecl {
+    fn default() -> Self {
+        Self::Provider(IngressProvider::None)
+    }
+}
+
+impl IngressDecl {
+    /// `true` when this mirror declares no front door at all.
+    pub fn is_absent(&self) -> bool {
+        match self {
+            Self::Provider(p) => !p.is_declared(),
+            Self::Edges(e) => e.is_empty(),
+        }
+    }
+}
+
+impl From<IngressProvider> for IngressDecl {
+    fn from(p: IngressProvider) -> Self {
+        Self::Provider(p)
+    }
+}
+
 /// A service mirror — the projection of a [`ServiceConfig`] onto concrete
 /// infra. Lives at `.yah/services/<svc>/mirrors/<env>.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2145,18 +3049,64 @@ impl IngressProvider {
 pub struct MirrorConfig {
     pub schema_version: u32,
     pub shape: MirrorShape,
-    /// Public-ingress provider fronting this mirror (W267). Defaults to
-    /// [`IngressProvider::None`].
+    /// Public-ingress edges fronting this mirror (W267, W305 F2). Defaults to
+    /// none.
+    ///
+    /// Two spellings, one meaning — see [`IngressDecl`]. `ingress = "passway"`
+    /// is one edge fronting everything; `[[ingress]]` entries declare several,
+    /// each naming its provider plus the slots or hostnames it fronts. Read it
+    /// through [`ingress_edges`](Self::ingress_edges), never by matching on the
+    /// enum, so the two spellings cannot drift apart.
     ///
     /// Declared at mirror scope rather than per provider slot because a front
     /// door does **fan-in**: one `cloudflared` (or one passway) on a node
-    /// multiplexes every hostname→port rule the mirror needs, so pinning it to
-    /// a single slot would mint one edge connection per slot for no gain.
-    #[serde(default, skip_serializing_if = "not_declared")]
-    pub ingress: IngressProvider,
+    /// multiplexes every hostname→port rule it fronts, so pinning one to a
+    /// single slot would mint one edge connection per slot for no gain. An
+    /// edge's `slots` selector is the general form of that — it groups slots
+    /// behind one front door, it does not split a front door per slot.
+    #[serde(default, skip_serializing_if = "IngressDecl::is_absent")]
+    pub ingress: IngressDecl,
+    /// Machines the front door is placed on — **independent of where the
+    /// fronted workload runs** (R330-F37).
+    ///
+    /// The single-edge spelling of [`IngressEdge::machines`]: it applies to the
+    /// one edge `ingress = "<provider>"` declares, and combining it with
+    /// `[[ingress]]` entries is an error rather than a silent precedence rule.
+    ///
+    /// Empty (the default) keeps the pre-existing behaviour: the front door is
+    /// co-located with the fronted slot's own `machine` / `machines`. That was
+    /// never a design choice, it was an artifact of bundles binding
+    /// `127.0.0.1` — nothing off-node could reach a workload, so a proxy had to
+    /// sit on top of it. R599-F12 landed mesh binding, which removes the
+    /// constraint: passway is a reverse proxy, and a valid front door needs a
+    /// cert and an upstream it can *reach*, not a local copy of the service.
+    ///
+    /// Listing several machines is what lets the ingress tier and the service
+    /// tier scale independently — **N front doors over ONE deployment**. There
+    /// is still exactly one rendered copy of the site, so fanning the front door
+    /// out introduces no cache-coherence problem; that only appears if you
+    /// deploy the *workload* to every node instead.
+    ///
+    /// ```toml
+    /// ingress = "passway"
+    /// ingress_machines = ["us-east-001", "us-west-001"]
+    /// ```
+    ///
+    /// Declaring this without [`ingress`](Self::ingress) is an error, not a
+    /// no-op — it always means the operator expected a front door somewhere.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ingress_machines: Vec<String>,
     /// Provider slots, keyed by role (`"static"`, `"compute"`, …). Each value
     /// either references a provider declared under `.yah/infra/providers/` or
     /// inlines a local-only provider (no creds, no infra file).
+    ///
+    /// A role is normally service-wide — one slot serves every component that
+    /// shares it — but [`ReconcileCtx::slot`](crate::reconciler::ReconcileCtx::slot)
+    /// looks up the component-qualified key `"<role>:<component id>"` first.
+    /// A service with two components of the same role (e.g. two
+    /// `mesofact-static` components under one mirror) declares
+    /// `providers."static:<id>"` per component to give each its own port;
+    /// omitting the qualifier keeps the pre-existing single-slot behavior.
     #[serde(default)]
     pub providers: BTreeMap<String, MirrorProviderSlot>,
     /// Capability→driver bindings, keyed by **capability** (`"pg"`, `"s3"`, …)
@@ -2190,13 +3140,62 @@ pub struct MirrorConfig {
     pub asset_aliases: BTreeMap<String, String>,
 }
 
-/// `skip_serializing_if` predicate for [`MirrorConfig::ingress`] — an
-/// undeclared front door round-trips as an absent key, not `ingress = "none"`.
-fn not_declared(ingress: &IngressProvider) -> bool {
-    !ingress.is_declared()
-}
-
 impl MirrorConfig {
+    /// This mirror's declared edges, with both spellings normalized (W305 F2).
+    ///
+    /// The single place `ingress` + `ingress_machines` are reconciled, so no
+    /// consumer has to know which spelling was written. Returns an empty vec
+    /// when the mirror declares no front door.
+    ///
+    /// Errors are the declarations that cannot mean anything:
+    ///
+    /// - `ingress_machines` with no `ingress` — front-door placement with no
+    ///   front door to place, always a typo (R330-F37);
+    /// - `ingress_machines` alongside `[[ingress]]` — placement declared twice,
+    ///   in a form where one silently wins;
+    /// - `provider = "none"` on an edge — an edge that fronts with nothing.
+    pub fn ingress_edges(&self) -> Result<Vec<IngressEdge>> {
+        match &self.ingress {
+            IngressDecl::Provider(p) if !p.is_declared() => {
+                if !self.ingress_machines.is_empty() {
+                    bail!(
+                        "mirror declares `ingress_machines = {:?}` but no `ingress` provider — \
+                         front-door placement with no front door to place. Add \
+                         `ingress = \"passway\"` (or \"cloudflare-tunnel\"), or drop \
+                         `ingress_machines`.",
+                        self.ingress_machines
+                    );
+                }
+                Ok(Vec::new())
+            }
+            IngressDecl::Provider(p) => Ok(vec![IngressEdge::all_slots(
+                *p,
+                self.ingress_machines.clone(),
+            )]),
+            IngressDecl::Edges(edges) => {
+                if !self.ingress_machines.is_empty() {
+                    bail!(
+                        "mirror declares both `[[ingress]]` edges and the single-edge \
+                         `ingress_machines = {:?}` — front-door placement stated twice. Move \
+                         those names onto the edge they place: `machines = [...]` inside the \
+                         `[[ingress]]` entry.",
+                        self.ingress_machines
+                    );
+                }
+                for edge in edges {
+                    if !edge.provider.is_declared() {
+                        bail!(
+                            "{}: `provider = \"none\"` fronts nothing. An edge exists to name a \
+                             front door — delete the entry instead.",
+                            edge.label()
+                        );
+                    }
+                }
+                Ok(edges.clone())
+            }
+        }
+    }
+
     /// Parse a single `mirrors/<env>.toml` file.
     pub fn load(path: &Path) -> Result<Self> {
         let src =
@@ -2323,9 +3322,20 @@ impl MirrorProviderSlot {
 ///   `allocatable` budget must cover the demand. `0` = no constraint.
 /// - `repel_archetype` — *taint repulsion* (R572-F5): the machine must not
 ///   carry the taint `"no-<archetype.taint_key()>"` for the workload's class.
-///   `None` = no repulsion check.
+///   `None` = no repulsion check. Absolute — see [`Self::repel_archetype`].
 /// - `requires_taint` — *taint affinity* (R572-F5): the machine must carry
 ///   this taint key (in `taints` or `mesh_tags`). `None` = no affinity.
+///
+/// These two are the **only** readers of [`MachineConfig::taints`], which is
+/// what makes [`taint_effect`]'s closed vocabulary well-founded.
+///
+/// [`MachineConfig::sovereign_group`] is deliberately **not** an axis here and
+/// must not become one (W305/R742-F1). A sovereign group is a blast radius,
+/// not a filter: which quorum a box votes in says nothing about whether a
+/// workload may run on it, and a dev-group node exists precisely so dev-mode
+/// services — stateful ones included — can be scheduled onto it. Filtering on
+/// it would re-make the mistake W305 exists to undo, where one mechanism
+/// silently carried three unrelated properties.
 ///
 /// An empty / zero / None on every axis means "no constraint on that axis".
 /// A fully-unconstrained `RequiredSpec` matches every machine (see
@@ -2342,9 +3352,23 @@ pub struct RequiredSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mesh_tags: Vec<String>,
 
+    /// R833-F8: **imperative** placement — the machine must be one of these by
+    /// `name`. Empty (the default) = no constraint, which is every pre-R833-F8
+    /// caller.
+    ///
+    /// This is the one axis that is not a *capability* the scheduler infers.
+    /// The operator typed `--where=node:us-west-003`, so it composes with the
+    /// other axes exactly like the rest — a named node that fails the capacity
+    /// floor or carries a repelling taint still does not match, and the refusal
+    /// names why rather than silently placing the work somewhere else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<String>,
+
     /// R572-F5: minimum memory (MiB) the target node must have in its
     /// declared `allocatable` budget. `0` = no constraint. Filled by
-    /// [`CloudConfig::admit_workload`] from the workload's `resources.memory_mb`.
+    /// [`CloudConfig::admit_workload`] from the workload's
+    /// `memory_request_mb()` — its placement **request**, which is not the
+    /// same number as the `resources.memory_mb` cgroup **ceiling**.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub memory_mb: u32,
     /// R572-F5: minimum CPU (millicores) the target node must have in its
@@ -2356,6 +3380,14 @@ pub struct RequiredSpec {
     /// rejects any node that carries the taint `"no-<archetype.taint_key()>"`.
     /// `None` = no repulsion check (backwards-compat for callers that don't
     /// thread a spec through).
+    ///
+    /// **This is an absolute block, not a preference.**
+    /// [`CloudConfig::admit_workload`] sets it unconditionally from the
+    /// workload's effective archetype, and nothing in the tree tolerates a
+    /// taint — so a workload cannot opt out of a `no-<archetype>` node
+    /// (W305 finding 2 / R742-T4). Adding toleration means giving
+    /// `WorkloadSpec` a tolerations list and consulting it here; until then,
+    /// do not describe this as "repel-unless-tolerate".
     #[serde(skip)]
     pub repel_archetype: Option<LifecycleArchetype>,
     /// R572-F5: taint the workload requires the target node to carry
@@ -2372,6 +3404,7 @@ impl RequiredSpec {
             && self.zones.is_empty()
             && self.providers.is_empty()
             && self.mesh_tags.is_empty()
+            && self.nodes.is_empty()
             && self.memory_mb == 0
             && self.cpu_millis == 0
             && self.repel_archetype.is_none()
@@ -2387,13 +3420,26 @@ impl RequiredSpec {
     ///   cover `self.{memory,cpu}`. A machine with no `allocatable` block passes
     ///   unconditionally (capacity unknown → no constraint enforced).
     /// - **R572-F5 taint repulsion**: machine must not carry the taint
-    ///   `"no-<archetype.taint_key()>"` for the workload's class.
+    ///   `"no-<archetype.taint_key()>"` for the workload's class. Absolute —
+    ///   the workload has no way to tolerate it (W305 finding 2).
     /// - **R572-F5 taint affinity**: if `requires_taint` is set, the machine
     ///   must carry that key in its `taints` list or `mesh_tags`.
+    ///
+    /// Any *other* taint on the machine is ignored here, which is precisely
+    /// why [`crate::validate::check_inert_taints`] refuses to let one be
+    /// declared: it would read as a constraint and be none.
     pub fn matches(&self, machine: &MachineConfig) -> bool {
         let member_ok = |constraint: &[String], value: Option<&str>| -> bool {
             constraint.is_empty() || value.map_or(false, |v| constraint.iter().any(|c| c == v))
         };
+
+        // R833-F8: imperative node pin, checked first because it is the axis a
+        // human asserted rather than one the scheduler derived — a refusal
+        // should read "us-west-003 does not match" and not lead with a tag set
+        // the operator never typed.
+        if !member_ok(&self.nodes, Some(machine.name.as_str())) {
+            return false;
+        }
 
         // Membership + mesh-tags (pre-existing axes).
         if !member_ok(&self.regions, machine.region.as_deref())
@@ -2417,8 +3463,8 @@ impl RequiredSpec {
             }
         }
 
-        // R572-F5: taint repulsion. A node taint "no-<archetype>" repels the
-        // workload class unless it explicitly tolerates it.
+        // R572-F5: taint repulsion. A node taint "no-<archetype>" rejects the
+        // workload class outright — there is no toleration list to consult.
         if let Some(arch) = self.repel_archetype {
             let repel_key = format!("no-{}", arch.taint_key());
             if machine.taints.iter().any(|t| *t == repel_key) {
@@ -2448,6 +3494,7 @@ impl RequiredSpec {
                 parts.push(format!("required.{label}=[{}]", vals.join(",")));
             }
         };
+        push("nodes", &self.nodes);
         push("regions", &self.regions);
         push("zones", &self.zones);
         push("providers", &self.providers);
@@ -2572,6 +3619,26 @@ pub struct DomainRoute {
     /// URL pattern this route matches. Examples: `"/"`, `"/dashboard/*"`,
     /// `"/camp/ws"`.
     pub path: String,
+    /// Response headers the front door sets on every response served under
+    /// this route (R746). Empty by default.
+    ///
+    /// This is the manifest's answer to "who decides a path's response
+    /// headers". Before it existed the answer was *nobody*: a `_headers` file
+    /// is a Cloudflare Pages / Netlify convention, and neither of this
+    /// repo's front doors reads one — a Worker returns what it fetched from
+    /// R2, and R2 serves only the object's own httpMetadata. So a site could
+    /// carry a `_headers` file declaring COOP/COEP and ship without them,
+    /// which is exactly how it was found: `SharedArrayBuffer` is simply
+    /// absent in a document served cross-origin-isolation-free, with no
+    /// error anywhere to say why.
+    ///
+    /// Deliberately a free-form `name -> value` map rather than named fields
+    /// for the isolation headers: the domain manifest has no business
+    /// knowing which headers a route's payload happens to need. Ordering
+    /// follows the route table's own rule — first matching route wins, no
+    /// merging across routes (see the Worker's `applyRouteHeaders`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
     #[serde(flatten)]
     pub mode: RouteMode,
 }
@@ -2614,6 +3681,61 @@ pub enum RouteMode {
 
 fn default_redirect_status() -> u16 {
     308
+}
+
+/// Normalize a component `mount` to a storage/URL key prefix: strip the
+/// surrounding slashes. `"/app"`, `"app/"`, `"/app/"` → `"app"`; `"/"`, `""`
+/// → `""` (the service root).
+///
+/// One producer on purpose — the publisher's key prefix, the route-path
+/// cross-check and the front door's key lookup must all agree on what `/app`
+/// means down to the byte, and three copies of `trim_matches('/')` is how they
+/// stop agreeing.
+pub fn normalize_mount(raw: &str) -> String {
+    raw.trim_matches('/').to_string()
+}
+
+/// The key prefix a domain route pattern serves under: `"/*"` → `""`,
+/// `"/app/*"` and `"/app"` → `"app"`. The twin of [`normalize_mount`] on the
+/// routing side.
+pub fn route_path_prefix(path: &str) -> String {
+    normalize_mount(path.strip_suffix('*').unwrap_or(path))
+}
+
+/// The route-driven domain whose route table binds a component of `service`,
+/// if any. Used by static publishers to pick up the per-route response
+/// headers a service's paths were declared with.
+///
+/// Deterministic by `BTreeMap` key order when more than one domain routes the
+/// same service (a legitimate shape: an apex and a staging host serving one
+/// bundle). Returning the first is a real limitation, not a considered
+/// choice — the day two such domains want *different* headers for one
+/// component, this needs the domain identity threaded in rather than inferred.
+pub fn domain_serving_service<'a>(
+    domains: &'a BTreeMap<String, DomainConfig>,
+    service: &str,
+) -> Option<&'a DomainConfig> {
+    domains
+        .values()
+        .find(|d| d.front_door.is_route_driven() && d.serves_service(service))
+}
+
+/// The `ROUTE_HEADERS` Worker-binding value for `service`, read from the
+/// workspace's domain manifests. `"[]"` when no route-driven domain routes the
+/// service, or when the one that does declares no headers.
+///
+/// Reads `.yah/domains/` directly rather than taking a loaded [`CloudConfig`]:
+/// the static reconcilers are handed a per-component [`ReconcileCtx`], not the
+/// whole workspace config, and threading a config reference through all 22 of
+/// its construction sites to reach one string would be a wide change for a
+/// narrow read. Manifest parse errors propagate — a domain file that no longer
+/// loads is a deploy-stopping fact, not a reason to ship a Worker with the
+/// headers quietly missing.
+pub fn route_headers_for_service(workspace_root: &Path, service: &str) -> Result<String> {
+    let domains = load_domains(&crate::paths::domains_dir(workspace_root))?;
+    Ok(domain_serving_service(&domains, service)
+        .map(DomainConfig::route_headers_json)
+        .unwrap_or_else(|| "[]".to_string()))
 }
 
 impl DomainConfig {
@@ -2678,6 +3800,42 @@ impl DomainConfig {
             }
         }
         Ok(())
+    }
+
+    /// The `ROUTE_HEADERS` Worker binding for this domain (R746) — the route
+    /// table's `path` + `headers` pairs, in manifest order, with routes that
+    /// declare no headers dropped. `"[]"` when nothing declares any.
+    ///
+    /// Order is load-bearing and must survive serialization: the front door
+    /// applies the FIRST matching rule, so `/app/*` above `/*` is what gives
+    /// the app its isolation headers and leaves the marketing site alone.
+    /// That is why this is a `Vec` of pairs and not a map keyed by path.
+    pub fn route_headers_json(&self) -> String {
+        #[derive(Serialize)]
+        struct Rule<'a> {
+            path: &'a str,
+            headers: &'a BTreeMap<String, String>,
+        }
+        let rules: Vec<Rule<'_>> = self
+            .routes
+            .iter()
+            .filter(|r| !r.headers.is_empty())
+            .map(|r| Rule {
+                path: &r.path,
+                headers: &r.headers,
+            })
+            .collect();
+        serde_json::to_string(&rules).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// Whether this domain's route table binds any component of `service`.
+    pub fn serves_service(&self, service: &str) -> bool {
+        self.routes.iter().any(|r| {
+            r.mode
+                .component()
+                .and_then(split_component_ref)
+                .is_some_and(|(svc, _)| svc == service)
+        })
     }
 
     /// Persist to `.yah/domains/<name>.toml`, creating the domains
@@ -2784,6 +3942,24 @@ pub struct SecretConfig {
     /// Defaults to [`SecretAccess::default`] — the deny-all empty allow-list. A
     /// declaration that forgets this field produces a secret nobody can mount,
     /// which is the correct direction to fail in.
+    ///
+    /// Three forms:
+    ///
+    /// ```toml
+    /// access = "allow_any"                              # explicit escape hatch
+    ///
+    /// [access]                                          # named workloads
+    /// workloads = [{ workload = "yah-cloud-admin" }]
+    ///
+    /// [access]                                          # signed recipes (R555-F5)
+    /// recipes = [{ recipe = "rusty-v8-musl", key = "3d40…" }]
+    /// ```
+    ///
+    /// Use the `recipes` form for a credential a **dispatched build** needs (the
+    /// R2 write key, the cosign signing key). A remote QED run's workload name
+    /// is a fresh `forge-<uuid>` every time, so `workloads` cannot name it and
+    /// `allow_any` over-answers — see W235 §Seam (c) secret scoping. `key` is
+    /// the hex Ed25519 public key from the recipe's `[admission]` block.
     #[serde(default)]
     pub access: SecretAccess,
 
@@ -3078,6 +4254,8 @@ mod tests {
             connect: None,
             allocatable: None,
             taints: vec![],
+            sovereign_group: None,
+            sovereign_role: None,
         }
     }
 
@@ -3245,15 +4423,15 @@ url = "postgres://shared/analytics"
     /// node (a Pi5), both carrying `tag:build-worker`.
     fn build_worker_fleet() -> CloudConfig {
         make_empty_cfg(vec![
-            make_machine("us-west-002", vec!["tag:build-worker", "tier:x86"]),
-            make_machine("pi5-001", vec!["tag:build-worker", "tier:arm"]),
+            make_machine("us-west-002", vec!["tag:build-worker", "arch:x86"]),
+            make_machine("pi5-001", vec!["tag:build-worker", "arch:arm"]),
         ])
     }
 
     #[test]
     fn admit_workload_routes_amd64_to_x86_worker() {
         let cfg = build_worker_fleet();
-        let ws = ws_with_selector(Some("tag:build-worker,tier:x86"));
+        let ws = ws_with_selector(Some("tag:build-worker,arch:x86"));
         let picked = cfg.admit_workload(&ws).unwrap();
         assert_eq!(picked.name, "us-west-002");
     }
@@ -3261,9 +4439,139 @@ url = "postgres://shared/analytics"
     #[test]
     fn admit_workload_routes_arm64_to_pi5_worker() {
         let cfg = build_worker_fleet();
-        let ws = ws_with_selector(Some("tag:build-worker,tier:arm"));
+        let ws = ws_with_selector(Some("tag:build-worker,arch:arm"));
         let picked = cfg.admit_workload(&ws).unwrap();
         assert_eq!(picked.name, "pi5-001");
+    }
+
+    /// A forge run must be admissible on a build-worker smaller than its own
+    /// cgroup ceiling.
+    ///
+    /// The fleet's arm build-workers are 8 GiB Pi-5s and `for_forge` sets a
+    /// 32 GiB ceiling, so while admission read `resources.memory_mb` as the
+    /// capacity floor this returned "no candidates" and *every* offloaded qed
+    /// step to those nodes failed at dispatch — measured on desktop-release run
+    /// b04cef47, where the aarch64-linux row died in 1.6s. The other
+    /// build-workers (16 GiB us-west-003, and the arm Pi-5s) were excluded the
+    /// same way, leaving one 47 GiB node as the fleet's only legal target for
+    /// remote CI.
+    #[test]
+    fn admit_workload_places_a_forge_run_on_a_worker_smaller_than_its_ceiling() {
+        let mut pi = make_machine("pi5-001", vec!["tag:build-worker", "arch:arm"]);
+        pi.allocatable = Some(NodeAllocatable {
+            memory_mb: 8192,
+            cpu_millis: 4000,
+        });
+        let cfg = make_empty_cfg(vec![pi]);
+
+        let ws = ws_with_selector(Some("tag:build-worker,arch:arm"));
+        assert!(
+            ws.resources.memory_mb > 8192,
+            "precondition: the ceiling must exceed the node, or this proves nothing"
+        );
+
+        let picked = cfg
+            .admit_workload(&ws)
+            .expect("an 8 GiB build-worker must admit a forge run");
+        assert_eq!(picked.name, "pi5-001");
+    }
+
+    /// The floor is still enforced — the fix separates two numbers, it does not
+    /// disable the R572-F5 capacity check.
+    #[test]
+    fn admit_workload_still_rejects_a_node_below_the_declared_request() {
+        let mut tiny = make_machine("tiny-001", vec!["tag:build-worker", "arch:arm"]);
+        tiny.allocatable = Some(NodeAllocatable {
+            memory_mb: 512,
+            cpu_millis: 4000,
+        });
+        let cfg = make_empty_cfg(vec![tiny]);
+
+        let ws = ws_with_selector(Some("tag:build-worker,arch:arm"));
+        assert!(
+            cfg.admit_workload(&ws).is_err(),
+            "a 512 MiB node cannot satisfy a 2 GiB forge request"
+        );
+    }
+
+    // ─── R833-F8 imperative node-selector admission ─────────────────────────
+
+    /// Build a forge WorkloadSpec carrying the R833-F8 imperative node
+    /// selector — the operator's `--where=node:<machine>`.
+    fn ws_pinned_to(node: &str) -> WorkloadSpec {
+        let mut ws = ws_with_selector(None);
+        ws.annotations.insert(
+            velveteen_exec::remote::NODE_SELECTOR_NODE_ANNOTATION.into(),
+            node.into(),
+        );
+        ws
+    }
+
+    /// The ticket's acceptance shape: a named node wins over the
+    /// declaration-order tie-break that would otherwise decide placement.
+    /// `us-west-002` is declared first and carries every tag, so an inferred
+    /// placement lands there; the pin must reach `pi5-001` regardless.
+    #[test]
+    fn admit_workload_honours_an_explicitly_named_node() {
+        let cfg = build_worker_fleet();
+        assert_eq!(
+            cfg.admit_workload(&ws_with_selector(Some("tag:build-worker")))
+                .unwrap()
+                .name,
+            "us-west-002",
+            "precondition: inference elects the first-declared node",
+        );
+        assert_eq!(
+            cfg.admit_workload(&ws_pinned_to("pi5-001")).unwrap().name,
+            "pi5-001",
+        );
+    }
+
+    /// A pin at a machine that is not declared fails loud, naming the
+    /// constraint and the pool — the operator mistyped a node, and silently
+    /// running the build somewhere else is the one outcome that must not
+    /// happen.
+    #[test]
+    fn admit_workload_refuses_a_node_that_is_not_declared() {
+        let cfg = build_worker_fleet();
+        let err = cfg
+            .admit_workload(&ws_pinned_to("us-west-404"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("required.nodes=[us-west-404]"), "{err}");
+        assert!(err.contains("us-west-002"), "the pool must be named: {err}");
+    }
+
+    /// The pin narrows the candidate set; it does not suspend the other axes.
+    /// A named node that cannot fit the workload still refuses, rather than
+    /// being handed work it has no room for.
+    #[test]
+    fn a_pinned_node_is_still_checked_against_capacity() {
+        let mut tiny = make_machine("tiny-001", vec!["tag:build-worker", "arch:arm"]);
+        tiny.allocatable = Some(NodeAllocatable {
+            memory_mb: 512,
+            cpu_millis: 4000,
+        });
+        let cfg = make_empty_cfg(vec![tiny]);
+        assert!(cfg.admit_workload(&ws_pinned_to("tiny-001")).is_err());
+    }
+
+    /// Inference is untouched: with no node annotation the `nodes` axis is
+    /// empty, which is "no constraint" — every pre-R833-F8 workload is admitted
+    /// exactly as before.
+    #[test]
+    fn an_unpinned_workload_carries_no_node_constraint() {
+        assert!(node_selector_node(&ws_with_selector(Some("arch:x86"))).is_none());
+        assert_eq!(
+            node_selector_node(&ws_pinned_to("us-west-003")).as_deref(),
+            Some("us-west-003")
+        );
+        assert!(RequiredSpec::default().is_unconstrained());
+        assert!(!RequiredSpec {
+            nodes: vec!["us-west-003".into()],
+            ..Default::default()
+        }
+        .is_unconstrained());
     }
 
     #[test]
@@ -3271,9 +4579,9 @@ url = "postgres://shared/analytics"
         // Only an arm worker exists; an x86 build must NOT land on it.
         let cfg = make_empty_cfg(vec![make_machine(
             "pi5-001",
-            vec!["tag:build-worker", "tier:arm"],
+            vec!["tag:build-worker", "arch:arm"],
         )]);
-        let ws = ws_with_selector(Some("tag:build-worker,tier:x86"));
+        let ws = ws_with_selector(Some("tag:build-worker,arch:x86"));
         assert!(cfg.admit_workload(&ws).is_err());
     }
 
@@ -3286,7 +4594,7 @@ url = "postgres://shared/analytics"
     /// sort in `load_dir`.
     ///
     /// Live consequence this guards: `.yah/infra/machines/` carries both
-    /// us-west-002 and us-west-003 on `[tag:build-worker, tier:x86, os:linux]`,
+    /// us-west-002 and us-west-003 on `[tag:build-worker, arch:x86, os:linux]`,
     /// so an x86 QED offload has two equal candidates. Unstable selection means
     /// a retried build cannot be relied on to land back on the node whose
     /// working state it left behind.
@@ -3299,7 +4607,7 @@ url = "postgres://shared/analytics"
             format!(
                 r#"name = "{name}"
 provider = "static"
-mesh_tags = ["tag:build-worker", "tier:x86"]
+mesh_tags = ["tag:build-worker", "arch:x86"]
 "#
             )
         };
@@ -3314,7 +4622,7 @@ mesh_tags = ["tag:build-worker", "tier:x86"]
             "machines must load in file-name order, not read_dir order"
         );
 
-        let ws = ws_with_selector(Some("tag:build-worker,tier:x86"));
+        let ws = ws_with_selector(Some("tag:build-worker,arch:x86"));
         assert_eq!(cfg.admit_workload(&ws).unwrap().name, "a-first");
     }
 
@@ -3330,10 +4638,10 @@ mesh_tags = ["tag:build-worker", "tier:x86"]
 
     #[test]
     fn node_selector_mesh_tags_trims_and_drops_empties() {
-        let ws = ws_with_selector(Some(" tag:build-worker , tier:x86 ,"));
+        let ws = ws_with_selector(Some(" tag:build-worker , arch:x86 ,"));
         assert_eq!(
             node_selector_mesh_tags(&ws),
-            vec!["tag:build-worker".to_string(), "tier:x86".to_string()]
+            vec!["tag:build-worker".to_string(), "arch:x86".to_string()]
         );
         assert!(node_selector_mesh_tags(&ws_with_selector(None)).is_empty());
     }
@@ -3464,6 +4772,8 @@ mesh_tags = ["tag:cloud-runner"]
             connect: None,
             allocatable: None,
             taints: vec![],
+            sovereign_group: None,
+            sovereign_role: None,
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: MachineConfig = toml::from_str(&s).unwrap();
@@ -3668,6 +4978,8 @@ mesh_tags = ["tag:cloud-runner"]
             connect: None,
             allocatable: None,
             taints: vec![],
+            sovereign_group: None,
+            sovereign_role: None,
         };
         // Land in the legacy tree so the legacy machine loader picks it up.
         machine.save(&cloud_dir).unwrap();
@@ -4145,6 +5457,8 @@ mesh_tags = ["tag:cloud-runner"]
             connect: None,
             allocatable: None,
             taints: vec![],
+            sovereign_group: None,
+            sovereign_role: None,
         };
         machine.save(root).unwrap();
 
@@ -4619,15 +5933,16 @@ mesh_ipv4 = "100.64.0.9"
         assert_eq!(cfg.yubaba_url().as_deref(), Some("http://100.64.0.9:9443"));
     }
 
-    /// R707-T6: the case no other test here exercises — a node that declares
-    /// BOTH a non-loopback `[connect].yubaba` literal AND a registered
-    /// `mesh_ipv4` (us-west-014's shape: mesh-joined, but its raft peers are
-    /// LAN-only so the literal is what `rollout::yubaba::membership_to_nodes`
-    /// needs). The declared literal must win — that's the whole point of the
-    /// flip; before it, `mesh_ipv4` unconditionally won and this node's LAN
-    /// URL was unreachable through `yubaba_url()`.
+    /// R605-T10 inverts R707-T6 for the private-literal case, and this is the
+    /// node it was inverted for: us-west-014's shape, mesh-joined AND declaring
+    /// a LAN `[connect].yubaba`. R707-T6 made the literal win outright so
+    /// `rollout::yubaba::membership_to_nodes` could match the dev group's
+    /// LAN-addressed raft membership — which fused identity into reach and made
+    /// every automated dial go to an address only bldg-2506 can route.
+    /// `lan_endpoint()` now serves that match, so the mesh address wins the
+    /// dial and the literal is inert.
     #[test]
-    fn a_declared_literal_wins_over_a_registered_mesh_address() {
+    fn a_private_literal_loses_to_the_registered_mesh_address() {
         let src = r#"
 name = "us-west-014"
 provider = "static"
@@ -4645,9 +5960,77 @@ mesh_ipv4 = "100.64.0.6"
         assert_eq!(cfg.mesh_ipv4(), Some("100.64.0.6"), "still mesh-joined");
         assert_eq!(
             cfg.yubaba_url().as_deref(),
-            Some("http://192.168.10.14:7443"),
-            "the declared LAN literal must win over the registered mesh address"
+            Some("http://100.64.0.6:7443"),
+            "automation dials the mesh, never the LAN literal"
         );
+        assert_eq!(
+            cfg.lan_endpoint().as_deref(),
+            Some("192.168.10.14:7443"),
+            "the LAN address is still recorded — as identity, not as reach"
+        );
+    }
+
+    /// The refusal R605-T10 asks for: a node whose ONLY declared reach is a LAN
+    /// literal is unresolvable, and says so by name rather than returning a URL
+    /// that will time out. us-west-011's shape before this ticket.
+    #[test]
+    fn a_lan_only_node_refuses_with_a_named_reason() {
+        let src = r#"
+name = "us-west-011"
+provider = "static"
+mesh_tags = []
+
+[connect]
+address = "192.168.10.11"
+ssh = "yah@192.168.10.11"
+yubaba = "http://192.168.10.11:7443"
+"#;
+        let cfg: MachineConfig = toml::from_str(src).unwrap();
+        assert_eq!(cfg.yubaba_url(), None);
+        let err = cfg.reach().unwrap_err();
+        assert!(err.contains("us-west-011"), "{err}");
+        assert!(err.contains("192.168.10.11"), "{err}");
+        assert!(err.contains("mesh_ipv4"), "{err}");
+    }
+
+    /// The loopback placeholder is a genuine declaration ("reach me through the
+    /// SSH tunnel"), not a LAN literal — 127/8 is not RFC1918. It must keep
+    /// resolving verbatim; `hub::coordinator::is_loopback_url` is what judges it
+    /// downstream.
+    #[test]
+    fn a_loopback_placeholder_still_resolves_verbatim() {
+        let src = r#"
+name = "m"
+provider = "static"
+mesh_tags = []
+
+[connect]
+address = "192.168.10.99"
+ssh = "yah@192.168.10.99"
+yubaba = "http://127.0.0.1:7443"
+"#;
+        let cfg: MachineConfig = toml::from_str(src).unwrap();
+        assert_eq!(cfg.yubaba_url().as_deref(), Some("http://127.0.0.1:7443"));
+    }
+
+    #[test]
+    fn private_ranges_are_exactly_rfc1918() {
+        for lan in [
+            "http://192.168.10.11:7443",
+            "http://10.0.0.5:7443",
+            "http://172.16.4.1:7443",
+        ] {
+            assert!(private_ipv4_from_url(lan).is_some(), "{lan}");
+        }
+        for not_lan in [
+            "http://100.64.0.6:7443",  // mesh
+            "http://127.0.0.1:7443",   // loopback
+            "http://172.32.0.1:7443",  // just past 172.16/12
+            "http://45.32.194.254:80", // public
+            "http://us-west-001:7443", // name, not a literal
+        ] {
+            assert!(private_ipv4_from_url(not_lan).is_none(), "{not_lan}");
+        }
     }
 
     /// `normalize` migrates in place: the legacy fingerprint moves into
@@ -4984,15 +6367,17 @@ use = "orbstack"
         // full WorkloadSpec is verbose, so this test asserts the new
         // mesofact-static abbreviated form parses as raw TOML (B3 will plumb
         // it through WorkloadSpec proper).
+        // `routes` above [build] — it is a top-level field, and TOML would
+        // scope it into that table if written below the header (R658-B1).
         let src = r#"
 schema_version = 1
 kind = "mesofact-static"
 
+routes = "./routes.ts"
+
 [build]
 command = "bun run build"
 out_dir = "dist"
-
-routes = "./routes.ts"
 "#;
         let v: toml::Value = toml::from_str(src).unwrap();
         assert_eq!(
@@ -5027,6 +6412,7 @@ routes = "./routes.ts"
             domain: "yah.dev".into(),
             db: DbCatalog::default(),
             components: vec![ServiceComponent {
+                mount: None,
                 id: "site".into(),
                 kind: "mesofact-static".into(),
                 path: "app/yah/web".into(),
@@ -5135,6 +6521,7 @@ routes = "./routes.ts"
             shape: MirrorShape::SingleMachine,
             providers: providers_map,
             ingress: Default::default(),
+            ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: Default::default(),
         };
@@ -5176,6 +6563,7 @@ routes = "./routes.ts"
             shape: MirrorShape::Local,
             providers: BTreeMap::new(),
             ingress: Default::default(),
+            ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: Default::default(),
         }
@@ -5214,6 +6602,7 @@ routes = "./routes.ts"
                 shape: MirrorShape::Local,
                 providers: BTreeMap::new(),
                 ingress: Default::default(),
+                ingress_machines: Vec::new(),
                 drivers: Default::default(),
                 asset_aliases: Default::default(),
             }
@@ -5242,6 +6631,7 @@ routes = "./routes.ts"
             domain: "yah.dev".into(),
             db: DbCatalog::default(),
             components: vec![ServiceComponent {
+                mount: None,
                 id: "site".into(),
                 kind: "mesofact-static".into(),
                 path: "app/yah/web".into(),
@@ -5265,12 +6655,14 @@ routes = "./routes.ts"
             worker_bundle_path: Some(".yah/workers/yah-dev/".into()),
             routes: vec![
                 DomainRoute {
+                    headers: Default::default(),
                     path: "/".into(),
                     mode: RouteMode::Static {
                         component: "yah-marketing/site".into(),
                     },
                 },
                 DomainRoute {
+                    headers: Default::default(),
                     path: "/dashboard/api/*".into(),
                     mode: RouteMode::Backend {
                         component: "yah-dashboard/api".into(),
@@ -5278,6 +6670,7 @@ routes = "./routes.ts"
                     },
                 },
                 DomainRoute {
+                    headers: Default::default(),
                     path: "/old".into(),
                     mode: RouteMode::Redirect {
                         target: "https://yah.dev/blog".into(),
@@ -5337,6 +6730,7 @@ target = "https://yah.dev/blog"
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                headers: Default::default(),
                 path: "/".into(),
                 mode: RouteMode::Static {
                     component: "yah-marketing/site".into(),
@@ -5455,6 +6849,224 @@ worker_bundle_path = ".yah/workers/cdn-yah-dev/"
         assert!(err.contains("worker_bundle_path"), "{err}");
     }
 
+    // ── R746: per-route response headers + component mounts ──────────────────
+
+    /// A two-component service: `site` at the root, `app` mounted at `/app`
+    /// with isolation headers on its route. This is the noisetable.com shape
+    /// the primitive was built for.
+    fn write_two_component_service(root: &Path) {
+        let svc = ServiceConfig {
+            schema_version: 1,
+            name: "yah-marketing".into(),
+            domain: "yah.dev".into(),
+            db: DbCatalog::default(),
+            components: vec![
+                ServiceComponent {
+                    mount: None,
+                    id: "site".into(),
+                    kind: "mesofact-static".into(),
+                    path: "app/yah/web".into(),
+                    role: "static".into(),
+                    publishes: None,
+                    wave: 0,
+                    git: None,
+                },
+                ServiceComponent {
+                    mount: Some("/app".into()),
+                    id: "app".into(),
+                    kind: "mesofact-static".into(),
+                    path: "app/browser".into(),
+                    role: "static".into(),
+                    publishes: None,
+                    wave: 0,
+                    git: None,
+                },
+            ],
+        };
+        svc.save(root).unwrap();
+    }
+
+    const MOUNTED_DOMAIN: &str = r#"
+schema_version = 1
+name = "yah-dev"
+domain = "yah.dev"
+front_door = "worker"
+cdn_bucket = "yah-dev"
+
+[[routes]]
+path = "/app/*"
+mode = "static"
+component = "yah-marketing/app"
+headers = { "Cross-Origin-Opener-Policy" = "same-origin", "Cross-Origin-Embedder-Policy" = "require-corp" }
+
+[[routes]]
+path = "/*"
+mode = "static"
+component = "yah-marketing/site"
+"#;
+
+    #[test]
+    fn a_mounted_component_routed_at_its_mount_loads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_two_component_service(root);
+        write_domain_toml(root, "yah-dev", MOUNTED_DOMAIN);
+        let cfg = CloudConfig::load(root).unwrap();
+        let dom = cfg.domain("yah-dev").unwrap();
+        assert_eq!(dom.routes.len(), 2);
+        assert_eq!(
+            dom.routes[0].headers.get("Cross-Origin-Opener-Policy").map(String::as_str),
+            Some("same-origin")
+        );
+        assert!(dom.routes[1].headers.is_empty());
+    }
+
+    /// The header table reaches the Worker in MANIFEST order with headerless
+    /// routes dropped. Order is the whole contract — the front door applies the
+    /// first match, so `/app/*` before `/*` is what isolates the app without
+    /// isolating the marketing site.
+    #[test]
+    fn route_headers_json_preserves_order_and_drops_headerless_routes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_two_component_service(root);
+        write_domain_toml(root, "yah-dev", MOUNTED_DOMAIN);
+        let cfg = CloudConfig::load(root).unwrap();
+        let json = cfg.domain("yah-dev").unwrap().route_headers_json();
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let rules = parsed.as_array().unwrap();
+        assert_eq!(rules.len(), 1, "the headerless catch-all is dropped: {json}");
+        assert_eq!(rules[0]["path"], "/app/*");
+        assert_eq!(rules[0]["headers"]["Cross-Origin-Embedder-Policy"], "require-corp");
+    }
+
+    #[test]
+    fn route_headers_json_is_an_empty_array_when_nothing_declares_headers() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_marketing_service(root);
+        write_domain_toml(
+            root,
+            "yah-dev",
+            r#"
+schema_version = 1
+name = "yah-dev"
+domain = "yah.dev"
+front_door = "worker"
+cdn_bucket = "yah-dev"
+
+[[routes]]
+path = "/*"
+mode = "static"
+component = "yah-marketing/site"
+"#,
+        );
+        let cfg = CloudConfig::load(root).unwrap();
+        assert_eq!(cfg.domain("yah-dev").unwrap().route_headers_json(), "[]");
+    }
+
+    /// The reconciler's own entry point: given a workspace root and a service
+    /// name, produce the binding value. `"[]"` when nothing routes the service.
+    #[test]
+    fn route_headers_for_service_reads_the_workspace_domains() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_two_component_service(root);
+        write_domain_toml(root, "yah-dev", MOUNTED_DOMAIN);
+        assert!(route_headers_for_service(root, "yah-marketing")
+            .unwrap()
+            .contains("require-corp"));
+        assert_eq!(route_headers_for_service(root, "some-other-svc").unwrap(), "[]");
+    }
+
+    /// A `bucket-direct` domain has no front door to set headers on, so it must
+    /// not be picked up as a service's header source.
+    #[test]
+    fn route_headers_ignores_domains_that_are_not_route_driven() {
+        let doms: BTreeMap<String, DomainConfig> = [(
+            "cdn".to_string(),
+            DomainConfig {
+                schema_version: 1,
+                name: "cdn".into(),
+                domain: "cdn.yah.dev".into(),
+                front_door: FrontDoor::BucketDirect,
+                cdn_bucket: "yah-dev".into(),
+                worker_bundle_path: None,
+                routes: vec![],
+            },
+        )]
+        .into_iter()
+        .collect();
+        assert!(domain_serving_service(&doms, "yah-marketing").is_none());
+    }
+
+    #[test]
+    fn a_mount_that_disagrees_with_its_route_path_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_two_component_service(root);
+        write_domain_toml(
+            root,
+            "yah-dev",
+            r#"
+schema_version = 1
+name = "yah-dev"
+domain = "yah.dev"
+front_door = "worker"
+cdn_bucket = "yah-dev"
+
+[[routes]]
+path = "/studio/*"
+mode = "static"
+component = "yah-marketing/app"
+"#,
+        );
+        let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
+        assert!(err.contains("mount = \"/app\""), "{err}");
+        assert!(err.contains("/studio/*"), "{err}");
+    }
+
+    /// The other direction: routing an unmounted component under a sub-path
+    /// points requests at a prefix nothing published to.
+    #[test]
+    fn routing_an_unmounted_component_under_a_subpath_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_marketing_service(root);
+        write_domain_toml(
+            root,
+            "yah-dev",
+            r#"
+schema_version = 1
+name = "yah-dev"
+domain = "yah.dev"
+front_door = "worker"
+cdn_bucket = "yah-dev"
+
+[[routes]]
+path = "/docs/*"
+mode = "static"
+component = "yah-marketing/site"
+"#,
+        );
+        let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
+        assert!(err.contains("no `mount`"), "{err}");
+        assert!(err.contains("/docs"), "{err}");
+    }
+
+    #[test]
+    fn mount_and_route_prefix_normalization_agree() {
+        for m in ["/app", "app", "app/", "/app/"] {
+            assert_eq!(normalize_mount(m), "app", "mount {m:?}");
+        }
+        assert_eq!(normalize_mount("/"), "");
+        assert_eq!(route_path_prefix("/*"), "");
+        assert_eq!(route_path_prefix("/app/*"), "app");
+        assert_eq!(route_path_prefix("/app"), "app");
+        assert_eq!(route_path_prefix("/"), "");
+    }
+
     #[test]
     fn worker_with_no_routes_is_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -5530,6 +7142,7 @@ cdn_bucket = "yah-dev"
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                headers: Default::default(),
                 path: "/*".into(),
                 mode: RouteMode::Static {
                     component: "yah-marketing/site".into(),
@@ -5562,6 +7175,7 @@ cdn_bucket = "yah-dev"
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                headers: Default::default(),
                 path: "/".into(),
                 mode: RouteMode::Static {
                     component: "yah-marketing/site".into(),
@@ -5590,6 +7204,7 @@ cdn_bucket = "yah-dev"
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                headers: Default::default(),
                 path: "/".into(),
                 mode: RouteMode::Static {
                     component: "yah-marketing/elsewhere".into(),
@@ -5618,6 +7233,7 @@ cdn_bucket = "yah-dev"
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                headers: Default::default(),
                 path: "/".into(),
                 mode: RouteMode::Static {
                     component: "no-slash-here".into(),
@@ -5645,6 +7261,7 @@ cdn_bucket = "yah-dev"
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                headers: Default::default(),
                 path: "/old".into(),
                 mode: RouteMode::Redirect {
                     target: "https://yah.dev/blog".into(),
@@ -5699,6 +7316,7 @@ cdn_bucket = "yah-dev"
             cdn_bucket: "net-yah-dev".into(), // shared per-tier bucket
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                headers: Default::default(),
                 path: "/*".into(),
                 mode: RouteMode::Static {
                     component: "yah-marketing/site".into(),
@@ -5777,19 +7395,454 @@ taints = ["no-appliance"]
     #[test]
     fn machine_multiple_taints_round_trip() {
         let toml_src = r#"
-name = "us-west-002"
+name = "quarantined"
 provider = "static"
 mesh_tags = ["tag:build-worker"]
-taints = ["no-server", "no-appliance", "no-voter"]
+taints = ["no-server", "no-appliance", "no-job"]
 "#;
         let m: MachineConfig = toml::from_str(toml_src).unwrap();
         assert_eq!(m.taints.len(), 3);
         assert!(m.taints.contains(&"no-server".to_string()));
         assert!(m.taints.contains(&"no-appliance".to_string()));
-        assert!(m.taints.contains(&"no-voter".to_string()));
+        assert!(m.taints.contains(&"no-job".to_string()));
+        // R742-T4: every key here is one the scheduler reads. This fixture
+        // used to carry `no-voter`, which none of them is.
+        assert!(m.inert_taints().is_empty());
     }
 
-    // ─── R572-F5: capacity floor + repel-unless-tolerate taints ─────────────
+    // ─── R742-T4 (W305): inert-taint classification ─────────────────────────
+
+    #[test]
+    fn every_archetype_repel_key_is_live() {
+        for arch in LifecycleArchetype::ALL {
+            let key = format!("no-{}", arch.taint_key());
+            assert_eq!(
+                taint_effect(&key),
+                TaintEffect::Repels(arch),
+                "{key} must repel {arch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_ip_is_an_affinity_key_not_an_inert_one() {
+        assert_eq!(
+            taint_effect(workload_spec::PUBLIC_IP_TAINT),
+            TaintEffect::Attracts
+        );
+    }
+
+    #[test]
+    fn a_free_form_taint_is_inert_and_says_so() {
+        // W305's headline example: `taints = ["qa"]` parsed clean and did
+        // nothing. Environment is not expressible as a taint.
+        assert_eq!(taint_effect("qa"), TaintEffect::Inert);
+        // And the one that actually cost fleet state: `no-voter` reads as an
+        // exclusion and excludes nothing — "voter" is not an archetype.
+        assert_eq!(taint_effect("no-voter"), TaintEffect::Inert);
+        // A near-miss on a real key is inert too, not silently forgiven.
+        assert_eq!(taint_effect("no-servers"), TaintEffect::Inert);
+
+        let m = make_machine_with_capacity(
+            "dev-pi",
+            8192,
+            4000,
+            vec!["no-appliance", "no-voter", "qa"],
+        );
+        assert_eq!(m.inert_taints(), vec!["no-voter", "qa"]);
+    }
+
+    #[test]
+    fn an_inert_taint_changes_no_placement_decision() {
+        // The reason this is a lint and not a behaviour change: the guard's
+        // whole premise is that these keys are invisible to `matches`.
+        let clean = make_machine_with_capacity("n", 8192, 4000, vec![]);
+        let noisy = make_machine_with_capacity("n", 8192, 4000, vec!["no-voter", "qa"]);
+        for arch in LifecycleArchetype::ALL {
+            let req = RequiredSpec {
+                repel_archetype: Some(arch),
+                ..Default::default()
+            };
+            assert_eq!(req.matches(&clean), req.matches(&noisy));
+        }
+    }
+
+    #[test]
+    fn live_taint_keys_lists_the_whole_legal_vocabulary() {
+        assert_eq!(
+            live_taint_keys(),
+            vec!["no-appliance", "no-job", "no-server", "public-ip"]
+        );
+    }
+
+    // ─── R742-F1 (W305): sovereign groups ───────────────────────────────────
+
+    /// A machine in `group`, with the role left unwritten — which is the state
+    /// of every machine TOML that predates R605-F12 and resolves to `voter`.
+    fn in_group(name: &str, group: Option<&str>) -> MachineConfig {
+        MachineConfig {
+            sovereign_group: group.map(String::from),
+            ..make_machine(name, vec![])
+        }
+    }
+
+    /// A machine in `group` with its quorum eligibility stated (R605-F12).
+    fn in_group_as(name: &str, group: &str, role: SovereignRole) -> MachineConfig {
+        MachineConfig {
+            sovereign_group: Some(group.to_string()),
+            sovereign_role: Some(role),
+            ..make_machine(name, vec![])
+        }
+    }
+
+    #[test]
+    fn a_join_within_one_sovereign_group_is_permitted() {
+        assert_eq!(
+            judge_join(
+                &in_group("us-west-013", Some("dev")),
+                &in_group("us-west-011", Some("dev")),
+            ),
+            JoinVerdict::Permit
+        );
+    }
+
+    /// The case the field exists for: before it, the only thing standing
+    /// between a dev Pi and the prod quorum was a comment in a TOML.
+    #[test]
+    fn a_cross_group_join_is_refused_naming_both_groups() {
+        let verdict = judge_join(
+            &in_group("us-west-011", Some("dev")),
+            &in_group("us-west-001", Some("prod")),
+        );
+        let JoinVerdict::Refuse(msg) = verdict else {
+            panic!("a dev node joining prod must be refused: {verdict:?}");
+        };
+        // A refusal that does not name what it saw is one the operator has to
+        // go and reconstruct, so it gets worked around instead of fixed.
+        assert!(msg.contains("us-west-011") && msg.contains("us-west-001"), "{msg}");
+        assert!(msg.contains("dev") && msg.contains("prod"), "{msg}");
+    }
+
+    /// `None` is a declaration ("standalone, in no group"), not a gap — so
+    /// growing prod with an unstamped box is a cross-group join too, and the
+    /// refusal has to say which file makes it legal.
+    #[test]
+    fn an_undeclared_node_cannot_join_a_declared_group() {
+        let verdict = judge_join(
+            &in_group("us-west-002", None),
+            &in_group("us-west-001", Some("prod")),
+        );
+        let JoinVerdict::Refuse(msg) = verdict else {
+            panic!("an unstamped node joining prod must be refused: {verdict:?}");
+        };
+        assert!(
+            msg.contains(".yah/infra/machines/us-west-002.toml"),
+            "the refusal must name the file to stamp: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_declared_node_cannot_join_a_standalone_target() {
+        // us-west-003 is `mode: standalone` on purpose; it is not a group of
+        // one waiting to be grown.
+        let verdict = judge_join(
+            &in_group("us-west-001", Some("prod")),
+            &in_group("us-west-003", None),
+        );
+        assert!(matches!(verdict, JoinVerdict::Refuse(msg) if msg.contains("us-west-003")));
+    }
+
+    #[test]
+    fn two_undeclared_nodes_cannot_form_an_undeclared_group() {
+        let verdict = judge_join(
+            &in_group("us-west-002", None),
+            &in_group("us-west-015", None),
+        );
+        assert!(
+            matches!(&verdict, JoinVerdict::Refuse(msg) if msg.contains("us-west-002")
+                && msg.contains("us-west-015")),
+            "forming a group nobody declared must be refused, naming both: {verdict:?}"
+        );
+    }
+
+    // ─── R605-F12: the voting axis ──────────────────────────────────────────
+
+    /// The whole ticket in one assertion. us-west-003 is a member of prod —
+    /// same secrets, same upgrade cadence, same destruction — and must never
+    /// hold a prod raft seat. Before the role axis, the only thing refusing it
+    /// was its *absent* group stamp, so writing down the truth above would have
+    /// removed the guard.
+    #[test]
+    fn a_non_voting_member_is_refused_into_its_own_group() {
+        let verdict = judge_join(
+            &in_group_as("us-west-003", "prod", SovereignRole::NonVoter),
+            &in_group_as("us-west-001", "prod", SovereignRole::Voter),
+        );
+        let JoinVerdict::Refuse(msg) = verdict else {
+            panic!("a non-voting prod member must not join the prod quorum: {verdict:?}");
+        };
+        assert!(msg.contains("us-west-003") && msg.contains("NON-VOTING"), "{msg}");
+        // The refusal must not blame the group: both sides say "prod", and a
+        // cross-group message here would read as a bug in the check itself.
+        assert!(!msg.contains("cross-group"), "{msg}");
+        assert!(
+            msg.contains(".yah/infra/machines/us-west-003.toml"),
+            "the refusal must name the file that decides it: {msg}"
+        );
+    }
+
+    /// Read from the other end: a box declared non-voting has no quorum seat to
+    /// be grown, so it cannot be a join target either.
+    #[test]
+    fn a_non_voting_target_has_no_quorum_to_grow() {
+        let verdict = judge_join(
+            &in_group_as("us-west-001", "prod", SovereignRole::Voter),
+            &in_group_as("us-west-003", "prod", SovereignRole::NonVoter),
+        );
+        assert!(
+            matches!(&verdict, JoinVerdict::Refuse(msg) if msg.contains("the target")
+                && msg.contains("us-west-003")),
+            "{verdict:?}"
+        );
+    }
+
+    /// A non-voter joining a *standalone* target is refused for two reasons at
+    /// once, and the message must pick the one whose fix would actually work.
+    /// Naming the role here would send the operator to flip `sovereign_role`
+    /// and come back to the same refusal.
+    #[test]
+    fn a_refusal_names_the_group_when_fixing_the_role_would_not_help() {
+        let verdict = judge_join(
+            &in_group_as("us-west-003", "prod", SovereignRole::NonVoter),
+            &in_group("us-west-002", None),
+        );
+        let JoinVerdict::Refuse(msg) = verdict else {
+            panic!("a standalone target has no group to join: {verdict:?}");
+        };
+        assert!(
+            msg.contains(".yah/infra/machines/us-west-002.toml"),
+            "the refusal must point at the target's missing group stamp: {msg}"
+        );
+        assert!(!msg.contains("NON-VOTING"), "{msg}");
+    }
+
+    /// The back-compat seam, pinned: the six nodes stamped before R605-F12
+    /// write no role, and an absent role means what declaring a group has
+    /// always meant. If this flips, the live prod and dev quorums stop being
+    /// growable on a config the operator never edited.
+    #[test]
+    fn an_unwritten_role_still_joins_its_group() {
+        let joiner = in_group("us-west-013", Some("dev"));
+        assert_eq!(joiner.sovereign_role, None);
+        assert_eq!(
+            judge_join(&joiner, &in_group("us-west-011", Some("dev"))),
+            JoinVerdict::Permit
+        );
+        assert_eq!(
+            judge_join(
+                &joiner,
+                &in_group_as("us-west-011", "dev", SovereignRole::Voter)
+            ),
+            JoinVerdict::Permit
+        );
+    }
+
+    /// A non-voting member is still a *member*, and the two claims must not be
+    /// conflated: `sovereign_membership()` reports the group either way, so a
+    /// consumer asking "is this box in prod's blast radius" gets yes.
+    #[test]
+    fn a_non_voter_is_still_in_the_group_it_names() {
+        let m = in_group_as("us-west-003", "prod", SovereignRole::NonVoter);
+        assert_eq!(m.sovereign_membership().group, Some("prod"));
+        assert!(!m.sovereign_membership().role.is_voter());
+
+        // …and the group-membership query the fleet reads is unaffected by it.
+        let cfg = make_empty_cfg(vec![
+            m,
+            in_group_as("us-west-001", "prod", SovereignRole::Voter),
+        ]);
+        assert_eq!(
+            cfg.machines_in_group("prod")
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["us-west-003", "us-west-001"]
+        );
+    }
+
+    /// The role travels through TOML in one spelling, and an absent one stays
+    /// absent on the way back out — otherwise every machine file would grow a
+    /// `sovereign_role = "voter"` line the operator never wrote, and the
+    /// unroled-member lint would have nothing left to find.
+    #[test]
+    fn sovereign_role_round_trips_and_is_omitted_when_unwritten() {
+        let m: MachineConfig = toml::from_str(
+            r#"
+name = "us-west-003"
+provider = "static"
+region = "us-west"
+arch = "x86_64"
+mesh_tags = []
+sovereign_group = "prod"
+sovereign_role = "non-voter"
+"#,
+        )
+        .unwrap();
+        assert_eq!(m.sovereign_role, Some(SovereignRole::NonVoter));
+        assert!(toml::to_string(&m)
+            .unwrap()
+            .contains(r#"sovereign_role = "non-voter""#));
+
+        let unwritten = MachineConfig {
+            sovereign_role: None,
+            ..m
+        };
+        assert!(!toml::to_string(&unwritten)
+            .unwrap()
+            .contains("sovereign_role"));
+    }
+
+    /// The invariant the ticket is most explicit about: a sovereign group is a
+    /// blast radius, not a filter. If this ever fails, `matches` has grown an
+    /// axis it must not have and dev-mode workloads have silently become
+    /// unschedulable on the dev group.
+    #[test]
+    fn sovereign_group_is_not_a_placement_input() {
+        let standalone = in_group("n", None);
+        let grouped = in_group("n", Some("dev"));
+        let other = in_group("n", Some("prod"));
+
+        for spec in [
+            RequiredSpec::default(),
+            RequiredSpec {
+                regions: vec!["us-west".into()],
+                ..Default::default()
+            },
+            RequiredSpec {
+                repel_archetype: Some(LifecycleArchetype::Appliance),
+                ..Default::default()
+            },
+        ] {
+            let baseline = spec.matches(&standalone);
+            assert_eq!(spec.matches(&grouped), baseline);
+            assert_eq!(spec.matches(&other), baseline);
+        }
+    }
+
+    // ─── R742-F3 (W305): group → machine set, and group-scoped admission ────
+
+    /// The primitive `migrate --to` needs and `rollout plan` still lacks
+    /// (W314 gap 1): a group exists only as the set of machines naming it, so
+    /// membership has to be derived rather than declared anywhere.
+    #[test]
+    fn machines_in_group_derives_membership_from_the_declarations() {
+        let cfg = make_empty_cfg(vec![
+            in_group("us-west-001", Some("prod")),
+            in_group("us-west-011", Some("dev")),
+            in_group("us-west-013", Some("dev")),
+            in_group("us-west-002", None),
+        ]);
+
+        let dev: Vec<&str> = cfg
+            .machines_in_group("dev")
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(dev, vec!["us-west-011", "us-west-013"]);
+        assert_eq!(cfg.machines_in_group("prod").len(), 1);
+
+        // Standalone is "in no group", not "in a group called none" — so an
+        // unstamped box is never swept into a migration target.
+        assert!(cfg.machines_in_group("").is_empty());
+        assert!(cfg.machines_in_group("staging").is_empty());
+    }
+
+    #[test]
+    fn declared_sovereign_groups_is_the_vocabulary_a_bad_target_is_named_against() {
+        let cfg = make_empty_cfg(vec![
+            in_group("a", Some("prod")),
+            in_group("b", Some("dev")),
+            in_group("c", Some("prod")),
+            in_group("d", None),
+        ]);
+        // Sorted + deduped, and standalone contributes nothing.
+        assert_eq!(cfg.declared_sovereign_groups(), vec!["dev", "prod"]);
+        assert!(make_empty_cfg(vec![in_group("a", None)])
+            .declared_sovereign_groups()
+            .is_empty());
+    }
+
+    /// Group-scoped admission must be the SAME predicate as unscoped
+    /// admission, only over fewer candidates. If it ever diverges, `migrate`
+    /// becomes a way to place a workload somewhere `yah cloud apply` would
+    /// refuse — which is exactly the silent routing-around W305 exists to stop.
+    #[test]
+    fn admit_workload_in_group_narrows_candidates_without_changing_the_predicate() {
+        let mut prod = in_group("us-west-001", Some("prod"));
+        prod.mesh_tags = vec!["tag:cloud-runner".into()];
+        let mut dev_repels = in_group("us-west-011", Some("dev"));
+        dev_repels.taints = vec!["no-appliance".into()];
+        let mut dev_ok = in_group("us-west-013", Some("dev"));
+        dev_ok.mesh_tags = vec!["tag:cloud-runner".into()];
+
+        let cfg = make_empty_cfg(vec![prod, dev_repels, dev_ok]);
+
+        let mut ws = ws_with_selector(None);
+        ws.archetype = Some(LifecycleArchetype::Appliance);
+
+        // Unscoped picks the first match in declaration order.
+        assert_eq!(cfg.admit_workload(&ws).unwrap().name, "us-west-001");
+        // Scoped skips the repelling dev node and lands on the other one —
+        // the taint is honoured, not bypassed.
+        assert_eq!(
+            cfg.admit_workload_in_group(&ws, "dev").unwrap().name,
+            "us-west-013"
+        );
+    }
+
+    #[test]
+    fn admit_workload_in_group_distinguishes_an_empty_group_from_a_repelling_one() {
+        let mut dev = in_group("us-west-011", Some("dev"));
+        dev.taints = vec!["no-appliance".into()];
+        let cfg = make_empty_cfg(vec![in_group("us-west-001", Some("prod")), dev]);
+
+        let mut ws = ws_with_selector(None);
+        ws.archetype = Some(LifecycleArchetype::Appliance);
+
+        // A group nobody declares names the legal vocabulary, because a typo
+        // is the realistic cause and "no candidates" would send the operator
+        // hunting for a placement problem that does not exist.
+        let missing = cfg.admit_workload_in_group(&ws, "stagng").unwrap_err().to_string();
+        assert!(missing.contains("no machine declares"), "{missing}");
+        assert!(missing.contains("dev") && missing.contains("prod"), "{missing}");
+
+        // A group that exists but refuses names the machines it tried.
+        let repelled = cfg.admit_workload_in_group(&ws, "dev").unwrap_err().to_string();
+        assert!(repelled.contains("us-west-011"), "{repelled}");
+    }
+
+    #[test]
+    fn sovereign_group_round_trips_and_is_omitted_when_standalone() {
+        let src = r#"
+name = "us-west-011"
+provider = "static"
+mesh_tags = []
+sovereign_group = "dev"
+"#;
+        let m: MachineConfig = toml::from_str(src).unwrap();
+        assert_eq!(m.sovereign_group.as_deref(), Some("dev"));
+        assert!(toml::to_string(&m).unwrap().contains("sovereign_group"));
+
+        // A machine that predates the field parses as standalone and does not
+        // grow the key back on write.
+        let legacy: MachineConfig =
+            toml::from_str("name = \"us-west-002\"\nprovider = \"static\"\nmesh_tags = []\n")
+                .unwrap();
+        assert_eq!(legacy.sovereign_group, None);
+        assert!(!toml::to_string(&legacy).unwrap().contains("sovereign_group"));
+    }
+
+    // ─── R572-F5: capacity floor + absolute (untolerable) taints ────────────
 
     fn make_machine_with_capacity(
         name: &str,
@@ -5826,6 +7879,15 @@ taints = ["no-server", "no-appliance", "no-voter"]
             cpu_millis,
             ephemeral_storage_mb: 0,
         };
+        // These are SERVER specs that borrow `for_forge` as a constructor
+        // shortcut, so drop the forge memory request it stamps on — otherwise
+        // every spec here silently requests the forge default instead of the
+        // `memory_mb` the caller passed, and the capacity-floor tests below
+        // stop testing their own argument. A server workload declares no
+        // request, which is the documented fall-back-to-`resources.memory_mb`
+        // path (`WorkloadSpec::memory_request_mb`).
+        ws.annotations
+            .remove(workload_spec::MEMORY_REQUEST_ANNOTATION);
         ws
     }
 
@@ -5934,14 +7996,14 @@ taints = ["no-server", "no-appliance", "no-voter"]
         // Full W244 fleet table scenario:
         // us-west-001/east-001: no taints, large capacity → appliance lands here
         // us-south-001: no-appliance taint → appliance rejected
-        // us-west-002: no-server, no-appliance, no-voter → appliance rejected
+        // us-west-002: no-server, no-appliance → appliance rejected
         let cfg = make_empty_cfg(vec![
             make_machine_with_capacity("us-south-001", 512, 1000, vec!["no-appliance"]),
             make_machine_with_capacity(
                 "us-west-002",
                 16384,
                 8000,
-                vec!["no-server", "no-appliance", "no-voter"],
+                vec!["no-server", "no-appliance"],
             ),
             make_machine_with_capacity("us-west-001", 4096, 4000, vec![]),
         ]);
@@ -5960,15 +8022,17 @@ taints = ["no-server", "no-appliance", "no-voter"]
                 "us-west-002",
                 16384,
                 8000,
-                vec!["no-server", "no-appliance", "no-voter"],
+                vec!["no-server", "no-appliance"],
             ),
         ]);
         let mut ws = server_spec(256, 500);
         ws.archetype = Some(LifecycleArchetype::Job);
-        // Jobs tolerate all fleet taints; west-001 comes first in declaration
-        // order (greedy, no preference), which is the expected tie-break.
+        // No fleet node declares `no-job`, so a Job is repelled by nothing;
+        // west-001 comes first in declaration order (greedy, no preference),
+        // which is the expected tie-break. Note this is *absence of a repel
+        // key*, not toleration — no workload can tolerate a taint (W305).
         let picked = cfg.admit_workload(&ws).unwrap();
-        // Both are eligible (Job tolerates no-server/no-appliance/no-voter).
+        // Both are eligible.
         assert!(
             picked.name == "us-west-001" || picked.name == "us-west-002",
             "job must land on an eligible node, got {}",
@@ -5981,15 +8045,17 @@ taints = ["no-server", "no-appliance", "no-voter"]
         use workload_spec::LifecycleArchetype;
         // R569-F4: the headless M2 (us-west-015) joins the fleet as a
         // build-worker but must never take cloud-critical load. It carries the
-        // same repel set as the rpi/x86 build-worker pool
-        // (`no-server, no-appliance, no-voter` — see
-        // .yah/infra/machines/us-west-015.toml). This pins that intent: with a
-        // plain cloud node available beside the Mac, every cloud-critical
-        // archetype lands on the cloud node and never the Mac; build Jobs
-        // (the Mac's actual purpose) remain eligible on it. `no-voter` is
-        // honored separately by R569-F3's learner-only join, not by workload
-        // admission — there is no "voter" workload archetype.
-        let mac_taints = vec!["no-server", "no-appliance", "no-voter"];
+        // same repel set as the x86 build-worker (`no-server, no-appliance` —
+        // see .yah/infra/machines/us-west-015.toml). This pins that intent:
+        // with a plain cloud node available beside the Mac, every
+        // cloud-critical archetype lands on the cloud node and never the Mac;
+        // build Jobs (the Mac's actual purpose) remain eligible on it.
+        //
+        // R742-T4: `no-voter` used to sit in this set and in the TOML. It was
+        // never read here — there is no "voter" workload archetype — and
+        // R569-F3's learner-only join is what actually keeps the box out of
+        // quorum. It is now rejected by `yah cloud validate` as inert.
+        let mac_taints = vec!["no-server", "no-appliance"];
         let fleet = || {
             make_empty_cfg(vec![
                 make_machine_with_capacity("us-west-015", 24576, 8000, mac_taints.clone()),

@@ -122,13 +122,18 @@ pub struct DomainWorkerPlan {
 
 /// Static-mode Worker bindings for an alias-tier subdomain. Kept in lockstep
 /// with `mesofact_static::worker_config_bindings(WorkerMode::Static, …)`.
-fn static_worker_bindings(asset_origin: &str) -> Vec<(String, String)> {
+///
+/// `route_headers` is the manifest's own `DomainConfig::route_headers_json` —
+/// this planner already holds the domain, so unlike the mirror-driven path it
+/// needs no lookup to find it (R746).
+fn static_worker_bindings(asset_origin: &str, route_headers: String) -> Vec<(String, String)> {
     vec![
         ("ASSET_ORIGIN".to_string(), asset_origin.to_string()),
         ("UPLOAD_ORIGIN".to_string(), String::new()),
         ("WORKER_MODE".to_string(), "static".to_string()),
         ("SSR_ORIGIN".to_string(), String::new()),
         ("SSR_PREFIXES".to_string(), "[]".to_string()),
+        ("ROUTE_HEADERS".to_string(), route_headers),
     ]
 }
 
@@ -191,7 +196,7 @@ pub fn plan_domain_worker(
     Ok(DomainWorkerPlan {
         worker_name: domain.name.clone(),
         custom_domain: domain.domain.clone(),
-        bindings: static_worker_bindings(&asset_origin),
+        bindings: static_worker_bindings(&asset_origin, domain.route_headers_json()),
         asset_origin,
     })
 }
@@ -355,6 +360,9 @@ pub fn plan_alias_claim(
         worker_bundle_path: None,
         routes: vec![DomainRoute {
             path: "/*".into(),
+            // A claimed alias serves one bundle at the root with no special
+            // header needs; a tenant that wants some edits its own manifest.
+            headers: BTreeMap::new(),
             mode: RouteMode::Static {
                 component: component.to_string(),
             },
@@ -396,6 +404,7 @@ mod tests {
             cdn_bucket: "net-yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                headers: Default::default(),
                 path: "/*".into(),
                 mode: RouteMode::Static {
                     component: "scrabcake/site".into(),
@@ -423,9 +432,37 @@ mod tests {
                     ("WORKER_MODE".into(), "static".into()),
                     ("SSR_ORIGIN".into(), String::new()),
                     ("SSR_PREFIXES".into(), "[]".into()),
+                    ("ROUTE_HEADERS".into(), "[]".into()),
                 ],
             }
         );
+    }
+
+    /// R746: headers declared on a route reach the deployed Worker as the
+    /// ROUTE_HEADERS binding. Without this the manifest could declare them and
+    /// the Worker would serve without them — the exact silent gap the primitive
+    /// exists to close.
+    #[test]
+    fn plan_carries_declared_route_headers_into_the_bindings() {
+        let mut dom = net_tier_manifest();
+        dom.routes[0].headers = [
+            ("Cross-Origin-Opener-Policy".to_string(), "same-origin".to_string()),
+            (
+                "Cross-Origin-Embedder-Policy".to_string(),
+                "require-corp".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let plan = plan_domain_worker(&dom, "https://cdn.net.yah.dev", "cloud").unwrap();
+        let binding = plan
+            .bindings
+            .iter()
+            .find(|(k, _)| k == "ROUTE_HEADERS")
+            .expect("ROUTE_HEADERS binding");
+        assert!(binding.1.contains("same-origin"), "{}", binding.1);
+        assert!(binding.1.contains("require-corp"), "{}", binding.1);
+        assert!(binding.1.contains("/*"), "{}", binding.1);
     }
 
     #[test]
@@ -454,6 +491,7 @@ mod tests {
     fn plan_bails_when_no_static_route() {
         let mut dom = net_tier_manifest();
         dom.routes = vec![DomainRoute {
+            headers: Default::default(),
             path: "/old".into(),
             mode: RouteMode::Redirect {
                 target: "https://elsewhere".into(),

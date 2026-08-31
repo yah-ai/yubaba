@@ -75,9 +75,7 @@ const fn declared_u32(src: &str, needle: &str) -> u32 {
         }
         if j == n.len() {
             let mut k = i + n.len();
-            while k < s.len()
-                && (s[k] == b' ' || s[k] == b'\t' || s[k] == b'\n' || s[k] == b'\r')
-            {
+            while k < s.len() && (s[k] == b' ' || s[k] == b'\t' || s[k] == b'\n' || s[k] == b'\r') {
                 k += 1;
             }
             let start = k;
@@ -87,7 +85,9 @@ const fn declared_u32(src: &str, needle: &str) -> u32 {
                 k += 1;
             }
             if k == start {
-                panic!("cluster-epochs.json: key is present but its value is not a decimal integer");
+                panic!(
+                    "cluster-epochs.json: key is present but its value is not a decimal integer"
+                );
             }
             return value;
         }

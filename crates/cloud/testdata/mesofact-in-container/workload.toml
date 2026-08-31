@@ -16,6 +16,12 @@
 schema_version = 1
 kind = "mesofact-static"
 
+# Top-level (R658-B1): `routes` is a field of MesofactStaticWorkload, not of
+# [build]. No routes module actually ships in this fixture — parsing + lowering
+# is all this testdata exercises — but the envelope requires the field, so the
+# fixture must declare it to stay loadable through `workload_spec::Workload`.
+routes = "./mesofact.routes.ts"
+
 [build]
 command = "bun run build"
 out_dir = "dist"

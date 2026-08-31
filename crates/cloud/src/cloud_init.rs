@@ -76,7 +76,7 @@
 //! @yah:handoff("X86 FLEET PROVISIONING LANDED (2026-08-02), and it closes the arch-specific-ceiling gap this relay opened. New .yah/infra/preseed/{yah-x86-worker.cfg, build-iso.sh, .gitignore}. Deliberately the SAME shape as the Pi path rather than a new idiom: a Debian container does the work, the operator key is injected at build time instead of committed, and one artifact provisions every x86 box with per-box identity applied after install. build-iso.sh caches the stock trixie amd64 netinst, renders the preseed with ~/.ssh/yah.pub substituted for @@SSH_PUBKEY@@, injects it into the installer initrd (so the install is hands-off with no boot prompt to type at), regenerates md5sum.txt, and repacks a UEFI hybrid ISO with xorriso. Neither path is a roll-your-own distro - one configures rpi-image-gen, the other configures debian-installer.")
 //! @yah:handoff("PARTITIONING IS THE STRUCTURAL HALF OF THIS RELAY, and the preseed is where it finally gets decided up front instead of discovered. Separate LVs for /, /var and /var/lib/docker on VG `yah`, ~40 GB left unallocated for online lvextend. A runaway BuildKit cache now fills /var/lib/docker and NOTHING else - root stays writable, sshd keeps accepting, journald keeps recording, the box stays reachable to clean up. That is the backstop for a MISSING ceiling; it does not replace the ceilings, which the preseed late_command also writes (journald 500M + docker daemon.json with log rotation and builder.gc at 100GB, sized to the 512 GB disk).")
 //! @yah:handoff("DOCKER CEILING IS NO LONGER A PROPERTY OF ONE IMAGE. stand-up-yubaba.sh now applies /etc/docker/daemon.json write-if-absent on any node where docker is present (it installs containerd, not docker, so this is a conditional), and restarts docker THERE so a parse failure surfaces during standup rather than at the next reboot - dockerd refuses to start on a daemon.json it cannot parse. Three provisioning paths now converge on the same ceilings: Pi image (baked), preseed late_command (baked), standup script (retrofit). bash -n clean on both scripts.")
-//! @yah:handoff("Scaffolded .yah/infra/machines/us-west-012.toml for the GEEKOM A5 (Ryzen 7 5825U 8C/16T, 16 GB, 512 GB NVMe): tier:x86 + os:linux + build-worker/qed, taints copied from us-west-002 for day one. Recorded WHY it is a better tier:x86 host than 002 - 002 is a WSL2 box that sleeps and reboots with Windows, this is dedicated always-on Debian - so dropping no-server/no-appliance later is a deliberate re-decision rather than drift. Stays no-voter regardless: a residential uplink must never be able to stall the raft. allocatable is from the vendor spec with an explicit instruction to re-verify via nproc + free -m on the box, since the OVH nodes shipped wrong for months. Parses: cargo test -p yah-cloud --lib machine 24/24, `yah cloud validate` ok.")
+//! @yah:handoff("Scaffolded .yah/infra/machines/us-west-012.toml for the GEEKOM A5 (Ryzen 7 5825U 8C/16T, 16 GB, 512 GB NVMe): arch:x86 + os:linux + build-worker/qed, taints copied from us-west-002 for day one. Recorded WHY it is a better arch:x86 host than 002 - 002 is a WSL2 box that sleeps and reboots with Windows, this is dedicated always-on Debian - so dropping no-server/no-appliance later is a deliberate re-decision rather than drift. Stays no-voter regardless: a residential uplink must never be able to stall the raft. allocatable is from the vendor spec with an explicit instruction to re-verify via nproc + free -m on the box, since the OVH nodes shipped wrong for months. Parses: cargo test -p yah-cloud --lib machine 24/24, `yah cloud validate` ok.")
 //! @yah:verify("UNPROVEN, and the one thing to watch: the partman-auto/expert_recipe in yah-x86-worker.cfg has never been run. A malformed recipe fails mid-install with an error that does not always name the offending stanza. Watch the first install of any ISO revision; once it completes cleanly the same ISO is proven for every later box. It also assumes ONE disk (early_command picks `list-devices disk | head -n1`), so a two-disk box needs the target pinned.")
 //! @yah:verify("UNPROVEN: build-iso.sh has not been executed - the initrd inject + xorriso repack path is written but not run, and the ISO URL pins DEBIAN_VERSION=13.1.0 which should be bumped to whatever trixie point release is current at build time (override with the env var).")
 //! @yah:verify("Cheap de-risk available before touching hardware: boot the built ISO in QEMU against a scratch qcow2 and let the unattended install run to completion. That proves the recipe, the initrd inject and the late_command without burning a USB or a trip to the box.")
@@ -150,17 +150,21 @@ pub const PLACEHOLDER_CLOUDFLARED_TOKEN: &str = "<CLOUDFLARED_TOKEN_PLACEHOLDER>
 pub const DEFAULT_YUBABA_CHANNEL: &str = "stable";
 /// Pinned cosign release used by the cloud-init verify-blob block. Bump in
 /// lockstep with [`COSIGN_SHA256_AMD64`] / [`COSIGN_SHA256_ARM64`] when
-/// upgrading the verifier — supply-chain hygiene (W203 §1.4, R330-F22).
-pub const COSIGN_VERSION: &str = "v2.4.1";
-/// sha256 of the cosign-linux-amd64 binary at [`COSIGN_VERSION`]. Cloud-init
+/// upgrading the verifier — supply-chain hygiene (W203 §1.4, R330-F22). v3.x
+/// on purpose: cosign 3's sigstore-bundle format (`--bundle`) is current best
+/// practice, replacing the old separate `.sig`/`.cert` file pair everywhere
+/// in this pipeline (install.sh, release_manifest.rs, yubaba_fetch.rs).
+pub const COSIGN_VERSION: &str = "v3.1.3";
+/// sha256 of the cosign-linux-amd64 binary at [`COSIGN_VERSION`], from
+/// cosign's own published `cosign_checksums.txt` for that release. Cloud-init
 /// verifies the downloaded binary against this before chmod+exec. Pinning the
 /// verifier itself closes the bootstrap-trust gap: TLS to github.com proves
 /// origin, sha256 proves bytes, then cosign proves the yubaba tarball.
 pub const COSIGN_SHA256_AMD64: &str =
-    "8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b";
+    "4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71";
 /// sha256 of the cosign-linux-arm64 binary at [`COSIGN_VERSION`].
 pub const COSIGN_SHA256_ARM64: &str =
-    "3b2e2e3854d0356c45fe6607047526ccd04742d20bd44afb5be91fa2a6e7cb4a";
+    "c5d324e091826b0d7a78eb16fef316450b4eb9aaec045611c08ba06f5e73220a";
 /// Sigstore Fulcio OIDC issuer for GitHub-Actions-rooted keyless signing.
 /// Re-exported from [`crate::release_manifest`], which owns the canonical
 /// copy — the shell verify path here and the Rust verify path in the yah CLI
@@ -184,11 +188,23 @@ pub fn load_template(workspace_root: &Path) -> Result<String> {
 /// Substitute `{{KEY}}` placeholders. Fails loudly if any unsubstituted
 /// placeholder remains — better than silently shipping a broken cloud-init.
 pub fn render(template: &str, input: &RenderInput) -> Result<String> {
-    let tags = if input.machine.mesh_tags.is_empty() {
+    // Tailscale's ACL model only accepts `tag:`-prefixed values in
+    // `--advertise-tags`; mesh_tags also carries placement predicates like
+    // `arch:x86` / `os:linux` that aren't ACL tags at all, and passing those
+    // through makes `tailscale up` reject the whole join (observed manually
+    // on us-west-003/011, R757).
+    let advertise_tags: Vec<&str> = input
+        .machine
+        .mesh_tags
+        .iter()
+        .map(String::as_str)
+        .filter(|t| t.starts_with("tag:"))
+        .collect();
+    let tags = if advertise_tags.is_empty() {
         // Tailscale rejects empty `--advertise-tags=`; emit a single tag derived from the machine name.
         format!("tag:{}", input.machine.name)
     } else {
-        input.machine.mesh_tags.join(",")
+        advertise_tags.join(",")
     };
 
     let mesh_login_server_arg = match &input.mesh_url {
@@ -304,15 +320,18 @@ fn build_cloudflared_block(token: &str) -> String {
 
 /// Build the cosign install + `cosign verify-blob` block for `runcmd`. Each
 /// line is a valid cloud-init sequence entry (two-space indent + `- `). The
-/// `.sig`/`.cert` URLs derive by appending those suffixes to the tarball URL —
-/// matching what `release.yml` publishes alongside the canonical artifact
-/// (R330-F19). Architecture is detected at boot via `dpkg --print-architecture`
-/// so one rendered template serves both x86_64 and aarch64 Hetzner machines.
+/// `.sigstore.json` bundle URL derives by appending that suffix to the
+/// tarball URL — matching what the release pipeline publishes alongside the
+/// canonical artifact (R330-F19). Architecture is detected at boot via
+/// `dpkg --print-architecture` so one rendered template serves both x86_64
+/// and aarch64 Hetzner machines.
 ///
 /// R605-F1: `identity_spec` is parsed as a [`ReleaseTrust`], so a fleet whose
 /// releases are cut on QED (key-based cosign, no Fulcio) provisions by setting
-/// `key:<pubkey-ref>` — the `.cert` fetch drops out with it, because a
-/// key-based signature has no certificate to download.
+/// `key:<pubkey-ref>`. cosign 3.x's bundle carries the signature (and, for
+/// keyless, the certificate + transparency proof) as one file either way, so
+/// unlike the pre-bundle format there is no second sidecar fetch that drops
+/// out for key trust — the bundle download is unconditional.
 fn build_cosign_verify_block(yubaba_url: &str, identity_spec: &str) -> String {
     // ARCH + SHA must be set, checked, and consumed inside the same `sh -c`
     // process — cloud-init runcmd entries are independent shells, so a
@@ -340,34 +359,37 @@ fn build_cosign_verify_block(yubaba_url: &str, identity_spec: &str) -> String {
         ver = COSIGN_VERSION
     );
     let trust = ReleaseTrust::parse(identity_spec);
-    // Single-quote each flag value: the regexp arm carries backslashes and `^`
-    // that the boot shell would otherwise eat, and the key arm carries a URI.
-    // Neither may contain a `'` — a spec that does is an operator error, not a
+    // Single-quote each VALUE token: the regexp arm carries backslashes and
+    // `^` that the boot shell would otherwise eat, and the key arm carries a
+    // URI. Flag names (the `--xxx` tokens, including standalone boolean
+    // flags like `--insecure-ignore-tlog` that take no value) are emitted
+    // bare — they're static literals, never operator input. This can't
+    // assume flag/value PAIRS any more: the key arm's flag list is now
+    // [--key, key_ref, --insecure-ignore-tlog], an odd length, because
+    // cosign key-mode signs with no transparency-log upload (see
+    // ReleaseTrust::verify_flags) and the verify side has to say so too. No
+    // value may contain a `'` — a spec that does is an operator error, not a
     // case to escape, since it can't be a valid identity regexp or key ref.
     let trust_flags = trust
         .verify_flags()
-        .chunks(2)
-        .map(|kv| format!("{} '{}'", kv[0], kv.get(1).map_or("", |v| v.as_str())))
+        .into_iter()
+        .map(|tok| {
+            if tok.starts_with("--") {
+                tok
+            } else {
+                format!("'{tok}'")
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ");
 
-    let mut lines = vec![
+    let lines = vec![
         install_and_verify_cosign,
-        format!("  - curl -fsSL -o /tmp/yah-yubaba.tar.gz.sig {yubaba_url}.sig"),
+        format!("  - curl -fsSL -o /tmp/yah-yubaba.tar.gz.sigstore.json {yubaba_url}.sigstore.json"),
+        format!(
+            "  - cosign verify-blob {trust_flags} --bundle /tmp/yah-yubaba.tar.gz.sigstore.json /tmp/yah-yubaba.tar.gz"
+        ),
     ];
-    if trust.needs_certificate() {
-        lines.push(format!(
-            "  - curl -fsSL -o /tmp/yah-yubaba.tar.gz.cert {yubaba_url}.cert"
-        ));
-    }
-    let cert_flag = if trust.needs_certificate() {
-        " --certificate /tmp/yah-yubaba.tar.gz.cert"
-    } else {
-        ""
-    };
-    lines.push(format!(
-        "  - cosign verify-blob {trust_flags}{cert_flag} --signature /tmp/yah-yubaba.tar.gz.sig /tmp/yah-yubaba.tar.gz"
-    ));
     lines.join("\n")
 }
 
@@ -485,6 +507,8 @@ mod tests {
             connect: None,
             allocatable: None,
             taints: vec![],
+            sovereign_group: None,
+            sovereign_role: None,
         }
     }
 
@@ -622,6 +646,23 @@ mod tests {
         input.headscale_preauth_key = Some("tskey-test".into());
         let out = render(DEFAULT_TEMPLATE, &input).unwrap();
         assert!(out.contains("--advertise-tags=tag:noisetable-pdx-1"));
+    }
+
+    #[test]
+    fn render_advertise_tags_filters_non_tag_prefixed_mesh_tags() {
+        let mut machine = sample_machine();
+        machine.mesh_tags = vec![
+            "tag:build-worker".into(),
+            "arch:x86".into(),
+            "os:linux".into(),
+            "tag:qed".into(),
+        ];
+        let mut input = minimal_input(&machine);
+        input.headscale_preauth_key = Some("tskey-test".into());
+        let out = render(DEFAULT_TEMPLATE, &input).unwrap();
+        assert!(out.contains("--advertise-tags=tag:build-worker,tag:qed"));
+        assert!(!out.contains("arch:x86"));
+        assert!(!out.contains("os:linux"));
     }
 
     #[test]
@@ -970,11 +1011,9 @@ mod tests {
     }
 
     /// R605-F1: a fleet whose releases are cut on QED verifies against a
-    /// pinned public key, not a Fulcio certificate identity. The `.cert`
-    /// fetch must drop out with it — the release publishes no `.cert`, so
-    /// leaving the curl in place would fail the boot before cosign ever runs.
+    /// pinned public key, not a Fulcio certificate identity.
     #[test]
-    fn render_with_key_trust_emits_key_verify_and_no_cert_fetch() {
+    fn render_with_key_trust_emits_key_verify() {
         let machine = sample_machine();
         let mut input = minimal_input(&machine);
         input.yubaba_url = "https://cdn.yah.dev/yubaba/0.9.0/x86_64-unknown-linux-musl/yah-yubaba-x86_64-unknown-linux-musl.tar.gz".into();
@@ -985,17 +1024,13 @@ mod tests {
         assert!(
             out.contains(
                 "cosign verify-blob --key 'https://cdn.yah.dev/keys/yah-release.pub' \
-                 --signature /tmp/yah-yubaba.tar.gz.sig"
+                 --insecure-ignore-tlog --bundle /tmp/yah-yubaba.tar.gz.sigstore.json"
             ),
             "key-based verify-blob line missing:\n{out}"
         );
         assert!(
             !out.contains("--certificate-identity-regexp"),
             "keyless flags must not survive into a key-trust render"
-        );
-        assert!(
-            !out.contains(&format!("{}.cert", input.yubaba_url)),
-            "key-based signatures have no .cert sibling to fetch"
         );
         // Still a well-formed runcmd sequence.
         for line in out.lines().filter(|l| l.contains("cosign")) {
@@ -1028,14 +1063,10 @@ mod tests {
             "verify-blob line missing or identity-regexp not threaded"
         );
         assert!(out.contains(COSIGN_OIDC_ISSUER), "oidc-issuer flag missing");
-        // sig + cert sibling URLs are derived by suffixing the tarball URL.
+        // The bundle sibling URL is derived by suffixing the tarball URL.
         assert!(
-            out.contains(&format!("{}.sig", input.yubaba_url)),
-            ".sig sibling URL missing"
-        );
-        assert!(
-            out.contains(&format!("{}.cert", input.yubaba_url)),
-            ".cert sibling URL missing"
+            out.contains(&format!("{}.sigstore.json", input.yubaba_url)),
+            "bundle sibling URL missing"
         );
         // cosign install is pinned to a specific release version (no `latest`).
         assert!(

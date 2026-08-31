@@ -18,7 +18,7 @@
 //! - `/raft/status` reports peer liveness from the attached `FailureDetector`.
 //!
 //! ```bash
-//! cargo test -p yubaba --test raft_promote_voter
+//! cargo test -p yubaba --test main -- raft_promote_voter::
 //! ```
 
 use std::sync::Arc;

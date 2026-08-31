@@ -1,0 +1,87 @@
+# yubaba-tenant-streamer — example configuration.
+#
+# Parsed by a test (`the_example_config_parses`), so it cannot drift from the
+# struct it documents. Default load path: /etc/yah/tenant-streamer.toml.
+#
+# Validate a real one without streaming anything:
+#   yubaba-tenant-streamer --config /etc/yah/tenant-streamer.toml --check
+#
+# That probes every tenant's sink for conditional-put support and exits. Run it
+# in the deploy pipeline: it is the only way to find out that a bucket cannot
+# fence BEFORE real tenants depend on it.
+
+# This node's yubaba raft node id. The streamer writes only for tenants yubaba
+# says THIS id owns.
+node_id = 7
+
+# The yubaba on this node. Always node-local: the fencing token is read from
+# the local applied state, and staleness is safe by design (a stale-low token
+# bounces at the sink; a stale-high one cannot exist).
+yubaba_url = "http://127.0.0.1:7777"
+
+# Root of the local hot tier. Tenant DBs are found at
+# <data_root>/tenants/<id>/db unless a tenant overrides db_path below.
+data_root = "/var/lib/yah"
+
+# Stated RPO bound, in seconds. The tail cadence is derived from it (rpo/2), so
+# a single missed tick still lands inside the bound. This is the data-loss
+# window on unclean node death — W253 §5 calls the streamer's cadence "the RPO
+# knob", which is why it is a stated promise rather than a constant in a loop.
+#
+# 120 (a 60s cadence) is the measured default, not a guess: every tail that
+# uploads anything writes two fixed objects — a generation manifest and a
+# watermark CAS — beyond the frames, so PUTs/write = frames/write +
+# 2/writes_per_tail. Tailing every 15s (the old rpo_secs = 30) sat at the
+# expensive end of that curve; 60s captures ~97% of the available reduction.
+# Lowering this raises the per-tenant R2 write-op bill superlinearly, so lower
+# it for tenants that genuinely need a tighter window, not by default.
+rpo_secs = 120
+
+# Tenant lease TTL requested on each renewal. Long relative to the cadence on
+# purpose: the lease is a liveness hint that bounds when a takeover is
+# PERMITTED, and the epoch is what makes a takeover safe. A short lease buys no
+# safety, only spurious failovers on a jittery WAN link. Renewal happens once a
+# lease drops below a third of its TTL, not every tick — heartbeating through
+# the raft log is what W253 §4 forbids.
+#
+# It is also COUPLED to rpo_secs and validated against it at startup: renewal
+# is only attempted on a tail tick, so lease_secs/3 must be at least two
+# cadences wide or one failed renewal drops a tenant this node owns. 540 gives
+# a 180s budget against a 60s cadence — three attempts. If you lower rpo_secs,
+# this can usually stay; if you RAISE it, re-check this or the process will
+# refuse to start (it tells you the minimum).
+lease_secs = 540
+
+# One bucket for every tenant, keyed by prefix. Not one bucket per tenant:
+# per-tenant buckets multiply credentials and bucket-count limits by the tenant
+# count for no isolation the key prefix does not already give.
+[sink]
+bucket = "yah-tenants"
+endpoint = "https://<account>.r2.cloudflarestorage.com"
+region = "auto"
+# Optional root under which each tenant's own tenants/<id>/ prefix hangs.
+prefix = ""
+# Credentials come from the environment, never from this file. Override the
+# variable NAMES here if yours differ; the values are never read from config.
+access_key_env = "S3_ACCESS_KEY_ID"
+secret_key_env = "S3_SECRET_ACCESS_KEY"
+
+# The tenants this node is configured to stream. Operator-supplied until R737's
+# placement record replaces it. Membership here does NOT mean this node streams
+# them — ownership, asked of yubaba every tick, decides that. Listing a tenant
+# this node never owns is inert.
+[[tenants]]
+tenant = "acme"
+# The tier-1a base snapshot the streamed frames replay onto.
+base_snapshot_key = "tenants/acme/snapshots/snapshot-00000000000000000001.db"
+# Page size of THAT snapshot, read from its header — never assumed. The 4 KB
+# default other code carries is the wrong thing to inherit.
+page_size = 4096
+
+[[tenants]]
+tenant = "globex"
+base_snapshot_key = "tenants/globex/snapshots/snapshot-00000000000000000001.db"
+page_size = 4096
+# Overrides the <data_root>/tenants/<id>/db convention. This is the
+# operator/manual path R732-T4 sanctions; leaving it unset is the norm.
+db_path = "/mnt/nvme1/globex.db"

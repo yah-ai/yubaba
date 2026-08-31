@@ -462,6 +462,7 @@ account_id = "test-account"
                 shape: MirrorShape::SingleMachine,
                 providers: mirror_providers,
                 ingress: Default::default(),
+                ingress_machines: Vec::new(),
                 drivers: Default::default(),
                 asset_aliases: Default::default(),
             };
@@ -473,6 +474,7 @@ account_id = "test-account"
                 db: crate::DbCatalog::default(),
             };
             let component = ServiceComponent {
+                mount: None,
                 id: "cache".to_string(),
                 kind: "cloudflare-worker".to_string(),
                 path: "app/yah/workers/yah-cr".to_string(),

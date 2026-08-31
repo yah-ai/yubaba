@@ -1,0 +1,52 @@
+[package]
+name = "yubaba-tenant-streamer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Per-node data-plane service: streams each owned tenant's WAL to object storage under the fencing epoch yubaba's control plane grants it."
+keywords = ["yubaba", "wal", "streaming", "fencing", "tenant"]
+categories = ["database"]
+# Not publishable while `turso-backup` is `publish = false` — see the dep note
+# below. Nothing about the crate itself is private.
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+# Thin wrapper over the library so R732-T5's chaos test can drive the tail loop
+# in-process without spawning a service (the ratified design's explicit ask).
+[[bin]]
+name = "yubaba-tenant-streamer"
+path = "src/main.rs"
+
+[dependencies]
+# The WAL→R2 engine. Path source, NOT the repo's usual `version` +
+# `[patch.crates-io]` redirect: that pattern overrides a crates.io name, and
+# turso-backup is `publish = false` and owns no such name, so there is nothing
+# to patch. Same relative-path shape as yubaba's own `mshr` dep. Verified
+# 2026-08-10 against oss/turso-backup/Cargo.toml.
+turso-backup = { path = "../../../turso-backup", version = "0.8.29" }
+# TenantId only — the one tenant identifier in the system (R732-F1 deliberately
+# minted no second one).
+workload-spec = { package = "yah-workload-spec", version = "0.8.29" }
+
+anyhow = "1.0"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+# Building the R2/S3 store and passing it to turso-backup as Arc<dyn ObjectStore>.
+object_store = { version = "0.13", features = ["aws"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+# 0.8 to match every other toml consumer in this workspace (almanac, cloud) —
+# a second major would resolve as a duplicate transitive for no gain.
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+futures-util = "0.3"
+tempfile = "3"

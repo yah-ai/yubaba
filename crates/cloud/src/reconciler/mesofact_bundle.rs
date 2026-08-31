@@ -49,6 +49,36 @@
 //! @yah:gotcha("THE SECOND HALF OF THE VERIFY LINE IS NOT DONE AND COULD NOT BE. curl https://yah.dev/.well-known/yah-publish.json still 404s, because the bundle tier cannot sync at all until R546 produces target/x86_64-unknown-linux-musl/release/{mesofact,almanac-feed}. slot_ready is false, yah-marketing still falls back to the static chain, and no bundle has been assembled by this code against the live apex. Everything is proven by test, nothing by a live apply. R703 now carries a notify_on(R546) that spells out the live run.")
 //! @yah:gotcha("When the bundle tier first turns on, expect the apply to FAIL the serving check for a while, and read that as the check working. us-east-001 is serving a hand-placed bundle from before this code existed, which carries no stamp, so the apex will answer the probe 404 (Missing) until a bundle assembled by THIS code is deployed there. Do not reach for verify_serving = false; deploy the stamped bundle.")
 //! @yah:next("LIVE VERIFY, gated on R546 and the only thing left: build the two musl binaries, yah cloud apply --service yah-marketing --env cloud, confirm it takes the bundle arm, then curl https://yah.dev/.well-known/yah-publish.json and check the digest equals bundle_beacon() over the synced manifest.")
+//!
+//! @yah:ticket(R752-B7, "revalidate routes allowlist is parsed, shipped, then dropped - the receiver accepts pokes for every route")
+//! @yah:status(review)
+//! @yah:at(2026-08-13T00:22:14Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R752)
+//! @yah:severity(medium)
+//! @yah:gotcha("Found 2026-08-12 while wiring R330-F13's sidecar to the live receiver. `[providers.bundle.revalidate] routes` is documented as an allowlist ('empty = all routes', mesofact_bundle.rs:218), is parsed into RevalidateSlot.routes, is copied into MesofactRevalidateReceiver.routes (mesofact_bundle.rs:264), and is shipped over the wire to kamaji. kamaji then never reads it: bundle_workload_spec_revalidate (oss/kamaji/crates/kamaji-bin/src/server.rs:2117) builds the receiver's argv from publish_config + listen and its env from receiver.env, and `routes` appears nowhere. grep confirms server.rs touches receiver.feeds / feed_interval_secs / feed_project_prefix / publish_config / env and never receiver.routes.")
+//! @yah:gotcha("MEASURED, not inferred: with .yah/services/yah-marketing/mirrors/cloud.toml declaring routes = [\"/releases\"], POST http://100.64.0.3:8081/revalidate {\"routes\":[\"/issues\"]} returned 202 on us-east-001 and went on to re-render and republish /issues. An undeclared route was accepted and acted on.")
+//! @yah:gotcha("Severity is medium not high because the receiver is not publicly reachable (mesh IP, and it is the tenant's own render path) — but it IS an unauthenticated write-shaped endpoint today: its process env carries no MESOFACT_MIRROR_KEY, so mirror_key_env is unresolved too. The declared scoping control and the declared bearer are BOTH inert, which is worth knowing before anyone treats either as a boundary.")
+//! @yah:next("Decide whether the allowlist is real. If yes, pass it to the receiver (argv or env) in bundle_workload_spec_revalidate and enforce it there; if no, delete the field rather than leaving a documented control that does nothing.")
+//! @yah:next("If it becomes enforced, .yah/services/yah-marketing/mirrors/cloud.toml already lists both \"/releases\" and \"/issues\" — R330-F13 added /issues precisely so enforcement does not silently break the now-working issue-filing path.")
+//! @yah:next("Same question for mirror_key_env: it resolves to nothing today, so the receiver runs open. Whatever change starts resolving it must set the matching ALMANAC_MIRROR_KEY on the issue-tracker unit on us-east-001 in the SAME change, or the sidecar's poke starts 401ing and /issues silently stops updating.")
+//! @yah:handoff("OPERATOR CALL 2026-08-12: the allowlist is real - enforce it IF present. Auth is a separate, pluggable axis (cheers auth, preshared key, or unauthenticated are all legitimate for an almanac route); the allowlist is scoping, not authentication, and the two are now independent controls end to end.")
+//! @yah:handoff("Node leg (oss/kamaji/crates/kamaji-bin/src/server.rs, bundle_workload_spec_revalidate): each declared route is rendered as one `--allow-route <route>` on the receiver's argv. An empty list emits no flag at all, which keeps the documented 'empty = all routes' meaning - `--allow-route \"\"` would have scoped the receiver to a route that cannot exist and silently killed every revalidation.")
+//! @yah:handoff("Receiver leg (oss/mesofact/crates/mesofact/src/revalidate.rs): RevalidateConfig gained `routes`, fed by a new repeatable `--allow-route` flag on `mesofact serve`. Enforced in BOTH shapes a poke can take - an explicit `{\"route\": ...}` outside the list gets a synchronous 403 and never enqueues, and a whole-site poke (no route named) is NARROWED to the list at render time. The narrowing is the half that matters: the escape actually measured on us-east-001 sent {\"routes\":[\"/issues\"]}, which the receiver's body type does not have a field for, so it deserialized to route=None and ran as a whole-site render. A handler-only check would still have let that through.")
+//! @yah:handoff("Route selection was split out of render_routes into a pure `render_targets(workload, route, allow)` so the scoping rule is testable without booting V8 - a security-shaped control whose only evidence was 'it compiles' is how this got shipped inert in the first place. It also errors on a disallowed explicit route rather than rendering nothing, so an in-process caller cannot get a silent success.")
+//! @yah:handoff("The allowlist is intersected with the manifest, not unioned: a listed route the manifest cannot render (ssr, deferred, or a typo) is skipped instead of turning every whole-site poke into an error.")
+//! @yah:handoff("Config docs corrected where they now lie: RevalidateSlot.routes in oss/yubaba/crates/cloud/src/reconciler/mesofact_bundle.rs and the block in .yah/services/yah-marketing/mirrors/cloud.toml both said the field was inert. The cloud.toml note now says the list is LOAD-BEARING - a route absent from it stops being republished after the next deploy of that mirror.")
+//! @yah:handoff("tenants.rs (multi-tenant receiver) passes an empty allowlist with a comment naming the shape to copy - tenants/<id>.toml has no routes key yet, so per-tenant scoping is unmodelled rather than silently unenforced.")
+//! @yah:verify("cargo test -p mesofact --all-features (oss/mesofact) - 104 passed, 0 failed, including 8 new: out-of-list route 403s and does not enqueue, in-list route accepted, a correct mirror_key does NOT widen the allowlist, empty allowlist accepts anything, whole-site poke accepted then narrowed, whole-site targets = manifest INTERSECT allowlist, an allowlisted route absent from the manifest is not rendered, explicit disallowed route errors at render time.")
+//! @yah:verify("cargo test -p kamaji-bin --all-features (oss/kamaji) - 239 passed, 0 failed. The pre-existing revalidate_spec_argv_matches_mesofact_serve_clap_shape test is the one that should have caught this: it declared routes = [\"/releases\"] and pinned an argv that never mentioned it, green the whole time. It now asserts the --allow-route pair, plus two new tests for the empty-list and two-route cases.")
+//! @yah:verify("cargo test -p yah-cloud --lib mesofact_bundle (oss/yubaba) - 44 passed, 0 failed.")
+//! @yah:verify("cargo test -p xtask --test schema_drift - 3 passed; the doc-comment edits touch no schemars-derived type, so no generated artifact moved.")
+//! @yah:verify("cargo clippy --all-features --all-targets on both changed crates - no new warnings from the changed files (mesofact-core/mesofact-build/server.rs warnings are pre-existing).")
+//! @yah:verify("Checked the roll is safe BEFORE it happens: the only mirror in the tree declaring [providers.bundle.revalidate] is yah-marketing/cloud.toml, and it lists both /releases and /issues. The only live pokers name exactly those - issue-tracker sends Poke::route(\"/issues\") (crates/yah/issue-tracker/src/main.rs:86) and the almanac on_change arms in .yah/almanac/{releases,yah-desktop}.toml both name /releases. fleet.toml uses kind=\"reload\", which pokes almanac's own receiver, not this one. So nothing that works today starts 403ing.")
+//! @yah:gotcha("NOT DEPLOYED - code only. Enforcement starts at the next `yah cloud` sync of yah-marketing, which re-forks the receiver with the new argv. Deliberately not rolled from this session: it is an outward-facing change to a live node, and deployment belongs to R330-F13/R523. Before that roll, the live receiver still accepts a poke for any route.")
+//! @yah:next("mirror_key_env is still inert and the receiver still runs OPEN - untouched here, because the operator's call put auth on its own axis. Whatever change starts resolving it must set the matching ALMANAC_MIRROR_KEY on the issue-tracker unit on us-east-001 in the SAME change, or the sidecar's poke starts 403ing and /issues silently stops updating.")
+//! @yah:next("Public front door: R752-F9 filed for the low-security platform key that ships with the browser bundle for POST /api/issues (the operator's second decision). Different endpoint, different key namespace - do not collapse it with MESOFACT_MIRROR_KEY.")
+//! @yah:gotcha("BEHAVIOUR CHANGE worth knowing: after the roll, a whole-site poke at yah-marketing re-renders ONLY /releases and /issues, not / and /404. That is the intended reading of the declared list, but it means the landing page can no longer be refreshed by poking the receiver - it is republished by a full deploy. If someone wants / kept fresh from a feed, add it to routes in cloud.toml.")
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -74,6 +104,51 @@ pub const REVALIDATE_KEY: &str = "revalidate";
 /// Default idle TTL for an `on-demand` (JIT) bundle when the slot doesn't name
 /// one: five minutes with zero connections before kamaji reaps the process.
 pub const DEFAULT_IDLE_TTL_MS: u64 = 300_000;
+
+/// Every key `[providers.bundle]` is allowed to carry (R556-B14).
+///
+/// The mirror schema's `MirrorProviderSlot` is `additionalProperties: true` by
+/// construction — it is one flattened `BTreeMap<String, toml::Value>` shared by
+/// every provider role, so it cannot know what any single role reads. That
+/// leniency is fine at the schema layer and is the wrong default here: a slot
+/// whose key nobody reads is not "extra metadata", it is an operator's
+/// instruction being ignored. Both instances that motivated this were
+/// **parses clean, deploys, wrong at request time** — a typo'd `prot = 8081`
+/// falls back to kamaji's node default, which post-R599-F12 is whatever OTHER
+/// bundle already holds 8080 on that node; and a `[providers.bundle.env]` block
+/// was, before R556-T12, read by nothing at all while looking exactly like it
+/// worked.
+///
+/// The set is the UNION of what every consumer of this slot reads, not just
+/// what [`BundleSlot::parse`] reads — `plan_ingress` reads four of its own off
+/// the same table (`reconciler::ingress`), and `MirrorProviderSlot::required`
+/// reads `required`. Scoping it to one consumer would reject live mirrors.
+///
+/// `use` / `kind` are absent deliberately: they are captured by the
+/// `MirrorProviderSlot` enum variant itself and never appear in `fields()`.
+const ALLOWED_SLOT_KEYS: &[&str] = &[
+    // BundleSlot::parse
+    "account",
+    "bucket",
+    "env",
+    "idle_ttl_ms",
+    "lifecycle",
+    "machines",
+    "name",
+    "port",
+    REVALIDATE_KEY,
+    "runtime_version",
+    "serve_bins",
+    "serve_build",
+    "verify_serving",
+    "zone",
+    // MirrorProviderSlot::required — F16 placement, read via the slot, not here
+    "required",
+    // reconciler::ingress::plan_ingress — the front-door planner reads the same
+    // table. `machines`, `port` and `zone` are shared with the list above.
+    "machine",
+    "upstream_host",
+];
 
 /// True when this mirror opts its mesofact components into the W272 bundle
 /// tier — i.e. declares a `[providers.bundle]` slot.
@@ -141,6 +216,13 @@ pub fn missing_bins(slot: &BundleSlot, workspace_root: &std::path::Path) -> Vec<
 /// A slot with no `serve_bins` at all is "ready" here on purpose: that is the
 /// vanilla-runtime shape, which fails later for a different, well-reported
 /// reason rather than being a half-built self-contained bundle.
+///
+/// R746-F2: a `serve_build` slot is likewise ready, and for a stronger reason —
+/// the sync can *produce* the binary it needs by dispatching the declared QED
+/// recipe, so there is no such thing as a path an operator forgot to build.
+/// That is the whole point of the declaration: B43's failure was "declared but
+/// nobody can build it here", and a recipe is exactly the thing that removes
+/// the "here".
 pub fn slot_ready(slot: &BundleSlot, workspace_root: &std::path::Path) -> bool {
     missing_bins(slot, workspace_root).is_empty()
 }
@@ -156,11 +238,23 @@ pub fn slot_ready(slot: &BundleSlot, workspace_root: &std::path::Path) -> bool {
 /// name = "yah-marketing"              # stable workload handle; defaults to the service name
 /// lifecycle = "keep-alive"            # or "on-demand"
 /// idle_ttl_ms = 300000                # on-demand only
-/// runtime_version = "0.8.20"          # vanilla bundles only (no serve_bins)
+/// runtime_version = "0.8.20"          # vanilla bundles only (no serve binary)
 /// serve_bins = { x86_64-unknown-linux-musl = "target/…/mesofact-serve" }
+/// # …or, instead of naming pre-built paths, name the recipe that builds them:
+/// # [providers.bundle.serve_build]
+/// # pipeline = "mesofact-musl"
+/// # binary   = "mesofact"
+/// # triples  = ["x86_64-unknown-linux-musl"]
 /// zone = "yah.dev"                    # front door to serving-verify; defaults
 ///                                     # to the service's own domain
 /// verify_serving = true               # default; see the field docs
+///
+/// # Environment for the serve process, as source URIs resolved at deploy
+/// # (R556-T12). An SSR route reading a private source needs this or it gets
+/// # a credential-less server on the node.
+/// [providers.bundle.env]
+/// ANALYTICS_R2_ACCESS_KEY = "vault:cloudflare-r2-access-key-id"
+/// ANALYTICS_R2_BUCKET     = "yah-analytics"      # bare literal: not a secret
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BundleSlot {
@@ -183,12 +277,31 @@ pub struct BundleSlot {
     /// `<triple> → <path to serve binary>`. Any entry makes this a
     /// `runtime = "self"` bundle that carries its own serve binaries.
     pub serve_bins: BTreeMap<String, PathBuf>,
+    /// Build the serve binaries on demand instead of naming pre-built paths
+    /// (R746-F2). Mutually exclusive with `serve_bins`; either one makes this a
+    /// `runtime = "self"` bundle.
+    pub serve_build: Option<BinBuild>,
     /// How kamaji supervises the served bundle.
     pub lifecycle: BundleLifecycle,
     /// Port the served bundle listens on (R599-F12). `None` → kamaji's
     /// node-wide default (8080), which is only correct while the node hosts a
     /// single bundle; declare one per workload to put several on a node.
     pub port: Option<u16>,
+    /// `[providers.bundle.env]` — environment for the **serve** process, as
+    /// `NAME → source URI` (R556-T12).
+    ///
+    /// Values are the source *declaration*, kept verbatim and resolved
+    /// deploy-side by `yah cloud apply` — `vault:<slot>`, `env:<VAR>`, a
+    /// pipe-joined fallback chain of either, or a bare literal for a
+    /// known-non-secret value. Same grammar `~/.yah/qed/secrets.toml` uses, so
+    /// there is one source-URI vocabulary in the camp rather than two.
+    ///
+    /// Parsing stays here and resolution does not: this crate is offline by
+    /// construction (a misconfigured mirror must fail before a build runs), and
+    /// only the syncing machine has the vault. The `RevalidateSlot::mirror_key_env`
+    /// → [`RevalidateSlot::to_workload_payload`] split is the same shape one
+    /// level down.
+    pub env: BTreeMap<String, String>,
     /// Optional revalidate receiver config (R330-F12). `Some` → the deploy
     /// also stands up a `mesofact serve --revalidate` process.
     pub revalidate: Option<RevalidateSlot>,
@@ -210,6 +323,37 @@ pub struct BundleSlot {
     pub verify_serving: bool,
 }
 
+/// A binary the bundle needs, declared as **the recipe that builds it** rather
+/// than as a path someone is expected to have already produced (R746-F2).
+///
+/// ```toml
+/// [providers.bundle.serve_build]
+/// pipeline = "mesofact-musl"                   # .yah/qed/<name>.toml
+/// binary   = "mesofact"                        # matches a step's `produces.binary`
+/// triples  = ["x86_64-unknown-linux-musl"]     # what the placed nodes run
+/// ```
+///
+/// # Why this is a declaration and not a fallback
+///
+/// The alternative shape — "use `serve_bins` if the path exists, otherwise
+/// build" — makes the deployed artifact a function of what happens to be on the
+/// operator's disk. Two machines syncing the same mirror would then ship
+/// different binaries, and the one with a stale path would ship the stale one
+/// silently. The mirror says which shape it is; the sync obeys.
+///
+/// Declaring both this and `serve_bins` is refused for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinBuild {
+    /// QED pipeline name, resolved under `.yah/qed/<pipeline>.toml`.
+    pub pipeline: String,
+    /// Logical binary name, matched against a step's `[[steps.produces]]
+    /// binary`.
+    pub binary: String,
+    /// Target triples to resolve, in declaration order. Non-empty: a build
+    /// declaration that names no target builds nothing.
+    pub triples: Vec<String>,
+}
+
 /// Parsed `[providers.bundle.revalidate]` sub-slot — declares the almanac
 /// revalidate receiver to fork alongside the static bundle server (R330-F12).
 ///
@@ -220,12 +364,21 @@ pub struct BundleSlot {
 /// publish_config = "mesofact.config.toml"        # default
 /// feeds = ["releases"]               # .yah/almanac/<name>.toml to keep fresh
 /// feed_interval_secs = 300           # default
-/// feed_bins = { x86_64-unknown-linux-musl = "target/…/almanac-feed" }
+/// feed_runtime = "almanac-feed/0.8.22"   # vanilla: node resolves the fetcher
+/// # …or, for a self-contained bundle, stage it in and name the built paths:
+/// # feed_bins = { x86_64-unknown-linux-musl = "target/…/almanac-feed" }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevalidateSlot {
     /// Routes the receiver accepts pokes for (allowlist).
     /// Empty → all routes in the workload manifest.
+    ///
+    /// Enforced on the node since R752-B7: kamaji renders this list as one
+    /// `--allow-route` per entry on the receiver's argv, `mesofact serve`
+    /// refuses an explicit poke outside it (403) and narrows a whole-site poke
+    /// to it. Before that it was parsed here, shipped over the wire, and read
+    /// by nobody — declaring it bought exactly nothing. Scoping only: `who may
+    /// poke` is `mirror_key_env`, and the two are independent.
     pub routes: Vec<String>,
     /// Env var name holding the tenant bearer secret. Deploy resolves it
     /// and sets `MESOFACT_MIRROR_KEY` on the receiver process.
@@ -241,9 +394,23 @@ pub struct RevalidateSlot {
     /// Seconds between feed-fetch ticks. `None` → the spec default.
     pub feed_interval_secs: Option<u64>,
     /// Per-triple path to the `almanac-feed` binary staged into the bundle as a
-    /// sidecar. Required when `feeds` is non-empty — the node has no other way
-    /// to get it.
+    /// sidecar. The self-contained shape's answer to "how does the fetcher
+    /// reach the node".
+    ///
+    /// Mutually exclusive with [`feed_runtime`](Self::feed_runtime), for the
+    /// same reason `serve_bins` and `serve_build` are: the mirror declares
+    /// which shape it is, and a use-whichever-exists fallback would make the
+    /// deployed binary a function of the syncing machine's disk.
     pub feed_bins: BTreeMap<String, PathBuf>,
+    /// Runtime ref the fetcher resolves from the node's shared runtime-asset
+    /// cache — `feed_runtime = "almanac-feed/0.8.22"` (R746-T3).
+    ///
+    /// This is the **vanilla** shape's answer, and it is what makes a vanilla
+    /// bundle with a feed tier possible at all: `feed_bins` is a path someone
+    /// must have cross-built, so a bundle that carries no serve binary but
+    /// still needs a sidecar path has only moved the toolchain requirement,
+    /// not removed it.
+    pub feed_runtime: Option<String>,
 }
 
 impl RevalidateSlot {
@@ -274,6 +441,7 @@ impl RevalidateSlot {
                 .feed_interval_secs
                 .unwrap_or(DEFAULT_FEED_INTERVAL_SECS),
             feed_project_prefix,
+            feed_runtime: self.feed_runtime.clone(),
         }
     }
 }
@@ -284,8 +452,15 @@ impl RevalidateSlot {
 pub const DEFAULT_FEED_INTERVAL_SECS: u64 = 300;
 
 /// Bundle path segment the fetch tier's sidecar binary is staged under —
-/// `bins/<triple>/almanac-feed`, next to `bins/<triple>/serve`.
-pub const FEED_BIN_NAME: &str = "almanac-feed";
+/// `bins/<triple>/almanac-feed`, next to `bins/<triple>/serve` — and the
+/// filename it lands under in the node runtime-asset cache when a *vanilla*
+/// bundle resolves it by name instead (R746-T3).
+///
+/// Re-exported from `yah_mesofact_bundle` rather than re-typed: this crate and
+/// kamaji both used to declare their own copy, pinned together only by an
+/// argv-shape test. One `const` in the crate they both already depend on
+/// removes the drift instead of detecting it.
+pub use yah_mesofact_bundle::FEED_BIN as FEED_BIN_NAME;
 
 impl BundleSlot {
     /// Parse the mirror's `[providers.bundle]` slot.
@@ -302,6 +477,28 @@ impl BundleSlot {
             )
         })?;
         let fields = slot.fields();
+
+        // R556-B14. Unknown keys are rejected BEFORE anything is read, so the
+        // operator gets the typo rather than a downstream complaint about the
+        // field the typo was supposed to be. Nearest-match is offered because
+        // the realistic failure is one transposed character, and an error that
+        // only says "unknown" makes the reader diff the docs by eye.
+        for key in fields.keys() {
+            if ALLOWED_SLOT_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            let hint = nearest_slot_key(key)
+                .map(|k| format!(" — did you mean `{k}`?"))
+                .unwrap_or_default();
+            bail!(
+                "providers.{SLOT_ROLE} has an unknown key `{key}`{hint} (service={service}, \
+                 env={env}). Every key this slot reads is one of: {}. An unrecognized key is \
+                 refused rather than ignored because the failure it hides is silent: a typo'd \
+                 `port` deploys onto whatever bundle already holds the node default, and a \
+                 mistyped credential block deploys a serve process with no credentials at all.",
+                ALLOWED_SLOT_KEYS.join(", "),
+            );
+        }
 
         let bucket = fields
             .get("bucket")
@@ -383,6 +580,24 @@ impl BundleSlot {
             }
         };
 
+        let serve_build = parse_bin_build(
+            fields.get("serve_build"),
+            &format!("providers.{SLOT_ROLE}.serve_build"),
+            service,
+            env,
+        )?;
+
+        if serve_build.is_some() && !serve_bins.is_empty() {
+            bail!(
+                "providers.{SLOT_ROLE} declares BOTH `serve_bins` and `serve_build` — pick one \
+                 (service={service}, env={env}). `serve_bins` names binaries you have already \
+                 built; `serve_build` names the QED recipe that builds them. Accepting both \
+                 would make the deployed binary depend on what happens to be on the syncing \
+                 machine's disk, which is how one operator ships a stale binary while another \
+                 ships a fresh one from the same mirror."
+            );
+        }
+
         // R599-F12. Parsed strictly: a port is either absent or a real one, and
         // a typo that silently fell back to 8080 would collide with whatever
         // bundle already holds that port on the node — a failure that surfaces
@@ -402,6 +617,40 @@ impl BundleSlot {
                          (1..=65535) (service={service}, env={env})"
                     )
                 })?)
+            }
+        };
+
+        // R556-T12. Env for the serve process. Declared as source URIs and
+        // stored verbatim — resolution is the deploy side's job (see the field
+        // docs). Every value is required to be a non-empty string: an empty
+        // source is a var that would silently reach the node unset, which is
+        // the exact failure mode this slot exists to remove.
+        let serve_env = match fields.get("env") {
+            None => BTreeMap::new(),
+            Some(v) => {
+                let table = v.as_table().with_context(|| {
+                    format!(
+                        "providers.{SLOT_ROLE}.env must be a table of <ENV_NAME> = \
+                         \"<source-uri>\" (service={service}, env={env})"
+                    )
+                })?;
+                table
+                    .iter()
+                    .map(|(name, source)| {
+                        let source = source
+                            .as_str()
+                            .filter(|s| !s.trim().is_empty())
+                            .with_context(|| {
+                                format!(
+                                    "providers.{SLOT_ROLE}.env.{name} must be a non-empty source \
+                                     string — \"vault:<slot>\", \"env:<VAR>\", a pipe-joined \
+                                     chain of either, or a bare literal for a non-secret \
+                                     (service={service}, env={env})"
+                                )
+                            })?;
+                        Ok((name.clone(), source.to_string()))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?
             }
         };
 
@@ -435,19 +684,39 @@ impl BundleSlot {
             })?,
         };
 
-        Ok(Self {
+        // R746-T3: a vanilla bundle carries no `bins/` by construction, so a
+        // sidecar declared as a PATH has nowhere to be staged into. Caught here
+        // rather than at assembly so the operator gets the mirror file and the
+        // remedy, offline, before a build runs.
+        let slot = Self {
             bucket,
             account,
             name,
             machines,
             runtime_version,
             serve_bins,
+            serve_build,
             lifecycle,
             port,
+            env: serve_env,
             revalidate,
             zone,
             verify_serving,
-        })
+        };
+        if !slot.is_self_contained() {
+            if let Some(rv) = slot.revalidate.as_ref() {
+                if !rv.feed_bins.is_empty() {
+                    anyhow::bail!(
+                        "providers.{SLOT_ROLE}.{REVALIDATE_KEY}.feed_bins is declared but this is \
+                         a VANILLA bundle (no serve_bins / serve_build), which carries no bins/ \
+                         at all — replace it with feed_runtime = \"{FEED_BIN_NAME}/<version>\" \
+                         and publish that asset once per triple with `yah cloud bundle \
+                         publish-runtime` (service={service}, env={env})"
+                    );
+                }
+            }
+        }
+        Ok(slot)
     }
 
     /// The zone whose front door a deploy of this bundle is checked against:
@@ -463,8 +732,14 @@ impl BundleSlot {
 
     /// True when the assembled bundle carries its own serve binaries
     /// (`runtime = "self"`) rather than resolving a stock node runtime asset.
+    ///
+    /// Keyed on the *declaration*, not on what is on disk: a `serve_build` slot
+    /// is self-contained before its binary has ever been built, because the
+    /// mirror said so. Deriving the shape from disk state instead is the bug
+    /// this relay exists to remove — it makes a bundle's shape depend on which
+    /// machine ran the sync.
     pub fn is_self_contained(&self) -> bool {
-        !self.serve_bins.is_empty()
+        !self.serve_bins.is_empty() || self.serve_build.is_some()
     }
 
     /// Build the `{digest, runtime, lifecycle}` triple a `mesofact-static`
@@ -473,7 +748,18 @@ impl BundleSlot {
     /// `runtime` wire-mirrors `yah_mesofact_bundle::BundleRuntime`, so it is
     /// taken from the manifest the assembler actually wrote rather than
     /// re-derived here — the manifest is what the node will verify against.
-    pub fn serve_bundle(&self, digest: &str, runtime: &str) -> MesofactServeBundle {
+    ///
+    /// `env` is the **resolved** serve environment, passed in rather than read
+    /// off `self.env`: this crate holds source URIs, and only the syncing
+    /// machine can turn a `vault:<slot>` into a value. Same by-value handoff
+    /// [`RevalidateSlot::to_workload_payload`] takes, for the same reason —
+    /// the node must never see a keystore slot name (R556-T12).
+    pub fn serve_bundle(
+        &self,
+        digest: &str,
+        runtime: &str,
+        env: BTreeMap<String, String>,
+    ) -> MesofactServeBundle {
         MesofactServeBundle {
             digest: BlakeHash(digest.to_string()),
             runtime: runtime.to_string(),
@@ -483,8 +769,134 @@ impl BundleSlot {
             // unblock the camp's build while this ticket was mid-flight; this
             // is the real threading it named.)
             port: self.port,
+            env,
         }
     }
+}
+
+/// Closest [`ALLOWED_SLOT_KEYS`] entry to `key`, or `None` when nothing is
+/// close enough to be worth suggesting (R556-B14).
+///
+/// The threshold scales with the key's length — one edit for a short key like
+/// `port`, two for a longer one — so `prot` suggests `port` while an entirely
+/// invented key suggests nothing. A confidently wrong suggestion is worse than
+/// none: it sends the operator to fix a line that was never the problem.
+fn nearest_slot_key(key: &str) -> Option<&'static str> {
+    let budget = if key.len() <= 5 { 1 } else { 2 };
+    ALLOWED_SLOT_KEYS
+        .iter()
+        .map(|candidate| (edit_distance(key, candidate), *candidate))
+        .filter(|(d, _)| *d <= budget)
+        .min()
+        .map(|(_, candidate)| candidate)
+}
+
+/// Optimal string alignment (Damerau-Levenshtein restricted to adjacent
+/// transpositions), three-row DP. Byte-wise: every key in this grammar is
+/// ASCII, and a multi-byte typo is not a case worth carrying a char-vec for.
+///
+/// Transposition counts as ONE edit, not two, and that is the whole reason to
+/// carry the extra row: `prot` for `port` is the motivating typo of R556-B14,
+/// and plain Levenshtein scores it 2 — far enough away that a threshold tight
+/// enough to avoid nonsense suggestions would refuse to suggest the one that
+/// matters.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut prev2 = vec![0usize; b.len() + 1];
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, &ac) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &bc) in b.iter().enumerate() {
+            let mut d = (prev[j] + usize::from(ac != bc))
+                .min(prev[j + 1] + 1)
+                .min(cur[j] + 1);
+            if i > 0 && j > 0 && ac == b[j - 1] && a[i - 1] == bc {
+                d = d.min(prev2[j - 1] + 1);
+            }
+            cur[j + 1] = d;
+        }
+        std::mem::swap(&mut prev2, &mut prev);
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Parse a `[…serve_build]`-shaped table into a [`BinBuild`] (R746-F2).
+///
+/// Taken as a helper rather than inlined because the revalidate tier's
+/// `feed_bins` has the identical "a path someone must have built" problem and
+/// will want the identical declaration once a recipe produces `almanac-feed`.
+/// Every message names the full config coordinate so the operator gets a line
+/// to open.
+fn parse_bin_build(
+    value: Option<&toml::Value>,
+    label: &str,
+    service: &str,
+    env: &str,
+) -> Result<Option<BinBuild>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let table = value.as_table().with_context(|| {
+        format!("{label} must be a table of pipeline/binary/triples (service={service}, env={env})")
+    })?;
+
+    let pipeline = table
+        .get("pipeline")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .with_context(|| {
+            format!(
+                "{label}.pipeline must name a QED pipeline (.yah/qed/<name>.toml) \
+                 (service={service}, env={env})"
+            )
+        })?
+        .to_string();
+
+    let binary = table
+        .get("binary")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .with_context(|| {
+            format!(
+                "{label}.binary must name the produced binary — it is matched against the \
+                 pipeline's `[[steps.produces]] binary` (service={service}, env={env})"
+            )
+        })?
+        .to_string();
+
+    let triples = table
+        .get("triples")
+        .and_then(|v| v.as_array())
+        .with_context(|| {
+            format!("{label}.triples must be an array of target triples (service={service}, env={env})")
+        })?
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .with_context(|| {
+                    format!("{label}.triples holds a non-string (or empty) entry (service={service}, env={env})")
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    if triples.is_empty() {
+        bail!(
+            "{label}.triples is empty — a build declaration that names no target builds \
+             nothing, and the bundle would assemble with no serve binary at all \
+             (service={service}, env={env})"
+        );
+    }
+
+    Ok(Some(BinBuild {
+        pipeline,
+        binary,
+        triples,
+    }))
 }
 
 /// `lifecycle = "keep-alive" | "on-demand"` (+ `idle_ttl_ms` for the latter).
@@ -644,14 +1056,51 @@ fn parse_revalidate_slot(
         }
     };
 
+    // R746-T3: the vanilla shape's fetcher. A ref, not a path — the node
+    // resolves it from the shared runtime-asset cache the same way it resolves
+    // `serve`, so no cross-built binary has to exist on the syncing machine.
+    let feed_runtime = match sub.get("feed_runtime") {
+        None => None,
+        Some(v) => {
+            let s = v.as_str().filter(|s| !s.is_empty()).with_context(|| {
+                format!(
+                    "providers.{SLOT_ROLE}.{REVALIDATE_KEY}.feed_runtime must be a non-empty \
+                     runtime reference like \"{FEED_BIN_NAME}/0.8.22\" (service={service}, \
+                     env={env})"
+                )
+            })?;
+            // Parse offline so a typo fails the apply with a file to open,
+            // rather than a node failing to resolve it twenty minutes later.
+            yah_mesofact_bundle::RuntimeRef::parse(s).with_context(|| {
+                format!(
+                    "providers.{SLOT_ROLE}.{REVALIDATE_KEY}.feed_runtime (service={service}, \
+                     env={env})"
+                )
+            })?;
+            Some(s.to_string())
+        }
+    };
+
+    // Declared, never inferred — the same rule serve_bins/serve_build follow.
+    // "Use the path if it happens to exist, else the ref" would make the
+    // deployed fetcher a function of the syncing machine's disk.
+    if !feed_bins.is_empty() && feed_runtime.is_some() {
+        anyhow::bail!(
+            "providers.{SLOT_ROLE}.{REVALIDATE_KEY} declares BOTH feed_bins and feed_runtime — \
+             pick one: feed_bins stages the `{FEED_BIN_NAME}` fetcher into the bundle (the \
+             self-contained shape), feed_runtime resolves it from the node's runtime-asset \
+             cache (the vanilla shape) (service={service}, env={env})"
+        );
+    }
+
     // Declaring feeds without shipping the fetcher is the failure that looks
     // like success: the deploy goes green, the receiver serves, and the data
     // never moves again. Catch it here, offline, with the file to edit.
-    if !feeds.is_empty() && feed_bins.is_empty() {
+    if !feeds.is_empty() && feed_bins.is_empty() && feed_runtime.is_none() {
         anyhow::bail!(
-            "providers.{SLOT_ROLE}.{REVALIDATE_KEY}.feeds declares {} feed(s) but no feed_bins — \
-             the node has no other way to get the `{FEED_BIN_NAME}` fetcher, so nothing would \
-             ever refresh them (service={service}, env={env})",
+            "providers.{SLOT_ROLE}.{REVALIDATE_KEY}.feeds declares {} feed(s) but neither \
+             feed_bins nor feed_runtime — the node has no way to get the `{FEED_BIN_NAME}` \
+             fetcher, so nothing would ever refresh them (service={service}, env={env})",
             feeds.len()
         );
     }
@@ -663,6 +1112,7 @@ fn parse_revalidate_slot(
         feeds,
         feed_interval_secs,
         feed_bins,
+        feed_runtime,
     }))
 }
 
@@ -753,19 +1203,29 @@ impl Reconciler for MesofactBundleReconciler {
 
     async fn up(&self, ctx: ReconcileCtx<'_>) -> Result<RunningWorkload> {
         let slot = BundleSlot::parse(ctx.mirror, &ctx.service.name, ctx.env)?;
+        // Name the DECLARED shape, not a count. R746-F2 added a third shape, and
+        // a bare `0 serve binaries` reads identically for "vanilla, resolves the
+        // node's stock runtime" and "self-contained, builds its binary on
+        // demand" — two different deploys.
+        let shape = match (&slot.serve_build, slot.serve_bins.len()) {
+            (Some(build), _) => format!(
+                "self-contained, serve binary built by QED recipe `{}` for [{}]",
+                build.pipeline,
+                build.triples.join(", "),
+            ),
+            (None, 0) => format!(
+                "vanilla, node resolves runtime mesofact/{}",
+                slot.runtime_version.as_deref().unwrap_or("<caller version>"),
+            ),
+            (None, n) => format!("self-contained, {n} declared serve binary path(s)"),
+        };
         bail!(
-            "bundle tier validated (bucket={}, workload={}, {} serve binar{}) for service={}, \
+            "bundle tier validated (bucket={}, workload={}, {shape}) for service={}, \
              env={}, but the sync arm runs at the apply layer — deploy with \
              `yah cloud mirror up {} --env {}` (machine placement needs the workspace's \
              machine set, which a desktop bring-up does not load)",
             slot.bucket,
             slot.workload_name(&ctx.service.name),
-            slot.serve_bins.len(),
-            if slot.serve_bins.len() == 1 {
-                "y"
-            } else {
-                "ies"
-            },
             ctx.service.name,
             ctx.env,
             ctx.service.name,
@@ -786,6 +1246,7 @@ mod tests {
             shape: MirrorShape::SingleMachine,
             providers: slots,
             ingress: Default::default(),
+            ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: BTreeMap::new(),
         }
@@ -821,6 +1282,8 @@ mod tests {
             connect: None,
             allocatable: None,
             taints: vec![],
+            sovereign_group: None,
+            sovereign_role: None,
         }
     }
 
@@ -902,6 +1365,125 @@ x86_64-unknown-linux-musl = "target/x86_64-unknown-linux-musl/release/mesofact"
         let slot = BundleSlot::parse(&mirror, "yah-marketing", "cloud").unwrap();
         assert!(slot_ready(&slot, root.path()));
         assert!(missing_bins(&slot, root.path()).is_empty());
+    }
+
+    /// R746-F2. The shape B43 could not express: self-contained, declared, and
+    /// buildable *from any machine* — so it is ready without anyone having a
+    /// binary on disk, and there is no `missing:` line to print because nothing
+    /// was ever promised to be there.
+    #[test]
+    fn a_serve_build_slot_is_self_contained_and_ready_with_no_binary_on_disk() {
+        let root = tempfile::tempdir().unwrap();
+        let mirror = mirror_with(
+            r#"
+use = "cloudflare"
+bucket = "yah-dev"
+
+[serve_build]
+pipeline = "mesofact-musl"
+binary = "mesofact"
+triples = ["x86_64-unknown-linux-musl"]
+"#,
+        );
+        let slot = BundleSlot::parse(&mirror, "yah-marketing", "cloud").unwrap();
+
+        let build = slot.serve_build.as_ref().expect("serve_build parsed");
+        assert_eq!(build.pipeline, "mesofact-musl");
+        assert_eq!(build.binary, "mesofact");
+        assert_eq!(build.triples, vec!["x86_64-unknown-linux-musl".to_string()]);
+
+        assert!(slot.is_self_contained(), "declared shape, not disk state");
+        assert!(slot_ready(&slot, root.path()));
+        assert!(missing_bins(&slot, root.path()).is_empty());
+    }
+
+    /// R746-F2 verify #1, at the only layer that can pin it offline: a vanilla
+    /// slot carries no build declaration at all, so the sync has nothing to
+    /// dispatch. The cheapness of the vanilla path is structural, not a
+    /// heuristic someone has to keep true.
+    #[test]
+    fn a_vanilla_slot_declares_no_build_so_a_sync_has_nothing_to_dispatch() {
+        let mirror = mirror_with(
+            r#"
+use = "cloudflare"
+bucket = "yah-dev"
+runtime_version = "0.8.22"
+"#,
+        );
+        let slot = BundleSlot::parse(&mirror, "yah-marketing", "cloud").unwrap();
+        assert!(slot.serve_build.is_none());
+        assert!(slot.serve_bins.is_empty());
+        assert!(!slot.is_self_contained());
+        assert_eq!(slot.runtime_version.as_deref(), Some("0.8.22"));
+    }
+
+    /// The shape must stay DECLARED, never derived — so the two ways of naming
+    /// a serve binary are mutually exclusive rather than one falling back to
+    /// the other. A fallback would make the deployed binary a function of the
+    /// syncing machine's disk.
+    #[test]
+    fn serve_bins_and_serve_build_together_are_refused() {
+        let mirror = mirror_with(
+            r#"
+use = "cloudflare"
+bucket = "yah-dev"
+
+[serve_bins]
+x86_64-unknown-linux-musl = "some/path/mesofact"
+
+[serve_build]
+pipeline = "mesofact-musl"
+binary = "mesofact"
+triples = ["x86_64-unknown-linux-musl"]
+"#,
+        );
+        let err = BundleSlot::parse(&mirror, "yah-marketing", "cloud").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("BOTH `serve_bins` and `serve_build`"), "{msg}");
+    }
+
+    /// Each field is load-bearing, so each absence is refused by name rather
+    /// than defaulted into a build that produces nothing.
+    #[test]
+    fn a_serve_build_missing_a_field_is_refused_naming_the_coordinate() {
+        let cases = [
+            (
+                r#"[serve_build]
+binary = "mesofact"
+triples = ["x86_64-unknown-linux-musl"]"#,
+                "serve_build.pipeline",
+            ),
+            (
+                r#"[serve_build]
+pipeline = "mesofact-musl"
+triples = ["x86_64-unknown-linux-musl"]"#,
+                "serve_build.binary",
+            ),
+            (
+                r#"[serve_build]
+pipeline = "mesofact-musl"
+binary = "mesofact""#,
+                "serve_build.triples",
+            ),
+            (
+                r#"[serve_build]
+pipeline = "mesofact-musl"
+binary = "mesofact"
+triples = []"#,
+                "serve_build.triples is empty",
+            ),
+        ];
+        for (fragment, expected) in cases {
+            let mirror = mirror_with(&format!(
+                "use = \"cloudflare\"\nbucket = \"yah-dev\"\n\n{fragment}\n"
+            ));
+            let err = BundleSlot::parse(&mirror, "yah-marketing", "cloud").unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(expected),
+                "expected {expected:?} in error, got: {msg}"
+            );
+        }
     }
 
     /// A declared feed tier is part of "can it serve" — R330-F31 stages the
@@ -1064,7 +1646,8 @@ port = 8081"#,
         .unwrap();
         assert_eq!(slot.port, Some(8081));
         assert_eq!(
-            slot.serve_bundle("a".repeat(64).as_str(), "self").port,
+            slot.serve_bundle("a".repeat(64).as_str(), "self", BTreeMap::new())
+                .port,
             Some(8081)
         );
 
@@ -1080,9 +1663,223 @@ bucket = "b""#,
         .unwrap();
         assert_eq!(bare.port, None);
         assert_eq!(
-            bare.serve_bundle("a".repeat(64).as_str(), "self").port,
+            bare.serve_bundle("a".repeat(64).as_str(), "self", BTreeMap::new())
+                .port,
             None
         );
+    }
+
+    /// R556-B14: a misspelled key fails the parse naming itself, rather than
+    /// deploying a wrong-but-plausible workload.
+    ///
+    /// `prot = 8081` is the motivating instance: it parses clean today, the
+    /// port falls back to kamaji's node-wide default, and post-R599-F12 that
+    /// default is whatever OTHER bundle already holds 8080 on the node. The
+    /// operator sees the wrong site served, with nothing in any log naming the
+    /// typo.
+    #[test]
+    fn an_unknown_slot_key_is_rejected_naming_the_key() {
+        let err = BundleSlot::parse(
+            &mirror_with(
+                r#"use = "cloudflare"
+bucket = "b"
+prot = 8081"#,
+            ),
+            "yah-marketing",
+            "cloud",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("prot"), "the error must name the typo: {err}");
+        assert!(
+            err.contains("did you mean `port`"),
+            "one transposed character is the realistic failure — suggest the \
+             fix rather than making the operator diff the docs: {err}"
+        );
+    }
+
+    /// The suggester's distance metric counts a transposition as ONE edit.
+    /// Plain Levenshtein scores `prot`→`port` at 2, which is far enough away
+    /// that any threshold tight enough to suppress nonsense suggestions would
+    /// also suppress the single typo this ticket was filed about.
+    #[test]
+    fn the_key_suggester_treats_a_transposition_as_one_edit() {
+        assert_eq!(edit_distance("prot", "port"), 1);
+        assert_eq!(edit_distance("bukcet", "bucket"), 1);
+        assert_eq!(nearest_slot_key("prot"), Some("port"));
+        assert_eq!(nearest_slot_key("bucket"), Some("bucket"));
+        assert_eq!(nearest_slot_key("zzzzzzzzzzzzzz"), None);
+    }
+
+    /// No suggestion when nothing is close. A confidently wrong hint sends the
+    /// operator to edit a line that was never the problem.
+    #[test]
+    fn an_unrecognizable_slot_key_is_rejected_without_a_bogus_suggestion() {
+        let err = BundleSlot::parse(
+            &mirror_with(
+                r#"use = "cloudflare"
+bucket = "b"
+ingress_tunnel_hostname = "analytics.yah.dev""#,
+            ),
+            "yah-analytics",
+            "cloud",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ingress_tunnel_hostname"), "{err}");
+        assert!(!err.contains("did you mean"), "{err}");
+    }
+
+    /// R556-B14's regression criterion: the allowed set is the UNION of every
+    /// consumer's reads, not just `BundleSlot::parse`'s. `plan_ingress` reads
+    /// `machine` / `machines` / `port` / `upstream_host` off this same table
+    /// and `MirrorProviderSlot::required` reads `required` — scoping the set to
+    /// one consumer would reject the live yah-marketing mirror, which carries
+    /// `upstream_host`.
+    #[test]
+    fn keys_read_by_other_consumers_of_this_slot_are_allowed() {
+        // Every non-comment key of .yah/services/yah-marketing/mirrors/cloud.toml's
+        // [providers.bundle] block, as of R556-B14.
+        let slot = BundleSlot::parse(
+            &mirror_with(
+                r#"use = "cloudflare"
+verify_serving = false
+bucket = "yah-dev"
+name = "yah-marketing"
+machines = ["us-east-001"]
+port = 8080
+zone = "yah.dev"
+upstream_host = "100.64.0.3"
+lifecycle = "keep-alive"
+runtime_version = "0.8.23"
+
+[revalidate]
+routes = ["/releases", "/issues"]
+mirror_key_env = "YAH_MARKETING_MIRROR_KEY"
+feeds = ["releases", "yah-desktop"]
+feed_interval_secs = 5
+feed_runtime = "almanac-feed/0.8.22""#,
+            ),
+            "yah-marketing",
+            "cloud",
+        )
+        .unwrap();
+        assert_eq!(slot.bucket, "yah-dev");
+        assert_eq!(slot.port, Some(8080));
+        assert!(!slot.verify_serving);
+
+        // …and the F16 placement form, whose `required` is read through the
+        // slot rather than by `parse`.
+        BundleSlot::parse(
+            &mirror_with(
+                r#"use = "cloudflare"
+bucket = "yah-dev"
+
+[required]
+regions = ["us-east"]"#,
+            ),
+            "s",
+            "e",
+        )
+        .unwrap();
+    }
+
+    /// R556-T12: `[providers.bundle.env]` parses into source URIs, kept
+    /// verbatim. Resolution is deliberately NOT done here — this crate is
+    /// offline by construction and only the syncing machine holds the vault.
+    #[test]
+    fn env_sources_are_parsed_verbatim_and_not_resolved() {
+        let slot = BundleSlot::parse(
+            &mirror_with(
+                r#"use = "cloudflare"
+bucket = "b"
+
+[env]
+ANALYTICS_R2_ACCESS_KEY = "vault:cloudflare-r2-access-key-id"
+ANALYTICS_R2_SECRET_KEY = "vault:cloudflare-r2-secret-key|env:R2_SECRET"
+ANALYTICS_R2_BUCKET     = "yah-analytics""#,
+            ),
+            "s",
+            "e",
+        )
+        .unwrap();
+        assert_eq!(slot.env.len(), 3);
+        assert_eq!(
+            slot.env.get("ANALYTICS_R2_ACCESS_KEY").map(String::as_str),
+            Some("vault:cloudflare-r2-access-key-id"),
+            "the SOURCE is stored, never a resolved secret — this struct is \
+             parsed on any machine and printed by diagnostics",
+        );
+        assert_eq!(
+            slot.env.get("ANALYTICS_R2_SECRET_KEY").map(String::as_str),
+            Some("vault:cloudflare-r2-secret-key|env:R2_SECRET"),
+            "a pipe-joined fallback chain survives parsing intact",
+        );
+        assert_eq!(
+            slot.env.get("ANALYTICS_R2_BUCKET").map(String::as_str),
+            Some("yah-analytics"),
+            "a bare literal is a legitimate non-secret source",
+        );
+
+        // Absent block → empty, and the serve bundle carries whatever the
+        // deploy resolved (nothing, here).
+        let bare = BundleSlot::parse(
+            &mirror_with("use = \"cloudflare\"\nbucket = \"b\""),
+            "s",
+            "e",
+        )
+        .unwrap();
+        assert!(bare.env.is_empty());
+    }
+
+    /// The resolved env reaches the workload payload — the leg that was missing
+    /// entirely (R556-T12). Before it, `MesofactServeBundle` had nowhere to put
+    /// credentials, so kamaji forked the serve process with an empty
+    /// environment and an SSR route reading a private source 500'd per request.
+    #[test]
+    fn resolved_env_reaches_the_serve_bundle() {
+        let slot = BundleSlot::parse(
+            &mirror_with(
+                r#"use = "cloudflare"
+bucket = "b"
+
+[env]
+ANALYTICS_R2_ACCESS_KEY = "vault:cloudflare-r2-access-key-id""#,
+            ),
+            "s",
+            "e",
+        )
+        .unwrap();
+
+        let mut resolved = BTreeMap::new();
+        resolved.insert("ANALYTICS_R2_ACCESS_KEY".to_string(), "AKIA".to_string());
+        let sb = slot.serve_bundle(&"a".repeat(64), "self", resolved);
+
+        assert_eq!(
+            sb.env.get("ANALYTICS_R2_ACCESS_KEY").map(String::as_str),
+            Some("AKIA"),
+            "the node receives the VALUE; a keystore slot name must never \
+             cross the wire",
+        );
+    }
+
+    /// An env entry that is not a usable source string must fail the parse.
+    /// The whole point of the slot is that a credential problem surfaces at
+    /// sync, in milliseconds, rather than as a per-request 500 on a node.
+    #[test]
+    fn an_unusable_env_source_is_rejected() {
+        for bad in [
+            "[env]\nFOO = \"\"",
+            "[env]\nFOO = \"   \"",
+            "[env]\nFOO = 8081",
+            "env = \"vault:x\"",
+        ] {
+            let toml = format!("use = \"cloudflare\"\nbucket = \"b\"\n{bad}");
+            let err = BundleSlot::parse(&mirror_with(&toml), "yah-marketing", "ha")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("env"), "{bad}: {err}");
+        }
     }
 
     /// A port typo must fail the parse, not silently fall back to 8080 — that
@@ -1255,7 +2052,7 @@ bucket = "b""#,
         );
         let slot = BundleSlot::parse(&mirror, "s", "e").unwrap();
         let digest = "a".repeat(64);
-        let sb = slot.serve_bundle(&digest, "mesofact/0.8.20");
+        let sb = slot.serve_bundle(&digest, "mesofact/0.8.20", BTreeMap::new());
         assert_eq!(sb.digest.0, digest);
         assert_eq!(sb.runtime, "mesofact/0.8.20");
         assert_eq!(sb.lifecycle, BundleLifecycle::KeepAlive);
@@ -1370,14 +2167,20 @@ mirror_key_env = "BEARER"
             feeds: vec![],
             feed_interval_secs: None,
             feed_bins: BTreeMap::new(),
+            feed_runtime: None,
         }
     }
 
     #[test]
     fn parses_feed_tier_declaration() {
+        // A staged sidecar belongs to a self-contained bundle, so this fixture
+        // declares one — R746-T3 refuses feed_bins on a vanilla slot.
         let mirror = mirror_with(
             r#"use = "cloudflare"
 bucket = "b"
+
+[serve_bins]
+x86_64-unknown-linux-musl = "target/x86_64-unknown-linux-musl/release/mesofact"
 
 [revalidate]
 routes = ["/releases"]
@@ -1396,6 +2199,124 @@ x86_64-unknown-linux-musl = "target/x86_64-unknown-linux-musl/release/almanac-fe
         assert_eq!(rv.feed_interval_secs, Some(60));
         assert_eq!(rv.feed_bins.len(), 1);
         assert!(rv.feed_bins["x86_64-unknown-linux-musl"].ends_with("almanac-feed"));
+        assert!(rv.feed_runtime.is_none());
+    }
+
+    /// R746-T3: the vanilla shape's feed tier. This is the declaration that
+    /// makes yah-marketing deployable from a machine with no Rust toolchain —
+    /// no path to a cross-built fetcher anywhere in it.
+    #[test]
+    fn a_vanilla_slot_declares_its_fetcher_as_a_runtime_ref() {
+        let mirror = mirror_with(
+            r#"use = "cloudflare"
+bucket = "b"
+runtime_version = "0.8.22"
+
+[revalidate]
+routes = ["/releases"]
+feeds = ["releases"]
+feed_runtime = "almanac-feed/0.8.22"
+"#,
+        );
+        let slot = BundleSlot::parse(&mirror, "s", "e").unwrap();
+        assert!(!slot.is_self_contained());
+        let rv = slot.revalidate.unwrap();
+        assert_eq!(rv.feed_runtime.as_deref(), Some("almanac-feed/0.8.22"));
+        assert!(rv.feed_bins.is_empty());
+    }
+
+    /// The whole point: a vanilla slot with a feed tier is READY with nothing
+    /// on disk. `feed_bins` would have kept the cross-built-binary requirement
+    /// alive on the syncing machine while pretending the bundle was vanilla.
+    #[test]
+    fn a_vanilla_feed_tier_needs_no_binary_on_the_syncing_machine() {
+        let mirror = mirror_with(
+            r#"use = "cloudflare"
+bucket = "b"
+runtime_version = "0.8.22"
+
+[revalidate]
+feeds = ["releases"]
+feed_runtime = "almanac-feed/0.8.22"
+"#,
+        );
+        let slot = BundleSlot::parse(&mirror, "s", "e").unwrap();
+        let empty = std::path::Path::new("/nonexistent-workspace-root");
+        assert!(missing_bins(&slot, empty).is_empty());
+        assert!(slot_ready(&slot, empty));
+    }
+
+    /// Declared, never inferred — the rule serve_bins/serve_build already
+    /// follow. "Use the path if it exists, else the ref" would make the
+    /// deployed fetcher a function of the syncing machine's disk.
+    #[test]
+    fn feed_bins_and_feed_runtime_together_are_refused() {
+        let mirror = mirror_with(
+            r#"use = "cloudflare"
+bucket = "b"
+
+[serve_bins]
+x86_64-unknown-linux-musl = "target/mesofact"
+
+[revalidate]
+feeds = ["releases"]
+feed_runtime = "almanac-feed/0.8.22"
+
+[revalidate.feed_bins]
+x86_64-unknown-linux-musl = "target/almanac-feed"
+"#,
+        );
+        let err = BundleSlot::parse(&mirror, "s", "e").unwrap_err().to_string();
+        assert!(err.contains("feed_bins") && err.contains("feed_runtime"), "got {err}");
+    }
+
+    /// A vanilla bundle carries no `bins/`, so a path-declared sidecar has
+    /// nowhere to be staged. Caught at parse, with the remedy in the message.
+    #[test]
+    fn feed_bins_on_a_vanilla_slot_is_refused_naming_feed_runtime() {
+        let mirror = mirror_with(
+            r#"use = "cloudflare"
+bucket = "b"
+runtime_version = "0.8.22"
+
+[revalidate]
+feeds = ["releases"]
+
+[revalidate.feed_bins]
+x86_64-unknown-linux-musl = "target/almanac-feed"
+"#,
+        );
+        let err = BundleSlot::parse(&mirror, "s", "e").unwrap_err().to_string();
+        assert!(err.contains("VANILLA"), "got {err}");
+        assert!(err.contains("feed_runtime"), "got {err}");
+    }
+
+    /// A typo in the ref fails the apply offline, not on a node twenty minutes
+    /// into a deploy.
+    #[test]
+    fn an_unparseable_feed_runtime_is_refused_at_parse() {
+        let mirror = mirror_with(
+            r#"use = "cloudflare"
+bucket = "b"
+runtime_version = "0.8.22"
+
+[revalidate]
+feeds = ["releases"]
+feed_runtime = "almanac-feed"
+"#,
+        );
+        let err = BundleSlot::parse(&mirror, "s", "e").unwrap_err().to_string();
+        assert!(err.contains("feed_runtime"), "got {err}");
+    }
+
+    /// The payload the node acts on must carry the ref, or kamaji has nothing
+    /// to resolve and the fetcher silently never forks.
+    #[test]
+    fn the_feed_runtime_ref_reaches_the_workload_payload() {
+        let mut slot = bare_revalidate_slot();
+        slot.feed_runtime = Some("almanac-feed/0.8.22".to_string());
+        let payload = slot.to_workload_payload(BTreeMap::new(), vec![], None);
+        assert_eq!(payload.feed_runtime.as_deref(), Some("almanac-feed/0.8.22"));
     }
 
     /// A receiver with no feed tier is the existing shape and must keep parsing
@@ -1435,6 +2356,7 @@ feeds = ["releases"]
             .unwrap_err()
             .to_string();
         assert!(err.contains("feed_bins"), "got {err}");
+        assert!(err.contains("feed_runtime"), "got {err}");
         assert!(err.contains(FEED_BIN_NAME), "got {err}");
     }
 

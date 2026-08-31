@@ -8,11 +8,11 @@
 //! ```bash
 //! # Local tier — requires a running containerd socket (Colima on macOS):
 //! cargo test -p yubaba --features containerd-integration \
-//!     --test integration_mesh
+//!     --test containerd -- integration_mesh::
 //!
 //! # With the __local filter (matches expanded macro names):
 //! cargo test -p yubaba --features containerd-integration \
-//!     --test integration_mesh multi_node_mesh__local
+//!     --test containerd -- integration_mesh::multi_node_mesh__local
 //!
 //! # Smoke tier — provisions real Hetzner CPX-11s (est. $0.15):
 //! YAH_SMOKE=1 \
@@ -20,7 +20,7 @@
 //! YAH_WARDEN_URL=https://... \
 //! YAH_WARDEN_SHA256=<sha256> \
 //! cargo test -p yubaba --features containerd-integration \
-//!     --test integration_mesh -- --ignored
+//!     --test containerd -- integration_mesh:: --ignored
 //! ```
 //!
 //! ## What is and isn't tested here
@@ -308,4 +308,634 @@ where
     );
 
     // Cluster teardown happens in Drop (aborts all remaining tasks).
+}
+
+// ── R732-T5 (W245 / W253 §9): the canonical split-brain test ─────────────────
+
+/// **Deliberate split-brain attempt.** W253 §9: *"partition a tenant's master
+/// so the control plane fails it over to a new node; heal the partition;
+/// confirm the old master is fenced (stale epoch ⇒ R2 writes bounce). If only
+/// one experiment ever runs, it's this one."*
+///
+/// ## What this models, and what it does not
+///
+/// A network partition is, at the layer this property lives on, exactly one
+/// thing: **the isolated node's applied raft state stops advancing while the
+/// quorum's continues.** So the partition is modelled by driving two
+/// independent `YubabaState`s through `raft::apply` — the real state-machine
+/// transition function, with the real `TransferTenant` CAS — and feeding the
+/// isolated node's copy nothing during the partition window. The old master
+/// keeps running the whole time, which is the point: a killed node writes
+/// nothing and would prove nothing.
+///
+/// openraft's own partition/election/quorum-loss behaviour is not re-tested
+/// here — `multi_node_mesh` above already covers it over real loopback HTTP.
+/// What that test cannot do is keep a partitioned master *alive and writing*,
+/// which is the only interesting case for fencing.
+///
+/// The R2 sink is a real `turso-backup` `BackupTarget` over an in-memory
+/// object store, driven through the real `tail_frames`, so the fence itself —
+/// epoch comparison, watermark CAS, frame keys, manifests — is not simulated.
+///
+/// ## The oracle (W253 §9 "no chaos without measurement")
+///
+/// A client-side ledger records every write and whether it was **acked**, an
+/// ack meaning "a `tail_frames` call covering this frame reported success".
+/// After recovery the ledger is reconciled against what a restore would
+/// actually replay, and the run reports **RTO** (partition → new owner serving)
+/// and **RPO** (acked writes lost). The steady-state hypothesis under test is
+/// W253's: *split-brain is never observable* — RPO for acked writes is 0.
+mod split_brain {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use futures_util::StreamExt;
+    use object_store::memory::InMemory;
+    use object_store::ObjectStore;
+    use turso_backup::snapshot::BackupTarget;
+    use turso_backup::stream::{
+        list_and_parse_generation_manifests, tail_frames, FrameInfo, StreamConfig, StreamOutcome,
+        WalSeam, Watermark, WAL_FRAME_HEADER_SIZE,
+    };
+    use workload_spec::TenantId;
+    use yubaba::raft::{apply, TenantOutcome, YubabaRequest, YubabaResponse, YubabaState};
+
+    const PAGE_SIZE: usize = 4096;
+    const NODE_A: u64 = 1;
+    const NODE_B: u64 = 2;
+
+    /// The tenant's WAL. Both nodes read the same logical database — B has
+    /// hydrated the tenant's local copy — so this is one frame log that each
+    /// node's seam view is taken over.
+    struct LedgerWal {
+        frames: RefCell<Vec<u8>>, // one fill byte per frame; contents are irrelevant
+    }
+
+    impl LedgerWal {
+        fn new() -> Self {
+            Self {
+                frames: RefCell::new(Vec::new()),
+            }
+        }
+        /// Accept a write. Returns the frame number the client is waiting on
+        /// an ack for.
+        fn write(&self) -> u64 {
+            let mut f = self.frames.borrow_mut();
+            let next = f.len() as u8;
+            f.push(next);
+            f.len() as u64
+        }
+        fn len(&self) -> u64 {
+            self.frames.borrow().len() as u64
+        }
+    }
+
+    impl WalSeam for LedgerWal {
+        fn wal_state(&self) -> anyhow::Result<Watermark> {
+            Ok(Watermark {
+                checkpoint_seq: 0,
+                last_frame: self.len(),
+            })
+        }
+        fn wal_get_frame(&self, frame_no: u64, buf: &mut [u8]) -> anyhow::Result<FrameInfo> {
+            let fill = *self
+                .frames
+                .borrow()
+                .get(frame_no as usize - 1)
+                .ok_or_else(|| anyhow::anyhow!("frame {frame_no} out of range"))?;
+            let info = FrameInfo {
+                page_no: frame_no as u32,
+                db_size: frame_no as u32,
+            };
+            buf[0..4].copy_from_slice(&info.page_no.to_be_bytes());
+            buf[4..8].copy_from_slice(&info.db_size.to_be_bytes());
+            buf[8..WAL_FRAME_HEADER_SIZE].fill(0);
+            buf[WAL_FRAME_HEADER_SIZE..].fill(fill);
+            Ok(info)
+        }
+        fn wal_auto_actions_disable(&self) {}
+    }
+
+    /// One client-visible write and its fate.
+    #[derive(Debug)]
+    struct LedgerEntry {
+        frame_no: u64,
+        acked: bool,
+    }
+
+    /// Every object under the sink, counted. The strongest available form of
+    /// "wrote zero frames": it catches a stray frame, manifest, or watermark
+    /// rewrite anywhere in the prefix, not just at keys the test thought to
+    /// name.
+    async fn objects_at(sink: &BackupTarget) -> usize {
+        sink.store
+            .list(None)
+            .filter(|r| {
+                let ok = r.is_ok();
+                async move { ok }
+            })
+            .count()
+            .await
+    }
+
+    fn target() -> BackupTarget {
+        BackupTarget {
+            store: Arc::new(InMemory::new()),
+            prefix: "tenants/acme".into(),
+        }
+    }
+
+    fn cfg<'a>(base: &'a str, epoch: u64, owner: &'a str) -> StreamConfig<'a> {
+        StreamConfig {
+            base_snapshot_key: base,
+            page_size: PAGE_SIZE,
+            backpressure: Default::default(),
+            rpo_target: None,
+            epoch,
+            owner: Some(owner),
+            pointer_generation: 0,
+        }
+    }
+
+    /// Ask raft (this node's applied state) for a fencing token, exactly as
+    /// `TenantStreamer` does in production.
+    fn token(state: &YubabaState, tenant: &TenantId, node: u64, now: u64) -> Option<u64> {
+        state.tenant_fencing_token(tenant, node, now)
+    }
+
+    #[tokio::test]
+    async fn the_old_master_is_fenced_after_the_partition_heals() {
+        let tenant = TenantId("acme".into());
+        let base = "tenants/acme/snapshots/base.db".to_string();
+        let sink = target();
+        let wal = LedgerWal::new();
+        let mut ledger: Vec<LedgerEntry> = Vec::new();
+
+        // Node A's applied state and the quorum's applied state start
+        // identical. `quorum` is what the surviving majority converges on;
+        // `a_state` is node A's private copy, which the partition freezes.
+        let mut a_state = YubabaState::default();
+        let mut quorum = YubabaState::default();
+
+        // ── Steady state: A claims the tenant and streams ─────────────────
+        // A deliberately long lease. The dangerous window is not "the old
+        // master's lease expired and it kept writing anyway" — that one is
+        // easy. It is "the old master's lease is still perfectly valid, it has
+        // every local reason to believe it owns the tenant, and the quorum
+        // transferred it away regardless" (TransferTenant is the authorized
+        // takeover path and does not wait for expiry). If the fence only held
+        // once the lease lapsed, the epoch would be redundant with the timeout
+        // — and this test would be proving the wrong thing.
+        let claim = YubabaRequest::ClaimTenant {
+            tenant: tenant.clone(),
+            node: NODE_A,
+            lease_secs: 300,
+            now: 1_000,
+        };
+        for st in [&mut a_state, &mut quorum] {
+            assert!(matches!(
+                apply(st, &claim),
+                YubabaResponse::Tenant(TenantOutcome::Granted { epoch: 1 })
+            ));
+        }
+        let a_epoch = token(&a_state, &tenant, NODE_A, 1_005).expect("A owns the tenant");
+        assert_eq!(a_epoch, 1);
+
+        let mut pending: Vec<u64> = (0..3).map(|_| wal.write()).collect();
+        let out = tail_frames(&wal, &sink, &cfg(&base, a_epoch, "node-a"))
+            .await
+            .unwrap();
+        assert!(matches!(out, StreamOutcome::Streamed { .. }), "got {out:?}");
+        for frame_no in pending.drain(..) {
+            ledger.push(LedgerEntry {
+                frame_no,
+                acked: true,
+            });
+        }
+
+        // ── Partition begins. A keeps serving; the quorum stops hearing it ─
+        let partition_at = Instant::now();
+
+        // A is isolated from raft but NOT from R2, and it is still the
+        // recorded owner at epoch 1 — so these writes are correctly acked.
+        // This window is legitimate, and a design that broke it would be
+        // trading availability for a safety property it already has.
+        let during: Vec<u64> = (0..2).map(|_| wal.write()).collect();
+        let out = tail_frames(&wal, &sink, &cfg(&base, a_epoch, "node-a"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, StreamOutcome::Streamed { .. }),
+            "a partitioned-but-still-owning master must keep streaming: {out:?}"
+        );
+        for frame_no in during {
+            ledger.push(LedgerEntry {
+                frame_no,
+                acked: true,
+            });
+        }
+
+        // ── Failover: the quorum transfers the tenant to B. A never sees it ─
+        let transfer = YubabaRequest::TransferTenant {
+            tenant: tenant.clone(),
+            to: NODE_B,
+            from_epoch: 1,
+            lease_secs: 30,
+            now: 1_100,
+        };
+        assert!(matches!(
+            apply(&mut quorum, &transfer),
+            YubabaResponse::Tenant(TenantOutcome::Granted { epoch: 2 })
+        ));
+        assert_eq!(
+            token(&a_state, &tenant, NODE_A, 1_105),
+            Some(1),
+            "the isolated node still believes it owns the tenant at its old epoch, \
+             on a lease that has NOT expired — this is the whole hazard, and it \
+             must not be papered over"
+        );
+
+        // B hydrates and takes over. RTO stops when B first serves.
+        let b_epoch = token(&quorum, &tenant, NODE_B, 1_105).expect("B owns the tenant");
+        assert_eq!(b_epoch, 2);
+        let after: Vec<u64> = (0..3).map(|_| wal.write()).collect();
+        let out = tail_frames(&wal, &sink, &cfg(&base, b_epoch, "node-b"))
+            .await
+            .unwrap();
+        assert!(matches!(out, StreamOutcome::Streamed { .. }), "got {out:?}");
+        let rto = partition_at.elapsed();
+        for frame_no in after {
+            ledger.push(LedgerEntry {
+                frame_no,
+                acked: true,
+            });
+        }
+
+        // ── The split-brain attempt ───────────────────────────────────────
+        // The partition heals. A never stopped: it accepted more writes and
+        // now tries to stream them under the token it still holds.
+        let manifests_before = list_and_parse_generation_manifests(&sink).await.unwrap();
+        let objects_before = objects_at(&sink).await;
+        let orphaned: Vec<u64> = (0..4).map(|_| wal.write()).collect();
+        let stale_epoch = token(&a_state, &tenant, NODE_A, 1_200).expect("A still thinks it owns");
+        let out = tail_frames(&wal, &sink, &cfg(&base, stale_epoch, "node-a"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out,
+            StreamOutcome::Fenced {
+                current_epoch: 2,
+                our_epoch: 1,
+                current_pointer_generation: 0,
+                our_pointer_generation: 0,
+            },
+            "THE assertion: the old master's R2 writes must bounce"
+        );
+        for frame_no in orphaned {
+            // Never acked — the client's write never reached durable storage,
+            // and the client was told so.
+            ledger.push(LedgerEntry {
+                frame_no,
+                acked: false,
+            });
+        }
+
+        // …and it wrote ZERO frames doing it.
+        assert_eq!(
+            list_and_parse_generation_manifests(&sink).await.unwrap(),
+            manifests_before,
+            "a fenced master must not publish a generation"
+        );
+        assert_eq!(
+            objects_at(&sink).await,
+            objects_before,
+            "a fenced master must leave the sink byte-for-byte as the winner left it — \
+             not one frame, not one manifest, not a watermark rewrite"
+        );
+
+        // ── Reconciliation + the two numbers ──────────────────────────────
+        // Every ACKED write must be replayable from the sink.
+        let chain = list_and_parse_generation_manifests(&sink).await.unwrap();
+        let replayable: u64 = chain.iter().map(|m| m.last_frame).max().unwrap_or(0);
+        let acked: Vec<u64> = ledger
+            .iter()
+            .filter(|e| e.acked)
+            .map(|e| e.frame_no)
+            .collect();
+        let lost: Vec<u64> = acked.iter().copied().filter(|f| *f > replayable).collect();
+
+        assert!(
+            lost.is_empty(),
+            "RPO violation — acked writes {lost:?} are not replayable (chain reaches {replayable})"
+        );
+        assert_eq!(
+            acked.len(),
+            8,
+            "3 steady + 2 during partition + 3 under the new owner"
+        );
+        assert_eq!(
+            replayable, 8,
+            "the chain must cover exactly the acked writes and none of the fenced ones"
+        );
+
+        // Both owners' generations survive, in epoch order, and the chain the
+        // restore path would actually take is valid.
+        let epochs: Vec<u64> = chain.iter().map(|m| m.epoch).collect();
+        assert_eq!(epochs, vec![1, 1, 2], "A's two generations, then B's");
+        let owners: Vec<Option<&str>> = chain.iter().map(|m| m.owner.as_deref()).collect();
+        assert_eq!(owners, vec![Some("node-a"), Some("node-a"), Some("node-b")]);
+
+        eprintln!(
+            "R732-T5 split-brain: RTO={rto:?} RPO=0 acked writes lost \
+             (of {} acked; {} writes bounced un-acked at the fence)",
+            acked.len(),
+            ledger.iter().filter(|e| !e.acked).count(),
+        );
+    }
+
+    /// The other half of the steady-state hypothesis: **graceful drain loses
+    /// zero acked writes.** A hands over deliberately instead of being
+    /// partitioned, so there is no un-streamed tail to lose.
+    #[tokio::test]
+    async fn a_graceful_transfer_loses_no_acked_writes() {
+        let tenant = TenantId("acme".into());
+        let base = "tenants/acme/snapshots/base.db".to_string();
+        let sink = target();
+        let wal = LedgerWal::new();
+        let mut state = YubabaState::default();
+
+        apply(
+            &mut state,
+            &YubabaRequest::ClaimTenant {
+                tenant: tenant.clone(),
+                node: NODE_A,
+                lease_secs: 30,
+                now: 1_000,
+            },
+        );
+        for _ in 0..4 {
+            wal.write();
+        }
+        // Drain: stream everything, THEN hand over.
+        tail_frames(&wal, &sink, &cfg(&base, 1, "node-a"))
+            .await
+            .unwrap();
+        apply(
+            &mut state,
+            &YubabaRequest::TransferTenant {
+                tenant: tenant.clone(),
+                to: NODE_B,
+                from_epoch: 1,
+                lease_secs: 30,
+                now: 1_010,
+            },
+        );
+
+        // B picks up with nothing outstanding.
+        let b_epoch = token(&state, &tenant, NODE_B, 1_015).unwrap();
+        let out = tail_frames(&wal, &sink, &cfg(&base, b_epoch, "node-b"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(out, StreamOutcome::Empty { .. }),
+            "a drained handover leaves nothing for the new owner to catch up: {out:?}"
+        );
+        let chain = list_and_parse_generation_manifests(&sink).await.unwrap();
+        assert_eq!(chain.iter().map(|m| m.last_frame).max(), Some(4), "RPO = 0");
+    }
+
+    /// A node that has been fenced must not be able to keep its lease alive
+    /// under the stale token either — otherwise it would look healthy to
+    /// every readiness gate while being unable to write a byte.
+    #[tokio::test]
+    async fn a_fenced_node_cannot_renew_its_lease() {
+        let tenant = TenantId("acme".into());
+        let mut state = YubabaState::default();
+        apply(
+            &mut state,
+            &YubabaRequest::ClaimTenant {
+                tenant: tenant.clone(),
+                node: NODE_A,
+                lease_secs: 30,
+                now: 1_000,
+            },
+        );
+        apply(
+            &mut state,
+            &YubabaRequest::TransferTenant {
+                tenant: tenant.clone(),
+                to: NODE_B,
+                from_epoch: 1,
+                lease_secs: 30,
+                now: 1_010,
+            },
+        );
+        let resp = apply(
+            &mut state,
+            &YubabaRequest::RenewTenantLease {
+                tenant: tenant.clone(),
+                node: NODE_A,
+                epoch: 1,
+                lease_secs: 30,
+                now: 1_015,
+            },
+        );
+        assert!(matches!(
+            resp,
+            YubabaResponse::Tenant(TenantOutcome::Fenced {
+                current_epoch: 2,
+                ..
+            })
+        ));
+        assert_eq!(
+            token(&state, &tenant, NODE_A, 1_015),
+            None,
+            "a fenced node must get no token at all"
+        );
+    }
+
+    /// Ownership drives the streamer end to end, through the real
+    /// `yubaba-tenant-streamer` tail loop rather than a re-implementation of
+    /// it: an unowned tenant is never attempted and writes nothing, and the
+    /// same loop starts streaming the instant raft grants a token.
+    ///
+    /// The loop runs in-process here because it is a library
+    /// ([`yubaba_test_harness::LocalOwnership`] hands it this test's own
+    /// `YubabaState` instead of an HTTP endpoint). In production the same code
+    /// runs as a separate kamaji-managed service and pulls the token over
+    /// `GET /tenants/{id}` — W253 tenet 1 keeps the byte mover out of the
+    /// consensus process.
+    #[tokio::test]
+    async fn the_streamer_only_tails_tenants_this_node_owns() {
+        use std::sync::Mutex;
+        use yubaba_tenant_streamer::streamer::{TenantSink, TenantStreamer, TenantTick};
+        use yubaba_test_harness::LocalOwnership;
+
+        let tenant = TenantId("acme".into());
+        let sink = target();
+        let state = Arc::new(Mutex::new(YubabaState::default()));
+        let ownership = LocalOwnership::new(state.clone(), NODE_A, 1_000);
+
+        let streamer = TenantStreamer::new(
+            ownership,
+            BTreeMap::from([(
+                tenant.clone(),
+                TenantSink {
+                    target: BackupTarget {
+                        store: sink.store.clone(),
+                        prefix: sink.prefix.clone(),
+                    },
+                    base_snapshot_key: "tenants/acme/snapshots/base.db".into(),
+                    page_size: PAGE_SIZE,
+                },
+            )]),
+            streamer_config(),
+        );
+
+        // No ownership record: nothing is attempted, and — asserted as a full
+        // object count, not a check of keys we thought to name — nothing at all
+        // reaches the sink.
+        let wal = LedgerWal::new();
+        wal.write();
+        let seams = BTreeMap::from([(tenant.clone(), wal)]);
+        let ticks = streamer.tick(&seams).await;
+        assert_eq!(ticks.len(), 1);
+        assert!(
+            matches!(ticks[0].1, TenantTick::NotOwner),
+            "an unowned tenant must not be tailed: {:?}",
+            ticks[0].1
+        );
+        assert_eq!(
+            objects_at(&sink).await,
+            0,
+            "an unowned tenant must write nothing"
+        );
+
+        // Grant ownership through the real state machine, and the very next
+        // tick streams — under the epoch raft minted, with no restart and no
+        // reconfiguration. Ownership is the only input that changed.
+        let granted = apply(
+            &mut state.lock().unwrap(),
+            &YubabaRequest::ClaimTenant {
+                tenant: tenant.clone(),
+                node: NODE_A,
+                lease_secs: 300,
+                now: 1_000,
+            },
+        );
+        assert!(matches!(
+            granted,
+            YubabaResponse::Tenant(TenantOutcome::Granted { epoch: 1 })
+        ));
+
+        let ticks = streamer.tick(&seams).await;
+        match &ticks[0].1 {
+            TenantTick::Tailed {
+                epoch,
+                outcome: StreamOutcome::Streamed { last_frame, .. },
+            } => {
+                assert_eq!(*epoch, 1, "the streamer must use the epoch raft granted");
+                assert_eq!(*last_frame, 1);
+            }
+            other => panic!("expected a stream under epoch 1, got {other:?}"),
+        }
+        assert!(objects_at(&sink).await > 0);
+    }
+
+    /// The wire contract between yubaba and the streamer, which is otherwise
+    /// unchecked in either direction.
+    ///
+    /// `yubaba-tenant-streamer` deliberately does NOT link this crate (that
+    /// dependency is exactly the control/data coupling W253 tenet 1 forbids),
+    /// so it hand-builds the `POST /raft/write` body for a lease renewal. That
+    /// makes the field names a wire contract with no compiler behind it: rename
+    /// `lease_secs` on the enum and the streamer keeps compiling, keeps
+    /// deploying, and silently stops being able to renew a lease — every node
+    /// would lose every tenant one lease-TTL after the rename shipped.
+    ///
+    /// This test is the compiler for that seam. It is the literal JSON
+    /// `HttpOwnership::renew_lease` sends.
+    #[test]
+    fn the_streamer_lease_renewal_body_deserializes_into_a_raft_request() {
+        let body = serde_json::json!({
+            "RenewTenantLease": {
+                "tenant": "acme",
+                "node": 7u64,
+                "epoch": 3u64,
+                "lease_secs": 300u64,
+                "now": 1_000u64,
+            }
+        });
+        let req: YubabaRequest = serde_json::from_value(body)
+            .expect("the streamer's renewal body must deserialize into YubabaRequest");
+        match req {
+            YubabaRequest::RenewTenantLease {
+                tenant,
+                node,
+                epoch,
+                lease_secs,
+                now,
+            } => {
+                assert_eq!(tenant, TenantId("acme".into()));
+                assert_eq!((node, epoch, lease_secs, now), (7, 3, 300, 1_000));
+            }
+            other => panic!("expected RenewTenantLease, got {other:?}"),
+        }
+    }
+
+    /// The other half of the same seam: the streamer parses yubaba's reply by
+    /// hand, so the response shape is a contract too. A `Granted` that stopped
+    /// decoding would read as an error and stall every renewal; a `Fenced` that
+    /// stopped decoding would leave a fenced node believing it still owns the
+    /// tenant, which is the direction that actually costs data.
+    #[test]
+    fn the_raft_write_reply_matches_what_the_streamer_parses() {
+        let granted =
+            serde_json::to_value(YubabaResponse::Tenant(TenantOutcome::Granted { epoch: 4 }))
+                .unwrap();
+        assert_eq!(
+            granted,
+            serde_json::json!({ "Tenant": { "Granted": { "epoch": 4 } } }),
+            "HttpOwnership::renew_lease reads exactly this shape"
+        );
+
+        let fenced = serde_json::to_value(YubabaResponse::Tenant(TenantOutcome::Fenced {
+            current_epoch: 9,
+            current_owner: Some(2),
+        }))
+        .unwrap();
+        assert_eq!(
+            fenced,
+            serde_json::json!({
+                "Tenant": { "Fenced": { "current_epoch": 9, "current_owner": 2 } }
+            })
+        );
+    }
+
+    /// A config for the loop with the lease knobs the split-brain scenario
+    /// needs: a long lease, so that at the moment of the fenced write attempt
+    /// the old master still holds a perfectly valid lease and has every local
+    /// reason to believe it owns the tenant. Only the epoch stops it. (A short
+    /// lease is how the first draft of this suite passed for the wrong reason.)
+    fn streamer_config() -> yubaba_tenant_streamer::StreamerConfig {
+        yubaba_tenant_streamer::StreamerConfig {
+            node_id: NODE_A,
+            yubaba_url: "http://127.0.0.1:1".into(),
+            data_root: std::path::PathBuf::from("/nonexistent"),
+            sink: yubaba_tenant_streamer::SinkConfig {
+                bucket: "test".into(),
+                endpoint: "http://127.0.0.1:1".into(),
+                region: "auto".into(),
+                prefix: String::new(),
+                access_key_env: None,
+                secret_key_env: None,
+            },
+            tenants: vec![],
+            rpo_secs: 30,
+            lease_secs: 300,
+        }
+    }
 }

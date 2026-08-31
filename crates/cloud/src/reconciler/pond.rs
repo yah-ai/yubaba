@@ -281,10 +281,10 @@
 //! @yah:verify("Signature validated live: real orphan argv `--socket-addr=entry=127.0.0.1:4323` matches the reap filter; the container-published :4323 shows 0 host-ps matches (container binds 0.0.0.0) -> guard bails with the actionable message and never reaps a container")
 //!
 //! @yah:relay(R659, "Pond hostname + TLS front door (passway on :443, mkcert wildcard for *.pond.localhost)")
-//! @yah:at(2026-08-03T00:46:25Z)
+//! @yah:status(review)
+//! @yah:at(2026-08-25T07:09:23Z)
 //! @yah:kind(spike)
-//! @yah:status(open)
-//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:next("Frame: pond is plain HTTP end to end (dev_url = http://127.0.0.1:{sim_port}, pond.rs:602) with a hand-assigned miniflare port per <service,env> (4322 marketing, 4323 dashboard). Give it real hostnames + browser-trusted TLS so the operator hits https://yah-dashboard.pond.localhost instead of remembering a port.")
 //! @yah:next("Direction: passway on :443 as the pond front door, one Host per <service,env> via its existing PASSWAY_UPSTREAMS=<hostname>=<addr> fan-in syntax; mkcert supplies a wildcard leaf that acme-engine structurally cannot issue for a non-public name. passway already takes the cert as opaque paths (PASSWAY_TLS_CERT / PASSWAY_TLS_KEY), so issuer-pluggability needs no new seam.")
 //! @yah:next("Payoff beyond dev sugar: W267 'Two front doors, one render contract' records that the passway (grey/orange) door is NOT symmetric with the Worker door - no per-path routing, no bucket serving - and pond today rehearses only the Worker door. passway-in-pond makes the second front door locally testable.")
@@ -297,6 +297,24 @@
 //! @yah:verify("Two pond services up at once, each reachable by its own https:// hostname on :443, with no hand-assigned port anywhere in the operator-visible path.")
 //! @yah:verify("Cold + warm pond spinup measured against the W142 budget (few-second cold / sub-second warm) with the front door in place.")
 //! @yah:assumes("Pond keeps emulating a real front door rather than collapsing to a bare static server - i.e. W267's grey/orange path stays a live target, not a retired one.")
+//! @yah:handoff("SPIKE ANSWERED + SHIPPED. New oss/yubaba/crates/cloud/src/reconciler/pond_door.rs derives one https hostname per pond mirror and runs passway in front of the set; `yah cloud pond door [--plan] [--port N] [--reissue-cert]` at app/yah/cli/src/cloud.rs:3110. Two derivation arms: (1) any mirror with a kind=miniflare-container static slot (marketing 4322, dashboard 4323); (2) a pond mirror with a bare kind=container component, port read from its workload.toml through container.rs parse_container_recipe (host_port over port) - covers yah-cloud-admin at 4326, the service where the port is hardest to remember since its dev tier is 4325. No opt-in field: the hostname derives from the service name.")
+//! @yah:handoff("DECISION (a) *.pond.localhost, settled empirically not by argument: getaddrinfo on darwin 25.5.0 answers ANY depth under localhost with 127.0.0.1 + ::1, no /etc/hosts and no DNS server. Not a browser-only special case - curl and Rust clients resolve it too, which was the open question in the ticket. So a *.pond.yah.dev A record on the zone we own buys nothing and adds a real DNS dependency to a local tier. Every derived name is ONE label under pond.localhost because a wildcard leaf covers one level only; a non-default env flattens to <svc>-<env>.pond.localhost rather than nesting.")
+//! @yah:handoff("DECISION (b) passway in front, not miniflare terminating TLS. Miniflare 3.20250718.3 does accept https/httpsCertPath/httpsKeyPath, but each miniflare binds its own port - that buys https WITH the port still in the URL and no hostname routing at all. One listener fanning in by Host is the whole feature and passway already does it (PASSWAY_UPSTREAMS host fan-in, R594-F10), exact-match, 503 for an unknown host, never another tenant's backends. passway builds and runs on macOS (pingora 0.8.1, verified 2026-08-24).")
+//! @yah:handoff("DECISION (c) zero delta against the W142 few-second-cold / sub-second-warm budget, because the door is out of the per-pond path entirely: its upstream map comes from DECLARED mirrors, not running ones, so it starts once and ponds come and go behind its health check. Demonstrated, not asserted - with the door already up, a pond brought up afterwards on 4326 went 503 -> 200 with no door restart. Door start itself: 0.57s warm, 2.57s cold, measured start-to-ready around the CLI.")
+//! @yah:handoff("DERIVED, NOT DECLARED - and the reason is worth keeping. The fleet arm declares ingress = passway in the mirror and plan_ingress turns zone+port into rules. Pond deliberately does not reuse that declaration path: a declared edge collates onto a MACHINE, and xtask/tests/mirror_ingress.rs every_front_door_placement_names_a_known_machine requires each such name to have a .yah/infra/machines/<name>.toml. The dev box is not in the machine registry and should not be - a localhost.toml manifest would put a fiction in the fleet infra tree to serve a local tier. So placement is derived and RENDERING is shared: the rules are real IngressRules and PASSWAY_UPSTREAMS comes from IngressRule::passway_upstream, the same function the fleet arm calls. One grammar, one place, two placement policies.")
+//! @yah:handoff("EXTRA WORK BEYOND THE TITLE. (1) container.rs parse_container_recipe made pub(crate) so the bare-container arm reads ports through the reconciler's own parser instead of minting a second reader of workload.toml - the exact two-parsers-one-kind shape container.rs's own doc blames for R658-B2. (2) pond.rs port_has_listener made pub(crate) for the door's pre-flight. (3) The first cut probed readiness with a bare TCP connect, which against a TLS listener is a truncated handshake - passway rightly logged ERROR TLSHandshakeFailure on every clean startup, describing nothing but our own probe. Rewritten to read passway's own 'passway listening on' line off a relayed stderr; the relay also drains the pipe, which an undrained pipe would eventually have turned into a proxy hang that reads as a routing bug. Startup log is now ERROR-free.")
+//! @yah:verify("yah cloud pond door --plan on this camp: exactly 3 ponds, yah-cloud-admin.pond.localhost=127.0.0.1:4326, yah-dashboard=:4323, yah-marketing=:4322, rendered into one PASSWAY_UPSTREAMS with no PASSWAY_ACME_* env.")
+//! @yah:verify("End to end through the CLI-started door: yah-marketing.pond.localhost and yah-dashboard.pond.localhost each returned their own upstream's body over TLS with the right Host and path; yah-cloud-admin (pond not running) 503; unknown host nope.pond.localhost 503 - never another host's backend. Upstreams were stand-in HTTP servers on the real pond ports; mkcert is not installed on this box so the leaf was a throwaway openssl wildcard, DELETED afterwards (.yah/infra/pond/_door/ left empty) so the operator's first run issues through mkcert rather than silently reusing an untrusted cert.")
+//! @yah:verify("cargo test -p yah-cloud --lib pond_door: 10 passed. cargo test -p xtask --test pond_door: 4 passed - that one runs against the camp's REAL .yah/services tree and guards hostname/port collisions, one-label-under-the-wildcard, loopback upstreams, and that the render parses as passway's host fan-in grammar. cargo build -p yah --bin yah clean.")
+//! @yah:verify("mkcert-absent branch verified live: `yah cloud pond door` with no mkcert on PATH prints the plan then fails with the brew install mkcert nss / mkcert -install instruction rather than falling back to an untrusted self-signed cert. The mkcert-present-but-CA-not-installed branch is coded (checks rootCA.pem under mkcert -CAROOT) but NOT exercised - mkcert is not installed here and mkcert -install needs a password camp cannot supply.")
+//! @yah:gotcha("Not yet done, deliberately: pond's own dev_url (pond.rs:619, format http://127.0.0.1:{sim_port}) is unchanged, so the desktop Run tab still shows the port even while the door is serving the hostname. Flipping it needs up_pond to know whether a door is running, which it cannot today - that is a separate ticket, not a loose end in this one. Same for auto-starting the door from camp: the command is foreground on purpose (no supervisor, no restart policy; backgrounding it would mint exactly the orphan class ensure_sim_port_free exists to clean up after).")
+//! @yah:handoff("W142-pond.md gained a 'Front door' section carrying all three decisions with their evidence, the two derivation arms, the trust story and the port constraint - the doc is where this belongs, since a spike's answer outlives its ticket.")
+//! @yah:verify("Operator's one-time step before first real use: brew install mkcert nss && mkcert -install (asks for a password once; writes the macOS login keychain plus the NSS/Firefox stores). Then `yah cloud pond door` issues the *.pond.localhost leaf into .yah/infra/pond/_door/ (gitignored) and serves.")
+//! @yah:gotcha("PORT, RESOLVED by operator 2026-08-25: they want 443. Recipe is `yah cloud pond cert` (as yourself, once) then `sudo yah cloud pond door --port 443`. Default stays 8443 because that is the port needing no privilege at all. Why sudo is unavoidable: ports below 1024 need uid 0, and macOS has neither setcap CAP_NET_BIND_SERVICE nor a net.ipv4.ip_unprivileged_port_start equivalent (checked sysctl - Darwin's net.inet.ip.portrange.* are ephemeral SOURCE-port ranges, not a bind threshold). pf rdr 443->8443 was considered and is NOT recommended: rdr applies to packets arriving on an interface and locally-originated connections to 127.0.0.1 take the loopback path, widely reported not to hit rdr on macOS - which is exactly the pond door's traffic. UNTESTED (pfctl needs sudo). A root LaunchDaemon is the always-on version; launchd socket activation would be ideal but needs launch_activate_socket support passway does not have.")
+//! @yah:handoff("TWO DEFECTS THE 443 DECISION EXPOSED, both fixed. (1) ensure_pond_cert would have issued under sudo against ROOT's HOME - mkcert keeps its CA under the operator's $HOME/Library/Application Support/mkcert and installs it into their LOGIN keychain, so a sudo first-run finds no CA there and would mint a leaf from a second CA nothing trusts, root-owned in the operator's tree. Now refuses when geteuid()==0 and names the unprivileged command; reusing an already-issued leaf as root is still allowed, since serving as root is the whole point of --port 443. Split into ensure_pond_cert_as(state_dir, reissue, running_as_root) so that branch is reachable from a test rather than shipping an error path nobody has run - sudo needs a password camp cannot supply. (2) PASSWAY_PID_FILE / PASSWAY_UPGRADE_SOCK are now keyed by port (pingora-443.pid vs pingora-8443.pid): the 443 door runs as root and leaves those root-owned, and a later unprivileged 8443 door could neither rewrite nor unlink them.")
+//! @yah:handoff("New `yah cloud pond cert [--reissue]` - issues the leaf and exits, without serving. Exists specifically so the 443 path has an unprivileged issuance step to point at.")
+//! @yah:verify("cargo test -p yah-cloud --lib pond_door: 12 passed, now including issuing_as_root_is_refused_but_reusing_an_existing_leaf_is_not (the sudo guard, executed rather than merely written) and the_pid_file_and_upgrade_sock_are_keyed_by_port. cargo build -p yah --bin yah clean; `yah cloud pond cert` prints the mkcert install instruction as designed.")
+//! @yah:gotcha("SHARED-TREE INCIDENT, self-inflicted and fully reverted - worth knowing because the trap is easy to repeat. `rustfmt oss/yubaba/crates/cloud/src/reconciler/mod.rs` FOLLOWS THE MOD TREE and reformatted 10 sibling files in that directory, several holding peers' uncommitted edits. Reverted precisely against commit c4e5a80f2bf41119e50c261919d62537918aba16: for each file, compared on-disk content against rustfmt(c4e5a80f) - 7 matched exactly (so they held no one's edits, only my churn) and were restored from c4e5a80f; pond_publish.rs and static_asset_prune.rs were already rustfmt-clean at c4e5a80f so my run never touched them (their diffs are a peer's R630-B1 uri_encode_key work, left intact); static_asset.rs had both, so its 6 formatting hunks were hand-reverted one at a time, leaving only the peer's R630-B1 lines. Verified after: the reconciler/ diff is my files plus the peer's edits and nothing else. Rule: format a single file by path, never a mod.rs.")
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -1181,7 +1199,7 @@ pub fn resolve_workerd_binary(workspace_root: &std::path::Path) -> Option<PathBu
 /// live listener is the real conflict; a lingering `TIME_WAIT` socket has no
 /// listener and refuses the connect, so this avoids the false positives a
 /// bind-probe would hit.
-fn port_has_listener(host: &str, port: u16) -> bool {
+pub(crate) fn port_has_listener(host: &str, port: u16) -> bool {
     use std::net::{TcpStream, ToSocketAddrs};
     let Ok(addrs) = (host, port).to_socket_addrs() else {
         return false;
@@ -1616,11 +1634,29 @@ mod tests {
     async fn ensure_sim_port_free_ok_when_unbound() {
         // Reserve then release an ephemeral port to get one that is almost
         // certainly free, and confirm the guard passes without a holder.
-        let port = {
-            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            l.local_addr().unwrap().port()
-        };
-        ensure_sim_port_free(port).await.unwrap();
+        //
+        // "Almost certainly" is not "certainly", and the gap is a real race
+        // rather than a theoretical one: the OS may hand the just-released
+        // port straight to a concurrently-running test in this same binary —
+        // `ensure_sim_port_free_bails_with_holder_on_foreign_listener` below
+        // binds an ephemeral port too. So a single draw makes this test's
+        // result depend on scheduling, and it duly went red the moment an
+        // unrelated change altered the test count (R742-F3).
+        //
+        // Re-draw on collision, which keeps exactly what this asserts — the
+        // guard passes when nothing listens — while making it independent of
+        // who else is binding. Same discipline, and the same reasoning, as
+        // `port_has_listener_is_false_when_idle` directly above.
+        for _ in 0..16 {
+            let port = {
+                let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                l.local_addr().unwrap().port()
+            };
+            if ensure_sim_port_free(port).await.is_ok() {
+                return;
+            }
+        }
+        panic!("no free ephemeral port observed in 16 draws");
     }
 
     #[tokio::test]
@@ -1683,6 +1719,7 @@ mod tests {
             db: crate::DbCatalog::default(),
         };
         let comp = crate::ServiceComponent {
+            mount: None,
             id: "site".into(),
             kind: "mesofact-static".into(),
             path: "app/yah/web".into(),
@@ -1696,6 +1733,7 @@ mod tests {
             shape: crate::MirrorShape::Local,
             providers: BTreeMap::new(),
             ingress: Default::default(),
+            ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: Default::default(),
         };
@@ -1752,6 +1790,7 @@ mod tests {
             db: crate::DbCatalog::default(),
         };
         let comp = crate::ServiceComponent {
+            mount: None,
             id: "site".into(),
             kind: "mesofact-static".into(),
             path: "app/web".into(),
@@ -1765,6 +1804,7 @@ mod tests {
             shape: crate::MirrorShape::Local,
             providers: BTreeMap::new(),
             ingress: Default::default(),
+            ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: Default::default(),
         };
@@ -1833,6 +1873,7 @@ mod tests {
             db: crate::DbCatalog::default(),
         };
         let comp = crate::ServiceComponent {
+            mount: None,
             id: "site".into(),
             kind: "mesofact-static".into(),
             path: "app/web".into(),
@@ -1846,6 +1887,7 @@ mod tests {
             shape: crate::MirrorShape::Local,
             providers: BTreeMap::new(),
             ingress: Default::default(),
+            ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: Default::default(),
         };
@@ -1912,6 +1954,7 @@ mod tests {
             db: crate::DbCatalog::default(),
         };
         let comp = crate::ServiceComponent {
+            mount: None,
             id: "site".into(),
             kind: "mesofact-static".into(),
             path: "app/web".into(),
@@ -1925,6 +1968,7 @@ mod tests {
             shape: crate::MirrorShape::Local,
             providers: BTreeMap::new(),
             ingress: Default::default(),
+            ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: Default::default(),
         };
@@ -1985,6 +2029,7 @@ mod tests {
             db: crate::DbCatalog::default(),
         };
         let comp = crate::ServiceComponent {
+            mount: None,
             id: "site".into(),
             kind: "mesofact-static".into(),
             path: "app/web".into(),
@@ -1998,6 +2043,7 @@ mod tests {
             shape: crate::MirrorShape::Local,
             providers: BTreeMap::new(),
             ingress: Default::default(),
+            ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: Default::default(),
         };

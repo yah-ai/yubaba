@@ -29,7 +29,7 @@ use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tower::ServiceExt;
 
-use kamaji::sibling::KamajiClient;
+use kamaji::sibling::{KamajiClient, KamajiSibling};
 use workload_spec::{
     ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, ResourceLimits, RestartPolicy,
     SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
@@ -118,11 +118,14 @@ async fn deploy_with_kamaji_attached_routes_to_kamaji_not_stub() {
     let sock = dir.path().join("kamaji.sock");
     let (server, stop) = spawn_kamaji(sock.clone()).await;
 
-    let client = KamajiClient::connect(sock).await.expect("kamaji handshake");
+    let client = KamajiClient::connect(sock.clone())
+        .await
+        .expect("kamaji handshake");
+    let sibling = KamajiSibling::new(client, sock, Duration::from_secs(5));
     let state = Arc::new(
         yubaba::ServerState::load(dir.path().join("identity.json"))
             .unwrap()
-            .with_constable_client(Arc::new(client)),
+            .with_constable_client(sibling),
     );
     let app = yubaba::build_router(state);
 
@@ -165,4 +168,149 @@ async fn deploy_with_kamaji_attached_routes_to_kamaji_not_stub() {
 
     let _ = stop.send(());
     server.await.unwrap();
+}
+
+/// R330-F33: `GET /workloads/{ident}/deploy-status` reaches kamaji's
+/// `DeployStatus` verb over the real wire.
+///
+/// A bare kamaji has admitted nothing, so the honest answer is 404 — and 404 is
+/// the load-bearing case, because it is what tells a polling caller to stop
+/// rather than wait out its budget against an ident that will never appear.
+/// Getting a *routed* 404 here also proves the route dispatches to kamaji
+/// instead of falling through to axum's own not-found.
+#[tokio::test]
+async fn deploy_status_dispatches_to_kamaji_over_the_real_wire() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("kamaji.sock");
+    let (server, stop) = spawn_kamaji(sock.clone()).await;
+
+    let client = KamajiClient::connect(sock.clone())
+        .await
+        .expect("kamaji handshake");
+    let sibling = KamajiSibling::new(client, sock, Duration::from_secs(5));
+    let state = Arc::new(
+        yubaba::ServerState::load(dir.path().join("identity.json"))
+            .unwrap()
+            .with_constable_client(sibling),
+    );
+    let app = yubaba::build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::get("/workloads/never-deployed/deploy-status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    // `x-workload-source: kamaji` is the proof the answer came from the UDS.
+    let source = resp
+        .headers()
+        .get("x-workload-source")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = body_json(resp).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND, "got {status}: {body}");
+    assert_eq!(source.as_deref(), Some("kamaji"));
+    assert!(
+        body.get("error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|e| e.contains("never-deployed")),
+        "the 404 must name the ident kamaji has no record of: {body}"
+    );
+
+    let _ = stop.send(());
+    server.await.unwrap();
+}
+
+/// R746-B11, second and separable defect: a kamaji that completes the
+/// handshake and then never answers must degrade to a status code, not park
+/// the caller's connection forever.
+///
+/// Every other failure mode on this route already answers — 503 reconnecting,
+/// 501 no kamaji, 404 UnknownWorkload, 502 anything else — so an unanswered
+/// `DeployStatus` was the one shape that produced an unbounded hang. Live on
+/// us-east-001 this read as `curl` sitting at zero bytes past 20s while the
+/// same route 404'd instantly for an ident with no deploy record.
+///
+/// Note what the sibling test above *cannot* catch: it exercises exactly the
+/// arm that always worked. The routing bug only ever bit an ident kamaji had
+/// a record for, which is why a green suite shipped it.
+#[tokio::test]
+async fn deploy_status_answers_a_status_code_when_kamaji_never_replies() {
+    use kamaji_proto::{decode_frame, encode_frame, KamajiToYubaba, YubabaToKamaji};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("kamaji.sock");
+    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+
+    // A kamaji that answers the handshake and nothing else. Holding `stream`
+    // matters: the client must be parked on a live connection, not woken by a
+    // close, or this passes for the wrong reason.
+    let deaf = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::with_capacity(4096);
+        let mut tmp = [0u8; 4096];
+        loop {
+            if decode_frame::<YubabaToKamaji>(&buf).is_ok() {
+                break;
+            }
+            let n = stream.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "client closed before the handshake");
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let welcome = encode_frame(&KamajiToYubaba::Welcome {
+            version: kamaji_proto::ProtocolVersion::CURRENT,
+            kamaji_version: "deaf-test".into(),
+        })
+        .unwrap();
+        stream.write_all(&welcome).await.unwrap();
+        // Never reply to anything else; keep the socket open.
+        tokio::time::sleep(Duration::from_secs(120)).await;
+    });
+
+    let client = KamajiClient::connect(sock.clone())
+        .await
+        .expect("kamaji handshake");
+    let sibling = KamajiSibling::new(client, sock, Duration::from_secs(5));
+    let state = Arc::new(
+        yubaba::ServerState::load(dir.path().join("identity.json"))
+            .unwrap()
+            .with_constable_client(sibling),
+    );
+    let app = yubaba::build_router(state);
+
+    // The outer budget is the assertion: before the fix this future never
+    // resolved at all, so a regression fails here instead of hanging CI.
+    let resp = tokio::time::timeout(
+        Duration::from_secs(30),
+        app.oneshot(
+            Request::get("/workloads/yah-marketing/deploy-status")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("deploy-status must answer even when kamaji is silent")
+    .unwrap();
+
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "a silent kamaji must read as 504, got {status}: {body}"
+    );
+    assert!(
+        body.get("error")
+            .and_then(|v| v.as_str())
+            .is_some_and(|e| e.contains("yah-marketing")),
+        "the 504 must name the ident it gave up on: {body}"
+    );
+
+    deaf.abort();
 }

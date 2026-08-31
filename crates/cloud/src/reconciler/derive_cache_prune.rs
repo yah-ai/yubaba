@@ -204,6 +204,7 @@ mod tests {
 
     fn static_asset_component(id: &str, path: &str) -> ServiceComponent {
         ServiceComponent {
+            mount: None,
             id: id.into(),
             kind: "static-asset".into(),
             path: path.into(),
@@ -316,6 +317,7 @@ recipe = "quantize"
         let svc = svc(
             "my-svc",
             vec![ServiceComponent {
+                mount: None,
                 id: "api".into(),
                 kind: "container".into(),
                 path: "app/api".into(),

@@ -380,7 +380,10 @@ mod tests {
         let elsewhere = tempfile::TempDir::new().unwrap();
         let cfg = CampRpcConfig::new(vec![allowed.path().to_path_buf()]);
         let err = cfg.resolve(elsewhere.path().to_str().unwrap()).unwrap_err();
-        assert!(err.contains("outside every camp-rpc root"), "unexpected: {err}");
+        assert!(
+            err.contains("outside every camp-rpc root"),
+            "unexpected: {err}"
+        );
     }
 
     /// The containment this actually has to survive: `..` segments that
@@ -393,7 +396,10 @@ mod tests {
         let cfg = CampRpcConfig::new(vec![allowed.path().join("inner")]);
         std::fs::create_dir(allowed.path().join("inner")).unwrap();
         let err = cfg.resolve(escape.to_str().unwrap()).unwrap_err();
-        assert!(err.contains("outside every camp-rpc root"), "unexpected: {err}");
+        assert!(
+            err.contains("outside every camp-rpc root"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]
@@ -455,7 +461,11 @@ mod tests {
     #[cfg(unix)]
     async fn serving_node(
         config: CampRpcConfig,
-    ) -> (mshr::Endpoint, mshr::EndpointAddr, tokio::task::JoinHandle<()>) {
+    ) -> (
+        mshr::Endpoint,
+        mshr::EndpointAddr,
+        tokio::task::JoinHandle<()>,
+    ) {
         let endpoint = mshr::Endpoint::builder()
             .keypair(mshr::Keypair::generate())
             .alpns([CAMP_RPC_ALPN])
@@ -523,8 +533,7 @@ mod tests {
         };
 
         let (server, addr, task) = serving_node(config).await;
-        let (dialer, conn, mut send, mut reader, ack) =
-            dial(addr, ws.to_str().unwrap()).await;
+        let (dialer, conn, mut send, mut reader, ack) = dial(addr, ws.to_str().unwrap()).await;
         assert!(ack.ok, "workspace refused: {:?}", ack.error);
 
         send.write_all(b"{\"jsonrpc\":\"2.0\"}\n").await.unwrap();
@@ -557,7 +566,10 @@ mod tests {
 
         assert!(!ack.ok);
         assert!(
-            ack.error.as_deref().unwrap_or_default().contains("outside every camp-rpc root"),
+            ack.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("outside every camp-rpc root"),
             "unexpected error: {:?}",
             ack.error
         );
@@ -584,7 +596,10 @@ mod tests {
 
         assert!(!ack.ok);
         assert!(
-            ack.error.as_deref().unwrap_or_default().contains("failed to spawn"),
+            ack.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("failed to spawn"),
             "unexpected error: {:?}",
             ack.error
         );

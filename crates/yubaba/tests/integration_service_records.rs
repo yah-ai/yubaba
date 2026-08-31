@@ -21,7 +21,8 @@
 //! Uses `FakeRuntime`, so no container socket is required.
 //!
 //! ```bash
-//! cargo test -p yubaba --features testing --test integration_service_records
+//! cargo test -p yubaba --features testing --test testing \
+//!     -- integration_service_records::
 //! ```
 //!
 //! @arch:see(.yah/docs/architecture/A053-yah-yubaba-integration-testing.md)
@@ -213,7 +214,10 @@ async fn destroy_retracts_the_record() {
     deploy(&state, &serving_spec("api", vec![8080])).await;
 
     let body = destroy(&state, "api").await;
-    assert_eq!(body["status"], "destroyed", "unexpected destroy body: {body}");
+    assert_eq!(
+        body["status"], "destroyed",
+        "unexpected destroy body: {body}"
+    );
 
     let record = state
         .service_records
@@ -279,7 +283,10 @@ async fn a_workload_that_died_during_downtime_is_retracted_not_advertised() {
     // Fresh runtime = the container is gone (it did not outlive the restart).
     let state = boot(tmp.path(), Arc::new(FakeRuntime::new()));
     assert!(
-        state.service_records.get(&MeshIdent("api".into())).is_some(),
+        state
+            .service_records
+            .get(&MeshIdent("api".into()))
+            .is_some(),
         "rehydrated, but unconfirmed"
     );
     assert!(state.service_records.ready().is_empty());

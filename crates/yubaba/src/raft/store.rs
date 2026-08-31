@@ -342,6 +342,213 @@ impl YubabaStateMachine {
             })
             .collect()
     }
+
+    // ── Locally-applied control-plane reads (R118-T1) ─────────────────────────
+    //
+    // The rig's non-negotiable rule (W138): nothing on the audio or graph path
+    // may synchronously await a raft commit. So every question the realtime
+    // side asks of the control plane — "who owns this role right now" — must be
+    // answerable from the replica this process already holds: no quorum, no
+    // leader round-trip, no `.await`. A node that has lost the cluster entirely
+    // still answers, with its last-known-good view, and reports how stale that
+    // view is via [`Self::applied_index`].
+    //
+    // These are the same shape as [`Self::cluster_secret`] above, which was the
+    // first consumer of the idea; naming them here makes it the general
+    // capability rather than a secrets-only affordance.
+
+    /// Who holds the singleton role `key` in **this node's applied state**.
+    ///
+    /// `None` means no live claim is recorded locally — which is not the same
+    /// as "nobody owns it cluster-wide", because this replica may be behind.
+    /// Callers that care about the difference read [`Self::applied_index`]
+    /// alongside it.
+    ///
+    /// Returns a clone so no caller holds the state lock while acting on the
+    /// answer. Expiry is deliberately *not* evaluated here: TTL is judged
+    /// against the acquiring node's clock inside [`apply`](super::apply), so a
+    /// local reader inventing its own "expired" verdict would be a second,
+    /// disagreeing authority. Read [`super::LockEntry::acquired_at`] +
+    /// `ttl_secs` if you need to render staleness.
+    pub fn singleton_owner(&self, key: &str) -> Option<super::LockEntry> {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .state
+            .locks
+            .get(key)
+            .cloned()
+    }
+
+    /// Every singleton role recorded in this node's applied state.
+    pub fn singleton_owners(&self) -> BTreeMap<String, super::LockEntry> {
+        self.inner.read().unwrap().data.state.locks.clone()
+    }
+
+    /// R732-T4 (W245): the fencing token `node` may stream `tenant` under, per
+    /// this node's applied state. Delegates to
+    /// [`YubabaState::tenant_fencing_token`](super::YubabaState::tenant_fencing_token)
+    /// so the owner-and-lease predicate lives in exactly one place.
+    ///
+    /// This is a *local* read and may be stale — this replica might not yet
+    /// have applied the entry that transferred the tenant away. That is safe
+    /// by construction rather than by luck: acting on a stale answer means
+    /// streaming under an old epoch, which the sink rejects
+    /// (`turso_backup::stream::StreamOutcome::Fenced`). Staleness costs a
+    /// wasted tail attempt, never a double writer — which is the entire reason
+    /// the epoch exists rather than a lock.
+    pub fn tenant_fencing_token(
+        &self,
+        tenant: &workload_spec::TenantId,
+        node: super::YubabaNodeId,
+        now: u64,
+    ) -> Option<u64> {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .state
+            .tenant_fencing_token(tenant, node, now)
+    }
+
+    /// R732-T4: the whole ownership record for `tenant` in this node's applied
+    /// state, or `None` if there is no record.
+    ///
+    /// Serves the diagnostic half of `GET /tenants/{id}` — who owns it, at
+    /// which epoch, until when. The streamer decides whether it may *write*
+    /// from [`Self::tenant_fencing_token`] and never by re-deriving the
+    /// owner-and-lease predicate from these fields; it reads `lease_expires`
+    /// only to know when to renew. Keeping the two apart is deliberate: one
+    /// predicate, one place (see R732-F1's handoff).
+    pub fn tenant_ownership(
+        &self,
+        tenant: &workload_spec::TenantId,
+    ) -> Option<super::TenantOwnership> {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .state
+            .tenants
+            .get(tenant)
+            .cloned()
+    }
+
+    /// R737-F3: every tenant's ownership record in this node's applied state —
+    /// the scheduler's per-tick read of who currently holds each tenant's
+    /// write path, so it can find whose owner just went down. A single-tenant
+    /// read is [`Self::tenant_ownership`]; this is the whole map for the loop
+    /// that has to walk it.
+    pub fn tenants(
+        &self,
+    ) -> BTreeMap<workload_spec::TenantId, super::TenantOwnership> {
+        self.inner.read().unwrap().data.state.tenants.clone()
+    }
+
+    /// R737-F3: one tenant's declared placement intent in this node's applied
+    /// state, or `None` if it has none — a legal state (see
+    /// [`super::TenantPlacement`]'s doc), read by the scheduler as
+    /// "unconstrained region, default tier, zero demand" rather than an
+    /// error.
+    pub fn tenant_placement(
+        &self,
+        tenant: &workload_spec::TenantId,
+    ) -> Option<super::TenantPlacement> {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .state
+            .placement
+            .get(tenant)
+            .cloned()
+    }
+
+    /// R737-F3: whether `node` has headroom for `demand` at `now`, forwarding
+    /// to [`super::YubabaState::node_admits`] under this node's single read
+    /// lock rather than cloning `members`/`tenants`/`placement` out to
+    /// recompute it at the call site.
+    pub fn node_admits(
+        &self,
+        node: super::YubabaNodeId,
+        demand: &super::TenantDemand,
+        now: u64,
+    ) -> bool {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .state
+            .node_admits(node, demand, now)
+    }
+
+    /// R734-F5: every member row in this node's applied state — the yubaba-side
+    /// mirror of membership, carrying the `region` tag openraft's `BasicNode`
+    /// has no room for.
+    ///
+    /// This is *not* the authority on who is in the cluster: raft membership is,
+    /// and it is reachable from `Raft::metrics`. This map is the replicated
+    /// *annotation* on those nodes, written by each node about itself
+    /// ([`member_registration`](crate::member_registration)), so a lag between
+    /// the two is normal — a node that has just joined is in membership and has
+    /// no row here until its registration loop converges.
+    pub fn members(&self) -> BTreeMap<super::YubabaNodeId, super::MemberInfo> {
+        self.inner.read().unwrap().data.state.members.clone()
+    }
+
+    /// One member row from this node's applied state (R734-F5).
+    ///
+    /// The registration loop's read half: a node compares its own row against
+    /// what it would write and stays quiet when they agree, which is what keeps
+    /// the loop from putting a raft write through quorum on every tick.
+    pub fn member(&self, node_id: super::YubabaNodeId) -> Option<super::MemberInfo> {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .state
+            .members
+            .get(&node_id)
+            .cloned()
+    }
+
+    /// Apply one request directly, bypassing the log. Test-only, and the only
+    /// way a router test can seed applied state — `apply` takes an openraft
+    /// entry stream, which is a lot of scaffolding to assert that a handler
+    /// reads the right field.
+    #[cfg(test)]
+    pub(crate) fn apply_for_test(&self, req: &super::YubabaRequest) -> super::YubabaResponse {
+        let mut guard = self.inner.write().unwrap();
+        super::apply(&mut guard.data.state, req)
+    }
+
+    /// The cluster's external-ingress owner in this node's applied state.
+    ///
+    /// Always `None` under [`IngressOwnership::Unmanaged`][io] — the rig preset
+    /// — because no node claims it from the raft-leader path there.
+    ///
+    /// [io]: crate::cluster_policy::IngressOwnership::Unmanaged
+    pub fn ingress_owner(&self) -> Option<String> {
+        self.inner.read().unwrap().data.state.ingress_owner.clone()
+    }
+
+    /// The raft log index this replica has applied up to, or `None` before the
+    /// first entry.
+    ///
+    /// This is the staleness marker that makes a local read honest: the answer
+    /// from [`Self::singleton_owner`] is "true as of this index". A node that
+    /// has been out of contact keeps serving reads and this number stops
+    /// moving, which is exactly the signal a consumer needs to decide whether
+    /// to trust its last-known-good assignment.
+    pub fn applied_index(&self) -> Option<u64> {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .last_applied
+            .map(|id| id.index)
+    }
 }
 
 /// Lower-case hex encoding. No `hex` crate dep in this crate; a digest is

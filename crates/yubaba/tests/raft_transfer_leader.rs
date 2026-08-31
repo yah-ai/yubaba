@@ -13,7 +13,7 @@
 //! - a redundant transfer to the sitting leader is an idempotent no-op.
 //!
 //! ```bash
-//! cargo test -p yubaba --test raft_transfer_leader
+//! cargo test -p yubaba --test main -- raft_transfer_leader::
 //! ```
 
 use std::time::Duration;

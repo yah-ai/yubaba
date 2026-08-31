@@ -167,6 +167,59 @@ impl HeadscaleClient {
             .collect())
     }
 
+    /// List the Headscale users (namespaces) preauth keys can be minted against.
+    ///
+    /// `GET /api/v1/user`. Headscale scopes every preauth key to a user, and a
+    /// key minted against a user that does not exist fails at mint time.
+    pub async fn list_users(&self) -> Result<Vec<String>> {
+        let resp = self
+            .http
+            .get(format!("{}/api/v1/user", self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .context("GET /api/v1/user")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Headscale API {status} on GET /api/v1/user: {text}");
+        }
+        let resp_json: serde_json::Value = resp.json().await.context("parsing user list")?;
+        Ok(resp_json["users"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|u| u["name"].as_str().map(str::to_string))
+            .collect())
+    }
+
+    /// Resolve the user to mint a preauth key against, asking the coordinator
+    /// instead of assuming a name.
+    ///
+    /// R608-B19: this used to be the literal `"default"` at the
+    /// `yah cloud machine provision` call site, and against the live
+    /// coordinator that is simply wrong — `POST /api/v1/preauthkey` answers
+    /// **500** for a user that does not exist. The two halves of the system
+    /// disagree on the name: [`crate::mesh`]'s camp-local `yah mesh start` path
+    /// creates `default` (its `--user` default), while `yah mesh bootstrap`
+    /// creates `yah` (`mint_bootstrap_preauth_key` in yubaba's lib.rs runs
+    /// `headscale users create yah`). The production coordinator was
+    /// bootstrapped, so it has only `yah` — every provision against it would
+    /// have failed at the preauth step with an opaque 500.
+    ///
+    /// Rather than swap one hardcoded guess for the other:
+    ///
+    /// - `preferred` present and known to the coordinator → use it;
+    /// - `preferred` absent and the coordinator has exactly one user → use it,
+    ///   which is every yah mesh in existence today;
+    /// - otherwise → error naming the users that DO exist, so the operator can
+    ///   pick, instead of a 500 that names nothing.
+    pub async fn resolve_user(&self, preferred: Option<&str>) -> Result<String> {
+        let users = self.list_users().await?;
+        choose_user(&self.base_url, &users, preferred)
+    }
+
     /// Light health check — HEAD or GET the Headscale root, no auth required.
     pub async fn health(&self) -> HeadscaleHealth {
         match self
@@ -185,6 +238,37 @@ impl HeadscaleClient {
             },
         }
     }
+}
+
+/// The user-selection half of [`HeadscaleClient::resolve_user`], split out so it
+/// is testable without standing up an HTTP server — this crate carries no HTTP
+/// mock, and the interesting behaviour is entirely in the choice, not the GET.
+fn choose_user(base_url: &str, users: &[String], preferred: Option<&str>) -> Result<String> {
+    if users.is_empty() {
+        anyhow::bail!(
+            "Headscale at {base_url} has no users — preauth keys are scoped to one. \
+             Create it with `headscale users create yah`."
+        );
+    }
+    if let Some(want) = preferred {
+        if users.iter().any(|u| u == want) {
+            return Ok(want.to_string());
+        }
+        anyhow::bail!(
+            "Headscale at {base_url} has no user '{want}' — preauth keys are scoped to \
+             a user, and minting against a missing one fails with an opaque 500. \
+             Existing users: {}.",
+            users.join(", ")
+        );
+    }
+    if let [only] = users {
+        return Ok(only.clone());
+    }
+    anyhow::bail!(
+        "Headscale at {base_url} has several users ({}) — pass one explicitly rather \
+         than letting this pick.",
+        users.join(", ")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -462,5 +546,69 @@ mod tests {
         let url = result.unwrap();
         assert!(url.contains(HEADSCALE_VERSION));
         assert!(url.starts_with("https://github.com"));
+    }
+
+    // -- choose_user (R608-B19) ---------------------------------------------
+    //
+    // The regression these pin down: `yah cloud machine provision` minted its
+    // preauth key against the literal `"default"`, which the production
+    // coordinator does not have. It was bootstrapped, so its only user is
+    // `yah` (`headscale users create yah`, yubaba lib.rs
+    // `mint_bootstrap_preauth_key`), while the camp-local `yah mesh start` path
+    // creates `default`. Headscale answers a mint against a missing user with a
+    // bare 500 naming nothing, so this failed opaquely on every provision.
+
+    fn users(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_lone_user_is_chosen_without_being_named() {
+        // The live shape: one bootstrapped coordinator, one user, and no reason
+        // to make the caller know whether it is called `yah` or `default`.
+        assert_eq!(
+            choose_user("https://mesh.test", &users(&["yah"]), None).unwrap(),
+            "yah"
+        );
+        assert_eq!(
+            choose_user("https://mesh.test", &users(&["default"]), None).unwrap(),
+            "default"
+        );
+    }
+
+    #[test]
+    fn a_preferred_user_that_exists_wins() {
+        assert_eq!(
+            choose_user("https://mesh.test", &users(&["yah", "ops"]), Some("ops")).unwrap(),
+            "ops"
+        );
+    }
+
+    #[test]
+    fn a_preferred_user_that_does_not_exist_is_refused_by_name() {
+        // THE bug, as a test: asking for "default" on a coordinator that only
+        // has "yah" must fail here, locally, saying what does exist — not reach
+        // the API and come back with a 500 that names nothing.
+        let err = choose_user("https://mesh.test", &users(&["yah"]), Some("default"))
+            .expect_err("a missing user must not be requested from the API");
+        let msg = err.to_string();
+        assert!(msg.contains("default"), "names what was asked for: {msg}");
+        assert!(msg.contains("yah"), "names what actually exists: {msg}");
+    }
+
+    #[test]
+    fn several_users_and_no_preference_refuses_rather_than_guessing() {
+        // Silently taking the first would reintroduce the same class of bug:
+        // a name picked by the code that the operator never chose.
+        let err = choose_user("https://mesh.test", &users(&["yah", "default"]), None)
+            .expect_err("an ambiguous mint target must not be guessed");
+        let msg = err.to_string();
+        assert!(msg.contains("yah") && msg.contains("default"), "{msg}");
+    }
+
+    #[test]
+    fn no_users_at_all_says_how_to_create_one() {
+        let err = choose_user("https://mesh.test", &[], None).expect_err("no users is fatal");
+        assert!(err.to_string().contains("headscale users create"));
     }
 }

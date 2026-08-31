@@ -6,7 +6,7 @@
 //!
 //! ```bash
 //! YAH_RECONCILER_E2E_BIN=$(pwd)/target/debug/mesofact-dev \
-//!   cargo test -p cloud --test mesofact_static_e2e -- --nocapture
+//!   cargo test -p cloud --test main -- mesofact_static_e2e:: --nocapture
 //! ```
 //!
 //! @yah:ticket(R441-B2, "mesofact_static_e2e: MirrorConfig missing asset_aliases field")
@@ -83,6 +83,7 @@ async fn local_static_reconciler_brings_up_app_yah_web() {
         shape: MirrorShape::Local,
         providers,
         ingress: Default::default(),
+        ingress_machines: Vec::new(),
         drivers: Default::default(),
         asset_aliases: Default::default(),
     };
@@ -95,6 +96,7 @@ async fn local_static_reconciler_brings_up_app_yah_web() {
         db: cloud::DbCatalog::default(),
     };
     let component = ServiceComponent {
+        mount: None,
         id: "site".to_string(),
         kind: "mesofact-static".to_string(),
         path: "app/yah/web/marketing".to_string(),

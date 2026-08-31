@@ -47,7 +47,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use yubaba::cluster_policy::ClusterPolicy;
 use yubaba::failure_detector::RaftHeartbeatDetector;
-use yubaba::{identity, serve, ServerState, DEFAULT_BIND, DEFAULT_STATE_PATH};
+use yubaba::lease_detector::{LeaseFailureDetector, RpoWatermarkRegistry};
+use yubaba::{identity, serve, ServerState, SovereignRole, DEFAULT_BIND, DEFAULT_STATE_PATH};
 
 /// Which [`ClusterPolicy`] this daemon runs under — the operator's one-time
 /// deployment choice (R118-T9).
@@ -184,6 +185,89 @@ enum Cmd {
         /// Self-referential for a cluster-of-one and never dialed.
         #[arg(long)]
         raft_advertise_addr: Option<String>,
+        /// R734-F5 (W247 §2): this node's geo region, e.g. `us-west`.
+        ///
+        /// Copy it from the `region` this machine declares in
+        /// `.yah/infra/machines/<name>.toml` — that is the same label space, not
+        /// a second taxonomy, and a node whose machine file and raft row
+        /// disagree is a bug nothing would catch.
+        ///
+        /// Once raft is up, the node writes this into its own member row so the
+        /// cluster knows where every voter is. That is what the
+        /// quorum-geography rule (`--cluster-profile fleet`) is judged on beyond
+        /// founding. Requires `--raft-node-id`; without it there is no cluster
+        /// to tell. Unset means untagged, which is normal for a `rig` (one
+        /// failure domain) and works — but leaves a fleet node's row with no
+        /// region for a peer to read.
+        #[arg(long)]
+        region: Option<String>,
+        /// R742-F1 (W305 §F1): which sovereign group this node votes in, e.g.
+        /// `prod` or `dev`.
+        ///
+        /// Copy it from the `sovereign_group` this machine declares in
+        /// `.yah/infra/machines/<name>.toml` — same label space, one source of
+        /// truth. Editing that file alone changes nothing on a running box: the
+        /// daemon declares what this flag says, so the two land together or the
+        /// node's comments describe a membership it does not hold.
+        ///
+        /// A sovereign group is a **blast radius** — its own quorum, its own
+        /// upgrade cadence, destroyable and rebuildable without touching
+        /// anything else — not a placement constraint. Nothing about it filters
+        /// workloads.
+        ///
+        /// What setting it does is *refuse*: `POST /raft/add-learner` on this
+        /// node then declines any join whose joiner is not in the same group,
+        /// asking the joiner rather than trusting the request. Unset means no
+        /// group is asserted and that gate does not run, which is the right
+        /// answer for a pond cluster, a rig, and a standalone BYO node — and
+        /// was every cluster's behaviour before R742-F1.
+        ///
+        /// Requires `--raft-node-id`; without a cluster there is no join to
+        /// refuse.
+        #[arg(long)]
+        sovereign_group: Option<String>,
+        /// R605-F12: whether this node may hold a seat in its sovereign group's
+        /// quorum — `voter` (default) or `non-voter`.
+        ///
+        /// Copy it from the `sovereign_role` this machine declares in
+        /// `.yah/infra/machines/<name>.toml`, alongside `--sovereign-group`.
+        /// Editing the TOML alone changes nothing on a running box.
+        ///
+        /// `--sovereign-group` says WHICH blast radius this node is in;
+        /// this says whether it votes in it. The two are separate because a box
+        /// can legitimately share a group's secrets, upgrade cadence and
+        /// destruction without being fit to hold a quorum seat — us-west-003 is
+        /// prod's x86 build worker on a residential uplink, and a home-internet
+        /// partition must never be able to stall the prod raft.
+        ///
+        /// Passing `non-voter` makes `POST /raft/add-learner` refuse in both
+        /// directions: this node will not be joined into its group's quorum,
+        /// and if it somehow holds a raft seat already it refuses to grow the
+        /// quorum from it. Unset means `voter`, which is what declaring a group
+        /// alone meant before this flag existed.
+        ///
+        /// Has no effect without `--sovereign-group`: a node in no group has no
+        /// quorum to be eligible for.
+        #[arg(long, default_value = "voter")]
+        sovereign_role: SovereignRole,
+        /// R734-T4 (W247 §3): softly prefer this region for raft leadership.
+        ///
+        /// A label from the same space as `--region`. When the raft leader is
+        /// outside it and a caught-up voter is inside it, the leader hands off,
+        /// so client writes stop paying a cross-region round trip to whichever
+        /// voter happened to win the last election.
+        ///
+        /// A *preference*, never a requirement: if no voter in this region is
+        /// available — the ordinary shape of that region being dark — leadership
+        /// stays wherever the cluster elected it and nothing is retried. The pin
+        /// can tidy up after a failover; it can never block one.
+        ///
+        /// Requires `--raft-node-id`, and refused under `--cluster-profile rig`,
+        /// where every voter shares one failure domain and there are no regions
+        /// to prefer between. Unset means leadership is left wherever raft puts
+        /// it, which is the behaviour every yubaba cluster had before R734-T4.
+        #[arg(long)]
+        leader_anchor: Option<String>,
         /// Phase 2: S3 URL for litestream Headscale DB replication.
         /// Format: `s3://bucket/path?endpoint=https://fsn1.your-objectstorage.com`
         /// When set, the leader watcher manages litestream replicate + restore.
@@ -308,8 +392,17 @@ enum RaftCmd {
     /// Run against exactly one founding voter after every member is up with
     /// `--raft-node-id`; the rest learn membership from the elected leader.
     Init {
-        /// Founding voter as `id=host:port`, repeatable
-        /// (e.g. --member 1=100.64.0.1:7443 --member 2=100.64.0.2:7443).
+        /// Founding voter as `id=host:port[@region]`, repeatable
+        /// (e.g. --member 1=100.64.0.1:7443@us-west
+        ///       --member 2=100.64.0.2:7443@us-east
+        ///       --member 3=100.64.0.3:7443@us-south).
+        ///
+        /// The `@region` suffix is the machine's `region` from
+        /// `.yah/infra/machines/<name>.toml`. Under the default `fleet`
+        /// profile it is REQUIRED for a multi-voter cluster: the daemon
+        /// refuses a founding set where one region holds a majority, and it
+        /// cannot check that on untagged voters (R734-F2, W247 §2). A `rig`
+        /// cluster is one failure domain by construction and needs no tags.
         #[arg(long = "member", required = true)]
         members: Vec<String>,
     },
@@ -323,7 +416,7 @@ enum RaftCmd {
     /// uninitialised (no `init`, no `--bootstrap-single-node`). The learner
     /// receives full replicated state but never votes or counts toward quorum;
     /// promotion to voter is a separate, deliberate step (not this command) —
-    /// a home-lab macOS node stays a learner by design (W255).
+    /// a home-lab macOS node stays a learner by design (W301).
     AddLearner {
         /// The joining node's raft node id (u64, unique fleet-wide).
         #[arg(long)]
@@ -343,6 +436,23 @@ enum RaftCmd {
         /// The learner's raft node id. It must already be in membership.
         #[arg(long)]
         node_id: u64,
+    },
+    /// Remove nodes from the cluster (R734-T3).
+    ///
+    /// The third membership verb, symmetric with `add-learner` and
+    /// `promote-voter`. Removed nodes leave entirely — they are not demoted to
+    /// learners — so a decommissioned box stops receiving replication. Run
+    /// against the current **leader**.
+    ///
+    /// Repeatable, and that matters: the surviving voter count must stay odd,
+    /// so shrinking a five-voter cluster to three is ONE call naming both
+    /// departing voters (`--node-id 4 --node-id 5`). Removing a single voter
+    /// from three is refused — it would leave two, which tolerates no failures
+    /// while requiring both nodes for every write.
+    RemoveMember {
+        /// A raft node id to remove; repeatable.
+        #[arg(long = "node-id", required = true)]
+        node_ids: Vec<u64>,
     },
     /// Transfer raft leadership to another node.
     TransferLeader {
@@ -364,6 +474,10 @@ fn default_serve() -> Cmd {
         raft_dir: PathBuf::from(DEFAULT_RAFT_DIR),
         bootstrap_single_node: false,
         raft_advertise_addr: None,
+        region: None,
+        sovereign_group: None,
+        sovereign_role: SovereignRole::default(),
+        leader_anchor: None,
         litestream_s3_url: None,
         control_plane: false,
         camp_rpc_roots: Vec::new(),
@@ -396,6 +510,10 @@ async fn main() -> Result<()> {
             raft_dir,
             bootstrap_single_node,
             raft_advertise_addr,
+            region,
+            sovereign_group,
+            sovereign_role,
+            leader_anchor,
             litestream_s3_url,
             control_plane,
             camp_rpc_roots,
@@ -410,6 +528,32 @@ async fn main() -> Result<()> {
             tracing::info!(channel = %channel, "yah-yubaba serve");
             let policy = cluster_profile.policy();
             tracing::info!(?policy, "cluster policy");
+            // R555-F5 / W235 §(c): yubaba now enforces signed-recipe admission
+            // at the deploy handler, ahead of secret resolution — so it needs
+            // the same posture kamaji-bin logs at startup, and for a sharper
+            // reason. yubaba.service and kamaji.service are separate units with
+            // separate environments, so a node can pin YAH_ADMISSION_KEYS for
+            // one and not the other. That misconfiguration looks like nothing
+            // until a signed dispatch is refused for an untrusted key that the
+            // operator can see is pinned — on the other unit. Two log lines at
+            // boot, one per unit, make the mismatch readable.
+            let admission = workload_spec::admission::NodeAdmission::from_env();
+            tracing::info!(
+                policy = ?admission.policy,
+                pinned_keys = admission.trusted_keys.len(),
+                policy_env = workload_spec::admission::POLICY_ENV,
+                keys_env = workload_spec::admission::KEYS_ENV,
+                "signed-recipe admission posture (W235 §(c)) — must match kamaji's on this node"
+            );
+            // R734-T4: refuse a meaningless anchor at boot rather than starting a
+            // loop that could never act on it. This is an operator flag typo, and
+            // a typo that silently does nothing is the worst of the three
+            // outcomes — the operator believes leadership is pinned and it is not.
+            if let Some(anchor) = &leader_anchor {
+                if let Err(why) = yubaba::leader_pin::validate(&policy, anchor) {
+                    anyhow::bail!("--leader-anchor: {why}");
+                }
+            }
             // R599-F12: `--bind` is also this node's own mesh address (in
             // production it is the tailscale0 IP), and a natively forked
             // workload can only bind an address the node already holds. Record
@@ -421,6 +565,93 @@ async fn main() -> Result<()> {
 
             if let Some(s3_url) = litestream_s3_url {
                 server_state = server_state.with_litestream_s3_url(s3_url);
+            }
+
+            // R779 (W267): the object-store fallback for per-domain TLS material.
+            // Opt-in via YUBABA_CERT_STORE_BUCKET; a node without it resolves
+            // from raft alone, exactly as before. Non-fatal on failure — an
+            // unreachable bucket must not stop the daemon from booting, and a
+            // node that cannot reach it simply has no per-domain certs.
+            //
+            // The issuer's directory URL names the store's issuer segment, so
+            // the writer and the reader agree on one path without a second
+            // config knob. An invalid or absent issuer config is not reported
+            // here — the issuer spawn below already logs it, and duplicating the
+            // line on boot would suggest two separate faults.
+            if let Ok(Some(cfg)) = yubaba::acme_issuer::parse_issuer_config(|k| std::env::var(k).ok())
+            {
+                if let Some(store_cfg) = &cfg.cert_store {
+                    match store_cfg.connect(&cfg.issue.directory.url()) {
+                        Ok(store) => {
+                            tracing::info!(
+                                bucket = %store_cfg.bucket,
+                                issuer = %store.issuer(),
+                                "cert store: per-domain TLS material resolves from the \
+                                 object store when raft does not hold it"
+                            );
+                            server_state = server_state.with_cert_store(store);
+
+                            // R779 (W267): and, if this node fronts a
+                            // passway-demux, keep that demux's route table in
+                            // step with the enrollment set. Spawned here rather
+                            // than in the raft branch below on purpose — the
+                            // node holding :443 for a free tier need not be a
+                            // raft member, which is the whole reason the
+                            // enrollment set lives in the bucket.
+                            match yubaba::demux_routes::parse_publisher_config(|k| {
+                                std::env::var(k).ok()
+                            }) {
+                                Ok(Some(pub_cfg)) => {
+                                    if let Some(store) = server_state.cert_store.clone() {
+                                        let _publisher =
+                                            yubaba::demux_routes::spawn(store, pub_cfg);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => tracing::error!(
+                                    "demux route publisher config invalid — not started \
+                                     (fix YUBABA_DEMUX_ROUTES_*): {e}"
+                                ),
+                            }
+
+                            // R779 (W267 §Decision 2): and the writer for that
+                            // same set — per-domain issuance for custom tenant
+                            // domains, validated by DNS-01 CNAME delegation.
+                            // Spawned here, outside the raft branch, for the
+                            // same reason as the publisher: issuance and
+                            // routing both live in the bucket, and neither
+                            // needs this node to be a raft member. Single-writer
+                            // per domain is the store's own CAS claim, not a
+                            // raft lock — see `cert_store::claim_issuance`.
+                            match yubaba::domain_issuer::parse_domain_issuer_config(|k| {
+                                std::env::var(k).ok()
+                            }) {
+                                Ok(Some(issuer_cfg)) => {
+                                    if let Some(store) = server_state.cert_store.clone() {
+                                        let _domain_issuer = yubaba::domain_issuer::spawn(
+                                            store,
+                                            // The claim holder, as an operator
+                                            // reading a stuck `issuing` object
+                                            // wants to see it: which node.
+                                            bind.clone(),
+                                            issuer_cfg,
+                                        );
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => tracing::error!(
+                                    "per-domain issuer config invalid — not started (fix \
+                                     YUBABA_DOMAIN_ISSUER_* / YUBABA_ACME_*): {e}"
+                                ),
+                            }
+                        }
+                        Err(e) => tracing::error!(
+                            bucket = %store_cfg.bucket,
+                            "cert store unavailable — per-domain TLS material will not \
+                             resolve on this node: {e}"
+                        ),
+                    }
+                }
             }
 
             // Wire the container runtime. This is what flips `/workloads/deploy`
@@ -488,11 +719,51 @@ async fn main() -> Result<()> {
                         raft_node.clone(),
                         policy.liveness_thresholds(),
                     )))
+                    // R737-F2: the node-lease channel a placement scheduler
+                    // is allowed to trust — see `lease_detector` module doc
+                    // for why this must stay separate from the detector
+                    // above.
+                    .with_lease_detector(Arc::new(LeaseFailureDetector::new(
+                        policy.liveness_thresholds(),
+                    )))
+                    // R782 (W253 §7): the streamer-RPO evidence channel a
+                    // placement scheduler is allowed to trust — see
+                    // `with_rpo_registry`'s doc for why this needs no
+                    // thresholds, unlike the detector above.
+                    .with_rpo_registry(Arc::new(RpoWatermarkRegistry::new()))
                     // R600-F6 (W273): share the raft state-machine handle so
                     // admission can resolve `SecretRef::Cluster` File mounts.
                     // Cloned here because the ACME issuer (F3) also moves a
                     // handle in below.
-                    .with_secret_state(state_machine.clone());
+                    .with_cluster_state(state_machine.clone());
+                if let Some(region) = region.clone() {
+                    server_state = server_state.with_region(region);
+                }
+                // R742-F1: declaring a group turns on the add-learner gate on
+                // this node. Unset leaves it off — see the flag's doc.
+                if let Some(group) = sovereign_group.clone() {
+                    server_state = server_state.with_sovereign_group(group);
+                }
+                // R605-F12: set unconditionally — it defaults to `voter`, so
+                // there is no "unset" to preserve, and the gate reads it only
+                // when a group is declared above.
+                server_state = server_state.with_sovereign_role(sovereign_role);
+                if !sovereign_role.is_voter() {
+                    // This branch has a --raft-node-id, so the node holds a
+                    // raft seat while declaring it must not. Both halves came
+                    // from the operator, so neither can be silently preferred —
+                    // and the add-learner gate refuses every join here, which
+                    // is a confusing symptom without this line above it.
+                    tracing::warn!(
+                        role = %sovereign_role,
+                        node_id,
+                        "--sovereign-role non-voter with a --raft-node-id: this node is holding \
+                         a raft seat its own declaration says it should not have. Joins through \
+                         it will be refused. Drop --raft-node-id (the us-west-003 shape: `mode: \
+                         standalone`), or correct sovereign_role in \
+                         .yah/infra/machines/<name>.toml and restart with --sovereign-role voter"
+                    );
+                }
                 // W197 §"Single-node raft" (R482-T3): the BYO-VPS bootstrap
                 // path self-initialises a cluster-of-one so the node comes up
                 // as a live one-voter raft with no operator `raft init` call.
@@ -518,6 +789,100 @@ async fn main() -> Result<()> {
                 // immediately on the first leader election.
                 let _watcher =
                     yubaba::leader::spawn(node_id, raft_node.clone(), Arc::clone(&shared_state));
+                // R734-F5: publish this node's own member row (address + region)
+                // into replicated state, and keep it correct. Convergent and
+                // non-fatal — see the module docs; nothing downstream waits on
+                // it, so it is spawned and forgotten like the watcher above.
+                // R737-F1: publish this node's schedulable budget in the same
+                // row. Measured, not declared — `specs()` is the same collection
+                // `GET /node/specs` serves and is cached after this first call,
+                // so reading it here costs one probe rather than a second
+                // capacity source that could disagree with the endpoint.
+                let capacity = {
+                    let specs = shared_state.node_probe.specs();
+                    match (specs.allocatable_memory_mb, specs.allocatable_cpu_millis) {
+                        // Both axes or neither. A half-measured node published as
+                        // `cpu_millis: 0` would read as "unconstrained on CPU"
+                        // (this system's spelling of zero) and take every tenant
+                        // on the fleet, which is worse than being unschedulable.
+                        (Some(memory_mb), Some(cpu_millis)) => Some(yubaba::raft::NodeCapacity {
+                            memory_mb,
+                            cpu_millis,
+                        }),
+                        _ => None,
+                    }
+                };
+                let _member_registration = yubaba::member_registration::spawn(
+                    node_id,
+                    raft_node.clone(),
+                    state_machine.clone(),
+                    region,
+                    capacity,
+                );
+                // R734-T4: soft leader pin. Started on every node, not just the
+                // leader — a follower's loop reaches `NotLeader` and does
+                // nothing, so there is no start/stop edge to get wrong across an
+                // election. Paced off the policy's own timings, so a WAN cluster
+                // is not evaluated at LAN speed.
+                if let Some(anchor) = leader_anchor {
+                    let _leader_pin = yubaba::leader_pin::spawn(
+                        node_id,
+                        raft_node.clone(),
+                        state_machine.clone(),
+                        yubaba::leader_pin::PinConfig::new(anchor, policy.timing),
+                    );
+                }
+                // R737-F3: tenant placement scheduler. Started on every node
+                // for the same reason as the leader pin above — a follower's
+                // tick is a no-op. Unlike the pin, this has no operator flag
+                // to gate it: a raft-configured node always has tenants that
+                // could need re-placement.
+                let _scheduler = yubaba::scheduler::spawn(
+                    node_id,
+                    raft_node.clone(),
+                    state_machine.clone(),
+                    shared_state.lease_detector.clone(),
+                    // R737-F2: the raft-heartbeat channel supplies W253 §7's
+                    // `raft peer healthy` gate — as a veto only, never as
+                    // grounds to place. See the scheduler module doc for why
+                    // that direction is what keeps the two channels separate.
+                    shared_state.failure_detector.clone(),
+                    // R782: streamer_watermark_age's live source.
+                    shared_state.rpo_registry.clone(),
+                    yubaba::scheduler::SchedulerConfig::new(
+                        policy.timing,
+                        yubaba::lease_detector::HysteresisPolicy::from_thresholds(
+                            policy.liveness_thresholds(),
+                        ),
+                    ),
+                );
+                // R737-F3: the client half of the node-lease channel — without
+                // this nothing ever calls `POST /mesh/lease-renew` and the
+                // scheduler above never confirms anyone Up or Down. Paced off
+                // the raft heartbeat so a detector gets several chances to
+                // hear from a live node within `down_after`.
+                let _lease_renewal = yubaba::lease_renewal::spawn(
+                    node_id,
+                    raft_node.clone(),
+                    shared_state.lease_detector.clone(),
+                    std::time::Duration::from_millis(policy.timing.heartbeat_interval_ms.max(1)),
+                );
+                // R737-T4: N+1 headroom accounting. Started on every node like
+                // the scheduler above; only the leader has real liveness
+                // evidence to act on, so a follower's tick is a no-op.
+                let _headroom = yubaba::headroom::spawn(
+                    node_id,
+                    raft_node.clone(),
+                    state_machine.clone(),
+                    shared_state.lease_detector.clone(),
+                    Arc::clone(&shared_state),
+                    yubaba::headroom::HeadroomConfig::new(
+                        policy.timing,
+                        yubaba::lease_detector::HysteresisPolicy::from_thresholds(
+                            policy.liveness_thresholds(),
+                        ),
+                    ),
+                );
                 // R600-F4 (W273): every node consuming a cluster cert runs the
                 // rotation watcher — not just the elected issuer. On a replicated
                 // cert renewal it re-renders the local tmpfs mount and graceful-
@@ -548,6 +913,49 @@ async fn main() -> Result<()> {
                 // Single-node mode: real containerd runtime, no raft mesh.
                 // This is the intentional surface tested before adding HA (R276-F4).
                 // Use --raft-node-id to enable the cluster coordination layer.
+                if let Some(region) = &region {
+                    // Not fatal — the flag is harmless here — but silence would
+                    // let an operator believe a node is tagged when there is no
+                    // cluster for the tag to reach.
+                    tracing::warn!(
+                        %region,
+                        "--region has no effect without --raft-node-id: there is no raft \
+                         cluster to publish this node's member row to"
+                    );
+                }
+                if let Some(group) = &sovereign_group {
+                    // The most dangerous of the three to pass silently: an
+                    // operator who set it believes cross-group joins are being
+                    // refused, and there is no raft here to refuse one.
+                    tracing::warn!(
+                        %group,
+                        "--sovereign-group has no effect without --raft-node-id: there is no \
+                         raft cluster, so no join can be refused"
+                    );
+                }
+                if !sovereign_role.is_voter() {
+                    // R605-F12. Not an error: this is the *expected* shape for
+                    // us-west-003 — a non-voting member runs standalone, with
+                    // no raft node id, which is exactly what the role declares.
+                    // Logged at info so the box's own logs record the claim,
+                    // because the only other place it appears is a TOML in a
+                    // camp this process cannot see.
+                    tracing::info!(
+                        role = %sovereign_role,
+                        "declared non-voting and running without --raft-node-id, which is the \
+                         consistent pair: this node holds no raft seat and asserts it should \
+                         not"
+                    );
+                }
+                if let Some(anchor) = &leader_anchor {
+                    // Same reasoning as `--region` above: harmless, but an
+                    // operator who passed it believes leadership is pinned.
+                    tracing::warn!(
+                        %anchor,
+                        "--leader-anchor has no effect without --raft-node-id: there is no \
+                         raft leadership to steer"
+                    );
+                }
                 tracing::info!(
                     "yubaba running in single-node mode — \
                      containerd runtime active, raft mesh disabled. \
@@ -580,13 +988,20 @@ async fn main() -> Result<()> {
             RaftCmd::Init { members } => {
                 let mut parsed = std::collections::BTreeMap::new();
                 for m in &members {
-                    let (id, addr) = m.split_once('=').ok_or_else(|| {
-                        anyhow::anyhow!("--member must be id=host:port, got {m:?}")
+                    let (id, rest) = m.split_once('=').ok_or_else(|| {
+                        anyhow::anyhow!("--member must be id=host:port[@region], got {m:?}")
                     })?;
                     let id: u64 = id
                         .parse()
                         .with_context(|| format!("--member node id must be a u64, got {id:?}"))?;
-                    parsed.insert(id, addr.to_string());
+                    // Split on the LAST '@': a mesh address never contains one
+                    // today, but rsplit keeps this correct if a user@host form
+                    // ever shows up, and a bare address stays a bare address.
+                    let (addr, region) = match rest.rsplit_once('@') {
+                        Some((addr, region)) if !region.is_empty() => (addr, Some(region)),
+                        _ => (rest, None),
+                    };
+                    parsed.insert(id, serde_json::json!({ "addr": addr, "region": region }));
                 }
                 let client = reqwest::Client::new();
                 let resp = client
@@ -632,6 +1047,22 @@ async fn main() -> Result<()> {
                     println!("{body}");
                 } else {
                     anyhow::bail!("raft promote-voter failed ({status}): {body}");
+                }
+                Ok(())
+            }
+            RaftCmd::RemoveMember { node_ids } => {
+                let client = reqwest::Client::new();
+                let resp = client
+                    .post(format!("{daemon}/raft/remove-member"))
+                    .json(&serde_json::json!({ "node_ids": node_ids }))
+                    .send()
+                    .await?;
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if status.is_success() {
+                    println!("{body}");
+                } else {
+                    anyhow::bail!("raft remove-member failed ({status}): {body}");
                 }
                 Ok(())
             }
@@ -999,7 +1430,12 @@ async fn attach_constable_client(state: ServerState, socket: Option<PathBuf>) ->
                     "kamaji client attached; workload list/state/drain dispatch \
                      through UDS"
                 );
-                return state.with_constable_client(Arc::new(client));
+                // KamajiSibling (not a bare client) so a later `systemctl
+                // restart kamaji` — e.g. a binary swap — doesn't strand this
+                // yubaba on PeerClosed until it, too, is restarted (R406-T8
+                // gap, live incident 2026-08-13).
+                let sibling = kamaji::sibling::KamajiSibling::new(client, socket, per_attempt);
+                return state.with_constable_client(sibling);
             }
             Err(e) => {
                 let now = std::time::Instant::now();
