@@ -21,35 +21,83 @@
 //! already has two facts, at two different moments, and this module
 //! combines them instead of re-deriving either:
 //!
-//! 1. **At deploy time** ([`ServiceRecords::upsert_deployed`]): the handler
-//!    that calls `ContainerRuntime::deploy_workload` (`POST
-//!    /workloads/deploy` in `lib.rs`) has both the [`WorkloadSpec`] (which
-//!    carries `expose.mesh.ports` — the only place a workload's serving
-//!    port(s) are declared) and the [`kamaji::DeployResult`] (which carries
-//!    the mesh IP yubaba just allocated via `ServerState::alloc_mesh_ip`).
-//!    That pairing is admission-time knowledge that exists nowhere else.
+//! 1. **At deploy time**, once per workload *tier*, because `POST
+//!    /workloads/deploy` in `lib.rs` admits two differently-shaped workloads
+//!    and only one of them has a [`WorkloadSpec`]:
+//!    - *Container* ([`ServiceRecords::upsert_deployed`]): the handler has
+//!      both the [`WorkloadSpec`] (which carries `expose.mesh.ports` — where
+//!      a container's serving port(s) are declared) and the
+//!      [`kamaji::DeployResult`] (which carries the mesh IP yubaba just
+//!      allocated via `ServerState::alloc_mesh_ip`).
+//!    - *W272 bundle* ([`ServiceRecords::admit_bundle`], R844-F1): a
+//!      `Workload::MesofactStatic` envelope has no `WorkloadSpec` at all. Its
+//!      serving port rides on `MesofactServeBundle::port` and its address is
+//!      the node's own mesh IP (`ServerState::node_mesh_ip`) — a native
+//!      bundle is a forked host process with no namespace, so there is no
+//!      per-workload address to allocate. Same pairing, different two facts.
+//!
+//!    Either way that pairing is admission-time knowledge that exists nowhere
+//!    else, which is why it cannot be recovered by step 2.
 //! 2. **On every subsequent read** ([`ServiceRecords::reconcile`]): the
 //!    exact same call `GET /workloads` already makes —
 //!    `ContainerRuntime::list_workloads()` → `Vec<`[`WorkloadState`]`>` — is
 //!    the authoritative "what does the runtime think is running right now"
-//!    source. `WorkloadState` carries `status` + (usually) `mesh_ip` but
-//!    *not* ports, which is exactly why step 1 must supply them first.
+//!    source. It carries `status`, (usually) `mesh_ip`, and — since R844-F2 —
+//!    the **resolved ports** the supervisor actually bound.
 //!
-//! `reconcile` therefore only refreshes/retracts idents it already knows
-//! about — it does not fabricate a record for an ident it has never seen,
-//! because it would have no port to publish for it (a record without a port
-//! is not something an ingress proxy can dial). `reconcile` is purely a
-//! health/liveness refresh; it is never a discovery path.
+//! ## Declared ports and resolved ports are different facts
 //!
-//! Records enter the registry by exactly two routes, both carrying ports:
-//! admission ([`ServiceRecords::upsert_deployed`]) and, on boot, the port
-//! ledger written by prior admissions (§The port ledger below). Cold-
-//! discovering a *never-admitted* workload's ports from `WorkloadState`
-//! alone remains impossible until the wire/state shape grows a ports field
-//! (the other option R594-F6 weighed — see that ticket, and `lib.rs`'s
-//! R406-T8 handoff note about enriching `WorkloadEntry` with `mesh_ip` +
-//! friends). That gap only bites a workload some *other* yubaba admitted,
-//! which is not a shape this node can serve anyway.
+//! That third field is why step 2 is no longer only a refresh, and the
+//! distinction it introduced is the thing to hold onto:
+//!
+//! - **Declared** ([`ServiceRecord::ports`]) — what the workload *asked for*.
+//!   `expose.mesh.ports` on a container's spec; `serve_bundle.port` on a
+//!   bundle, which the mirror's `[providers.bundle] port` key writes. Known at
+//!   admission, before anything has bound.
+//! - **Resolved** ([`ServiceRecord::resolved_ports`]) — what the supervisor
+//!   *bound*, reported on every sweep. For a bundle with no declaration this is
+//!   a port kamaji allocated (`kamaji::ports`), which exists nowhere in
+//!   yubaba's inputs and can only arrive this way.
+//!
+//! [`ServiceRecord::dialable_ports`] resolves the precedence once: resolved
+//! wins, declared is the fallback. The fallback is not a courtesy — a
+//! namespaced container's declared port *is* its bound port, so its backend
+//! reports no resolved set and never will.
+//!
+//! Keeping them apart rather than overwriting one with the other is deliberate:
+//! they can disagree, and the disagreement is the diagnosis. A declared port
+//! that never appears as resolved is a workload that failed to bind what it
+//! asked for; a resolved port with no declaration is the normal steady state
+//! once a mirror stops naming one.
+//!
+//! ## How a record enters, and the one invariant
+//!
+//! Three routes, and every one of them satisfies the same two-clause
+//! invariant — **a record exists iff yubaba declared the workload serving AND
+//! a dialable port is known**. The second clause is the one F1 established;
+//! the first was implicit while admission was the only route in, and R844-F2
+//! made it explicit because cold admission reads from a supervisor that also
+//! runs workloads yubaba never placed (see [`ServiceRecords::reconcile`]):
+//!
+//! - [`ServiceRecords::upsert_deployed`] at deploy time, for a container.
+//! - [`ServiceRecords::admit_bundle`] at deploy time, for a bundle that
+//!   declares a port.
+//! - [`ServiceRecords::reconcile`]'s **cold-admission** arm (R844-F2), for a
+//!   workload yubaba declared serving but could name no port for, whose
+//!   supervisor has now reported the port it bound. This is what makes a
+//!   mirror able to name no port at all: `admit_bundle` declines at admission
+//!   because no port exists yet, and the first sweep after the fork publishes
+//!   the real one.
+//!
+//! Plus, on boot, the port ledger written by prior admissions (§The port ledger
+//! below).
+//!
+//! `reconcile` still never *fabricates* a record: an ident yubaba never
+//! declared, or one whose state reports no resolved port, is skipped. What
+//! changed is only that "no port to publish" is now a question the supervisor
+//! can answer, where before R844-F2 it could not: `WorkloadState` had no ports
+//! field, which is the gap R594-F6 weighed and deferred (see also `lib.rs`'s
+//! R406-T8 note about enriching `WorkloadEntry`).
 //!
 //! ## Push-on-change over polling
 //!
@@ -80,7 +128,13 @@
 //! - **Producer**: `deploy_workload_spec` calls [`ServiceRecords::upsert_deployed`]
 //!   on a successful deploy (beside the `archetype_registry` /
 //!   `workload_resources` inserts it already does), and `destroy_workload`
-//!   calls [`ServiceRecords::retract`] beside the matching removals.
+//!   calls [`ServiceRecords::retract`] beside the matching removals. R844-F1
+//!   added the second producer: `deploy_non_container` calls
+//!   [`ServiceRecords::admit_bundle`] on a successful kamaji bundle deploy.
+//!   Until then the bundle tier had **no** producer at all — every node in
+//!   the fleet served bundles and answered `GET /service-records?ready=true`
+//!   with an empty set, and because `reconcile` never backfills an
+//!   un-admitted ident (below), nothing could recover it.
 //! - **Refresh**: [`run`] is a background sweep — `active_backend()`
 //!   `.list_workloads()` → [`ServiceRecords::reconcile`] every
 //!   [`SWEEP_INTERVAL`] — because health can change without a yubaba-initiated
@@ -156,10 +210,10 @@
 //! rather than draining every backend on a transient yubaba blip. That is the
 //! same distinction [`run`]'s sweep makes when `list_workloads()` fails.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kamaji::{WorkloadState, WorkloadStatus};
@@ -221,9 +275,25 @@ pub struct ServiceRecord {
     /// Mesh-plane IPv4 address (from `100.64.0.0/10`, per
     /// `ServerState::alloc_mesh_ip`).
     pub mesh_ip: Ipv4Addr,
-    /// Container-side port(s) this workload listens on
-    /// (`expose.mesh.ports`). A proxy dials `mesh_ip:port` for each.
+    /// Port(s) the workload **declared** — `expose.mesh.ports` for a container,
+    /// `serve_bundle.port` for a W272 bundle. A request, made at admission
+    /// time, before anything bound.
     pub ports: Vec<u16>,
+    /// Port(s) the supervisor **actually bound**, as reported by
+    /// `kamaji::WorkloadState::ports` on the refresh sweep (R844-F2).
+    ///
+    /// Deliberately a separate field rather than overloading [`Self::ports`],
+    /// because they are different facts that can disagree and the disagreement
+    /// is the interesting part: a declared port that never got bound is a
+    /// misconfiguration, and a resolved port with no declaration is the normal
+    /// state once a mirror stops naming one. Collapsing them would erase the
+    /// only evidence of either.
+    ///
+    /// Empty means the supervisor reported no resolved port — either a
+    /// namespaced container backend, where the declaration *is* the bound port
+    /// and there is nothing to resolve, or a workload that has not bound yet.
+    /// Dial [`Self::dialable_ports`], not this.
+    pub resolved_ports: Vec<u16>,
     /// Backend-assigned container/task id, useful for correlating a record
     /// with logs or `docker`/`containerd` inspection.
     pub container_id: String,
@@ -236,10 +306,26 @@ pub struct ServiceRecord {
 }
 
 impl ServiceRecord {
-    /// `mesh_ip:port` for every declared port. Empty if the workload
-    /// declares no mesh ports (a valid but proxy-uninteresting shape).
+    /// The port(s) a proxy should actually dial: what the supervisor bound
+    /// when it reported that, and what the workload declared otherwise
+    /// (R844-F2).
+    ///
+    /// Resolved wins because it is a measurement and the declaration is a
+    /// request. The fallback is not a courtesy — it is what the container tier
+    /// runs on: a namespaced container's declared port *is* its bound port, so
+    /// its backend reports no resolved set and never will.
+    pub fn dialable_ports(&self) -> &[u16] {
+        if self.resolved_ports.is_empty() {
+            &self.ports
+        } else {
+            &self.resolved_ports
+        }
+    }
+
+    /// `mesh_ip:port` for every dialable port. Empty if the workload has no
+    /// known ports at all (a valid but proxy-uninteresting shape).
     pub fn endpoints(&self) -> Vec<SocketAddrV4> {
-        self.ports
+        self.dialable_ports()
             .iter()
             .map(|&port| SocketAddrV4::new(self.mesh_ip, port))
             .collect()
@@ -271,6 +357,21 @@ pub struct ServiceRecords {
     /// (tests, and the embedded/camp path that has no durable state dir) —
     /// every other operation behaves identically either way.
     ledger_path: Option<PathBuf>,
+    /// Idents yubaba has **declared to be serving** — the eligibility set for
+    /// [`Self::reconcile`]'s cold-admission arm (R844-F2).
+    ///
+    /// Deliberately NOT the record map. A record needs a declaration *and* a
+    /// dialable port; this set is the first half on its own, which is exactly
+    /// the state a bundle sits in between "admitted with no declared port" and
+    /// "the supervisor reported the port it bound". Without somewhere to hold
+    /// that, cold admission has no way to tell a workload yubaba placed from
+    /// one kamaji forked for itself.
+    ///
+    /// Not persisted, and it does not need to be: once cold admission fires,
+    /// the resulting record goes in the ledger, and a restart rehydrates it
+    /// onto the *refresh* path rather than the cold-admit path. Rehydration
+    /// re-declares each recovered ident so the two stay consistent.
+    serving: Mutex<HashSet<String>>,
 }
 
 /// File name of the port ledger, written beside `identity.json` in the
@@ -291,6 +392,11 @@ struct LedgerEntry {
     ident: String,
     mesh_ip: Ipv4Addr,
     ports: Vec<u16>,
+    /// R844-F2. `#[serde(default)]` so a ledger written before this field
+    /// existed still loads — the first sweep after boot re-learns the resolved
+    /// ports from the supervisor anyway, so an old ledger costs nothing.
+    #[serde(default)]
+    resolved_ports: Vec<u16>,
     container_id: String,
 }
 
@@ -314,6 +420,7 @@ impl ServiceRecords {
         Self {
             tx,
             ledger_path: None,
+            serving: Mutex::new(HashSet::new()),
         }
     }
 
@@ -331,6 +438,7 @@ impl ServiceRecords {
                     ident: MeshIdent(entry.ident),
                     mesh_ip: entry.mesh_ip,
                     ports: entry.ports,
+                    resolved_ports: entry.resolved_ports,
                     container_id: entry.container_id,
                     health: Health::NotReady {
                         reason: "rehydrated",
@@ -347,11 +455,54 @@ impl ServiceRecords {
                  until the first reconcile sweep confirms the workloads are live"
             );
         }
+        // R844-F2: a rehydrated ident was declared serving in a prior life —
+        // the ledger entry IS that declaration, persisted. Re-declaring keeps
+        // the eligibility set consistent with the records across a restart, so
+        // a workload whose record was later retracted (backend blip, say) can
+        // still be re-admitted from its resolved port rather than being stuck
+        // out until the next deploy.
+        let serving = records.keys().cloned().collect::<HashSet<_>>();
         let (tx, _rx) = watch::channel(Arc::new(records));
         Self {
             tx,
             ledger_path: Some(path),
+            serving: Mutex::new(serving),
         }
+    }
+
+    /// Record that yubaba has placed `ident` as a **serving** workload
+    /// (R844-F2) — the eligibility gate for cold admission.
+    ///
+    /// Called from the two admission paths, and only when the workload's own
+    /// declaration says it serves: a container with a non-empty
+    /// `expose.mesh.ports` (the caller in `lib.rs` gates on exactly that), or a
+    /// bundle envelope carrying a `serve_bundle`. Note the bundle case does
+    /// **not** require the declaration to name a port — that is the whole
+    /// point. "This workload serves" and "we know where" are separate facts,
+    /// and only the first one is knowable at admission.
+    fn declare_serving(&self, ident: &MeshIdent) {
+        if let Ok(mut serving) = self.serving.lock() {
+            serving.insert(ident.0.clone());
+        }
+    }
+
+    /// Forget that `ident` serves. Paired with [`Self::retract`] so a redeploy
+    /// that drops its ports, or an explicit destroy, also drops the workload's
+    /// cold-admission eligibility — otherwise the next sweep would re-admit
+    /// from a resolved port the record was just retracted for.
+    fn undeclare_serving(&self, ident: &MeshIdent) {
+        if let Ok(mut serving) = self.serving.lock() {
+            serving.remove(ident.0.as_str());
+        }
+    }
+
+    /// Whether yubaba declared `ident` as serving. `true` is a precondition for
+    /// cold admission, never a substitute for knowing a port.
+    pub fn is_declared_serving(&self, ident: &MeshIdent) -> bool {
+        self.serving
+            .lock()
+            .map(|s| s.contains(ident.0.as_str()))
+            .unwrap_or(false)
     }
 
     /// The ledger file this registry persists to, if any.
@@ -421,6 +572,7 @@ impl ServiceRecords {
                 ident: r.ident.0.clone(),
                 mesh_ip: r.mesh_ip,
                 ports: r.ports.clone(),
+                resolved_ports: r.resolved_ports.clone(),
                 container_id: r.container_id.clone(),
             })
             .collect();
@@ -455,10 +607,17 @@ impl ServiceRecords {
         container_id: impl Into<String>,
     ) {
         let ident = spec.expose.mesh.identity.clone();
+        // R844-F2: the caller only reaches here for a spec with non-empty
+        // `expose.mesh.ports`, so arriving at all IS the serving declaration.
+        self.declare_serving(&ident);
         let record = ServiceRecord {
             ident: ident.clone(),
             mesh_ip,
             ports: spec.expose.mesh.ports.clone(),
+            // A container is namespaced: its declared port is its bound port,
+            // so there is nothing to resolve and `dialable_ports` falls back to
+            // the declaration. See [`ServiceRecord::resolved_ports`].
+            resolved_ports: Vec::new(),
             container_id: container_id.into(),
             health: Health::Ready,
             observed_at_unix_ms: now_unix_ms(),
@@ -468,40 +627,233 @@ impl ServiceRecords {
         self.publish(next);
     }
 
-    /// Refresh health (and mesh IP, if it changed) against the runtime's
-    /// own authoritative listing — the same data `GET /workloads` reads via
+    /// Record a **bundle-tier** workload at the moment yubaba hands it to
+    /// kamaji (R844-F1).
+    ///
+    /// The container tier reaches [`Self::upsert_deployed`] with a whole
+    /// [`WorkloadSpec`]; the W272 bundle tier has none. A bundle deploy is a
+    /// `Workload::MesofactStatic` envelope whose serving port rides on
+    /// `MesofactServeBundle::port` — the field workload-spec's own docs call
+    /// "the bundle-tier analogue of a container's `expose.mesh.ports`" — so
+    /// the two facts arrive separately and this is the seam that pairs them.
+    ///
+    /// `ident` **must** be the operator-facing workload id from the deploy
+    /// body, not the bundle digest. That id is what kamaji's `list()` reports
+    /// as `mesh_ident`, and [`Self::reconcile`] keys on exactly that: keyed on
+    /// the digest instead, the record would be retracted by the very first
+    /// sweep.
+    ///
+    /// `ports` empty is a caller bug, not a shape this admits — see
+    /// [`Self::admit_bundle`], which is the entry point callers should use.
+    fn upsert_bundle_deployed(
+        &self,
+        ident: &MeshIdent,
+        mesh_ip: Ipv4Addr,
+        ports: Vec<u16>,
+        resolved_ports: Vec<u16>,
+    ) {
+        let record = ServiceRecord {
+            ident: ident.clone(),
+            mesh_ip,
+            ports,
+            resolved_ports,
+            // A native bundle is a forked host process, not a container. The
+            // ident is the only handle kamaji correlates it by, so repeating
+            // it here is the honest answer rather than an invented id.
+            container_id: ident.0.clone(),
+            health: Health::Ready,
+            observed_at_unix_ms: now_unix_ms(),
+        };
+        let mut next = (*self.tx.borrow()).as_ref().clone();
+        next.insert(ident.0.clone(), record);
+        self.publish(next);
+    }
+
+    /// Admit a bundle-tier workload as an upstream at **deploy time**, or
+    /// decline with a reason.
+    ///
+    /// Returns `true` when a record was published. `declared_port` is
+    /// `MesofactServeBundle::port`. Two cases decline:
+    ///
+    /// - **No declared port.** The port kamaji will bind is not knowable from
+    ///   here at admission: a bundle `Deploy` acks on admission, before kamaji
+    ///   has materialized the tree or forked anything, so there is no resolved
+    ///   port in existence yet. Publishing a guess (kamaji's old node-wide
+    ///   8080) would re-create the well-known-port assumption discovery exists
+    ///   to remove, and publishing a *portless* record would invent a third
+    ///   state (present, `Ready`, undialable) that no consumer handles.
+    ///   Non-admission is the same answer the container tier gives a portless
+    ///   spec.
+    /// - **No node mesh IP.** A dev host binds loopback; there is no
+    ///   mesh-plane address another node could dial.
+    ///
+    /// **R844-F2: declining here is no longer the end of the story.** Since
+    /// `kamaji::WorkloadState` carries the resolved port, [`Self::reconcile`]
+    /// admits an undeclared bundle on the first sweep after it binds — see
+    /// that method's cold-admission arm. So the two paths are: a bundle that
+    /// declares a port is discoverable immediately, and one that does not is
+    /// discoverable within one sweep, once there is a real port to publish
+    /// rather than a guess. Both end at the same invariant — a record exists
+    /// iff a dialable port is known.
+    ///
+    /// Declining is not an error: the workload still deploys and serves.
+    pub fn admit_bundle(
+        &self,
+        ident: &MeshIdent,
+        node_mesh_ip: Option<Ipv4Addr>,
+        declared_port: Option<u16>,
+    ) -> bool {
+        // R844-F2: declare FIRST, before the port check decides whether
+        // anything can be published. A bundle envelope reaching this function
+        // is yubaba saying "this workload serves"; whether it also named a
+        // port is a separate question, and the declining path below is exactly
+        // the state cold admission later resolves. Declaring only on the
+        // success path would make the gate useless for the case it exists for.
+        self.declare_serving(ident);
+        let (Some(mesh_ip), Some(port)) = (node_mesh_ip, declared_port) else {
+            tracing::debug!(
+                ident = %ident.0,
+                has_mesh_ip = node_mesh_ip.is_some(),
+                has_declared_port = declared_port.is_some(),
+                "service_records: bundle workload not admitted at deploy time — \
+                 no declared port yet. If the node has a mesh IP, the refresh \
+                 sweep will admit it once kamaji reports the port it actually \
+                 bound (R844-F2); yubaba does not guess a port at admission."
+            );
+            return false;
+        };
+        // Declared, not resolved: nothing has bound yet at admission time. The
+        // sweep fills `resolved_ports` in, and corrects this if they differ.
+        self.upsert_bundle_deployed(ident, mesh_ip, vec![port], Vec::new());
+        true
+    }
+
+    /// Refresh health, mesh IP and **resolved ports** against the runtime's own
+    /// authoritative listing — the same data `GET /workloads` reads via
     /// `ContainerRuntime::list_workloads()`.
     ///
-    /// Every already-tracked ident found in `states` gets its `health` (and
-    /// `mesh_ip`, when the state reports one) refreshed. Every
-    /// already-tracked ident **absent** from `states` — i.e. the runtime no
-    /// longer knows about it, which is exactly what happens after a
-    /// teardown — is retracted. Idents present in `states` but never
-    /// previously admitted via [`Self::upsert_deployed`] are skipped (see
-    /// module docs: this module never fabricates a portless record).
-    pub fn reconcile(&self, states: &[WorkloadState]) {
+    /// Three things happen per sweep:
+    ///
+    /// 1. **Refresh.** Every already-tracked ident found in `states` gets its
+    ///    `health`, its `mesh_ip` (when the state reports one) and its
+    ///    `resolved_ports` (when the supervisor reports any) updated. The last
+    ///    of those is R844-F2's correction path: a keep-alive workload that
+    ///    came back on a different port updates its record here instead of
+    ///    leaving it advertising a port nothing is listening on. That failure
+    ///    is strictly worse than an empty registry, because the record still
+    ///    reads as `Ready` and nothing detects it.
+    /// 2. **Cold-admit** (R844-F2). An ident with *no* prior record is
+    ///    admitted now if — and only if — **both** hold: its state carries a
+    ///    resolved port, and yubaba
+    ///    [declared it serving](Self::is_declared_serving). This is what lets a
+    ///    mirror stop naming a port at all: `admit_bundle` declines at deploy
+    ///    time because no port exists yet, and this arm publishes the record
+    ///    one sweep later using the port kamaji actually bound.
+    ///
+    ///    **Both halves are load-bearing, and the declaration half is a
+    ///    routing-safety gate, not bookkeeping.** kamaji forks workloads
+    ///    yubaba never placed — a bundle's revalidate receiver and its feed
+    ///    tier are forked from the bundle deploy, so they appear in
+    ///    `list_workloads` with real resolved ports and yubaba holds no
+    ///    declaration for either. Admitting on the port alone would publish
+    ///    them as `Ready` records, and passway's `addrs_from_body`
+    ///    (`oss/passway/crates/passway/src/discovery.rs`) pushes *every*
+    ///    endpoint of *every* Ready record into its upstream set with no ident
+    ///    filter — so the revalidation receiver would start taking apex
+    ///    traffic it cannot serve. A wrong-answer outage out of a change whose
+    ///    diff reads like an accuracy improvement.
+    ///
+    ///    So the invariant grows one clause and keeps its shape: **a record
+    ///    exists iff yubaba declared the workload serving AND a dialable port
+    ///    is known.** What R844-F2 changed is only where the port may come
+    ///    from — the supervisor, not just a human writing it into a file.
+    ///
+    ///    An ident missing either half is skipped. That also keeps
+    ///    container-backend entries out on a second, independent ground: they
+    ///    resolve no ports by construction.
+    /// 3. **Retract.** Every already-tracked ident **absent** from `states` —
+    ///    i.e. the runtime no longer knows about it, which is exactly what
+    ///    happens after a teardown — is retracted.
+    ///
+    /// `node_mesh_ip` is this node's own mesh address, used as the cold-admit
+    /// fallback when a state reports none. A bundle is a forked host process
+    /// with no namespace of its own, so it binds the node's address by
+    /// construction — the same reasoning `admit_bundle` already relies on.
+    /// `None` (a dev host on loopback) disables cold admission: there is no
+    /// mesh-plane address another node could dial.
+    pub fn reconcile(&self, states: &[WorkloadState], node_mesh_ip: Option<Ipv4Addr>) {
         let mut next = (*self.tx.borrow()).as_ref().clone();
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for state in states {
             let key = state.ident.0.as_str();
-            match next.get_mut(key) {
-                Some(record) => {
-                    seen.insert(key);
+            // Split on `contains_key` rather than matching on `get_mut`: the
+            // cold-admit arm inserts into the same map, which a live `get_mut`
+            // borrow would forbid.
+            if next.contains_key(key) {
+                {
+                    let record = next.get_mut(key).expect("checked above");
+                    seen.insert(key.to_string());
                     if let Some(ip) = state.mesh_ip {
                         record.mesh_ip = ip;
+                    }
+                    // Only overwrite from a supervisor that actually reported
+                    // ports. An empty report means "this backend resolves
+                    // nothing", not "the ports went away" — clearing on it
+                    // would blank a bundle's record on any sweep the backend
+                    // answered thinly.
+                    if !state.ports.is_empty() {
+                        record.resolved_ports = state.ports.clone();
                     }
                     record.container_id = state.container_id.clone();
                     record.health = Health::from_status(&state.status);
                     record.observed_at_unix_ms = now_unix_ms();
                 }
-                None => {
+            } else if !state.ports.is_empty() && self.is_declared_serving(&state.ident) {
+                let Some(mesh_ip) = state.mesh_ip.or(node_mesh_ip) else {
                     tracing::debug!(
                         ident = %state.ident.0,
-                        "service_records: reconcile saw a workload with no prior \
-                         upsert_deployed record (no known ports); skipping"
+                        "service_records: reconcile saw an unadmitted workload \
+                         with resolved ports but no mesh address to publish it \
+                         at; skipping"
                     );
-                }
+                    continue;
+                };
+                tracing::info!(
+                    ident = %state.ident.0,
+                    mesh_ip = %mesh_ip,
+                    ports = ?state.ports,
+                    "service_records: admitting a workload from its resolved \
+                     ports — the supervisor bound a port yubaba was never told \
+                     about at deploy time (R844-F2)"
+                );
+                seen.insert(key.to_string());
+                next.insert(
+                    state.ident.0.clone(),
+                    ServiceRecord {
+                        ident: state.ident.clone(),
+                        mesh_ip,
+                        // Nothing was declared — that is why this is a cold
+                        // admission rather than a refresh.
+                        ports: Vec::new(),
+                        resolved_ports: state.ports.clone(),
+                        container_id: state.container_id.clone(),
+                        health: Health::from_status(&state.status),
+                        observed_at_unix_ms: now_unix_ms(),
+                    },
+                );
+            } else {
+                tracing::debug!(
+                    ident = %state.ident.0,
+                    has_resolved_ports = !state.ports.is_empty(),
+                    declared_serving = self.is_declared_serving(&state.ident),
+                    "service_records: reconcile saw a workload it will not \
+                     admit — cold admission needs BOTH a resolved port and a \
+                     serving declaration from yubaba. A workload kamaji forked \
+                     for itself (a bundle's revalidate receiver or feed tier) \
+                     has the former and never the latter, and must not become \
+                     a routable upstream."
+                );
             }
         }
 
@@ -519,6 +871,11 @@ impl ServiceRecords {
     /// /workloads/{ident}/destroy` call site, once wired). Idempotent — a
     /// retract of an unknown or already-retracted ident is a no-op publish.
     pub fn retract(&self, ident: &MeshIdent) {
+        // R844-F2: drop cold-admission eligibility too, or the next sweep
+        // would re-admit from a resolved port the record was just retracted
+        // for — which is precisely the redeploy-drops-its-ports case
+        // `redeploy_without_ports_retracts_the_previous_record` pins.
+        self.undeclare_serving(ident);
         let mut next = (*self.tx.borrow()).as_ref().clone();
         if let Some(record) = next.get_mut(ident.0.as_str()) {
             record.health = Health::Retracted;
@@ -613,8 +970,25 @@ pub struct ServiceRecordsWire {
 pub struct ServiceRecordWire {
     pub ident: String,
     pub mesh_ip: Ipv4Addr,
+    /// The port(s) to dial — [`ServiceRecord::dialable_ports`].
+    ///
+    /// R844-F2 changed where this comes from, not what it means: it is the
+    /// supervisor-resolved port when there is one and the declared port
+    /// otherwise, where it used to be only the declaration. A consumer that
+    /// dials these keeps working and starts being right about a workload
+    /// nobody declared a port for; the split between the two facts is below,
+    /// for operators rather than proxies.
     pub ports: Vec<u16>,
-    /// `mesh_ip:port` for every declared port — exactly what
+    /// The port(s) the supervisor reported actually binding, when it reported
+    /// any (R844-F2). Omitted from the JSON when empty.
+    ///
+    /// Diagnostic, not dial-able-by-preference: `ports` above already resolves
+    /// the precedence. This is here so an operator can tell "kamaji allocated
+    /// 43117" from "someone wrote 8080 in a mirror" without reading two
+    /// systems.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved_ports: Vec<u16>,
+    /// `mesh_ip:port` for every dialable port — exactly what
     /// [`ServiceRecord::endpoints`] computes, pre-joined so a consumer dials
     /// without re-deriving the pairing (and cannot get it wrong).
     pub endpoints: Vec<String>,
@@ -638,7 +1012,8 @@ impl From<&ServiceRecord> for ServiceRecordWire {
         Self {
             ident: r.ident.0.clone(),
             mesh_ip: r.mesh_ip,
-            ports: r.ports.clone(),
+            ports: r.dialable_ports().to_vec(),
+            resolved_ports: r.resolved_ports.clone(),
             endpoints: r.endpoints().iter().map(|e| e.to_string()).collect(),
             container_id: r.container_id.clone(),
             health: health.to_string(),
@@ -714,28 +1089,53 @@ pub const SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 /// [`crate::serve_on_listener`]; returns immediately (task ends) when the node
 /// has no workload backend, which is the stub/dev case.
 pub async fn run(state: Arc<crate::ServerState>) {
-    let Some(backend) = state.active_backend() else {
+    // The backend is re-resolved per tick inside `sweep_once`; this is only the
+    // "don't spawn a loop at all" guard for the stub/dev case.
+    if state.active_backend().is_none() {
         tracing::debug!("service_records: no workload backend; refresh sweep idle");
         return;
-    };
+    }
     tracing::info!(
         interval_secs = SWEEP_INTERVAL.as_secs(),
         ledger = ?state.service_records.ledger_path(),
         "service_records: refresh sweep started"
     );
     loop {
-        match backend.list_workloads().await {
-            Ok(states) => state.service_records.reconcile(&states),
-            // A failed list is NOT an empty list. Reconciling against `&[]`
-            // here would retract every record on a transient backend blip
-            // (kamaji socket restarting, containerd busy) and yank live
-            // upstreams out from under the ingress proxy. Skip the tick.
-            Err(e) => tracing::debug!(
+        sweep_once(&state).await;
+        tokio::time::sleep(SWEEP_INTERVAL).await;
+    }
+}
+
+/// One turn of [`run`]'s refresh loop, factored out so a test can drive the
+/// real thing instead of re-implementing the tick.
+///
+/// Returns `true` when the backend answered and a reconcile ran. It lives here
+/// rather than in the test because the tick reads `ServerState::node_mesh_ip`,
+/// which `reconcile` needs as the cold-admission address and which is private
+/// to this crate — and because a hand-rolled copy in a test is exactly how a
+/// test stops testing the code that ships.
+pub async fn sweep_once(state: &Arc<crate::ServerState>) -> bool {
+    let Some(backend) = state.active_backend() else {
+        return false;
+    };
+    match backend.list_workloads().await {
+        Ok(states) => {
+            state
+                .service_records
+                .reconcile(&states, state.node_mesh_ip);
+            true
+        }
+        // A failed list is NOT an empty list. Reconciling against `&[]` here
+        // would retract every record on a transient backend blip (kamaji socket
+        // restarting, containerd busy) and yank live upstreams out from under
+        // the ingress proxy. Skip the tick.
+        Err(e) => {
+            tracing::debug!(
                 error = format!("{e:#}"),
                 "service_records: workload list failed; skipping this refresh tick"
-            ),
+            );
+            false
         }
-        tokio::time::sleep(SWEEP_INTERVAL).await;
     }
 }
 
@@ -799,13 +1199,34 @@ mod tests {
         }
     }
 
+    /// A backend report with no resolved ports — the container-tier shape, and
+    /// the shape every pre-R844-F2 test implicitly assumed.
     fn running_state(name: &str, mesh_ip: Option<Ipv4Addr>) -> WorkloadState {
         WorkloadState {
             ident: MeshIdent(name.to_string()),
             container_id: format!("container-{name}"),
             status: WorkloadStatus::Running,
             mesh_ip,
+            ports: Vec::new(),
         }
+    }
+
+    /// A backend report that DOES carry resolved ports — the native/bundle
+    /// shape kamaji answers with since R844-F2.
+    fn running_state_on_ports(
+        name: &str,
+        mesh_ip: Option<Ipv4Addr>,
+        ports: Vec<u16>,
+    ) -> WorkloadState {
+        WorkloadState {
+            ports,
+            ..running_state(name, mesh_ip)
+        }
+    }
+
+    /// This node's mesh address, as `reconcile` is given it by the sweep.
+    fn sweep_node_ip() -> Option<Ipv4Addr> {
+        Some(Ipv4Addr::new(100, 64, 0, 3))
     }
 
     #[test]
@@ -841,6 +1262,406 @@ mod tests {
         );
     }
 
+    // ── Bundle tier (R844-F1) ──────────────────────────────────────────────
+    //
+    // These pin the producer the W272 bundle tier had never had. Before this,
+    // `deploy_non_container` returned 202 without touching the registry, so
+    // every node in the fleet served bundles and answered
+    // `GET /service-records?ready=true` with `[]`. Each test below asserts a
+    // NON-EMPTY set (or a deliberate refusal) — asserting "the call returned"
+    // passed fine against zero records, which is how this stayed invisible.
+
+    /// The defect this ticket exists for: a bundle deploy must leave behind a
+    /// record an ingress proxy can dial, carrying BOTH the resolved host and
+    /// the resolved port.
+    #[test]
+    fn admitted_bundle_yields_a_ready_dialable_record() {
+        let records = ServiceRecords::new();
+        let node_ip = Ipv4Addr::new(100, 64, 0, 3);
+
+        let admitted = records.admit_bundle(&MeshIdent("yah-marketing".into()), Some(node_ip), Some(8080));
+
+        assert!(admitted, "a bundle declaring a port must be admitted");
+        assert_eq!(
+            records.ready().len(),
+            1,
+            "a bundle deploy must publish exactly one ready record"
+        );
+        let record = records.get(&MeshIdent("yah-marketing".into())).unwrap();
+        assert!(record.is_ready());
+        assert_eq!(record.mesh_ip, node_ip, "host must be the node's mesh IP");
+        assert_eq!(record.ports, vec![8080], "port must be the declared one");
+        assert_eq!(
+            record.endpoints(),
+            vec![SocketAddrV4::new(node_ip, 8080)],
+            "the record must resolve to a dialable address, not just a host"
+        );
+    }
+
+    /// The subtlest way this fix could rot. `deploy_non_container` holds two
+    /// different strings — the bundle DIGEST and the operator-facing workload
+    /// id — and only the latter is what kamaji's `list()` reports back as
+    /// `mesh_ident`. `reconcile` keys on that, so a digest-keyed record is
+    /// retracted by the very first 15s sweep and the bug returns in disguise.
+    #[test]
+    fn bundle_record_keyed_on_the_workload_id_survives_the_sweep() {
+        let records = ServiceRecords::new();
+        let node_ip = Ipv4Addr::new(100, 64, 0, 3);
+        records.admit_bundle(&MeshIdent("yah-marketing".into()), Some(node_ip), Some(8080));
+
+        // What the sweep actually sees: kamaji lists the bundle under its
+        // stable id, never under the digest.
+        records.reconcile(&[running_state("yah-marketing", None)], sweep_node_ip());
+
+        assert_eq!(
+            records.ready().len(),
+            1,
+            "the sweep must keep the bundle record, not retract it"
+        );
+        let record = records.get(&MeshIdent("yah-marketing".into())).unwrap();
+        assert_eq!(
+            record.ports,
+            vec![8080],
+            "the sweep must not lose the admission-time port"
+        );
+        assert_eq!(
+            record.mesh_ip, node_ip,
+            "a listing that reports no mesh IP must not blank the record's host"
+        );
+    }
+
+    // ── R844-F2: the resolved-port return path ────────────────────────────
+
+    /// THE ticket's assertion. Two bundles co-tenant one node, NEITHER mirror
+    /// naming a port, and each ends up with a record carrying the port its own
+    /// workload actually bound.
+    ///
+    /// This is the shape that raised R844: yah-marketing holds 8080 on
+    /// us-east-001, and a second site landing on the same node had nowhere to
+    /// go. A design correct for one workload per node does not address it,
+    /// which is why the test is written with two.
+    #[test]
+    fn two_undeclared_bundles_on_one_node_get_distinct_dialable_records() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+
+        // Neither declares a port, so neither is admitted at deploy time —
+        // there is no port to publish yet, only a guess, and the registry does
+        // not guess.
+        assert!(!records.admit_bundle(&MeshIdent("yah-marketing".into()), Some(node), None));
+        assert!(!records.admit_bundle(&MeshIdent("noisetable-com".into()), Some(node), None));
+        assert!(records.snapshot().is_empty());
+
+        // kamaji allocated one each and reports them on the first sweep.
+        records.reconcile(
+            &[
+                running_state_on_ports("yah-marketing", None, vec![43117]),
+                running_state_on_ports("noisetable-com", None, vec![43119]),
+            ],
+            Some(node),
+        );
+
+        let marketing = records.get(&MeshIdent("yah-marketing".into())).unwrap();
+        let noisetable = records.get(&MeshIdent("noisetable-com".into())).unwrap();
+        assert_eq!(marketing.dialable_ports(), &[43117]);
+        assert_eq!(noisetable.dialable_ports(), &[43119]);
+        assert_eq!(
+            marketing.endpoints(),
+            vec![SocketAddrV4::new(node, 43117)],
+            "the rendered upstream must carry this workload's own port"
+        );
+        assert_eq!(noisetable.endpoints(), vec![SocketAddrV4::new(node, 43119)]);
+        assert_eq!(records.ready().len(), 2);
+    }
+
+    /// The step-(3) regression guard, stated as the thing that must be true
+    /// BEFORE the mirror's `port` key is deleted: with no declaration anywhere,
+    /// `GET /service-records?ready=true` still answers with a dialable record.
+    ///
+    /// Without the cold-admission arm this test fails by returning an EMPTY
+    /// set — not by erroring — which is precisely how deleting the pin would
+    /// have silently undone R844-F1.
+    #[test]
+    fn a_bundle_with_no_declared_port_anywhere_is_still_discoverable() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        assert!(!records.admit_bundle(&MeshIdent("yah-marketing".into()), Some(node), None));
+
+        records.reconcile(
+            &[running_state_on_ports("yah-marketing", None, vec![43117])],
+            Some(node),
+        );
+
+        let body = discovery_body(&records.snapshot(), true);
+        assert_eq!(
+            body.records.len(),
+            1,
+            "ready=true must not be empty once kamaji has reported a real port"
+        );
+        assert_eq!(body.records[0].ident, "yah-marketing");
+        assert_eq!(body.records[0].ports, vec![43117]);
+        assert_eq!(body.records[0].endpoints, vec!["100.64.0.3:43117"]);
+    }
+
+    /// A port that MOVED must be corrected, not left standing. This is the
+    /// failure the sweep half of the return path exists for, and it is worse
+    /// than an empty registry because the stale record still reads `Ready`.
+    #[test]
+    fn a_moved_port_is_corrected_by_the_next_sweep() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        // Declared serving but with no port, so the first sweep cold-admits.
+        assert!(!records.admit_bundle(&MeshIdent("yah-marketing".into()), Some(node), None));
+        records.reconcile(
+            &[running_state_on_ports("yah-marketing", None, vec![43117])],
+            Some(node),
+        );
+        assert_eq!(
+            records
+                .get(&MeshIdent("yah-marketing".into()))
+                .unwrap()
+                .dialable_ports(),
+            &[43117]
+        );
+
+        // Restarted onto a different port (ledger lost, or the old port was
+        // taken by something else while kamaji was down).
+        records.reconcile(
+            &[running_state_on_ports("yah-marketing", None, vec![51001])],
+            Some(node),
+        );
+
+        let record = records.get(&MeshIdent("yah-marketing".into())).unwrap();
+        assert_eq!(
+            record.dialable_ports(),
+            &[51001],
+            "the record must follow the workload, not keep advertising a dead port"
+        );
+        assert_eq!(record.endpoints(), vec![SocketAddrV4::new(node, 51001)]);
+    }
+
+    /// A resolved port beats a declared one when they disagree — the
+    /// supervisor is the measurement and the mirror is the request — but BOTH
+    /// are kept, because the disagreement is the diagnosis.
+    #[test]
+    fn a_resolved_port_overrides_a_declared_one_without_erasing_it() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        assert!(records.admit_bundle(&MeshIdent("yah-marketing".into()), Some(node), Some(8080)));
+
+        records.reconcile(
+            &[running_state_on_ports("yah-marketing", None, vec![43117])],
+            Some(node),
+        );
+
+        let record = records.get(&MeshIdent("yah-marketing".into())).unwrap();
+        assert_eq!(record.ports, vec![8080], "the declaration is still recorded");
+        assert_eq!(record.resolved_ports, vec![43117]);
+        assert_eq!(record.dialable_ports(), &[43117]);
+        let row = &discovery_body(&records.snapshot(), false).records[0];
+        assert_eq!(row.ports, vec![43117], "consumers dial the resolved port");
+        assert_eq!(
+            row.resolved_ports,
+            vec![43117],
+            "and an operator can still see which of the two it came from"
+        );
+    }
+
+    /// A thin report must not blank a record. A backend that resolves no ports
+    /// (every container backend, by construction) answering the same sweep as
+    /// a bundle must leave the bundle's ports alone.
+    #[test]
+    fn a_backend_reporting_no_ports_does_not_clear_a_known_one() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        records.admit_bundle(&MeshIdent("yah-marketing".into()), Some(node), Some(8080));
+        records.reconcile(
+            &[running_state_on_ports("yah-marketing", None, vec![43117])],
+            Some(node),
+        );
+        // Next tick the backend answers without ports.
+        records.reconcile(&[running_state("yah-marketing", None)], Some(node));
+
+        assert_eq!(
+            records
+                .get(&MeshIdent("yah-marketing".into()))
+                .unwrap()
+                .dialable_ports(),
+            &[43117],
+            "an empty report means 'this backend resolves nothing', not 'the ports went away'"
+        );
+    }
+
+    /// Cold admission needs a mesh address. On a dev host (no node mesh IP,
+    /// loopback binds) there is nothing another node could dial, so nothing is
+    /// published — the same answer `admit_bundle` gives.
+    #[test]
+    fn cold_admission_is_declined_without_a_mesh_address() {
+        let records = ServiceRecords::new();
+        // Declared serving, so the ONLY thing missing is the address — without
+        // this the test would pass on the declaration gate instead and stop
+        // testing what it names.
+        records.admit_bundle(&MeshIdent("yah-marketing".into()), None, None);
+        records.reconcile(
+            &[running_state_on_ports("yah-marketing", None, vec![43117])],
+            None,
+        );
+        assert!(records.snapshot().is_empty());
+    }
+
+    /// Same registry, one field different: proof the cold-admission tests above
+    /// are not vacuous. Without resolved ports there is nothing to publish, so
+    /// the pre-R844-F2 skip still applies.
+    #[test]
+    fn cold_admission_is_declined_without_resolved_ports() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        // Declared serving, so the only thing missing is the port.
+        records.admit_bundle(&MeshIdent("yah-marketing".into()), Some(node), None);
+        records.reconcile(&[running_state("yah-marketing", None)], Some(node));
+        assert!(records.snapshot().is_empty());
+    }
+
+    /// THE ROUTING-SAFETY GATE. kamaji forks a bundle's revalidate receiver and
+    /// feed tier from the bundle deploy, so yubaba never places them and holds
+    /// no declaration for either — but they DO appear in `list_workloads` with
+    /// real resolved ports. They must not become service records.
+    ///
+    /// This is not tidiness. passway's `addrs_from_body`
+    /// (oss/passway/crates/passway/src/discovery.rs) pushes every endpoint of
+    /// every Ready record into its upstream set with NO ident filter, so a
+    /// record here would put the revalidation receiver into the rotation for
+    /// the apex and answer real traffic from something that is not a web
+    /// server for that site.
+    #[test]
+    fn a_kamaji_forked_sibling_is_not_cold_admitted() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        // Only the bundle itself is declared. The two siblings are exactly what
+        // kamaji forks beside it, named as they are on us-east-001.
+        assert!(!records.admit_bundle(&MeshIdent("yah-marketing".into()), Some(node), None));
+
+        records.reconcile(
+            &[
+                running_state_on_ports("yah-marketing", None, vec![43117]),
+                running_state_on_ports("yah-marketing-revalidate", None, vec![43118]),
+                running_state_on_ports("yah-marketing-feed", None, vec![43120]),
+            ],
+            Some(node),
+        );
+
+        assert!(
+            records
+                .get(&MeshIdent("yah-marketing-revalidate".into()))
+                .is_none(),
+            "a kamaji-forked revalidate receiver must never become a routable upstream"
+        );
+        assert!(records
+            .get(&MeshIdent("yah-marketing-feed".into()))
+            .is_none());
+        // Non-vacuous: the declared workload on the very same sweep IS admitted,
+        // so the gate is discriminating rather than just refusing everything.
+        assert_eq!(
+            records
+                .get(&MeshIdent("yah-marketing".into()))
+                .unwrap()
+                .dialable_ports(),
+            &[43117]
+        );
+        assert_eq!(records.ready().len(), 1);
+    }
+
+    /// A redeploy that drops its ports retracts the record AND the eligibility.
+    /// Without the second half the next sweep would immediately re-admit the
+    /// workload from its resolved port, silently undoing the retraction that
+    /// `redeploy_without_ports_retracts_the_previous_record` exists to enforce.
+    #[test]
+    fn retraction_also_drops_cold_admission_eligibility() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        records.admit_bundle(&MeshIdent("yah-marketing".into()), Some(node), Some(8080));
+        assert!(records.is_declared_serving(&MeshIdent("yah-marketing".into())));
+
+        records.retract(&MeshIdent("yah-marketing".into()));
+        assert!(!records.is_declared_serving(&MeshIdent("yah-marketing".into())));
+
+        // The record still exists but is Retracted; a sweep reporting a live
+        // resolved port must not resurrect it as Ready.
+        records.reconcile(&[], Some(node));
+        assert!(records.ready().is_empty());
+    }
+
+    /// Same registry, keyed the wrong way: proof the assertion above is not
+    /// vacuous. A record under the digest is invisible to the sweep, gets
+    /// retracted, and `ready()` goes back to empty — the exact fleet symptom.
+    #[test]
+    fn bundle_record_keyed_on_the_digest_is_retracted_by_the_sweep() {
+        let records = ServiceRecords::new();
+        let digest = "a".repeat(64);
+        records.admit_bundle(
+            &MeshIdent(digest.clone()),
+            Some(Ipv4Addr::new(100, 64, 0, 3)),
+            Some(8080),
+        );
+        assert_eq!(records.ready().len(), 1);
+
+        records.reconcile(&[running_state("yah-marketing", None)], sweep_node_ip());
+
+        assert!(
+            records.ready().is_empty(),
+            "a digest-keyed record cannot survive a sweep — this is why \
+             admit_bundle must be called with the workload id"
+        );
+    }
+
+    /// kamaji falls back to its own node-wide bind port (`KAMAJI_BUNDLE_PORT`,
+    /// else 8080) when a bundle declares none, and that value is not visible
+    /// from yubaba. Guessing it would re-create the well-known-port assumption
+    /// discovery exists to remove, so this declines — the same non-admission
+    /// the container tier gives a spec with empty `expose.mesh.ports`.
+    #[test]
+    fn bundle_without_a_declared_port_is_not_admitted() {
+        let records = ServiceRecords::new();
+
+        let admitted =
+            records.admit_bundle(&MeshIdent("portless".into()), Some(Ipv4Addr::new(100, 64, 0, 3)), None);
+
+        assert!(!admitted);
+        assert!(
+            records.snapshot().is_empty(),
+            "a bundle with no known port has no endpoint to publish — a \
+             present-but-undialable record reads as healthy and is worse than \
+             absence"
+        );
+    }
+
+    /// A dev host with no mesh-plane address binds loopback; there is no
+    /// address another node could dial, so there is nothing to advertise.
+    #[test]
+    fn bundle_on_a_node_without_a_mesh_ip_is_not_admitted() {
+        let records = ServiceRecords::new();
+
+        let admitted = records.admit_bundle(&MeshIdent("dev-host".into()), None, Some(8080));
+
+        assert!(!admitted);
+        assert!(records.snapshot().is_empty());
+    }
+
+    /// Bundle and container records share one registry and one wire view, so a
+    /// node hosting both must advertise both.
+    #[test]
+    fn bundle_and_container_records_coexist_in_one_ready_set() {
+        let records = ServiceRecords::new();
+        let node_ip = Ipv4Addr::new(100, 64, 0, 3);
+
+        records.upsert_deployed(&test_spec("api", vec![9090]), Ipv4Addr::new(100, 64, 0, 7), "c1");
+        records.admit_bundle(&MeshIdent("yah-marketing".into()), Some(node_ip), Some(8080));
+
+        let mut idents: Vec<String> = records.ready().into_iter().map(|r| r.ident.0).collect();
+        idents.sort();
+        assert_eq!(idents, vec!["api".to_string(), "yah-marketing".to_string()]);
+    }
+
     #[test]
     fn undeployed_workload_is_retracted_on_reconcile() {
         let records = ServiceRecords::new();
@@ -852,7 +1673,7 @@ mod tests {
         // Torn down: the runtime's own list_workloads() no longer includes
         // it (matches kamaji's FakeRuntime/real backends, which remove the
         // entry entirely on teardown).
-        records.reconcile(&[]);
+        records.reconcile(&[], sweep_node_ip());
 
         let record = records.get(&MeshIdent("gone".into())).unwrap();
         assert!(!record.is_ready(), "retracted workload must not be ready");
@@ -874,8 +1695,9 @@ mod tests {
             container_id: "container-stopping".into(),
             status: WorkloadStatus::Stopping,
             mesh_ip: Some(ip),
+            ports: Vec::new(),
         };
-        records.reconcile(std::slice::from_ref(&stopped));
+        records.reconcile(std::slice::from_ref(&stopped), sweep_node_ip());
 
         let record = records.get(&MeshIdent("stopping".into())).unwrap();
         assert!(!record.is_ready());
@@ -891,7 +1713,7 @@ mod tests {
 
         let new_ip = Ipv4Addr::new(100, 64, 0, 10);
         let state = running_state("moved", Some(new_ip));
-        records.reconcile(std::slice::from_ref(&state));
+        records.reconcile(std::slice::from_ref(&state), sweep_node_ip());
 
         let record = records.get(&MeshIdent("moved".into())).unwrap();
         assert!(record.is_ready());
@@ -903,7 +1725,7 @@ mod tests {
     fn reconcile_skips_unknown_idents_it_has_no_ports_for() {
         let records = ServiceRecords::new();
         let state = running_state("never-deployed-here", Some(Ipv4Addr::new(100, 64, 0, 11)));
-        records.reconcile(std::slice::from_ref(&state));
+        records.reconcile(std::slice::from_ref(&state), sweep_node_ip());
 
         assert!(records
             .get(&MeshIdent("never-deployed-here".into()))
@@ -955,7 +1777,7 @@ mod tests {
         // only fires for the retraction below.
         rx.borrow_and_update();
 
-        records.reconcile(&[]);
+        records.reconcile(&[], sweep_node_ip());
 
         rx.changed().await.expect("sender still alive");
         let snap = rx.borrow_and_update();
@@ -1022,7 +1844,7 @@ mod tests {
             Ipv4Addr::new(100, 64, 0, 22),
             "c-sick",
         );
-        records.reconcile(&[running_state("healthy", None)]);
+        records.reconcile(&[running_state("healthy", None)], sweep_node_ip());
 
         let snapshot = records.snapshot();
         let filtered = discovery_body(&snapshot, true);
@@ -1044,12 +1866,16 @@ mod tests {
             Ipv4Addr::new(100, 64, 0, 23),
             "c-api",
         );
-        records.reconcile(&[WorkloadState {
-            ident: MeshIdent("api".into()),
-            container_id: "c-api".into(),
-            status: WorkloadStatus::Stopping,
-            mesh_ip: None,
-        }]);
+        records.reconcile(
+            &[WorkloadState {
+                ident: MeshIdent("api".into()),
+                container_id: "c-api".into(),
+                status: WorkloadStatus::Stopping,
+                mesh_ip: None,
+                ports: Vec::new(),
+            }],
+            sweep_node_ip(),
+        );
 
         let row = &discovery_body(&records.snapshot(), false).records[0];
         assert_eq!(row.health, HEALTH_NOT_READY);
@@ -1168,7 +1994,7 @@ mod tests {
         // The workload rode out the restart — the runtime still lists it.
         let records = restart(&ledger);
         let state = running_state("api", Some(ip));
-        records.reconcile(std::slice::from_ref(&state));
+        records.reconcile(std::slice::from_ref(&state), sweep_node_ip());
 
         let ready = records.ready();
         assert_eq!(ready.len(), 1, "confirmed-live record becomes routable");
@@ -1190,7 +2016,7 @@ mod tests {
 
         // The container did not survive the restart.
         let records = restart(&ledger);
-        records.reconcile(&[]);
+        records.reconcile(&[], sweep_node_ip());
         assert_eq!(
             records.get(&MeshIdent("ghost".into())).unwrap().health,
             Health::Retracted

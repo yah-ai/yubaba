@@ -619,31 +619,24 @@ impl MesofactStaticReconciler {
         // Prefer the configured port; fall back to OS-assigned when it's taken.
         // Web entrypoints are browser handles — the port number itself doesn't
         // matter to the operator, so floating to any free port is fine.
+        //
+        // R844-F2: this is the LOCAL tier's half of the one allocation
+        // contract the remote (kamaji) tier answers through as well. It was
+        // hand-rolled here and nowhere else, which is exactly the shape that
+        // lets a service running both locally and remotely learn its port from
+        // two mechanisms that can disagree; `kamaji::ports::EphemeralPorts` is
+        // this logic, named, so the two tiers cannot drift. Ephemeral rather
+        // than ledger-backed on purpose: a camp port is disposable, nothing
+        // publishes it, and a fresh one each run is fine.
         let spawn_port = {
-            let preferred = std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                port,
-            );
-            match std::net::TcpListener::bind(preferred) {
-                Ok(_probe) => {
-                    // Probe succeeded: preferred port is free. Drop the probe
-                    // so the child can bind it. Tiny race window; fine for dev.
-                    port
-                }
-                Err(_) => {
-                    let fallback = std::net::TcpListener::bind("127.0.0.1:0")
-                        .context("could not bind any port for mesofact-dev")?;
-                    let p = fallback.local_addr()?.port();
-                    if port != 0 {
-                        info!(
-                            preferred = port,
-                            actual = p,
-                            "preferred port taken; mesofact-dev will use OS-assigned port"
-                        );
-                    }
-                    p
-                }
-            }
+            use kamaji::ports::PortAllocator;
+            kamaji::ports::EphemeralPorts
+                .resolve(
+                    &ctx.component.id,
+                    kamaji::ports::LOOPBACK,
+                    (port != 0).then_some(port),
+                )
+                .context("could not bind any port for mesofact-dev")?
         };
 
         // R490-F2: spawn mesofact-dev through kamaji's Native (fork+exec)

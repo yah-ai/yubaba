@@ -1,3 +1,19 @@
+// src/cache-policy.ts
+function derivePageCacheHeaders(policy, gated) {
+  if (!policy)
+    return null;
+  const ttl = typeof policy.ttl === "number" ? policy.ttl : 0;
+  const swr = typeof policy.swr === "number" ? policy.swr : undefined;
+  if (ttl === 0 && swr === undefined)
+    return null;
+  const scope = gated ? "private" : "public";
+  let cacheControl = `${scope}, max-age=${ttl}`;
+  if (swr !== undefined)
+    cacheControl += `, stale-while-revalidate=${swr}`;
+  const vary = Array.isArray(policy.vary) && policy.vary.length > 0 ? policy.vary.join(", ") : undefined;
+  return vary === undefined ? { cacheControl } : { cacheControl, vary };
+}
+
 // src/manifest.ts
 function buildPageRoot(manifest) {
   const id = manifest?.build_id;
@@ -19,6 +35,18 @@ function matchesDeferredRoute(manifest, pathname) {
     return false;
   }
   return manifest.routes.some((r) => isDeferred(r) && matchRoutePattern(r.route, pathname));
+}
+function pageCacheHeaders(manifest, pathname) {
+  for (const route of manifest?.routes ?? []) {
+    const derived = derivePageCacheHeaders(route.cache_policy, isGated(route));
+    if (derived && matchRoutePattern(route.route, pathname)) {
+      return derived;
+    }
+  }
+  return null;
+}
+function isGated(route) {
+  return Array.isArray(route.requires) && route.requires.length > 0;
 }
 function isDeferred(route) {
   const p = route.prerender;
@@ -151,14 +179,14 @@ async function route(request, env) {
       for (const candidate of assetCandidates(key)) {
         const resp = await fetch(`${env.ASSET_ORIGIN}/${pageRoot}/${candidate}`);
         if (resp.ok) {
-          return routePage(resp);
+          return routePage(resp, manifest, path);
         }
       }
     }
   }
   const assetResp = await fetch(`${env.ASSET_ORIGIN}/${key}`);
   if (assetResp.ok) {
-    return assetResp;
+    return isPageKey(key) ? withDeclaredCache(assetResp, manifest, path) : assetResp;
   }
   if (!manifestLoaded) {
     manifest = await loadManifest(env.ASSET_ORIGIN);
@@ -169,7 +197,7 @@ async function route(request, env) {
   for (const candidate of assetCandidates(key).slice(1)) {
     const cleanResp = await fetch(`${env.ASSET_ORIGIN}/${candidate}`);
     if (cleanResp.ok) {
-      return cleanResp;
+      return withDeclaredCache(cleanResp, manifest, path);
     }
   }
   if (env.WORKER_MODE === "static") {
@@ -202,7 +230,7 @@ async function serveInstance(env, path, manifest) {
       return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
     }
     const headers = new Headers(contentResp.headers);
-    headers.set("Cache-Control", IMMUTABLE_CACHE_CONTROL);
+    stampPageCache(headers, manifest, path, IMMUTABLE_CACHE_CONTROL);
     return new Response(contentResp.body, { status: 200, headers });
   }
   if (state.kind === "deleted") {
@@ -235,10 +263,26 @@ function assetCandidates(key) {
     return [key];
   return [key, `${key}.html`, `${key}/index.html`];
 }
-function routePage(resp) {
+function withPageCache(resp, manifest, path, fallback) {
   const headers = new Headers(resp.headers);
-  headers.set("Cache-Control", PAGE_CACHE_CONTROL);
+  if (!stampPageCache(headers, manifest, path, fallback))
+    return resp;
   return new Response(resp.body, { status: resp.status, headers });
+}
+function stampPageCache(headers, manifest, path, fallback) {
+  const declared = pageCacheHeaders(manifest, path);
+  if (!declared && fallback === null)
+    return false;
+  headers.set("Cache-Control", declared?.cacheControl ?? fallback);
+  if (declared?.vary)
+    headers.set("Vary", declared.vary);
+  return true;
+}
+function routePage(resp, manifest, path) {
+  return withPageCache(resp, manifest, path, PAGE_CACHE_CONTROL);
+}
+function withDeclaredCache(resp, manifest, path) {
+  return withPageCache(resp, manifest, path, null);
 }
 function routeToAssetKeys(routePath) {
   const rel = routePath.replace(/^\/+/, "");
@@ -278,20 +322,48 @@ function parseRouteHeaders(raw) {
     return routeHeaderCache.rules;
   let rules = [];
   try {
-    const v = JSON.parse(raw);
-    if (Array.isArray(v))
-      rules = v.filter(isRouteHeaderRule);
-  } catch {
+    rules = validateRouteHeaderTable(raw);
+  } catch (err) {
+    console.error(`mesofact: ROUTE_HEADERS binding is malformed, serving with NO route headers — ${err instanceof Error ? err.message : String(err)}`);
     rules = [];
   }
   routeHeaderCache = { raw, rules };
   return rules;
 }
+function validateRouteHeaderTable(raw) {
+  const v = JSON.parse(raw);
+  if (!Array.isArray(v)) {
+    throw new Error("expected a JSON array of {path, headers} rules");
+  }
+  return v.map((rule, i) => {
+    if (!isRouteHeaderRule(rule)) {
+      throw new Error(`rule ${i} is not a {path: string, headers: object}`);
+    }
+    if (rule.path === "") {
+      throw new Error(`rule ${i} has an empty path — a rule that matches nothing (or everything, depending on who reads it) is not a policy`);
+    }
+    assertSettableHeaders(rule, i);
+    return rule;
+  });
+}
+function assertSettableHeaders(rule, i) {
+  const probe = new Headers;
+  for (const [name, value] of Object.entries(rule.headers)) {
+    if (typeof value !== "string") {
+      throw new Error(`rule ${i} declares ${JSON.stringify(name)} = ${JSON.stringify(value)}, which is not a string`);
+    }
+    try {
+      probe.set(name, value);
+    } catch (err) {
+      throw new Error(`rule ${i} declares ${JSON.stringify(name)} = ${JSON.stringify(value)}, which cannot be set as a response header — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
 function isRouteHeaderRule(v) {
   if (!v || typeof v !== "object")
     return false;
   const r = v;
-  return typeof r.path === "string" && !!r.headers && typeof r.headers === "object";
+  return typeof r.path === "string" && !!r.headers && typeof r.headers === "object" && !Array.isArray(r.headers);
 }
 function matchesRoutePattern(pattern, path) {
   if (!pattern.endsWith("*"))
@@ -421,5 +493,6 @@ function emitTelemetry(target, attempts, outcome, latencyMs) {
   }));
 }
 export {
+  validateRouteHeaderTable,
   router_default as default
 };

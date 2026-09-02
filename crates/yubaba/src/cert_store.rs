@@ -627,6 +627,29 @@ impl ObjectCertStore {
         }
     }
 
+    /// Read `domain`'s issuance claim without competing for it.
+    ///
+    /// The read-only peer of [`claim_issuance`](Self::claim_issuance), and the
+    /// only way to tell the two states an operator most needs distinguished
+    /// apart: a domain that is *mid-order* on some node, and a domain whose last
+    /// order **failed** and is serving out its cooldown. Both are one `issuing`
+    /// object; [`cool_down_issuance`](Self::cool_down_issuance) writes the
+    /// failure case with a longer `ttl_secs`, so the TTL is the tell.
+    ///
+    /// Never taken, stolen, or refreshed by this call — an admin command that
+    /// peeked by attempting a claim would evict a live issuer.
+    pub fn issuance_claim(&self, domain: &str) -> Result<Option<IssuanceClaim>, CertStoreError> {
+        let key = format!("{}{domain}/{CLAIM_OBJECT}", issuer_prefix(&self.issuer));
+        let Some(bytes) = self.objects.get(&key)? else {
+            return Ok(None);
+        };
+        let claim = serde_json::from_slice(&bytes).map_err(|source| CertStoreError::Malformed {
+            key: key.clone(),
+            source,
+        })?;
+        Ok(Some(claim))
+    }
+
     /// Drop this node's claim on `domain`. Idempotent.
     ///
     /// Not required for correctness — a claim expires on its own — but a

@@ -1447,6 +1447,21 @@ impl CloudConfig {
                         }
                     }
                 }
+                // An `[[ingress]]` edge's own `use` is the same kind of
+                // reference (R845) and gets the same check: a typo there is
+                // otherwise invisible until `yah cloud apply` reaches the
+                // Cloudflare arm and fails on a missing provider file.
+                for (idx, edge) in mirror.ingress_edge_slice().iter().enumerate() {
+                    if let Some(id) = edge.provider_id.as_deref() {
+                        if !provider_ids.contains(id) {
+                            anyhow::bail!(
+                                "services/{svc_name}/mirrors/{env}.toml: \
+                                 ingress[{idx}].use = \"{id}\" — no such provider; \
+                                 declare it at infra/providers/{id}.toml"
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -2914,6 +2929,24 @@ pub struct IngressEdge {
     /// cohorts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel_id: Option<String>,
+    /// Infra provider id whose credentials this edge's front door authenticates
+    /// with — `use = "cloudflare"`, resolved through
+    /// `.yah/infra/providers/<id>.toml` exactly as a slot's `use` is.
+    ///
+    /// Same split as [`tunnel_id`](Self::tunnel_id), one field over: whose
+    /// Cloudflare account holds the tunnel is a property of the **front door**,
+    /// not of the box that runs the compute. Without this the account was read
+    /// off the fronted slot's own `use`, which conflates two unrelated facts —
+    /// and is unwritable for a slot whose compute provider is `kind = "static"`
+    /// (a borrowed bare box: placement only, no credentials). Such a mirror had
+    /// no way to name a Cloudflare account at all, short of writing
+    /// `use = "cloudflare"` on the compute slot and lying about what runs it
+    /// (R845).
+    ///
+    /// `None` falls back to the fronted slot's `use`, which is what every
+    /// mirror written before this field meant.
+    #[serde(default, rename = "use", skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
 }
 
 impl IngressEdge {
@@ -2926,6 +2959,7 @@ impl IngressEdge {
             slots: Vec::new(),
             hostnames: Vec::new(),
             tunnel_id: None,
+            provider_id: None,
         }
     }
 
@@ -3154,6 +3188,22 @@ impl MirrorConfig {
     /// - `ingress_machines` alongside `[[ingress]]` — placement declared twice,
     ///   in a form where one silently wins;
     /// - `provider = "none"` on an edge — an edge that fronts with nothing.
+    /// The `[[ingress]]` entries exactly as written, without normalizing the
+    /// scalar spelling or validating anything.
+    ///
+    /// [`ingress_edges`](Self::ingress_edges) is the one to reach for; this
+    /// exists for the checks that must run *before* a mirror is known to be
+    /// well-formed — cross-reference validation walks every mirror in the
+    /// workspace, and hard-failing there on an unrelated mirror's shape error
+    /// would report the wrong file. Empty for the scalar spelling, which has no
+    /// edge table to carry per-edge fields.
+    pub fn ingress_edge_slice(&self) -> &[IngressEdge] {
+        match &self.ingress {
+            IngressDecl::Edges(edges) => edges,
+            IngressDecl::Provider(_) => &[],
+        }
+    }
+
     pub fn ingress_edges(&self) -> Result<Vec<IngressEdge>> {
         match &self.ingress {
             IngressDecl::Provider(p) if !p.is_declared() => {
@@ -3749,6 +3799,8 @@ impl DomainConfig {
             toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
         dom.validate_front_door()
             .with_context(|| format!("validating {}", path.display()))?;
+        dom.validate_route_headers()
+            .with_context(|| format!("validating {}", path.display()))?;
         Ok(dom)
     }
 
@@ -3810,6 +3862,10 @@ impl DomainConfig {
     /// applies the FIRST matching rule, so `/app/*` above `/*` is what gives
     /// the app its isolation headers and leaves the marketing site alone.
     /// That is why this is a `Vec` of pairs and not a map keyed by path.
+    ///
+    /// Infallible by design — [`Self::validate_route_headers`] has already run
+    /// at [`Self::load`], so by the time a reconciler calls this the table is
+    /// known to be one both front doors can apply.
     pub fn route_headers_json(&self) -> String {
         #[derive(Serialize)]
         struct Rule<'a> {
@@ -3826,6 +3882,66 @@ impl DomainConfig {
             })
             .collect();
         serde_json::to_string(&rules).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    /// R749-T5 — everything [`Self::route_headers_json`] emits must be
+    /// *applicable*, checked here where the table is PRODUCED.
+    ///
+    /// That method serializes a typed struct, so the table's JSON *shape* is
+    /// sound by construction. Its contents are not: a route's `headers` map is
+    /// a free-form `name -> value` read verbatim out of hand-written TOML, so
+    /// `"Cross Origin Opener Policy"` (spaces instead of hyphens) or a value
+    /// carrying a newline ships a structurally-valid table that neither front
+    /// door can apply — and they fail *differently*, neither naming the
+    /// manifest line responsible:
+    ///
+    /// - **passway** — `mesofact::route_headers::RouteHeaderTable::parse`
+    ///   refuses the start, so the origin is simply down.
+    /// - **worker** — `validateRouteHeaderTable` accepts it (it checks shape,
+    ///   not header validity) and `applyRouteHeaders` then throws inside the
+    ///   exported `fetch`, which is a 500 on every request, not the
+    ///   serve-without-the-headers degradation that code intends.
+    ///
+    /// So the strictness lives at the producer: a table that cannot be applied
+    /// fails `yah cloud apply` at manifest load, naming domain, route and
+    /// header. This is deliberately *not* a second parser — the check is
+    /// `HeaderName`/`HeaderValue`'s own, the very constructors the passway door
+    /// runs on the far side, and route *matching* semantics stay defined once,
+    /// at the doors. Only routes that contribute to the table are checked, so
+    /// the invariant is exactly "`route_headers_json`'s output parses".
+    ///
+    /// Called from [`Self::load`], alongside [`Self::validate_front_door`].
+    pub fn validate_route_headers(&self) -> Result<()> {
+        use axum::http::{HeaderName, HeaderValue};
+
+        for route in self.routes.iter().filter(|r| !r.headers.is_empty()) {
+            if route.path.is_empty() {
+                anyhow::bail!(
+                    "domain \"{}\" declares response headers on a route whose `path` is \
+                     empty — a rule that matches nothing (or everything, depending on \
+                     which front door reads it) is not a policy",
+                    self.name
+                );
+            }
+            for (name, value) in &route.headers {
+                HeaderName::try_from(name.as_str()).with_context(|| {
+                    format!(
+                        "domain \"{}\" route \"{}\" declares {name:?}, which is not a valid \
+                         HTTP header name — names are token characters only, so it is \
+                         `Cross-Origin-Opener-Policy`, never `Cross Origin Opener Policy`",
+                        self.name, route.path
+                    )
+                })?;
+                HeaderValue::try_from(value.as_str()).with_context(|| {
+                    format!(
+                        "domain \"{}\" route \"{}\" declares {name} = {value:?}, which is not \
+                         a valid HTTP header value — no newlines and no control characters",
+                        self.name, route.path
+                    )
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// Whether this domain's route table binds any component of `service`.
@@ -6314,6 +6430,35 @@ use = "orbstack"
     }
 
     #[test]
+    fn cloud_config_cross_ref_fails_on_missing_provider_named_by_an_ingress_edge() {
+        // R845: the edge's own `use` is a provider reference like any other, so
+        // a typo has to fail here rather than at the Cloudflare arm of apply.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let svc = root.join(".yah").join("services").join("dev-yah");
+        std::fs::create_dir_all(svc.join("mirrors")).unwrap();
+        std::fs::write(
+            svc.join("service.toml"),
+            "schema_version = 1\nname = \"dev-yah\"\ndomain = \"yah.dev\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            svc.join("mirrors/prod.toml"),
+            "schema_version = 1\nshape = \"single-machine\"\n\n\
+             [providers.compute]\nkind = \"static\"\nmachine = \"borrowed-01\"\n\
+             zone = \"a.yah.dev\"\nport = 8080\n\n\
+             [[ingress]]\nprovider = \"cloudflare-tunnel\"\nuse = \"cloudflar\"\n",
+        )
+        .unwrap();
+
+        let msg = CloudConfig::load(root).unwrap_err().to_string();
+        assert!(
+            msg.contains("ingress[0].use") && msg.contains("cloudflar"),
+            "error should name the edge and the typo'd id, got: {msg}"
+        );
+    }
+
+    #[test]
     fn cloud_config_cross_ref_passes_on_inline_only_mirror() {
         // Inline `kind = "local-static"` doesn't require an infra provider.
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6978,6 +7123,87 @@ component = "yah-marketing/site"
             .unwrap()
             .contains("require-corp"));
         assert_eq!(route_headers_for_service(root, "some-other-svc").unwrap(), "[]");
+    }
+
+    // ---- R749-T5: a broken table fails the DEPLOY, not the edge -----------
+
+    /// The manifest's `headers` map is hand-written TOML, so a header name with
+    /// spaces in it is one keystroke away — and it survives serialization into
+    /// a structurally-valid table that neither front door can apply. Fail at
+    /// load, naming the domain, the route and the header, instead of shipping a
+    /// binding the Worker throws on and an origin that refuses to boot.
+    #[test]
+    fn a_route_header_name_that_is_not_a_header_name_fails_the_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_marketing_service(root);
+        write_domain_toml(
+            root,
+            "yah-dev",
+            r#"
+schema_version = 1
+name = "yah-dev"
+domain = "yah.dev"
+front_door = "worker"
+cdn_bucket = "yah-dev"
+
+[[routes]]
+path = "/*"
+mode = "static"
+component = "yah-marketing/site"
+headers = { "Cross Origin Opener Policy" = "same-origin" }
+"#,
+        );
+        let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
+        assert!(err.contains("yah-dev"), "{err}");
+        assert!(err.contains("/*"), "{err}");
+        assert!(err.contains("Cross Origin Opener Policy"), "{err}");
+        assert!(err.contains("not a valid HTTP header name"), "{err}");
+    }
+
+    /// A newline in a value is header injection if it ever reached the wire, so
+    /// both doors reject it and so does this.
+    #[test]
+    fn a_route_header_value_that_is_not_a_header_value_fails_the_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_marketing_service(root);
+        write_domain_toml(
+            root,
+            "yah-dev",
+            r#"
+schema_version = 1
+name = "yah-dev"
+domain = "yah.dev"
+front_door = "worker"
+cdn_bucket = "yah-dev"
+
+[[routes]]
+path = "/*"
+mode = "static"
+component = "yah-marketing/site"
+headers = { "X-Frame-Options" = "DENY\nSet-Cookie: pwned=1" }
+"#,
+        );
+        let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
+        assert!(err.contains("X-Frame-Options"), "{err}");
+        assert!(err.contains("not a valid HTTP header value"), "{err}");
+    }
+
+    /// The invariant this gate exists to hold: everything `route_headers_json`
+    /// emits is applicable. A headerless route contributes no rule, so its path
+    /// is not the table's business — only rules that ship are checked.
+    #[test]
+    fn a_headerless_route_is_not_subject_to_the_route_header_gate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_two_component_service(root);
+        write_domain_toml(root, "yah-dev", MOUNTED_DOMAIN);
+        let cfg = CloudConfig::load(root).unwrap();
+        cfg.domain("yah-dev")
+            .unwrap()
+            .validate_route_headers()
+            .unwrap();
     }
 
     /// A `bucket-direct` domain has no front door to set headers on, so it must

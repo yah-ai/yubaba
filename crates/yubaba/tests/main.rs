@@ -30,6 +30,7 @@ mod integration_deploy_through_kamaji;
 mod pond_kamaji_supervision;
 mod pond_reconciler_smoke;
 mod raft_add_learner;
+mod raft_cell_tagging;
 mod raft_leader_pin;
 mod raft_member_registration;
 mod raft_membership_loop;

@@ -57,11 +57,24 @@
 //! later: a peer whose build predates it answers with no role key at all and is
 //! read as a voter. That is deliberate and bounded; [`read_group`] carries the
 //! reasoning and the window it leaves.
+//!
+//! # A group is also a cell id (R736-T3)
+//!
+//! W250's *cell* — one raft group bound to one jurisdiction — is this same
+//! object seen from the residency side, and its id is this group's label. So
+//! [`ask_peer`] returns a [`PeerDeclaration`] carrying the peer's jurisdiction
+//! beside its group, read out of the one `/raft/status` body, and
+//! [`cell::judge`] runs on the join immediately after [`judge`]. Coarse question
+//! first: "is this box in my raft group at all" before "is it in my
+//! jurisdiction". See [`crate::cell`] for why there is no separate `--cell`
+//! flag.
 
 use std::time::Duration;
 
 use serde::Deserialize;
 use workload_spec::sovereign::{Membership, SovereignRole};
+
+use crate::cell;
 
 /// How long the leader waits for a joiner to answer "which group are you in?".
 ///
@@ -224,6 +237,12 @@ struct PeerStatus {
     /// [`read_group`].
     #[serde(default)]
     sovereign_role: Option<SovereignRole>,
+    /// R736-T3. Same `Option<Option<_>>` shape as the group, for the same
+    /// reason: a build predating cell tagging has to be told to roll, and a
+    /// current build that was simply never given `--jurisdiction` has to be told
+    /// to restart with the flag. See [`cell::PeerJurisdiction`].
+    #[serde(default, deserialize_with = "present_but_maybe_null")]
+    jurisdiction: Option<Option<String>>,
 }
 
 /// Deserialize a present field into `Some(_)`, letting an absent one fall
@@ -237,7 +256,23 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
-/// Ask the node at `addr` which sovereign group it declares.
+/// Everything a peer declares about itself that a join is judged on — R736-T3.
+///
+/// One struct rather than two calls: both gates read the same `/raft/status`
+/// body, and asking twice would let a node answer differently to the two
+/// questions in the window between them. It also keeps the join path at one
+/// round trip, which is what the short [`ASK_TIMEOUT`] is sized for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerDeclaration {
+    /// Which blast radius the peer says it is in ([`judge`]).
+    pub group: PeerGroup,
+    /// Which jurisdiction the peer says it is in
+    /// ([`cell::judge`](crate::cell::judge)).
+    pub jurisdiction: cell::PeerJurisdiction,
+}
+
+/// Ask the node at `addr` what it declares about itself — its sovereign group,
+/// its role, and its jurisdiction.
 ///
 /// `addr` is the raft membership address the `add-learner` call carried, and
 /// `http://{addr}` is the same base URL the raft network client dials peers on
@@ -248,7 +283,7 @@ where
 /// failure rather than folded into [`PeerGroup::Unsupported`], because "the box
 /// did not answer" and "the box answered, with nothing" call for different
 /// operator actions and a retry only helps for one of them.
-pub async fn ask_peer(addr: &str) -> Result<PeerGroup, String> {
+pub async fn ask_peer(addr: &str) -> Result<PeerDeclaration, String> {
     let client = reqwest::Client::builder()
         .timeout(ASK_TIMEOUT)
         .build()
@@ -293,16 +328,26 @@ pub async fn ask_peer(addr: &str) -> Result<PeerGroup, String> {
 /// and refuses it on the camp side, which is where operator-driven joins go —
 /// so the window is a node-side backstop lagging a rollout, not an unguarded
 /// path. It closes for a given group the moment its nodes carry the flag.
-fn read_group(body: &str) -> Result<PeerGroup, String> {
+fn read_group(body: &str) -> Result<PeerDeclaration, String> {
     let status: PeerStatus =
         serde_json::from_str(body).map_err(|e| format!("unparseable /raft/status body: {e}"))?;
-    Ok(match status.sovereign_group {
-        Some(Some(group)) => PeerGroup::Declared {
-            group,
-            role: status.sovereign_role.unwrap_or_default(),
+    Ok(PeerDeclaration {
+        group: match status.sovereign_group {
+            Some(Some(group)) => PeerGroup::Declared {
+                group,
+                role: status.sovereign_role.unwrap_or_default(),
+            },
+            Some(None) => PeerGroup::Undeclared,
+            None => PeerGroup::Unsupported,
         },
-        Some(None) => PeerGroup::Undeclared,
-        None => PeerGroup::Unsupported,
+        // R736-T3: the same present/absent/null split, one field over. A peer
+        // that predates cell tagging reports no key and is `Unsupported`, which
+        // only matters to a cluster that declares a jurisdiction of its own.
+        jurisdiction: match status.jurisdiction {
+            Some(Some(jurisdiction)) => cell::PeerJurisdiction::Declared(jurisdiction),
+            Some(None) => cell::PeerJurisdiction::Undeclared,
+            None => cell::PeerJurisdiction::Unsupported,
+        },
     })
 }
 
@@ -312,6 +357,12 @@ mod tests {
 
     const JOINER: &str = "node 11 at 100.64.0.11:7443";
     const TARGET: &str = "node 1 at 100.64.0.1:7443";
+
+    /// The blast-radius half of what a peer declared — the axis these tests are
+    /// about. The jurisdiction half rides the same read and has its own test.
+    fn group_of(body: &str) -> PeerGroup {
+        read_group(body).unwrap().group
+    }
 
     /// A peer declaring `group` on a build that carries the role axis.
     fn declared(group: &str, role: SovereignRole) -> PeerGroup {
@@ -438,18 +489,51 @@ mod tests {
     fn a_missing_key_and_an_explicit_null_are_different_peers() {
         // A build that predates the field: it answers, with no such key.
         assert_eq!(
-            read_group(r#"{"node_id":4,"state":"Learner"}"#).unwrap(),
+            group_of(r#"{"node_id":4,"state":"Learner"}"#),
             PeerGroup::Unsupported
         );
         // A current build started without --sovereign-group.
         assert_eq!(
-            read_group(r#"{"node_id":4,"sovereign_group":null}"#).unwrap(),
+            group_of(r#"{"node_id":4,"sovereign_group":null}"#),
             PeerGroup::Undeclared
         );
         assert_eq!(
-            read_group(r#"{"node_id":4,"sovereign_group":"prod","sovereign_role":"voter"}"#)
-                .unwrap(),
+            group_of(r#"{"node_id":4,"sovereign_group":"prod","sovereign_role":"voter"}"#),
             declared("prod", SovereignRole::Voter)
+        );
+    }
+
+    /// R736-T3: the jurisdiction axis carries the identical split, read off the
+    /// same body in the same call. Pinned separately because the two fields have
+    /// independent lifetimes — the fleet will spend a long stretch declaring a
+    /// group and no jurisdiction, which is `Declared` on one axis and
+    /// `Undeclared` on the other from one status read.
+    #[test]
+    fn the_jurisdiction_axis_splits_missing_from_null_the_same_way() {
+        assert_eq!(
+            read_group(r#"{"node_id":4,"sovereign_group":"prod"}"#)
+                .unwrap()
+                .jurisdiction,
+            cell::PeerJurisdiction::Unsupported,
+            "no key at all is a build predating cell tagging"
+        );
+        assert_eq!(
+            read_group(r#"{"node_id":4,"sovereign_group":"prod","jurisdiction":null}"#)
+                .unwrap()
+                .jurisdiction,
+            cell::PeerJurisdiction::Undeclared,
+            "a current build started without --jurisdiction"
+        );
+        let declaring =
+            read_group(r#"{"node_id":4,"sovereign_group":"prod-us","jurisdiction":"us"}"#).unwrap();
+        assert_eq!(
+            declaring.jurisdiction,
+            cell::PeerJurisdiction::Declared("us".into())
+        );
+        assert_eq!(
+            declaring.group,
+            declared("prod-us", SovereignRole::Voter),
+            "both axes come out of the one read, so neither can be stale relative to the other"
         );
     }
 
@@ -462,11 +546,11 @@ mod tests {
     #[test]
     fn a_group_without_a_role_key_is_a_voter_not_a_refusal() {
         assert_eq!(
-            read_group(r#"{"node_id":4,"sovereign_group":"prod"}"#).unwrap(),
+            group_of(r#"{"node_id":4,"sovereign_group":"prod"}"#),
             declared("prod", SovereignRole::Voter)
         );
         assert_eq!(
-            read_group(r#"{"node_id":4,"sovereign_group":"prod","sovereign_role":null}"#).unwrap(),
+            group_of(r#"{"node_id":4,"sovereign_group":"prod","sovereign_role":null}"#),
             declared("prod", SovereignRole::Voter)
         );
     }
@@ -476,8 +560,7 @@ mod tests {
     #[test]
     fn a_peer_reports_its_role_in_the_toml_spelling() {
         assert_eq!(
-            read_group(r#"{"node_id":4,"sovereign_group":"prod","sovereign_role":"non-voter"}"#)
-                .unwrap(),
+            group_of(r#"{"node_id":4,"sovereign_group":"prod","sovereign_role":"non-voter"}"#),
             declared("prod", SovereignRole::NonVoter)
         );
     }
@@ -488,12 +571,11 @@ mod tests {
     #[test]
     fn unrelated_status_sections_are_ignored() {
         assert_eq!(
-            read_group(
+            group_of(
                 r#"{"membership_config":{"x":1},"liveness":{"peers":{}},
                     "members":{"1":{"addr":"a","region":"us-west"}},
                     "sovereign_group":"dev","sovereign_role":"voter"}"#
-            )
-            .unwrap(),
+            ),
             declared("dev", SovereignRole::Voter)
         );
     }

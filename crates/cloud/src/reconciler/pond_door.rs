@@ -11,8 +11,8 @@
 //!   .yah/services/<svc>/mirrors/<env>.toml     (kind = "miniflare-container", port = N)
 //!            │ derive
 //!            ▼
-//!   IngressRule { hostname: <svc>.pond.localhost, port: N, upstream_host: 127.0.0.1 }
-//!            │ render (shared grammar with the cloud arm — IngressRule::passway_upstream)
+//!   IngressRule { hostname: <svc>.pond.localhost, port: N, upstream_hosts: [127.0.0.1] }
+//!            │ render (shared grammar with the cloud arm — IngressRule::passway_upstreams)
 //!            ▼
 //!   PASSWAY_UPSTREAMS=yah-dashboard.pond.localhost=127.0.0.1:4323,…
 //!            │
@@ -43,7 +43,7 @@
 //!
 //! So placement is derived here and *rendering* is shared: rules are real
 //! [`IngressRule`]s and the `PASSWAY_UPSTREAMS` string comes from
-//! [`IngressRule::passway_upstream`], the same function the fleet arm calls.
+//! [`IngressRule::passway_upstreams`], the same function the fleet arm calls.
 //! One grammar, one place, two placement policies.
 //!
 //! ## Hostname: `*.pond.localhost`, not `.local`, not a real zone
@@ -197,15 +197,14 @@ pub struct PondDoorPlan {
 
 impl PondDoorPlan {
     /// The `PASSWAY_UPSTREAMS` value, in passway's R594-F10 host fan-in
-    /// grammar. Rendered by [`IngressRule::passway_upstream`] — the same
+    /// grammar. Rendered by [`IngressRule::passway_upstreams`] — the same
     /// function the fleet arm uses, so the two can never drift.
     pub fn upstreams_env(&self) -> Result<String> {
-        Ok(self
-            .rules
-            .iter()
-            .map(IngressRule::passway_upstream)
-            .collect::<Result<Vec<_>>>()?
-            .join(","))
+        let mut out = Vec::new();
+        for rule in &self.rules {
+            out.extend(rule.passway_upstreams()?);
+        }
+        Ok(out.join(","))
     }
 
     /// Operator-visible URLs, one per fronted pond.
@@ -309,12 +308,13 @@ pub fn plan_pond_door(cfg: &CloudConfig, listen: SocketAddr) -> Result<PondDoorP
                     port,
                     slot: role.clone(),
                     provider_id: None,
-                    machine: None,
+                    machines: Vec::new(),
                     // Pinned, never discovered: a pond's miniflare is a host
                     // process (or a container publishing to the host port), so
                     // its address is loopback by construction. There is no mesh
-                    // IP to allocate and no yubaba to ask.
-                    upstream_host: Some(UPSTREAM_HOST.to_string()),
+                    // IP to allocate and no yubaba to ask. Exactly one backend,
+                    // carried in the set-valued field the fleet arm shares.
+                    upstream_hosts: vec![UPSTREAM_HOST.to_string()],
                 });
                 if !sources.contains(&label) {
                     sources.push(label);
@@ -754,8 +754,8 @@ mod tests {
             port,
             slot: STATIC_SLOT.into(),
             provider_id: None,
-            machine: None,
-            upstream_host: Some(UPSTREAM_HOST.into()),
+            machines: Vec::new(),
+            upstream_hosts: vec![UPSTREAM_HOST.into()],
         }
     }
 

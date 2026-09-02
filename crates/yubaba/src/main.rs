@@ -43,6 +43,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use yubaba::cluster_policy::ClusterPolicy;
@@ -250,6 +251,29 @@ enum Cmd {
         /// quorum to be eligible for.
         #[arg(long, default_value = "voter")]
         sovereign_role: SovereignRole,
+        /// R736-T3 (W250): the legal jurisdiction this node's data is bound to,
+        /// e.g. `us` or `eu`.
+        ///
+        /// Setting it declares that this node's `--sovereign-group` is a
+        /// **cell**: one raft group, one jurisdiction, named in the global
+        /// tenant pointer (`tenants/<tenant>/cell.toml`) by the group's own
+        /// label. There is deliberately no separate `--cell` id — a second name
+        /// for one raft group is a second thing to get wrong, and the
+        /// disagreement would be a pointer naming a cell nothing answers to.
+        ///
+        /// What setting it does is *refuse*: `POST /raft/add-learner` declines a
+        /// joiner in a different jurisdiction even when the sovereign group
+        /// matches, because one voter across a legal boundary breaks the
+        /// residency promise for every tenant already in the cell — not only for
+        /// tenants placed after it. Moving a *tenant* between cells is the
+        /// cross-cell move protocol (W250 §5), never a raft join.
+        ///
+        /// Requires `--sovereign-group`: a jurisdiction with no group names no
+        /// cell, and the daemon refuses to start rather than carry a residency
+        /// claim nothing can act on. Unset means this cluster is a blast radius
+        /// that is not a cell, which is every yubaba cluster today.
+        #[arg(long)]
+        jurisdiction: Option<String>,
         /// R734-T4 (W247 §3): softly prefer this region for raft leadership.
         ///
         /// A label from the same space as `--region`. When the raft leader is
@@ -381,6 +405,86 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RaftCmd,
     },
+    /// Custom tenant domains: enrol, unenrol, inspect (R779 / W267).
+    ///
+    /// Reads and writes the object store directly — the enrollment set is not
+    /// raft state, so these verbs need no quorum, no leader, and no running
+    /// daemon, only `YUBABA_CERT_STORE_*` and the `cloudflare-r2-*` credentials
+    /// the daemon itself uses.
+    Domain {
+        #[command(subcommand)]
+        cmd: DomainCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum DomainCmd {
+    /// Register a domain and print the DNS records its owner must create.
+    ///
+    /// Enrolment is the *whole* of turning a domain on: the same object is the
+    /// allowlist `passway-demux` routes from and the work list the per-domain
+    /// issuer sweeps, so there is no second activation step. The tenant's DNS is
+    /// the only remaining input, which is why this prints it.
+    ///
+    /// Idempotent for an identical record; a conflicting one is refused rather
+    /// than silently re-pointed.
+    Enroll {
+        /// The tenant's domain, e.g. `shop.tenant.io`.
+        domain: String,
+        /// Where the demux splices this domain's TLS bytes — the per-tenant
+        /// passway's listener, or the socket kamaji holds for a cold tenant.
+        ///
+        /// A `host:port`, never a hostname: the demux's route table parses its
+        /// backends to a `SocketAddr`, so a name here would be discovered as a
+        /// routes file the demux refuses at load rather than as an enrolment
+        /// error here.
+        #[arg(long)]
+        tls_backend: SocketAddr,
+        /// Optional port-80 backend, for when an HTTP tier exists. Carried in
+        /// the record and unused today.
+        #[arg(long)]
+        http_backend: Option<SocketAddr>,
+        /// This deployment's *public* ingress address, as the tenant's A/AAAA
+        /// record should name it. Repeatable.
+        ///
+        /// Not derivable: `--tls-backend` is the internal address the demux
+        /// splices to, which is precisely not what a tenant points DNS at.
+        /// Omitted, the printed instruction says so instead of guessing.
+        #[arg(long = "ingress")]
+        ingress: Vec<String>,
+        /// Emit JSON — the form an onboarding page renders from.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Drop a domain's route, keeping its certificate material.
+    ///
+    /// Keeping the cert is the default because undoing a typo should not cost
+    /// an ACME order against a rate limit that is counted per identifier.
+    Unenroll {
+        /// The domain to unenrol.
+        domain: String,
+        /// Also delete the sealed cert, key and any issuance claim.
+        ///
+        /// Deliberate rather than default: re-enrolling afterwards orders a
+        /// fresh certificate, and Let's Encrypt counts new orders per account
+        /// and failures per identifier.
+        #[arg(long)]
+        forget_cert: bool,
+    },
+    /// List enrolled domains and whether each holds a certificate.
+    List {
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one domain's enrolment, certificate, issuance claim and DNS contract.
+    Status {
+        /// The domain to inspect.
+        domain: String,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -477,6 +581,7 @@ fn default_serve() -> Cmd {
         region: None,
         sovereign_group: None,
         sovereign_role: SovereignRole::default(),
+        jurisdiction: None,
         leader_anchor: None,
         litestream_s3_url: None,
         control_plane: false,
@@ -513,6 +618,7 @@ async fn main() -> Result<()> {
             region,
             sovereign_group,
             sovereign_role,
+            jurisdiction,
             leader_anchor,
             litestream_s3_url,
             control_plane,
@@ -553,6 +659,21 @@ async fn main() -> Result<()> {
                 if let Err(why) = yubaba::leader_pin::validate(&policy, anchor) {
                     anyhow::bail!("--leader-anchor: {why}");
                 }
+            }
+            // R736-T3: same reasoning one flag over. A jurisdiction that names
+            // no cell, or a label the global tenant pointer could not carry,
+            // must fail here — where the fix is a flag edit — rather than in the
+            // middle of a cross-cell move months later, on a value fixed at
+            // boot. `identify` is also what decides the cell exists at all, so
+            // this is the one place the two labels are checked together.
+            let cell = yubaba::cell::identify(sovereign_group.as_deref(), jurisdiction.as_deref())
+                .map_err(|why| anyhow::anyhow!("--jurisdiction: {why}"))?;
+            if let Some(cell) = &cell {
+                tracing::info!(
+                    cell_id = %cell.id,
+                    jurisdiction = %cell.jurisdiction,
+                    "this cluster is a residency cell (W250) — cross-jurisdiction joins refused"
+                );
             }
             // R599-F12: `--bind` is also this node's own mesh address (in
             // production it is the tailscale0 IP), and a natively forked
@@ -744,6 +865,13 @@ async fn main() -> Result<()> {
                 if let Some(group) = sovereign_group.clone() {
                     server_state = server_state.with_sovereign_group(group);
                 }
+                // R736-T3: and declaring a jurisdiction beside it makes that
+                // group a cell, which arms the cross-jurisdiction half of the
+                // same gate. Validated above, so this cannot be a jurisdiction
+                // with no group.
+                if let Some(jurisdiction) = jurisdiction.clone() {
+                    server_state = server_state.with_jurisdiction(jurisdiction);
+                }
                 // R605-F12: set unconditionally — it defaults to `voter`, so
                 // there is no "unset" to preserve, and the gate reads it only
                 // when a group is declared above.
@@ -933,6 +1061,18 @@ async fn main() -> Result<()> {
                          raft cluster, so no join can be refused"
                     );
                 }
+                if let Some(jurisdiction) = &jurisdiction {
+                    // R736-T3. Same shape as the group above and dangerous for
+                    // the same reason, one level up: this declares the node a
+                    // member of a residency CELL, and a cell with no raft has no
+                    // join to refuse — so the boundary an operator believes is
+                    // being enforced is not.
+                    tracing::warn!(
+                        %jurisdiction,
+                        "--jurisdiction has no effect without --raft-node-id: a cell is one raft \
+                         group, and there is no raft cluster here to bind to a jurisdiction"
+                    );
+                }
                 if !sovereign_role.is_voter() {
                     // R605-F12. Not an error: this is the *expected* shape for
                     // us-west-003 — a non-voting member runs standalone, with
@@ -1098,6 +1238,105 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Cmd::Domain { cmd } => run_domain_cmd(cmd),
+    }
+}
+
+/// R779 (W267) — the `domain` verbs, against the object store directly.
+///
+/// Synchronous inside an async `main` on purpose: [`yubaba::cert_store`]'s API
+/// is blocking, these are one-shot commands with nothing else on the runtime,
+/// and wrapping four `get`s in `spawn_blocking` would buy nothing but noise.
+fn run_domain_cmd(cmd: DomainCmd) -> Result<()> {
+    use yubaba::domain_admin::{self, DomainReport};
+
+    let cfg = domain_admin::parse_admin_config(|k| std::env::var(k).ok())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let store = cfg
+        .connect()
+        .with_context(|| format!("opening cert store bucket {}", cfg.store.bucket))?;
+    let zone = cfg.delegate_zone.as_deref();
+    let now = std::time::SystemTime::now();
+    let now_secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    match cmd {
+        DomainCmd::Enroll {
+            domain,
+            tls_backend,
+            http_backend,
+            ingress,
+            json,
+        } => {
+            let onboarding = domain_admin::enroll(
+                &store,
+                &domain,
+                tls_backend,
+                http_backend,
+                zone,
+                ingress,
+                now,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&onboarding.to_json())?);
+            } else {
+                println!("enrolled {domain} -> {tls_backend}\n");
+                print!("{}", onboarding.render());
+            }
+            Ok(())
+        }
+        DomainCmd::Unenroll {
+            domain,
+            forget_cert,
+        } => {
+            store.unenroll(&domain)?;
+            println!("unenrolled {domain} — the demux drops the route on its next sweep");
+            if forget_cert {
+                store.delete_domain(&domain)?;
+                println!(
+                    "deleted the sealed cert, key and any issuance claim; re-enrolling \
+                     will place a fresh ACME order"
+                );
+            } else {
+                println!(
+                    "certificate material kept — re-enrolling costs no ACME order \
+                     (pass --forget-cert to delete it)"
+                );
+            }
+            Ok(())
+        }
+        DomainCmd::List { json } => {
+            let rows = domain_admin::list(&store)?;
+            if json {
+                let out: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "domain": r.domain,
+                            "has_cert": r.has_cert,
+                            "tls_backend": r.enrollment.tls_backend.to_string(),
+                            "http_backend": r.enrollment.http_backend.map(|a| a.to_string()),
+                            "enrolled_at": r.enrollment.enrolled_at,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                print!("{}", domain_admin::render_list(&rows));
+            }
+            Ok(())
+        }
+        DomainCmd::Status { domain, json } => {
+            let report = DomainReport::collect(&store, &domain, zone)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report.to_json(now_secs))?);
+            } else {
+                print!("{}", report.render(now_secs));
+            }
+            Ok(())
+        }
     }
 }
 

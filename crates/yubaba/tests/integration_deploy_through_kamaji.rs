@@ -314,3 +314,107 @@ async fn deploy_status_answers_a_status_code_when_kamaji_never_replies() {
 
     deaf.abort();
 }
+
+/// R844-F1: a bundle deploy kamaji REFUSES must not leave a service record
+/// behind.
+///
+/// The bundle tier's registration call (`ServiceRecords::admit_bundle`) lives
+/// inside `deploy_non_container`'s `Ok` arm, and that placement is the whole
+/// guarantee: a record advertises a dialable upstream, so publishing one for a
+/// workload that never started is strictly worse than the empty set this
+/// ticket fixed — passway would route live traffic into a process that does
+/// not exist. Hoisting the call above the `match` (or into the `Err` arm) is
+/// an easy, plausible-looking edit that no unit test on `admit_bundle` itself
+/// can catch, because at that level the refusal has already been discarded.
+///
+/// The test is deliberately NON-VACUOUS: the node is given a real mesh IP via
+/// `with_bind_addr` and the bundle declares a port, so `admit_bundle` would
+/// admit this workload if it were reached. The empty registry therefore proves
+/// the refusal suppressed it, not that some other precondition was missing.
+///
+/// Note this asserts the negative only. The success arm cannot be exercised
+/// in-process: a bare kamaji has no bundle backend, and reaching `Ok` needs
+/// kamaji-bin built with `--features bundle-serving` plus an R2 object store
+/// holding a real published bundle to materialize. That path is proved live,
+/// not here — see this ticket's re-measure step.
+#[tokio::test]
+async fn a_refused_bundle_deploy_publishes_no_service_record() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("kamaji.sock");
+    let (server, stop) = spawn_kamaji(sock.clone()).await;
+
+    let client = KamajiClient::connect(sock.clone())
+        .await
+        .expect("kamaji handshake");
+    let sibling = KamajiSibling::new(client, sock, Duration::from_secs(5));
+    let state = Arc::new(
+        yubaba::ServerState::load(dir.path().join("identity.json"))
+            .unwrap()
+            // Both halves admit_bundle needs, so a passing assertion below can
+            // only be explained by the refusal.
+            .with_bind_addr("100.64.0.3:7443")
+            .with_constable_client(sibling),
+    );
+    assert_eq!(
+        state.node_mesh_ip(),
+        Some(std::net::Ipv4Addr::new(100, 64, 0, 3)),
+        "test precondition: the node must have a mesh IP, or this passes vacuously"
+    );
+    let records = Arc::clone(&state);
+    let app = yubaba::build_router(state);
+
+    let envelope = workload_spec::Workload::MesofactStatic(workload_spec::MesofactStaticWorkload {
+        schema_version: SchemaVersion::V1,
+        build: workload_spec::BuildConfig {
+            command: Some("bun run build".into()),
+            out_dir: PathBuf::from("dist"),
+            render_command: None,
+        },
+        routes: PathBuf::from("./mesofact.routes.ts"),
+        build_mode: workload_spec::BuildMode::default(),
+        ssr_runtime: None,
+        serve_bundle: Some(workload_spec::MesofactServeBundle {
+            digest: workload_spec::BlakeHash("a".repeat(64)),
+            runtime: "self".into(),
+            lifecycle: workload_spec::BundleLifecycle::KeepAlive,
+            // Declared, so the port is not the reason nothing is published.
+            port: Some(8080),
+            env: Default::default(),
+        }),
+        revalidate_receiver: None,
+    });
+
+    let resp = app
+        .oneshot(
+            Request::post("/workloads/deploy")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "spec": envelope,
+                        "id": "yah-marketing",
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert!(
+        !status.is_success(),
+        "a bare kamaji has no bundle backend and must refuse, got {status}: {body}"
+    );
+
+    assert!(
+        records.service_records.snapshot().is_empty(),
+        "a refused bundle deploy published a record — admit_bundle must stay \
+         inside deploy_non_container's Ok arm, or yubaba advertises an \
+         upstream that never started: {:?}",
+        records.service_records.snapshot()
+    );
+
+    let _ = stop.send(());
+    server.await.unwrap();
+}

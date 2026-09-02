@@ -94,6 +94,7 @@ pub mod pond_door;
 pub mod pond_publish;
 pub mod publish_beacon;
 pub mod r2_publish;
+pub mod service_discovery;
 pub mod static_asset;
 pub mod static_asset_prune;
 pub mod sync_status;
@@ -130,6 +131,9 @@ pub use pond_publish::{derive_minio_key, publish_to_pond, PondPublishReport};
 pub use r2_publish::{
     publish_to_r2, R2PublishReport, R2PurgeOpts, R2_ACCESS_KEY_ENV, R2_ACCESS_KEY_SLOT,
     R2_SECRET_KEY_ENV, R2_SECRET_KEY_SLOT,
+};
+pub use service_discovery::{
+    DiscoveredRecord, RecordVisibility, ServiceRecordFanout, UnknownReason,
 };
 pub use static_asset::StaticAssetReconciler;
 pub use static_asset_prune::{

@@ -51,6 +51,11 @@ pub struct SoloNode {
     /// --sovereign-group`), or `None` for a node declaring no group — which is
     /// what leaves the R742-F1 add-learner gate switched off.
     pub sovereign_group: Option<String>,
+    /// The jurisdiction this node was started with (`yubaba serve
+    /// --jurisdiction`), or `None` for a node in no cell (R736-T3). Declaring
+    /// one alongside a group is what makes this node's raft group a **cell** and
+    /// arms the cross-jurisdiction half of the add-learner gate.
+    pub jurisdiction: Option<String>,
     /// This node's raft handle — the same one its router serves from.
     ///
     /// Exposed (R734-T4) because a test that drives a background loop needs to
@@ -152,6 +157,33 @@ pub async fn solo_node_with_sovereign_role(
     .await
 }
 
+/// [`solo_node`] as a member of a **cell** — R736-T3, the harness equivalent of
+/// `yubaba serve --sovereign-group <id> --jurisdiction <j> --region <r>`.
+///
+/// All three labels together, because a cell is exactly their conjunction: the
+/// group is the cell id the global tenant pointer records, the jurisdiction is
+/// what makes that group a cell at all, and the region is what the node
+/// publishes into its own member row and therefore what the cell reports as its
+/// geographic spread. A constructor that took fewer would be building a
+/// half-cell no deployment has.
+pub async fn solo_node_in_cell(
+    node_id: u64,
+    policy: ClusterPolicy,
+    cell_id: &str,
+    jurisdiction: &str,
+    region: &str,
+) -> Result<SoloNode> {
+    build(Spec {
+        node_id,
+        policy,
+        region: Some(region),
+        sovereign_group: Some(cell_id),
+        jurisdiction: Some(jurisdiction),
+        ..Spec::default()
+    })
+    .await
+}
+
 /// [`solo_node`] with the member-registration loop **not** running — a node that
 /// will never publish a row about itself (R734-F5).
 ///
@@ -190,6 +222,9 @@ struct Spec<'a> {
     policy: ClusterPolicy,
     region: Option<&'a str>,
     sovereign_group: Option<&'a str>,
+    /// R736-T3. Only meaningful with a `sovereign_group` — that pair is what a
+    /// cell is — which is why no public constructor sets it alone.
+    jurisdiction: Option<&'a str>,
     /// R605-F12. Not an `Option`: a real node's flag defaults to `voter`, so
     /// there is no unset state for the harness to reproduce.
     sovereign_role: SovereignRole,
@@ -204,6 +239,7 @@ impl Default for Spec<'_> {
             policy: ClusterPolicy::fleet(),
             region: None,
             sovereign_group: None,
+            jurisdiction: None,
             sovereign_role: SovereignRole::Voter,
             register: true,
         }
@@ -216,12 +252,14 @@ async fn build(
         policy,
         region,
         sovereign_group,
+        jurisdiction,
         sovereign_role,
         register,
     }: Spec<'_>,
 ) -> Result<SoloNode> {
     let region = region.map(str::to_string);
     let sovereign_group = sovereign_group.map(str::to_string);
+    let jurisdiction = jurisdiction.map(str::to_string);
     let tmp = tempfile::TempDir::new().context("solo node tempdir")?;
     let state_path = tmp.path().join("identity.json");
     let raft_dir = tmp.path().join("raft");
@@ -252,6 +290,9 @@ async fn build(
     }
     if let Some(group) = &sovereign_group {
         state = state.with_sovereign_group(group.clone());
+    }
+    if let Some(jurisdiction) = &jurisdiction {
+        state = state.with_jurisdiction(jurisdiction.clone());
     }
     state = state.with_sovereign_role(sovereign_role);
     let registration = if register {
@@ -294,6 +335,7 @@ async fn build(
         node_id,
         region,
         sovereign_group,
+        jurisdiction,
         raft,
         state_machine,
         _tmp: tmp,

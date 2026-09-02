@@ -137,9 +137,10 @@ async fn destroy(state: &Arc<ServerState>, ident: &str) -> serde_json::Value {
 /// One turn of the refresh sweep that `service_records::run` performs on a
 /// timer in the live daemon. Called directly so the tests don't sleep.
 async fn sweep(state: &Arc<ServerState>) {
-    let backend = state.active_backend().expect("runtime attached");
-    let states = backend.list_workloads().await.unwrap();
-    state.service_records.reconcile(&states);
+    assert!(
+        yubaba::service_records::sweep_once(state).await,
+        "the sweep must have a backend to list"
+    );
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

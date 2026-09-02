@@ -367,6 +367,11 @@ pub mod cert_store;
 /// (R779 / W267) — the allowlist that keeps an SNI flood from reaching any
 /// passway, made structural.
 pub mod demux_routes;
+/// Registering a custom tenant domain and printing the DNS its owner must
+/// create (R779 / W267 §Decision 2) — the operator's end of [`cert_store`]'s
+/// enrollment set, and the one place the `_acme-challenge` CNAME contract is
+/// rendered for a human.
+pub mod domain_admin;
 /// Per-domain ACME issuance for custom tenant domains (R779 / W267 §Decision 2)
 /// — sweeps the [`cert_store`] enrollment set, validates by DNS-01 CNAME
 /// delegation, and writes the sealed pair to the object store rather than raft.
@@ -376,6 +381,10 @@ pub mod domain_issuer;
 /// reaches a BYO VPS exactly as it reaches a managed rig. Opt-in via
 /// `serve --camp-rpc-root <PATH>`.
 pub mod camp_rpc;
+/// The cell this raft group is: its id (the sovereign-group label) and the
+/// jurisdiction that binds it, plus the gate that keeps a cell from taking a
+/// voter outside its own jurisdiction (R736-T3, W250).
+pub mod cell;
 pub mod cheers_client;
 /// The cluster-compatibility epochs this build declares (W275 / R625-F2) —
 /// `cluster_protocol` (wire) and `state_epoch` (on-disk), read at compile time
@@ -625,6 +634,23 @@ pub struct ServerState {
     /// `add-learner` refuses too, because it is holding a raft seat its own
     /// declaration says it should not have.
     pub sovereign_role: SovereignRole,
+
+    /// R736-T3 (W250): the legal jurisdiction this node's data is bound to — the
+    /// label `yubaba serve --jurisdiction` was given, which an operator takes
+    /// from the machine's own `.yah/infra/machines/<name>.toml`.
+    ///
+    /// Declaring one is what turns this node's
+    /// [`sovereign_group`](Self::sovereign_group) into a **cell**: one raft
+    /// group bound to one jurisdiction, named in the global tenant pointer by
+    /// the group's own label. A group without this is a blast radius that is not
+    /// a cell — the dev raft is the case — and it is `None` across the whole
+    /// fleet until an operator says otherwise.
+    ///
+    /// Like [`region`](Self::region) and unlike anything replicated, this is
+    /// only ever what *this process* was started with; every other node's
+    /// jurisdiction is asked of that node ([`sovereign_group::ask_peer`]) and
+    /// judged by [`cell::judge`] on the join path.
+    pub jurisdiction: Option<String>,
 
     /// R118-T9: the rules this cluster runs under — whether learners can be
     /// promoted to voters, whether the raft leader carries the cluster's
@@ -1074,6 +1100,7 @@ impl ServerState {
             region: None,
             sovereign_group: None,
             sovereign_role: SovereignRole::default(),
+            jurisdiction: None,
             cluster_policy: ClusterPolicy::default(),
             failure_detector: None,
             lease_detector: None,
@@ -1549,6 +1576,33 @@ impl ServerState {
     pub fn with_sovereign_role(mut self, role: SovereignRole) -> Self {
         self.sovereign_role = role;
         self
+    }
+
+    /// R736-T3: declare this node's jurisdiction (`yubaba serve
+    /// --jurisdiction`), which makes its sovereign group a **cell**.
+    ///
+    /// See [`ServerState::jurisdiction`] and [`cell`]. `main.rs` validates the
+    /// pair through [`cell::identify`] before calling this, so a daemon never
+    /// reaches a state where it holds a jurisdiction that names no cell.
+    pub fn with_jurisdiction(mut self, jurisdiction: impl Into<String>) -> Self {
+        self.jurisdiction = Some(jurisdiction.into());
+        self
+    }
+
+    /// Which cell this node is in, derived from the two labels it declares —
+    /// `None` when it is in none (R736-T3).
+    ///
+    /// Derived rather than stored so the id and the jurisdiction cannot drift
+    /// apart: the cell id *is* [`sovereign_group`](Self::sovereign_group), never
+    /// a copy of it. An invalid combination — a jurisdiction with no group, or a
+    /// label the global tenant pointer would refuse — answers `None` here, which
+    /// is the safe degrade (the gate is simply not in force). `main.rs` refuses
+    /// to start on exactly those inputs, so on a daemon this branch is
+    /// unreachable; it exists for a `ServerState` assembled directly in a test.
+    pub fn cell(&self) -> Option<cell::CellIdentity> {
+        cell::identify(self.sovereign_group.as_deref(), self.jurisdiction.as_deref())
+            .ok()
+            .flatten()
     }
 
     /// R600-F6 (W273): attach the read handle to the raft-replicated
@@ -2968,6 +3022,35 @@ async fn deploy_non_container(
                 bind_ip = ?s.node_mesh_ip,
                 "bundle workload deployed via kamaji"
             );
+
+            // R844-F1: register the bundle as a discoverable upstream. This is
+            // the bundle tier's analogue of the container branch's
+            // `upsert_deployed` call, and it has to live here because this is
+            // the only point that holds all three facts at once — the
+            // operator-facing workload name, this node's mesh IP, and the
+            // bundle's own declared serve port. Without it the entire W272
+            // tier deployed and served while `GET /service-records` stayed
+            // empty forever: the sweep's `reconcile` deliberately never
+            // backfills an ident nothing admitted, so there was no later
+            // recovery point.
+            //
+            // Keyed on `name`, NOT on `ident`. `ident` above is the bundle
+            // DIGEST (the content, which changes on every rebuild); `name` is
+            // the stable handle kamaji's `list()` reports as `mesh_ident`, and
+            // `reconcile` keys on exactly that. A digest-keyed record would be
+            // retracted by the very first 15s sweep.
+            let declared_port = match &workload {
+                workload_spec::Workload::MesofactStatic(w) => {
+                    w.serve_bundle.as_ref().and_then(|b| b.port)
+                }
+                _ => None,
+            };
+            s.service_records.admit_bundle(
+                &workload_spec::MeshIdent(name.clone()),
+                s.node_mesh_ip,
+                declared_port,
+            );
+
             (
                 StatusCode::ACCEPTED,
                 Json(serde_json::json!({
@@ -5121,6 +5204,13 @@ async fn get_tenant_ownership(
 /// that group. Always a value, never `null`: the role has a default where the
 /// group does not, so a *missing* key is the only signal a reader needs, and it
 /// means the build predates the field.
+///
+/// Carries `jurisdiction` (R736-T3) on the same present-vs-`null` contract as
+/// the group, and — when one is declared — a `cell` section naming the cell this
+/// raft group is: its id (the sovereign-group label), its jurisdiction, and the
+/// distinct regions its member rows declare. `cell` is absent on a group that
+/// has not been bound to a jurisdiction, which is every cluster in the fleet
+/// today; see [`cell`] for why that is a group and not a cell.
 async fn raft_status(
     State(s): State<Arc<ServerState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -5143,7 +5233,33 @@ async fn raft_status(
         // reading a *missing* key here knows it is talking to a build older
         // than this field and resolves it to `voter` itself.
         "sovereign_role": s.sovereign_role,
+        // R736-T3: emitted even when None, for the same present-vs-null reason
+        // as `sovereign_group` — a cell asking a joiner which jurisdiction it is
+        // in has to tell an unflagged daemon (`null`) from one whose build
+        // predates cell tagging (key absent), because one needs a restart and
+        // the other a roll.
+        "jurisdiction": s.jurisdiction,
     });
+
+    // R736-T3: the cell this raft group *is* — present only when a jurisdiction
+    // has been declared, since that is what makes a sovereign group a cell. A
+    // convenience view over two keys already above plus the regions its members
+    // declare, so a mover reading W250's global pointer can check "is this the
+    // cell the pointer names, and is it in the jurisdiction policy allows"
+    // against one object rather than reassembling it.
+    if let Some(identity) = s.cell() {
+        let regions = s
+            .cluster_state
+            .as_ref()
+            .map(|sm| {
+                sm.members()
+                    .into_values()
+                    .filter_map(|info| info.region)
+                    .collect()
+            })
+            .unwrap_or_default();
+        body["cell"] = cell::describe(&identity, regions);
+    }
 
     if let Some(sm) = &s.cluster_state {
         let members: serde_json::Map<String, serde_json::Value> = sm
@@ -5400,17 +5516,33 @@ struct RaftAddLearnerRequest {
 ///
 /// The 200 body carries `sovereign_group_judged`, so a join that the gate never
 /// evaluated is never mistaken for one that passed it.
+///
+/// R736-T3 runs a second gate on the same answer: when this node declares a
+/// `--jurisdiction` — which is what makes its group a **cell** — a joiner in a
+/// different jurisdiction is refused `409` even though it is in the right group,
+/// because one voter across a legal boundary breaks the residency promise for
+/// every tenant already in the cell. The 200 body carries `cell_judged` beside
+/// `sovereign_group_judged` on the same contract. See [`cell`].
 async fn raft_add_learner(
     State(s): State<Arc<ServerState>>,
     Json(body): Json<RaftAddLearnerRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let raft = require_raft!(s);
 
-    // R742-F1: refuse a cross-group join before touching membership.
-    let gate = match s.sovereign_group.as_deref() {
+    // R742-F1: refuse a cross-group join before touching membership. R736-T3
+    // adds the cell gate on the same declaration, so both questions are answered
+    // from one status read of the joiner.
+    let me = s
+        .node_id
+        .map(|id| format!("node {id}"))
+        .unwrap_or_else(|| "this node".to_string());
+    let joiner_label = format!("node {} at {}", body.node_id, body.addr);
+    let (gate, cell_gate) = match s.sovereign_group.as_deref() {
         // Nothing declared here means no blast radius asserted, so there is
-        // nothing to cross — and no reason to dial the joiner.
-        None => sovereign_group::Gate::NotInForce,
+        // nothing to cross — and no reason to dial the joiner. A cell cannot
+        // exist without a group either (`cell::identify`), so the cell gate is
+        // off here by construction rather than by a second check.
+        None => (sovereign_group::Gate::NotInForce, cell::Gate::NotInForce),
         Some(mine) => {
             let joiner = sovereign_group::ask_peer(&body.addr).await.map_err(|e| {
                 (
@@ -5424,21 +5556,35 @@ async fn raft_add_learner(
                     ),
                 )
             })?;
-            sovereign_group::judge(
-                Some(mine),
-                s.sovereign_role,
-                &s.node_id
-                    .map(|id| format!("node {id}"))
-                    .unwrap_or_else(|| "this node".to_string()),
-                &joiner,
-                &format!("node {} at {}", body.node_id, body.addr),
+            (
+                sovereign_group::judge(
+                    Some(mine),
+                    s.sovereign_role,
+                    &me,
+                    &joiner.group,
+                    &joiner_label,
+                ),
+                cell::judge(
+                    s.jurisdiction.as_deref(),
+                    &me,
+                    &joiner.jurisdiction,
+                    &joiner_label,
+                ),
             )
         }
     };
+    // Blast radius first, residency second: a jurisdiction refusal for a node
+    // that was never in this raft group would send the operator to fix the wrong
+    // label. See `cell::judge`.
     let judged_group = match gate {
         sovereign_group::Gate::Refuse(reason) => return Err((StatusCode::CONFLICT, reason)),
         sovereign_group::Gate::Permit(group) => Some(group),
         sovereign_group::Gate::NotInForce => None,
+    };
+    let judged_jurisdiction = match cell_gate {
+        cell::Gate::Refuse(reason) => return Err((StatusCode::CONFLICT, reason)),
+        cell::Gate::Permit(jurisdiction) => Some(jurisdiction),
+        cell::Gate::NotInForce => None,
     };
 
     let node = openraft::BasicNode {
@@ -5456,6 +5602,11 @@ async fn raft_add_learner(
             // is about.
             "sovereign_group_judged": judged_group.is_some(),
             "sovereign_group": judged_group,
+            // R736-T3: same contract one axis over — `false` means this cluster
+            // is a sovereign group but not a cell, so residency was not checked
+            // rather than checked and found equal.
+            "cell_judged": judged_jurisdiction.is_some(),
+            "jurisdiction": judged_jurisdiction,
         }))),
         // Not the leader: hand back the redirect hint (leader id + node) so the
         // operator/orchestrator can retarget the call at the actual leader,

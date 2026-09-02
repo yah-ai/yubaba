@@ -1363,7 +1363,13 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
 /// Open (or create) a yubaba raft node.
 ///
 /// `node_id`  — this machine's unique yubaba node ID (u64, assigned at provision time).
-/// `raft_dir` — directory for raft persistence files (`raft_vote.json`, `raft_log.json`, `raft_state.json`).
+/// `raft_dir` — directory for raft persistence files (`raft_vote.json`, `raft_log.json`,
+///              `raft_state.json`, `raft_meta.json`). **All four are one unit**: wiping a
+///              node's raft state means removing every one of them. `raft_meta.json` carries
+///              the purge marker (R841-B1), so leaving it behind while deleting the other
+///              three hands the fresh node a marker over an empty log —
+///              [`YubabaLogStore::open`](store) detects and drops that case, but the
+///              instruction to give an operator is still "delete all four".
 /// `policy`   — the cluster policy this node runs under; its
 ///              [`RaftTiming`](crate::cluster_policy::RaftTiming) sets the
 ///              election and heartbeat timers.

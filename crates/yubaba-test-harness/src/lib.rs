@@ -97,8 +97,8 @@ pub use tenant_ownership::LocalOwnership;
 /// interesting behaviour happens *before* a cluster exists.
 pub mod solo_node;
 pub use solo_node::{
-    solo_node, solo_node_in_region, solo_node_in_sovereign_group, solo_node_unregistered,
-    solo_node_with_sovereign_role, SoloNode,
+    solo_node, solo_node_in_cell, solo_node_in_region, solo_node_in_sovereign_group,
+    solo_node_unregistered, solo_node_with_sovereign_role, SoloNode,
     HARNESS_CAPACITY,
 };
 
