@@ -50,7 +50,22 @@ use std::path::Path;
 /// Name of the litestream replicate systemd unit.
 pub const LITESTREAM_UNIT: &str = "litestream-headscale.service";
 /// Default litestream config path on the machine.
-pub const LITESTREAM_CONFIG_PATH: &str = "/etc/yah-cloud/litestream.yml";
+///
+/// Under yubaba's own state directory, NOT `/etc` — and that is a correctness
+/// requirement, not tidiness. `yubaba.service` runs with
+/// `ProtectSystem=strict`, which mounts the whole hierarchy read-only except
+/// the paths it names; `/var/lib/yah/yubaba` is granted (`StateDirectory` +
+/// `ReadWritePaths`) and `/etc` is not. This file was at
+/// `/etc/yah-cloud/litestream.yml` until R858, where every write of it failed
+/// EROFS on a fleet node and [`install`]'s `Err` was absorbed by
+/// `leader::on_became_leader` into a `warn!` — the fourth way this path
+/// contrived to replicate nothing while looking wired.
+///
+/// `templates/mirror.yml` already states the constraint for the other half of
+/// this pair: "yubaba runs under ProtectSystem=strict and CANNOT write
+/// /etc/systemd/system or /etc/ufw", which is why the *unit* is pre-staged at
+/// provision time and only the config is written here.
+pub const LITESTREAM_CONFIG_PATH: &str = "/var/lib/yah/yubaba/litestream.yml";
 
 /// Every key under a replica entry sits at this indent — `- url:` is at 6, so
 /// its sibling keys are at 8. Named because the bug this constant replaced was
@@ -83,12 +98,30 @@ pub fn generate_config(headscale_db: &Path, s3_url: &str) -> String {
     out
 }
 
-/// Write the litestream config to `LITESTREAM_CONFIG_PATH` and install
-/// the `litestream-headscale.service` systemd unit (idempotent).
+/// Write the litestream config to [`LITESTREAM_CONFIG_PATH`] (idempotent).
 ///
 /// Credentials are read from `LITESTREAM_ACCESS_KEY_ID` /
 /// `LITESTREAM_SECRET_ACCESS_KEY` in the environment — inject via
-/// `/etc/yah-cloud/litestream.env` or cloud-init `EnvironmentFile`.
+/// `/etc/yah-cloud/litestream.env`, which `litestream-headscale.service` reads
+/// with `EnvironmentFile=-` and `yubaba.service` reads for
+/// `YUBABA_LITESTREAM_S3_URL`. One file, both readers, because a URL without
+/// the credentials that authenticate to it replicates nothing.
+///
+/// # The config only. The unit ships at provision time
+///
+/// This function used to write `/etc/systemd/system/litestream-headscale.service`
+/// too, and could not: `yubaba.service` sets `ProtectSystem=strict` and grants
+/// no path under `/etc`, so both that write and the config write (then also
+/// under `/etc`) failed EROFS on every fleet node, and
+/// `leader::on_became_leader` absorbed the `Err` into a `warn!`. R591-T3 found
+/// three ways this path replicated nothing while looking wired; this was the
+/// fourth, and it defeated the other three's fixes.
+///
+/// The unit is static text, so it needs no writer at all — it is shipped in
+/// the release tarball beside `yubaba.service` and laid down by cloud-init,
+/// the same treatment `templates/mirror.yml` already gives `headscale.service`
+/// for exactly this reason. What genuinely varies per node is the S3 URL, and
+/// that is all this function now writes.
 ///
 /// # Call this before `restore` (R591-T3)
 ///
@@ -97,50 +130,14 @@ pub fn generate_config(headscale_db: &Path, s3_url: &str) -> String {
 /// all, so that file never existed on any node: every restore failed at
 /// "no such file", every `systemctl start litestream-headscale.service` failed
 /// against a unit that had never been written, and both failures were absorbed
-/// — the restore into a `warn!`, the start into a discarded exit status. The
-/// feature looked wired from `leader.rs` and replicated nothing.
+/// — the restore into a `warn!`, the start into a discarded exit status.
 pub fn install(headscale_db: &Path, s3_url: &str) -> Result<()> {
     let config = generate_config(headscale_db, s3_url);
     if let Some(parent) = Path::new(LITESTREAM_CONFIG_PATH).parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(LITESTREAM_CONFIG_PATH, &config)?;
-
-    // NO `BindsTo=`/`WantedBy=headscale.service` (R591-F1). Headscale is a
-    // kamaji-supervised appliance now, so on a re-homed node `headscale.service`
-    // is *disabled* — binding to it would stop this unit the moment it started,
-    // and ordering after a unit that never starts is at best a no-op. The
-    // lifecycle owner is `leader.rs`, which starts this on becoming the ingress
-    // owner and stops it on losing that, so the unit needs no [Install] section
-    // at all: it is never `enable`d, only started.
-    //
-    // `Restart=always` for the same reason the appliance uses it — a replicate
-    // process that exits 0 has stopped replicating, and "it exited cleanly" is
-    // not a reason to leave the coordinator's DB unbacked.
-    let unit_path = format!("/etc/systemd/system/{LITESTREAM_UNIT}");
-    std::fs::write(&unit_path, unit_text())?;
-    let _ = std::process::Command::new("systemctl")
-        .args(["daemon-reload"])
-        .status();
     Ok(())
-}
-
-/// The `litestream-headscale.service` unit text. Split out from [`install`] so
-/// its directives are assertable — the writer targets `/etc/systemd/system`,
-/// which no test can write.
-fn unit_text() -> String {
-    format!(
-        "[Unit]\n\
-         Description=Litestream Headscale replication (yah-yubaba Phase 2)\n\
-         After=network-online.target\n\
-         \n\
-         [Service]\n\
-         EnvironmentFile=-/etc/yah-cloud/litestream.env\n\
-         ExecStart=/usr/local/bin/litestream replicate -config {cfg}\n\
-         Restart=always\n\
-         RestartSec=5\n",
-        cfg = LITESTREAM_CONFIG_PATH,
-    )
 }
 
 /// Start `litestream-headscale.service` (idempotent — no-op if already running).
@@ -293,36 +290,50 @@ mod tests {
         );
     }
 
-    /// R591-F1 re-homed headscale onto kamaji, so `headscale.service` is
-    /// *disabled* on a re-homed node. The unit used to carry
-    /// `BindsTo=headscale.service` + `WantedBy=headscale.service`, which would
-    /// have stopped replication the instant it started and bound the sidecar's
-    /// lifecycle to a unit that no longer runs. `leader.rs` owns the lifecycle.
+    /// The unit's own directives — `Restart=always`, no `[Install]`, no
+    /// `headscale.service` binding, and the config path it shares with
+    /// [`restore`] — moved to
+    /// `app/yah/cli/tests/camp_systemd_unit_emit.rs::the_litestream_sidecar_unit_*`
+    /// when the unit stopped being generated here (R858). It is shipped text
+    /// now, so it is asserted where it is shipped from; generating a second
+    /// copy in this crate purely to assert against would be asserting a copy
+    /// that can drift from the file nodes actually run.
+    ///
+    /// What stays here is the half that is still generated: the config.
+    /// [`install`] must write it somewhere `ProtectSystem=strict` permits, and
+    /// that is the property this test holds.
     #[test]
-    fn the_sidecar_is_not_bound_to_the_retired_headscale_unit() {
-        let unit = unit_text();
-        assert!(!unit.contains("headscale.service"), "{unit}");
+    fn the_config_lives_where_a_hardened_yubaba_can_write_it() {
+        // `yubaba.service` grants ReadWritePaths=/var/lib/yah/yubaba (plus
+        // StateDirectory=yah/yubaba) and nothing under /etc. A config path
+        // outside that grant is EROFS on every fleet node, and the caller
+        // absorbs the error into a warn! — so the bug is silent.
         assert!(
-            !unit.contains("[Install]"),
-            "the sidecar is started by leader.rs, never enabled:\n{unit}"
+            LITESTREAM_CONFIG_PATH.starts_with("/var/lib/yah/yubaba/"),
+            "config must sit inside yubaba's writable state dir, got \
+             {LITESTREAM_CONFIG_PATH}"
         );
     }
 
-    /// Same lesson as the appliance's `RestartPolicy::Always`: a replicate
-    /// process that exits 0 has stopped replicating, and exiting cleanly is not
-    /// a reason to leave the coordinator's DB unbacked.
+    /// `install` writes the config and nothing else. It used to also write a
+    /// systemd unit, which it had no permission to do; a regression that
+    /// reintroduces any `/etc` write reintroduces the silent EROFS.
     #[test]
-    fn the_sidecar_restarts_on_a_graceful_exit() {
-        let unit = unit_text();
-        assert!(unit.contains("Restart=always"), "{unit}");
-        assert!(!unit.contains("Restart=on-failure"), "{unit}");
-    }
+    fn install_writes_the_config_and_only_the_config() {
+        let tmp = std::env::temp_dir().join("yah-litestream-install-probe");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let db = tmp.join("headscale.db");
 
-    /// The unit and [`restore`] must name the same config file, or one of them
-    /// runs against a path nothing writes — which is the shape of the bug this
-    /// ticket found.
-    #[test]
-    fn the_unit_and_the_restore_share_one_config_path() {
-        assert!(unit_text().contains(LITESTREAM_CONFIG_PATH));
+        // Not calling `install` directly — it targets absolute host paths no
+        // test may write. This asserts the payload it would write, which is
+        // the part that carries meaning.
+        let cfg = generate_config(&db, "s3://yah-headscale/headscale");
+        assert!(cfg.contains("s3://yah-headscale/headscale"));
+        assert!(
+            !cfg.contains("[Service]") && !cfg.contains("ExecStart="),
+            "the config is YAML, not a smuggled unit file:\n{cfg}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

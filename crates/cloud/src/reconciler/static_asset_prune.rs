@@ -217,20 +217,15 @@ fn load_static_asset_workload(path: &Path) -> Result<StaticAssetWorkload> {
         toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
     match envelope {
         workload_spec::Workload::StaticAsset(w) => Ok(w),
+        // `Workload::kind_str` rather than a match here: this was the "sixth
+        // place enumerating the variants, in another crate, with nothing to
+        // force it to keep up" its doc comment warns about, and it duly went
+        // non-exhaustive the moment `TenantPassway` was added.
         other => anyhow::bail!(
             "{}: expected kind=\"static-asset\", got {:?}",
             path.display(),
-            workload_kind_str(&other)
+            other.kind_str()
         ),
-    }
-}
-
-fn workload_kind_str(w: &workload_spec::Workload) -> &'static str {
-    match w {
-        workload_spec::Workload::MesofactStatic(_) => "mesofact-static",
-        workload_spec::Workload::Container(_) => "container",
-        workload_spec::Workload::Almanac(_) => "almanac",
-        workload_spec::Workload::StaticAsset(_) => "static-asset",
     }
 }
 

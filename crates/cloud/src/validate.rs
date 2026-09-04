@@ -827,9 +827,20 @@ pub struct IngressReport {
 /// `MachineConfig.cloudflared` cohort statement (W267 Gap 3), which nothing
 /// checked against the services that actually fronted through it.
 ///
-/// Upstreams are **not** resolved: discovery needs a live node, and this runs at
-/// validate time. A rule with no pinned `upstream_host` collates fine and simply
-/// has no address yet.
+/// Upstreams are resolved **from configuration, never from the network**
+/// (R844-F12). A rule that pins `upstream_host` keeps it; every other rule takes
+/// the declared `[registration].mesh_ipv4` of each machine in its placement set,
+/// via [`machine_mesh_addrs`](crate::reconciler::machine_mesh_addrs). That is a
+/// second lookup over the machine slice this function already loaded — no
+/// network, no credentials, so this still answers the same question in CI as on
+/// the operator's laptop.
+///
+/// It is also what lets a mirror drop `upstream_host` at all: before this, the
+/// pin was the only thing standing between the apex and a collation that
+/// rendered `<unresolved>`. What it is *not* is a source of truth — see
+/// [`IngressPlan::resolve_upstreams_from_config`](crate::reconciler::IngressPlan::resolve_upstreams_from_config).
+/// A rule placed on a machine that declares no mesh address still collates fine
+/// and simply has no address yet.
 pub fn collate_workspace_ingress(workspace_root: &Path) -> anyhow::Result<IngressReport> {
     // Needed only to resolve a slot's `required = { … }` into a machine name
     // (R772) — `plan_ingress` itself stays pure. Reads `.yah/infra/machines/`
@@ -844,6 +855,11 @@ pub fn collate_workspace_ingress(workspace_root: &Path) -> anyhow::Result<Ingres
             .into_iter()
             .map(|(_, m)| m)
             .collect();
+
+    // R844-F12: name -> declared mesh address, built once for the whole walk.
+    // Same slice, second lookup — the offline stand-in for the discovery read
+    // this pass deliberately cannot make.
+    let mesh_addrs = crate::reconciler::machine_mesh_addrs(&machines);
 
     let mut planned = Vec::new();
     let mut problems = Vec::new();
@@ -862,7 +878,8 @@ pub fn collate_workspace_ingress(workspace_root: &Path) -> anyhow::Result<Ingres
             }
         };
         match crate::reconciler::plan_ingress(&m.mirror, &placements) {
-            Ok(plans) => planned.extend(plans.into_iter().map(|plan| {
+            Ok(plans) => planned.extend(plans.into_iter().map(|mut plan| {
+                plan.resolve_upstreams_from_config(&mesh_addrs);
                 crate::reconciler::PlannedEdge {
                     service: m.service.clone(),
                     env: m.env.clone(),

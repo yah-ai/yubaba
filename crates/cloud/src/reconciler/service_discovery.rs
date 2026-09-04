@@ -105,10 +105,30 @@ use super::ingress::{IngressPlan, IngressRule};
 /// iff yubaba declared the workload serving **and** a dialable port is known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredRecord {
+    /// Mesh identity the record was admitted under — a bundle's workload name
+    /// (`BundleSlot::workload_name`, the service name unless the slot renames
+    /// it), a container's `expose.mesh.identity`.
+    ///
+    /// Carried because it is the only field that says *which workload* a record
+    /// describes (R844-F5). Matching by port alone was enough while every rule
+    /// pinned one, but a rule that declares `fronted = true` and lets discovery
+    /// answer for the port has nothing else to select on — and a node runs
+    /// several workloads (us-east-001 runs three), so an unkeyed read would
+    /// hand back whichever of them sorted first.
+    pub ident: String,
     /// Mesh address the workload bound (R599-F12 — not loopback).
     pub mesh_ip: String,
     /// Ports the record is dialable on.
     pub ports: Vec<u16>,
+    /// The same dialable ports keyed by **port name** (R844-F15), off the
+    /// record's `named_ports`.
+    ///
+    /// This is what lets [`ServiceRecordFanout::port_for`] answer for a
+    /// multi-port workload at all. Empty when the answering node predates the
+    /// field, which is the normal state during a fleet roll — every rule that
+    /// resolved before still resolves, because the name is only consulted when
+    /// the anonymous read is ambiguous.
+    pub named_ports: BTreeMap<String, u16>,
 }
 
 /// Why a node's records could not be seen.
@@ -296,20 +316,88 @@ impl ServiceRecordFanout {
     /// door looks like it worked. Node-keyed order (the `BTreeMap`'s) makes the
     /// answer deterministic across runs, so two applies of an unchanged fleet
     /// render byte-identical config.
+    /// **Empty for a rule whose port is still unresolved** (R844-F5). The match
+    /// is by port, so there is nothing to match on until
+    /// [`IngressPlan::resolve_ports`] has run — resolve ports first, and a rule
+    /// that stayed portless fails once, in [`IngressRule::upstreams`], naming
+    /// both halves.
     pub fn upstreams_for(&self, rule: &IngressRule) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
+        let Some(port) = rule.port else {
+            return out;
+        };
         for (_, visibility) in self
             .nodes
             .iter()
             .filter(|(machine, _)| self.in_scope(rule, machine))
         {
             for record in visibility.records() {
-                if record.ports.contains(&rule.port) && !out.contains(&record.mesh_ip) {
+                if record.ports.contains(&port) && !out.contains(&record.mesh_ip) {
                     out.push(record.mesh_ip.clone());
                 }
             }
         }
         out
+    }
+
+    /// The port to dial for a rule that declared none — the one port `ident`'s
+    /// ready records agree on across every node in the rule's scope.
+    ///
+    /// `None` unless the answer is unambiguous, and that strictness is the
+    /// point (R844-F5). Zero matching records means the workload is not up, and
+    /// two different ports mean the read cannot tell which one this hostname
+    /// fronts; both are cases where guessing publishes a hostname at the wrong
+    /// backend — the exact failure that stays invisible until a request 502s.
+    /// An operator who needs an ambiguous case published pins `port` on the
+    /// slot, and the pin always wins.
+    ///
+    /// **A workload with several listeners is no longer automatically ambiguous
+    /// (R844-F15).** It used to be: an `http` + `metrics` workload offered two
+    /// numbers with nothing to choose between them, so this returned `None` and
+    /// the slot had to pin a port forever — which is the pin R844's whole line
+    /// of work exists to remove. Now the records carry names, and a hostname
+    /// fronts the port named [`kamaji::DEFAULT_PORT_NAME`]. That is not a guess
+    /// dressed up as a rule: `http` is the name the allocator gives a sole
+    /// listener and the name synthesis gives a first declared port, so it means
+    /// "the one this workload serves traffic on" at every tier.
+    ///
+    /// The name is only consulted when the anonymous read is ambiguous, so a
+    /// node that predates named ports resolves exactly as it did before, and
+    /// two nodes disagreeing about which port is `http` is still `None`.
+    ///
+    /// Keyed on `ident` rather than on the rule's slot role: a node runs
+    /// several workloads and the record is the only thing that knows which is
+    /// which. The caller supplies the ident because it is a mirror-level fact
+    /// (`BundleSlot::workload_name`), not something a pure plan carries.
+    pub fn port_for(&self, rule: &IngressRule, ident: &str) -> Option<u16> {
+        let mut candidates: Vec<u16> = Vec::new();
+        let mut serving: Vec<u16> = Vec::new();
+        for (_, visibility) in self
+            .nodes
+            .iter()
+            .filter(|(machine, _)| self.in_scope(rule, machine))
+        {
+            for record in visibility.records().iter().filter(|r| r.ident == ident) {
+                for port in &record.ports {
+                    if !candidates.contains(port) {
+                        candidates.push(*port);
+                    }
+                }
+                if let Some(port) = record.named_ports.get(kamaji::DEFAULT_PORT_NAME) {
+                    if !serving.contains(port) {
+                        serving.push(*port);
+                    }
+                }
+            }
+        }
+        // The named answer first — it is the only one that can disambiguate a
+        // multi-listener workload — then the historic "exactly one port across
+        // every in-scope node" rule for records that carry no names.
+        match (serving.as_slice(), candidates.as_slice()) {
+            ([one], _) => Some(*one),
+            (_, [one]) => Some(*one),
+            _ => None,
+        }
     }
 
     /// Whether `machine`'s records may answer for `rule` — true for every node
@@ -401,7 +489,7 @@ impl IngressPlan {
                          a node is expected to stay dark.",
                         rule.slot,
                         rule.hostname,
-                        rule.port
+                        rule.port_label()
                     );
                 }
             }
@@ -409,6 +497,32 @@ impl IngressPlan {
             rule.upstreams()?;
         }
         Ok(())
+    }
+
+    /// Fill in each rule's port from a fanout read — the port half of
+    /// [`resolve_upstreams_from`](Self::resolve_upstreams_from), and the
+    /// fanout-backed counterpart of [`IngressPlan::resolve_ports`] (R844-F5).
+    ///
+    /// `ident` is the mesh identity the fronted workload registers under: a
+    /// bundle's `BundleSlot::workload_name`, which is the service name unless
+    /// the slot renames it. A record is only a candidate for a rule when its
+    /// ident matches, because a node runs several workloads and a port picked
+    /// off the wrong one publishes a hostname at somebody else's backend.
+    ///
+    /// **Run this before `resolve_upstreams_from`**: address discovery matches
+    /// records by port, so a rule still missing one resolves no address either.
+    /// Rules that pinned `port` are untouched — an operator pin always wins.
+    ///
+    /// Silent on failure by design: a rule that resolves neither port nor
+    /// address is reported once by [`IngressRule::upstreams`], naming both,
+    /// rather than twice in two vocabularies.
+    pub fn resolve_ports_from(&mut self, fanout: &ServiceRecordFanout, ident: &str) {
+        for rule in &mut self.rules {
+            if rule.port.is_some() {
+                continue;
+            }
+            rule.port = fanout.port_for(rule, ident);
+        }
     }
 
     /// Every node this plan's rules are placed on, deduplicated, in rule order —
@@ -439,9 +553,32 @@ mod tests {
     use crate::config::IngressProvider;
 
     fn record(ip: &str, ports: &[u16]) -> DiscoveredRecord {
+        named_record("yah-marketing", ip, ports)
+    }
+
+    /// A record for a named workload — what a node with several workloads
+    /// reports, and what port resolution has to tell apart (R844-F5).
+    fn named_record(ident: &str, ip: &str, ports: &[u16]) -> DiscoveredRecord {
         DiscoveredRecord {
+            ident: ident.into(),
             mesh_ip: ip.into(),
             ports: ports.to_vec(),
+            named_ports: kamaji::name_anonymous_ports(ports),
+        }
+    }
+
+    /// A record whose ports the supervisor NAMED — the shape a multi-listener
+    /// workload reports since R844-F14/F15, and the only one `port_for` can
+    /// disambiguate.
+    fn named_port_record(ident: &str, ip: &str, ports: &[(&str, u16)]) -> DiscoveredRecord {
+        DiscoveredRecord {
+            ident: ident.into(),
+            mesh_ip: ip.into(),
+            ports: ports.iter().map(|(_, p)| *p).collect(),
+            named_ports: ports
+                .iter()
+                .map(|(n, p)| ((*n).to_string(), *p))
+                .collect(),
         }
     }
 
@@ -450,7 +587,7 @@ mod tests {
     fn rule(hostname: &str, port: u16, machines: &[&str]) -> IngressRule {
         IngressRule {
             hostname: hostname.into(),
-            port,
+            port: Some(port),
             slot: "compute".into(),
             provider_id: None,
             machines: machines.iter().map(|m| m.to_string()).collect(),
@@ -800,5 +937,172 @@ mod tests {
         assert!(fanout.unknown_note().is_none());
         assert_eq!(fanout.records().count(), 0);
         assert_eq!(plan(Vec::new()).workload_machines(), Vec::<&str>::new());
+    }
+
+    // ── port resolution (R844-F5) ──
+
+    /// The live shape, measured on us-east-001: three workloads, two of them
+    /// sharing a port. A portless rule that matched on anything but the ident
+    /// would front the wrong one.
+    fn crowded_node() -> ServiceRecordFanout {
+        let mut fanout = ServiceRecordFanout::default();
+        fanout.push_answer(
+            "us-east-001",
+            vec![
+                named_record("yah-marketing", "100.64.0.3", &[43117]),
+                named_record("yah-marketing-revalidate", "100.64.0.3", &[8081]),
+                named_record("yah-marketing-feed", "100.64.0.3", &[8081]),
+            ],
+        );
+        fanout
+    }
+
+    #[test]
+    fn a_portless_rule_takes_the_port_its_own_record_reports() {
+        let fanout = crowded_node();
+        let mut portless = rule("yah.dev", 0, &["us-east-001"]);
+        portless.port = None;
+
+        let mut p = plan(vec![portless]);
+        p.resolve_ports_from(&fanout, "yah-marketing");
+        assert_eq!(p.rules[0].port, Some(43117));
+
+        // …and the address then resolves against that port, end to end.
+        p.resolve_upstreams_from(&fanout).unwrap();
+        assert_eq!(
+            p.passway_upstreams().unwrap(),
+            vec!["yah.dev=100.64.0.3:43117"]
+        );
+    }
+
+    #[test]
+    fn a_pinned_port_is_never_overwritten_by_discovery() {
+        let fanout = crowded_node();
+        let mut p = plan(vec![rule("yah.dev", 8080, &["us-east-001"])]);
+        p.resolve_ports_from(&fanout, "yah-marketing");
+        assert_eq!(p.rules[0].port, Some(8080), "an operator pin always wins");
+    }
+
+    #[test]
+    fn an_ident_nobody_reported_leaves_the_port_unresolved() {
+        let fanout = crowded_node();
+        let mut portless = rule("yah.dev", 0, &["us-east-001"]);
+        portless.port = None;
+
+        let mut p = plan(vec![portless]);
+        p.resolve_ports_from(&fanout, "yah-marketing-preview");
+        assert_eq!(p.rules[0].port, None);
+        // One message, naming both unresolved halves — not a panic, not a rule
+        // that publishes a hostname pointing at somebody else's workload.
+        let msg = format!("{:#}", p.resolve_upstreams_from(&fanout).unwrap_err());
+        assert!(msg.contains("no resolved port"), "got: {msg}");
+        assert!(msg.contains("no resolved upstream address"), "got: {msg}");
+    }
+
+    #[test]
+    fn two_ports_on_one_ident_is_ambiguous_rather_than_a_guess() {
+        // A workload exposing several ports cannot say which one the hostname
+        // fronts. Guessing publishes a front door at the wrong one and only
+        // shows up as a 502 at request time; the mirror pins `port` instead.
+        let mut fanout = ServiceRecordFanout::default();
+        fanout.push_answer(
+            "us-east-001",
+            vec![named_record("yah-marketing", "100.64.0.3", &[8080, 9090])],
+        );
+        let mut portless = rule("yah.dev", 0, &["us-east-001"]);
+        portless.port = None;
+        assert_eq!(fanout.port_for(&portless, "yah-marketing"), None);
+    }
+
+    /// …but a workload whose supervisor NAMED its ports is no longer ambiguous
+    /// (R844-F15). `http` is the name a sole listener gets from the allocator
+    /// and the name a front door publishes, so a hostname fronting an
+    /// `http` + `metrics` workload resolves to `http` instead of forcing the
+    /// slot to pin a port forever — which is the pin R844 exists to remove.
+    #[test]
+    fn a_named_serving_port_disambiguates_a_multi_listener_workload() {
+        let mut fanout = ServiceRecordFanout::default();
+        fanout.push_answer(
+            "us-east-001",
+            vec![named_port_record(
+                "yah-marketing",
+                "100.64.0.3",
+                &[("http", 8080), ("metrics", 9090)],
+            )],
+        );
+        let mut portless = rule("yah.dev", 0, &["us-east-001"]);
+        portless.port = None;
+        assert_eq!(fanout.port_for(&portless, "yah-marketing"), Some(8080));
+    }
+
+    /// The name buys disambiguation, not a guess. Two nodes that disagree about
+    /// which port is `http` are still ambiguous — the same answer the anonymous
+    /// path gives for two different ports, for the same reason.
+    #[test]
+    fn two_nodes_disagreeing_about_http_is_still_ambiguous() {
+        let mut fanout = ServiceRecordFanout::default();
+        fanout.push_answer(
+            "us-east-001",
+            vec![named_port_record(
+                "yah-marketing",
+                "100.64.0.3",
+                &[("http", 8080), ("metrics", 9090)],
+            )],
+        );
+        fanout.push_answer(
+            "us-west-001",
+            vec![named_port_record(
+                "yah-marketing",
+                "100.64.0.9",
+                &[("http", 8081), ("metrics", 9090)],
+            )],
+        );
+        let mut portless = rule("yah.dev", 0, &["us-east-001", "us-west-001"]);
+        portless.port = None;
+        assert_eq!(fanout.port_for(&portless, "yah-marketing"), None);
+    }
+
+    /// A node that predates named ports resolves exactly as it did before: the
+    /// name is only consulted when the anonymous read is ambiguous, so the
+    /// single-port path is untouched by any of this.
+    #[test]
+    fn a_record_with_no_names_still_resolves_its_single_port() {
+        let mut fanout = ServiceRecordFanout::default();
+        fanout.push_answer(
+            "us-east-001",
+            vec![DiscoveredRecord {
+                ident: "yah-marketing".into(),
+                mesh_ip: "100.64.0.3".into(),
+                ports: vec![43117],
+                named_ports: BTreeMap::new(),
+            }],
+        );
+        let mut portless = rule("yah.dev", 0, &["us-east-001"]);
+        portless.port = None;
+        assert_eq!(fanout.port_for(&portless, "yah-marketing"), Some(43117));
+    }
+
+    #[test]
+    fn a_record_on_a_node_outside_the_placement_does_not_answer() {
+        // The `upstreams_for` scoping rule, applied to ports: another node's
+        // workload of the same name is not this rule's backend.
+        let mut fanout = ServiceRecordFanout::default();
+        fanout.push_answer(
+            "us-west-001",
+            vec![named_record("yah-marketing", "100.64.0.9", &[43117])],
+        );
+        let mut portless = rule("yah.dev", 0, &["us-east-001"]);
+        portless.port = None;
+        assert_eq!(fanout.port_for(&portless, "yah-marketing"), None);
+    }
+
+    #[test]
+    fn an_unresolved_port_resolves_no_address_either() {
+        // Why ports must be resolved first: address discovery matches records
+        // by port, so a portless rule has nothing to match on.
+        let fanout = crowded_node();
+        let mut portless = rule("yah.dev", 0, &["us-east-001"]);
+        portless.port = None;
+        assert!(fanout.upstreams_for(&portless).is_empty());
     }
 }

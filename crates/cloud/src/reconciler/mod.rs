@@ -84,6 +84,7 @@ pub mod container;
 pub mod derive_cache_prune;
 pub mod domain;
 pub mod ingress;
+pub mod ingress_verify;
 pub mod local_process;
 pub mod mesofact_bundle;
 pub mod mesofact_static;
@@ -111,9 +112,14 @@ pub use derive_cache_prune::{
 };
 pub use domain::ensure_r2_custom_domain;
 pub use ingress::{
-    collate_front_doors, declared as ingress_declared, ensure_tunnel_ingress, plan_ingress,
-    publish_tunnel_ingress, resolve_ingress_placements, Collation, IngressPlan, IngressRule,
-    NodeFrontDoor, PlannedEdge, TunnelIngressOutcome,
+    collate_front_doors, declared as ingress_declared, ensure_tunnel_ingress, machine_mesh_addrs,
+    plan_ingress, publish_tunnel_ingress, resolve_ingress_placements, Collation, IngressPlan,
+    IngressRule, NodeFrontDoor, PlannedEdge, TunnelIngressOutcome,
+};
+pub use ingress_verify::{
+    apply_public_path, resolve_upstreams_reporting, verify_collation, BeaconFetch, DialOutcome,
+    EndpointCheck, PublicReadings, RuleResolution, RuleResolutions, RuleVerdict, VerifyFinding,
+    VerifyReport,
 };
 pub use local_process::LocalProcessReconciler;
 pub use mesofact_bundle::{

@@ -197,6 +197,7 @@
 //! @yah:handoff("DETERMINISM VERIFIED (not assumed): two independent builds an hour apart produced byte-identical tars, sha256 e856a18d14146fd199040c2557881c38e7275a911e3f6c2076587e5acbb42d01. That validated pasting the recorded hashes into .yah/services/yah-cloud/components/rusty-v8-musl/workload.toml, closing R546-T3's code side.")
 //! @yah:handoff("TEST GAP (deliberate, not done): the reap guard is NOT unit-tested -- workload_spec::forge_produced::HOST_ROOT is a hardcoded absolute /var/lib path, so a test would touch the real host fs. Making HOST_ROOT injectable is the prerequisite; I did not refactor that unprompted.")
 //! @yah:handoff("FLEET NOT YET PROTECTED: us-west-002 still runs the hand-patched unit + a yubaba binary WITHOUT the reap guard. The repo fixes only reach it on the next cross-build+redeploy. Fine for now (the timeout fix removes the trigger; the guard is defense-in-depth), but a fresh node provisioned before that redeploy would still hit the EROFS mkdir failure.")
+//! @yah:next("DESTROY SEMANTICS BUG — ROOT-CAUSED under R823-B4 (2026-09-03), read that ticket before acting on the bullet above. The incoherence that note describes (\"reaps the produced dir but leaves the container running\") is not a semantics choice; it is a key mismatch. yubaba's Stop carries the workload's MESH ident (forge.&lt;uuid&gt;) while kamaji-bin's containerd backend NAMES the container from spec.name (forge-&lt;uuid&gt;, R590-B9), so teardown probed a container that never existed and returned Ok — destroy answered \"destroyed\" over a live container. Fixed in oss/kamaji/crates/kamaji-bin/src/containerd.rs by resolving the Stop key through the yah.mesh-ident label. Retire this bullet once R823-B4's live roll proves it on a node.")
 //!
 //! @yah:ticket(R624-T2, "yubaba serve(): retry the mesh-IP bind with backoff instead of hard-exiting into the systemd restart budget")
 //! @yah:status(review)
@@ -357,6 +358,39 @@
 //! @yah:verify("rg -n 'cloudflared_url|register_cloudflare_tunnel|CloudflaredMock' oss/yubaba app/ -- should return zero hits outside annotation-block history")
 //! @yah:gotcha("Full build/test verification could not be run this session due to shared-tree contention from R783-F1 (see verify notes). The change itself is a straightforward deletion + one log-statement swap, reviewed by hand for brace/type correctness, but has NOT been compiler-checked. Whoever signs off should run the verify commands once the workspace is green again.")
 //! @yah:handoff("Filed R784 for the env_validate.rs discovery above (was previously just a prose note here) -- see R784 for the full keep-vs-delete decision.")
+//!
+//! @yah:relay(R854, "Back-to-back redeploy 500s with \"containerd: task already exists\" and leaves a healthy workload Failed with its secrets reaped")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-09-03T07:50:55Z)
+//! @yah:next("Decide the contract first: should deploy be idempotent over a running workload? If yes, the deploy path must reap-or-adopt the existing containerd task instead of letting create collide. If no, it should return a typed 409-shaped refusal that does NOT tear the running workload down, rather than a 500 that leaves it Failed.")
+//! @yah:next("Whichever way that goes, a deploy that fails at the backend must not leave a previously-healthy workload in Failed with no retry. Recovery here was one more deploy; that should not be something an operator has to know.")
+//! @yah:next("Reconsider the two teardown_secret_dir sites at lib.rs around 3457 and 3607 with R848's secret_dir_exists guard in hand. They reaped a still-declared workload's secrets on this path.")
+//! @yah:verify("Deploy the same workload twice back to back on one node and require both to return 200. This is also R848's end-to-end verify, which is blocked by this bug and cannot be closed until it is fixed.")
+//! @yah:verify("After a deliberately failed backend deploy, assert the previously-running workload is still Running (or is restored) and that /run/yah/secrets/<ident>/ still holds its file.")
+//! @yah:gotcha("REPRODUCED LIVE 2026-09-03 on us-west-001 running yubaba/kamaji 0.8.31, while closing R848's end-to-end verify. Two `yah cloud workload deploy yah-cloud-admin --where=node:us-west-001` calls back to back: the first returned deployed, the second returned 500 with kamaji BackendRefused, containerd 'creating task for yah-cloud-admin: Some entity that we attempted to create already exists / task yah-cloud-admin: already exists'. This is NOT R848 and not secrets: the deploy got PAST secret materialization to the container backend. R848's writer fix succeeded on all three deploys in that session.")
+//! @yah:gotcha("IT IS NOT IDEMPOTENT AND NOT SELF-HEALING. The failed deploy left the workload in state Failed (GET /workloads reported state Failed) - a redeploy of a HEALTHY production workload took it down. A third deploy a moment later succeeded and restored it (Running, /__mesofact/health 200, / 401), so recovery is one more deploy, but nothing does that automatically and an operator who walks away after the 500 leaves the service down.")
+//! @yah:gotcha("THE FAILURE PATH ALSO REAPS THE RUNNING WORKLOAD'S SECRET DIR. After the 500, /run/yah/secrets/yah-cloud-admin/ was gone. That is the backend-failure teardown at lib.rs around 3457 / 3607 - the two sites R848 deliberately left alone because they follow rt.teardown_workload, where reaping is normally correct. R848 fixed the equivalent overreach on the materialization-failure path only. Worth deciding whether these two want the same secret_dir_exists guard: here the reap fired on a workload that was still declared and about to be recovered.")
+//! @yah:gotcha("LIKELY A RACE, NOT A LOGIC BUG - the second deploy arrives before the first deploy's containerd task has been reaped, so task creation collides with a task on its way out. Matches the timing (back-to-back CLI calls, seconds apart). It also explains why R848's filing gotcha recorded 'deploying the IDENTICAL spec a second time succeeded' on 0.8.30: there the first attempt 422'd early on secrets and never created a task, so the second never collided.")
+//! @yah:handoff("ROOT CAUSE FOUND AND FIXED, and it is not where the ticket guessed. kamaji-bin's reap_container (oss/kamaji/crates/kamaji-bin/src/containerd.rs:715) fired SIGKILL and then deleted the task record in the very next breath with the result discarded (`let _ = tasks.delete(...)`). Containerd refuses to delete a task that has not reached STOPPED, so on a back-to-back redeploy that delete lost the race and was thrown away; the CONTAINER delete on the next line succeeded anyway (containerd's metadata store does not hold container and task together), leaving an orphan task with no container record. The redeploy then recreated the container fine and collided at CreateTask -- exactly the observed 'task yah-cloud-admin: already exists'. The inlined kamaji backend had the same bug wearing a blind `sleep(500ms)`.")
+//! @yah:handoff("CONTRACT DECIDED, no operator call needed: deploy IS idempotent over a running workload. The code already said so -- oss/kamaji/crates/kamaji/src/containerd.rs:790 comments 'Idempotent redeploy: reap any prior generation(s)' -- so this was a broken implementation of a settled contract, not an open design question. The fix makes the claim true rather than renegotiating it.")
+//! @yah:handoff("FIX (kamaji-containerd-core, the crate that exists so the two containerd backends cannot drift): new `reap_task(tasks, ns, container_id, timeout)` kills, waits on the shim's exit event (Tasks.Wait, bounded), deletes, and RE-PROBES -- it returns Ok only once containerd reports no task, and an Err naming the survivor's status otherwise. New `create_task_reaping_stale(...)` wraps Tasks.Create: on AlreadyExists it reaps the survivor and retries the create exactly once. Both containerd backends now call both. TASK_REAP_TIMEOUT = 15s.")
+//! @yah:handoff("SELF-HEALING, so the 'operator walks away after the 500' failure mode is gone: the AlreadyExists retry means the collision that produced R854 now resolves inside the one deploy instead of needing a third one. The reap wait means it should not arise at all.")
+//! @yah:handoff("SECRET REAP (the ticket's third next-step), both sites reconsidered with R848's guard in hand. lib.rs backend-failure arm (now ~3693) is GUARDED: `secret_dir_is_new` is hoisted to ~3311 and the reap only fires when THIS request created the dir. Rationale in-code: several kamaji refusals (tier guard, admission, unpullable image) reject BEFORE the running container is touched, so the files that arm unlinked were the live generation's. The headscale arm (~3497) is deliberately LEFT unguarded, with a comment saying why: the line above it has just called teardown_workload, so nothing is running off those files and reaping is correct there, not overreach.")
+//! @yah:handoff("DISCOVERED AND FIXED -- a second, independent reason 'deploy twice, both 200' could not pass. Materializing a File secret APPENDS a read-only bind volume to the spec, `effective_archetype()` infers Appliance from any non-empty volumes, and the archetype registry was recorded from the MATERIALIZED spec. So every secret-mounting workload with no explicit `archetype` was registered as an Appliance, and the single-instance guard refused its every later deploy with 409 'appliance already live' -- before the request ever reached containerd. The archetype is now sampled from the operator-authored spec before materialization (`authored_archetype`, lib.rs ~3300 / ~3660). A declared appliance is unaffected; there is a test for each half.")
+//! @yah:handoff("TESTABILITY WORK the fix needed: (a) kcc's reap loop is factored behind a small `TaskOps` trait (`reap_task_with`) so the retry/deadline logic -- the part that was wrong -- is exercised on a machine with no containerd; (b) yubaba gained `ServerState.local_secret_store_root` + `with_local_secret_store()`, because the handler hardcoded `SECRET_STORE_ROOT` and no test could otherwise resolve a LocalFile secret at all. Same value in production; the rotation task still uses the constant (noted in the field doc).")
+//! @yah:verify("cargo test -p kamaji-containerd-core --features containerd-integration = 36 passed / 0 failed (4 new in `reap_tests`: retries until the task is actually gone; a never-dying task errors instead of reporting a phantom reap; a STOPPED-but-undeletable record says so distinctly; no task at all is a silent no-op that does not SIGKILL).")
+//! @yah:verify("cargo test --workspace --features kamaji/containerd-integration (in oss/kamaji) = all green, 0 failed.")
+//! @yah:verify("cargo check -p kamaji --features containerd-integration / -p kamaji-bin --features containerd-integration = clean (the two pre-existing warnings in pidfd.rs + server.rs are not mine).")
+//! @yah:verify("cargo test -p yubaba --features testing --test testing -- integration_redeploy_failure:: = 4 passed / 0 failed. New file crates/yubaba/tests/integration_redeploy_failure.rs, registered in tests/testing.rs: a failed redeploy leaves the running generation's secret file byte-intact and the workload still declared, and the next deploy recovers; a failed FIRST deploy still reaps what it materialized; a secret-mounting server stays redeployable; a declared appliance is still single-instance.")
+//! @yah:verify("cargo test -p yubaba --features testing = 605 lib tests passed / 0 failed. The tests/main.rs raft group showed failures in raft_member_registration / raft_membership_loop / raft_quorum_geography -- that is the PRE-EXISTING red W267 documents verbatim ('the SAME pre-existing raft red F1 documented ... the count still moves between runs'), it is containerd-free cluster-timing flake under a loaded camp, and nothing I touched is on its path.")
+//! @yah:verify("NOT RUN, and it is the ticket's headline verify: two back-to-back deploys on us-west-001 both returning 200. That needs kamaji rebuilt and deployed to a live production node, which is an operator action, not a session one. Sequence when someone takes it: cross-build kamaji (DOCKER_DEFAULT_PLATFORM=linux/amd64), ship it to us-west-001, then `yah cloud workload deploy yah-cloud-admin --where=node:us-west-001` twice in a row -- both 200 -- and confirm /run/yah/secrets/yah-cloud-admin/ still holds its file after. That also closes R848's blocked verify.")
+//! @yah:gotcha("THE LIVE ASSERTION IS STILL OPEN. Everything here is proven by unit + handler tests on a containerd-free host; the two-deploys-on-a-node assertion needs a kamaji rebuild shipped to us-west-001, which is an operator action. Do not read 'R854 fixed' as 'reproduced fixed on the box' until that runs.")
+//! @yah:gotcha("SHARED-TREE NOTE: @Ashguard:vortex is live on R848 in the SAME function (deploy_workload_spec, oss/yubaba/crates/yubaba/src/lib.rs), and another session was mid-landing `Workload::TenantPassway` + oss/yubaba/crates/yubaba/src/tenant_passway.rs while this shipped -- which left yubaba's lib non-exhaustive at lib.rs:2965 and made the final yubaba re-run un-runnable. That break is theirs and transient; my hunks (secret_dir_is_new at ~3311, the guarded reap at ~3693, authored_archetype at ~3300/~3660, local_secret_store_root) were verified present by content afterwards. @Ashguard:vortex was notified over party.chat with the full hunk list.")
+//! @yah:handoff("Done, pending the live assertion. Root cause was kamaji's task reap, not yubaba's secret handling: kamaji-bin's reap_container discarded the result of a Tasks.Delete it fired immediately after SIGKILL, containerd refuses to delete a non-STOPPED task, and the orphan collided with the redeploy's CreateTask. Fixed in kamaji-containerd-core (reap_task waits + verifies; create_task_reaping_stale reaps-and-retries once on AlreadyExists) and wired into both containerd backends. yubaba's backend-failure arm now applies R848's secret_dir_exists guard; the headscale arm is deliberately left unguarded with an in-code reason. Also fixed a second, independent blocker to 'deploy twice, both 200': secret materialization appends a bind volume, which made effective_archetype() infer Appliance, so the single-instance guard 409'd every redeploy of a secret-mounting workload before it reached containerd -- the archetype is now sampled from the authored spec. 8 new tests, all green. The peer collision noted in the gotchas is @Ashguard:blade (R852, tenant_passway); the one lib-test failure on the final run is theirs, in their own new module.")
+//! @yah:verify("Final tree state, after @Ashguard:blade's tenant_passway landing: cargo test -p yubaba --features testing --test testing = 21 passed / 0 failed (my 4 among them); cargo test -p yubaba --features testing --lib = 611 passed / 1 failed, the failure being tenant_passway::tests::the_ident_is_the_domain_until_it_would_exceed_the_mesh_ident_cap, a peer's in-flight module.")
+//! @yah:gotcha("DESTROY GOT SLOWER IN THE PATHOLOGICAL CASE, and anyone timing a rolling replace should know. POST /workloads/{ident}/destroy routes to kamaji-bin reap_container, which now WAITS for the task to actually die (kcc::TASK_REAP_TIMEOUT = 15s, bounded) instead of firing a delete and discarding the result. Normal case is unchanged -- it returns the moment the shim publishes the exit, which it always could have. A reap that exhausts the budget is still non-fatal: it logs 'kamaji: task reap did not complete' at warn and destroy still answers 'destroyed', so no new error surface. That warn line is the thing to grep if a redeploy ever still hits 'already exists' -- it means 15s was not enough, not that the retry is broken. Relevant to R848-B1's rolling verb (@Ashguard:vortex), which does destroy-then-deploy per machine; notified.")
+//! @yah:gotcha("YOUR 15s REAP BOUND IS NOW LOAD-BEARING ON A CLIENT TIMEOUT (from R848-B1, Ashguard:vortex). Making destroy WAIT for the containerd task to reach STOPPED before deleting the record means POST /workloads/{ident}/destroy is no longer a control-plane decision, and cloud-client's destroy_workload was still inheriting DEFAULT_TIMEOUT = 5s. A destroy that actually used its reap budget would therefore fail client-side while the server was doing the right thing. Fixed in R848-B1: new DESTROY_TIMEOUT = 60s at crates/yah/cloud-client/src/lib.rs, applied per-request the same way DEPLOY_TIMEOUT is. If the 15s bound in kamaji's reap_task ever moves, re-check that 60s. The failure mode is silent and asymmetric - too short and `yah cloud workload rolling` (destroy-then-deploy per machine, R848-B1) reports a teardown failure for a teardown that succeeded, skips its re-deploy, and leaves the workload DOWN. The other caller with the same exposure was Remote-QED's MeshWardenClient reaping forge containers; it is covered by the same change.")
 
 pub mod acme_issuer;
 /// Per-domain TLS material in an object store instead of raft (R779 / W267) —
@@ -376,6 +410,10 @@ pub mod domain_admin;
 /// — sweeps the [`cert_store`] enrollment set, validates by DNS-01 CNAME
 /// delegation, and writes the sealed pair to the object store rather than raft.
 pub mod domain_issuer;
+/// Arm one cold passway per enrolled custom domain (R852-F1 / W267) — the
+/// far end of the splice [`demux_routes`] publishes, deployed through kamaji's
+/// JIT tier so 10k idle domains cost 10k held fds rather than 10k processes.
+pub mod tenant_passway;
 /// The camp-RPC lane of the yah control plane (R609-F2): serve a
 /// workspace's `yah camp --stdio` JSON-RPC to a NodeId dial, so a desktop
 /// reaches a BYO VPS exactly as it reaches a managed rig. Opt-in via
@@ -457,7 +495,7 @@ use openraft::async_runtime::watch::WatchReceiver;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cheers_client::CheersClient;
@@ -732,10 +770,49 @@ pub struct ServerState {
     /// secret name that is per-domain TLS material.
     pub cert_store: Option<std::sync::Arc<cert_store::ObjectCertStore>>,
 
+    /// R852-F2: this deployment's **public** ingress address(es) — the host
+    /// running `passway-demux` on `:443` — as `GET /domains/{d}/onboarding`
+    /// reports them to a tenant.
+    ///
+    /// Resolved once at boot from [`PUBLIC_INGRESS_ENV`] rather than read per
+    /// request, so the handler holds no process-global state and a test can
+    /// build a node with a known answer instead of racing `set_var` against
+    /// whatever else the test binary is running.
+    ///
+    /// Empty means **unknown, and say so** — never guessed. The one address the
+    /// daemon could otherwise reach for is the enrollment's `tls_backend`,
+    /// which is the internal address the demux splices to; handing that to a
+    /// tenant as their A record is the failure this field exists to avoid.
+    pub public_ingress: Vec<String>,
+
+    /// R852-F2: the zone `_acme-challenge.<domain>` is CNAME'd into, resolved
+    /// at boot from `domain_issuer::DELEGATE_ZONE_ENV` — the same value the
+    /// issuer runs with, so the record this node *reports* and the record it
+    /// *publishes under* cannot disagree.
+    ///
+    /// `None` is a misconfiguration for a custom domain (the TXT would have to
+    /// live in a zone we do not hold), and the onboarding payload renders it as
+    /// one rather than printing a record the tenant cannot usefully create.
+    pub domain_delegate_zone: Option<String>,
+
     /// R600-F6 (W273): root for materialized secret tmpfs files (default
     /// [`deploy::secret_mount::DEFAULT_SECRET_MOUNT_ROOT`]; override in tests).
     /// Each workload gets a `<root>/<ident>/` subdir, reaped on destroy.
     pub secret_mount_root: PathBuf,
+
+    /// Root of the per-machine yubaba secret store a `SecretRef::LocalFile`
+    /// resolves against (default [`secrets::SECRET_STORE_ROOT`]).
+    ///
+    /// R854: a field rather than the constant inlined at the resolver's
+    /// construction, so a test can point it at a tempdir and drive the deploy
+    /// handler's *whole* secret path — which is the only way to assert what
+    /// the failure arms do with an already-materialized dir.
+    ///
+    /// Read by the deploy handler only. The rotation task
+    /// ([`secret_reload::reload_once`]) still builds its resolver on the
+    /// constant; identical in production, and its own tests construct
+    /// resolvers directly rather than going through this state.
+    pub local_secret_store_root: PathBuf,
 
     /// R600-F4 (W273): registry of deployed workloads that mount a cluster
     /// secret as a `File`, keyed on mesh ident. Populated by the deploy handler
@@ -940,22 +1017,25 @@ pub struct ServerState {
     /// that built the handler map, never re-stated.
     pub control_plane_planes: control_plane::Planes,
 
-    /// Monotonically increasing counter for stub mesh-IP allocation.
-    /// Allocates from `100.64.0.1` upward (CGNAT range per RFC 6598).
-    /// Replaced by raft-consensus assignment in R091-F6.
-    next_mesh_ip: AtomicU32,
-
     /// This **node's own** mesh address — the one yubaba itself is bound to
     /// (R599-F12). Set from `--bind` in `main.rs`; `None` when yubaba is bound
     /// to loopback, to `0.0.0.0`, or to a non-IP host, i.e. whenever there is
     /// no mesh IP plane to place anything on.
     ///
-    /// Distinct from [`Self::alloc_mesh_ip`], and the distinction is the whole
-    /// point: an allocated address belongs to *one workload* and is only
-    /// meaningful to a backend that gives the workload its own network
-    /// namespace. A **natively forked** workload — the W272 bundle path — is a
-    /// plain host process, so the only address it can successfully bind is one
-    /// the node already holds. That is this one.
+    /// **The only mesh address this node ever hands out** (R844-B11). There
+    /// used to be a second source — a `next_mesh_ip: AtomicU32` counter seeded
+    /// to `100.64.0.1` on every node, drawn from by `alloc_mesh_ip()` for the
+    /// container deploy path. Nothing ever *configured* the address it
+    /// produced (`MeshAssignment::stub` applies no WireGuard), but containerd
+    /// wrote it as the `yah.mesh_ip` label, `ServiceRecords::reconcile` read
+    /// it back, and the record then advertised it as a dialable endpoint. Since
+    /// the counter drew from the same `100.64.0.0/10` the real node addresses
+    /// live in, allocation *n* of a process was `100.64.0.n` — a **different,
+    /// real node**. Measured on us-west-001 2026-09-03: its `yah-cloud-admin`
+    /// record advertised `100.64.0.3:4325` (us-east-001, connection refused)
+    /// while the workload answered on `100.64.0.1:4325`, west's own address.
+    /// Both the counter and `alloc_mesh_ip` are gone; see
+    /// [`Self::workload_bind_ip`] for what replaced them.
     node_mesh_ip: Option<std::net::Ipv4Addr>,
 }
 
@@ -1049,6 +1129,27 @@ fn hostkey_dir_for(state_path: &std::path::Path) -> PathBuf {
     }
 }
 
+/// @yah:ticket(R844-B11, "Container service records advertise a counter-allocated mesh IP that collides with real node addresses")
+/// @yah:status(review)
+/// @yah:at(2026-09-03T22:13:27Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R844)
+/// @yah:severity(high)
+/// @yah:gotcha("MEASURED LIVE 2026-09-03, not inferred. `curl http://100.64.0.1:7443/service-records` (us-west-001) returns {\"ident\":\"yah-cloud-admin\",\"mesh_ip\":\"100.64.0.3\",\"ports\":[4325],\"endpoints\":[\"100.64.0.3:4325\"],\"health\":\"ready\"}. 100.64.0.3 is us-east-001 (raft voter 3), which does NOT run cloud-admin: `curl http://100.64.0.3:4325/` gets exit 7 connection-refused, while `curl http://100.64.0.1:4325/` answers 401. So the record is advertising an endpoint that is a DIFFERENT NODE and is dead, while the workload it describes is alive one address over. The record is not stale and not a replication artifact — west stamped the wrong address onto its own record at deploy time.")
+/// @yah:gotcha("ROOT CAUSE, end to end, all five hops read on disk. (1) `ServerState::next_mesh_ip` is seeded `AtomicU32::new(u32::from_be_bytes([100,64,0,1]))` at oss/yubaba/crates/yubaba/src/lib.rs:1213 — the SAME constant on every node, no node identity in it. (2) `alloc_mesh_ip` (lib.rs:1564) is a bare `fetch_add(1)` → `Ipv4Addr::from(n)`, so allocation n of a process is 100.64.0.n. (3) The container deploy path takes that value: `MeshAssignment::stub(s.alloc_mesh_ip())` at lib.rs:3475. (4) It is never applied to anything — `MeshAssignment::stub` is a pure alias for `inlined` (oss/kamaji/crates/kamaji/src/lib.rs), which sets `wg_private_key: String::new()` so `has_wireguard()` is false; containerd only writes it as the `yah.mesh_ip` LABEL (containerd.rs:391) and echoes it in DeployResult (containerd.rs:459), per its own module doc at containerd.rs:20 (\"only uses the mesh_ip field in F1\"). (5) `ServiceRecords::reconcile` reads that label straight back off `WorkloadState::mesh_ip` into the record (service_records.rs:797, containerd.rs:845). So a container workload's advertised mesh_ip is a per-process counter drawn from the SAME 100.64.0.0/10 the real node addresses live in. cloud-admin was west's 3rd container deploy since yubaba start; .1/.2/.3 are west-001/south-001/east-001.")
+/// @yah:gotcha("DO NOT CONCLUDE FROM A HEALTHY-LOOKING RECORD THAT THE FLEET IS FINE — the tier decides, not the node. W272 bundles go through `ServiceRecords::admit_bundle`, which uses `ServerState::node_mesh_ip` (a REAL address, service_records.rs:35, :703-727), so their records are correct. Container workloads go through the counter and are wrong. That is the entire reason us-east-001's `yah-marketing` record reads {\"mesh_ip\":\"100.64.0.3\",\"endpoints\":[\"100.64.0.3:8080\"]} and looks perfect: marketing is a bundle and .3 genuinely IS east's node address. The R844 relay's 2026-09-03 \"discovery works, blocker is gone\" gotchas were all measured against that ONE bundle record. No container record was checked. Re-measure per tier before trusting any of them.")
+/// @yah:gotcha("THE EXISTING TEST LOOKS LIKE IT COVERS THIS AND DOES NOT. oss/yubaba/crates/yubaba/src/lib.rs:9545 asserts `assert_ne!(mesh.alloc_mesh_ip(), Ipv4Addr::new(100,64,0,3))` with the comment \"The allocator hands out a *different* address entirely — one that belongs to a workload, not to this node.\" It passes ONLY because it is the first allocation in that test (returns 100.64.0.1). Call `alloc_mesh_ip()` twice more before the assert and it fails. Do not treat it as a regression guard; replace it with one that pins the invariant it is gesturing at.")
+/// @yah:next("THE BLAST RADIUS IS R844-T10 AND ONLY R844-T10, which is why this is filed here rather than as a standalone yubaba bug. Nothing is broken in production TODAY because the apex pins (`upstream_host` / `ingress_machines` in .yah/services/*/mirrors/cloud.toml) still name the address literally, so passway never consults `endpoints`. T10 deletes exactly those pins. The moment it lands, every FRONTED CONTAINER workload resolves to whatever node address the counter happened to hand it — a wrong-node, connection-refused upstream that reads as a healthy Ready record. That is precisely the \"renders a SUBSET rather than an empty set, which is worse than the failure R772 refused to ship because it looks like it worked\" failure mode R844-F4 exists to prevent, arriving through a different door.")
+/// @yah:next("THE FIX IS TO STOP INVENTING AN ADDRESS, NOT TO PICK A BETTER RANGE. Since `stub`/`inlined` applies no WireGuard and containerd shares the host network namespace, a container on node N is reachable at N's own address — so the honest value for a container record is `ServerState::node_mesh_ip`, exactly what `admit_bundle` already uses. Preferred shape: make the record's address come from `node_mesh_ip` for BOTH tiers, and either delete `alloc_mesh_ip` or confine it behind `MeshAssignment::has_wireguard()` so it can only ever produce an address that something actually configures. Second-best if a per-workload identifier is still wanted for labels: keep the counter for the `yah.mesh_ip` label but STOP letting `reconcile` promote a label into a routable `endpoints` entry. Do not \"fix\" this by moving the counter to an unused sub-range — that keeps a fabricated address in the routing path and only delays the collision.")
+/// @yah:next("Tier: Warrior — the code change is small and localized, but the call about what a container record's address MEANS spans yubaba, kamaji's mesh contract and R844-F4/F5's discovery semantics, and it gates a live-traffic cutover on the node fronting yah.dev.")
+/// @yah:verify("LIVE, and it is the only verification that counts — a unit test cannot see this. After the fix, roll the node and re-read: `curl -s http://100.64.0.1:7443/service-records` must report yah-cloud-admin at 100.64.0.1:4325 (west's own address), and `curl -o /dev/null -w '%{http_code}' http://<advertised endpoint>` must answer 401, not connection-refused. Assert the general form on every clustered node, not just west: for each record, `mesh_ip` MUST equal that node's own `tailscale ip -4`.")
+/// @yah:verify("cargo test -p yubaba --lib  # plus a NEW test replacing the false guard at lib.rs:9545: exhaust several allocations before asserting, so it fails if a record's address can ever equal a declared node address in .yah/infra/machines/*.toml")
+/// @yah:handoff("FIXED AT THE SOURCE, and the class is gone rather than narrowed. `ServerState::alloc_mesh_ip` and its `next_mesh_ip: AtomicU32` are DELETED (they had exactly one production caller). The container deploy path at oss/yubaba/crates/yubaba/src/lib.rs now takes `crate::mesh::MeshAssignment::stub(s.workload_bind_ip())`, and `workload_bind_ip()` is `self.node_mesh_ip.unwrap_or(Ipv4Addr::LOCALHOST)` — the same answer the bundle path and `ServiceRecords::admit_bundle` already used, so BOTH tiers now advertise the answering node's own address and there is no second source to drift.")
+/// @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib = 625 passed / 0 failed. cargo test -p yubaba --features testing --test testing -- integration_service_records:: = 11 passed / 0 failed. cargo check --manifest-path oss/yubaba/Cargo.toml --workspace --all-targets = exit 0 (only the two pre-existing unused-import warnings in mesofact_static.rs).")
+/// @yah:handoff("WHY `node_mesh_ip` IS THE HONEST VALUE AND NOT JUST A BETTER GUESS, corrected from the ticket's own reasoning. The ticket said containerd \"shares the host network namespace\"; it does not — containerd.rs:461 says a container gets its OWN netns and its test `netns_present` at :1325 asserts \"default workload must get an isolated netns\". The real argument is narrower and stronger: `MeshAssignment::stub` leaves `wg_private_key` empty so `has_wireguard()` is false, `mesh.netns_name` is None, and containerd writes `mesh_ip` ONLY as the `yah.mesh_ip` label — so NOTHING configures the address on any interface, in any tier. The value was never routable; it only looked routable because it was drawn from 100.64.0.0/10. Reachability therefore comes from host networking, and the one container workload this fleet runs has it: .yah/infra/workloads/yah-cloud-admin.toml:133 sets `\"yah.network\" = \"host\"` (gated on tier = \"infra\"), which is exactly why cloud-admin answers on us-west-001's own 100.64.0.1:4325. Loopback is the fallback for a node with no mesh plane and is also the honest answer for a hypothetical isolated-netns container: unreachable, and VISIBLY so, unlike a neighbour's address.")
+/// @yah:handoff("THE FALSE GUARD IS REPLACED, AND A SECOND STALE ASSERTION WAS FOUND BY THE FIX. (1) lib.rs's `assert_ne!(mesh.alloc_mesh_ip(), 100.64.0.3)` is gone; `the_node_mesh_address_comes_from_the_bind_flag` keeps only the part that was real, and a new `a_deployed_workloads_address_is_this_nodes_own_however_many_came_before` asserts STABILITY over 8 consecutive deploys plus the loopback fallback — repetition is the property the counter failed, so asserting it is what makes it a guard instead of a restatement. (2) DISCOVERED, not in the ticket: oss/yubaba/crates/yubaba/tests/integration_service_records.rs:178 asserted `record.mesh_ip.octets()[0] == 100` — \"somewhere in the CGNAT pool\", which is precisely the property THE BUG SATISFIED, since the counter drew from that pool and its third draw was us-east-001's real address. Replaced with `assert_eq!(record.mesh_ip, state.node_mesh_ip().unwrap())` on a node booted at 100.64.0.7 via a new `boot_on_mesh` helper (`.7` chosen because `.1/.2/.3` are both the counter's first three draws and the fleet's first three node addresses, so the old assertion could not discriminate). Reported to me by @Ashguard:dove, who hit it on R844-F15; fixed here because it is B11's semantics.")
+/// @yah:verify("STILL OWED, AND IT IS THE VERIFICATION THAT COUNTS — a unit test cannot see this. The fleet must be rolled onto a yubaba carrying this change, then re-read per tier: `curl -s http://100.64.0.1:7443/service-records` must report yah-cloud-admin at 100.64.0.1:4325 (west's OWN address, not .3), and `curl -o /dev/null -w '%{http_code}' http://<advertised endpoint>` must answer 401 rather than connection-refused. General form on EVERY clustered node: each record's `mesh_ip` equals that node's own `tailscale ip -4`. Until that read is taken, this fix is proven in tests and unproven in production.")
+/// @yah:gotcha("UNBLOCKS R844-F12's STATED LIMIT. F12 depends_on this ticket because its `upstream_host` derivation reads a machine's declared `mesh_ipv4`, and F12's own gotcha said that is \"sound for node-bound NATIVE workloads and its general validity depends on how B11 resolves\". It resolves in F12's favour: after this change EVERY tier's record address is the node's own mesh address, which is the same fact `.yah/infra/machines/<node>.toml` declares as `[registration].mesh_ipv4`. So the derivation is now valid for containers too, and the two sources agree by construction rather than by coincidence. F12 no longer needs to \"scope the fallback explicitly to the native shape and make it refuse rather than guess for containers\".")
 impl ServerState {
     pub fn load(state_path: PathBuf) -> Result<Self> {
         let mut state = identity::load_state(&state_path)?;
@@ -1109,7 +1210,10 @@ impl ServerState {
             cluster_state: None,
             cluster_kek_path: PathBuf::from(secrets::CLUSTER_KEK_PATH),
             cert_store: None,
+            public_ingress: Vec::new(),
+            domain_delegate_zone: None,
             secret_mount_root: PathBuf::from(deploy::secret_mount::DEFAULT_SECRET_MOUNT_ROOT),
+            local_secret_store_root: PathBuf::from(secrets::SECRET_STORE_ROOT),
             secret_workloads: Default::default(),
             litestream_s3_url: None,
             session_id: new_session_id(),
@@ -1131,7 +1235,6 @@ impl ServerState {
             control_plane: None,
             control_plane_planes: control_plane::Planes::default(),
             // Start at 100.64.0.1 (first usable in the CGNAT /10 pool).
-            next_mesh_ip: AtomicU32::new(u32::from_be_bytes([100, 64, 0, 1])),
             node_mesh_ip: None,
         })
     }
@@ -1478,13 +1581,38 @@ impl ServerState {
         Some(result)
     }
 
-    /// Allocate the next mesh IP from the 100.64.0.0/10 stub pool.
+    /// The mesh address a workload deployed by this node is reachable at
+    /// (R844-B11).
     ///
-    /// Thread-safe; wraps around at 100.127.255.255 (pool exhaustion silently
-    /// rolls over — acceptable for tests). Replaced by raft in R091-F6.
-    pub fn alloc_mesh_ip(&self) -> std::net::Ipv4Addr {
-        let n = self.next_mesh_ip.fetch_add(1, Ordering::Relaxed);
-        std::net::Ipv4Addr::from(n)
+    /// Replaces `alloc_mesh_ip`, which invented one. The distinction that
+    /// matters is not "node vs workload" but **configured vs fabricated**: an
+    /// address is only dialable if something wrote it onto an interface, and
+    /// nothing in this tree does. `MeshAssignment::stub` leaves
+    /// `wg_private_key` empty, so `has_wireguard()` is false and no WireGuard
+    /// is ever applied; containerd's own module doc says it "only uses the
+    /// `mesh_ip` field", writing it as the `yah.mesh_ip` label and nothing
+    /// else. So a per-workload address is a string that travels from this
+    /// function into a service record and out to passway without ever becoming
+    /// true — and because it was drawn from `100.64.0.0/10`, it collided with
+    /// the fleet's real node addresses.
+    ///
+    /// The node's own address, by contrast, *is* configured — yubaba is bound
+    /// to it. A host-networked container (the only container shape the fleet
+    /// runs: `.yah/infra/workloads/yah-cloud-admin.toml` sets
+    /// `"yah.network" = "host"`, and kamaji permits it only for `tier =
+    /// "infra"`) binds host ports directly, so the node's address is exactly
+    /// where it answers. Same reasoning the bundle path already relies on for
+    /// its native fork, and the same as `ServiceRecords::admit_bundle`.
+    ///
+    /// Loopback when this node has no mesh plane (`--bind 0.0.0.0` on a dev
+    /// host), matching the bundle path's fallback. It is the honest answer for
+    /// the isolated-netns shape too: such a container gets a fresh empty
+    /// namespace with nothing but `lo` in it, so there is no address another
+    /// node could dial. A record carrying `127.0.0.1` is visibly unreachable;
+    /// one carrying a neighbour's address is not, and that is the failure this
+    /// replaces.
+    pub fn workload_bind_ip(&self) -> std::net::Ipv4Addr {
+        self.node_mesh_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST)
     }
 
     /// Attach an already-opened raft node to the server state.
@@ -1643,6 +1771,14 @@ impl ServerState {
         self
     }
 
+    /// Override the per-machine secret store a `SecretRef::LocalFile` reads
+    /// from (R854) — the third path the deploy handler touches, and the one a
+    /// test needs redirected before a `LocalFile` secret can resolve at all.
+    pub fn with_local_secret_store(mut self, root: impl Into<PathBuf>) -> Self {
+        self.local_secret_store_root = root.into();
+        self
+    }
+
     /// R779 (W267): attach the object-store fallback for per-domain TLS material.
     ///
     /// Built from the daemon environment at startup
@@ -1650,6 +1786,21 @@ impl ServerState {
     /// node never calls this and keeps resolving from raft alone.
     pub fn with_cert_store(mut self, store: cert_store::ObjectCertStore) -> Self {
         self.cert_store = Some(std::sync::Arc::new(store));
+        self
+    }
+
+    /// R852-F2: what `GET /domains/{d}/onboarding` reports. `delegate_zone` is
+    /// the issuer's own; `ingress` is this deployment's public address(es), and
+    /// an empty list is the honest "not known here".
+    pub fn with_domain_onboarding(
+        mut self,
+        delegate_zone: Option<String>,
+        ingress: Vec<String>,
+    ) -> Self {
+        self.domain_delegate_zone = delegate_zone
+            .map(|z| z.trim().trim_matches('.').to_string())
+            .filter(|z| !z.is_empty());
+        self.public_ingress = ingress;
         self
     }
 
@@ -1841,6 +1992,11 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
             service_records::DISCOVERY_PATH,
             get(service_records::get_service_records),
         )
+        // R852-F2 (W267 §Decision 2): the two DNS records a custom domain's
+        // owner must create, for a UI to render. Read-only and derivation-only
+        // — see the handler for why this is a GET on the daemon while
+        // `yubaba domain enroll` deliberately is not.
+        .route("/domains/{domain}/onboarding", get(get_domain_onboarding))
         // R374-F2: pond (sim-tier mesofact-static) status surface
         .route("/pond/deploy", post(pond::deploy))
         .route("/pond/teardown", post(pond::teardown))
@@ -2146,6 +2302,121 @@ async fn get_node_usage(
 ) -> Json<node::NodeUsage> {
     let committed = node::committed_totals(&s.workload_resources);
     Json(s.node_probe.usage(q.window_ms, committed).await)
+}
+
+/// Env key naming this deployment's **public** ingress address(es), comma- or
+/// space-separated — the host running `passway-demux` on `:443` (R852-F2).
+///
+/// Asked for, never derived, exactly as `yubaba domain enroll --ingress` is and
+/// for the same reason: the only address the daemon can otherwise reach for is
+/// the enrollment's `tls_backend`, which is the *internal* address the demux
+/// splices to. Handing a tenant a loopback address as their A record is a
+/// worse answer than "I do not know", so unset renders as unknown rather than
+/// as a guess.
+pub const PUBLIC_INGRESS_ENV: &str = "YUBABA_PUBLIC_INGRESS";
+
+/// Read [`PUBLIC_INGRESS_ENV`] into the address list an onboarding payload
+/// carries. Unset, blank, or all-separators yields an empty list.
+///
+/// Public so `main.rs` can resolve it once at boot into
+/// [`ServerState::public_ingress`] — the request path must not read the
+/// environment, both because a handler with hidden global inputs is untestable
+/// and because this test binary runs its modules in parallel.
+pub fn public_ingress_targets(raw: Option<String>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// `GET /domains/{domain}/onboarding` — the two DNS records the owner of a
+/// custom domain must create (R852-F2 / W267 §Decision 2).
+///
+/// **Why this read is on the daemon while the writes are not.** `yubaba domain
+/// enroll` reads and writes the bucket directly — no daemon, no quorum, no
+/// leader — because the enrollment set is not raft state and routing an admin
+/// write through the daemon would add a dependency the data does not have. That
+/// argument is about *writes needing no coordination*; it does not say a
+/// tenant-facing UI should hold R2 credentials in order to render two DNS
+/// names. This is derivation plus one existence check, and it is the same
+/// mesh-bound read posture `GET /service-records` and `GET /workloads` already
+/// have.
+///
+/// **404 for a domain that was never enrolled**, deliberately: the enrollment
+/// set is the structural allowlist (R779 P5), so rendering onboarding for a
+/// name outside it would walk a tenant through creating records that can never
+/// validate — and would let anyone use this endpoint to mint plausible-looking
+/// instructions for a domain this deployment will not serve.
+///
+/// The payload is `domain_admin::Onboarding::to_json` verbatim; the record
+/// names come from `acme_engine::dns01_record_name`, the same function the
+/// issuer publishes under. Nothing here formats a name.
+async fn get_domain_onboarding(
+    State(s): State<Arc<ServerState>>,
+    axum::extract::Path(domain): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let Some(store) = s.cert_store.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "no cert store configured on this node — set {} so the enrollment set \
+                     can be read",
+                    cert_store::BUCKET_ENV
+                )
+            })),
+        )
+            .into_response();
+    };
+
+    let enrolled = {
+        let domain = domain.clone();
+        tokio::task::spawn_blocking(move || store.enrollment(&domain)).await
+    };
+    match enrolled {
+        Ok(Ok(Some(_))) => {}
+        Ok(Ok(None)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "{domain} is not enrolled — `yubaba domain enroll {domain} \
+                         --tls-backend <addr>` first. The enrollment set is the allowlist, \
+                         so a name outside it cannot be issued for."
+                    )
+                })),
+            )
+                .into_response();
+        }
+        Ok(Err(e)) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": format!("reading the enrollment set: {e}") })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("enrollment lookup panicked: {e}") })),
+            )
+                .into_response();
+        }
+    }
+
+    // Both inputs were resolved at boot (see `ServerState::public_ingress`):
+    // the request path reads no environment, so this handler's answer is a pure
+    // function of the node's configuration plus the enrollment check above.
+    let onboarding = domain_admin::Onboarding::new(
+        &domain,
+        domain_admin::validation(&domain, s.domain_delegate_zone.as_deref()),
+        s.public_ingress.clone(),
+    );
+    Json(onboarding.to_json()).into_response()
 }
 
 /// `POST /node/metrics` — publish domain metrics this node cannot measure.
@@ -2948,6 +3219,22 @@ async fn deploy_non_container(
             String::new(),
             Some("static-asset workloads publish to the object store, not to a node".into()),
         ),
+        // R852-F1: a per-tenant passway IS deployed to a node, but not through
+        // this HTTP verb. Its declaration is generated from the enrollment set
+        // by `tenant_passway::reconcile_once`, which goes straight to
+        // `KamajiClient::deploy_envelope` — there is no operator-authored
+        // manifest to POST here, and a hand-posted one would be overwritten by
+        // the next sweep. Reject with that pointer rather than half-supporting
+        // a path nothing drives.
+        workload_spec::Workload::TenantPassway(w) => (
+            w.domain.clone(),
+            Some(
+                "tenant-passway workloads are generated from the cert-store enrollment set by \
+                 yubaba's tenant_passway reconciler, not posted — enroll the domain with \
+                 `yubaba domain enroll <domain> --tls-backend <addr>` and the next sweep arms it"
+                    .into(),
+            ),
+        ),
         workload_spec::Workload::Container(_) => unreachable!("container handled by the caller"),
     };
 
@@ -3010,9 +3297,10 @@ async fn deploy_non_container(
     // process binds something reachable from another node, instead of the
     // loopback it was previously pinned to. A native workload is a plain host
     // process with no namespace of its own, so an *allocated* per-workload
-    // address (`alloc_mesh_ip`) would simply fail to bind — the node address is
-    // the only correct answer here. `None` (dev host, `0.0.0.0`) keeps the
-    // loopback bind.
+    // address would simply fail to bind — the node address is the only correct
+    // answer here. `None` (dev host, `0.0.0.0`) keeps the loopback bind. R844-
+    // B11 retired the allocator this contrasted with; the container branch now
+    // reaches the same answer through `ServerState::workload_bind_ip`.
     let mesh = s.node_mesh_ip.map(crate::mesh::MeshAssignment::stub);
 
     match kamaji.deploy_envelope(&id, &workload, mesh.as_ref()).await {
@@ -3234,7 +3522,14 @@ async fn deploy_workload_spec(
     let backend: Option<Arc<dyn ContainerRuntime + Send + Sync>> = s.active_backend();
 
     if let Some(rt) = backend {
-        let mesh = crate::mesh::MeshAssignment::stub(s.alloc_mesh_ip());
+        // R844-B11: this node's OWN mesh address, never an invented one. The
+        // value travels straight through to the workload's service record —
+        // containerd writes it as the `yah.mesh_ip` label, echoes it back in
+        // `DeployResult.mesh_ip`, and `upsert_deployed` below publishes it as
+        // the endpoint passway dials. It was an `alloc_mesh_ip()` counter draw,
+        // which made the third container deploy of any yubaba process advertise
+        // `100.64.0.3` — us-east-001. See `ServerState::workload_bind_ip`.
+        let mesh = crate::mesh::MeshAssignment::stub(s.workload_bind_ip());
         let mesh_ident = workload_spec::MeshIdent(ident.clone());
 
         // R600-F4 (W273): capture the workload's original cluster `File` secret
@@ -3255,6 +3550,24 @@ async fn deploy_workload_spec(
             .collect();
         let mut pending_secret_registration: Option<crate::secret_reload::SecretWorkloadEntry> =
             None;
+        // R854: the archetype as the OPERATOR declared it, sampled before
+        // secret materialization rewrites `spec`.
+        //
+        // `effective_archetype()` infers `Appliance` from a non-empty
+        // `volumes`, and materializing a File secret *appends a read-only bind
+        // volume* — so registering the materialized spec's archetype silently
+        // reclassified every secret-mounting workload as an appliance, and the
+        // single-instance guard above then refused its every later deploy with
+        // 409 "appliance already live". A yubaba-injected secret bind is not
+        // the per-ident state that guard exists to protect (W244 §Schema gaps
+        // #1); the operator's own spec is what decides.
+        let authored_archetype = spec.effective_archetype();
+        // R854: does the secret dir belong to THIS request? Hoisted out of the
+        // materialization block below because every failure path from here to
+        // the backend's answer has to know it. `false` until proven otherwise,
+        // so a workload with no File secrets — nothing was materialized — never
+        // reaps a dir it did not create.
+        let mut secret_dir_is_new = false;
 
         // R603-T5: create the host-persistent produced dir before the backend
         // binds it. kamaji's OCI mapper is a pure mapper — it does not mkdir a
@@ -3325,7 +3638,7 @@ async fn deploy_workload_spec(
                 match crate::secrets::ClusterResolver::from_kek_file(
                     secret_store,
                     &s.cluster_kek_path,
-                    crate::secrets::SECRET_STORE_ROOT,
+                    &s.local_secret_store_root,
                     consumer,
                 ) {
                     Ok(r) => Box::new(r),
@@ -3343,10 +3656,20 @@ async fn deploy_workload_spec(
                 }
             } else {
                 Box::new(crate::secrets::LocalFileResolver::new(
-                    crate::secrets::SECRET_STORE_ROOT,
+                    s.local_secret_store_root.clone(),
                 ))
             };
 
+            // R848: only reap on failure if this materialization is the one that
+            // created the dir. On a *re*deploy the dir already holds the running
+            // container's secrets — reaping it there unlinks live material on a
+            // failure path that never touched the running workload, which is how
+            // a deterministic redeploy bug (write_secret_file's EACCES) came to
+            // look flaky: the reap made every retry a first materialization.
+            secret_dir_is_new = !crate::deploy::secret_mount::secret_dir_exists(
+                &s.secret_mount_root,
+                &ident,
+            );
             if let Err(e) = crate::deploy::secret_mount::materialize_file_secrets(
                 &mut spec,
                 &ident,
@@ -3355,7 +3678,9 @@ async fn deploy_workload_spec(
             ) {
                 // Fail closed: a missing / undecryptable cluster secret rejects
                 // the deploy rather than starting a workload without its cert.
-                crate::deploy::secret_mount::teardown_secret_dir(&s.secret_mount_root, &ident);
+                if secret_dir_is_new {
+                    crate::deploy::secret_mount::teardown_secret_dir(&s.secret_mount_root, &ident);
+                }
                 return (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(serde_json::json!({
@@ -3453,6 +3778,14 @@ async fn deploy_workload_spec(
                                         );
                                     }
                                     Err(e) => {
+                                        // R854 reviewed this site and left the
+                                        // reap unguarded on purpose: unlike the
+                                        // backend-failure arm below, the line
+                                        // above has just torn the workload down,
+                                        // so no generation is left running off
+                                        // these files and the dir is genuinely
+                                        // nobody's. Reaping is the correct
+                                        // behaviour, not overreach.
                                         let _ = rt.teardown_workload(&mesh_ident).await;
                                         crate::deploy::secret_mount::teardown_secret_dir(
                                             &s.secret_mount_root,
@@ -3551,11 +3884,13 @@ async fn deploy_workload_spec(
                         .insert(ident.clone(), entry);
                 }
                 // R572-F4: record the archetype so drain + single-instance
-                // guard can branch without re-parsing the spec.
+                // guard can branch without re-parsing the spec. R854: the
+                // authored one — see where it's sampled for why the
+                // materialized spec is the wrong thing to ask.
                 s.archetype_registry
                     .lock()
                     .unwrap()
-                    .insert(ident.clone(), spec.effective_archetype());
+                    .insert(ident.clone(), authored_archetype);
                 // Record what this workload asked for, so `GET /node/usage`
                 // can report committed capacity and `GET /workloads` can
                 // attach a per-workload request. Recorded here (post-success,
@@ -3604,7 +3939,25 @@ async fn deploy_workload_spec(
                 tracing::error!(ident = %ident, error = format!("{e:#}"), "workload deploy failed");
                 // Reap any secret files materialized before the failed deploy so
                 // decrypted PEM doesn't linger for a workload that never started.
-                crate::deploy::secret_mount::teardown_secret_dir(&s.secret_mount_root, &ident);
+                //
+                // R854: only when THIS request created the dir. A redeploy that
+                // fails at the backend leaves the ident still declared, and the
+                // prior generation may still be running off exactly these files
+                // — every one of kamaji's pre-teardown refusals (tier guard,
+                // admission, an unpullable image) rejects without touching the
+                // live container. Reaping there unlinked a healthy workload's
+                // mounted cert material, which is how R854 came in: a 500 from
+                // the redeploy AND an empty /run/yah/secrets/<ident>/. The dir
+                // is the running generation's until a destroy says otherwise.
+                if secret_dir_is_new {
+                    crate::deploy::secret_mount::teardown_secret_dir(&s.secret_mount_root, &ident);
+                } else {
+                    tracing::warn!(
+                        ident = %ident,
+                        "deploy failed at the backend; leaving the pre-existing secret dir in \
+                         place for the generation that already owns it (R854)"
+                    );
+                }
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
@@ -9228,15 +9581,14 @@ mod bundle_deploy_tests {
 
     /// R599-F12: which address a bundle deploy tells kamaji to bind.
     ///
-    /// This is deliberately derived from `--bind` and *not* from
-    /// [`ServerState::alloc_mesh_ip`]. A bundle is a natively forked host
+    /// Deliberately derived from `--bind`. A bundle is a natively forked host
     /// process with no network namespace of its own, so it can only bind an
-    /// address the node already holds; an allocated per-workload address would
-    /// fail with "Address not available". The wildcard and loopback cases must
-    /// stay `None` — a wildcard bind would also publish the site on the node's
+    /// address the node already holds; a per-workload address would fail with
+    /// "Address not available". The wildcard and loopback cases must stay
+    /// `None` — a wildcard bind would also publish the site on the node's
     /// *public* interface.
     #[test]
-    fn the_node_mesh_address_comes_from_the_bind_flag_not_the_ip_allocator() {
+    fn the_node_mesh_address_comes_from_the_bind_flag() {
         use std::net::Ipv4Addr;
 
         let (_tmp, s) = state();
@@ -9244,9 +9596,6 @@ mod bundle_deploy_tests {
             .map(|s| s.with_bind_addr("100.64.0.3:7443"))
             .unwrap_or_else(|_| unreachable!("sole owner"));
         assert_eq!(mesh.node_mesh_ip(), Some(Ipv4Addr::new(100, 64, 0, 3)));
-        // The allocator hands out a *different* address entirely — one that
-        // belongs to a workload, not to this node.
-        assert_ne!(mesh.alloc_mesh_ip(), Ipv4Addr::new(100, 64, 0, 3));
 
         for no_mesh_plane in [
             "0.0.0.0:7443",
@@ -9265,6 +9614,57 @@ mod bundle_deploy_tests {
                  kamaji must keep binding loopback"
             );
         }
+    }
+
+    /// R844-B11: the address a container deploy advertises is this node's own,
+    /// and stays that way however many workloads the process has deployed.
+    ///
+    /// This replaces a guard that looked like it pinned this and did not. It
+    /// read `assert_ne!(s.alloc_mesh_ip(), Ipv4Addr::new(100, 64, 0, 3))`,
+    /// commented "the allocator hands out a *different* address entirely", and
+    /// passed only because it was that state's **first** allocation, returning
+    /// `100.64.0.1`. Two more calls first and it failed — the counter walked
+    /// straight onto the node's own address, and past it onto every other
+    /// node's. On us-west-001 the third container deploy is what published
+    /// `yah-cloud-admin` at `100.64.0.3:4325`, us-east-001.
+    ///
+    /// The invariant is *stability*, not inequality: repetition is precisely
+    /// what the counter failed, so asserting it is what makes this a guard
+    /// rather than a restatement. A function that returns one node address for
+    /// every call cannot return a different node's, whatever the fleet's
+    /// addresses turn out to be — which is why this does not need to read
+    /// `.yah/infra/machines/*.toml` (unreachable from this standalone
+    /// workspace anyway). The live per-node form of the same check is in the
+    /// ticket's verify: every record's `mesh_ip` must equal the answering
+    /// node's `tailscale ip -4`.
+    #[test]
+    fn a_deployed_workloads_address_is_this_nodes_own_however_many_came_before() {
+        use std::net::Ipv4Addr;
+
+        let (_tmp, s) = state();
+        let s = Arc::try_unwrap(s)
+            .map(|s| s.with_bind_addr("100.64.0.3:7443"))
+            .unwrap_or_else(|_| unreachable!("sole owner"));
+
+        for nth in 1..=8 {
+            assert_eq!(
+                s.workload_bind_ip(),
+                Ipv4Addr::new(100, 64, 0, 3),
+                "deploy #{nth} advertised an address that is not this node's — \
+                 a per-workload counter drawn from 100.64.0.0/10 walks onto \
+                 real node addresses (R844-B11)"
+            );
+        }
+
+        // No mesh plane: loopback, matching the bundle path's fallback. Wrong
+        // to dial from another node, but *visibly* wrong — unlike a
+        // neighbour's address, which reads as a healthy Ready record.
+        let (_t, dev) = state();
+        let dev = Arc::try_unwrap(dev)
+            .map(|s| s.with_bind_addr("0.0.0.0:7443"))
+            .unwrap_or_else(|_| unreachable!("sole owner"));
+        assert_eq!(dev.node_mesh_ip(), None);
+        assert_eq!(dev.workload_bind_ip(), Ipv4Addr::LOCALHOST);
     }
 
     /// A bare `WorkloadSpec` must still parse as `Container`: every deployed

@@ -30,6 +30,22 @@
 //! would add a dependency the data does not have. The cost is that the caller
 //! needs the store's credentials; the same `YUBABA_CERT_STORE_*` /
 //! `cloudflare-r2-*` vault slots the daemon reads.
+//!
+//! @yah:ticket(R852-F2, "Tenant-facing custom-domain onboarding page: render the two DNS records, never re-derive them")
+//! @yah:status(review)
+//! @yah:at(2026-09-03T18:39:21Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R852)
+//! @yah:gotcha("DO NOT HARD-CODE THE CHALLENGE RECORD NAME. It is derived by acme_engine::dns01_record_name(base, delegate_zone) (oss/passway/crates/acme-engine/src/lib.rs) — the same function the issuer publishes under, which is why it is public. A page that re-derives the name by string-formatting drifts by one label and every validation fails with both sides looking correct. Render challenge_record.target verbatim. R779 P8 proved this contract against a real CA (Pebble) including a mutation control: a wrong CNAME target makes the CA reject the order.")
+//! @yah:gotcha("The public ingress address is ASKED FOR (--ingress), never derived: --tls-backend is the INTERNAL address the demux splices to, so deriving the tenant A record from the enrollment record would hand them a loopback address. With no --ingress the CLI says it does not know; the page must do the same rather than guessing. Likewise, a node with no YUBABA_DOMAIN_ISSUER_DELEGATE_ZONE configured renders as the misconfiguration it is — do not print a TXT record the tenant cannot create.")
+//! @yah:handoff("BUILT, and wider than the title — the page had no data rail, so the rail is here too. (1) packages/yah/ui/src/components/domains/: types.ts (an exact TS mirror of Onboarding::to_json, snake_case BECAUSE the wire is), CustomDomainOnboarding.tsx (the page — renders challenge_record.name/.target and address_record.targets VERBATIM, never re-derived) and CustomDomainPanel.tsx (the fetching shell, split out so the page's tests can hand it a payload directly instead of asserting through a mocked transport). (2) The rail: yubaba GET /domains/{domain}/onboarding (read-only, mesh-bound, 404 for a domain outside the enrollment set) -> CloudClient::domain_onboarding -> desktop tauri `domain_onboarding` (app/yah/desktop/src/domains.rs) -> env.rpc.domains.onboarding with a real tauri impl and a browser fixture so the page is inspectable in the preview. (3) The anti-drift device the ticket's gotcha demands, made structural: domain_admin's new to_json_carries_exactly_the_keys_this_ui_reads asserts the exact key set of all three objects AND both arms of the challenge-record union, and names the .ts file in its failure message — TypeScript cannot see a Rust rename, so that test is the only thing that fails first.")
+//! @yah:handoff("Tree anchor at handoff: 202fd70aba27dad05548439df3551001cd1c1ac6 — the shared tree as I left it. Diff against it (`git diff 202fd70aba27dad05548439df3551001cd1c1ac6..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:verify("bun test src/components/domains — 9 pass (the load-bearing ones feed payloads whose values are DELIBERATELY not what a re-derivation would produce: a name that is not `_acme-challenge.<domain>`, a target that is not `<domain>.<zone>`; empty ingress asserts 127.0.0.1 does NOT appear; delegated:false asserts no CNAME row is offered). cargo test -p yubaba --test main -- domain_onboarding — 5 pass (404-not-rendered-instruction, 503-naming-the-variable-not-404, unconfigured-admits-what-it-does-not-know, configured-reports-both-verbatim, the env-list parse). cargo test -p yubaba --lib domain_admin — 13 pass incl. the new key pin. bun run typecheck clean, bun run build clean, cargo check --workspace --all-targets clean.")
+//! @yah:gotcha("PRE-EXISTING RED, verified not mine, twice over. (a) `cargo test -p yubaba --test main` fails 10-11 raft tests (raft_member_registration, raft_membership_loop, raft_quorum_geography, sometimes raft_leader_pin). They pass when their module is run alone and fail identically when the run is FILTERED TO `raft_` ONLY — i.e. with my module excluded from the run entirely — and the failing set varies between runs. Signature is `assertion failed: becomes_initialized(&node).await`, a bounded wait: load-sensitive flake on a box running a dozen concurrent agent builds. (b) `bun test` is 1993 pass / 15 fail / 9 errors, which matches the baseline three separate annotations in this repo already record as pre-existing (main.tsx, nav.ts, TabStrip.tsx, PartyView.tsx name the same 6 tests plus the 9 Playwright-sweep errors).")
+//! @yah:handoff("MOUNTED IN SERVICES (operator picked A over the Infra machine card). The wire thread is NOT the raw `ingress_machines` field the mount-point note proposed — that field is only the SINGLE-EDGE spelling, so a mirror written as `[[ingress]] machines = [...]` reads as empty, and it says nothing about WHICH front door, so a cloudflare-tunnel edge would have pointed the page at a node that answers 404 for /domains/{d}/onboarding. What actually landed: `MirrorConfig::passway_machines()` (oss/yubaba/crates/cloud/src/config.rs) reads through the existing `ingress_edges()` — the one place the two spellings are already reconciled — and keeps only Passway edges. `Option<Vec<String>>`, because three states are distinguishable and the middle one matters: None = no passway front door; Some([]) = a passway edge whose placement is co-located and therefore resolved by the reconciler (IngressRule::machines), not knowable from a mirror read alone; Some([..]) = the nodes. Nothing half-derives the co-located fallback here; that is placement resolution and it stays in ingress.rs. CloudConfig::load folds it into a new derived `ServiceWithMirrors::passway_machines: BTreeMap&lt;env, Vec&lt;machine&gt;&gt;` — same \"computed at load, in no TOML\" precedent as component_transform_recipes, and deliberately NOT on MirrorConfig, whose Serialize is also its file format (MirrorConfig::save would have written a derived key into mirrors/&lt;env&gt;.toml). A malformed declaration reads as None rather than propagating: this runs while loading every service in the workspace, so erroring would report an unrelated mirror's shape error from the wrong file — validate.rs already names those properly. UI: env/types.ts mirrors the field with the three states documented; ServicesView gains `CustomDomainSection` (exported for test, same precedent as frontDoorUrl/syncCommand) rendering CustomDomainPanel at the top of DeployPanel's right column, above recent-syncs. Empty array renders the co-located explanation naming ingress_machines instead of guessing a node; several machines render the panel for the first plus a caption saying which one answered and how many were declared.")
+//! @yah:verify("cargo test -p yah-cloud --lib passway — 8 pass, 5 of them new: both spellings collapse to the same answer, a cloudflare-tunnel edge is skipped (alone AND mixed with a passway edge), Some([]) vs None separated, an `ingress_machines` with no `ingress` reads None while ingress_edges() still errors, and CloudConfig::load derives the map for the passway env only. bun test src/components/services src/components/domains — 23 pass (5 new on the gate: panel + right node, no-passway renders NOTHING and issues no RPC, field absent renders nothing, empty array admits it instead of guessing, N front doors say which answered). bun run typecheck clean, bun run build clean.")
+//! @yah:handoff("CLOSED OUT — the two prior phases (page+rail, Services mount) are re-verified green on today's tree, and the one thing left was a lie in the design doc, now fixed. W267 §'The page, and the contract that crosses the language boundary' still ended with 'One thing is not decided: where the panel is mounted' — that decision shipped in phase 2. Replaced with what actually landed: Services / DeployPanel right column above recent-syncs, why raw `ingress_machines` was the WRONG field to thread (single-edge spelling only, so `[[ingress]] machines = [...]` reads empty; and it does not say WHICH front door, so a cloudflare-tunnel edge would have aimed the panel at a node that 404s /domains/{d}/onboarding), and a table of the three `Option&lt;Vec&lt;String&gt;&gt;` states None / Some([]) / Some([..]) against what each renders. A design doc that says a shipped decision is open is worse than one that says nothing.")
+//! @yah:verify("RE-RUN THIS SESSION, all green on the live shared tree, not inherited from the handoff: bun test src/components/domains src/components/services — 23 pass / 0 fail / 51 expects. cargo test -p yubaba --lib domain_admin (from oss/yubaba — yubaba is NOT a root-workspace member, so `cargo test -p yubaba` from the repo root errors 'requires dev-dependencies and is not a member of the workspace') — 13 pass incl. to_json_carries_exactly_the_keys_this_ui_reads. cargo test -p yubaba --test main -- domain_onboarding — 5 pass. cargo test -p yah-cloud --lib passway — 8 pass. bun run typecheck clean. Rail re-verified by content end to end: yubaba lib.rs route -> CloudClient -> desktop domains.rs registered at app/yah/desktop/src/lib.rs:1570 -> env/index.ts:3008 with a real tauri impl (tauri.ts:1332) AND a browser fixture (browser.ts:1150). No Rust changed this session, so the workspace check was not re-run.")
 
 use std::net::SocketAddr;
 use std::time::SystemTime;
@@ -592,6 +608,75 @@ mod tests {
         );
         assert_eq!(j["address_record"]["targets"], json!(["203.0.113.7"]));
         assert!(o.render().contains(j["challenge_record"]["target"].as_str().unwrap()));
+    }
+
+    /// R852-F2 — the cross-language half of the same contract.
+    ///
+    /// `packages/yah/ui/src/components/domains/types.ts` declares a TypeScript
+    /// mirror of this payload and the onboarding page reads these keys off it.
+    /// TypeScript cannot see a Rust rename, so a field renamed here would
+    /// compile clean on both sides and render `undefined` into a DNS record a
+    /// tenant then types into their registrar. This test is the only thing that
+    /// fails first.
+    ///
+    /// **If it fails, the fix is in that .ts file, not here** — unless the
+    /// rename was a mistake, in which case it is here.
+    #[test]
+    fn to_json_carries_exactly_the_keys_this_ui_reads() {
+        fn keys(v: &serde_json::Value) -> Vec<String> {
+            let mut k: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
+            k.sort();
+            k
+        }
+
+        let deleg = Onboarding::new(
+            "shop.tenant.io",
+            validation("shop.tenant.io", Some("acme.yah.dev")),
+            vec!["203.0.113.7".into()],
+        )
+        .to_json();
+        assert_eq!(
+            keys(&deleg),
+            ["address_record", "challenge_record", "domain"],
+            "the DomainOnboarding interface in \
+             packages/yah/ui/src/components/domains/types.ts reads these three"
+        );
+        assert_eq!(
+            keys(&deleg["address_record"]),
+            ["name", "targets"],
+            "the AddressRecord interface reads these two"
+        );
+        assert_eq!(
+            keys(&deleg["challenge_record"]),
+            ["delegated", "name", "target", "type"],
+            "the delegated arm of the ChallengeRecord union reads these four"
+        );
+
+        // The undelegated arm is a DIFFERENT key set — `note` where `target`
+        // was — which is exactly why the TS side models it as a discriminated
+        // union on `delegated` rather than one struct with optional fields.
+        let held = Onboarding::new(
+            "shop.tenant.io",
+            validation("shop.tenant.io", None),
+            Vec::new(),
+        )
+        .to_json();
+        assert_eq!(
+            keys(&held["challenge_record"]),
+            ["delegated", "name", "note", "type"],
+            "the undelegated arm of the ChallengeRecord union reads these four"
+        );
+        assert_eq!(held["challenge_record"]["delegated"], json!(false));
+        assert_eq!(held["challenge_record"]["type"], json!("TXT"));
+        // The page renders `note` verbatim rather than naming the variable
+        // itself, so the note has to keep carrying it.
+        assert!(
+            held["challenge_record"]["note"]
+                .as_str()
+                .expect("note is a string")
+                .contains(DELEGATE_ZONE_ENV),
+            "{held}"
+        );
     }
 
     #[test]

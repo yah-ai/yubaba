@@ -340,9 +340,9 @@ async fn start_headscale(state: &Arc<ServerState>) {
         systemctl(&["disable", "--now", "headscale"]);
 
         // R599-F12's rule for a NATIVE workload: hand kamaji this node's own
-        // mesh address, never an `alloc_mesh_ip()` one. A fork+exec'd process
-        // has no namespace of its own, so a per-workload address would simply
-        // fail to bind — and the node address is what makes the appliance
+        // mesh address, never a per-workload one. A fork+exec'd process has no
+        // namespace of its own, so a per-workload address would simply fail to
+        // bind — and the node address is what makes the appliance
         // reachable from another node, which is the whole premise of R591-T2's
         // follow-placement ingress. `None` (a dev host, `0.0.0.0`) keeps the
         // loopback bind.

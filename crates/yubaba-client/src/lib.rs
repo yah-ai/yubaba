@@ -11,6 +11,9 @@
 //! The slot specs `PondDeployReq` embeds (`MinioSpec`, `MiniflareSpec`,
 //! `SsrRuntimeSpec`) live in `local-driver` — the runtime that consumes them —
 //! and are re-used here unchanged.
+//!
+//! @arch:see(.yah/docs/working/W242-yubaba-mesh-raft-roadmap.md)
+//!
 
 use local_driver::pond_miniflare::MiniflareSpec;
 use local_driver::pond_minio::MinioSpec;

@@ -15,6 +15,15 @@
 //! which meant a route-carrying manifest bound straight to R2 was accepted
 //! and silently skipped by this pass. The discriminator is now declared and
 //! validated at load.
+//!
+//! @yah:relay(R859, "Sovereign-edge automation ring: DNS reconciled from declared intent, public addressing follows placement (W267 audit followups)")
+//! @yah:at(2026-09-04T19:06:24Z)
+//! @yah:status(handoff)
+//! @yah:assignee(agent:user-custom-char-gul2)
+//! @arch:see(.yah/docs/working/W267-sovereign-public-ingress.md)
+//! @yah:next("Filed from the 2026-09-04 HA/ingress audit (chat session, operator-reviewed). The grey door is live but the automation ring around it is manual: DNS flips ride scripts/cf-apex-mode.sh by hand, and node loss leaves a dead A record taking ~half the round-robin traffic until a human edits DNS.")
+//! @yah:next("Order: F1 (DNS reconciler) before F2 (floating-IP wiring) — F2's DNS-withdrawal half needs F1's record-rendering to exist. Sibling track R844-F23 (poll-N door discovery) is independent and filed under R844 where door discovery lives.")
+//! @yah:next("Deliberately out of scope here: replica layer (W284/R626), kamaji healthcheck execution, generic appliance backup/migrate (R742-F3), external synthetic prober — each is its own track; this relay is only 'public addressing follows declared intent'.")
 
 use std::path::Path;
 

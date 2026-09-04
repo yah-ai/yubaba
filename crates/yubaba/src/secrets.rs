@@ -67,6 +67,7 @@ impl SecretResolver for LocalFileResolver {
                     .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
                 {
                     return Err(SecretError::Io {
+                        op: "resolving",
                         path: rel.to_path_buf(),
                         source: std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
@@ -81,6 +82,7 @@ impl SecretResolver for LocalFileResolver {
                         SecretError::NotFound { path: full }
                     } else {
                         SecretError::Io {
+                            op: "reading",
                             path: full,
                             source: e,
                         }
@@ -195,45 +197,68 @@ impl<S: ClusterSecretStore> ClusterResolver<S> {
             .ok_or_else(|| SecretError::ClusterNotFound {
                 name: name.to_string(),
             })?;
-
-        // R706: authorize BEFORE decrypting. Ordering matters — a denied read
-        // must not exercise the KEK at all, so a rule violation cannot be
-        // distinguished from a missing secret by timing either.
-        if !rec.access.admits(&self.consumer) {
-            // Logged on the node (the operator's own audit trail); the error
-            // returned to the deploying caller is deliberately identical to
-            // ClusterNotFound so a probing spec cannot map the namespace.
-            tracing::warn!(
-                secret = %name,
-                workload = %self.consumer.workload,
-                tenant = %self.consumer.tenant.0,
-                namespace = %self.consumer.namespace.0,
-                rule = %rec.access.summary(),
-                "cluster secret refused: workload is not admitted by the secret's access rule"
-            );
-            return Err(SecretError::Forbidden {
-                name: name.to_string(),
-            });
-        }
-
-        // GCM nonces are 12 bytes. A record with any other nonce length is
-        // treated as a decrypt failure rather than panicking in `from_slice`.
-        if rec.nonce.len() != 12 {
-            return Err(SecretError::ClusterDecrypt {
-                name: name.to_string(),
-            });
-        }
-
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(self.kek.as_ref()));
-        let nonce = Nonce::from_slice(&rec.nonce);
-        // A wrong KEK or tampered ciphertext fails the GCM tag check here; the
-        // error is opaque on purpose — no key, nonce, or ciphertext is logged.
-        cipher
-            .decrypt(nonce, rec.ciphertext.as_ref())
-            .map_err(|_| SecretError::ClusterDecrypt {
-                name: name.to_string(),
-            })
+        open_cluster_secret(&self.kek, name, &rec, &self.consumer)
     }
+}
+
+/// Authorize and decrypt one already-read [`SecretRecord`] — the inverse of
+/// [`seal_cluster_secret`], and **the only place a sealed record is opened**.
+///
+/// Extracted from [`ClusterResolver::resolve_cluster`] by R852-F3, which needs
+/// the same operation against a record that did not come from raft: a per-domain
+/// tenant cert lives in the object store (see [`crate::cert_store`]), read with
+/// [`ObjectCertStore::read_secret`](crate::cert_store::ObjectCertStore::read_secret)
+/// rather than through [`ClusterSecretStore`] because that trait's `Option`
+/// return cannot distinguish "no cert issued yet" from "the bucket is
+/// unreachable", and one of those must not be reported as the other.
+///
+/// A second decryption path is exactly the kind of code that drifts — the
+/// authorize-before-KEK ordering, the nonce-length guard and the deliberately
+/// opaque failure are all load-bearing and all easy to omit on a re-write — so
+/// there is one function and both callers go through it.
+///
+/// R706 (W294): the access rule is checked BEFORE the KEK is touched. Ordering
+/// matters — a denied read must not exercise the key at all, so a rule violation
+/// cannot be distinguished from a missing secret by timing either. The refusal
+/// is logged on the node (the operator's own audit trail) while the returned
+/// error stays opaque, so a probing caller cannot map the namespace.
+pub fn open_cluster_secret(
+    kek: &[u8; 32],
+    name: &str,
+    rec: &SecretRecord,
+    consumer: &SecretConsumer,
+) -> Result<Vec<u8>, SecretError> {
+    if !rec.access.admits(consumer) {
+        tracing::warn!(
+            secret = %name,
+            workload = %consumer.workload,
+            tenant = %consumer.tenant.0,
+            namespace = %consumer.namespace.0,
+            rule = %rec.access.summary(),
+            "cluster secret refused: workload is not admitted by the secret's access rule"
+        );
+        return Err(SecretError::Forbidden {
+            name: name.to_string(),
+        });
+    }
+
+    // GCM nonces are 12 bytes. A record with any other nonce length is
+    // treated as a decrypt failure rather than panicking in `from_slice`.
+    if rec.nonce.len() != 12 {
+        return Err(SecretError::ClusterDecrypt {
+            name: name.to_string(),
+        });
+    }
+
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(kek));
+    let nonce = Nonce::from_slice(&rec.nonce);
+    // A wrong KEK or tampered ciphertext fails the GCM tag check here; the
+    // error is opaque on purpose — no key, nonce, or ciphertext is logged.
+    cipher
+        .decrypt(nonce, rec.ciphertext.as_ref())
+        .map_err(|_| SecretError::ClusterDecrypt {
+            name: name.to_string(),
+        })
 }
 
 impl<S: ClusterSecretStore> SecretResolver for ClusterResolver<S> {

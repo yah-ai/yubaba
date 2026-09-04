@@ -90,8 +90,36 @@ runcmd:
   - sh -c 'cp /tmp/yubaba-*/yubaba.slice /etc/systemd/system/yubaba.slice'
   - sh -c 'cp /tmp/yubaba-*/kamaji.service /etc/systemd/system/kamaji.service'
   - sh -c 'cp /tmp/yubaba-*/yubaba.service /etc/systemd/system/yubaba.service'
-  - chmod 0644 /etc/systemd/system/yubaba.slice /etc/systemd/system/kamaji.service /etc/systemd/system/yubaba.service
+  # litestream-headscale.service — headscale DB replication for whichever node
+  # holds the ingress owner role. Laid down here and never enabled: leader.rs
+  # starts it on gaining that role and stops it on losing it. It MUST be
+  # pre-staged for the same reason headscale.service is (see the coordinator
+  # pre-stage block below) — yubaba runs ProtectSystem=strict and cannot write
+  # /etc/systemd/system, so a unit it "installs" at runtime is a silent EROFS.
+  - sh -c 'cp /tmp/yubaba-*/litestream-headscale.service /etc/systemd/system/litestream-headscale.service'
+  - chmod 0644 /etc/systemd/system/yubaba.slice /etc/systemd/system/kamaji.service /etc/systemd/system/yubaba.service /etc/systemd/system/litestream-headscale.service
   - sh -c 'rm -rf /tmp/yah-yubaba.tar.gz /tmp/yubaba-*'
+  # litestream — the replicate/restore binary litestream-headscale.service execs
+  # and leader.rs shells for `litestream restore` before starting the appliance.
+  # Absent from every node in the fleet as of 2026-09-04, which made the whole
+  # DB-continuity path inert regardless of configuration.
+  #
+  # PINNED TO 0.3.13, NOT LATEST (0.5.x): litestream 0.5 is a rewrite onto the
+  # LTX format with a changed config schema, and `litestream::generate_config`
+  # emits the 0.3 `dbs[].replicas[].url` shape. Moving to 0.5 is a real
+  # migration — new config emitter, and a replica written by 0.3 is not a
+  # replica 0.5 reads — not a version bump. Checksums below were computed by
+  # downloading these exact assets, not copied from the release page.
+  - sh -c 'case "$(dpkg --print-architecture)" in
+      amd64) LS_ARCH=amd64; LS_SHA=eb75a3de5cab03875cdae9f5f539e6aedadd66607003d9b1e7a9077948818ba0 ;;
+      arm64) LS_ARCH=arm64; LS_SHA=9585f5a508516bd66af2b2376bab4de256a5ef8e2b73ec760559e679628f2d59 ;;
+      *) echo "litestream: unsupported arch $(dpkg --print-architecture), skipping" >&2; exit 0 ;;
+      esac;
+      curl -fsSL -o /tmp/litestream.tar.gz "https://github.com/benbjohnson/litestream/releases/download/v0.3.13/litestream-v0.3.13-linux-${LS_ARCH}.tar.gz" &&
+      echo "${LS_SHA}  /tmp/litestream.tar.gz" | sha256sum -c - &&
+      tar -xzf /tmp/litestream.tar.gz -C /usr/local/bin litestream &&
+      chmod +x /usr/local/bin/litestream &&
+      rm -f /tmp/litestream.tar.gz'
   # Channel goes into a drop-in (yubaba.service's ExecStart bakes the default args;
   # the channel is operator-tunable per node).
   - mkdir -p /etc/systemd/system/yubaba.service.d

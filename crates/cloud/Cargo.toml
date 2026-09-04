@@ -50,45 +50,45 @@ json-schema = ["dep:schemars", "workload-spec/json-schema"]
 libc = "0.2"
 # WorkloadSpec — typed wire format for yubaba workloads. Used by WorkloadConfig
 # to validate workload TOML against the schema (R092-F1).
-workload-spec = { package = "yah-workload-spec", version = "0.8.30" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.32" }
 # Almanac feed configs + OnChangeConfig — dispatch_on_change maps on_change
 # to the correct reconciler (R330-F4). Cross-workspace since R746-T10 (it lives
 # in oss/mesofact now), so it drops the `path =` and resolves through this
 # workspace's `[patch.crates-io]` block like every other out-of-tree dep.
-yah-almanac = { version = "0.8.30" }
+yah-almanac = { version = "0.8.32" }
 
 # Shared credential vault — HetznerDriver::from_default_sources() reads
 # hetzner-api-token / hetzner-s3-access-key / hetzner-s3-secret-key
 # from this vault, falling back to HETZNER_* env vars (R040-F9).
-fob = { version = "0.8.30" }
+fob = { version = "0.8.32" }
 # Shared Hetzner Cloud API client — transport, bearer auth, and server/SSH-key
 # operations. Cloud crate adds S3 bucket ops and MachineProvider trait impl on top.
-yah-hetzner = { path = "../hetzner", version = "0.8.30" }
+yah-hetzner = { path = "../hetzner", version = "0.8.32" }
 
 # Object-store trait + R2 impl — publish_to_r2 delegates PUT/GET ops here (R498-F5).
-yah-object-store = { version = "0.8.30" }
+yah-object-store = { version = "0.8.32" }
 
 # W272 mesofact bundle store (R599-F1) — content-addressed blob/manifest publish.
 # `store` feature pulls the ObjectStore-backed publish/materialize surface.
-yah-mesofact-bundle = { version = "0.8.30", features = ["store"] }
+yah-mesofact-bundle = { version = "0.8.32", features = ["store"] }
 
 # Local-tier infrastructure primitives (docker-CLI driver + S3 SigV4 helpers).
 # Both cloud and yubaba depend on this — moved out of cloud in R374-F3 so
 # yubaba could own MinIO lifecycle without a reverse yubaba→cloud dep.
-local-driver = { package = "yah-local-driver", version = "0.8.30" }
+local-driver = { package = "yah-local-driver", version = "0.8.32" }
 
 # Kamaji supervisor — the mesofact-static local-static arm spawns
 # mesofact-dev as a host binary through the Native fork+exec backend
 # (R490-F2; W199's "ideal native-backend case"). Replaces the reconciler's
 # direct Command::spawn so dev-tier workloads share the supervision primitive.
-kamaji = { version = "0.8.30", features = ["native-integration"] }
+kamaji = { version = "0.8.32", features = ["native-integration"] }
 
 # Forge executor + transform recipe loader. Cloud's static-asset reconciler
 # materializes derived assets (W164) by lowering recipes → ForgeSpec and
 # handing them to a `dyn ForgeExecutor`. The dep edge intentionally stops
 # here: no cloud → qed edge, only cloud → task (R438-T13 architectural rule).
-velveteen = { version = "0.8.30" }
-velveteen-exec = { version = "0.8.30" }
+velveteen = { version = "0.8.32" }
+velveteen-exec = { version = "0.8.32" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -207,6 +207,7 @@ use serde::Deserialize;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use tracing::{info, warn};
 use workload_spec::EnvVar;
+use workload_spec::MeshExpose;
 
 use super::native_support::{
     capture_paths, native_spec, sanitize_ident, spawn_native_log_supervisor,
@@ -521,7 +522,12 @@ impl Reconciler for LocalProcessReconciler {
             }
         }
 
-        let workload = native_spec(&ident_str, argv, env);
+        let mut workload = native_spec(&ident_str, argv, env);
+        // A declared `[process] port` reaches the child as `PORT` / `PORT_HTTP`
+        // (R844-T13) by riding the spec, not by a per-caller string. Declared
+        // `[process.env]` still wins — the native backend layers spec env last.
+        // A portless component contributes nothing and gets neither variable.
+        workload.expose.mesh.ports = MeshExpose::anonymous_ports(spec.port);
         let runtime = Arc::new(NativeRuntime::new(&state_dir));
         let mesh = MeshAssignment::inlined(Ipv4Addr::LOCALHOST);
 

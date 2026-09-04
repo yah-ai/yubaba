@@ -25,6 +25,17 @@
 //! Headscale via a Cloudflare Tunnel. R591 is peer-owned and gated on R570
 //! (real multi-node raft HA); this module is not blocked on either — it
 //! builds directly on the `ingress_owner` seam, which already exists.
+//!
+//! @yah:ticket(R859-F2, "Wire floating-ip.* provider adapters to ingress_owner transitions + health-checked DNS withdrawal for dead origins")
+//! @yah:at(2026-09-04T19:06:57Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:user-custom-char-gul2)
+//! @yah:parent(R859)
+//! @yah:next("The verbs and adapters exist with zero callers: envoy/floating_ip.rs + provider/{vultr,hetzner,ovh}_floating_ip.rs are dead code today. Raft already holds and applies ingress_owner (raft/mod.rs:597,1182) — the missing piece is the effector that commands the provider when it changes, which is exactly W267 Tier 1's 'external identity follows placement' (the R591 property).")
+//! @yah:next("Two failover speeds, both currently manual: intra-provider = floating-IP reassign (seconds, no DNS propagation, no cert re-mint — mind the W267-verified mobility constraints: Hetzner per network zone, OVH per DC region, Vultr region-bound); cross-provider = short-TTL DNS withdrawal of the dead origin's A record (needs R859-F1's rendering).")
+//! @yah:next("The health signal for withdrawal must NOT come from raft health (W267 §'Where liveness lives' — reachability is observer-relative); use the supervisor-level fact only: a machine leaving the fleet / its yubaba unreachable from quorum, not a per-proxy probe.")
+//! @yah:next("cloud.mesh_failover (W271) is the existing manual verb — keep it as the operator path; this ticket automates the effector both paths share.")
+//! @yah:next("Tier: Wizard — touches live-fleet failover semantics; wrong wiring here turns a leadership flap into a public outage. Design the guard rails (hysteresis, refuse-on-degraded-quorum per yubaba-failover.md) before the effector.")
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;

@@ -628,13 +628,22 @@ impl MesofactStaticReconciler {
         // this logic, named, so the two tiers cannot drift. Ephemeral rather
         // than ledger-backed on purpose: a camp port is disposable, nothing
         // publishes it, and a fresh one each run is fine.
+        // R844-F14: ports are named now (`http` here — one listener), and the
+        // configured number rides in as a `pin`. On THIS tier a pin is a
+        // preference, not a declaration: `localhost:4321` out of a dev mirror
+        // is a browser handle the operator typed, nothing publishes it, and it
+        // floats when taken. The published (kamaji) tier is where a pin is an
+        // error instead.
         let spawn_port = {
             use kamaji::ports::PortAllocator;
             kamaji::ports::EphemeralPorts
-                .resolve(
+                .resolve_one(
                     &ctx.component.id,
                     kamaji::ports::LOOPBACK,
-                    (port != 0).then_some(port),
+                    kamaji::ports::PortSpec {
+                        name: kamaji::ports::HTTP.to_string(),
+                        pin: (port != 0).then_some(port),
+                    },
                 )
                 .context("could not bind any port for mesofact-dev")?
         };
@@ -679,7 +688,20 @@ impl MesofactStaticReconciler {
             ctx.component.id.clone(),
         ];
         argv.extend(self.local_static.extra_args.iter().cloned());
-        let spec = native_spec(&ident_str, argv, Vec::new());
+        let mut spec = native_spec(&ident_str, argv, Vec::new());
+        // The port the allocator just handed us is the workload's own fact, so it
+        // rides the spec rather than only the argv. Two things follow, and both
+        // were missing before R844-T13: the native backend injects `PORT` /
+        // `PORT_HTTP` from it (one contract, whether mesofact-dev runs here or on
+        // a fleet node), and `DeployResult::ports` stops reporting this workload
+        // as portless.
+        // Named, not anonymous (R844-F17): the allocator above asked for this
+        // port under `kamaji::ports::HTTP`, so the spec states that name rather
+        // than leaving `declared_port_names` to re-derive it from the count.
+        spec.expose.mesh.ports = vec![workload_spec::MeshPort::pinned(
+            kamaji::ports::HTTP,
+            spawn_port,
+        )];
 
         let runtime = Arc::new(NativeRuntime::new(&state_dir));
         let mesh = MeshAssignment::inlined(Ipv4Addr::LOCALHOST);

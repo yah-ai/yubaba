@@ -21,7 +21,7 @@
 //! layer; only becomes a literal when yubaba assembles the containerd spec
 //! after this module renders it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -39,7 +39,15 @@ use workload_spec::{MeshIdent, MeshLookup, WorkloadSpec};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeshAddress {
     pub ident: MeshIdent,
-    pub ports: Vec<u16>,
+    /// The peer's listeners as `name -> port` (R844-B22).
+    ///
+    /// Was a `Vec<u16>`, which is why every lookup here resolved positionally:
+    /// a bare list cannot answer "which of these is the API port", so the code
+    /// answered "the first" and the trait doc wrote that down as a rule. This
+    /// is the same `BTreeMap<String, u16>` that `kamaji::WorkloadState::ports`
+    /// and `ServiceRecord::resolved_ports` carry, so a name survives from the
+    /// manifest all the way to a dependent's environment.
+    pub ports: BTreeMap<String, u16>,
     pub dependency_wait_deadline: Option<Duration>,
 }
 
@@ -56,14 +64,12 @@ pub trait MeshState: Send + Sync {
 
 /// Adapter that implements [`MeshResolver`] using a [`MeshState`] for lookups.
 ///
-/// Resolution rules per the arch doc §"Mesh-derived env":
-/// - `Url`  → `"http://<ident>:<first_port>"`
-/// - `Host` → bare DNS-ish identity
-/// - `Port` → first port stringified
-///
-/// All three rules use the **first** entry in
-/// [`MeshAddress::ports`] — so a workload that exposes multiple ports must
-/// list its primary port first to keep `Url` and `Port` consistent.
+/// The resolution rules — including **which** port a `Url` / `Port` lookup
+/// selects when the peer has several — live in
+/// [`workload_spec::validate::select_mesh_port`], not here. This impl is the
+/// adapter and nothing more: re-deriving the rule locally is exactly how this
+/// file came to promise "the first entry" while the rest of the workspace had
+/// moved to names (R844-B22).
 pub struct StateMeshResolver<'a> {
     state: &'a dyn MeshState,
 }
@@ -82,25 +88,16 @@ impl<'a> MeshResolver for StateMeshResolver<'a> {
             .ok_or_else(|| MeshError::NotDeployed {
                 ident: ident.0.clone(),
             })?;
+        if !kind.needs_port() {
+            return Ok(addr.ident.0.clone());
+        }
+        let port = workload_spec::validate::select_mesh_port(&ident.0, &addr.ports, &kind)?;
         match kind {
-            MeshLookup::Host => Ok(addr.ident.0.clone()),
-            MeshLookup::Port => {
-                addr.ports
-                    .first()
-                    .map(|p| p.to_string())
-                    .ok_or(MeshError::NoPorts {
-                        ident: ident.0.clone(),
-                        lookup: kind,
-                    })
+            MeshLookup::Host => unreachable!("Host needs no port"),
+            MeshLookup::Port | MeshLookup::PortNamed { .. } => Ok(port.to_string()),
+            MeshLookup::Url | MeshLookup::UrlNamed { .. } => {
+                Ok(format!("http://{}:{}", addr.ident.0, port))
             }
-            MeshLookup::Url => addr
-                .ports
-                .first()
-                .map(|p| format!("http://{}:{}", addr.ident.0, p))
-                .ok_or(MeshError::NoPorts {
-                    ident: ident.0.clone(),
-                    lookup: kind,
-                }),
         }
     }
 }
@@ -262,7 +259,7 @@ mod mesh {
                 expose: ExposeSpec {
                     mesh: MeshExpose {
                         identity: MeshIdent("consumer".into()),
-                        ports: vec![8080],
+                        ports: MeshExpose::anonymous_ports([8080]),
                         allow_from: vec![],
                     },
                     public: None,
@@ -273,10 +270,14 @@ mod mesh {
             }
         }
 
+        fn ports(pairs: &[(&str, u16)]) -> std::collections::BTreeMap<String, u16> {
+            pairs.iter().map(|(n, p)| ((*n).to_string(), *p)).collect()
+        }
+
         fn db_address() -> MeshAddress {
             MeshAddress {
                 ident: MeshIdent("noisetable-db.pdx".into()),
-                ports: vec![5432, 9100],
+                ports: ports(&[("http", 5432)]),
                 dependency_wait_deadline: Some(Duration::from_secs(45)),
             }
         }
@@ -284,7 +285,7 @@ mod mesh {
         // ── Url / Host / Port ────────────────────────────────────────────────
 
         #[test]
-        fn url_renders_first_port_with_http_prefix() {
+        fn url_renders_the_selected_port_with_http_prefix() {
             let mut state = InMemoryMeshState::new();
             state.insert(db_address());
             let resolver = StateMeshResolver::new(&state);
@@ -292,6 +293,59 @@ mod mesh {
                 .resolve(&MeshIdent("noisetable-db.pdx".into()), MeshLookup::Url)
                 .expect("resolve");
             assert_eq!(value, "http://noisetable-db.pdx:5432");
+        }
+
+        /// R844-B22: `db_address` used to expose `[5432, 9100]` and this file
+        /// asserted `Url` rendered 5432 — the first entry, i.e. a coin flip the
+        /// test then locked in. A multi-listener peer with no `http` now has to
+        /// be asked which one.
+        #[test]
+        fn several_unnamed_ports_error_rather_than_resolving_to_the_first() {
+            let mut state = InMemoryMeshState::new();
+            state.insert(MeshAddress {
+                ident: MeshIdent("multi.pdx".into()),
+                ports: ports(&[("5432", 5432), ("9100", 9100)]),
+                dependency_wait_deadline: None,
+            });
+            let resolver = StateMeshResolver::new(&state);
+            let err = resolver
+                .resolve(&MeshIdent("multi.pdx".into()), MeshLookup::Url)
+                .unwrap_err();
+            assert!(
+                matches!(err, MeshError::AmbiguousPort { .. }),
+                "expected AmbiguousPort, got {err:?}"
+            );
+        }
+
+        /// And the spelling that answers it, end to end through the production
+        /// resolver rather than the fake in workload-spec's own tests.
+        #[test]
+        fn a_named_lookup_selects_that_port_through_the_state_resolver() {
+            let mut state = InMemoryMeshState::new();
+            state.insert(MeshAddress {
+                ident: MeshIdent("api.pdx".into()),
+                ports: ports(&[("http", 8080), ("wss", 8443)]),
+                dependency_wait_deadline: None,
+            });
+            let resolver = StateMeshResolver::new(&state);
+            assert_eq!(
+                resolver
+                    .resolve(
+                        &MeshIdent("api.pdx".into()),
+                        MeshLookup::UrlNamed {
+                            name: "wss".into()
+                        }
+                    )
+                    .expect("resolve"),
+                "http://api.pdx:8443"
+            );
+            // The unnamed form still answers, via `http`, not via position.
+            assert_eq!(
+                resolver
+                    .resolve(&MeshIdent("api.pdx".into()), MeshLookup::Port)
+                    .expect("resolve"),
+                "8080"
+            );
         }
 
         #[test]
@@ -336,7 +390,7 @@ mod mesh {
             let mut state = InMemoryMeshState::new();
             state.insert(MeshAddress {
                 ident: MeshIdent("portless".into()),
-                ports: vec![],
+                ports: std::collections::BTreeMap::new(),
                 dependency_wait_deadline: None,
             });
             let resolver = StateMeshResolver::new(&state);
@@ -503,12 +557,12 @@ mod mesh {
             let mut state = InMemoryMeshState::new();
             state.insert(MeshAddress {
                 ident: MeshIdent("a".into()),
-                ports: vec![1],
+                ports: ports(&[("http", 1)]),
                 dependency_wait_deadline: Some(Duration::from_secs(10)),
             });
             state.insert(MeshAddress {
                 ident: MeshIdent("b".into()),
-                ports: vec![2],
+                ports: ports(&[("http", 2)]),
                 dependency_wait_deadline: Some(Duration::from_secs(15)),
             });
             // c is not registered, so default applies.
@@ -527,7 +581,7 @@ mod mesh {
             let mut state = InMemoryMeshState::new();
             state.insert(MeshAddress {
                 ident: MeshIdent("a".into()),
-                ports: vec![1],
+                ports: ports(&[("http", 1)]),
                 dependency_wait_deadline: None, // dep deployed but has no healthcheck
             });
             let spec = spec_with_depends_on(vec![MeshIdent("a".into())]);

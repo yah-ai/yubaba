@@ -9,7 +9,7 @@
 //! published are derived, not typed in:
 //!
 //! ```text
-//! slots with `zone` + `port`  ─partitioned by edge selector─►  IngressPlan { provider, rules, front_doors }
+//! slots with `zone` + (`port` | `fronted`)  ─by edge selector─►  IngressPlan { provider, rules, front_doors }
 //!                                           ├── cloudflare-tunnel → CF API ingress config
 //!                                           └── passway           → PASSWAY_UPSTREAMS
 //! ```
@@ -63,21 +63,44 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use tracing::{debug, info};
 
-use crate::config::{resolve_machine_among, IngressEdge, IngressProvider};
+use crate::config::{resolve_machines_among, IngressEdge, IngressProvider};
 use crate::{CloudflareClient, MachineConfig, MirrorConfig};
 
 /// Slot field naming the public hostname a slot is fronted at.
 const ZONE_FIELD: &str = "zone";
-/// Slot field that opts a slot into the front door: the node-local port its
-/// workload listens on. Already `BundleSlot.port`'s meaning — the port kamaji
-/// binds the workload to and the port the front door dials are the same port,
-/// so this reuses that field rather than minting a parallel one.
+/// Slot field pinning the node-local port the front door dials. Already
+/// `BundleSlot.port`'s meaning — the port kamaji binds the workload to and the
+/// port the front door dials are the same port, so this reuses that field
+/// rather than minting a parallel one.
 ///
-/// `port` is the opt-in and `zone` is not, because `zone` is overloaded: a
+/// **A value, no longer the opt-in** (R844-F5). It used to be both, which meant
+/// deleting the key did not remove a pin — it removed the *slot* from the plan,
+/// silently un-publishing a live hostname. [`FRONTED_FIELD`] now carries the
+/// participation half, and this one is optional: a rule that declares no port
+/// gets it from the fronting node's `GET /service-records?ready=true` via
+/// [`IngressPlan::resolve_ports`], where `resolved_ports` reports what the
+/// supervisor actually bound (R844-F2) rather than what a mirror asked for.
+///
+/// Declaring it still implies participation, so every mirror on disk plans
+/// byte-identically across that change — and an explicit pin always wins over
+/// discovery, exactly as [`UPSTREAM_HOST_FIELD`] does.
+const PORT_FIELD: &str = "port";
+/// Slot field that opts a slot into the front door and says nothing else:
+/// `fronted = true` means "publish me", with the port left to discovery.
+///
+/// Its own field rather than a reuse of `zone`, because `zone` is overloaded: a
 /// CDN-published static slot carries it meaning the *Cloudflare zone*. Keying
 /// participation off `zone` would drag every such slot into the ingress plan
-/// and fail the apply of mirrors that have no front door at all.
-const PORT_FIELD: &str = "port";
+/// and fail the apply of mirrors that have no front door at all. Nor can the
+/// `[[ingress]]` edge selector serve — every mirror on disk uses the scalar
+/// spelling, which yields one selectorless edge that claims everything, so it
+/// would drag in exactly the same static slots. The signal has to be slot-side
+/// and mean one thing.
+///
+/// `fronted = false` is not an opt-*out* of a declared `port`: a slot with a
+/// port is fronted regardless, which keeps the one silent-de-listing shape this
+/// field exists to remove from reappearing under a new spelling.
+const FRONTED_FIELD: &str = "fronted";
 /// Slot field naming the machine the fronted workload runs on.
 const MACHINE_FIELD: &str = "machine";
 /// Plural spelling of [`MACHINE_FIELD`], used by placement-list slots such as
@@ -114,8 +137,19 @@ const UPSTREAM_HOST_FIELD: &str = "upstream_host";
 pub struct IngressRule {
     /// Public hostname, e.g. `analytics.yah.dev`.
     pub hostname: String,
-    /// Node-local port the fronted workload listens on.
-    pub port: u16,
+    /// Node-local port the fronted workload listens on — `None` until
+    /// [`IngressPlan::resolve_ports`] fills it, for a slot that declared
+    /// `fronted = true` without pinning a number.
+    ///
+    /// Optional for the same reason [`upstream_hosts`](Self::upstream_hosts) is
+    /// resolved rather than defaulted (R844-F5): once kamaji allocates the port
+    /// (`PortAllocator::resolve`), the number the workload actually bound is
+    /// unknowable from the mirror, so a rule that carried a `u16` could only
+    /// carry a *declaration* — and the front door dialing a declared number
+    /// while the supervisor bound another one fails at request time, long after
+    /// the apply that looked clean. A declared `port` still wins; discovery
+    /// only answers where the mirror stayed silent.
+    pub port: Option<u16>,
     /// Mirror provider slot this rule was derived from (`"compute"`, …). Kept
     /// so an error or a summary line can name the slot the operator wrote.
     pub slot: String,
@@ -165,24 +199,87 @@ impl IngressRule {
     /// Erroring on empty rather than returning an empty vec is the point: a
     /// front door that publishes a hostname with no backend advertises a 502,
     /// which is worse than a failed apply.
+    ///
+    /// **The single place an undialable rule is reported** (R844-F5). A rule
+    /// needs two resolved halves — a port and at least one address — and both
+    /// come from the same discovery read, so a rule missing both says so in one
+    /// message here rather than failing twice in two different words.
     pub fn upstreams(&self) -> Result<Vec<String>> {
-        if self.upstream_hosts.is_empty() {
+        let (Some(port), false) = (self.port, self.upstream_hosts.is_empty()) else {
+            let mut missing: Vec<String> = Vec::new();
+            if self.port.is_none() {
+                missing.push(format!(
+                    "no resolved port: the slot declares `{FRONTED_FIELD} = true` without \
+                     `{PORT_FIELD}`, so the number has to come from the node's `resolved_ports` \
+                     (R844-F2) and no ready record supplied one"
+                ));
+            }
+            if self.upstream_hosts.is_empty() {
+                missing.push(format!(
+                    "no resolved upstream address: the workload's mesh IP is allocated at \
+                     deploy time (R599-F12), so it cannot come from the mirror"
+                ));
+            }
             return Err(anyhow::anyhow!(
-                "slot [providers.{}] has no resolved upstream address for {}: the workload's \
-                 mesh IP is allocated at deploy time (R599-F12), so it cannot come from the \
-                 mirror. Either the fronting node's `GET /service-records?ready=true` must \
-                 report a ready record exposing port {}, or the slot must pin \
-                 `{UPSTREAM_HOST_FIELD} = \"<addr>\"` explicitly.",
+                "slot [providers.{}] fronted at {} cannot be dialed — {}. Either the fronting \
+                 node's `GET /service-records?ready=true` must report a ready record for it, or \
+                 the slot must pin `{PORT_FIELD} = <n>` / `{UPSTREAM_HOST_FIELD} = \"<addr>\"` \
+                 explicitly.",
                 self.slot,
                 self.hostname,
-                self.port
+                missing.join("; ")
             ));
-        }
+        };
         Ok(self
             .upstream_hosts
             .iter()
-            .map(|host| format!("{host}:{}", self.port))
+            .map(|host| format!("{host}:{port}"))
             .collect())
+    }
+
+    /// Every backend as a **displayable** `host:port`, resolved halves shown and
+    /// unresolved ones spelled `<unresolved>` — never an error (R844-T10).
+    ///
+    /// The read-only counterpart of [`upstreams`](Self::upstreams), for a
+    /// renderer whose job is to describe the plan rather than to act on it:
+    /// `yah cloud ingress collate` and `yah cloud validate`. Those make no
+    /// network call by design, so a rule taking its port from the supervisor
+    /// (`fronted = true`, no `port`) is *expected* to be half-resolved there and
+    /// reporting it as a failure would train an operator to ignore the output.
+    ///
+    /// It shows **each half independently**, which is the whole point. The
+    /// previous rendering collapsed any error to `<unresolved>:<port_label>` and
+    /// so threw away a known address — after R844-F12 the host resolves offline
+    /// from the placement machine's declared `mesh_ipv4`, so a portless apex now
+    /// reads `100.64.0.3:<unresolved>` and names exactly the one fact that is
+    /// genuinely runtime, instead of claiming ignorance of both.
+    ///
+    /// **Not evidence the front door works.** Nothing here is a measurement:
+    /// the address comes from a mirror or a machine toml, so a rule can render
+    /// perfectly and still dial nothing. That distinction has cost this camp a
+    /// 19-day outage once already, via a pinned `upstream_host` left at
+    /// `127.0.0.1` that every collation printed back confidently.
+    pub fn upstream_labels(&self) -> Vec<String> {
+        let port = self.port_label();
+        if self.upstream_hosts.is_empty() {
+            return vec![format!("<unresolved>:{port}")];
+        }
+        self.upstream_hosts
+            .iter()
+            .map(|host| format!("{host}:{port}"))
+            .collect()
+    }
+
+    /// This rule's port for a message — the number, or `<unresolved>` before
+    /// [`IngressPlan::resolve_ports`] has answered for it.
+    ///
+    /// Exists so every diagnostic renders an unresolved port the same way. A
+    /// call site formatting `Option<u16>` directly prints `None`, which reads
+    /// as a bug in the tool rather than a fact about the fleet.
+    pub fn port_label(&self) -> String {
+        self.port
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "<unresolved>".to_string())
     }
 
     /// The **first** `host:port`, for a renderer that can carry only one backend
@@ -312,6 +409,106 @@ impl IngressPlan {
         Ok(())
     }
 
+    /// Fill in the node-local port each rule's front door dials.
+    ///
+    /// The port half of [`resolve_upstreams`](Self::resolve_upstreams), and the
+    /// step that lets a mirror say `fronted = true` without pinning a number
+    /// (R844-F5). `discover` is backed by the fronting node's
+    /// `GET /service-records?ready=true`, whose `resolved_ports` is what the
+    /// supervisor **bound** rather than what a mirror asked for — the only
+    /// source that stays correct once kamaji allocates the port.
+    ///
+    /// A rule that declared `port` keeps it: an explicit operator pin always
+    /// wins, exactly as `upstream_host` does, which is why every mirror on disk
+    /// applies byte-identically across this change.
+    ///
+    /// **Call this before [`resolve_upstreams`](Self::resolve_upstreams)**, not
+    /// after: discovery matches a record *by port*, so a rule whose port is
+    /// still `None` cannot pick its address out of a node running several
+    /// workloads.
+    ///
+    /// Leaving a rule unresolved is deliberately **not** an error here.
+    /// [`IngressRule::upstreams`] is already the single place an undialable
+    /// rule is reported, and a rule that resolved neither half should say that
+    /// once rather than twice.
+    ///
+    /// Pure, like the planner it follows: the caller does the read and hands
+    /// the answer in, so `plan_ingress` keeps taking no network and
+    /// `xtask/tests/mirror_ingress.rs` keeps planning the real tree as a unit
+    /// test. Third instance of that shape, after
+    /// [`resolve_ingress_placements`] and
+    /// [`resolve_upstreams`](Self::resolve_upstreams).
+    pub fn resolve_ports<F>(&mut self, mut discover: F) -> Result<()>
+    where
+        F: FnMut(&IngressRule) -> Result<Option<u16>>,
+    {
+        for rule in &mut self.rules {
+            if rule.port.is_some() {
+                continue;
+            }
+            rule.port = discover(rule)?;
+        }
+        Ok(())
+    }
+
+    /// Fill in each rule's upstream address from its placement machines'
+    /// **declared** mesh addresses — the offline half of upstream resolution
+    /// (R844-F12).
+    ///
+    /// This is what lets a slot drop `upstream_host` without giving up offline
+    /// planning. The pin was never a fact only the network knew: a rule's
+    /// placement set is already machine *names*
+    /// ([`IngressRule::machines`], R844-F3), and every machine's
+    /// `[registration].mesh_ipv4` is right there in `.yah/infra/machines/`. So
+    /// the pin was a hand-copy of a value the config already stated twice —
+    /// `.yah/infra/machines/us-east-001.toml` says `mesh_ipv4 = "100.64.0.3"`
+    /// and the apex mirror said `upstream_host = "100.64.0.3"` — with nothing
+    /// keeping the two in step. The copy has drifted before: this mirror's pin
+    /// was once found still naming `127.0.0.1` after a second front door
+    /// existed, and every rendered rule looked correct.
+    ///
+    /// **Declared, not authoritative.** Run this only where there is no live
+    /// read to have — `yah cloud ingress collate`, `yah cloud validate`, the
+    /// `xtask` suite. The apply path resolves through
+    /// [`resolve_upstreams_from`](Self::resolve_upstreams_from) instead, and
+    /// must keep doing so: a service record reports the address the supervisor
+    /// actually bound, while this reports what a TOML claims, and when they
+    /// disagree the TOML is the one that can be stale. Calling this *before*
+    /// discovery would silently make the stale value win, since every resolver
+    /// here skips a rule that already has an address — the exact
+    /// confidently-wrong shape R844 exists to remove. It is the offline
+    /// renderer's answer, not a second source of truth.
+    ///
+    /// Pure: `mesh_addrs` is handed in as data by a caller that already loaded
+    /// the machine tomls ([`machine_mesh_addrs`]), so `plan_ingress` and
+    /// everything after it still take no network, no credentials and no
+    /// `CloudConfig` — the property `xtask/tests/mirror_ingress.rs` depends on
+    /// to plan the camp's real `.yah/services` tree as a unit test. Fourth
+    /// instance of that shape, after [`resolve_ingress_placements`],
+    /// [`resolve_upstreams`](Self::resolve_upstreams) and
+    /// [`resolve_ports`](Self::resolve_ports).
+    ///
+    /// Silent where it cannot answer, like [`resolve_ports`](Self::resolve_ports):
+    /// a machine with no declared `mesh_ipv4` contributes nothing and the rule
+    /// stays empty, so [`IngressRule::upstreams`] remains the single place an
+    /// undialable rule is reported. A rule that already has an address — a
+    /// pinned `upstream_host`, or a discovery answer — is left alone.
+    pub fn resolve_upstreams_from_config(&mut self, mesh_addrs: &HashMap<String, String>) {
+        for rule in &mut self.rules {
+            if !rule.upstream_hosts.is_empty() {
+                continue;
+            }
+            // Declaration order, matching `machines` — the renderer emits one
+            // `PASSWAY_UPSTREAMS` entry per backend and a reordered set would
+            // look like drift on every apply.
+            rule.upstream_hosts = rule
+                .machines
+                .iter()
+                .filter_map(|name| mesh_addrs.get(name).cloned())
+                .collect();
+        }
+    }
+
     /// Provider id the front door's credentials resolve through — the edge's
     /// own `use`, falling back to the `use` of the first fronted slot that
     /// names one.
@@ -381,20 +578,31 @@ pub fn declared(mirror: &MirrorConfig) -> Result<Vec<IngressEdge>> {
 /// is a loud error naming the slot: a front door whose workload cannot be
 /// placed is exactly the silent-trap shape this exists to close.
 ///
-/// **Set-valued, resolving to one (R844-F3).** The return type is a placement
-/// *set* per role because that is what [`IngressRule::machines`] carries and
-/// what the discovery fanout asks — but a constraint still resolves to exactly
-/// one machine, deliberately. The deploy-side resolver
+/// **Set-valued, and resolving to as many as the constraint declares
+/// (R844-F8).** The return type is a placement *set* per role because that is
+/// what [`IngressRule::machines`] carries and what the discovery fanout asks.
+/// A `required` block with no `replicas` still resolves to exactly one machine
+/// — every mirror on disk is that shape, and they all resolve byte-identically
+/// — while `replicas = N` resolves to the first N machines the constraint
+/// matches.
+///
+/// **The count is declared, never inferred from the match count.** A constraint
+/// matching four nodes and asking for two places on two; otherwise adding a box
+/// to the fleet would silently scale a production front door.
+///
+/// The reason R844-F3 stopped at one, and the invariant that replaces it: this
+/// and the deploy-side resolver
 /// ([`resolve_bundle_machines`](super::mesofact_bundle::resolve_bundle_machines))
-/// answers a `required` block with `cfg.resolve_machine(…)`, a single machine,
-/// so fanning out here to *every* node the constraint matches would make the
-/// ingress planner and the deployer disagree about where the workload is — the
-/// planner would aim discovery at nodes nothing was ever deployed to. Horizontal
-/// scale is therefore something a mirror **declares** (`machines = [a, b]`,
-/// which this function does not touch and [`plan_ingress`] now reads whole), not
-/// something the constraint's match count implies. When the deploy side grows a
-/// replica count, this is the one line that widens with it, and the type it
-/// returns already fits.
+/// must agree **set for set**, not merely in count, or the planner aims
+/// discovery at nodes nothing was ever deployed to and the front door renders a
+/// *subset* of the backends — the failure that looks like it worked. They now
+/// agree by construction rather than by test: both bottom out in the same
+/// `select_matching` over the same declaration-ordered `cfg.machines` slice
+/// (here via [`resolve_machines_among`], there via `CloudConfig::resolve_machines`).
+///
+/// A slot declaring a literal `machines = [a, b]` is still untouched by this
+/// and read whole by [`plan_ingress`] — that remains the imperative spelling of
+/// horizontal scale, beside the derived one.
 pub fn resolve_ingress_placements(
     machines: &[MachineConfig],
     mirror: &MirrorConfig,
@@ -408,23 +616,55 @@ pub fn resolve_ingress_placements(
         let Some(required) = slot.required() else {
             continue;
         };
-        let machine = resolve_machine_among(machines, &required).with_context(|| {
+        let resolved = resolve_machines_among(machines, &required).with_context(|| {
             format!("resolving placement for [providers.{role}] required = {{ … }}")
         })?;
-        placements.insert(role.clone(), vec![machine.name.clone()]);
+        placements.insert(
+            role.clone(),
+            resolved.iter().map(|m| m.name.clone()).collect(),
+        );
     }
     Ok(placements)
 }
 
+/// Every machine's declared mesh address, keyed by machine name (R844-F12).
+///
+/// The data half of [`IngressPlan::resolve_upstreams_from_config`], split out
+/// for the same reason [`resolve_ingress_placements`] is: the planner stays
+/// pure and the caller — which has already loaded `.yah/infra/machines/` for
+/// placement resolution — does the reading. No new input, just a second lookup
+/// over a slice that is already in hand.
+///
+/// Reads through [`MachineConfig::mesh_ipv4`], so it picks up the same
+/// `[registration].mesh_ipv4`-then-legacy-`yubaba_url`-host precedence every
+/// other consumer sees; a machine that declares neither is simply absent, and
+/// a rule placed only on such machines resolves no address offline. That is
+/// the honest answer — silence, reported once by
+/// [`IngressRule::upstreams`] — rather than a guess.
+pub fn machine_mesh_addrs(machines: &[MachineConfig]) -> HashMap<String, String> {
+    machines
+        .iter()
+        .filter_map(|m| Some((m.name.clone(), m.mesh_ipv4()?.to_string())))
+        .collect()
+}
+
 /// Derive every declared edge's rules from the mirror's provider slots.
 ///
-/// A slot participates when it declares `port`; its `zone` is the public
-/// hostname that port is fanned in at. `port` without a `zone` is an **error**,
-/// not a skip — a mirror that declares a front door and a fronted port but no
-/// hostname is always a typo, and silently dropping it is exactly the failure
-/// mode where an operator flips `ingress = "cloudflare-tunnel"` and gets a
-/// front door that publishes nothing. A slot with `zone` and no `port` is
-/// skipped: that is a CDN-published tier, not a fronted one.
+/// A slot participates when it declares `fronted = true` **or** a `port`; its
+/// `zone` is the public hostname it is fanned in at. Participation without a
+/// `zone` is an **error**, not a skip — a mirror that declares a front door and
+/// a fronted slot but no hostname is always a typo, and silently dropping it is
+/// exactly the failure mode where an operator flips
+/// `ingress = "cloudflare-tunnel"` and gets a front door that publishes
+/// nothing. A slot with `zone` and neither signal is skipped: that is a
+/// CDN-published tier, not a fronted one.
+///
+/// The two signals are separate as of R844-F5. `port` used to be both the value
+/// and the opt-in, so deleting it did not un-pin a port, it removed the slot
+/// from the plan — a live hostname silently losing its backend. `port` still
+/// implies participation (nothing on disk changes), but a slot may now opt in
+/// with `fronted = true` alone and take its port from
+/// [`IngressPlan::resolve_ports`].
 ///
 /// `placements` is the pre-resolved output of [`resolve_ingress_placements`] —
 /// a fallback for a slot's `machine` field when the slot declares `required`
@@ -441,6 +681,21 @@ pub fn resolve_ingress_placements(
 ///
 /// Returns an empty vec when the mirror declares no ingress edge. Plans are in
 /// declaration order.
+///
+/// @yah:ticket(R844-F12, "Derive a rule's upstream host from the placement machine's declared mesh_ipv4 — retire upstream_host without giving up offline planning")
+/// @yah:status(review)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:at(2026-09-03T22:18:35Z)
+/// @yah:parent(R844)
+/// @yah:next("THE SHAPE: when a slot declares no `upstream_host`, fall back to the DECLARED mesh address of each machine in the rule's resolved placement set, instead of leaving upstream_hosts empty for discovery to fill. IngressRule.machines is already the placement set (R844-F3) and `resolve_ingress_placements(machines: &[MachineConfig], mirror)` at ingress.rs:515 already receives every MachineConfig, so the data is in hand at plan time — this is a lookup, not a new input, and plan_ingress keeps taking no network and no CloudConfig. Live discovery via IngressPlan::resolve_upstreams should still WIN when it answers, because it reports what is actually bound; the config fallback is what makes the plan renderable offline rather than what makes it authoritative.")
+/// @yah:verify("EQUIVALENCE IS THE TEST, NOT NON-EMPTINESS. With `upstream_host` deleted from .yah/services/yah-marketing/mirrors/cloud.toml, `yah cloud ingress collate` must still render `yah.dev -> 100.64.0.3:8080` on BOTH front doors (us-east-001 and us-south-001), byte-identical to the pinned output, and `cargo test -p xtask --test main mirror_ingress` must be green WITHOUT network. A partial or empty answer that renders a SUBSET of backends looks exactly like success — that is the failure class R844 exists to eliminate and the reason R772 reverted this same deletion once.")
+/// @yah:gotcha("WHY THIS IS SAFE AND WHERE ITS LIMIT IS. Safe: .yah/infra/machines/us-east-001.toml:109 declares mesh_ipv4 = \"100.64.0.3\", the apex's live service record reports endpoints [\"100.64.0.3:8080\"], and the two agree — verified against the live fleet 2026-09-03. The existing xtask assertion the_apex_bundle_places_on_the_node_set_its_upstreams_are_pinned_to already performs exactly this offline lookup (its failure message reads \"us-east-001 resolves to mesh address 100.64.0.3\"), so the derivation is proven to work; it is simply not wired into planning. THE LIMIT: R599-F12's doc says native_bind_ip binds the workload's ALLOCATED MeshAssignment, not flatly the node's IP. Those coincide for the apex today, but R844-B11 reports container records advertising a COUNTER-ALLOCATED mesh IP that collides with real node addresses — so this fallback is sound for node-bound NATIVE workloads and its general validity depends on how B11 resolves. Hence depends_on(R844-B11): either land B11 first, or scope the fallback explicitly to the native shape and make it refuse rather than guess for containers.")
+/// @yah:depends_on(R844-B11)
+/// @yah:handoff("SHIPPED, AND THE PIN IS NOW REDUNDANT RATHER THAN LOAD-BEARING. Two additions to oss/yubaba/crates/cloud/src/reconciler/ingress.rs: `machine_mesh_addrs(&[MachineConfig]) -> HashMap<String,String>` (machine name -> declared `[registration].mesh_ipv4`, read through `MachineConfig::mesh_ipv4()` so it inherits the same registration-then-legacy-url precedence every other consumer sees), and `IngressPlan::resolve_upstreams_from_config(&mesh_addrs)`, which fills each rule's `upstream_hosts` from its placement set in declaration order. Wired into `collate_workspace_ingress` (validate.rs) — the ONE seam, which is why both `yah cloud ingress collate` AND `yah cloud validate` get it, since both call that function (app/yah/cli/src/cloud.rs:3709 and :7521). Exported via reconciler/mod.rs.")
+/// @yah:verify("EQUIVALENCE, NOT NON-EMPTINESS, AND AGAINST THE REAL FILE. New `xtask/tests/mirror_ingress.rs::the_apex_renders_the_same_backends_with_upstream_host_deleted` reads .yah/services/yah-marketing/mirrors/cloud.toml OFF DISK, strips the `upstream_host` line from the text, and asserts the pinless render equals the pinned render exactly — `[\"yah.dev=100.64.0.3:8080\"]` both ways. It also asserts the strip actually happened (so a rename cannot make it compare the pinned mirror to itself and pass forever) and that the pinless plan resolves NOTHING before the config pass runs, so the equality provably comes from the derivation and not from some other path supplying the address. cargo test -p xtask --test main mirror_ingress = 11 passed / 0 failed, still with no network, no credentials and no CloudConfig — the purity canary holds.")
+/// @yah:verify("Five new unit tests in ingress.rs pin the semantics the xtask test cannot isolate: a pinless slot derives its address; every placement machine contributes a backend IN DECLARATION ORDER (a subset here is the failure that looks like it worked); a pinned `upstream_host` still wins; a machine with no declared mesh address resolves NOTHING rather than falling back to loopback or a neighbour; and a live discovery answer is not overwritten by the declaration. cargo test -p yah-cloud --lib = 997 passed / 0 failed / 4 ignored. cargo test -p yubaba --lib = 632 passed / 0 failed. cargo check -p yah -p xtask --all-targets = exit 0.")
+/// @yah:handoff("THE PRECEDENCE IS THE SAFETY PROPERTY, AND IT IS ORDERING, NOT CODE. Config-derived is DECLARED, never authoritative: it runs ONLY where there is no live read to have (collate, validate, xtask). The apply path still resolves through `resolve_upstreams_from` and MUST keep doing so — a service record reports what the supervisor actually bound, this reports what a TOML claims, and when they disagree the TOML is the one that can be stale. Because every resolver here skips a rule that already has an address, calling the config pass BEFORE discovery would silently make the stale value win. That is the confidently-wrong shape R844 exists to remove, so it is asserted as a test (`a_live_answer_is_not_overwritten_by_the_declaration`) rather than left as a convention. The drift is not hypothetical: this mirror's pin was once found still naming 127.0.0.1 after a second front door existed, and every rendered rule looked correct.")
+/// @yah:handoff("DEPENDS_ON(R844-B11) IS DISCHARGED, in B11's favour. This ticket's own gotcha said the derivation was \"sound for node-bound NATIVE workloads\" and that its general validity depended on how B11's container mesh-IP bug resolved. B11 (now at review, same session) deleted `alloc_mesh_ip` outright and routed the container tier through `ServerState::workload_bind_ip()` = the node's own mesh address — the same value `admit_bundle` already used. So BOTH tiers now advertise the answering node's own address, which is precisely the fact `.yah/infra/machines/<node>.toml` declares as `[registration].mesh_ipv4`. The two sources agree by construction rather than by coincidence, and this fallback needed no container-specific scoping or refusal.")
 pub fn plan_ingress(
     mirror: &MirrorConfig,
     placements: &HashMap<String, Vec<String>>,
@@ -453,22 +708,45 @@ pub fn plan_ingress(
     let mut rules = Vec::new();
     for (role, slot) in &mirror.providers {
         let fields = slot.fields();
-        let Some(port) = fields.get(PORT_FIELD).and_then(|v| v.as_integer()) else {
-            continue;
+        let declared_port = fields.get(PORT_FIELD).and_then(|v| v.as_integer());
+        let fronted = match fields.get(FRONTED_FIELD) {
+            None => false,
+            Some(value) => value.as_bool().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "slot [providers.{role}] {FRONTED_FIELD} = {value} is not a boolean — write \
+                     `{FRONTED_FIELD} = true` to put the slot behind the front door. Any other \
+                     spelling reads as `not fronted`, which would drop the slot from the plan \
+                     silently."
+                )
+            })?,
         };
+        // The opt-in, either spelling. `port` implies it so that every mirror
+        // written before `fronted` existed plans identically (R844-F5).
+        if declared_port.is_none() && !fronted {
+            continue;
+        }
         let Some(zone) = fields.get(ZONE_FIELD).and_then(|v| v.as_str()) else {
+            let (declared, drop_field) = match declared_port {
+                Some(p) => (format!("{PORT_FIELD} = {p}"), PORT_FIELD),
+                None => (format!("{FRONTED_FIELD} = true"), FRONTED_FIELD),
+            };
             bail!(
                 "mirror declares {} ingress edge(s) and slot [providers.{role}] declares \
-                 {PORT_FIELD} = {port}, but no `zone` — an ingress provider fans a public \
-                 hostname in to a node-local port, so it has nothing to publish that port \
-                 at. Add `zone = \"<hostname>\"` to the slot, or drop `{PORT_FIELD}` if \
-                 this slot is not fronted.",
+                 {declared}, but no `zone` — an ingress provider fans a public hostname in to a \
+                 node-local port, so it has nothing to publish that slot at. Add \
+                 `zone = \"<hostname>\"` to the slot, or drop `{drop_field}` if this slot is \
+                 not fronted.",
                 edges.len()
             );
         };
-        let port = u16::try_from(port).with_context(|| {
-            format!("slot [providers.{role}] {PORT_FIELD} = {port} is not a valid TCP port")
-        })?;
+        let port = match declared_port {
+            Some(p) => Some(u16::try_from(p).with_context(|| {
+                format!("slot [providers.{role}] {PORT_FIELD} = {p} is not a valid TCP port")
+            })?),
+            // Filled by `IngressPlan::resolve_ports` from the node's service
+            // records — the port the supervisor actually bound.
+            None => None,
+        };
         rules.push(IngressRule {
             hostname: zone.to_string(),
             port,
@@ -490,9 +768,11 @@ pub fn plan_ingress(
 
     if rules.is_empty() {
         bail!(
-            "mirror declares {} ingress edge(s) but no provider slot declares `{PORT_FIELD}` — \
-             there is nothing to publish. Either add `zone` + `{PORT_FIELD}` to the slot \
-             the front door fronts, or remove the `ingress` declaration.",
+            "mirror declares {} ingress edge(s) but no provider slot declares `{PORT_FIELD}` or \
+             `{FRONTED_FIELD} = true` — there is nothing to publish. Either add `zone` plus one \
+             of those to the slot the front door fronts (`{FRONTED_FIELD} = true` takes the port \
+             from the node's service records; `{PORT_FIELD}` pins it), or remove the `ingress` \
+             declaration.",
             edges.len()
         );
     }
@@ -590,9 +870,10 @@ fn partition(edges: &[IngressEdge], rules: Vec<IngressRule>) -> Result<Vec<Ingre
     for (edge, rules) in edges.iter().zip(buckets) {
         if rules.is_empty() {
             bail!(
-                "{}: fronts nothing. Its selector matches no slot that declares `zone` + \
-                 `{PORT_FIELD}` — a typo'd slot name is otherwise invisible, because the front \
-                 door still deploys and simply publishes an empty rule set.",
+                "{}: fronts nothing. Its selector matches no slot that declares `zone` plus \
+                 `{PORT_FIELD}` or `{FRONTED_FIELD} = true` — a typo'd slot name is otherwise \
+                 invisible, because the front door still deploys and simply publishes an empty \
+                 rule set.",
                 edge.label()
             );
         }
@@ -759,10 +1040,10 @@ pub fn collate_front_doors(planned: &[PlannedEdge]) -> Result<Collation> {
                             rule.hostname,
                             first_edge.label(),
                             first_rule.slot,
-                            first_rule.port,
+                            first_rule.port_label(),
                             edge.label(),
                             rule.slot,
-                            rule.port
+                            rule.port_label()
                         );
                     }
                 }
@@ -1034,7 +1315,7 @@ mod tests {
             vec![
                 IngressRule {
                     hostname: "a.yah.dev".into(),
-                    port: 9090,
+                    port: Some(9090),
                     slot: "receiver".into(),
                     provider_id: Some("cloudflare".into()),
                     machines: Vec::new(),
@@ -1042,7 +1323,7 @@ mod tests {
                 },
                 IngressRule {
                     hostname: "z.yah.dev".into(),
-                    port: 8080,
+                    port: Some(8080),
                     slot: "compute".into(),
                     provider_id: Some("hetzner".into()),
                     machines: vec!["us-east-001".into()],
@@ -1261,6 +1542,325 @@ mod tests {
         assert!(format!("{err:#}").contains("no provider slot declares `port`"));
     }
 
+    // ── `fronted`: participation split from the port value (R844-F5) ──
+
+    #[test]
+    fn a_fronted_slot_with_no_port_is_planned_rather_than_skipped() {
+        // The finding this ticket exists for: before the split, deleting `port`
+        // did not un-pin a port — it removed the slot from the plan entirely,
+        // so a live hostname silently lost its backend while the mirror still
+        // read as if it were fronted.
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\nmachines = [\"us-east-001\"]\n\
+             zone = \"yah.dev\"\nfronted = true\n",
+        );
+        let plan = only_plan(&m);
+        assert_eq!(plan.rules.len(), 1);
+        assert_eq!(plan.rules[0].hostname, "yah.dev");
+        assert_eq!(plan.rules[0].port, None, "the port is discovery's to answer");
+        assert_eq!(plan.rules[0].machines, vec!["us-east-001"]);
+        assert_eq!(plan.front_doors, vec!["us-east-001".to_string()]);
+    }
+
+    #[test]
+    fn a_declared_port_still_fronts_without_the_new_field() {
+        // The migration is additive: every mirror on disk predates `fronted`
+        // and must plan byte-identically.
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\nmachine = \"us-east-001\"\n\
+             zone = \"yah.dev\"\nport = 8080\n",
+        );
+        let plan = only_plan(&m);
+        assert_eq!(plan.rules.len(), 1);
+        assert_eq!(plan.rules[0].port, Some(8080));
+    }
+
+    #[test]
+    fn a_slot_with_neither_signal_is_still_skipped() {
+        // A CDN-published static tier carries `zone` meaning the CLOUDFLARE
+        // zone. Keying participation off it would drag every such slot into the
+        // plan, which is why `fronted` exists at all.
+        let m = mirror(
+            IngressProvider::Passway,
+            "[static]\nuse = \"cloudflare\"\nbucket = \"b\"\nzone = \"cdn.yah.dev\"\n\
+             [bundle]\nuse = \"cloudflare\"\nzone = \"yah.dev\"\nfronted = true\n",
+        );
+        let plan = only_plan(&m);
+        assert_eq!(
+            plan.rules.iter().map(|r| r.slot.as_str()).collect::<Vec<_>>(),
+            vec!["bundle"]
+        );
+    }
+
+    #[test]
+    fn fronted_without_a_zone_is_the_same_error_as_port_without_one() {
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\nfronted = true\n",
+        );
+        let msg = format!("{:#}", plan_ingress(&m, &HashMap::new()).unwrap_err());
+        assert!(msg.contains("providers.bundle"), "got: {msg}");
+        assert!(msg.contains("fronted = true"), "names the signal: {msg}");
+        assert!(msg.contains("zone"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_non_boolean_fronted_is_an_error_rather_than_a_silent_skip() {
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\nzone = \"yah.dev\"\nfronted = \"yes\"\n",
+        );
+        let msg = format!("{:#}", plan_ingress(&m, &HashMap::new()).unwrap_err());
+        assert!(msg.contains("is not a boolean"), "got: {msg}");
+        assert!(msg.contains("providers.bundle"), "got: {msg}");
+    }
+
+    #[test]
+    fn the_empty_plan_error_names_both_participation_spellings() {
+        let m = mirror(
+            IngressProvider::Passway,
+            "[static]\nuse = \"cloudflare\"\nbucket = \"b\"\n",
+        );
+        let msg = format!("{:#}", plan_ingress(&m, &HashMap::new()).unwrap_err());
+        assert!(msg.contains("fronted = true"), "got: {msg}");
+        assert!(msg.contains("`port`"), "got: {msg}");
+    }
+
+    // ── resolve_ports (R844-F5) ──
+
+    #[test]
+    fn resolve_ports_fills_a_portless_rule_from_discovery() {
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\nmachines = [\"us-east-001\"]\n\
+             zone = \"yah.dev\"\nfronted = true\nupstream_host = \"100.64.0.3\"\n",
+        );
+        let mut plan = only_plan(&m);
+        // What kamaji allocated and the supervisor reported as `resolved_ports`
+        // — a number no mirror could have known.
+        plan.resolve_ports(|rule| {
+            assert_eq!(rule.slot, "bundle");
+            Ok(Some(43117))
+        })
+        .unwrap();
+        assert_eq!(plan.rules[0].port, Some(43117));
+        assert_eq!(
+            plan.passway_upstreams().unwrap(),
+            vec!["yah.dev=100.64.0.3:43117"]
+        );
+    }
+
+    #[test]
+    fn a_declared_port_wins_over_discovery() {
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\nzone = \"yah.dev\"\nport = 8080\n\
+             fronted = true\nupstream_host = \"100.64.0.3\"\n",
+        );
+        let mut plan = only_plan(&m);
+        plan.resolve_ports(|_| panic!("discovery must not run for a pinned port"))
+            .unwrap();
+        assert_eq!(plan.rules[0].port, Some(8080));
+    }
+
+    #[test]
+    fn an_unresolved_port_is_one_combined_error_not_a_panic() {
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\nzone = \"yah.dev\"\nfronted = true\n",
+        );
+        let mut plan = only_plan(&m);
+        plan.resolve_ports(|_| Ok(None)).unwrap();
+        // Neither half resolved: one message naming both, from the single place
+        // an undialable rule is reported.
+        let msg = format!("{:#}", plan.rules[0].service_url().unwrap_err());
+        assert!(msg.contains("no resolved port"), "got: {msg}");
+        assert!(msg.contains("no resolved upstream address"), "got: {msg}");
+        assert!(msg.contains("providers.bundle"), "got: {msg}");
+        assert_eq!(plan.rules[0].port_label(), "<unresolved>");
+    }
+
+    #[test]
+    fn a_resolved_port_with_no_backend_still_says_so() {
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\nzone = \"yah.dev\"\nfronted = true\n",
+        );
+        let mut plan = only_plan(&m);
+        plan.resolve_ports(|_| Ok(Some(43117))).unwrap();
+        let err = plan.resolve_upstreams(|_| Ok(Vec::new())).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no resolved upstream address"), "got: {msg}");
+        assert!(!msg.contains("no resolved port"), "port resolved: {msg}");
+    }
+
+    // ── resolve_upstreams_from_config (R844-F12) ──
+
+    fn addrs(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(n, a)| (n.to_string(), a.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_pinless_slot_takes_its_address_from_the_placement_machines_declaration() {
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\nmachines = [\"us-east-001\"]\n\
+             zone = \"yah.dev\"\nport = 8080\n",
+        );
+        let mut plan = only_plan(&m);
+        assert!(
+            plan.rules[0].upstream_hosts.is_empty(),
+            "nothing pins it, so the planner leaves it for a resolver"
+        );
+        plan.resolve_upstreams_from_config(&addrs(&[("us-east-001", "100.64.0.3")]));
+        assert_eq!(
+            plan.passway_upstreams().unwrap(),
+            vec!["yah.dev=100.64.0.3:8080"],
+            "the exact string the pinned mirror renders — equivalence is the claim"
+        );
+    }
+
+    #[test]
+    fn every_placement_machine_contributes_a_backend_in_declaration_order() {
+        // Horizontal scale > 1: taking the first entry would render a subset,
+        // which is the failure that looks like it worked (R844-F3/F4).
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\n\
+             machines = [\"us-east-001\", \"us-west-001\"]\n\
+             zone = \"yah.dev\"\nport = 8080\n",
+        );
+        let mut plan = only_plan(&m);
+        plan.resolve_upstreams_from_config(&addrs(&[
+            ("us-west-001", "100.64.0.1"),
+            ("us-east-001", "100.64.0.3"),
+        ]));
+        assert_eq!(
+            plan.passway_upstreams().unwrap(),
+            vec!["yah.dev=100.64.0.3:8080", "yah.dev=100.64.0.1:8080"],
+            "declaration order, not map order — a reordered set reads as drift \
+             on every apply"
+        );
+    }
+
+    #[test]
+    fn a_pinned_upstream_host_still_wins_over_the_declaration() {
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\nmachines = [\"us-east-001\"]\n\
+             zone = \"yah.dev\"\nport = 8080\nupstream_host = \"10.0.0.9\"\n",
+        );
+        let mut plan = only_plan(&m);
+        plan.resolve_upstreams_from_config(&addrs(&[("us-east-001", "100.64.0.3")]));
+        assert_eq!(
+            plan.passway_upstreams().unwrap(),
+            vec!["yah.dev=10.0.0.9:8080"],
+            "an explicit operator override is the escape hatch for a node whose \
+             declared address is wrong — the derivation must not overwrite it"
+        );
+    }
+
+    #[test]
+    fn a_machine_with_no_declared_address_resolves_nothing_rather_than_guessing() {
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\nmachines = [\"dev-box\"]\n\
+             zone = \"yah.dev\"\nport = 8080\n",
+        );
+        let mut plan = only_plan(&m);
+        plan.resolve_upstreams_from_config(&addrs(&[("us-east-001", "100.64.0.3")]));
+        // Silence, reported once by the single undialable-rule error site —
+        // never a fallback to loopback or to some other node's address.
+        let msg = format!("{:#}", plan.passway_upstreams().unwrap_err());
+        assert!(msg.contains("no resolved upstream address"), "got: {msg}");
+        assert!(!msg.contains("no resolved port"), "port is pinned: {msg}");
+    }
+
+    #[test]
+    fn a_live_answer_is_not_overwritten_by_the_declaration() {
+        // Precedence, stated as a test because the ordering is the whole
+        // safety property: discovery reports what the supervisor bound, the
+        // declaration reports what a TOML claims, and running this pass after
+        // discovery must leave the measured answer alone.
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\nmachines = [\"us-east-001\"]\n\
+             zone = \"yah.dev\"\nport = 8080\n",
+        );
+        let mut plan = only_plan(&m);
+        plan.resolve_upstreams(|_| Ok(vec!["100.64.0.42".to_string()]))
+            .unwrap();
+        plan.resolve_upstreams_from_config(&addrs(&[("us-east-001", "100.64.0.3")]));
+        assert_eq!(
+            plan.passway_upstreams().unwrap(),
+            vec!["yah.dev=100.64.0.42:8080"],
+            "a stale machine toml must not win over a live read"
+        );
+    }
+
+    // ── upstream_labels (R844-T10) ──
+
+    #[test]
+    fn a_half_resolved_rule_labels_the_half_it_knows() {
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\nmachines = [\"us-east-001\"]\n\
+             zone = \"yah.dev\"\nfronted = true\n",
+        );
+        let mut plan = only_plan(&m);
+        plan.resolve_upstreams_from_config(&addrs(&[("us-east-001", "100.64.0.3")]));
+        // The address is a config fact and resolves offline; the port is a
+        // runtime fact and cannot. Reporting the first as unknown too — which
+        // the old `<unresolved>:<port>` fallback did — discards a fact the tool
+        // is holding.
+        assert_eq!(
+            plan.rules[0].upstream_labels(),
+            vec!["100.64.0.3:<unresolved>"]
+        );
+        assert!(
+            plan.rules[0].upstreams().is_err(),
+            "and it is still undialable — a label is not a resolution"
+        );
+    }
+
+    #[test]
+    fn a_rule_with_neither_half_says_so_once_per_line() {
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\nzone = \"yah.dev\"\nfronted = true\n",
+        );
+        let plan = only_plan(&m);
+        assert_eq!(
+            plan.rules[0].upstream_labels(),
+            vec!["<unresolved>:<unresolved>"]
+        );
+    }
+
+    #[test]
+    fn every_backend_gets_its_own_label() {
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\n\
+             machines = [\"us-east-001\", \"us-west-001\"]\n\
+             zone = \"yah.dev\"\nport = 8080\n",
+        );
+        let mut plan = only_plan(&m);
+        plan.resolve_upstreams_from_config(&addrs(&[
+            ("us-east-001", "100.64.0.3"),
+            ("us-west-001", "100.64.0.1"),
+        ]));
+        assert_eq!(
+            plan.rules[0].upstream_labels(),
+            vec!["100.64.0.3:8080", "100.64.0.1:8080"],
+            "collating one backend out of N is the subset failure this view exists \
+             to catch, so the view must not collapse the set either"
+        );
+    }
 
     // ── declared edges (W305 F2) ──
 
@@ -1600,7 +2200,7 @@ mod tests {
             provider,
             rules: vec![IngressRule {
                 hostname: hostname.into(),
-                port,
+                port: Some(port),
                 slot: "compute".into(),
                 provider_id: None,
                 machines: Vec::new(),
@@ -1842,7 +2442,7 @@ mod tests {
         );
         let mut plan = only_plan(&m);
         plan.resolve_upstreams(|r| {
-            assert_eq!(r.port, 8080);
+            assert_eq!(r.port, Some(8080));
             Ok(vec!["100.64.0.7".into()])
         })
         .unwrap();
@@ -1886,7 +2486,7 @@ mod tests {
     fn rule(hostname: &str, port: u16) -> IngressRule {
         IngressRule {
             hostname: hostname.into(),
-            port,
+            port: Some(port),
             slot: "compute".into(),
             provider_id: None,
             machines: Vec::new(),

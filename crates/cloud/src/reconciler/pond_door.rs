@@ -305,7 +305,10 @@ pub fn plan_pond_door(cfg: &CloudConfig, listen: SocketAddr) -> Result<PondDoorP
 
                 rules.push(IngressRule {
                     hostname,
-                    port,
+                    // Always pinned here: a pond's port comes from the recipe,
+                    // not from a discovery read (R844-F5 made the field
+                    // optional for the fleet arm, which has a yubaba to ask).
+                    port: Some(port),
                     slot: role.clone(),
                     provider_id: None,
                     machines: Vec::new(),
@@ -751,7 +754,7 @@ mod tests {
     fn rule(hostname: &str, port: u16) -> IngressRule {
         IngressRule {
             hostname: hostname.into(),
-            port,
+            port: Some(port),
             slot: STATIC_SLOT.into(),
             provider_id: None,
             machines: Vec::new(),

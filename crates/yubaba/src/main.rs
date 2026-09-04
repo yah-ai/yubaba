@@ -164,6 +164,18 @@ enum Cmd {
         /// exit 2).
         #[arg(long = "kamaji-socket")]
         kamaji_socket: Option<PathBuf>,
+        /// R556-F6 gate (b) / A049 §federation: advertised endpoint of the
+        /// node-local scryer (`http://<mesh-ip>:6543`). When set, `GET
+        /// /services` carries the kamaji-managed scryer entry
+        /// (`ServerState::with_scryer_endpoint`) so consumers — hub Mode-1
+        /// federation, peers, tower — can locate it; unset, the node
+        /// advertises no scryer, which is correct for an opted-out box
+        /// (the mesh tolerates absence, A049 §"What scryer is not"). The
+        /// value names THIS node's own mesh IP so it is per-node config:
+        /// production sets it via a yubaba.service drop-in, the same shape
+        /// as the 20-mesh-bind drop-in.
+        #[arg(long)]
+        scryer_endpoint: Option<String>,
         /// Phase 2: this node's raft node ID (u64, unique per yubaba instance).
         /// When set, the raft coordination layer is started and `/raft/*`
         /// routes become active.
@@ -295,7 +307,20 @@ enum Cmd {
         /// Phase 2: S3 URL for litestream Headscale DB replication.
         /// Format: `s3://bucket/path?endpoint=https://fsn1.your-objectstorage.com`
         /// When set, the leader watcher manages litestream replicate + restore.
-        #[arg(long)]
+        ///
+        /// # Delivered by environment on the fleet, not by ExecStart
+        ///
+        /// `yubaba.service` ships in the release tarball and is copied verbatim
+        /// onto every node of every camp, so a bucket named in its ExecStart
+        /// would be a *fleet* URL baked into a binary a rig also installs. The
+        /// env fallback puts it in `/etc/yah-cloud/litestream.env` instead —
+        /// the same per-node file that already carries
+        /// `LITESTREAM_ACCESS_KEY_ID` / `LITESTREAM_SECRET_ACCESS_KEY`, which is
+        /// the right place because a URL is useless without the credentials
+        /// that authenticate to it and the two must never drift apart.
+        /// `yubaba.service` reads that file via `EnvironmentFile=-`, so turning
+        /// replication on for a node is one file, not a unit edit and a roll.
+        #[arg(long, env = "YUBABA_LITESTREAM_S3_URL")]
         litestream_s3_url: Option<String>,
         /// R609-F1 (A032 §"yah-aware control plane"): bind the yah control
         /// plane — an `mshr::Endpoint` on this machine's hostkey — so
@@ -574,6 +599,7 @@ fn default_serve() -> Cmd {
         channel: "stable".to_string(),
         containerd_socket: DEFAULT_CONTAINERD_SOCKET.to_string(),
         kamaji_socket: None,
+        scryer_endpoint: None,
         raft_node_id: None,
         raft_dir: PathBuf::from(DEFAULT_RAFT_DIR),
         bootstrap_single_node: false,
@@ -611,6 +637,7 @@ async fn main() -> Result<()> {
             channel,
             containerd_socket,
             kamaji_socket,
+            scryer_endpoint,
             raft_node_id,
             raft_dir,
             bootstrap_single_node,
@@ -684,9 +711,28 @@ async fn main() -> Result<()> {
                 .with_cluster_policy(policy)
                 .with_bind_addr(&bind);
 
+            // R556-F6 gate (b): make the /services scryer advertisement
+            // reachable from the daemon. `with_scryer_endpoint` existed since
+            // R556-T10 but nothing in the serve path called it, so a node
+            // running a scryer still answered `/services -> []`.
+            if let Some(endpoint) = scryer_endpoint {
+                server_state = server_state.with_scryer_endpoint(endpoint);
+            }
+
             if let Some(s3_url) = litestream_s3_url {
                 server_state = server_state.with_litestream_s3_url(s3_url);
             }
+
+            // R852-F2: what `GET /domains/{d}/onboarding` reports to a tenant.
+            // Resolved here, once, rather than per request — the handler must
+            // be a pure function of node config so it is testable and so two
+            // requests in the same second cannot disagree.
+            server_state = server_state.with_domain_onboarding(
+                std::env::var(yubaba::domain_issuer::DELEGATE_ZONE_ENV).ok(),
+                yubaba::public_ingress_targets(
+                    std::env::var(yubaba::PUBLIC_INGRESS_ENV).ok(),
+                ),
+            );
 
             // R779 (W267): the object-store fallback for per-domain TLS material.
             // Opt-in via YUBABA_CERT_STORE_BUCKET; a node without it resolves
@@ -786,6 +832,49 @@ async fn main() -> Result<()> {
             // for triage, but the warning makes it clear the requested
             // dispatch path is unavailable.
             server_state = attach_constable_client(server_state, kamaji_socket).await;
+
+            // R852-F1 (W267): the far end of the splice the demux publisher
+            // above renders. One cold passway per enrolled custom domain, armed
+            // through kamaji's JIT tier so 10k idle domains cost 10k held fds
+            // rather than 10k processes.
+            //
+            // Spawned HERE and not beside the publisher because it is the only
+            // one of the three that needs a kamaji, and `attach_constable_client`
+            // runs after that block. Both halves still read the same enrollment
+            // set, so a domain becomes routable and servable from one write —
+            // see `tenant_passway`'s module doc for why deriving them from
+            // different sources is the failure to avoid.
+            match yubaba::tenant_passway::parse_config(|k| std::env::var(k).ok()) {
+                Ok(Some(tp_cfg)) => match (
+                    server_state.cert_store.clone(),
+                    server_state.constable_client.clone(),
+                ) {
+                    (Some(store), Some(kamaji)) => {
+                        let _tenant_passways =
+                            yubaba::tenant_passway::spawn(store, kamaji, tp_cfg);
+                    }
+                    // Configured but unusable. Named rather than silent: the
+                    // symptom otherwise is every tenant domain resolving,
+                    // handshaking and hanging, with nothing in the log to
+                    // attribute it to.
+                    (None, _) => tracing::error!(
+                        "tenant passway reconciler requested ({}) but no cert store is \
+                         configured — set YUBABA_CERT_STORE_BUCKET, or the enrollment set \
+                         cannot be read",
+                        yubaba::tenant_passway::STATE_DIR_ENV
+                    ),
+                    (_, None) => tracing::error!(
+                        "tenant passway reconciler requested ({}) but no kamaji is attached \
+                         — pass --kamaji-socket, or nothing can hold the tenant sockets",
+                        yubaba::tenant_passway::STATE_DIR_ENV
+                    ),
+                },
+                Ok(None) => {}
+                Err(e) => tracing::error!(
+                    "tenant passway reconciler config invalid — not started (fix \
+                     YUBABA_TENANT_PASSWAY_*): {e}"
+                ),
+            }
 
             // Pond (R454-F1 seam): the containerized pond yubaba drives
             // MinIO/miniflare as sibling containers through the host docker

@@ -48,6 +48,11 @@ use yubaba::ServerState;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Expected-value side of a named port assertion (R844-F15).
+fn named_ports(pairs: &[(&str, u16)]) -> std::collections::BTreeMap<String, u16> {
+    pairs.iter().map(|(n, p)| ((*n).to_string(), *p)).collect()
+}
+
 fn serving_spec(name: &str, ports: Vec<u16>) -> WorkloadSpec {
     WorkloadSpec {
         schema_version: SchemaVersion::V1,
@@ -85,7 +90,7 @@ fn serving_spec(name: &str, ports: Vec<u16>) -> WorkloadSpec {
         expose: ExposeSpec {
             mesh: MeshExpose {
                 identity: MeshIdent(name.to_string()),
-                ports,
+                ports: MeshExpose::anonymous_ports(ports),
                 allow_from: vec![],
             },
             public: None,
@@ -104,6 +109,22 @@ fn boot(state_dir: &Path, rt: Arc<FakeRuntime>) -> Arc<ServerState> {
         ServerState::load(state_dir.join("identity.json"))
             .unwrap()
             .with_runtime(rt),
+    )
+}
+
+/// [`boot`], but as a node that actually holds a mesh address — what every
+/// fleet node is, and what [`boot`] alone is not (R844-B11).
+///
+/// `bind` is the `--bind` a real `yubaba serve` gets, and `ServerState`
+/// derives `node_mesh_ip` from it. That address is now the *only* one a
+/// deployed workload's service record can advertise, so a test that wants to
+/// assert anything about a record's address has to boot a node that has one.
+fn boot_on_mesh(state_dir: &Path, rt: Arc<FakeRuntime>, bind: &str) -> Arc<ServerState> {
+    Arc::new(
+        ServerState::load(state_dir.join("identity.json"))
+            .unwrap()
+            .with_runtime(rt)
+            .with_bind_addr(bind),
     )
 }
 
@@ -150,7 +171,16 @@ async fn sweep(state: &Arc<ServerState>) {
 #[tokio::test]
 async fn deploy_publishes_a_ready_dialable_record() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let state = boot(tmp.path(), Arc::new(FakeRuntime::new()));
+    // R844-B11: deliberately NOT `100.64.0.1`, `.2` or `.3`. Those are the
+    // first three draws of the counter this replaced, and the first three real
+    // node addresses in the fleet — the collision that made a record advertise
+    // a neighbour. A node address the counter could never have produced is what
+    // makes the assertion below discriminating.
+    let state = boot_on_mesh(
+        tmp.path(),
+        Arc::new(FakeRuntime::new()),
+        "100.64.0.7:7443",
+    );
 
     let status = deploy(&state, &serving_spec("api", vec![8080])).await;
     assert!(status.is_success(), "deploy failed: {status}");
@@ -159,16 +189,32 @@ async fn deploy_publishes_a_ready_dialable_record() {
     assert_eq!(ready.len(), 1, "deploy should publish exactly one record");
     let record = &ready[0];
     assert_eq!(record.ident, MeshIdent("api".into()));
-    assert_eq!(record.ports, vec![8080]);
+    assert_eq!(record.ports, named_ports(&[("http", 8080)]));
+    assert_eq!(
+        record.port("http"),
+        Some(8080),
+        "a single-listener workload's port resolves by the name every tier gives it"
+    );
     assert_eq!(
         record.endpoints(),
         vec![SocketAddrV4::new(record.mesh_ip, 8080)],
         "endpoint must pair the allocated mesh IP with the declared port"
     );
-    assert!(
-        record.mesh_ip.octets()[0] == 100,
-        "mesh IP should come from the CGNAT pool, got {}",
-        record.mesh_ip
+    // R844-B11: the record advertises THIS NODE's own address, not an invented
+    // one. This assertion replaces `octets()[0] == 100` — "somewhere in the
+    // CGNAT pool" — which is exactly the property the bug satisfied: the
+    // counter drew from that pool and its third draw was us-east-001's real
+    // address, so a west node published a live-looking endpoint one node over.
+    // Being in the right /10 was never the invariant; being the ANSWERING
+    // node's address is.
+    assert_eq!(
+        record.mesh_ip,
+        state
+            .node_mesh_ip()
+            .expect("booted on a mesh address, so the node has one"),
+        "a service record's address must equal the address of the node serving \
+         it — that is the invariant to check against a live `GET /service-records` \
+         too, per R844-B11's verify"
     );
 }
 
@@ -254,7 +300,7 @@ async fn records_survive_a_restart_without_redeploy() {
         .expect("record rehydrated from the port ledger");
     assert_eq!(
         record.ports,
-        vec![8080],
+        named_ports(&[("http", 8080)]),
         "the serving port is the fact nothing else can re-derive"
     );
     assert_eq!(record.mesh_ip, mesh_ip);
@@ -361,6 +407,11 @@ async fn discovery_endpoint_publishes_a_dialable_endpoint_off_node() {
         records[0]["endpoints"],
         serde_json::json!([format!("{mesh_ip}:8080")]),
         "endpoints must be pre-paired so a proxy cannot re-derive them wrong"
+    );
+    assert_eq!(
+        records[0]["named_endpoints"],
+        serde_json::json!({ "http": format!("{mesh_ip}:8080") }),
+        "R844-F15: the same endpoint, selectable by what the port IS"
     );
 }
 

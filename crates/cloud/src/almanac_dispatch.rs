@@ -121,7 +121,11 @@ mod tests {
     async fn missing_service_returns_error() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        // No services declared — CloudConfig::load returns an empty map.
+        // A real workspace that declares no services — CloudConfig::load
+        // returns an empty map. R844-B7: the `.yah/` is what makes this an
+        // empty fleet rather than a wrong-root error, and the distinction is
+        // the point of the test (the service is missing, not the workspace).
+        std::fs::create_dir_all(root.join(".yah")).unwrap();
         let on_change = OnChangeConfig::MesofactRebuild {
             service: "no-such-svc".to_string(),
             route: "/releases".to_string(),

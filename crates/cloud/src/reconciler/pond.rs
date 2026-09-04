@@ -889,9 +889,14 @@ async fn spawn_miniflare_child(
 
     let ssr_prefixes_json =
         serde_json::to_string(ssr_prefixes).unwrap_or_else(|_| "[]".to_string());
+    // `PORT` / `PORT_HTTP`, not the retired `MF_PORT` (R844-T13): the sim serves
+    // the same Worker bundle a fleet node serves, so it must not be the one tier
+    // that spells "what port did I get" its own way. `MF_SCRIPT` and the other
+    // `MF_*` bindings stay — those configure the shim, they are not the port.
+    let port_env = kamaji::ports::port_env(&kamaji::name_anonymous_ports(&[sim_port]));
     let mut cmd = Command::new(&node_binary);
     cmd.arg(&state.miniflare_shim)
-        .env("MF_PORT", sim_port.to_string())
+        .envs(&port_env)
         .env("MF_SCRIPT", &state.worker_js)
         .env("MF_MINIFLARE_IMPORT", &miniflare_import)
         .env("ASSET_ORIGIN", &asset_origin)

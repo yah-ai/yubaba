@@ -91,7 +91,7 @@ fn operator_workload_spec(name: &str, tag: &str, port: u16) -> WorkloadSpec {
         expose: ExposeSpec {
             mesh: MeshExpose {
                 identity: MeshIdent(name.to_string()),
-                ports: vec![port],
+                ports: MeshExpose::anonymous_ports([port]),
                 allow_from: vec![],
             },
             public: None,

@@ -171,7 +171,7 @@ pub fn appliance_spec(headscale_dir: &Path) -> WorkloadSpec {
         expose: ExposeSpec {
             mesh: MeshExpose {
                 identity: MeshIdent(HEADSCALE_IDENT.to_string()),
-                ports: HEADSCALE_PORTS.to_vec(),
+                ports: MeshExpose::anonymous_ports(HEADSCALE_PORTS.iter().copied()),
                 allow_from: vec![],
             },
             public: None,

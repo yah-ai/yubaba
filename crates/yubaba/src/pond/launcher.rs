@@ -195,7 +195,9 @@ pub fn lower_run_spec(spec: &ContainerRunSpec) -> Result<WorkloadSpec> {
                 // Identity == container name: kamaji's docker backend derives
                 // `--name` from this, and teardown resolves by it.
                 identity: MeshIdent(spec.name.clone()),
-                ports: spec.ports.iter().map(|(_, container)| *container).collect(),
+                ports: MeshExpose::anonymous_ports(
+                    spec.ports.iter().map(|(_, container)| *container),
+                ),
                 allow_from: vec![],
             },
             public: None,

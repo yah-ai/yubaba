@@ -294,6 +294,7 @@ mod tests {
             service,
             mirrors,
             component_transform_recipes: BTreeMap::new(),
+            passway_machines: BTreeMap::new(),
         }
     }
 

@@ -1223,6 +1223,20 @@ pub struct ServiceWithMirrors {
     /// `[asset.derive.transform] recipe = "..."`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub component_transform_recipes: BTreeMap<String, String>,
+    /// Nodes each mirror's passway front door is placed on, keyed by env —
+    /// exactly what [`MirrorConfig::passway_machines`] returns, with the envs
+    /// that declare no passway edge left out.
+    ///
+    /// Derived at load time like `component_transform_recipes` above: it is
+    /// stored in no TOML file. It exists so that a consumer of this wire type —
+    /// the desktop `service_list` command, and through it the Services tab's
+    /// custom-domain panel — never reconciles the two `ingress` spellings
+    /// itself. An env present here with an **empty** list is a passway edge
+    /// whose placement is co-located rather than declared; see
+    /// [`MirrorConfig::passway_machines`] for why that is a different answer
+    /// from being absent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub passway_machines: BTreeMap<String, Vec<String>>,
 }
 
 /// All cloud config loaded from a workspace root (the parent of `.yah/`).
@@ -1287,7 +1301,35 @@ impl CloudConfig {
     /// Cross-ref validation runs after both trees finish loading: every
     /// `mirror.providers.X.use = "<id>"` must resolve to a real provider
     /// declared under `.yah/infra/providers/`.
+    ///
+    /// R844-B7 — **a missing `.yah/` is a wrong-root error, not an empty
+    /// fleet.** Every sub-loader below tolerates a missing directory by
+    /// returning empty, so before this check a call against the wrong
+    /// directory produced a perfectly valid `CloudConfig` with zero machines,
+    /// zero services and zero providers. Nothing downstream can tell that
+    /// apart from a camp that genuinely declares nothing, so the failure
+    /// surfaces as an operation that silently does nothing to nothing: a
+    /// collate that renders no backends, a fanout that asks no nodes, a
+    /// rollout that plans against an empty fleet. It was found the hard way —
+    /// a live-fleet test in `app/yah/cli` called this with `"."`, which under
+    /// `cargo test` is the *package* root, and passed while measuring nothing.
+    ///
+    /// The line is drawn at `.yah/` and only there: a workspace whose
+    /// `.yah/infra/machines/` is absent or empty is a real, if unusual, camp
+    /// with an empty fleet and still loads. `unknown` is not `answered with
+    /// none`.
     pub fn load(workspace_root: &Path) -> Result<Self> {
+        let yah_dir = crate::paths::yah_dir(workspace_root);
+        if !yah_dir.is_dir() {
+            anyhow::bail!(
+                "not a yah workspace: no {} — expected the camp root (the parent \
+                 of `.yah/`), got {}. This is a wrong-root error, not an empty \
+                 fleet; a camp with no machines declared still has a `.yah/`.",
+                yah_dir.display(),
+                workspace_root.display(),
+            );
+        }
+
         let mut providers = load_providers(&crate::paths::providers_dir(workspace_root))?;
         let services = load_services(&crate::paths::services_dir(workspace_root), workspace_root)?;
         let domains = load_domains(&crate::paths::domains_dir(workspace_root))?;
@@ -1620,6 +1662,25 @@ impl CloudConfig {
         resolve_machine_among(&self.machines, req)
     }
 
+    /// F16 placement at horizontal scale: the first
+    /// [`RequiredSpec::replica_count`] machines satisfying every hard axis of
+    /// `req`, in declaration order (R844-F8).
+    ///
+    /// The N-valued form of [`Self::resolve_machine`], which is the N=1 case of
+    /// this and not a different selector — both land in [`select_matching`].
+    /// That shared bottom is what makes the deploy resolver
+    /// (`reconciler::mesofact_bundle::resolve_bundle_machines`, which calls
+    /// this) and the ingress planner's
+    /// (`reconciler::ingress::resolve_ingress_placements`, which calls
+    /// [`resolve_machines_among`] over the same `machines` slice) agree on the
+    /// same N machines **by construction**. They must agree set-for-set, not
+    /// merely in count: a front door aimed at nodes the workload was never
+    /// deployed to renders a *subset* of the backends, which is the failure that
+    /// looks like it worked.
+    pub fn resolve_machines(&self, req: &RequiredSpec) -> Result<Vec<&MachineConfig>> {
+        resolve_machines_among(&self.machines, req)
+    }
+
     /// F16 placement: first machine whose `mesh_tags` is a superset of
     /// `required`. Declaration order in `.yah/infra/machines/` decides ties.
     /// Empty `required` matches the first machine; callers should treat
@@ -1658,6 +1719,47 @@ impl CloudConfig {
     /// [`Self::resolve_machine`]. Do not fork a second selector.
     pub fn admit_workload(&self, ws: &WorkloadSpec) -> Result<&MachineConfig> {
         self.resolve_machine(&admission_spec(ws))
+    }
+
+    /// Every machine that admits `ws`, in declaration order — the *pool*
+    /// [`Self::admit_workload`] returns the head of (R605-T14).
+    ///
+    /// # Why a pool and not just the winner
+    ///
+    /// `tag:build-worker` is a statement that the tagged boxes are
+    /// **interchangeable**: a build is booked against the tag, not against
+    /// `us-west-002`. Returning one machine forced every caller to act as if it
+    /// were booked against a name, and admission has no liveness input — so a
+    /// tagged box that is asleep won the file-name tie-break and its builds
+    /// failed rather than landing on the identical box next to it. That is
+    /// exactly what happened on 2026-09-03 when `us-west-002` regained the tag.
+    ///
+    /// The fix is **not** to teach this function about liveness. It stays a pure
+    /// function of the declared inventory (see `xtask/tests/fleet_build_placement.rs`
+    /// on why a placement pin that needs the network is a flake). It hands the
+    /// dispatcher the whole interchangeable set instead, and the dispatcher —
+    /// which has the network — probes and fails over within it:
+    /// `app/yah/cli/src/yubaba_client.rs`'s `MeshYubabaClient::deploy`.
+    ///
+    /// Order is the declaration order `admit_workload` already used, and callers
+    /// should preserve it as their preference order rather than load-balancing
+    /// across it: a retried build wants the node still holding its warm
+    /// `target/`, which is the same reason [`first_match`] is deliberately
+    /// first-fit.
+    ///
+    /// `Err` — never `Ok(vec![])` — when nothing admits `ws`, carrying the same
+    /// message [`Self::admit_workload`] would have produced. "No node admits
+    /// this" and "the pool is empty" are the same failure and must read the same.
+    pub fn admit_workload_candidates(&self, ws: &WorkloadSpec) -> Result<Vec<&MachineConfig>> {
+        let req = admission_spec(ws);
+        let all: Vec<&MachineConfig> = self.machines.iter().collect();
+        let matched = matching(&all, &req);
+        if matched.is_empty() {
+            // Delegate the wording so the two paths cannot drift apart.
+            return Err(first_match(&all, &req, DECLARED_POOL, EMPTY_DECLARED_POOL)
+                .expect_err("matching() found nothing, so first_match cannot succeed"));
+        }
+        Ok(matched)
     }
 
     /// [`Self::admit_workload`] restricted to the machines of one sovereign
@@ -1733,13 +1835,44 @@ pub(crate) fn resolve_machine_among<'a>(
     req: &RequiredSpec,
 ) -> Result<&'a MachineConfig> {
     let all: Vec<&MachineConfig> = machines.iter().collect();
-    first_match(
+    first_match(&all, req, DECLARED_POOL, EMPTY_DECLARED_POOL)
+}
+
+/// R844-F8: [`resolve_machine_among`] widened to the constraint's own replica
+/// count — the first [`RequiredSpec::replica_count`] matching machines, in the
+/// same declaration order, from the same candidate slice.
+///
+/// **The one entry point both resolvers share.**
+/// `reconciler::ingress::resolve_ingress_placements` calls this directly and
+/// `reconciler::mesofact_bundle::resolve_bundle_machines` reaches it through
+/// [`CloudConfig::resolve_machines`], both over `cfg.machines` — so the ingress
+/// planner and the deployer cannot pick different subsets. That is a structural
+/// guarantee, not a tested coincidence, and it has to be: discovery aimed at a
+/// node the bundle was never placed on publishes a hostname with a dead
+/// backend behind it, and at scale > 1 the front door still answers from the
+/// nodes that *did* get it.
+///
+/// Determinism is therefore part of correctness here. `machines` arrives in
+/// file-name order (`load_dir`, pinned by
+/// `machines_load_in_file_name_order_not_read_dir_order`), and selection is a
+/// stable prefix of that order — so "the first two matching" is the same two
+/// on both sides of the same tree.
+pub(crate) fn resolve_machines_among<'a>(
+    machines: &'a [MachineConfig],
+    req: &RequiredSpec,
+) -> Result<Vec<&'a MachineConfig>> {
+    let all: Vec<&MachineConfig> = machines.iter().collect();
+    select_matching(
         &all,
         req,
-        "declared machines",
-        "(no machines declared under .yah/infra/machines/)",
+        req.replica_count(),
+        DECLARED_POOL,
+        EMPTY_DECLARED_POOL,
     )
 }
+
+const DECLARED_POOL: &str = "declared machines";
+const EMPTY_DECLARED_POOL: &str = "(no machines declared under .yah/infra/machines/)";
 
 fn first_match<'a>(
     candidates: &[&'a MachineConfig],
@@ -1747,25 +1880,88 @@ fn first_match<'a>(
     pool: &str,
     empty_pool: &str,
 ) -> Result<&'a MachineConfig> {
+    Ok(select_matching(candidates, req, 1, pool, empty_pool)?
+        .into_iter()
+        .next()
+        .expect("select_matching errors rather than returning short"))
+}
+
+/// The N-selecting core of the placement selector: the first `want` candidates
+/// satisfying `req`, in candidate order (R844-F8).
+///
+/// [`first_match`] is this with `want = 1`, which is why widening a caller to a
+/// replica count cannot introduce a second selector — the predicate, the
+/// ordering and the failure vocabulary are all one implementation.
+///
+/// **A shortfall is an error.** Matching one machine when two were asked for
+/// returns `Err` naming both numbers and the pool searched, never a one-element
+/// vec: a half-placed workload that reports success is worse than a failed
+/// apply, because the front door then publishes a hostname whose backend set is
+/// quietly smaller than declared. `want = 0` is the same mistake spelled
+/// differently and is refused for the same reason.
+fn select_matching<'a>(
+    candidates: &[&'a MachineConfig],
+    req: &RequiredSpec,
+    want: usize,
+    pool: &str,
+    empty_pool: &str,
+) -> Result<Vec<&'a MachineConfig>> {
+    let names = || {
+        if candidates.is_empty() {
+            empty_pool.to_string()
+        } else {
+            candidates
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+
+    if want == 0 {
+        anyhow::bail!(
+            "replicas = 0 places {} on nothing — a placement that deploys to no machine is \
+             a typo, not a scale-down; remove the slot instead",
+            req.describe()
+        );
+    }
+
+    let mut matched = matching(candidates, req);
+    if matched.len() >= want {
+        matched.truncate(want);
+        return Ok(matched);
+    }
+
+    if want == 1 {
+        anyhow::bail!(
+            "no candidates matching {} — {pool}: {}",
+            req.describe(),
+            names()
+        );
+    }
+    anyhow::bail!(
+        "only {} of {want} machines match {} — placing fewer than the declared \
+         `replicas = {want}` would publish a smaller backend set than the mirror asks for; \
+         {pool}: {}",
+        matched.len(),
+        req.describe(),
+        names()
+    )
+}
+
+/// The predicate itself, applied to every candidate in order — the one place
+/// `req.matches` is called on a set.
+///
+/// [`select_matching`] takes a prefix of this; [`CloudConfig::admit_workload_candidates`]
+/// takes all of it. Keeping both on this function is what makes "the pool the
+/// dispatcher failed over within" and "the machine admission picked" the same
+/// answer by construction rather than by two filters that happen to agree.
+fn matching<'a>(candidates: &[&'a MachineConfig], req: &RequiredSpec) -> Vec<&'a MachineConfig> {
     candidates
         .iter()
         .copied()
-        .find(|m| req.matches(m))
-        .ok_or_else(|| {
-            let names = if candidates.is_empty() {
-                empty_pool.to_string()
-            } else {
-                candidates
-                    .iter()
-                    .map(|m| m.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            anyhow::anyhow!(
-                "no candidates matching {} — {pool}: {names}",
-                req.describe()
-            )
-        })
+        .filter(|m| req.matches(m))
+        .collect()
 }
 
 /// The [`RequiredSpec`] a workload is admitted against — the single place the
@@ -1929,12 +2125,17 @@ fn load_services(
                 }
             }
         }
+        let passway_machines = mirrors
+            .iter()
+            .filter_map(|(env, m)| m.passway_machines().map(|ms| (env.clone(), ms)))
+            .collect();
         out.insert(
             service.name.clone(),
             ServiceWithMirrors {
                 service,
                 mirrors,
                 component_transform_recipes,
+                passway_machines,
             },
         );
     }
@@ -3246,6 +3447,47 @@ impl MirrorConfig {
         }
     }
 
+    /// Nodes this mirror's **passway** front doors are placed on, in
+    /// declaration order and de-duplicated — or `None` when the mirror declares
+    /// no passway edge at all.
+    ///
+    /// `Some(vec![])` is a real and different answer from `None`: a passway edge
+    /// is declared but names no machine, so its placement falls back to the
+    /// fronted slot's own. That fallback is placement *resolution* — it belongs
+    /// to [`IngressRule::machines`](crate::reconciler::IngressRule::machines)
+    /// and the plan it is built from, not to a mirror read in isolation — so it
+    /// is reported as "declared, placement unknown from here" rather than
+    /// half-derived. A caller that needs a node to dial has to say so.
+    ///
+    /// Passway-only because the caller is tenant DNS onboarding: only a passway
+    /// node serves yubaba's `GET /domains/{domain}/onboarding`. A
+    /// cloudflare-tunnel edge publishes through Cloudflare's own DNS and has no
+    /// such record to hand a tenant, so folding its machines in would point the
+    /// UI at a node that cannot answer.
+    ///
+    /// Read through [`ingress_edges`](Self::ingress_edges), so both spellings
+    /// are covered by construction. A declaration that cannot mean anything
+    /// (`ingress_machines` with no `ingress`, or both spellings at once) reads
+    /// as `None` rather than propagating an error: those are reported by
+    /// cross-reference validation, which can name the offending file.
+    pub fn passway_machines(&self) -> Option<Vec<String>> {
+        let edges = self.ingress_edges().ok()?;
+        let mut declared = false;
+        let mut machines: Vec<String> = Vec::new();
+        for edge in edges
+            .iter()
+            .filter(|e| matches!(e.provider, IngressProvider::Passway))
+        {
+            declared = true;
+            for m in &edge.machines {
+                if !machines.iter().any(|seen| seen == m) {
+                    machines.push(m.clone());
+                }
+            }
+        }
+        declared.then_some(machines)
+    }
+
     /// Parse a single `mirrors/<env>.toml` file.
     pub fn load(path: &Path) -> Result<Self> {
         let src =
@@ -3445,9 +3687,45 @@ pub struct RequiredSpec {
     /// key in its `taints` list or `mesh_tags`. `None` = no affinity constraint.
     #[serde(skip)]
     pub requires_taint: Option<String>,
+
+    /// R844-F8: **how many** machines this constraint places onto. `None` — the
+    /// only shape on disk before this field — means one, so every mirror in the
+    /// tree resolves byte-identically across the change.
+    ///
+    /// This is not a match axis: it never appears in [`Self::matches`] and never
+    /// changes whether a given machine qualifies. It is the *cardinality* of the
+    /// answer, which is why it lives here rather than as another filter — the
+    /// operator declares what is required and how many of it, and the scheduler
+    /// picks which.
+    ///
+    /// **Declared, never inferred.** The count is emphatically not "how many
+    /// machines happen to match": deriving it that way would make adding a box
+    /// to the fleet silently scale a production front door. A constraint that
+    /// matches four machines and asks for two places on two.
+    ///
+    /// **Fewer matches than asked is an error** ([`select_matching`]), not a
+    /// partial placement. Placing one of two and reporting success is the
+    /// subset-that-looks-like-it-worked failure R844 exists to close.
+    ///
+    /// Deliberately absent from [`Self::is_unconstrained`], which answers "does
+    /// every machine match" — a question about the predicate, not the count. A
+    /// `required = { replicas = 2 }` with no axis is therefore still
+    /// unconstrained, and the deploy side still refuses it as an
+    /// underspecified placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicas: Option<u32>,
 }
 
 impl RequiredSpec {
+    /// How many machines this constraint places onto — [`Self::replicas`],
+    /// resolving the absent case to the pre-R844-F8 answer of one.
+    ///
+    /// The single place that default is spelled, so the ingress planner and the
+    /// deploy resolver cannot disagree about what "no replica count" means.
+    pub fn replica_count(&self) -> usize {
+        self.replicas.unwrap_or(1) as usize
+    }
+
     /// True when no axis carries a constraint — every machine matches.
     pub fn is_unconstrained(&self) -> bool {
         self.regions.is_empty()
@@ -4740,6 +5018,103 @@ mesh_tags = ["tag:build-worker", "arch:x86"]
 
         let ws = ws_with_selector(Some("tag:build-worker,arch:x86"));
         assert_eq!(cfg.admit_workload(&ws).unwrap().name, "a-first");
+
+        // R605-T14: the same two nodes, seen as the pool they are. The head is
+        // what `admit_workload` returns, and the tail is what the dispatcher
+        // fails over to when the head does not answer — so these two views must
+        // come from one predicate, not two.
+        assert_eq!(
+            cfg.admit_workload_candidates(&ws)
+                .unwrap()
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-first", "b-second"],
+            "the pool must be every admissible node, in the same declaration order"
+        );
+    }
+
+    /// A pool of one is still a pool, and a pool of none is an `Err` that reads
+    /// exactly like `admit_workload`'s — "nothing admits this" is one failure
+    /// with one wording, not two.
+    #[test]
+    fn admit_workload_candidates_matches_admit_workload_on_the_edges() {
+        let cfg = make_empty_cfg(vec![
+            make_machine("x86-box", vec!["tag:build-worker", "arch:x86"]),
+            make_machine("arm-box", vec!["tag:build-worker", "arch:arm"]),
+        ]);
+
+        let one = ws_with_selector(Some("arch:arm"));
+        assert_eq!(
+            cfg.admit_workload_candidates(&one)
+                .unwrap()
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["arm-box"],
+            "only one node carries arch:arm, so the pool is that one node"
+        );
+
+        let none = ws_with_selector(Some("arch:riscv"));
+        let pool_err = cfg.admit_workload_candidates(&none).unwrap_err().to_string();
+        let single_err = cfg.admit_workload(&none).unwrap_err().to_string();
+        assert_eq!(
+            pool_err, single_err,
+            "an empty pool must be refused in the same words as an unadmitted workload"
+        );
+    }
+
+    /// R844-B7 — the wrong-root half of the distinction. A directory with no
+    /// `.yah/` at all used to load as a valid config with zero machines, so a
+    /// caller pointed at the wrong directory got a green result that measured
+    /// nothing. Asserting `load` merely *succeeds* is what let that through;
+    /// the shape that catches it is a non-zero machine count, or — here — an
+    /// `Err` naming the path that was looked for.
+    #[test]
+    fn loading_a_directory_that_is_not_a_yah_workspace_is_an_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A plausible-looking package root: real files, real subdirectories,
+        // no `.yah/`. This is exactly what `load_cloud(".")` reads when a test
+        // runs under `cargo test` from a member crate.
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+
+        let err = CloudConfig::load(tmp.path()).expect_err(
+            "a directory with no .yah/ is the WRONG DIRECTORY, not a fleet with no machines",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a yah workspace"),
+            "error must say the root is not a workspace, got: {msg}"
+        );
+        assert!(
+            msg.contains(&tmp.path().join(".yah").display().to_string()),
+            "error must name the path it looked for so an operator sees the \
+             wrong-root immediately, got: {msg}"
+        );
+    }
+
+    /// R844-B7 — the other half, and the reason the check is drawn at `.yah/`
+    /// rather than at the machine list: a camp that declares no machines is a
+    /// real workspace and must keep loading. Blanket-erroring on an empty
+    /// fleet would conflate `unknown` with `answered with none`, which is the
+    /// exact confusion the check exists to remove.
+    #[test]
+    fn a_workspace_with_no_machines_declared_still_loads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".yah")).unwrap();
+
+        let cfg = CloudConfig::load(tmp.path())
+            .expect("a `.yah/` with no infra/machines/ is an empty fleet, not a wrong root");
+        assert!(cfg.machines.is_empty(), "nothing was declared");
+        assert!(cfg.services.is_empty());
+        assert!(cfg.providers.is_empty());
+
+        // And an existing-but-empty machines dir is the same answer, not a
+        // second special case.
+        std::fs::create_dir_all(crate::paths::machines_dir(tmp.path())).unwrap();
+        let cfg = CloudConfig::load(tmp.path()).expect("an empty machines/ dir still loads");
+        assert!(cfg.machines.is_empty());
     }
 
     #[test]
@@ -4860,6 +5235,125 @@ mesh_tags = ["tag:cloud-runner"]
         assert_eq!(req.regions, vec!["us-west"]);
         assert_eq!(req.mesh_tags, vec!["tag:cloud-runner"]);
         assert!(req.zones.is_empty());
+    }
+
+    // ─── R844-F8 replica count ──────────────────────────────────────────────
+
+    fn three_runner_fleet() -> CloudConfig {
+        make_empty_cfg(vec![
+            make_machine_topo("us-east-001", "hetzner", "us-east", vec!["tag:cloud-runner"]),
+            make_machine_topo(
+                "us-south-001",
+                "hetzner",
+                "us-south",
+                vec!["tag:cloud-runner"],
+            ),
+            make_machine_topo(
+                "us-west-001",
+                "hetzner",
+                "us-west",
+                vec!["tag:cloud-runner"],
+            ),
+        ])
+    }
+
+    #[test]
+    fn an_absent_replica_count_still_places_exactly_one_machine() {
+        // The migration is additive: every mirror on disk omits `replicas`, and
+        // must resolve byte-identically to the pre-R844-F8 answer.
+        let cfg = three_runner_fleet();
+        let req = RequiredSpec {
+            mesh_tags: vec!["tag:cloud-runner".into()],
+            ..Default::default()
+        };
+        assert_eq!(req.replica_count(), 1);
+        let names: Vec<&str> = cfg
+            .resolve_machines(&req)
+            .unwrap()
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["us-east-001"]);
+        assert_eq!(cfg.resolve_machine(&req).unwrap().name, "us-east-001");
+    }
+
+    #[test]
+    fn a_replica_count_places_that_many_machines_not_every_match() {
+        // Three machines match; two are asked for; two are placed. Inferring the
+        // count from the match count would make adding a box to the fleet
+        // silently scale a production front door.
+        let cfg = three_runner_fleet();
+        let req = RequiredSpec {
+            mesh_tags: vec!["tag:cloud-runner".into()],
+            replicas: Some(2),
+            ..Default::default()
+        };
+        let names: Vec<&str> = cfg
+            .resolve_machines(&req)
+            .unwrap()
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["us-east-001", "us-south-001"]);
+    }
+
+    #[test]
+    fn fewer_matches_than_replicas_is_an_error_naming_both_numbers() {
+        // Never a partial placement: one of two reported as success is the
+        // subset-that-looks-like-it-worked failure in its purest form.
+        let cfg = three_runner_fleet();
+        let req = RequiredSpec {
+            regions: vec!["us-east".into()],
+            replicas: Some(2),
+            ..Default::default()
+        };
+        let err = cfg.resolve_machines(&req).unwrap_err().to_string();
+        assert!(err.contains("only 1 of 2"), "got: {err}");
+        assert!(err.contains("required.regions=[us-east]"), "got: {err}");
+        // …and names the pool it searched, like every other placement refusal.
+        assert!(err.contains("declared machines"), "got: {err}");
+        assert!(err.contains("us-south-001"), "got: {err}");
+    }
+
+    #[test]
+    fn zero_replicas_is_refused_rather_than_placing_nothing() {
+        let cfg = three_runner_fleet();
+        let req = RequiredSpec {
+            mesh_tags: vec!["tag:cloud-runner".into()],
+            replicas: Some(0),
+            ..Default::default()
+        };
+        let err = cfg.resolve_machines(&req).unwrap_err().to_string();
+        assert!(err.contains("replicas = 0"), "got: {err}");
+    }
+
+    #[test]
+    fn replicas_parses_from_the_inline_required_form() {
+        // The INLINE form specifically: `[providers.bundle.required]` as a table
+        // HEADER ends the slot's table and reparents every key below it.
+        let slot: MirrorProviderSlot = toml::from_str(
+            r#"
+use = "hetzner-primary"
+port = 8080
+required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas = 2 }
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            slot.fields().get("port").and_then(|v| v.as_integer()),
+            Some(8080),
+            "the inline form leaves the slot's other keys where they were"
+        );
+        let req = slot.required().expect("required block present");
+        assert_eq!(req.replicas, Some(2));
+        assert_eq!(req.replica_count(), 2);
+        // A count is not a match axis — it says how many, not which.
+        assert!(!req.is_unconstrained());
+        assert!(RequiredSpec {
+            replicas: Some(2),
+            ..Default::default()
+        }
+        .is_unconstrained());
     }
 
     #[test]
@@ -5249,7 +5743,7 @@ mesh_tags = ["tag:cloud-runner"]
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent("asset-registry.pdx".into()),
-                    ports: vec![8080],
+                    ports: MeshExpose::anonymous_ports([8080]),
                     allow_from: vec![],
                 },
                 public: None,
@@ -5313,7 +5807,7 @@ mesh_tags = ["tag:cloud-runner"]
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent(name.into()),
-                    ports: vec![4325],
+                    ports: MeshExpose::anonymous_ports([4325]),
                     allow_from: vec![],
                 },
                 public: None,
@@ -5449,7 +5943,7 @@ mesh_tags = ["tag:cloud-runner"]
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent("asset-registry.pdx".into()),
-                    ports: vec![8080],
+                    ports: MeshExpose::anonymous_ports([8080]),
                     allow_from: vec![],
                 },
                 public: None,
@@ -5525,7 +6019,7 @@ mesh_tags = ["tag:cloud-runner"]
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent("signing.pdx".into()),
-                    ports: vec![9090],
+                    ports: MeshExpose::anonymous_ports([9090]),
                     allow_from: vec![],
                 },
                 public: None,
@@ -6480,6 +6974,102 @@ use = "orbstack"
         assert!(cfg.service("local-only").is_some());
     }
 
+    fn mirror(src: &str) -> MirrorConfig {
+        toml::from_str(&format!("schema_version = 1\nshape = \"single-machine\"\n{src}"))
+            .expect("parse mirror")
+    }
+
+    #[test]
+    fn passway_machines_reads_both_ingress_spellings_the_same_way() {
+        // The whole reason this is derived in Rust rather than read off a field
+        // by the UI: these two mirrors say the identical thing, and a consumer
+        // that reaches for `ingress_machines` sees the second one as empty.
+        let scalar = mirror("ingress = \"passway\"\ningress_machines = [\"us-east-001\"]\n");
+        let edges = mirror(
+            "[[ingress]]\nprovider = \"passway\"\nmachines = [\"us-east-001\"]\n",
+        );
+        assert_eq!(scalar.passway_machines(), Some(vec!["us-east-001".into()]));
+        assert_eq!(scalar.passway_machines(), edges.passway_machines());
+    }
+
+    #[test]
+    fn passway_machines_skips_a_cloudflare_tunnel_edge() {
+        // A cloudflared node publishes through Cloudflare's DNS and does not
+        // serve `GET /domains/{d}/onboarding`, so naming it here would point
+        // the custom-domain UI at a node that cannot answer.
+        let cf_only =
+            mirror("[[ingress]]\nprovider = \"cloudflare-tunnel\"\nmachines = [\"cf-01\"]\n");
+        assert_eq!(cf_only.passway_machines(), None);
+
+        let mixed = mirror(
+            "[[ingress]]\nprovider = \"cloudflare-tunnel\"\nmachines = [\"cf-01\"]\n\
+             slots = [\"static\"]\n\n\
+             [[ingress]]\nprovider = \"passway\"\nmachines = [\"us-east-001\"]\n\
+             slots = [\"bundle\"]\n",
+        );
+        assert_eq!(mixed.passway_machines(), Some(vec!["us-east-001".into()]));
+    }
+
+    #[test]
+    fn passway_machines_separates_declared_but_unplaced_from_undeclared() {
+        // Some(vec![]) means "a passway front door exists, but its placement
+        // falls back to the fronted slot's and is not knowable from the mirror".
+        // None means there is no passway front door at all. Collapsing the two
+        // would make a co-located edge indistinguishable from no edge.
+        assert_eq!(mirror("ingress = \"passway\"\n").passway_machines(), Some(vec![]));
+        assert_eq!(mirror("").passway_machines(), None);
+        assert_eq!(mirror("ingress = \"none\"\n").passway_machines(), None);
+    }
+
+    #[test]
+    fn passway_machines_is_none_for_a_declaration_that_cannot_mean_anything() {
+        // `ingress_machines` with no `ingress` is an error `ingress_edges` names
+        // properly; swallowing it to None here is deliberate, because this is
+        // read while loading every service in the workspace and hard-failing
+        // would report an unrelated mirror's shape error from the wrong place.
+        let orphaned = mirror("ingress_machines = [\"us-east-001\"]\n");
+        assert!(orphaned.ingress_edges().is_err());
+        assert_eq!(orphaned.passway_machines(), None);
+    }
+
+    #[test]
+    fn cloud_config_load_derives_passway_machines_only_for_passway_envs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let svc = root.join(".yah").join("services").join("dev-yah");
+        std::fs::create_dir_all(svc.join("mirrors")).unwrap();
+        std::fs::write(
+            svc.join("service.toml"),
+            "schema_version = 1\nname = \"dev-yah\"\ndomain = \"yah.dev\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            svc.join("mirrors/cloud.toml"),
+            "schema_version = 1\nshape = \"single-machine\"\n\
+             ingress = \"passway\"\ningress_machines = [\"us-east-001\", \"us-west-001\"]\n\n\
+             [providers.static]\nkind = \"local-static\"\nport = 8080\n",
+        )
+        .unwrap();
+        std::fs::write(
+            svc.join("mirrors/local.toml"),
+            "schema_version = 1\nshape = \"local\"\n\n\
+             [providers.static]\nkind = \"local-static\"\nport = 8080\n",
+        )
+        .unwrap();
+
+        let cfg = CloudConfig::load(root).unwrap();
+        let svc = cfg.service("dev-yah").unwrap();
+        assert_eq!(
+            svc.passway_machines.get("cloud"),
+            Some(&vec!["us-east-001".to_string(), "us-west-001".to_string()])
+        );
+        assert!(
+            !svc.passway_machines.contains_key("local"),
+            "an env with no front door must be absent, not empty: {:?}",
+            svc.passway_machines
+        );
+    }
+
     #[test]
     fn cloud_config_load_coexists_legacy_and_new_trees() {
         // Both trees present — both fields populated independently.
@@ -6857,6 +7447,9 @@ target = "https://yah.dev/blog"
     #[test]
     fn missing_domains_dir_is_empty() {
         let tmp = tempfile::TempDir::new().unwrap();
+        // R844-B7: `.yah/` must exist or this is a wrong-root error rather
+        // than an empty tree. The absent directory under test is `domains/`.
+        std::fs::create_dir_all(tmp.path().join(".yah")).unwrap();
         let cfg = CloudConfig::load(tmp.path()).unwrap();
         assert!(cfg.domains.is_empty());
     }

@@ -25,6 +25,7 @@
 //! is no shared fixed port, fixed path, or process-global initialization.
 
 mod bootstrap_single_node;
+mod domain_onboarding_endpoint;
 mod integration_constable_client;
 mod integration_deploy_through_kamaji;
 mod pond_kamaji_supervision;

@@ -11,6 +11,17 @@
 //! zone ID — the adapter owns the name→id lookup so callers stay
 //! provider-agnostic. The `type` field follows the RFC 1035 convention
 //! (uppercase strings: `"A"`, `"CNAME"`, `"TXT"`, etc.).
+//!
+//! @yah:ticket(R859-F1, "Domain reconciler arm for front_door = \"passway\": render A records from the ingress plan via dns.* verbs, retire cf-apex-mode.sh as the flip mechanism")
+//! @yah:at(2026-09-04T19:06:41Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:user-custom-char-gul2)
+//! @yah:parent(R859)
+//! @yah:next("domain.rs header says it plainly: front_door = \"passway\" 'has no reconciler here yet'. Build the arm: domain manifest + IngressPlan.front_doors → the set of public IPs of machines carrying that edge → dns.record.upsert (DNS-only, proxied=false) through the provider-agnostic dns.* verbs. Idempotent, list-first, like ensure_r2_custom_domain.")
+//! @yah:next("This dissolves the two-source front_door flip: the field in domains/*.toml becomes the single source and the reconciler renders it, so a flip is one line + apply instead of cf-apex-mode.sh + a manual TOML edit kept honest only by the publish beacon after the fact (it cost 19 days once, R330-B36, and 4 more, R703-B4).")
+//! @yah:next("Growing the public fleet organically falls out: adding a machine with the public-ip taint to an edge's machines list adds its A record on the next apply; removing it withdraws.")
+//! @yah:next("Keep cf-apex-mode.sh as break-glass (worker/orange flip under attack per W267 tier ladder) — retire it as the routine mechanism, don't delete it.")
+//! @yah:next("Tier: Wizard — new reconciler arm with provider seam, apply/validate wiring, and a live-DNS blast radius that needs careful idempotence tests.")
 
 use serde::{Deserialize, Serialize};
 

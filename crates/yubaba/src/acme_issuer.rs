@@ -229,8 +229,13 @@ pub fn parse_issuer_config(
                 // that zone. Delegation (R779) is only for *custom tenant*
                 // domains — see [`crate::domain_issuer`].
                 delegate_zone: None,
+                // R779-P8 test hook; the SAME key the domain issuer reads,
+                // for the same reason every other `YUBABA_ACME_*` input is
+                // shared — two config sets would be two ACME accounts.
+                api_base: cf_api_base(&get),
             },
             dns01_propagation_delay: Duration::from_secs(propagation_secs),
+            directory_root_cert: None,
         },
         kek_path,
         access,
@@ -240,6 +245,19 @@ pub fn parse_issuer_config(
         renew_before: Duration::from_secs(renew_before_days * 86_400),
         cert_store: CertStoreConfig::parse(&get)?,
     }))
+}
+
+/// R779-P8 — the env key naming a Cloudflare-shaped API base for the DNS-01
+/// TXT publisher. Unset (the production case) means the real Cloudflare API;
+/// only the DNS-01 integration harness has any reason to set it.
+pub const CF_API_BASE_ENV: &str = "YUBABA_ACME_CF_API_BASE";
+
+/// Read [`CF_API_BASE_ENV`]. Deliberately shared by BOTH issuers rather than
+/// duplicated per-loop: the fleet issuer and the per-domain issuer read the
+/// same `YUBABA_ACME_*` keys throughout (one contact, one account cache, one
+/// CF token) because two config sets would silently be two ACME accounts.
+pub fn cf_api_base(get: &impl Fn(&str) -> Option<String>) -> Option<String> {
+    get(CF_API_BASE_ENV).map(|b| b.trim().to_string()).filter(|b| !b.is_empty())
 }
 
 fn parse_u64(

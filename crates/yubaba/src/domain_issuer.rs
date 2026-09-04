@@ -220,8 +220,11 @@ pub fn parse_domain_issuer_config(
                 token_file,
                 zone_id,
                 delegate_zone: Some(delegate_zone),
+                // Same key as the fleet issuer — see [`crate::acme_issuer::cf_api_base`].
+                api_base: crate::acme_issuer::cf_api_base(&get),
             },
             dns01_propagation_delay: Duration::from_secs(propagation_secs),
+            directory_root_cert: None,
         },
         kek_path,
         access,
@@ -501,17 +504,19 @@ async fn store_issued(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let cert_rec = seal_cluster_secret(
-        kek,
-        issued.cert_chain_pem.as_bytes(),
-        stamp,
-        cfg.access.clone(),
-    );
+    // R852-F3: the operator's configured rule, widened to admit this domain's
+    // own passway. Sealing and authorizing are the same decision and this is the
+    // only frame that knows *which domain* this plaintext belongs to — an
+    // allow-list written in advance cannot name one entry per tenant at 10k
+    // domains, and `AllowAny` over-answers it by making every tenant private key
+    // a bearer secret. See `tenant_passway::grant`.
+    let access = crate::tenant_passway::grant(&cfg.access, domain);
+    let cert_rec = seal_cluster_secret(kek, issued.cert_chain_pem.as_bytes(), stamp, access.clone());
     // Zeroizing for the same reason the fleet issuer does it: this is the
     // node's own plaintext copy of a tenant's private key, and it should not
     // linger in a freed heap page after this frame.
     let key_bytes = Zeroizing::new(issued.key_pem.into_bytes());
-    let key_rec = seal_cluster_secret(kek, &key_bytes, stamp, cfg.access.clone());
+    let key_rec = seal_cluster_secret(kek, &key_bytes, stamp, access);
 
     // `write_pair` is key-first/cert-last, which is what makes a partial write
     // heal: `needs_issuance` gates off the CERT record, so a half-written pair
@@ -593,6 +598,7 @@ mod tests {
                 token_file: "/etc/cf-token".to_string(),
                 zone_id: "zone123".to_string(),
                 delegate_zone: Some("acme.yah.dev".to_string()),
+                api_base: None,
             }
         );
         assert!(

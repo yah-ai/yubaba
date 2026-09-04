@@ -10,7 +10,7 @@
 //! module is the opposite shape: a stateful, queryable record of workloads
 //! yubaba has *already placed and knows the mesh address of* — that's
 //! workload-placement bookkeeping, which is yubaba-proper's job (yubaba
-//! already owns `ServerState`, `alloc_mesh_ip`, and the `ContainerRuntime` /
+//! already owns `ServerState`, `workload_bind_ip`, and the `ContainerRuntime` /
 //! `kamaji::Kamaji` dispatch that this module reads from). Homing a
 //! queryable service-record surface in the cloud crate would duplicate (or
 //! reach back into) state yubaba already holds.
@@ -27,14 +27,21 @@
 //!    - *Container* ([`ServiceRecords::upsert_deployed`]): the handler has
 //!      both the [`WorkloadSpec`] (which carries `expose.mesh.ports` — where
 //!      a container's serving port(s) are declared) and the
-//!      [`kamaji::DeployResult`] (which carries the mesh IP yubaba just
-//!      allocated via `ServerState::alloc_mesh_ip`).
+//!      [`kamaji::DeployResult`] (which echoes back the mesh IP yubaba handed
+//!      the backend at deploy — `ServerState::workload_bind_ip`).
 //!    - *W272 bundle* ([`ServiceRecords::admit_bundle`], R844-F1): a
 //!      `Workload::MesofactStatic` envelope has no `WorkloadSpec` at all. Its
 //!      serving port rides on `MesofactServeBundle::port` and its address is
 //!      the node's own mesh IP (`ServerState::node_mesh_ip`) — a native
 //!      bundle is a forked host process with no namespace, so there is no
 //!      per-workload address to allocate. Same pairing, different two facts.
+//!
+//!    **Both tiers now advertise the node's own address** (R844-B11). They did
+//!    not always: the container tier drew a per-workload address from a
+//!    `100.64.0.1`-seeded counter that nothing configured, so it published a
+//!    neighbouring node's real address as a dialable endpoint. A record's
+//!    `mesh_ip` must equal the answering node's own mesh address — that is the
+//!    invariant to check when reading `GET /service-records` off a live node.
 //!
 //!    Either way that pairing is admission-time knowledge that exists nowhere
 //!    else, which is why it cannot be recovered by step 2.
@@ -69,6 +76,46 @@
 //! that never appears as resolved is a workload that failed to bind what it
 //! asked for; a resolved port with no declaration is the normal steady state
 //! once a mirror stops naming one.
+//!
+//! ## Ports are NAMED (R844-F15)
+//!
+//! Both sets are `BTreeMap<String, u16>`, not `Vec<u16>`. A consumer handed
+//! three bare numbers cannot tell which one is the websocket listener: it
+//! guesses by index or by a convention nothing enforces, and is wrong the first
+//! time a port moves or a declaration is reordered. That — not allocation — is
+//! what actually blocks cross-mesh service discovery, so [`ServiceRecord::port`]
+//! and [`ServiceRecord::endpoint`] take a name and either resolve it or don't.
+//!
+//! Where the names come from, in order of how much they are worth:
+//!
+//! 1. **The supervisor.** kamaji's allocator resolves a named set (R844-F14) and
+//!    reports it on `kamaji::WorkloadState::ports`, which rides the same 15s
+//!    sweep that already re-asserts every resolved port. Names cost no new
+//!    machinery — they ride an existing correction path.
+//! 2. **Synthesis, for declarations that still carry no names.**
+//!    `expose.mesh.ports` and `serve_bundle.port` are anonymous number lists, so
+//!    [`kamaji::name_anonymous_ports`] names them — and it is the *only* place
+//!    that decides, so a workload's ports are spelled the same in a record, in a
+//!    kamaji entry, and in the `PORT_<NAME>` environment (R844-T13).
+//!
+//! The synthesis rule has one clause worth reading before touching it: a **sole**
+//! anonymous port is named `http`, and **several** anonymous ports are each named
+//! by their own number with *none* of them called `http`. Naming the first one
+//! `http` is the obvious rule, reads as harmless, and reintroduces exactly the
+//! positional guess this ticket removes — `port_for` would then resolve an
+//! ingress rule off declaration order and publish a hostname at whatever
+//! listener happened to be written first. Pinned by
+//! `kamaji::tests::several_anonymous_ports_name_none_of_themselves_http`.
+//!
+//! **The two wires this data crosses do NOT have the same compatibility rules,
+//! and conflating them cost a debugging cycle.** [`ServiceRecordsWire`] below is
+//! JSON over HTTP between independently-versioned binaries on a mixed fleet, so
+//! `ports`/`endpoints` keep their array shape forever and the named views are
+//! *additional* fields — an un-rolled consumer ignores them. `kamaji-proto`'s
+//! `WorkloadEntry` is **postcard**, which is positional: there, an "optional"
+//! field is a contradiction, `skip_serializing_if` produces frames a
+//! same-version peer cannot decode, and the only compatibility mechanism is a
+//! `ProtocolVersion` bump (V6 carries `named_ports`).
 //!
 //! ## How a record enters, and the one invariant
 //!
@@ -145,9 +192,16 @@
 //!
 //! ## The port ledger — why records survive a yubaba restart
 //!
-//! Ports are admission-time knowledge. `WorkloadState` (what
-//! `list_workloads()` returns) carries `ident` / `container_id` / `status` /
-//! `mesh_ip` but **no ports**, so after a yubaba restart the sweep alone can
+//! Ports are admission-time knowledge — *declared* ports still are, which is
+//! the whole reason this file exists. (Read the next sentence in the past
+//! tense: when R594-F6 wrote this ledger, `WorkloadState` carried `ident` /
+//! `container_id` / `status` / `mesh_ip` and no ports at all. R844-F2 added
+//! resolved ports to it and R844-F15 named them, so a *resolved* port is now
+//! recoverable from the sweep — but a declaration the supervisor never bound
+//! is not, and neither is one on a namespaced container backend that resolves
+//! nothing. The ledger is still the only recovery for those.)
+//!
+//! With no ledger and no resolved ports, the sweep alone can
 //! never rebuild a dialable record: it would know a workload is `Running` and
 //! know its mesh IP, and still have nothing to dial. Before this ticket the
 //! only recovery was to redeploy every serving workload — the containers were
@@ -210,13 +264,13 @@
 //! rather than draining every backend on a transient yubaba blip. That is the
 //! same distinction [`run`]'s sweep makes when `list_workloads()` fails.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kamaji::{WorkloadState, WorkloadStatus};
+use kamaji::{name_anonymous_ports, WorkloadState, WorkloadStatus};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use workload_spec::{MeshIdent, WorkloadSpec};
@@ -266,21 +320,65 @@ impl Health {
 ///
 /// This is the record shape a future ingress proxy consumes: enough to
 /// dial (`mesh_ip` + `ports`) and enough to gate routing (`health`).
+///
+/// @yah:ticket(R844-F15, "Service records carry NAMED ports — a peer resolving a service can ask for 'wss', not guess an index")
+/// @yah:status(review)
+/// @yah:at(2026-09-03T22:36:45Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R844)
+/// @yah:next("`ServiceRecord.ports: Vec<u16>` (service_records.rs:295) is already plural but anonymous — a consumer gets three numbers and no way to tell which is the websocket listener. This, not allocation, is the actual blocker for cross-mesh service discovery.")
+/// @yah:next("Move to `ports: BTreeMap<String, u16>` and keep a derived ordered accessor so `endpoints()` (service_records.rs:341) and the ingress renderer keep working unchanged.")
+/// @yah:next("Mirror the same change into `ServiceRecordWire.ports` (service_records.rs:995) and the pre-joined `endpoints` field (service_records.rs:1008) — a wire consumer should be able to select an endpoint by port name.")
+/// @yah:next("The 15s service-record sweep already re-asserts every resolved port on each pass; names ride the same path with no new machinery.")
+/// @yah:verify("A workload declaring http+wss produces one record whose named map resolves both, and `endpoints()` still yields one endpoint per port in a stable order.")
+/// @yah:verify("The existing multi-port test (`deployed_workload_with_multiple_ports_yields_multiple_endpoints`, service_records.rs:1265) passes unmodified or with a name-keyed equivalent.")
+/// @yah:verify("A wire round-trip (ServiceRecords -> ServiceRecordsWire -> back) preserves port names.")
+/// @yah:handoff("LANDED. Ports are named end to end. `ServiceRecord.{ports,resolved_ports}` and `kamaji::{WorkloadState,DeployResult}.ports` are now `BTreeMap<String,u16>`; `ServiceRecord` gained `port(name)`, `endpoint(name)`, `named_endpoints()` and `dialable_port_numbers()`; `endpoints()` keeps its old contract (one endpoint per distinct port, ascending by NUMBER not by name, so a `[8080,9090]` workload renders exactly as before). `kamaji_proto::WorkloadEntry` gained `named_ports` (protocol V6) so names survive the sibling wire; `ServiceRecordWire` gained `named_ports` + `named_endpoints`.")
+/// @yah:handoff("THE NAMING RULE IS THE DESIGN, and the obvious version of it is wrong. `kamaji::name_anonymous_ports` (kamaji/src/lib.rs) is the single place that names a portless declaration: a SOLE anonymous port becomes `http`; SEVERAL anonymous ports each become their own number and NONE becomes `http`. I first wrote first-is-http, and `yah-cloud`'s existing `two_ports_on_one_ident_is_ambiguous_rather_than_a_guess` caught it — that rule would let `port_for` resolve an ingress rule off declaration order and publish a hostname at whichever listener was written first, which is the positional guess this ticket exists to abolish. Pinned by kamaji::tests::several_anonymous_ports_name_none_of_themselves_http and naming_is_independent_of_declaration_order.")
+/// @yah:handoff("TWO WIRES, TWO DIFFERENT COMPATIBILITY RULES — the bug I shipped and fixed mid-relay, worth reading before anyone adds a field to either. yubaba's `GET /service-records` is JSON over HTTP between independently-versioned binaries on a mixed fleet (0.8.28-0.8.31), so `ports`/`endpoints` keep their array shape forever and the named views are ADDITIVE; `WIRE_VERSION` does not move. kamaji-proto is POSTCARD — positional, no field names — where `skip_serializing_if` is not 'optional', it omits bytes the decoder still reads, producing frames a peer of its OWN version cannot parse. I carried the JSON reasoning onto the postcard wire and broke `List` with `PeerClosed` on both sibling_wire_e2e and docker_backend_e2e. Fix: drop `skip_serializing_if`, bump `ProtocolVersion::CURRENT` to V6. The rule is now written into the V6 stanza in kamaji-proto/src/version.rs so a fourth person does not pay for it.")
+/// @yah:handoff("DOWNSTREAM PAYOFF, in scope and delivered: `ServiceRecordFanout::port_for` (cloud/src/reconciler/service_discovery.rs) used to return None for ANY multi-port workload, which forced such a slot to pin `port` forever — the exact pin R844 exists to remove. It now selects the port named `kamaji::DEFAULT_PORT_NAME` when the read is otherwise ambiguous. Single-port and unnamed records resolve identically to before, and two nodes disagreeing about which port is `http` is still None. `DiscoveredRecord` gained `named_ports`, plumbed from the CLI's `RecordWire` (app/yah/cli/src/cloud.rs).")
+/// @yah:handoff("PASSWAY WAS DELIBERATELY NOT CHANGED, and this is a live gap rather than a finished handover. `addrs_from_body` (oss/passway/crates/passway/src/discovery.rs) still flattens every endpoint of every ready record into one backend set, which is silently wrong for a workload with `http` + `metrics`. Nothing has hit it because no fronted workload declares two ports yet. `named_endpoints` on the wire is what will let passway fix it; changing a separate binary's backend selection with no ticket was out of my blast radius. Recorded in the `ServiceRecordWire::named_endpoints` doc at the code site.")
+/// @yah:handoff("DISCOVERED WORK DONE IN THIS PASS, beyond the ticket title: (1) fixed the stale `DeployResult.ports` doc citing the removed `ports::PortAllocator::resolve` — flagged by @Ashguard:libra, now says a declared NAME is the request and a declared NUMBER is refused unless it is in `ports::WORLD_FIXED_PORTS`; (2) corrected a module-doc claim in service_records.rs asserting `WorkloadState` carries no ports, false since R844-F2 and disproved by this very change; (3) updated `.yah/docs/guides/write-a-service-toml.md` with the port-naming contract beside F14's `port` guidance; (4) swept every `WorkloadState`/`DeployResult` construction outside oss/yubaba — crates/yah/hub/src/workload.rs (3 sites) and xtask/tests/mirror_ingress.rs (2 fixtures), neither visible from a `cargo check` inside oss/yubaba, both found only because @Ashguard:griffin grepped wider.")
+/// @yah:handoff("COORDINATION, all resolved, no unresolved seams. @Ashguard:libra (R844-F14) and I split at `kamaji::WorkloadState`/`DeployResult`: they kept kamaji/src/ports.rs entirely, I took the field types plus every producer and the kamaji-proto wire; agreed by party.chat before either of us touched it. @Ashguard:griffin (R844-B11) fixed a red test my run surfaced — integration_service_records::deploy_publishes_a_ready_dialable_record was asserting the CGNAT pool against B11's `workload_bind_ip()` loopback fallback, their ticket's semantics, so I reported it rather than authoring on it. @Ashguard:libra (R844-F16) is building `yah cloud ingress verify` against `ServiceRecordFanout`, whose public API this change does not touch.")
+/// @yah:verify("yubaba: `cargo test -p yubaba --lib service_records` = 45 passed / 0 failed. `cargo test -p yubaba --features testing --test testing -- integration_service_records::` = 11 passed / 0 failed (includes @Ashguard:griffin's B11 fix landing in the same file).")
+/// @yah:verify("yubaba workspace: `cargo test --workspace` in oss/yubaba = 1008 + 634 + smaller suites all ok, yah-cloud lib 1000 passed / 0 failed, service_discovery 27 passed / 0 failed. ONE CAVEAT, measured not assumed: 11 raft membership/quorum tests FAILED in that fully-parallel run and then passed 47/0 on re-run with `--test-threads=2`. They spawn real raft clusters and bind real ports; nothing in this change touches raft or service records from those paths.")
+/// @yah:verify("kamaji: `cargo test --workspace --all-features` in oss/kamaji = zero failures across every target (kamaji-bin lib 272/0, kamaji lib 39/0). The two wire e2e suites that the postcard bug broke and this fix restored: `--test sibling_wire_e2e` = 2 passed / 0 failed, and @Ashguard:libra re-ran `--test docker_backend_e2e --all-features` = 2 passed / 0 failed on this tree.")
+/// @yah:verify("The R844 purity canary, run from the repo root because it lives outside the oss/yubaba workspace: `cargo test -p xtask --test main mirror_ingress` = 11 passed / 0 failed.")
+/// @yah:verify("Whole tree: `cargo check --workspace --tests` from the repo root = 0 errors. This is the run that caught the three `crates/yah/hub/src/workload.rs` sites a workspace-local check could not see.")
+/// @yah:verify("The ticket's three stated criteria, each with the test that pins it: (1) http+wss resolves both by name and endpoints() still yields one endpoint per port in stable order -> service_records::tests::a_workload_serving_http_and_wss_resolves_both_ports_by_name; (2) the multi-port test still passes -> deployed_workload_with_multiple_ports_yields_multiple_endpoints, UNMODIFIED; (3) a wire round-trip preserves port names -> wire_round_trip_preserves_port_names, plus the_wire_stays_readable_to_a_consumer_that_has_never_heard_of_port_names asserting the JSON keys an un-rolled reader depends on are unchanged in name, type and value.")
+/// @yah:verify("Restart survival was re-verified rather than assumed, because it is what the ledger exists for: `LEDGER_VERSION` deliberately did NOT move, and `LedgerEntry` reads both the old `[8080]` and the new `{\"http\":8080}` via a custom deserializer. A version bump would have discarded the ledger on precisely the boot that installs this binary, leaving every serving workload undialable until its next deploy. Pinned by a_ledger_written_before_port_names_still_rehydrates and port_names_survive_the_ledger_round_trip.")
+/// @yah:verify("NOT VERIFIED, stated plainly: nothing was run against a live fleet node, and the V6 protocol bump means a node's yubaba and kamaji must be rolled together — which is the documented one-node blast radius of this UDS protocol (version.rs), not a fleet flag-day. The JSON discovery wire is unaffected by that bump and stays readable to every un-rolled consumer.")
 #[derive(Debug, Clone)]
 pub struct ServiceRecord {
     /// Mesh identity (`expose.mesh.identity` on the [`WorkloadSpec`]) —
     /// the DNS-segment name other workloads (and now the ingress proxy)
     /// address this workload by.
     pub ident: MeshIdent,
-    /// Mesh-plane IPv4 address (from `100.64.0.0/10`, per
-    /// `ServerState::alloc_mesh_ip`).
+    /// Mesh-plane IPv4 address another node dials this workload at.
+    ///
+    /// Always the **answering node's own** mesh address (R844-B11) — both the
+    /// container tier (`ServerState::workload_bind_ip`, echoed through
+    /// `DeployResult.mesh_ip`) and the bundle tier
+    /// (`ServerState::node_mesh_ip`, via [`ServiceRecords::admit_bundle`]) put
+    /// the same value here, because that is the only address anything actually
+    /// configured. A record whose `mesh_ip` is some *other* node's address is
+    /// the R844-B11 bug, not a workload with its own mesh identity.
     pub mesh_ip: Ipv4Addr,
-    /// Port(s) the workload **declared** — `expose.mesh.ports` for a container,
-    /// `serve_bundle.port` for a W272 bundle. A request, made at admission
-    /// time, before anything bound.
-    pub ports: Vec<u16>,
-    /// Port(s) the supervisor **actually bound**, as reported by
-    /// `kamaji::WorkloadState::ports` on the refresh sweep (R844-F2).
+    /// Port(s) the workload **declared**, keyed by port name —
+    /// `expose.mesh.ports` for a container, `serve_bundle.port` for a W272
+    /// bundle. A request, made at admission time, before anything bound.
+    ///
+    /// Both of those declaration surfaces are still anonymous number lists, so
+    /// the names here are synthesized by [`kamaji::name_anonymous_ports`] —
+    /// `http` for the first, its own number for each of the rest. That is the
+    /// same function every other tier uses, so one workload's ports are spelled
+    /// identically in a record, in a kamaji entry and in the `PORT_<NAME>`
+    /// environment (R844-T13). Once a manifest spells `ports = ["http", "wss"]`
+    /// the real names arrive and no synthesis happens.
+    pub ports: BTreeMap<String, u16>,
+    /// Port(s) the supervisor **actually bound**, keyed by port name, as
+    /// reported by `kamaji::WorkloadState::ports` on the refresh sweep
+    /// (R844-F2; named by R844-F15).
     ///
     /// Deliberately a separate field rather than overloading [`Self::ports`],
     /// because they are different facts that can disagree and the disagreement
@@ -293,7 +391,7 @@ pub struct ServiceRecord {
     /// namespaced container backend, where the declaration *is* the bound port
     /// and there is nothing to resolve, or a workload that has not bound yet.
     /// Dial [`Self::dialable_ports`], not this.
-    pub resolved_ports: Vec<u16>,
+    pub resolved_ports: BTreeMap<String, u16>,
     /// Backend-assigned container/task id, useful for correlating a record
     /// with logs or `docker`/`containerd` inspection.
     pub container_id: String,
@@ -314,7 +412,10 @@ impl ServiceRecord {
     /// request. The fallback is not a courtesy — it is what the container tier
     /// runs on: a namespaced container's declared port *is* its bound port, so
     /// its backend reports no resolved set and never will.
-    pub fn dialable_ports(&self) -> &[u16] {
+    ///
+    /// The whole map is returned rather than a slice of numbers so a caller can
+    /// select the port it actually means — see [`Self::port`].
+    pub fn dialable_ports(&self) -> &BTreeMap<String, u16> {
         if self.resolved_ports.is_empty() {
             &self.ports
         } else {
@@ -322,13 +423,62 @@ impl ServiceRecord {
         }
     }
 
-    /// `mesh_ip:port` for every dialable port. Empty if the workload has no
-    /// known ports at all (a valid but proxy-uninteresting shape).
-    pub fn endpoints(&self) -> Vec<SocketAddrV4> {
+    /// The dialable port called `name`, if this workload has one (R844-F15).
+    ///
+    /// This is the reason the map exists. A consumer holding three bare numbers
+    /// has to guess which one is the websocket listener — by index, or by a
+    /// convention nothing enforces — and is wrong the first time a port moves
+    /// or the declaration order changes. Asking for `wss` cannot be wrong in
+    /// that way: it either resolves or it doesn't.
+    pub fn port(&self, name: &str) -> Option<u16> {
+        self.dialable_ports().get(name).copied()
+    }
+
+    /// `mesh_ip:port` for the dialable port called `name` — [`Self::port`]
+    /// paired with the address, so a caller never re-derives the join.
+    pub fn endpoint(&self, name: &str) -> Option<SocketAddrV4> {
+        self.port(name).map(|p| SocketAddrV4::new(self.mesh_ip, p))
+    }
+
+    /// `mesh_ip:port` for every dialable port, keyed by port name. Empty if the
+    /// workload has no known ports at all (a valid but proxy-uninteresting
+    /// shape).
+    pub fn named_endpoints(&self) -> BTreeMap<String, SocketAddrV4> {
         self.dialable_ports()
             .iter()
-            .map(|&port| SocketAddrV4::new(self.mesh_ip, port))
+            .map(|(name, &port)| (name.clone(), SocketAddrV4::new(self.mesh_ip, port)))
             .collect()
+    }
+
+    /// `mesh_ip:port` for every dialable port, **one entry per distinct port,
+    /// ascending by port number**. Empty if the workload has no known ports at
+    /// all.
+    ///
+    /// Ordered by number rather than by name on purpose. Name order would sort
+    /// `9090` before `http` (ASCII digits precede letters), which is stable but
+    /// silently reverses what every existing consumer saw for a workload
+    /// declaring `[8080, 9090]`; numeric order reproduces the old behaviour
+    /// exactly while still being independent of declaration order. Two names
+    /// pointing at one port (an alias) collapse to one endpoint — this answers
+    /// "where can I connect", and that is one place.
+    ///
+    /// Use [`Self::named_endpoints`] or [`Self::endpoint`] when it matters
+    /// *which* listener you reach.
+    pub fn endpoints(&self) -> Vec<SocketAddrV4> {
+        self.dialable_port_numbers()
+            .into_iter()
+            .map(|port| SocketAddrV4::new(self.mesh_ip, port))
+            .collect()
+    }
+
+    /// Every distinct dialable port number, ascending — the anonymous view of
+    /// [`Self::dialable_ports`] that the wire's back-compatible `ports` array
+    /// and [`Self::endpoints`] are both built from.
+    pub fn dialable_port_numbers(&self) -> Vec<u16> {
+        let mut ports: Vec<u16> = self.dialable_ports().values().copied().collect();
+        ports.sort_unstable();
+        ports.dedup();
+        ports
     }
 
     /// Convenience passthrough — see [`Health::is_ready`].
@@ -391,13 +541,47 @@ const LEDGER_VERSION: u32 = 1;
 struct LedgerEntry {
     ident: String,
     mesh_ip: Ipv4Addr,
-    ports: Vec<u16>,
+    /// Named since R844-F15, and read through [`de_ports`] so a ledger written
+    /// by an older yubaba — where this was a bare `[8080]` — still loads.
+    ///
+    /// That tolerance is the point of the ledger, not a nicety: this file
+    /// exists so records survive a restart, and the restart that matters most
+    /// is the one that installs the new binary. A version bump would have
+    /// discarded the whole file on exactly that boot (see [`LEDGER_VERSION`]),
+    /// leaving every serving workload undialable until its next deploy.
+    #[serde(deserialize_with = "de_ports")]
+    ports: BTreeMap<String, u16>,
     /// R844-F2. `#[serde(default)]` so a ledger written before this field
     /// existed still loads — the first sweep after boot re-learns the resolved
-    /// ports from the supervisor anyway, so an old ledger costs nothing.
-    #[serde(default)]
-    resolved_ports: Vec<u16>,
+    /// ports from the supervisor anyway, so an old ledger costs nothing. Same
+    /// both-shapes tolerance as [`Self::ports`].
+    #[serde(default, deserialize_with = "de_ports")]
+    resolved_ports: BTreeMap<String, u16>,
     container_id: String,
+}
+
+/// Deserialize a port set written either as a named map (`{"http": 8080}`, the
+/// shape R844-F15 writes) or as the anonymous array (`[8080]`) every yubaba
+/// before it wrote.
+///
+/// An anonymous array is named by [`kamaji::name_anonymous_ports`], the same
+/// function the live paths use, so a rehydrated record is indistinguishable
+/// from a freshly-admitted one rather than being a second, subtly different
+/// naming of the same ports.
+fn de_ports<'de, D>(d: D) -> Result<BTreeMap<String, u16>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Named(BTreeMap<String, u16>),
+        Anonymous(Vec<u16>),
+    }
+    Ok(match Either::deserialize(d)? {
+        Either::Named(m) => m,
+        Either::Anonymous(v) => name_anonymous_ports(&v),
+    })
 }
 
 /// On-disk shape of the port ledger.
@@ -613,11 +797,11 @@ impl ServiceRecords {
         let record = ServiceRecord {
             ident: ident.clone(),
             mesh_ip,
-            ports: spec.expose.mesh.ports.clone(),
+            ports: kamaji::declared_port_names(&spec.expose.mesh),
             // A container is namespaced: its declared port is its bound port,
             // so there is nothing to resolve and `dialable_ports` falls back to
             // the declaration. See [`ServiceRecord::resolved_ports`].
-            resolved_ports: Vec::new(),
+            resolved_ports: BTreeMap::new(),
             container_id: container_id.into(),
             health: Health::Ready,
             observed_at_unix_ms: now_unix_ms(),
@@ -649,8 +833,8 @@ impl ServiceRecords {
         &self,
         ident: &MeshIdent,
         mesh_ip: Ipv4Addr,
-        ports: Vec<u16>,
-        resolved_ports: Vec<u16>,
+        ports: BTreeMap<String, u16>,
+        resolved_ports: BTreeMap<String, u16>,
     ) {
         let record = ServiceRecord {
             ident: ident.clone(),
@@ -724,7 +908,12 @@ impl ServiceRecords {
         };
         // Declared, not resolved: nothing has bound yet at admission time. The
         // sweep fills `resolved_ports` in, and corrects this if they differ.
-        self.upsert_bundle_deployed(ident, mesh_ip, vec![port], Vec::new());
+        self.upsert_bundle_deployed(
+            ident,
+            mesh_ip,
+            name_anonymous_ports(&[port]),
+            BTreeMap::new(),
+        );
         true
     }
 
@@ -835,7 +1024,7 @@ impl ServiceRecords {
                         mesh_ip,
                         // Nothing was declared — that is why this is a cold
                         // admission rather than a refresh.
-                        ports: Vec::new(),
+                        ports: BTreeMap::new(),
                         resolved_ports: state.ports.clone(),
                         container_id: state.container_id.clone(),
                         health: Health::from_status(&state.status),
@@ -978,7 +1167,33 @@ pub struct ServiceRecordWire {
     /// dials these keeps working and starts being right about a workload
     /// nobody declared a port for; the split between the two facts is below,
     /// for operators rather than proxies.
+    ///
+    /// Anonymous, ascending by number, **and staying that way** — the named
+    /// view is [`Self::named_ports`] beside it. See that field for why this one
+    /// was not simply reshaped.
     pub ports: Vec<u16>,
+    /// The same dialable ports, keyed by **port name** (R844-F15) — the field a
+    /// consumer should read when it cares *which* listener it reaches.
+    ///
+    /// **Additive rather than a reshape of [`Self::ports`], deliberately.**
+    /// This body is a cross-binary contract: passway reads it in its own Cargo
+    /// workspace (`oss/passway/crates/passway/src/discovery.rs`), `yah cloud
+    /// apply` reads it to resolve ingress ports, and the fleet runs mixed
+    /// yubaba versions — 0.8.28 through 0.8.31 as of 2026-09-03. Turning
+    /// `ports` into an object would make a rolled node's answer undecodable to
+    /// every consumer that had not been rebuilt, which is a front-door outage
+    /// produced by a field rename. An extra object beside the array is ignored
+    /// by an old consumer and available to a new one, so names ship ahead of
+    /// the roll instead of behind it. [`WIRE_VERSION`] therefore does *not*
+    /// move: nothing that could read v1 has stopped being able to.
+    ///
+    /// Omitted from the JSON when empty, which for the same reason as
+    /// `kamaji_proto::WorkloadEntry::named_ports` means either "no ports" or
+    /// "written by a yubaba that predates this field" — a consumer that must
+    /// tell them apart falls back to naming [`Self::ports`] with
+    /// `kamaji::name_anonymous_ports`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub named_ports: BTreeMap<String, u16>,
     /// The port(s) the supervisor reported actually binding, when it reported
     /// any (R844-F2). Omitted from the JSON when empty.
     ///
@@ -991,7 +1206,34 @@ pub struct ServiceRecordWire {
     /// `mesh_ip:port` for every dialable port — exactly what
     /// [`ServiceRecord::endpoints`] computes, pre-joined so a consumer dials
     /// without re-deriving the pairing (and cannot get it wrong).
+    ///
+    /// One entry per distinct port, ascending by port number. Anonymous, for
+    /// the same compatibility reason as [`Self::ports`]; the named view is
+    /// [`Self::named_endpoints`].
     pub endpoints: Vec<String>,
+    /// The same endpoints keyed by **port name** (R844-F15) — what lets a wire
+    /// consumer select an endpoint by what the port *is* rather than by where
+    /// it happened to sort.
+    ///
+    /// The consumer that reads it today is `yah cloud apply`'s ingress port
+    /// resolution (`ServiceRecordFanout::port_for` selects the port named
+    /// `http`), via `named_ports` above.
+    ///
+    /// **passway does NOT read this yet, and that is a live gap, not a
+    /// completed handover.** `addrs_from_body`
+    /// (`oss/passway/crates/passway/src/discovery.rs`) pushes every endpoint of
+    /// every ready record into one flat backend set — right for a
+    /// single-listener workload, and silently wrong for a workload with an
+    /// `http` and a `metrics` port, where half the apex traffic lands on the
+    /// metrics listener. Nothing has hit that yet because no fronted workload
+    /// declares two ports, and this field is what will let passway fix it when
+    /// one does. Changing passway's backend selection is a behaviour change to
+    /// a separate binary in its own workspace, so R844-F15 stopped at making
+    /// the fact available rather than acting on it there.
+    ///
+    /// Omitted when empty; same two readings as [`Self::named_ports`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub named_endpoints: BTreeMap<String, String>,
     pub container_id: String,
     /// [`HEALTH_READY`] / [`HEALTH_NOT_READY`] / [`HEALTH_RETRACTED`].
     pub health: String,
@@ -1012,9 +1254,25 @@ impl From<&ServiceRecord> for ServiceRecordWire {
         Self {
             ident: r.ident.0.clone(),
             mesh_ip: r.mesh_ip,
-            ports: r.dialable_ports().to_vec(),
-            resolved_ports: r.resolved_ports.clone(),
+            ports: r.dialable_port_numbers(),
+            named_ports: r.dialable_ports().clone(),
+            // Still the anonymous diagnostic it has always been: `named_ports`
+            // above already resolves declared-vs-resolved precedence, so naming
+            // this too would put a fourth port field on the wire to answer a
+            // question ("did a human write 8080 or did kamaji pick 43117")
+            // that the numbers alone answer.
+            resolved_ports: {
+                let mut v: Vec<u16> = r.resolved_ports.values().copied().collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            },
             endpoints: r.endpoints().iter().map(|e| e.to_string()).collect(),
+            named_endpoints: r
+                .named_endpoints()
+                .into_iter()
+                .map(|(name, addr)| (name, addr.to_string()))
+                .collect(),
             container_id: r.container_id.clone(),
             health: health.to_string(),
             reason,
@@ -1188,7 +1446,7 @@ mod tests {
             expose: ExposeSpec {
                 mesh: MeshExpose {
                     identity: MeshIdent(name.to_string()),
-                    ports,
+                    ports: MeshExpose::anonymous_ports(ports),
                     allow_from: vec![],
                 },
                 public: None,
@@ -1207,21 +1465,48 @@ mod tests {
             container_id: format!("container-{name}"),
             status: WorkloadStatus::Running,
             mesh_ip,
-            ports: Vec::new(),
+            ports: BTreeMap::new(),
         }
     }
 
     /// A backend report that DOES carry resolved ports — the native/bundle
     /// shape kamaji answers with since R844-F2.
+    ///
+    /// Takes bare numbers and names them the way every real producer does, so
+    /// these tests exercise the same synthesis the live path runs rather than a
+    /// hand-written map that could disagree with it.
     fn running_state_on_ports(
         name: &str,
         mesh_ip: Option<Ipv4Addr>,
         ports: Vec<u16>,
     ) -> WorkloadState {
         WorkloadState {
-            ports,
+            ports: name_anonymous_ports(&ports),
             ..running_state(name, mesh_ip)
         }
+    }
+
+    /// A backend report carrying ports the supervisor **named** — the shape
+    /// R844-F14's allocator answers with, where the names are real rather than
+    /// synthesized.
+    fn running_state_on_named_ports(
+        name: &str,
+        mesh_ip: Option<Ipv4Addr>,
+        ports: &[(&str, u16)],
+    ) -> WorkloadState {
+        WorkloadState {
+            ports: named(ports),
+            ..running_state(name, mesh_ip)
+        }
+    }
+
+    /// Build a named port map from pairs — the expected-value side of every
+    /// assertion below.
+    fn named(pairs: &[(&str, u16)]) -> BTreeMap<String, u16> {
+        pairs
+            .iter()
+            .map(|(n, p)| ((*n).to_string(), *p))
+            .collect()
     }
 
     /// This node's mesh address, as `reconcile` is given it by the sweep.
@@ -1242,7 +1527,12 @@ mod tests {
             .expect("record present");
         assert!(record.is_ready(), "freshly deployed workload must be ready");
         assert_eq!(record.mesh_ip, ip);
-        assert_eq!(record.ports, vec![8080]);
+        assert_eq!(record.ports, named(&[("http", 8080)]));
+        assert_eq!(
+            record.port("http"),
+            Some(8080),
+            "a single-listener workload's port must be reachable by the name every tier gives it"
+        );
         assert_eq!(record.endpoints(), vec![SocketAddrV4::new(ip, 8080)]);
         assert_eq!(record.container_id, "container-abc");
     }
@@ -1290,7 +1580,11 @@ mod tests {
         let record = records.get(&MeshIdent("yah-marketing".into())).unwrap();
         assert!(record.is_ready());
         assert_eq!(record.mesh_ip, node_ip, "host must be the node's mesh IP");
-        assert_eq!(record.ports, vec![8080], "port must be the declared one");
+        assert_eq!(
+            record.ports,
+            named(&[("http", 8080)]),
+            "port must be the declared one"
+        );
         assert_eq!(
             record.endpoints(),
             vec![SocketAddrV4::new(node_ip, 8080)],
@@ -1321,7 +1615,7 @@ mod tests {
         let record = records.get(&MeshIdent("yah-marketing".into())).unwrap();
         assert_eq!(
             record.ports,
-            vec![8080],
+            named(&[("http", 8080)]),
             "the sweep must not lose the admission-time port"
         );
         assert_eq!(
@@ -1363,8 +1657,8 @@ mod tests {
 
         let marketing = records.get(&MeshIdent("yah-marketing".into())).unwrap();
         let noisetable = records.get(&MeshIdent("noisetable-com".into())).unwrap();
-        assert_eq!(marketing.dialable_ports(), &[43117]);
-        assert_eq!(noisetable.dialable_ports(), &[43119]);
+        assert_eq!(marketing.dialable_ports(), &named(&[("http", 43117)]));
+        assert_eq!(noisetable.dialable_ports(), &named(&[("http", 43119)]));
         assert_eq!(
             marketing.endpoints(),
             vec![SocketAddrV4::new(node, 43117)],
@@ -1421,7 +1715,7 @@ mod tests {
                 .get(&MeshIdent("yah-marketing".into()))
                 .unwrap()
                 .dialable_ports(),
-            &[43117]
+            &named(&[("http", 43117)])
         );
 
         // Restarted onto a different port (ledger lost, or the old port was
@@ -1434,7 +1728,7 @@ mod tests {
         let record = records.get(&MeshIdent("yah-marketing".into())).unwrap();
         assert_eq!(
             record.dialable_ports(),
-            &[51001],
+            &named(&[("http", 51001)]),
             "the record must follow the workload, not keep advertising a dead port"
         );
         assert_eq!(record.endpoints(), vec![SocketAddrV4::new(node, 51001)]);
@@ -1455,9 +1749,13 @@ mod tests {
         );
 
         let record = records.get(&MeshIdent("yah-marketing".into())).unwrap();
-        assert_eq!(record.ports, vec![8080], "the declaration is still recorded");
-        assert_eq!(record.resolved_ports, vec![43117]);
-        assert_eq!(record.dialable_ports(), &[43117]);
+        assert_eq!(
+            record.ports,
+            named(&[("http", 8080)]),
+            "the declaration is still recorded"
+        );
+        assert_eq!(record.resolved_ports, named(&[("http", 43117)]));
+        assert_eq!(record.dialable_ports(), &named(&[("http", 43117)]));
         let row = &discovery_body(&records.snapshot(), false).records[0];
         assert_eq!(row.ports, vec![43117], "consumers dial the resolved port");
         assert_eq!(
@@ -1487,7 +1785,7 @@ mod tests {
                 .get(&MeshIdent("yah-marketing".into()))
                 .unwrap()
                 .dialable_ports(),
-            &[43117],
+            &named(&[("http", 43117)]),
             "an empty report means 'this backend resolves nothing', not 'the ports went away'"
         );
     }
@@ -1566,7 +1864,7 @@ mod tests {
                 .get(&MeshIdent("yah-marketing".into()))
                 .unwrap()
                 .dialable_ports(),
-            &[43117]
+            &named(&[("http", 43117)])
         );
         assert_eq!(records.ready().len(), 1);
     }
@@ -1680,7 +1978,7 @@ mod tests {
         assert_eq!(record.health, Health::Retracted);
         // Endpoint/port bookkeeping survives retraction — useful for
         // diagnostics — but is_ready() is what a proxy must respect.
-        assert_eq!(record.ports, vec![8080]);
+        assert_eq!(record.ports, named(&[("http", 8080)]));
     }
 
     #[test]
@@ -1695,7 +1993,7 @@ mod tests {
             container_id: "container-stopping".into(),
             status: WorkloadStatus::Stopping,
             mesh_ip: Some(ip),
-            ports: Vec::new(),
+            ports: BTreeMap::new(),
         };
         records.reconcile(std::slice::from_ref(&stopped), sweep_node_ip());
 
@@ -1718,7 +2016,11 @@ mod tests {
         let record = records.get(&MeshIdent("moved".into())).unwrap();
         assert!(record.is_ready());
         assert_eq!(record.mesh_ip, new_ip);
-        assert_eq!(record.ports, vec![443], "ports are untouched by reconcile");
+        assert_eq!(
+            record.ports,
+            named(&[("http", 443)]),
+            "ports are untouched by reconcile"
+        );
     }
 
     #[test]
@@ -1829,6 +2131,208 @@ mod tests {
         assert_eq!(row.health, HEALTH_READY);
         assert_eq!(row.reason, None, "a ready record has nothing to explain");
         assert!(row.observed_at_unix_ms > 0);
+
+        // R844-F15 rides beside the anonymous fields, it does not replace them:
+        // the two assertions above are byte-for-byte what a pre-F15 consumer
+        // saw, and these two are what a new one gets.
+        assert_eq!(row.named_ports, named(&[("8080", 8080), ("9090", 9090)]));
+        assert_eq!(
+            row.named_endpoints,
+            [
+                ("8080".to_string(), format!("{ip}:8080")),
+                ("9090".to_string(), format!("{ip}:9090")),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+        );
+    }
+
+    // ── R844-F15: named ports, end to end ───────────────────────────────────
+
+    /// The ticket's headline case. A workload serving HTTP **and** a websocket
+    /// listener is exactly the shape three bare numbers cannot describe: a
+    /// consumer holding `[8080, 8443]` has to guess which is which, and guesses
+    /// wrong the moment either moves. Here the supervisor reports real names —
+    /// what R844-F14's allocator answers with — and both resolve by name.
+    #[test]
+    fn a_workload_serving_http_and_wss_resolves_both_ports_by_name() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+
+        // Admitted with no declared port at all (the portless mirror shape),
+        // then cold-admitted from what the supervisor actually bound.
+        records.admit_bundle(&MeshIdent("chatty".into()), Some(node), None);
+        records.reconcile(
+            &[running_state_on_named_ports(
+                "chatty",
+                None,
+                &[("http", 8080), ("wss", 8443)],
+            )],
+            Some(node),
+        );
+
+        let record = records.get(&MeshIdent("chatty".into())).unwrap();
+        assert_eq!(record.port("http"), Some(8080));
+        assert_eq!(record.port("wss"), Some(8443));
+        assert_eq!(
+            record.port("metrics"),
+            None,
+            "a name the workload does not serve must resolve to nothing, not to \
+             whichever port sorted first"
+        );
+        assert_eq!(
+            record.endpoint("wss"),
+            Some(SocketAddrV4::new(node, 8443)),
+            "the whole point: ask for the websocket listener and get the \
+             websocket listener"
+        );
+
+        // The anonymous accessor keeps its old contract — one endpoint per
+        // port, stable order — so nothing that was reading it has to change.
+        assert_eq!(
+            record.endpoints(),
+            vec![
+                SocketAddrV4::new(node, 8080),
+                SocketAddrV4::new(node, 8443)
+            ]
+        );
+    }
+
+    /// Names survive the projection onto the wire, which is where they have to
+    /// arrive for a *separate binary* (passway, `yah cloud apply`) to use them.
+    /// A record that knows its ports are named and a wire that flattens them
+    /// back to numbers would be a mechanism with no consumer.
+    #[test]
+    fn wire_round_trip_preserves_port_names() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        records.admit_bundle(&MeshIdent("chatty".into()), Some(node), None);
+        records.reconcile(
+            &[running_state_on_named_ports(
+                "chatty",
+                None,
+                &[("http", 8080), ("wss", 8443)],
+            )],
+            Some(node),
+        );
+
+        let body = discovery_body(&records.snapshot(), true);
+        let json = serde_json::to_string(&body).unwrap();
+        let back: ServiceRecordsWire = serde_json::from_str(&json).unwrap();
+
+        let row = &back.records[0];
+        assert_eq!(row.named_ports, named(&[("http", 8080), ("wss", 8443)]));
+        assert_eq!(
+            row.named_endpoints.get("wss").map(String::as_str),
+            Some(format!("{node}:8443").as_str())
+        );
+        // …and the anonymous halves still say exactly what they used to.
+        assert_eq!(row.ports, vec![8080, 8443]);
+        assert_eq!(
+            row.endpoints,
+            vec![format!("{node}:8080"), format!("{node}:8443")]
+        );
+    }
+
+    /// A consumer built before R844-F15 must still be able to read a rolled
+    /// node's answer. It cannot be linked against here, so the check is the one
+    /// that actually matters: the JSON keys it reads are unchanged in name,
+    /// type and value, and the new ones are additions it will ignore.
+    #[test]
+    fn the_wire_stays_readable_to_a_consumer_that_has_never_heard_of_port_names() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        records.admit_bundle(&MeshIdent("chatty".into()), Some(node), None);
+        records.reconcile(
+            &[running_state_on_named_ports(
+                "chatty",
+                None,
+                &[("http", 8080), ("wss", 8443)],
+            )],
+            Some(node),
+        );
+
+        let json = serde_json::to_value(discovery_body(&records.snapshot(), true)).unwrap();
+        let row = &json["records"][0];
+        assert_eq!(
+            row["ports"],
+            serde_json::json!([8080, 8443]),
+            "`ports` is still an array of numbers — reshaping it into an object \
+             is what would break every un-rolled reader"
+        );
+        assert_eq!(
+            row["endpoints"],
+            serde_json::json!([format!("{node}:8080"), format!("{node}:8443")])
+        );
+        assert_eq!(
+            json["version"], WIRE_VERSION,
+            "an additive field is not a version bump: a v1 reader can still read this"
+        );
+    }
+
+    /// A record whose ports were never named anywhere gets the same names at
+    /// every tier, because one function decides them. If this drifts, a
+    /// workload's port is called `http` in kamaji and something else in a
+    /// service record, and the `PORT_<NAME>` contract (R844-T13) inherits the
+    /// disagreement.
+    #[test]
+    fn an_anonymous_declaration_is_named_the_same_way_every_tier_names_it() {
+        let records = ServiceRecords::new();
+        let ip = Ipv4Addr::new(100, 64, 0, 5);
+        records.upsert_deployed(&test_spec("api", vec![8080, 9090]), ip, "c-api");
+
+        let record = records.get(&MeshIdent("api".into())).unwrap();
+        assert_eq!(record.ports, name_anonymous_ports(&[8080, 9090]));
+        assert_eq!(record.port("8080"), Some(8080));
+        assert_eq!(record.port("9090"), Some(9090));
+        assert_eq!(
+            record.port("http"),
+            None,
+            "AN ANONYMOUS MULTI-PORT DECLARATION NAMES NOTHING `http`. Calling \
+             the first one `http` would let ingress port resolution publish a \
+             hostname at whichever listener happened to be written first — the \
+             positional guess named ports exist to abolish. `None` sends the \
+             operator to pin the port or name it in the manifest, which is \
+             somebody stating the fact instead of the code inventing it."
+        );
+
+        // The single-port case has nothing to be ambiguous about, so it does
+        // get the name — that is the whole asymmetry.
+        let solo = ServiceRecords::new();
+        solo.upsert_deployed(&test_spec("solo", vec![8080]), ip, "c-solo");
+        assert_eq!(
+            solo.get(&MeshIdent("solo".into())).unwrap().port("http"),
+            Some(8080)
+        );
+    }
+
+    /// Two names for one port collapse to one endpoint. `endpoints()` answers
+    /// "where can I connect", and that is one place however many aliases point
+    /// at it — a proxy that dialled the same socket twice would double-count it
+    /// in its backend set.
+    #[test]
+    fn aliased_names_on_one_port_yield_one_endpoint() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        records.admit_bundle(&MeshIdent("aliased".into()), Some(node), None);
+        records.reconcile(
+            &[running_state_on_named_ports(
+                "aliased",
+                None,
+                &[("http", 8080), ("web", 8080)],
+            )],
+            Some(node),
+        );
+
+        let record = records.get(&MeshIdent("aliased".into())).unwrap();
+        assert_eq!(record.port("http"), Some(8080));
+        assert_eq!(record.port("web"), Some(8080));
+        assert_eq!(record.endpoints(), vec![SocketAddrV4::new(node, 8080)]);
+        assert_eq!(
+            record.named_endpoints().len(),
+            2,
+            "the named view keeps both names — only the anonymous one dedupes"
+        );
     }
 
     #[test]
@@ -1872,7 +2376,7 @@ mod tests {
                 container_id: "c-api".into(),
                 status: WorkloadStatus::Stopping,
                 mesh_ip: None,
-                ports: Vec::new(),
+                ports: BTreeMap::new(),
             }],
             sweep_node_ip(),
         );
@@ -1943,7 +2447,7 @@ mod tests {
         let record = restart(&ledger)
             .get(&MeshIdent("api".into()))
             .expect("record rehydrated from ledger");
-        assert_eq!(record.ports, vec![8080, 9090]);
+        assert_eq!(record.ports, named(&[("8080", 8080), ("9090", 9090)]));
         assert_eq!(record.mesh_ip, ip);
         assert_eq!(record.container_id, "container-api");
         assert_eq!(
@@ -2089,6 +2593,73 @@ mod tests {
         )
         .unwrap();
         assert!(ServiceRecords::with_ledger(future).snapshot().is_empty());
+    }
+
+    /// The upgrade boot. A ledger written by a pre-R844-F15 yubaba spells its
+    /// ports as bare arrays; the binary that reads it first is, by definition,
+    /// the new one. Bumping [`LEDGER_VERSION`] would have discarded the whole
+    /// file on exactly that boot — every serving workload undialable until its
+    /// next deploy, which is the outage the ledger exists to prevent — so the
+    /// old shape is read, not rejected.
+    #[test]
+    fn a_ledger_written_before_port_names_still_rehydrates() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ledger = tmp.path().join(LEDGER_FILE_NAME);
+        std::fs::write(
+            &ledger,
+            serde_json::json!({
+                "version": LEDGER_VERSION,
+                "services": [{
+                    "ident": "api",
+                    "mesh_ip": "100.64.0.5",
+                    "ports": [8080, 9090],
+                    "resolved_ports": [43117],
+                    "container_id": "container-api",
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let record = ServiceRecords::with_ledger(ledger)
+            .get(&MeshIdent("api".into()))
+            .expect("an old-shaped ledger must still rehydrate its records");
+        assert_eq!(record.ports, named(&[("8080", 8080), ("9090", 9090)]));
+        assert_eq!(record.resolved_ports, named(&[("http", 43117)]));
+        assert_eq!(
+            record.port("http"),
+            Some(43117),
+            "resolved still beats declared after rehydration"
+        );
+    }
+
+    /// And the names a live record carries survive the round trip to disk —
+    /// otherwise a restart would silently re-synthesize `http`/`<number>` over
+    /// whatever the supervisor actually called them.
+    #[test]
+    fn port_names_survive_the_ledger_round_trip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ledger = tmp.path().join(LEDGER_FILE_NAME);
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+
+        {
+            let records = ServiceRecords::with_ledger(ledger.clone());
+            records.admit_bundle(&MeshIdent("chatty".into()), Some(node), None);
+            records.reconcile(
+                &[running_state_on_named_ports(
+                    "chatty",
+                    None,
+                    &[("http", 8080), ("wss", 8443)],
+                )],
+                Some(node),
+            );
+        }
+
+        let record = restart(&ledger)
+            .get(&MeshIdent("chatty".into()))
+            .expect("record rehydrated");
+        assert_eq!(record.port("wss"), Some(8443));
+        assert_eq!(record.resolved_ports, named(&[("http", 8080), ("wss", 8443)]));
     }
 
     #[test]

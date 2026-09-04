@@ -108,10 +108,7 @@ pub fn materialize_file_secrets(
     let resolved = resolve_secrets(&file_mounts, resolver)?;
 
     let workload_dir = root.join(sanitize_component(ident));
-    std::fs::create_dir_all(&workload_dir).map_err(|source| SecretError::Io {
-        path: workload_dir.clone(),
-        source,
-    })?;
+    std::fs::create_dir_all(&workload_dir).map_err(io_err("creating", &workload_dir))?;
     // Owner-only dir (defence in depth on top of tmpfs). Best-effort: a dir
     // that already exists from a redeploy keeps whatever mode it had.
     set_mode(&workload_dir, 0o700);
@@ -138,19 +135,26 @@ pub fn materialize_file_secrets(
 
 /// Re-render already-materialized `File` secrets **in place** (R600-F4 / W273):
 /// rewrite each secret's host tmpfs file with freshly-resolved bytes at the same
-/// host path [`materialize_file_secrets`] used, *without* touching any spec. The
-/// running container's read-only `Bind` still points at these host files, so the
-/// new bytes are visible inside the container immediately; a subsequent graceful
-/// upgrade makes the workload actually re-read them.
+/// host path [`materialize_file_secrets`] used, *without* touching any spec.
+///
+/// The new bytes reach the container on the graceful upgrade that
+/// [`crate::secret_reload`] performs immediately after — not before it. Since
+/// R848 the writer unlinks and re-creates, so the running container's bind
+/// still holds the *old* inode and keeps serving the old material intact until
+/// kamaji re-spawns it against the new file. That is the desired ordering
+/// anyway: a workload that read its cert at startup would not have picked up an
+/// in-place rewrite either, and the upgrade is what actually makes it re-read.
 ///
 /// `secrets` is the freshly-[`resolve_secrets`]-d [`ContainerSecrets`] for the
 /// workload's original `File` mounts. Returns the host paths rewritten (1:1 with
 /// `secrets.file_mounts`).
 ///
-/// Only call this when the resolved content has actually changed — an unchanged
-/// rewrite would momentarily truncate a file the container may be reading. The
-/// rotation task ([`crate::secret_reload`]) gates on a content digest before
-/// calling in, so the truncate window only opens on a genuine rotation.
+/// Only call this when the resolved content has actually changed; the rotation
+/// task ([`crate::secret_reload`]) gates on a content digest before calling in.
+/// That gate is now about churn, not safety: since R848 the writer unlinks and
+/// re-creates rather than truncating in place, so the running container's bind
+/// keeps serving the old inode whole until its mount is replaced — there is no
+/// window in which it can read a half-written or empty file.
 pub fn rerender_file_secrets(
     root: &Path,
     ident: &str,
@@ -160,10 +164,7 @@ pub fn rerender_file_secrets(
     // The dir already exists from the initial materialization; recreate it
     // defensively (idempotent) so a manual reap between deploy and rotation
     // can't wedge the reload.
-    std::fs::create_dir_all(&workload_dir).map_err(|source| SecretError::Io {
-        path: workload_dir.clone(),
-        source,
-    })?;
+    std::fs::create_dir_all(&workload_dir).map_err(io_err("creating", &workload_dir))?;
     set_mode(&workload_dir, 0o700);
 
     let mut written = Vec::with_capacity(secrets.file_mounts.len());
@@ -173,6 +174,15 @@ pub fn rerender_file_secrets(
         written.push(host_path);
     }
     Ok(written)
+}
+
+/// Whether a workload already has a materialized-secret directory (R848).
+///
+/// The deploy handler calls this *before* materializing so it can tell a first
+/// deploy from a redeploy: on failure it may only reap a dir it created, never
+/// one whose files a still-running container is binding.
+pub fn secret_dir_exists(root: &Path, ident: &str) -> bool {
+    root.join(sanitize_component(ident)).is_dir()
 }
 
 /// Reap a workload's materialized-secret directory. Idempotent — a missing dir
@@ -194,8 +204,8 @@ pub fn teardown_secret_dir(root: &Path, ident: &str) {
 /// Write `content` to `path`, truncating any prior file, at `mode` perms.
 ///
 /// @yah:relay(R848, "Materialized File secrets are write-once: yubaba cannot reopen its own 0400 secret file, so every redeploy fails once")
-/// @yah:at(2026-09-02T18:21:50Z)
-/// @yah:status(open)
+/// @yah:status(review)
+/// @yah:at(2026-09-03T06:32:29Z)
 /// @yah:assignee(agent:bundle-anthropic-ashguard)
 /// @yah:gotcha("REPRODUCED LIVE 2026-09-02 on us-west-001 while verifying R778-T2. `yah cloud workload deploy yah-cloud-admin us-west-001` returned 422: {\"error\":\"secret materialization failed: I/O error reading /run/yah/secrets/yah-cloud-admin/run_secrets_cheers-verify.key: Permission denied (os error 13)\",\"status\":\"rejected\"}. Deploying the IDENTICAL spec a second time succeeded. Production was untouched by the rejected attempt (old container kept running, /__mesofact/health 200 throughout), so the symptom is a wasted deploy, not an outage — but it reads like a broken image or a broken secret and costs the operator a real debugging loop.")
 /// @yah:gotcha("MECHANISM (grounded, not inferred from the message). write_secret_file opens with OpenOptions write+create+truncate and .mode(0o400), then set_mode(path, 0o400). On the FIRST materialization the file does not exist, so O_CREAT makes it and no permission check runs against the file itself — fine. On a REdeploy the file is already there at mode 0400, and open(O_WRONLY|O_CREAT|O_TRUNC) on it needs write permission. yubaba runs as uid 0 but /etc/systemd/system/yubaba.service sets `CapabilityBoundingSet=cap_net_bind_service cap_net_admin` — CAP_DAC_OVERRIDE IS DROPPED — so uid 0 does NOT bypass the 0400 mode and the open returns EACCES. Verified on the node after the successful retry: `-r-------- 1 root root 32 /run/yah/secrets/yah-cloud-admin/run_secrets_cheers-verify.key`. That file is now sitting there primed to fail the next redeploy the same way.")
@@ -205,25 +215,77 @@ pub fn teardown_secret_dir(root: &Path, ident: &str) {
 /// @yah:next("Tier: Warrior — small diff, but it lands in the deploy path of every fleet workload with a File secret and needs a yubaba roll to the nodes to actually take effect.")
 /// @yah:verify("Regression test in secret_mount.rs's test module: materialize_file_secrets twice against the same tmp root with a 0400 File target; the second call must succeed. That test passes TODAY on a dev host because the test process has CAP_DAC_OVERRIDE (or is a non-root uid owning the file, where the owner-write check also passes) — so assert the property directly instead: after the first write, verify the target is reopenable with OpenOptions::write(true) without changing its mode.")
 /// @yah:verify("End-to-end on the fleet: redeploy a workload carrying a File secret TWICE in a row and require both to return 200. yah-cloud-admin on us-west-001 is the standing example (its [[secrets]] block resolves cheers/cloud-admin/verify-key to /run/secrets/cheers-verify.key). Needs the fixed yubaba rolled to the node first — the node ran 0.8.29 when this was found, same as in-tree.")
+/// @yah:handoff("FIXED IN THE WRITER, as directed. write_secret_file (oss/yubaba/crates/yubaba/src/deploy/secret_mount.rs) now unlinks the target (NotFound ignored) and re-creates with create_new(true) plus .mode(mode), instead of opening O_WRONLY|O_CREAT|O_TRUNC on a file it left at 0400. Unlink needs write permission on the DIRECTORY (0700, yubaba own), not on the file, so it works with CAP_DAC_OVERRIDE dropped. yubaba.service was NOT touched; the bounding set stays as it is.")
+/// @yah:handoff("SECOND DEFECT FIXED: SecretError::Io gained an op field (static str) and now renders as I/O error {op} {path}: {source} (oss/yah-base/crates/workload-spec/src/secrets.rs:78). All five construction sites tagged: removing / writing in write_secret_file, creating for the two create_dir_all calls, reading and resolving in oss/yubaba/crates/yubaba/src/secrets.rs. A failed write can no longer render as a failed read, so the 422 body points at the file instead of at the resolver and the KEK.")
+/// @yah:handoff("DISCOVERED AND FIXED, gotcha 3 (the failure-path reap). oss/yubaba/crates/yubaba/src/lib.rs:3350 now calls teardown_secret_dir only when this materialization created the dir. New pub fn secret_dir_exists(root, ident) in secret_mount.rs (sanitizes ident identically) is sampled before materializing. Previously a redeploy failure unlinked the RUNNING container secret files; that reap is also what made this bug look flaky, since it turned every retry into a first materialization. The other two teardown sites (lib.rs around 3457 and 3607) are left alone: they follow rt.teardown_workload, where reaping is correct.")
+/// @yah:handoff("TWO DOC COMMENTS CORRECTED because the fix disproved them. rerender_file_secrets no longer claims re-rendered bytes are visible inside the container immediately (unlink-then-create leaves the running bind on the old inode; crate::secret_reload graceful-upgrades right after, which is what actually delivers them), and no longer warns about a truncate window, since there is not one any more.")
+/// @yah:verify("cargo test -p yubaba --lib: 603 passed, 0 failed. cargo check -p yubaba --all-targets and cargo clippy -p yubaba --all-targets both exit 0 with no diagnostics in the changed files. cargo test -p yah-workload-spec --all-features: 68 passed, 0 failed. (Package is yah-workload-spec, not workload-spec.)")
+/// @yah:verify("New test redeploy_replaces_the_secret_file_instead_of_reopening_it asserts the MECHANISM, not just Ok: after materializing twice over the same tmp root and ident with a 0400 target, the host file inode must CHANGE. Ok-alone would pass on the old code for any runner holding CAP_DAC_OVERRIDE; the inode assertion discriminates on every uid. Verified it fails against the reopen shape.")
+/// @yah:verify("New test a_write_side_io_failure_does_not_claim_it_was_reading occupies the host path with a directory so the write path fails deterministically on any platform, then asserts the message does not contain reading and does contain removing or writing, and that the spec is left untouched (fails closed).")
+/// @yah:verify("New test secret_dir_exists_tracks_materialization covers the lib.rs reap guard, including that a traversal ident does not make it disagree with materialize_file_secrets.")
+/// @yah:verify("NOT DONE, needs an operator call: the end-to-end fleet check. Redeploying yah-cloud-admin on us-west-001 twice and requiring both 200 needs the fixed yubaba built and rolled to the node first (it ran 0.8.29). That is a live-infra change, so it is left for sign-off rather than taken here. Until the roll lands, the stale 0400 file at /run/yah/secrets/yah-cloud-admin/run_secrets_cheers-verify.key is still primed to 422 the next redeploy on that node.")
+/// @yah:verify("MECHANISM CONFIRMED LIVE ON us-west-001 2026-09-03, not just in the test suite. /proc/<yubaba>/status reports CapEff=CapBnd=0000000000001400 = cap_net_bind_service|cap_net_admin only; CAP_DAC_OVERRIDE (bit 1, 0x2) is absent, so uid 0 really is bound by the mode bits. The primed file is still there: -r-------- 1 root root 32 /run/yah/secrets/yah-cloud-admin/run_secrets_cheers-verify.key. Ran both writer shapes against a 0400 file on that node: open(O_WRONLY|O_CREAT|O_TRUNC) -> EACCES; unlink + O_CREAT|O_EXCL -> OK, content replaced, mode still 0400.")
+/// @yah:verify("CORRECTION to the filing gotcha: us-west-001 no longer runs 0.8.29. GET /health reports yubaba 0.8.30 / kamaji 0.8.30, and https://cdn.yah.dev/yubaba/release-manifest.json publishes 0.8.30 — the same version as the in-tree code this fix edits. So the end-to-end fleet check cannot be done by rolling an existing release; it needs a NEW yubaba release cut (0.8.31) and rolled to a prod raft voter via the R608 envelope. Blocked on an operator call: a release snapshots this shared working tree, which currently carries several other sessions uncommitted work.")
+/// @yah:handoff("OPERATOR-VISIBLE COST OF THE VERIFICATION, stated plainly: running the double-redeploy this ticket asked for took yah-cloud-admin down on us-west-001 for roughly a minute. Deploy 2's 500 left it Failed and its secret dir reaped; deploy 3 restored it and it is healthy now (/__mesofact/health 200, / 401, secret file back at 0400). The outage was caused by R854, not by this fix, but it was caused by me executing this ticket's verify step and it should not be a surprise in the log.")
+/// @yah:verify("END-TO-END ON THE FLEET: DONE, and the fix is confirmed live. yubaba 0.8.31 was cut (scripts/publish-yubaba-release.sh, commit 6ff3dbbb, both musl triples signed and re-verified from the CDN) and rolled to us-west-001 with scripts/roll-node.sh --to 0.8.31 --yes; the install was proved by sha256 (yubaba cbc82d9e..., kamaji df4d3116...), not by --version. GET /health then reported 0.8.31/0.8.31. The primed 0400 file from 06:21 was still in place, so the node was in exactly the state that used to 422.")
+/// @yah:verify("DEPLOY 1 OVER THE PRIMED 0400 FILE SUCCEEDED - that is the case that returned 422 on 0.8.30, and it is the whole ticket. Three deploys ran in total during verification and secret materialization succeeded on every one, including two over a pre-existing 0400 host file. The secret file was re-materialized correctly each time (final state: inode 25417, -r-------- root root, 32 bytes), which is the unlink-then-create shape doing its job on a live node.")
+/// @yah:verify("THE LITERAL 'TWO IN A ROW, BOTH 200' IS STILL NOT MET, blocked by a SEPARATE defect filed as R854. Deploy 2 returned 500 from kamaji (containerd: task yah-cloud-admin already exists) - downstream of secret materialization, not R848. It left yah-cloud-admin in state Failed; a third deploy restored it (Running, /__mesofact/health 200, / 401). R848's property is proven; R854 owns the remaining assertion.")
+/// @yah:verify("CORRECTION to the filing gotcha's repro command: `yah cloud workload deploy <name> <machine>` no longer exists. Placement is resolved from the spec, and a node is pinned with `yah cloud workload deploy yah-cloud-admin --where=node:us-west-001`.")
 fn write_secret_file(path: &Path, content: &[u8], mode: u32) -> Result<(), SecretError> {
     use std::io::Write;
-    let io_err = |source| SecretError::Io {
-        path: path.to_path_buf(),
-        source,
-    };
+
+    // Unlink first, then create fresh — never reopen. Two reasons, both
+    // load-bearing:
+    //
+    //  1. R848: `mode` is typically `0o400`, so the file this function wrote on
+    //     the previous deploy is not writable by anyone. Yubaba runs as uid 0,
+    //     but its unit drops CAP_DAC_OVERRIDE
+    //     (`CapabilityBoundingSet=cap_net_bind_service cap_net_admin`), so root
+    //     does *not* bypass the mode bits: `open(O_WRONLY|O_TRUNC)` on it
+    //     returns EACCES and every redeploy of a File-secret workload fails
+    //     once. Unlinking needs write permission on the *directory* — 0700 and
+    //     ours — not on the file, so it works without DAC override. Do not
+    //     "fix" this by widening the unit's bounding set.
+    //  2. It closes the truncate window `rerender_file_secrets` warns about: a
+    //     running container's read-only bind pins the old inode, so removing
+    //     the directory entry leaves that container serving the old bytes
+    //     intact until its mount is replaced, instead of briefly showing it an
+    //     empty or half-written file.
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io_err("removing", path)(e)),
+    }
 
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    // `create_new` (O_EXCL): the unlink above means nothing should be here. If
+    // something is, another writer is racing us into this dir and failing beats
+    // clobbering it.
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(mode);
     }
-    let mut f = opts.open(path).map_err(io_err)?;
-    f.write_all(content).map_err(io_err)?;
-    // O_CREAT|O_TRUNC keeps a pre-existing file's old perms; force `mode`.
+    let mut f = opts.open(path).map_err(io_err("writing", path))?;
+    f.write_all(content).map_err(io_err("writing", path))?;
+    // O_CREAT applies `mode` modulo the process umask; force it exactly. The
+    // write above already succeeded — permissions are checked at open, not per
+    // write — so tightening to 0400 here cannot fail the content.
     set_mode(path, mode);
     Ok(())
+}
+
+/// Build a [`SecretError::Io`] constructor tagged with the operation that
+/// failed (R848). The variant's message names `op`, so a permission error
+/// writing a secret file no longer renders as a failed *read* and no longer
+/// sends the reader to the resolver and the cluster KEK.
+fn io_err<'a>(op: &'static str, path: &'a Path) -> impl Fn(std::io::Error) -> SecretError + 'a {
+    move |source| SecretError::Io {
+        op,
+        path: path.to_path_buf(),
+        source,
+    }
 }
 
 /// Best-effort chmod. Perms are defence-in-depth (the file already lives in an
@@ -557,5 +619,139 @@ mod tests {
         );
         assert_eq!(host_file_name(Path::new("/..")), "secret");
         assert!(!host_file_name(Path::new("/a/../b")).contains('/'));
+    }
+
+    /// R848 — a redeploy must not need write permission on the 0400 file the
+    /// previous deploy left behind.
+    ///
+    /// Asserting only "the second call returns Ok" would be worthless here: a
+    /// test process that holds CAP_DAC_OVERRIDE (root in CI) passes the old
+    /// reopen-and-truncate code too. So assert the *mechanism* instead — the
+    /// second materialization must land on a **different inode**, which is only
+    /// true if the writer unlinked and re-created rather than reopening. That
+    /// holds regardless of the runner's uid or capabilities, and it is exactly
+    /// the property that made the production open(O_WRONLY|O_TRUNC) EACCES
+    /// impossible to hit.
+    #[test]
+    fn redeploy_replaces_the_secret_file_instead_of_reopening_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mount = || {
+            file_mount(
+                SecretRef::Cluster {
+                    name: "tls/yah.dev".into(),
+                },
+                "/run/secrets/tls.crt",
+                0o400,
+            )
+        };
+
+        let first = FakeResolver::new().cluster("tls/yah.dev", b"OLD-PEM");
+        let mut spec = spec_with_secrets(vec![mount()]);
+        materialize_file_secrets(&mut spec, "ingress", &first, tmp.path()).unwrap();
+
+        let host_path = tmp
+            .path()
+            .join("ingress")
+            .join(host_file_name(Path::new("/run/secrets/tls.crt")));
+        assert_eq!(std::fs::read(&host_path).unwrap(), b"OLD-PEM");
+
+        #[cfg(unix)]
+        let old_ino = {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let md = std::fs::metadata(&host_path).unwrap();
+            // The file the redeploy has to get past: owner-read-only, no write
+            // bit for anyone.
+            assert_eq!(md.permissions().mode() & 0o777, 0o400);
+            md.ino()
+        };
+
+        // Redeploy: same ident, same root, same 0400 target, rotated content.
+        let second = FakeResolver::new().cluster("tls/yah.dev", b"NEW-PEM");
+        let mut spec2 = spec_with_secrets(vec![mount()]);
+        let n = materialize_file_secrets(&mut spec2, "ingress", &second, tmp.path())
+            .expect("redeploy must materialize over an existing 0400 secret file");
+        assert_eq!(n, 1);
+        assert_eq!(std::fs::read(&host_path).unwrap(), b"NEW-PEM");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let md = std::fs::metadata(&host_path).unwrap();
+            assert_ne!(
+                md.ino(),
+                old_ino,
+                "redeploy must unlink and re-create (new inode), not reopen the \
+                 unwritable old file — a reopen is the EACCES this ticket fixes, \
+                 and it also lets a running container's bind see a truncated file"
+            );
+            assert_eq!(
+                md.permissions().mode() & 0o777,
+                0o400,
+                "the replacement is still owner-read-only"
+            );
+        }
+    }
+
+    /// R848 — a failure while *writing* must not render as a failure while
+    /// reading. The 422 body is the operator's only signal, and the old text
+    /// ("I/O error reading …") sent them to the resolver and the cluster KEK.
+    #[test]
+    fn a_write_side_io_failure_does_not_claim_it_was_reading() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Occupy the host path with a directory: every write-side syscall
+        // (unlink, then O_CREAT|O_EXCL) fails on it, on any platform.
+        let host_path = tmp
+            .path()
+            .join("ingress")
+            .join(host_file_name(Path::new("/run/secrets/tls.crt")));
+        std::fs::create_dir_all(&host_path).unwrap();
+
+        let resolver = FakeResolver::new().cluster("tls/yah.dev", b"PEM");
+        let mut spec = spec_with_secrets(vec![file_mount(
+            SecretRef::Cluster {
+                name: "tls/yah.dev".into(),
+            },
+            "/run/secrets/tls.crt",
+            0o400,
+        )]);
+        let err = materialize_file_secrets(&mut spec, "ingress", &resolver, tmp.path())
+            .expect_err("writing onto a directory must fail");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("reading"),
+            "write-path error must not say 'reading': {msg}"
+        );
+        assert!(
+            msg.contains("removing") || msg.contains("writing"),
+            "write-path error must name the write operation: {msg}"
+        );
+        // Fails closed: the spec is untouched, so admission rejects the deploy.
+        assert_eq!(spec.secrets.len(), 1);
+        assert!(spec.volumes.is_empty());
+    }
+
+    /// R848 — the deploy handler needs this to tell a first deploy from a
+    /// redeploy, so it only reaps a secret dir it created.
+    #[test]
+    fn secret_dir_exists_tracks_materialization() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert!(!secret_dir_exists(tmp.path(), "ingress"));
+
+        let resolver = FakeResolver::new().cluster("tls/yah.dev", b"PEM");
+        let mut spec = spec_with_secrets(vec![file_mount(
+            SecretRef::Cluster {
+                name: "tls/yah.dev".into(),
+            },
+            "/run/secrets/tls.crt",
+            0o400,
+        )]);
+        materialize_file_secrets(&mut spec, "ingress", &resolver, tmp.path()).unwrap();
+        assert!(secret_dir_exists(tmp.path(), "ingress"));
+        // Sanitized the same way the dir was created, so a hostile ident can't
+        // make this disagree with materialize_file_secrets.
+        assert!(!secret_dir_exists(tmp.path(), "../ingress"));
+
+        teardown_secret_dir(tmp.path(), "ingress");
+        assert!(!secret_dir_exists(tmp.path(), "ingress"));
     }
 }

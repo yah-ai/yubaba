@@ -223,7 +223,7 @@ fn mesh_only_spec(name: &str) -> WorkloadSpec {
         expose: ExposeSpec {
             mesh: MeshExpose {
                 identity: MeshIdent(name.to_string()),
-                ports: vec![8080],
+                ports: MeshExpose::anonymous_ports([8080]),
                 allow_from: vec![],
             },
             public: None,

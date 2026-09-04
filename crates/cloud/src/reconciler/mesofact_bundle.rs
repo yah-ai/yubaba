@@ -148,6 +148,12 @@ const ALLOWED_SLOT_KEYS: &[&str] = &[
     // table. `machines`, `port` and `zone` are shared with the list above.
     "machine",
     "upstream_host",
+    // R844-F5 split participation from the port value, but only taught the
+    // planner about it — so a bundle slot spelling the portless shape it
+    // introduced (`fronted = true`, no `port`) was rejected here as an unknown
+    // key, and the deletion that ticket exists to enable would have failed the
+    // apply. Found and fixed from R844-F8.
+    "fronted",
 ];
 
 /// True when this mirror opts its mesofact components into the W272 bundle
@@ -1123,12 +1129,23 @@ fn parse_revalidate_slot(
 ///    prefer while a bundle binds loopback (F10: one bundle per node, passway
 ///    co-located), because *which* nodes serve is then an operator decision
 ///    rather than a scheduler outcome.
-/// 2. `required = { regions = […], mesh_tags = […] }` — F16 placement, same
-///    grammar [`super::mesofact_runner::resolve_runner_machine`] uses. Resolves
-///    to exactly one machine.
+/// 2. `required = { regions = […], mesh_tags = […], replicas = N }` — F16
+///    placement. Resolves to the first `N` machines the constraint matches
+///    (`replicas` absent = one, the only shape on disk before R844-F8).
 ///
 /// An undeclared / unresolvable placement is an error, not an empty deploy —
 /// silently publishing a bundle nobody serves is the failure mode this avoids.
+/// So is a *short* one: `replicas = 2` matching a single machine fails here
+/// rather than deploying one copy, because the front door would then publish a
+/// hostname whose backend set is quietly half of what the mirror declared.
+///
+/// **R844-F8: the constraint arm shares its selector with the ingress
+/// planner's.** [`CloudConfig::resolve_machines`] and
+/// [`super::ingress::resolve_ingress_placements`] both bottom out in the same
+/// N-selecting `select_matching` over the same `cfg.machines` slice, so the
+/// deployer and the discovery fanout cannot pick different subsets of a
+/// scale-N placement. The `machines = [...]` arm above needs no such
+/// guarantee — the planner reads that literal list off the slot directly.
 pub fn resolve_bundle_machines<'a>(
     cfg: &'a CloudConfig,
     mirror: &MirrorConfig,
@@ -1164,14 +1181,14 @@ pub fn resolve_bundle_machines<'a>(
             )
         })?;
 
-    let machine = cfg.resolve_machine(&required).with_context(|| {
+    cfg.resolve_machines(&required).with_context(|| {
         format!(
-            "F16 placement: no machine satisfies providers.{SLOT_ROLE}.required ({}) — check \
-             .yah/services/{service}/mirrors/{env}.toml against .yah/infra/machines/*.toml",
+            "F16 placement: cannot place providers.{SLOT_ROLE}.required ({}) onto {} machine(s) \
+             — check .yah/services/{service}/mirrors/{env}.toml against .yah/infra/machines/*.toml",
             required.describe(),
+            required.replica_count(),
         )
-    })?;
-    Ok(vec![machine])
+    })
 }
 
 /// Desktop-side (offline) half of the bundle tier: validate the mirror's
@@ -1782,6 +1799,24 @@ regions = ["us-east"]"#,
             "e",
         )
         .unwrap();
+
+        // …and R844-F5's portless shape: `fronted = true` with no `port`. This
+        // is the same union rule one ticket later — the key is read only by
+        // `plan_ingress`, but it is declared on THIS table, so rejecting it here
+        // would have made the pin deletion R844-F5 exists to enable fail the
+        // apply rather than land as a no-op.
+        let portless = BundleSlot::parse(
+            &mirror_with(
+                r#"use = "cloudflare"
+bucket = "yah-dev"
+zone = "yah.dev"
+fronted = true"#,
+            ),
+            "s",
+            "e",
+        )
+        .unwrap();
+        assert_eq!(portless.port, None);
     }
 
     /// R556-T12: `[providers.bundle.env]` parses into source URIs, kept
@@ -2026,6 +2061,80 @@ required = { regions = ["us-east"] }"#,
         let resolved = resolve_bundle_machines(&cfg, &mirror, &slot, "s", "e").unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "us-east-001");
+    }
+
+    /// R844-F8: a constraint with `replicas = N` places N machines, and the
+    /// ingress planner's resolver picks the SAME N.
+    ///
+    /// The set-for-set half is the assertion that matters. Both sides returning
+    /// two while disagreeing about *which* two aims the discovery fanout at a
+    /// node the bundle was never deployed to, and the front door then renders a
+    /// subset of the backends with every line in the mirror still reading
+    /// correctly. They agree here because they are one selector over one
+    /// candidate slice, not two implementations that happen to match.
+    #[test]
+    fn a_replica_count_places_n_machines_and_the_ingress_planner_picks_the_same_n() {
+        let mirror = mirror_with(
+            r#"use = "cloudflare"
+bucket = "b"
+zone = "scaled.yah.dev"
+port = 8080
+required = { regions = ["us-east"], replicas = 2 }"#,
+        );
+        let slot = BundleSlot::parse(&mirror, "s", "e").unwrap();
+        let cfg = cfg_with(vec![
+            machine("us-east-001", "us-east"),
+            machine("us-east-002", "us-east"),
+            machine("us-east-003", "us-east"),
+            machine("us-south-001", "us-south"),
+        ]);
+
+        let deployed: Vec<&str> = resolve_bundle_machines(&cfg, &mirror, &slot, "s", "e")
+            .unwrap()
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(
+            deployed,
+            vec!["us-east-001", "us-east-002"],
+            "two asked for, two placed — NOT the three the constraint matches, or \
+             adding a box to the fleet would scale a production front door"
+        );
+
+        let planned = super::super::ingress::resolve_ingress_placements(&cfg.machines, &mirror)
+            .unwrap()
+            .remove("bundle")
+            .expect("the constraint slot resolves for the planner too");
+        assert_eq!(planned, deployed, "set for set, not merely in count");
+    }
+
+    /// Never a partial placement. One of two reported as success is the
+    /// failure that looks like it worked.
+    #[test]
+    fn fewer_matches_than_replicas_fails_the_deploy_resolver() {
+        let mirror = mirror_with(
+            r#"use = "cloudflare"
+bucket = "b"
+required = { regions = ["us-east"], replicas = 2 }"#,
+        );
+        let slot = BundleSlot::parse(&mirror, "s", "e").unwrap();
+        let cfg = cfg_with(vec![
+            machine("us-east-001", "us-east"),
+            machine("us-south-001", "us-south"),
+        ]);
+        // `{:#}` — the shortfall is the *source* of the placement failure, and
+        // the outer context only names the constraint and the count wanted.
+        let err = format!(
+            "{:#}",
+            resolve_bundle_machines(&cfg, &mirror, &slot, "s", "e").unwrap_err()
+        );
+        assert!(err.contains("onto 2 machine(s)"), "{err}");
+        assert!(err.contains("only 1 of 2"), "{err}");
+        assert!(err.contains("required.regions=[us-east]"), "{err}");
+        assert!(
+            err.contains("us-south-001"),
+            "names the pool it searched: {err}"
+        );
     }
 
     /// Publishing a bundle no node serves is the silent failure this guards.

@@ -2,7 +2,12 @@
 // Runs the Worker script under miniflare v3 (workerd subprocess).
 // Spawned by yah's local_sim reconciler; config via environment variables:
 //
-//   MF_PORT             — listen port (default: 4322)
+//   PORT                — listen port (default: 4322). One spelling across
+//                         every yah supervisor (R844-T13); an alias for the
+//                         port named `http`, also published as PORT_HTTP.
+//                         MF_PORT is the retired spelling, still READ so a
+//                         container image baked before the contract keeps
+//                         binding the right port — nothing produces it.
 //   MF_HOST             — bind address (default: 127.0.0.1; set 0.0.0.0 when
 //                         running inside a container so the published port
 //                         is reachable from the host)
@@ -21,7 +26,7 @@
 
 import { readFileSync } from 'fs';
 
-const port = parseInt(process.env.MF_PORT ?? '4322', 10);
+const port = parseInt(process.env.PORT ?? process.env.MF_PORT ?? '4322', 10);
 const host = process.env.MF_HOST ?? '127.0.0.1';
 const scriptPath = process.env.MF_SCRIPT;
 const assetOrigin = process.env.ASSET_ORIGIN ?? '';

@@ -27,10 +27,10 @@ path = "src/main.rs"
 # turso-backup is `publish = false` and owns no such name, so there is nothing
 # to patch. Same relative-path shape as yubaba's own `mshr` dep. Verified
 # 2026-08-10 against oss/turso-backup/Cargo.toml.
-turso-backup = { path = "../../../turso-backup", version = "0.8.30" }
+turso-backup = { path = "../../../turso-backup", version = "0.8.32" }
 # TenantId only — the one tenant identifier in the system (R732-F1 deliberately
 # minted no second one).
-workload-spec = { package = "yah-workload-spec", version = "0.8.30" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.32" }
 
 anyhow = "1.0"
 async-trait = "0.1"

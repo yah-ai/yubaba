@@ -65,11 +65,20 @@ const WARDEN_WARM_BUDGET: Duration = Duration::from_secs(3);
 /// Absolute deadline for waiting on yubaba HTTP during the spike measurement.
 const WARDEN_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// R844-B7: this was `.ancestors().nth(3)`, which since the OSS split resolves
+/// to `<camp>/oss/` — a directory with no `.yah/` at all. `CloudConfig::load`
+/// used to answer that with an empty config rather than an error, so the test
+/// died one line later on a missing service instead of naming the wrong root,
+/// and every `.yah/`-derived assertion below it was measuring nothing. The
+/// sibling `yubaba/tests/pond_reconciler_smoke.rs:51` already carries this
+/// exact fix and its comment records the same `nth(3)` → `oss/` slip; this is
+/// the copy that never got it. Walking ancestors is depth-agnostic, so an
+/// OSS-layout move can't silently re-arm it.
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
-        .nth(3)
-        .expect("workspace root three dirs above CARGO_MANIFEST_DIR")
+        .find(|dir| dir.join(".yah/services").is_dir())
+        .expect("camp root with .yah/services above CARGO_MANIFEST_DIR")
         .to_path_buf()
 }
 
@@ -124,13 +133,16 @@ async fn pond_spinup_budget() {
     let cloud = CloudConfig::load(&workspace).expect("CloudConfig::load");
     let svc_with_mirrors = cloud
         .services
-        .get("dev-yah")
-        .expect("dev-yah service in .yah/services/dev-yah/service.toml");
+        // R347-T1 renamed dev-yah → yah-marketing. This lookup kept the old
+        // name because the wrong root above meant it never resolved anything
+        // either way (R844-B7).
+        .get("yah-marketing")
+        .expect("yah-marketing service in .yah/services/yah-marketing/service.toml");
     let service = &svc_with_mirrors.service;
     let mirror = svc_with_mirrors
         .mirrors
         .get("pond")
-        .expect("pond mirror in .yah/services/dev-yah/mirrors/pond.toml");
+        .expect("pond mirror in .yah/services/yah-marketing/mirrors/pond.toml");
 
     // Verify the mirror declares the expected miniflare-container slot.
     match mirror.providers.get("static") {

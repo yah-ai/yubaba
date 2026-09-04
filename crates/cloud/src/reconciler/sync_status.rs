@@ -694,6 +694,7 @@ mod tests {
                 ("cloud".to_string(), cloudflare_mirror()),
             ]),
             component_transform_recipes: BTreeMap::new(),
+            passway_machines: BTreeMap::new(),
         };
 
         let mut obs = BTreeMap::new();
