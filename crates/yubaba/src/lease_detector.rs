@@ -92,6 +92,25 @@ impl LeaseFailureDetector {
         self.renewals.lock().unwrap().insert(node, Instant::now());
     }
 
+    /// How long since `node` last renewed, or `None` if it never has.
+    ///
+    /// The raw number behind [`observe`](FailureDetector::observe)'s judged
+    /// report, exposed for R858-T7's appliance fence. That decision is an
+    /// *inequality between two elapsed times* — how long a holder waits before
+    /// fencing itself against how long the cluster waits before replacing it —
+    /// and [`TransitionTracker`] collapses this channel to a boolean, which is
+    /// the right shape for placement and the wrong shape for that. See
+    /// [`owner_lease_expired`](crate::appliance_ownership::owner_lease_expired).
+    ///
+    /// `None` for a node never heard from is load-bearing and matches the
+    /// detector's own "an empty report never means every node is down" rule: a
+    /// leader elected moments ago has received nobody's first renewal yet, and a
+    /// caller reading that as death would expire every owner on every
+    /// leadership change.
+    pub fn silence(&self, node: YubabaNodeId) -> Option<Duration> {
+        self.renewals.lock().unwrap().get(&node).map(|at| at.elapsed())
+    }
+
     fn snapshot(&self) -> LivenessReport {
         self.renewals
             .lock()

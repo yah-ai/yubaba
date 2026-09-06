@@ -132,6 +132,27 @@ struct CfDnsRecord {
     content: String,
 }
 
+/// One live DNS record with everything a reconciler needs to decide what to
+/// change — R859-F1, the read side of [`CloudflareClient::list_dns_records`].
+///
+/// Distinct from the private [`CfDnsRecord`] above, which deliberately reads
+/// only name + content because tunnel-drift detection asks a narrower
+/// question. Reconciling a record set needs the `id` (to delete one member of
+/// a multi-valued RRset) and `proxied` (an orange-clouded record at an apex
+/// that should be grey is drift, even when the content is right).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DnsRecordDetail {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub record_type: String,
+    pub content: String,
+    #[serde(default)]
+    pub ttl: u32,
+    #[serde(default)]
+    pub proxied: bool,
+}
+
 // ---------- public output types ----------
 
 /// A Cloudflare account the API token can access.
@@ -1043,7 +1064,44 @@ impl CloudflareClient {
         ttl: u32,
         proxied: bool,
     ) -> Result<String> {
-        let existing_id = self.find_dns_record(zone_id, name, record_type).await?;
+        self.upsert_dns_record_matching(zone_id, name, record_type, content, ttl, proxied, false)
+            .await
+    }
+
+    /// [`upsert_dns_record`](Self::upsert_dns_record) with control over what
+    /// counts as "the existing record" — R859-F1.
+    ///
+    /// `match_content = false` reproduces the original behaviour: the first
+    /// record sharing `name` + `record_type` is updated in place. That is right
+    /// for a single-valued name (one CNAME at `cdn.yah.dev`) and **wrong for a
+    /// multi-valued RRset**: adding the second A record of a round-robin apex
+    /// would rewrite the first one's content, silently halving the origin set
+    /// to one box.
+    ///
+    /// `match_content = true` keys the lookup on `(name, type, content)`, so
+    /// the call means "ensure exactly this record exists" — a no-op update when
+    /// it already does, a create when it does not, and never a mutation of a
+    /// sibling record at the same name.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_dns_record_matching(
+        &self,
+        zone_id: &str,
+        name: &str,
+        record_type: &str,
+        content: &str,
+        ttl: u32,
+        proxied: bool,
+        match_content: bool,
+    ) -> Result<String> {
+        let existing_id = if match_content {
+            self.list_dns_records(zone_id, Some(name), Some(record_type))
+                .await?
+                .into_iter()
+                .find(|r| r.content == content)
+                .map(|r| r.id)
+        } else {
+            self.find_dns_record(zone_id, name, record_type).await?
+        };
 
         #[derive(Serialize)]
         struct RecordBody<'a> {
@@ -1086,6 +1144,33 @@ impl CloudflareClient {
         }
     }
 
+    /// Read the DNS records in `zone_id`, optionally narrowed to one `name`
+    /// and/or one `record_type` — R859-F1, the read half the `dns.*` catalog
+    /// was missing.
+    ///
+    /// Unlike [`dns_records_named`](Self::dns_records_named) (drift-detection
+    /// only, name + content) this returns the record **id**, type, ttl and
+    /// proxy flag, which is what a reconciler needs to decide what to change.
+    ///
+    /// Requires: `DNS: Read` (zone-scoped).
+    pub async fn list_dns_records(
+        &self,
+        zone_id: &str,
+        name: Option<&str>,
+        record_type: Option<&str>,
+    ) -> Result<Vec<DnsRecordDetail>> {
+        let mut query = format!("/zones/{zone_id}/dns_records?per_page=100");
+        if let Some(n) = name {
+            query.push_str(&format!("&name={n}"));
+        }
+        if let Some(t) = record_type {
+            query.push_str(&format!("&type={t}"));
+        }
+        let resp: CfPage<DnsRecordDetail> = self.cf_get(&query).await?;
+        self.ok(&resp.success, &resp.errors)?;
+        Ok(resp.result.unwrap_or_default())
+    }
+
     /// Delete all DNS records in `zone_id` whose name matches `name` (and
     /// optionally `record_type`). Returns the count of records deleted.
     /// A count of 0 is not an error — the records may already have been absent.
@@ -1097,22 +1182,31 @@ impl CloudflareClient {
         name: &str,
         record_type: Option<&str>,
     ) -> Result<u32> {
-        #[derive(Deserialize)]
-        struct RecordEntry {
-            id: String,
-        }
-        let query = match record_type {
-            Some(t) => {
-                format!("/zones/{zone_id}/dns_records?name={name}&type={t}")
-            }
-            None => format!("/zones/{zone_id}/dns_records?name={name}"),
-        };
-        let resp: CfPage<RecordEntry> = self.cf_get(&query).await?;
-        self.ok(&resp.success, &resp.errors)?;
-        let ids: Vec<String> = resp
-            .result
-            .unwrap_or_default()
+        self.delete_dns_records_matching(zone_id, name, record_type, None)
+            .await
+    }
+
+    /// [`delete_dns_records`](Self::delete_dns_records) narrowed to records
+    /// carrying one exact value — R859-F1.
+    ///
+    /// A round-robin apex holds several A records under one name, so
+    /// "delete the A records at `yah.dev`" is not a way to withdraw *one*
+    /// origin: it takes the live ones with it. `content = Some(ip)` deletes
+    /// only the withdrawn member.
+    ///
+    /// Requires: `DNS: Edit` (zone-scoped).
+    pub async fn delete_dns_records_matching(
+        &self,
+        zone_id: &str,
+        name: &str,
+        record_type: Option<&str>,
+        content: Option<&str>,
+    ) -> Result<u32> {
+        let ids: Vec<String> = self
+            .list_dns_records(zone_id, Some(name), record_type)
+            .await?
             .into_iter()
+            .filter(|r| content.is_none_or(|c| r.content == c))
             .map(|r| r.id)
             .collect();
         let mut deleted = 0u32;

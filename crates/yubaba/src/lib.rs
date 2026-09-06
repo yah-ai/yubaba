@@ -393,10 +393,17 @@
 //! @yah:gotcha("YOUR 15s REAP BOUND IS NOW LOAD-BEARING ON A CLIENT TIMEOUT (from R848-B1, Ashguard:vortex). Making destroy WAIT for the containerd task to reach STOPPED before deleting the record means POST /workloads/{ident}/destroy is no longer a control-plane decision, and cloud-client's destroy_workload was still inheriting DEFAULT_TIMEOUT = 5s. A destroy that actually used its reap budget would therefore fail client-side while the server was doing the right thing. Fixed in R848-B1: new DESTROY_TIMEOUT = 60s at crates/yah/cloud-client/src/lib.rs, applied per-request the same way DEPLOY_TIMEOUT is. If the 15s bound in kamaji's reap_task ever moves, re-check that 60s. The failure mode is silent and asymmetric - too short and `yah cloud workload rolling` (destroy-then-deploy per machine, R848-B1) reports a teardown failure for a teardown that succeeded, skips its re-deploy, and leaves the workload DOWN. The other caller with the same exposure was Remote-QED's MeshWardenClient reaping forge containers; it is covered by the same change.")
 
 pub mod acme_issuer;
+/// R858-T3: who owns the pinned-singleton appliance, elected from an
+/// eligibility set instead of aliased to raft leadership.
+pub mod appliance_ownership;
 /// Per-domain TLS material in an object store instead of raft (R779 / W267) —
 /// the store W267's free-tier ingress needs at 10k domains, where one
 /// `PutSecret` per cert would rewrite the whole raft state on every node.
 pub mod cert_store;
+/// Deliver the fleet-shared cert to a passway that **systemd** supervises
+/// (R600-F10) — the edge [`secret_reload`] cannot reach, because it walks the
+/// deployed-workload registry and the live yah.dev doors are not workloads.
+pub mod cert_materialize;
 /// Publish `passway-demux`'s route table from the [`cert_store`] enrollment set
 /// (R779 / W267) — the allowlist that keeps an SNI flood from reaching any
 /// passway, made structural.
@@ -455,6 +462,9 @@ pub mod lease_renewal;
 /// as an ordinary pinned singleton so kamaji, not systemd, supervises it
 /// (R591-F1).
 pub mod headscale_appliance;
+/// Headscale's on-disk state dir: the single writer for `headscale_dir`, and
+/// the pre-start materialization of the coordinator's noise identity (R858-T2).
+pub mod headscale_state;
 pub mod identity;
 pub mod leader;
 /// Soft-prefer an anchor region for raft leadership, without ever blocking a
@@ -467,6 +477,10 @@ pub mod member_registration;
 pub mod mesh;
 pub mod node;
 pub mod pond;
+/// Live quorum health (R859-F2): `yubaba-failover.md`'s "do not fail over out
+/// of a degraded quorum" pre-check, as a pure function over the voter set and
+/// one detector's report.
+pub mod quorum_health;
 pub mod raft;
 pub mod rollout;
 pub mod runtime;
@@ -553,10 +567,45 @@ pub const DEFAULT_HEADSCALE_DIR: &str = "/var/lib/yah-cloud/headscale";
 /// Pinned Headscale release used by the self-bootstrap path when the request
 /// omits an explicit version. Kept in lockstep with `cloud::mesh::HEADSCALE_VERSION`.
 pub const DEFAULT_HEADSCALE_VERSION: &str = "0.23.0";
+/// `policy.mode` emitted by both headscale config renderers below (R861-T2).
+///
+/// `database` keeps the ACL policy inside `headscale.db`, which litestream
+/// replicates, rather than in an `acls.yaml` that nothing replicates — and it
+/// is the only mode in which headscale accepts `PUT /api/v1/policy`, so it is
+/// what makes a declared policy pushable instead of merely readable. Verified
+/// against the pinned v0.23.0 source: the value must be exactly `"file"` or
+/// `"database"` or headscale `log.Fatal`s at startup.
+///
+/// Kept in lockstep with `cloud::mesh::POLICY_MODE` the same way
+/// [`DEFAULT_HEADSCALE_VERSION`] is — there is no dependency edge from this
+/// crate to `yah-cloud`.
+pub const HEADSCALE_POLICY_MODE: &str = "database";
 /// Permissive default ACL — all nodes may reach all nodes. Headscale's
 /// file-policy loader parses HuJSON (JSON-with-comments), NOT YAML, so this
 /// must stay JSON (a leading `---` fails with "invalid literal: ---").
 pub const DEFAULT_ACL_POLICY_HUJSON: &str = "{\n  \"acls\": [\n    { \"action\": \"accept\", \"src\": [\"*\"], \"dst\": [\"*:*\"] }\n  ]\n}\n";
+
+/// Whether a `HeadscaleDeployRequest::acl_policy` carries nothing a
+/// database-mode coordinator would lose (R861-T2).
+///
+/// True for an empty field and for [`DEFAULT_ACL_POLICY_HUJSON`] in any
+/// formatting; false for anything else, which the deploy handler refuses.
+///
+/// The comparison is deliberately coarse — all whitespace is dropped and the
+/// remainder compared to the same constant treated the same way. It is not a
+/// HuJSON parser and does not try to be: this crate has none, and the only
+/// question being asked is "is this byte-for-byte the permissive default we
+/// already know we can drop?". Whitespace inside a JSON string literal would be
+/// mangled by the strip, but that can only turn a match into a mismatch, and a
+/// mismatch is the *safe* answer here (refuse the transplant) rather than the
+/// dangerous one.
+pub fn carried_policy_is_permissive_default(carried: &str) -> bool {
+    fn squeeze(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+    let carried = squeeze(carried);
+    carried.is_empty() || carried == squeeze(DEFAULT_ACL_POLICY_HUJSON)
+}
 /// Default directory for compose.yml + Caddyfile (R040-F7).
 pub const DEFAULT_COMPOSE_DIR: &str = "/etc/yah-cloud";
 /// Systemd unit name for the Podman Compose service stack.
@@ -881,6 +930,22 @@ pub struct ServerState {
     /// - `deploy_workload_spec` rejects a second deploy of the same ident when
     ///   the existing entry is `Appliance` (single live instance invariant).
     pub archetype_registry: Mutex<HashMap<String, LifecycleArchetype>>,
+
+    /// R860-T6 (W338): what each live workload's *requirement edges* committed
+    /// this node to — the `supply = "self"` providers it stood up, and the
+    /// placement group it belongs to. Keyed on mesh ident, with exactly the
+    /// lifecycle of [`Self::archetype_registry`]: written by the deploy handler
+    /// on success, removed by destroy.
+    ///
+    /// This is the rail R860-T4 said was missing. Placement computes a group
+    /// camp-side (`cloud::config::placement_group`), but the node knew only
+    /// per-workload archetypes — so `drain_workloads` skipped an Appliance and
+    /// then happily drained the Server a `local` edge binds to it, and destroy
+    /// left a self-supplied sidecar running with nothing left to serve. Both
+    /// now read this map; see [`crate::deploy::self_supply`], which also
+    /// explains why the node computes its own group view rather than calling
+    /// cloud's (yubaba has no runtime dependency on cloud, by design).
+    pub requirement_graph: Mutex<HashMap<String, crate::deploy::self_supply::DeployedRequirements>>,
 
     /// Requested `resources` of each live workload, keyed on mesh ident.
     ///
@@ -1222,6 +1287,7 @@ impl ServerState {
             cheers_client: None,
             ownership_rows: Mutex::new(HashMap::new()),
             archetype_registry: Mutex::new(HashMap::new()),
+            requirement_graph: Mutex::new(HashMap::new()),
             workload_resources: Default::default(),
             node_probe: node::NodeProbe::new(),
             node_enrollment: Mutex::new(None),
@@ -2625,12 +2691,18 @@ async fn register_hostkey(
 ///
 /// Returns **200** only when both conditions hold:
 ///   - This yubaba node is the current raft leader.
-///   - The Headscale API is reachable on localhost:8080.
+///   - Headscale is running on this node, per [`headscale_liveness`].
 ///
 /// Returns **503** in all other cases (follower, raft not configured, headscale
 /// stopped).  Cloudflare will route Headscale HTTPS traffic only to nodes that
 /// return 200, so leader changes flip ingress automatically within the CF LB
 /// health-check cadence (~10 s).
+///
+/// R858-B11: this used to call `probe_headscale_local` **alone** — no supervisor
+/// query and not even the systemd fallback `/headscale/health` had. So on a
+/// coordinator running the appliance the way yubaba deploys it, this endpoint
+/// answered 503 unconditionally: not merely a wrong dashboard field, but the
+/// signal an external load balancer uses to decide the leader is not serving.
 ///
 /// When raft is not configured (`--raft-node-id` not passed to `serve`), this
 /// endpoint returns 503 so that single-node Phase 1b deployments don't
@@ -2651,7 +2723,7 @@ async fn mesh_leader_health(State(s): State<Arc<ServerState>>) -> impl IntoRespo
         _ => false,
     };
 
-    let headscale_running = probe_headscale_local().await;
+    let headscale_running = headscale_liveness(&s).await.running();
 
     let body = LeaderHealthBody {
         leader: is_leader,
@@ -3086,6 +3158,28 @@ async fn drain_workloads(State(s): State<Arc<ServerState>>) -> impl IntoResponse
                 );
                 continue;
             }
+            // R860-T6 (W338 §"Placement consequences" 2), the gap R860-T4
+            // inherited to this ticket: the check above is PER-WORKLOAD, so a
+            // Server bound to an Appliance by a `local` edge was drained alone —
+            // which breaks the group the same way placing it alone would. A
+            // group moves together or not at all. The predicate is
+            // `workload_spec::group_is_drainable`, the single implementation
+            // `cloud::config::group_is_drainable` also delegates to: placement
+            // and drain disagreeing about drainability is precisely the drift
+            // the requirement graph was plumbed to the node to close.
+            let blocking = {
+                let graph = s.requirement_graph.lock().unwrap();
+                crate::deploy::self_supply::group_blocking_drain(&graph, ident_key)
+            };
+            if let Some(requirer) = blocking {
+                tracing::info!(
+                    id = entry.id.as_str(),
+                    ident = ident_key,
+                    requirer = %requirer,
+                    "drain: skipping a member of a non-drainable placement group (W338)"
+                );
+                continue;
+            }
             match client.drain(&entry.id, budget).await {
                 Ok((true, _)) => drained.push(entry.id.as_str().to_string()),
                 Ok((false, reason)) => failed.push(serde_json::json!({
@@ -3362,6 +3456,88 @@ async fn deploy_non_container(
     }
 }
 
+/// Type-erased re-entry into [`deploy_workload_spec`] — R860-T6.
+///
+/// A `supply = "self"` provider is deployed by the deploy handler calling
+/// itself, and an `async fn` cannot name its own future's type. Erasing to
+/// `dyn Future` here breaks that cycle; the recursion is bounded at one level by
+/// `validate::shape`, which forbids a `provides` spec from self-provisioning.
+fn deploy_workload_spec_boxed(
+    s: Arc<ServerState>,
+    body: WorkloadDeployBody,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = axum::response::Response> + Send>> {
+    Box::pin(deploy_workload_spec(State(s), Json(body)))
+}
+
+/// Type-erased re-entry into [`destroy_workload`] — R860-T6. Same reason as
+/// [`deploy_workload_spec_boxed`]: the teardown cascade destroys a workload's
+/// self-supplied providers by re-entering the destroy handler for each, so every
+/// provider gets the same cheers revoke, secret reap and registry clearing the
+/// requirer gets.
+fn destroy_workload_boxed(
+    s: Arc<ServerState>,
+    ident: String,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = axum::response::Response> + Send>> {
+    Box::pin(destroy_workload(State(s), axum::extract::Path(ident)))
+}
+
+/// Tear down the providers a requirer stood up before its own deploy failed
+/// (R860-T6).
+///
+/// A `self` provider exists only to serve its requirer, so a requirer that never
+/// started must not leave one running: that is the same ownership claim the
+/// teardown cascade makes, applied to a deploy that got partway. Best-effort and
+/// idempotent — destroy answers `not_found` for anything already gone.
+async fn rollback_self_supplied(s: &Arc<ServerState>, requirer: &str, provisioned: &[String]) {
+    for p_ident in provisioned.iter().rev() {
+        tracing::warn!(
+            ident = %requirer,
+            provider = %p_ident,
+            "requirer deploy failed after its provider was stood up; tearing the provider back down"
+        );
+        let _ = destroy_workload_boxed(Arc::clone(s), p_ident.clone()).await;
+    }
+}
+
+/// Roll back and refuse: the requirer could not stand one of its carried
+/// providers up, so it cannot run (R860-T6).
+///
+/// `FAILED_DEPENDENCY` for the same reason the R860-B3 gate uses it — an
+/// unsatisfiable requirement, named, rather than a generic 500 that makes the
+/// operator guess which half of the group failed.
+async fn self_supply_refusal(
+    s: &Arc<ServerState>,
+    ident: &str,
+    provider: &str,
+    secret_dir_is_new: bool,
+    provisioned: Vec<String>,
+    reason: String,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    rollback_self_supplied(s, ident, &provisioned).await;
+    if secret_dir_is_new {
+        crate::deploy::secret_mount::teardown_secret_dir(&s.secret_mount_root, ident);
+    }
+    tracing::warn!(
+        ident = %ident,
+        provider = %provider,
+        reason = %reason,
+        "deploy refused: a self-supplied provider could not be stood up"
+    );
+    (
+        StatusCode::FAILED_DEPENDENCY,
+        Json(serde_json::json!({
+            "status": "rejected",
+            "ident": ident,
+            "error": format!(
+                "self-supplied provider {provider:?} could not be deployed: {reason}"
+            ),
+        })),
+    )
+        .into_response()
+}
+
 async fn deploy_workload_spec(
     State(s): State<Arc<ServerState>>,
     Json(req): Json<WorkloadDeployBody>,
@@ -3562,6 +3738,14 @@ async fn deploy_workload_spec(
         // the per-ident state that guard exists to protect (W244 §Schema gaps
         // #1); the operator's own spec is what decides.
         let authored_archetype = spec.effective_archetype();
+        // R860-T6 (W338): the requirement edges as the OPERATOR declared them,
+        // sampled here for the same reason `authored_archetype` is. Secret
+        // materialization appends bind volumes, and `group_is_drainable` asks
+        // `effective_archetype()`, which infers `Appliance` from a non-empty
+        // `volumes` — reading the materialized spec would classify every
+        // secret-mounting group as non-drainable (the R854 trap, one layer up).
+        let carried_providers = crate::deploy::self_supply::self_supplied_providers(&spec);
+        let placement_group = crate::deploy::self_supply::local_group_members(&spec);
         // R854: does the secret dir belong to THIS request? Hoisted out of the
         // materialization block below because every failure path from here to
         // the backend's answer has to know it. `false` until proven otherwise,
@@ -3718,6 +3902,171 @@ async fn deploy_workload_spec(
             }
         }
 
+        // R860-T6 (W338 §"Design"): stand up every `supply = "self"` provider
+        // this spec carries, before the gate and before the requirer itself.
+        //
+        // Each provider goes through THIS SAME HANDLER, re-entered with its own
+        // spec. That is the load-bearing choice, not an implementation
+        // convenience: W338 §"Each member keeps its own mesh identity" requires
+        // a provider to be independently discoverable, and re-entry is what
+        // gives it its own admission check, its own secret materialization, its
+        // own archetype-registry entry and its own service record. A helper that
+        // shortcut to `rt.deploy_workload` would collapse the group under the
+        // requirer's identity and make the `anywhere` case unexpressible.
+        //
+        // Locality needs no branch here. The provider lands on whichever node
+        // received the requirer's deploy, which is what `local` demands and what
+        // `prefer-local` prefers; `anywhere` + `self` is satisfied by a local
+        // provider like any other. Camp-side, `elect_node` picks that node once
+        // for the whole group — see the R860-T4 note in cloud/src/config.rs.
+        //
+        // Recursion terminates: `validate::shape` (`check_requires`) forbids a
+        // `provides` spec from itself carrying a `self` requirement, so this is
+        // one level deep by construction.
+        let mut provisioned: Vec<String> = Vec::new();
+        for provider in &carried_providers {
+            let p_ident = provider.expose.mesh.identity.0.clone();
+            // Already standing on this node — a redeploy of the requirer must
+            // not try to stand its sidecars up a second time. For an Appliance
+            // provider the single-instance guard would refuse with 409 and take
+            // the requirer's redeploy down with it; for a Server it would be a
+            // pointless restart of a healthy provider mid-flight.
+            if s.archetype_registry.lock().unwrap().contains_key(&p_ident) {
+                tracing::info!(
+                    ident = %ident,
+                    provider = %p_ident,
+                    "self-supplied provider is already live on this node; not redeploying it"
+                );
+                continue;
+            }
+            let p_body = match serde_json::to_value(provider) {
+                Ok(spec_json) => WorkloadDeployBody {
+                    spec: spec_json,
+                    operator_signature: None,
+                    requesting_camp_id: req.requesting_camp_id.clone(),
+                    on_behalf_of_user: req.on_behalf_of_user.clone(),
+                    id: None,
+                },
+                Err(e) => {
+                    return self_supply_refusal(
+                        &s,
+                        &ident,
+                        &p_ident,
+                        secret_dir_is_new,
+                        provisioned,
+                        format!("serializing the carried provider spec: {e}"),
+                    )
+                    .await;
+                }
+            };
+            let resp = deploy_workload_spec_boxed(Arc::clone(&s), p_body).await;
+            if !resp.status().is_success() {
+                return self_supply_refusal(
+                    &s,
+                    &ident,
+                    &p_ident,
+                    secret_dir_is_new,
+                    provisioned,
+                    format!("provider deploy answered {}", resp.status()),
+                )
+                .await;
+            }
+            tracing::info!(
+                ident = %ident,
+                provider = %p_ident,
+                "self-supplied provider deployed ahead of its requirer"
+            );
+            provisioned.push(p_ident);
+        }
+
+        // R860-B3: the dependency gate and the `FromMesh` env resolver, at the
+        // last point before the workload starts.
+        //
+        // `deploy::mesh_resolve` had been written, tested and documented for
+        // three relays without a single production caller — `depends_on` was
+        // documented as enforced and enforced nothing, and an
+        // `EnvValue::FromMesh` reference was never rendered from real cluster
+        // state (kamaji refused the unresolved value outright, so such a
+        // workload simply could not deploy). Both are wired here.
+        //
+        // Placement is deliberate: AFTER secret materialization, so a spec that
+        // will be refused for a missing dependency has already been fully
+        // admitted and can be torn down by the same failure paths; and BEFORE
+        // `rt.deploy_workload`, because "block until the dependency appears"
+        // means nothing once the container is running.
+        //
+        // R860-T2: satisfaction is Ready-and-local-aware, not presence. The
+        // node's own mesh address is threaded in because that is the only thing
+        // a provider's record `mesh_ip` can be compared against to decide a
+        // `locality = "local"` requirement — there is no node identifier on
+        // this seam. `None` (yubaba on loopback / 0.0.0.0) makes a `local`
+        // requirement unsatisfiable, deliberately: see `requirement_satisfied`.
+        {
+            let mesh_state = crate::deploy::mesh_resolve::ServiceRecordMeshState::new(
+                &s.service_records,
+                s.node_mesh_ip(),
+            );
+            let deadline = crate::deploy::mesh_resolve::compute_dependency_deadline(
+                &spec,
+                &mesh_state,
+                crate::deploy::mesh_resolve::DEFAULT_DEPENDENCY_WAIT_PER_DEP,
+            );
+            let gate = crate::deploy::mesh_resolve::await_dependencies(
+                &spec,
+                &mesh_state,
+                deadline,
+                crate::deploy::mesh_resolve::DEFAULT_POLL_INTERVAL,
+            )
+            .await;
+            if let Err(e) = gate {
+                // R860-T6: the requirer will not run, so its carried providers
+                // have nothing left to serve.
+                rollback_self_supplied(&s, &ident, &provisioned).await;
+                if secret_dir_is_new {
+                    crate::deploy::secret_mount::teardown_secret_dir(&s.secret_mount_root, &ident);
+                }
+                tracing::warn!(
+                    ident = %ident,
+                    error = %e,
+                    "deploy refused: a declared dependency never appeared on the mesh"
+                );
+                return (
+                    StatusCode::FAILED_DEPENDENCY,
+                    Json(serde_json::json!({
+                        "status": "rejected",
+                        "ident": ident,
+                        "error": format!("dependency wait failed: {e}"),
+                    })),
+                )
+                    .into_response();
+            }
+
+            let resolver = crate::deploy::mesh_resolve::StateMeshResolver::new(&mesh_state);
+            let rendered = workload_spec::validate::resolve_env_from_mesh(&spec.env, &resolver);
+            match rendered {
+                Ok(env) => spec.env = env,
+                Err(e) => {
+                    // R860-T6: same reasoning as the gate arm above.
+                    rollback_self_supplied(&s, &ident, &provisioned).await;
+                    if secret_dir_is_new {
+                        crate::deploy::secret_mount::teardown_secret_dir(
+                            &s.secret_mount_root,
+                            &ident,
+                        );
+                    }
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(serde_json::json!({
+                            "status": "rejected",
+                            "ident": ident,
+                            "error": format!("mesh env resolution failed: {e}"),
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+
         match rt.deploy_workload(&spec, &mesh).await {
             Ok(result) => {
                 // Public ingress (R780): yubaba's own deploy handler has no
@@ -3787,6 +4136,10 @@ async fn deploy_workload_spec(
                                         // nobody's. Reaping is the correct
                                         // behaviour, not overreach.
                                         let _ = rt.teardown_workload(&mesh_ident).await;
+                                        // R860-T6: the requirer has just been
+                                        // torn down, so its carried providers
+                                        // go with it.
+                                        rollback_self_supplied(&s, &ident, &provisioned).await;
                                         crate::deploy::secret_mount::teardown_secret_dir(
                                             &s.secret_mount_root,
                                             &ident,
@@ -3891,6 +4244,22 @@ async fn deploy_workload_spec(
                     .lock()
                     .unwrap()
                     .insert(ident.clone(), authored_archetype);
+                // R860-T6: record this workload's requirement edges beside its
+                // archetype, same lifecycle. Destroy reads `self_supplied` to
+                // cascade along `self` edges; drain reads `group` to answer the
+                // set-valued drainability question a per-workload archetype
+                // cannot. Both were sampled pre-materialization — see
+                // `carried_providers`.
+                s.requirement_graph.lock().unwrap().insert(
+                    ident.clone(),
+                    crate::deploy::self_supply::DeployedRequirements {
+                        self_supplied: carried_providers
+                            .iter()
+                            .map(|p| p.expose.mesh.identity.0.clone())
+                            .collect(),
+                        group: placement_group,
+                    },
+                );
                 // Record what this workload asked for, so `GET /node/usage`
                 // can report committed capacity and `GET /workloads` can
                 // attach a per-workload request. Recorded here (post-success,
@@ -3937,6 +4306,9 @@ async fn deploy_workload_spec(
                 // runc message under "creating task for ..."), not just the
                 // top context — essential for diagnosing deploy failures.
                 tracing::error!(ident = %ident, error = format!("{e:#}"), "workload deploy failed");
+                // R860-T6: the requirer never started; its carried providers
+                // exist only to serve it.
+                rollback_self_supplied(&s, &ident, &provisioned).await;
                 // Reap any secret files materialized before the failed deploy so
                 // decrypted PEM doesn't linger for a workload that never started.
                 //
@@ -4046,6 +4418,18 @@ async fn destroy_workload(
     s.secret_workloads.lock().unwrap().remove(&ident);
     // R572-F4: clear the archetype so a fresh deploy of the same ident is accepted.
     s.archetype_registry.lock().unwrap().remove(&ident);
+    // R860-T6 (W338 §"Placement consequences" 4): take this workload's
+    // requirement edges out of the graph. Removed BEFORE the cascade below runs,
+    // so a graph that somehow described a cycle closes instead of recursing
+    // forever, and so a concurrent destroy of the same ident cannot cascade
+    // twice.
+    let cascade = s
+        .requirement_graph
+        .lock()
+        .unwrap()
+        .remove(&ident)
+        .map(|deployed| deployed.self_supplied)
+        .unwrap_or_default();
     // Release its committed capacity — a destroyed workload must stop
     // counting against `yah.committed.*` or the node slowly reports itself
     // full while sitting idle.
@@ -4056,6 +4440,32 @@ async fn destroy_workload(
     // diagnostics, and `is_ready()` — the only thing a proxy routes on — is
     // already false. No-op when the ident was never a serving workload.
     s.service_records.retract(&mesh_ident);
+
+    // R860-T6 / W338 §"Placement consequences" 4: **teardown cascades along
+    // `self` edges and never along `wait` edges.**
+    //
+    // `self_supplied` holds only the providers this workload carried inline and
+    // stood up itself (`deploy::self_supply::self_supplied_idents`). A `wait`
+    // provider — at any locality, including `local` — belongs to whoever
+    // declared it, so following that edge here would destroy another operator's
+    // workload out from under every other requirer of it.
+    //
+    // Each provider goes through this same handler, so it gets the same runtime
+    // teardown, secret reap, registry clearing and cheers revoke the requirer
+    // just got — the mesh identity it kept on the way up is the one it is torn
+    // down by. Requirer first, providers after: the thing using the sidecar
+    // stops before the sidecar does. One level deep, because a provider cannot
+    // itself self-provision (`validate::shape`).
+    let mut cascaded: Vec<String> = Vec::new();
+    for provider in cascade {
+        tracing::info!(
+            ident = %ident,
+            provider = %provider,
+            "destroy cascading into a self-supplied provider (W338)"
+        );
+        let _ = destroy_workload_boxed(Arc::clone(&s), provider.clone()).await;
+        cascaded.push(provider);
+    }
 
     // Revoke the cheers ownership row (if registered).
     let row_id = s.ownership_rows.lock().unwrap().remove(&ident);
@@ -4132,6 +4542,10 @@ async fn destroy_workload(
         "status": teardown_status,
         "ident": ident,
         "revoked": revoked,
+        // R860-T6: the self-supplied providers torn down with this workload.
+        // Reported rather than silent so an operator can see that destroying a
+        // requirer took its sidecars, and see that it took nothing else.
+        "cascaded": cascaded,
     });
     if let Some(err) = teardown_error {
         body["teardown_note"] = serde_json::Value::String(err);
@@ -4602,6 +5016,14 @@ pub struct HeadscaleHealthResponse {
     pub headscale: String,
     /// Whether the headscale HTTP API on localhost:8080 responded.
     pub api_reachable: bool,
+    /// R858-B11: whether this node's own supervisor (kamaji) reports the
+    /// appliance `Running` here. This is the authoritative signal in the shape
+    /// yubaba actually deploys, and the one a reader needs in order to tell
+    /// "genuinely stopped" from "running, but not the way the other two probes
+    /// happen to look for it". `#[serde(default)]` so a client can still parse a
+    /// pre-B11 yubaba's body, where the field is simply absent.
+    #[serde(default)]
+    pub supervised: bool,
 }
 
 async fn headscale_deploy(
@@ -4629,7 +5051,11 @@ async fn headscale_deploy(
                     format!("decode {}: {e}", $filename),
                 )
             })?;
-            std::fs::write(dir.join($filename), &bytes).map_err(|e| {
+            // R858-T2: one writer for `headscale_dir`, shared with
+            // `leader::start_headscale`'s noise-identity materialization, so
+            // the owner-only mode on this coordinator's key material cannot
+            // drift between the transplant path and the failover path.
+            crate::headscale_state::write_state_file(dir, $filename, &bytes).map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("write {}: {e}", $filename),
@@ -4642,12 +5068,29 @@ async fn headscale_deploy(
     write_b64!(req.private_key_base64, "private.key");
     write_b64!(req.noise_key_base64, "noise_private.key");
 
-    std::fs::write(dir.join("acls.yaml"), &req.acl_policy).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("write acls.yaml: {e}"),
-        )
-    })?;
+    // R861-T2: the carried policy is NOT written to `acls.yaml` any more —
+    // under [`HEADSCALE_POLICY_MODE`] = `database` headscale reads policy from
+    // `headscale.db`, which this request already transplants wholesale, and
+    // never opens `policy.path`. A carried policy that is the permissive
+    // default is therefore redundant (an absent policy row compiles to
+    // `tailcfg.FilterAllowAll` in the pinned v0.23.0, the same tailnet). A
+    // carried policy that is anything ELSE means the source coordinator was
+    // still file-mode, its `headscale.db` has no policy row, and writing the
+    // file would no longer carry it — so the transplant is refused rather than
+    // silently widening the destination tailnet to allow-all.
+    if !carried_policy_is_permissive_default(&req.acl_policy) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "acl_policy carries a non-permissive policy, but this coordinator runs \
+                 `policy.mode: {HEADSCALE_POLICY_MODE}` and reads its policy from headscale.db, \
+                 not from acls.yaml — writing the file would drop the policy and leave the \
+                 destination allow-all. Migrate the SOURCE coordinator's policy into its \
+                 headscale.db first (R861-T2), so the transplanted DB carries it, then re-deploy \
+                 with an empty acl_policy."
+            ),
+        ));
+    }
 
     // Generate a config.yaml appropriate for remote paths.
     let config_yaml = generate_remote_headscale_config(&req.server_url, dir);
@@ -4679,26 +5122,97 @@ async fn headscale_deploy(
     }))
 }
 
-async fn headscale_health_check() -> Json<HeadscaleHealthResponse> {
-    let systemd_active = std::process::Command::new("systemctl")
-        .args(["is-active", "--quiet", "headscale"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    // Also try a direct HTTP probe of the headscale API on localhost.
-    let api_reachable = probe_headscale_local().await;
-
-    let headscale = if systemd_active || api_reachable {
-        "running"
-    } else {
-        "stopped"
-    };
+/// @yah:ticket(R858-B11, "/headscale/health reports the HEALTHY appliance as \"stopped\" — both halves of its OR are false in the configuration yubaba itself deploys")
+/// @yah:status(review)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:at(2026-09-05T20:36:19Z)
+/// @yah:parent(R858)
+/// @yah:severity(high)
+/// @yah:next("THE 8080 LEG IS R858-B9's, DO NOT FIX IT TWICE. B9 already owns the port disagreement: `generate_remote_headscale_config` binds 127.0.0.1:8080 (lib.rs:4734), HEADSCALE_PORTS advertises [443, 80], and this probe hardcodes 127.0.0.1:8080 — three places disagreeing with no production value forcing agreement. Whoever takes B9 should take this probe's port with it; what is left here is the systemd-vs-kamaji half, which is independent and is the one that inverts the answer.")
+/// @yah:gotcha("IT HAS ALREADY NEARLY CAUSED A SECOND OUTAGE, which is why this is filed at high severity rather than as tidy-up. @Ashguard:griffin (R600-F10, 2026-09-05) was about to restart yubaba on us-west-001 to activate the fleet ACME issuer drop-in, read `\"headscale\":\"stopped\"`, and stopped only because they independently found the process with `ps` and asked. A yubaba restart on west drops raft leadership, and R858's root-cause chain then reproduces the Sept 3 outage exactly — us-south-001's kamaji has no `--native-exec-dir` and no headscale.service to fall back to. So the cost of this field is not a confusing dashboard: it actively argues for the one action that decapitates the mesh, at the moment the mesh is healthy.")
+/// @yah:handoff("FILED, NOT FIXED — full diagnosis, measured on us-west-001 2026-09-05, so the next agent can go straight to the edit. `headscale_health_check` (oss/yubaba/crates/yubaba/src/lib.rs:4744) reports \"running\" if EITHER `systemctl is-active --quiet headscale` succeeds OR `probe_headscale_local()` returns true. Both are false whenever yubaba has deployed the appliance the way yubaba is designed to deploy it, so the healthy state reports as \"stopped\" and the field is effectively INVERTED — it can only read \"running\" in the degraded systemd-fallback configuration. HALF ONE, the systemd probe: leader.rs deploys headscale as a KAMAJI NATIVE workload and stops+disables the systemd unit in the same second, so `is-active` is `inactive` by construction. Measured: `systemctl is-active headscale.service` = inactive, `is-enabled` = disabled, while `ps -o ppid,lstart,cmd -p 517125` shows the live headscale started Sat Sep 5 01:54:01 2026 with ppid 515908 = `/usr/local/bin/kamaji --native-exec-dir /var/lib/yah/kamaji/native`, and `/proc/517125/cgroup` = `0::/yubaba.slice/kamaji.service/native`. HALF TWO, the HTTP probe: `probe_headscale_local` (lib.rs:4766) hardcodes `http://127.0.0.1:8080/health`, but the live appliance serves TLS on *:443 and *:80 (`ss -lntp`), nothing on 8080 — so the probe times out and returns false. Independent public confirmation that the thing is fine: `https://cloud.mesh.yah.dev/key?v=138` = HTTP 200, and `/health` = 200 from the open internet (griffin's own measurement). THE RIGHT FIX IS TO ASK KAMAJI, NOT SYSTEMD: kamaji is the supervisor in the deployed shape, it holds the workload's state, and the appliance's mesh_ip and port are what leader.rs already wrote when it deployed. A probe that asks the process's actual supervisor cannot go stale the way a hardcoded unit name and a hardcoded port both did. Keep the systemd check as a fallback if you like — it is the fallback path's signal — but it must not be the only one that can say yes.")
+/// @yah:verify("Reproduce before fixing (it reproduces on the live fleet right now, no setup needed): `ssh -i ~/.ssh/yah debian@15.204.89.240 'systemctl is-active headscale.service; systemctl is-enabled headscale.service; ss -lntp | grep -E \":443|:8080\"'` — expect inactive / disabled / headscale on *:443 with nothing on 8080. Then `curl -s https://cloud.mesh.yah.dev/key?v=138 -o /dev/null -w '%{http_code}'` = 200, i.e. the appliance the field calls \"stopped\" is serving the public internet. AFTER the fix, the acceptance test is that the field reads \"running\" in the NORMAL kamaji-supervised state — a test that only exercises the systemd-fallback shape is the test that let this ship.")
+/// @yah:gotcha("THE TICKET'S OWN @yah:assumes WAS FALSE AND IS NOW REMOVED — traced, not inherited. It guessed that `/mesh/leader-health`'s headscale field is fed by `headscale_health_check`. IT IS NOT: `mesh_leader_health` called `probe_headscale_local()` DIRECTLY (was lib.rs:2720), with no systemd fallback at all. So leader-health was the MORE inverted of the two endpoints — on any kamaji-supervised coordinator it could only ever answer `\"stopped\"` + HTTP 503, unconditionally, and 503 there is the signal an external load balancer reads to decide the leader is not serving. The diagnosis under-counted the blast radius by one endpoint; both are fixed here and both now route through one `headscale_liveness`.")
+/// @yah:handoff("FIXED. Both health endpoints now ask the appliance's ACTUAL SUPERVISOR first. New `headscale_liveness(&ServerState) -> HeadscaleLiveness { supervised, systemd_active, api_reachable }` in oss/yubaba/crates/yubaba/src/lib.rs, with `running() = supervised || systemd_active || api_reachable`. `supervised` comes from `leader::observe_local_appliance` — the probe R858-T3 already built, which asks this node's own kamaji via `get_workload(appliance_ident())` — promoted from private to `pub(crate)` (leader.rs, one visibility keyword, body untouched, agreed with @Ashguard:spade before the edit). The systemd and HTTP legs are KEPT as fallbacks per the ticket: the unit is the real signal on a node whose kamaji predates `--native-exec-dir`, which during a rolling upgrade is most of the fleet. `headscale_health_check` gained `State<Arc&lt;ServerState&gt;>`; `mesh_leader_health` swapped its bare `probe_headscale_local()` for the same helper.")
+/// @yah:handoff("SCOPE HELD: THE 8080 LEG IS UNTOUCHED AND STILL R858-B9's. `probe_headscale_local` is byte-for-byte unchanged — still hardcodes `http://127.0.0.1:8080/health`, still returns false on the live fleet — and `api_reachable` still reports exactly what it measures rather than being papered over. Nothing in the port disagreement was fixed twice.")
+/// @yah:handoff("A THIRD INSTANCE OF THE SAME INVERSION, FOUND AND FIXED IN THIS PASS — and without it the yubaba fix would NOT have reached the reader who was actually misled. crates/yah/agent-tools/src/cloud_tools.rs computed `headscale_ok = (h.headscale == \"running\") && h.api_reachable`, re-ANDing one signal back on top of the verdict over all of them. That is the field behind `cloud.mesh_diagnose`, so it would have kept emitting the finding \"headscale island: 'us-west-001' is reachable but headscale is not running/healthy\" against a coordinator serving the public internet, forever, because `api_reachable` is false for R858-B9's unrelated port reason. Now `h.headscale == \"running\"`. Also added `supervised: bool` to `HeadscaleHealthResponse` (yubaba + crates/yah/cloud-client, `#[serde(default)]` on both so a pre-B11 yubaba still deserializes) and surfaced it in the single-machine health JSON, so a reader sees WHICH signal said yes — `api_reachable:false` with `supervised:true` is the normal healthy shape on this fleet, not a fault.")
+/// @yah:verify("REPRODUCED LIVE BEFORE AND MEASURED BY ME (read-only, no live node changed), us-west-001 2026-09-05. `systemctl is-active headscale.service` = inactive; `is-enabled` = disabled; `ss -lntp` = headscale pid 517125 on `*:443` and `*:80` with NOTHING on 8080 (so B9's hand-move to 8080 has not happened yet); `GET 100.64.0.1:7443/headscale/health` = `{\"headscale\":\"stopped\",\"api_reachable\":false}`; `GET 100.64.0.1:7443/mesh/leader-health` = `{\"leader\":false,\"headscale\":\"stopped\"}` with HTTP 503 — while `https://cloud.mesh.yah.dev/key?v=138` = 200 in 0.14s and `/health` = 200. Note yubaba binds the mesh IP (100.64.0.1:7443), NOT loopback:7443; a curl at 127.0.0.1:7443 returns nothing and looks like a dead yubaba.")
+/// @yah:verify("THE ACCEPTANCE TEST EXERCISES THE NORMAL KAMAJI-SUPERVISED STATE, as the ticket demanded, AND IT IS FALSIFIED. 4 new tests in lib.rs on a new `ApplianceSupervisorFake` (a kamaji answering `get_workload` and recording what it was asked): (1) `the_health_field_reads_running_on_a_kamaji_supervised_appliance` — through the REAL router, asserts headscale==\"running\", supervised==true, and that the probe asked for HEADSCALE_IDENT; neither old signal can be true in the fixture (no systemd unit under a tempdir, nothing on any port), so only the supervisor query can make it pass. (2) `the_supervisor_signal_alone_is_enough_to_say_running` — the decision rule alone, deliberately NOT through HTTP so a dev box with something on :8080 cannot make it green for an environmental reason; also asserts the systemd fallback can still say yes. (3) `a_supervisor_reporting_a_stopped_appliance_does_not_claim_it_is_supervised` (Stopped, and never-heard-of). (4) `leader_health_asks_the_supervisor_not_only_the_hardcoded_port` — the second endpoint, asserting 503 for the leader half (no raft in the fixture) but headscale==\"running\". FALSIFICATION RUN: dropping `self.supervised ||` out of `running()` fails 3 of the 4, and they fail reporting exactly the live symptom, `left: String(\"stopped\") right: \"running\"`. Rule restored and re-run green.")
+/// @yah:verify("SUITES, all green on the shared tree as of this write: `cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib` = 759 passed / 0 failed (743 at my first run; @Ashguard:spade's R858-T7 tests landed under me in between, which is why the count moved). `cargo test -p yah-agent-tools --lib` = 1221 passed / 0 failed. Parent relay smoke: `cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib cloud_init` = 27 passed (note: `-p yah-cloud` needs the yubaba manifest — from the repo root it errors \"not a member of the workspace\", which reads like a broken crate and is not); `cargo test -p yah --test main camp_systemd_unit_emit` = 8 passed. `cargo clippy --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib`: zero findings on any line I touched (the 10 crate warnings are pre-existing, in pond/minio.rs, rollout/engine.rs and others). cloud-client + agent-tools check clean.")
+/// @yah:gotcha("THE DEPLOYED BINARY STILL LIES UNTIL 0.8.33 ROLLS — this fix is code, and NOTHING was rolled and no live node was touched. Until the fleet carries it, `/headscale/health` and `/mesh/leader-health` on us-west-001 keep answering \"stopped\" / 503 exactly as measured above. So the operational rule stands unchanged for now: DO NOT read \"stopped\" from a yubaba on 0.8.32 as grounds to restart yubaba on the coordinator — check `ps`/`ss` on the box, or curl `https://cloud.mesh.yah.dev/key?v=138`. After the roll, the tell that the fix is live is the new `supervised` field appearing in the `/headscale/health` body at all; a pre-B11 yubaba omits it.")
+/// @yah:gotcha("SHARED-TREE STATE, UNCOMMITTED — verify by CONTENT, not by `git status` (peers wip-commit constantly here). Tree anchor at pickup: 00ee20d1; quote that SHA, never HEAD, in any revert instruction. Four files carry my hunks: oss/yubaba/crates/yubaba/src/lib.rs (grep `headscale_liveness`, `HeadscaleLiveness`, `ApplianceSupervisorFake`), oss/yubaba/crates/yubaba/src/leader.rs (grep `pub(crate) async fn observe_local_appliance` — line number MOVED from 729 to ~892 under spade's edits, which is why you grep rather than seek), crates/yah/cloud-client/src/lib.rs (grep `supervised`), crates/yah/agent-tools/src/cloud_tools.rs (grep `R858-B11`). Any commit of this must be pathspec-scoped: @Ashguard:spade (session:1be15e4f, R858-T7) was editing appliance_ownership.rs / lease_detector.rs / leader.rs / cert_store.rs / tests/raft_appliance_ownership.rs concurrently. No collision — coordinated with them by party.chat before the first edit and they confirmed they are not rewriting observe_local_appliance.")
+/// @yah:gotcha("MEASURED IN PASSING, AND IT CHANGES HOW `/mesh/leader-health` SHOULD BE READ: us-west-001 answers `leader: false` while it is the node actually running the appliance. Raft leadership sits elsewhere and west owns the appliance anyway — the decoupled state R858-T3 deliberately produced, working as intended. Consequence: that endpoint's `leader` field is now ORTHOGONAL to appliance ownership, so anything reading it as \"is this the coordinator\" is wrong on the live fleet TODAY, not just in theory. Before this fix the same endpoint also returned 503 unconditionally on any kamaji-supervised node, so both of its fields were misleading at once. Relayed to @Ashguard:spade for R858-T7's detection design.")
+async fn headscale_health_check(
+    State(s): State<Arc<ServerState>>,
+) -> Json<HeadscaleHealthResponse> {
+    let live = headscale_liveness(&s).await;
 
     Json(HeadscaleHealthResponse {
-        headscale: headscale.into(),
-        api_reachable,
+        headscale: if live.running() { "running" } else { "stopped" }.into(),
+        api_reachable: live.api_reachable,
+        supervised: live.supervised,
     })
+}
+
+/// The three independent answers to "is headscale up on this node", kept apart
+/// so the endpoints can report *which* one said yes rather than only the OR.
+struct HeadscaleLiveness {
+    /// This node's kamaji reports the appliance `Running`.
+    supervised: bool,
+    /// `systemctl is-active headscale` succeeded.
+    systemd_active: bool,
+    /// The localhost HTTP probe got a success status.
+    api_reachable: bool,
+}
+
+impl HeadscaleLiveness {
+    fn running(&self) -> bool {
+        self.supervised || self.systemd_active || self.api_reachable
+    }
+}
+
+/// Ask every supervisor that could plausibly be holding headscale on this node.
+///
+/// # Why this asks kamaji first (R858-B11)
+///
+/// Until R858-B11 the answer was `systemd_active || api_reachable`, and **both
+/// halves are false in the configuration yubaba itself deploys**, so the field
+/// was effectively inverted — it could only read `running` in the degraded
+/// systemd-fallback shape.
+///
+/// - [`leader::start_headscale`] deploys the appliance as a *kamaji native
+///   workload* and runs `systemctl disable --now headscale` in the same breath
+///   (deliberately — two supervisors both want `:443`). So `is-active` is
+///   `inactive` **by construction** on a healthy coordinator.
+/// - The HTTP probe hardcodes `127.0.0.1:8080`, which the live appliance does
+///   not bind. That port disagreement is R858-B9's; it is *not* fixed here, and
+///   `api_reachable` is left reporting exactly what it measures.
+///
+/// Measured on us-west-001 2026-09-05: `is-active` = `inactive`, `is-enabled` =
+/// `disabled`, nothing on 8080 — while the appliance was serving
+/// `https://cloud.mesh.yah.dev/key?v=138` to the open internet with a live pid
+/// parented to `kamaji --native-exec-dir`.
+///
+/// The cost was not a confusing dashboard. On 2026-09-05 an agent about to
+/// restart yubaba on us-west-001 read `"headscale":"stopped"` and nearly took
+/// the action that drops raft leadership and decapitates the mesh; they stopped
+/// only because they checked `ps` themselves. A probe that asks the process's
+/// **actual supervisor** cannot go stale the way a hardcoded unit name and a
+/// hardcoded port both did.
+///
+/// The other two are kept as fallbacks, not retired: the systemd unit is the
+/// real signal on a node whose kamaji predates `--native-exec-dir`, which
+/// during a rolling upgrade is most of the fleet.
+async fn headscale_liveness(s: &Arc<ServerState>) -> HeadscaleLiveness {
+    HeadscaleLiveness {
+        supervised: crate::leader::observe_local_appliance(s).await.is_some(),
+        systemd_active: std::process::Command::new("systemctl")
+            .args(["is-active", "--quiet", "headscale"])
+            .status()
+            .map(|st| st.success())
+            .unwrap_or(false),
+        api_reachable: probe_headscale_local().await,
+    }
 }
 
 async fn probe_headscale_local() -> bool {
@@ -4726,7 +5240,6 @@ fn generate_remote_headscale_config(server_url: &str, headscale_dir: &std::path:
         .to_string();
     let db_path = headscale_dir.join("headscale.db").display().to_string();
     let socket_path = headscale_dir.join("headscale.sock").display().to_string();
-    let acl_path = headscale_dir.join("acls.yaml").display().to_string();
 
     format!(
         "---\n\
@@ -4757,8 +5270,7 @@ fn generate_remote_headscale_config(server_url: &str, headscale_dir: &std::path:
            v6: fd7a:115c:a1e0::/48\n\
            allocation: sequential\n\
          policy:\n\
-           mode: file\n\
-           path: {acl_path}\n\
+           mode: {HEADSCALE_POLICY_MODE}\n\
          derp:\n\
            server:\n\
              enabled: false\n\
@@ -4852,14 +5364,17 @@ async fn headscale_bootstrap(
         )
     })?;
 
-    // Write config + permissive ACL FIRST so they exist regardless of whether
-    // the download/start/mint steps succeed (mirrors headscale_deploy ordering).
-    std::fs::write(dir.join("acls.yaml"), DEFAULT_ACL_POLICY_HUJSON).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("write acls.yaml: {e}"),
-        )
-    })?;
+    // Write config FIRST so it exists regardless of whether the
+    // download/start/mint steps succeed (mirrors headscale_deploy ordering).
+    //
+    // R861-T2: no `acls.yaml` is written any more. Under
+    // [`HEADSCALE_POLICY_MODE`] = `database` headscale never reads that path,
+    // and a fresh coordinator simply has no policy row — which the pinned
+    // v0.23.0 treats as a nil `*ACLPolicy` whose `CompileFilterRules` returns
+    // `tailcfg.FilterAllowAll`. That is byte-for-byte the same tailnet
+    // behaviour [`DEFAULT_ACL_POLICY_HUJSON`] produced, so bootstrapping loses
+    // nothing; a non-permissive policy now arrives as declared config through
+    // the `kind = "headscale"` reconciler, which can finally push it.
     let config_yaml = generate_bootstrap_headscale_config(&req.server_url, &le_hostname, dir);
     std::fs::write(dir.join("config.yaml"), &config_yaml).map_err(|e| {
         (
@@ -5131,7 +5646,6 @@ fn generate_bootstrap_headscale_config(
         .to_string();
     let db_path = headscale_dir.join("headscale.db").display().to_string();
     let socket_path = headscale_dir.join("headscale.sock").display().to_string();
-    let acl_path = headscale_dir.join("acls.yaml").display().to_string();
     let tls_cache = headscale_dir.join("acme-cache").display().to_string();
 
     format!(
@@ -5167,8 +5681,7 @@ fn generate_bootstrap_headscale_config(
          \x20\x20v6: fd7a:115c:a1e0::/48\n\
          \x20\x20allocation: sequential\n\
          policy:\n\
-         \x20\x20mode: file\n\
-         \x20\x20path: {acl_path}\n\
+         \x20\x20mode: {HEADSCALE_POLICY_MODE}\n\
          derp:\n\
          \x20\x20server:\n\
          \x20\x20\x20\x20enabled: false\n\
@@ -7651,7 +8164,12 @@ mod tests {
             "db_base64": engine.encode(b"test-db"),
             "private_key_base64": engine.encode(b"test-private-key"),
             "noise_key_base64": engine.encode(b"test-noise-key"),
-            "acl_policy": "---\nacls: []",
+            // R861-T2: nothing carried. The transplanted headscale.db is the
+            // policy source under `policy.mode: database`. (This fixture used
+            // to send `---\nacls: []`, which headscale's HuJSON loader would
+            // have refused outright — it was never a policy headscale could
+            // have booted on.)
+            "acl_policy": "",
             "server_url": "https://mesh.example.com"
         });
 
@@ -7689,11 +8207,75 @@ mod tests {
             std::fs::read(headscale_tmp.path().join("noise_private.key")).unwrap(),
             b"test-noise-key"
         );
-        assert!(headscale_tmp.path().join("acls.yaml").exists());
+        // R861-T2: acls.yaml is NOT recreated. A newly-deployed coordinator
+        // must not carry back the very file the migration deletes.
+        assert!(!headscale_tmp.path().join("acls.yaml").exists());
         assert!(headscale_tmp.path().join("config.yaml").exists());
 
         let config = std::fs::read_to_string(headscale_tmp.path().join("config.yaml")).unwrap();
         assert!(config.contains("server_url: https://mesh.example.com"));
+    }
+
+    /// R861-T2. Under `policy.mode: database` the policy travels inside the
+    /// transplanted `headscale.db`, so a carried non-permissive `acl_policy`
+    /// means the SOURCE was still file-mode and its DB has no policy row.
+    /// Writing `acls.yaml` would no longer carry it and the destination would
+    /// come up allow-all — a silent widening. Refuse instead.
+    #[tokio::test]
+    async fn headscale_deploy_refuses_a_carried_non_default_policy() {
+        let (_tmp, state_base) = fresh_state();
+        let headscale_tmp = tempfile::TempDir::new().unwrap();
+        let state = {
+            let state_raw = Arc::try_unwrap(state_base).unwrap();
+            Arc::new(state_raw.with_headscale_dir(headscale_tmp.path()))
+        };
+        let app = build_router(state);
+
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let req_body = serde_json::json!({
+            "headscale_version": "0.23.0",
+            "db_base64": engine.encode(b"test-db"),
+            "private_key_base64": engine.encode(b"test-private-key"),
+            "noise_key_base64": engine.encode(b"test-noise-key"),
+            "acl_policy": "{\"acls\":[{\"action\":\"accept\",\"src\":[\"tag:ci\"],\"dst\":[\"*:22\"]}]}",
+            "server_url": "https://mesh.example.com"
+        });
+
+        let resp = app
+            .oneshot(
+                Request::post("/headscale/deploy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // And it refused BEFORE laying anything down.
+        assert!(!headscale_tmp.path().join("acls.yaml").exists());
+    }
+
+    #[test]
+    fn permissive_default_is_recognised_through_reformatting() {
+        // Empty = nothing carried.
+        assert!(carried_policy_is_permissive_default(""));
+        assert!(carried_policy_is_permissive_default("\n  \n"));
+        // The constant itself, and the exact 77 bytes measured on us-west-001's
+        // live acls.yaml 2026-09-04 — same document, different formatting.
+        assert!(carried_policy_is_permissive_default(
+            DEFAULT_ACL_POLICY_HUJSON
+        ));
+        assert!(carried_policy_is_permissive_default(
+            "{\"acls\":[{\"action\":\"accept\",\"src\":[\"*\"],\"dst\":[\"*:*\"]}]}"
+        ));
+        // Anything that restricts anything is not the default.
+        assert!(!carried_policy_is_permissive_default(
+            "{\"acls\":[{\"action\":\"accept\",\"src\":[\"tag:ci\"],\"dst\":[\"*:*\"]}]}"
+        ));
+        // Not even an empty ruleset — that is MORE restrictive, not less, and
+        // dropping it would widen the tailnet.
+        assert!(!carried_policy_is_permissive_default("{\"acls\":[]}"));
     }
 
     #[tokio::test]
@@ -7755,7 +8337,9 @@ mod tests {
             "db_base64": engine.encode(b"test-db"),
             "private_key_base64": engine.encode(b"test-private-key"),
             "noise_key_base64": engine.encode(b"test-noise-key"),
-            "acl_policy": "---\nacls: []",
+            // R861-T2: nothing carried — the transplanted headscale.db is the
+            // policy source under `policy.mode: database`.
+            "acl_policy": "",
             "server_url": "https://mesh.example.com"
         });
         let resp = app
@@ -7861,8 +8445,12 @@ mod tests {
         // Keys + DB live under the headscale dir; headscale creates them itself.
         assert!(cfg.contains("/etc/yah-cloud/headscale/private.key"));
         assert!(cfg.contains("/etc/yah-cloud/headscale/headscale.db"));
-        // ACL policy is referenced by path (file mode).
-        assert!(cfg.contains("mode: file"));
+        // R861-T2: policy lives in headscale.db (litestream replicates it), not
+        // in an acls.yaml that nothing replicates. This site is the one that
+        // spells the block with escaped spaces (`\x20\x20mode:`), so a grep for
+        // a literal two-space prefix misses it — assert on it explicitly.
+        assert!(cfg.contains(&format!("mode: {HEADSCALE_POLICY_MODE}")));
+        assert!(!cfg.contains("acls.yaml"));
     }
 
     #[tokio::test]
@@ -7892,13 +8480,16 @@ mod tests {
             .unwrap();
 
         // 200 (full bootstrap) or 500 (download/systemd unavailable in CI) — but
-        // config + ACL must be written first either way.
+        // config must be written first either way.
         let status = resp.status();
         assert!(
             status.is_success() || status == StatusCode::INTERNAL_SERVER_ERROR,
             "unexpected status {status}"
         );
-        assert!(headscale_tmp.path().join("acls.yaml").exists());
+        // R861-T2: a fresh coordinator gets no acls.yaml. Under
+        // `policy.mode: database` an absent policy row is allow-all, which is
+        // exactly what DEFAULT_ACL_POLICY_HUJSON used to write.
+        assert!(!headscale_tmp.path().join("acls.yaml").exists());
         let cfg = std::fs::read_to_string(headscale_tmp.path().join("config.yaml")).unwrap();
         assert!(cfg.contains("server_url: https://cloud.mesh.yah.dev"));
         assert!(cfg.contains("tls_letsencrypt_hostname: cloud.mesh.yah.dev"));
@@ -9364,6 +9955,893 @@ mod tests {
                 .contains("appliance already live"),
             "error should mention 'appliance already live', got: {}",
             b["error"]
+        );
+    }
+
+    // ── R860-B3: the deploy handler REACHES the dependency gate ──────────────
+    //
+    // Every test here drives `POST /workloads/deploy` through the real router.
+    // That is the whole point of the ticket: `deploy::mesh_resolve` had a full
+    // unit suite and zero production callers, so a test that called
+    // `await_dependencies` directly passed for three relays while `depends_on`
+    // enforced nothing. These assert on what the BACKEND was handed — an empty
+    // recording means the gate ran before the workload could start.
+
+    /// A `Kamaji` backend that records the specs it is asked to deploy.
+    #[derive(Default)]
+    struct RecordingRuntime {
+        deployed: std::sync::Mutex<Vec<workload_spec::WorkloadSpec>>,
+        /// R860-T6: idents this backend was asked to tear down, in order. The
+        /// teardown cascade's whole claim is about *which* workloads die with a
+        /// requirer, so the test has to read the backend's teardowns and not
+        /// only the registries yubaba keeps beside them.
+        torn_down: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingRuntime {
+        fn specs(&self) -> Vec<workload_spec::WorkloadSpec> {
+            self.deployed.lock().unwrap().clone()
+        }
+
+        /// Mesh idents of everything deployed, in the order the backend saw
+        /// them — which is the order the group was stood up in.
+        fn deploy_order(&self) -> Vec<String> {
+            self.specs()
+                .iter()
+                .map(|s| s.expose.mesh.identity.0.clone())
+                .collect()
+        }
+
+        fn teardown_order(&self) -> Vec<String> {
+            self.torn_down.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl kamaji::Kamaji for RecordingRuntime {
+        fn backend(&self) -> kamaji::Backend {
+            kamaji::Backend::Containerd
+        }
+        async fn deploy_workload(
+            &self,
+            spec: &workload_spec::WorkloadSpec,
+            mesh: &kamaji::MeshAssignment,
+        ) -> anyhow::Result<kamaji::DeployResult> {
+            self.deployed.lock().unwrap().push(spec.clone());
+            Ok(kamaji::DeployResult {
+                container_id: "recorded".into(),
+                mesh_ip: mesh.mesh_ip,
+                task_pid: 1,
+                ports: std::collections::BTreeMap::new(),
+            })
+        }
+        async fn list_workloads(&self) -> anyhow::Result<Vec<kamaji::WorkloadState>> {
+            Ok(vec![])
+        }
+        async fn get_workload(
+            &self,
+            _ident: &workload_spec::MeshIdent,
+        ) -> anyhow::Result<Option<kamaji::WorkloadState>> {
+            Ok(None)
+        }
+        async fn stream_logs(
+            &self,
+            _ident: &workload_spec::MeshIdent,
+            _opts: kamaji::LogOpts,
+        ) -> anyhow::Result<kamaji::LogStream> {
+            anyhow::bail!("RecordingRuntime: no logs")
+        }
+        async fn restart_workload(&self, _ident: &workload_spec::MeshIdent) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn teardown_workload(&self, ident: &workload_spec::MeshIdent) -> anyhow::Result<()> {
+            self.torn_down.lock().unwrap().push(ident.0.clone());
+            Ok(())
+        }
+        async fn health(&self) -> anyhow::Result<kamaji::RuntimeHealth> {
+            anyhow::bail!("RecordingRuntime: no health")
+        }
+    }
+
+    fn state_with_recording_runtime() -> (tempfile::TempDir, Arc<ServerState>, Arc<RecordingRuntime>)
+    {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rt = Arc::new(RecordingRuntime::default());
+        let state = ServerState::load(tmp.path().join("identity.json"))
+            .unwrap()
+            .with_runtime(rt.clone());
+        (tmp, Arc::new(state), rt)
+    }
+
+    /// A container spec the deploy handler will accept, with one anonymous
+    /// mesh port so it is a serving workload.
+    fn mesh_spec(ident: &str, port: u16) -> workload_spec::WorkloadSpec {
+        use workload_spec::{ImageRef, MeshIdent, TierTag, WorkloadSpec};
+        let mut spec = WorkloadSpec::for_forge(
+            "fixture",
+            ImageRef {
+                registry: "localhost".into(),
+                repository: "test".into(),
+                tag: "latest".into(),
+                digest: workload_spec::testing::test_digest(),
+            },
+            TierTag("infra".into()),
+            vec![port],
+        );
+        spec.expose.mesh.identity = MeshIdent(ident.into());
+        spec
+    }
+
+    async fn post_deploy(
+        state: Arc<ServerState>,
+        spec: &workload_spec::WorkloadSpec,
+    ) -> axum::response::Response {
+        let body = serde_json::json!({ "spec": serde_json::to_value(spec).unwrap() });
+        build_router(state)
+            .oneshot(
+                Request::post("/workloads/deploy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    // ── R858-B11: the health field must read the shape yubaba deploys ────────
+
+    /// A kamaji that answers `get_workload` for the appliance and records what
+    /// it was asked about — the supervisor half of the deployed shape, without
+    /// needing a Linux box, a systemd unit, or a bound port.
+    #[derive(Default)]
+    struct ApplianceSupervisorFake {
+        status: Option<kamaji::WorkloadStatus>,
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ApplianceSupervisorFake {
+        fn reporting(status: kamaji::WorkloadStatus) -> Self {
+            Self {
+                status: Some(status),
+                asked: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl kamaji::Kamaji for ApplianceSupervisorFake {
+        fn backend(&self) -> kamaji::Backend {
+            kamaji::Backend::Native
+        }
+        async fn deploy_workload(
+            &self,
+            _spec: &workload_spec::WorkloadSpec,
+            mesh: &kamaji::MeshAssignment,
+        ) -> anyhow::Result<kamaji::DeployResult> {
+            Ok(kamaji::DeployResult {
+                container_id: "native:517125".into(),
+                mesh_ip: mesh.mesh_ip,
+                task_pid: 517125,
+                ports: std::collections::BTreeMap::new(),
+            })
+        }
+        async fn list_workloads(&self) -> anyhow::Result<Vec<kamaji::WorkloadState>> {
+            Ok(vec![])
+        }
+        async fn get_workload(
+            &self,
+            ident: &workload_spec::MeshIdent,
+        ) -> anyhow::Result<Option<kamaji::WorkloadState>> {
+            self.asked.lock().unwrap().push(ident.0.clone());
+            Ok(self
+                .status
+                .clone()
+                .map(|status| kamaji::WorkloadState {
+                    ident: ident.clone(),
+                    container_id: "native:517125".into(),
+                    status,
+                    mesh_ip: None,
+                    ports: std::collections::BTreeMap::new(),
+                }))
+        }
+        async fn stream_logs(
+            &self,
+            _ident: &workload_spec::MeshIdent,
+            _opts: kamaji::LogOpts,
+        ) -> anyhow::Result<kamaji::LogStream> {
+            anyhow::bail!("ApplianceSupervisorFake: no logs")
+        }
+        async fn restart_workload(&self, _ident: &workload_spec::MeshIdent) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn teardown_workload(&self, _ident: &workload_spec::MeshIdent) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> anyhow::Result<kamaji::RuntimeHealth> {
+            anyhow::bail!("ApplianceSupervisorFake: no health")
+        }
+    }
+
+    fn state_with_supervisor(
+        fake: ApplianceSupervisorFake,
+    ) -> (tempfile::TempDir, Arc<ServerState>, Arc<ApplianceSupervisorFake>) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rt = Arc::new(fake);
+        let state = ServerState::load(tmp.path().join("identity.json"))
+            .unwrap()
+            .with_runtime(rt.clone());
+        (tmp, Arc::new(state), rt)
+    }
+
+    /// **The acceptance test for R858-B11**, and the one whose absence let the
+    /// defect ship: it exercises the NORMAL kamaji-supervised state.
+    ///
+    /// The old field was `systemd_active || api_reachable`, and on a coordinator
+    /// running the appliance the way `leader::start_headscale` deploys it, both
+    /// are false by construction — the systemd unit is stopped and disabled in
+    /// the same second the kamaji workload starts. A test written against the
+    /// systemd-fallback shape passes on code that reports every healthy
+    /// coordinator as "stopped", which is exactly what happened.
+    ///
+    /// Neither of the two old signals can be true here: there is no systemd unit
+    /// under a tempdir and nothing is deployed on any port. The only thing that
+    /// can make this pass is the supervisor query.
+    #[tokio::test]
+    async fn the_health_field_reads_running_on_a_kamaji_supervised_appliance() {
+        let (_tmp, state, rt) = state_with_supervisor(ApplianceSupervisorFake::reporting(
+            kamaji::WorkloadStatus::Running,
+        ));
+
+        let resp = build_router(state)
+            .oneshot(Request::get("/headscale/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+
+        assert_eq!(
+            body["headscale"], "running",
+            "a kamaji-supervised appliance is RUNNING; reporting it as stopped is the \
+             defect that argued for restarting yubaba on the live coordinator"
+        );
+        assert_eq!(
+            body["supervised"], true,
+            "the supervisor is what answered, and the body must say so"
+        );
+        assert_eq!(
+            rt.asked.lock().unwrap().as_slice(),
+            [headscale_appliance::HEADSCALE_IDENT],
+            "the probe must ask about the appliance by its stable ident"
+        );
+    }
+
+    /// The falsification probe, written to be independent of the host: drop the
+    /// `supervised ||` arm out of `running()` and the first assertion fails.
+    ///
+    /// Deliberately not routed through the HTTP handler — `api_reachable` dials
+    /// `127.0.0.1:8080`, and on a dev machine something unrelated may be
+    /// listening there. This asserts the decision rule itself, so it cannot go
+    /// green for an environmental reason.
+    #[test]
+    fn the_supervisor_signal_alone_is_enough_to_say_running() {
+        assert!(
+            HeadscaleLiveness {
+                supervised: true,
+                systemd_active: false,
+                api_reachable: false,
+            }
+            .running(),
+            "kamaji reporting the appliance Running must be sufficient on its own — \
+             this is the exact combination the live fleet is in"
+        );
+        assert!(
+            !HeadscaleLiveness {
+                supervised: false,
+                systemd_active: false,
+                api_reachable: false,
+            }
+            .running(),
+            "with nothing reporting it up, the answer is still stopped"
+        );
+        // The fallbacks are kept, not retired: a node whose kamaji predates
+        // `--native-exec-dir` runs the appliance under systemd, and that is the
+        // real signal there.
+        assert!(
+            HeadscaleLiveness {
+                supervised: false,
+                systemd_active: true,
+                api_reachable: false,
+            }
+            .running(),
+            "the systemd fallback must still be able to say yes"
+        );
+    }
+
+    /// A supervisor that answers, and answers something other than `Running`,
+    /// is not evidence the appliance is up. Only the `supervised` field is
+    /// asserted, so the host's port 8080 cannot make this pass or fail.
+    #[tokio::test]
+    async fn a_supervisor_reporting_a_stopped_appliance_does_not_claim_it_is_supervised() {
+        let (_tmp, state, _rt) = state_with_supervisor(ApplianceSupervisorFake::reporting(
+            kamaji::WorkloadStatus::Stopped,
+        ));
+        assert!(
+            !headscale_liveness(&state).await.supervised,
+            "a Stopped workload must not read as a live appliance"
+        );
+
+        let (_tmp2, absent, _rt2) = state_with_supervisor(ApplianceSupervisorFake::default());
+        assert!(
+            !headscale_liveness(&absent).await.supervised,
+            "a supervisor that has never heard of the appliance must not vouch for it"
+        );
+    }
+
+    /// `/mesh/leader-health` had the same inversion and a worse consequence: it
+    /// called `probe_headscale_local` *alone*, with not even the systemd
+    /// fallback, so on a kamaji-supervised coordinator it answered 503
+    /// unconditionally — the signal an external load balancer reads to decide
+    /// the leader is not serving.
+    ///
+    /// 503 here is correct and expected for the *leader* half: this fixture
+    /// configures no raft, so `leader` is legitimately false. The field under
+    /// test is `headscale`.
+    #[tokio::test]
+    async fn leader_health_asks_the_supervisor_not_only_the_hardcoded_port() {
+        let (_tmp, state, rt) = state_with_supervisor(ApplianceSupervisorFake::reporting(
+            kamaji::WorkloadStatus::Running,
+        ));
+
+        let resp = build_router(state)
+            .oneshot(
+                Request::get("/mesh/leader-health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no raft configured, so this node is not the leader"
+        );
+        let body = body_json(resp).await;
+
+        assert_eq!(body["leader"], false);
+        assert_eq!(
+            body["headscale"], "running",
+            "the headscale half must reflect the supervisor, not a port the \
+             appliance does not bind"
+        );
+        assert_eq!(
+            rt.asked.lock().unwrap().as_slice(),
+            [headscale_appliance::HEADSCALE_IDENT],
+            "leader-health must route through the same one probe"
+        );
+    }
+
+    /// The bug this ticket exists for: a workload declaring `depends_on` used
+    /// to start immediately, because nothing called the gate. It must now be
+    /// refused, and — the load-bearing half — the backend must never have been
+    /// asked to run it.
+    ///
+    /// `start_paused` fast-forwards the poll loop's real 30s-per-dep budget;
+    /// the deadline arithmetic is exercised for real, just not in wall time.
+    #[tokio::test(start_paused = true)]
+    async fn a_deploy_whose_dependency_never_appears_is_refused_before_the_backend_is_called() {
+        let (_tmp, state, rt) = state_with_recording_runtime();
+        let mut spec = mesh_spec("consumer", 8080);
+        spec.depends_on = vec![workload_spec::MeshIdent("absent-dep".into())];
+
+        let resp = post_deploy(state, &spec).await;
+
+        assert_eq!(resp.status(), StatusCode::FAILED_DEPENDENCY);
+        let body = body_json(resp).await;
+        assert!(
+            body["error"].as_str().unwrap().contains("dependency wait"),
+            "error should name the dependency wait, got: {}",
+            body["error"]
+        );
+        assert!(
+            rt.specs().is_empty(),
+            "the gate must run BEFORE the workload starts — backend was called anyway"
+        );
+    }
+
+    /// The other side of the same gate: a dependency already in the node's
+    /// service-record registry satisfies it, and the deploy proceeds.
+    #[tokio::test(start_paused = true)]
+    async fn a_dependency_present_in_the_service_records_satisfies_the_gate() {
+        let (_tmp, state, rt) = state_with_recording_runtime();
+        let dep = mesh_spec("db", 5432);
+        state
+            .service_records
+            .upsert_deployed(&dep, std::net::Ipv4Addr::new(100, 64, 0, 7), "dep-container");
+
+        let mut spec = mesh_spec("consumer", 8080);
+        spec.depends_on = vec![workload_spec::MeshIdent("db".into())];
+
+        let resp = post_deploy(state, &spec).await;
+
+        assert_eq!(
+            rt.specs().len(),
+            1,
+            "a satisfied dependency must not block the deploy (status was {})",
+            resp.status()
+        );
+    }
+
+    // ── R860-T2: the gate knows WHICH node, and knows Ready from present ─────
+    //
+    // The decision logic is unit-tested in `deploy::mesh_resolve`; these three
+    // exist because that logic needs two things only the real deploy path can
+    // supply — the node's own mesh address (`ServerState::node_mesh_ip`,
+    // threaded into `ServiceRecordMeshState`) and a real `ServiceRecord`'s
+    // health. A unit test cannot tell a correctly-threaded address from a
+    // hardcoded one.
+
+    fn state_with_recording_runtime_on_node(
+        node_ip: &str,
+    ) -> (tempfile::TempDir, Arc<ServerState>, Arc<RecordingRuntime>) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rt = Arc::new(RecordingRuntime::default());
+        let state = ServerState::load(tmp.path().join("identity.json"))
+            .unwrap()
+            .with_bind_addr(&format!("{node_ip}:9443"))
+            .with_runtime(rt.clone());
+        (tmp, Arc::new(state), rt)
+    }
+
+    fn local_requirement(ident: &str) -> workload_spec::Requirement {
+        workload_spec::Requirement {
+            ident: workload_spec::MeshIdent(ident.into()),
+            locality: workload_spec::Locality::Local,
+            supply: workload_spec::Supply::Wait,
+            provides: None,
+        }
+    }
+
+    /// W338: `local` means "only a provider on **this node** satisfies it".
+    /// Before this ticket the gate did a plain presence check for every
+    /// locality, so this deploy succeeded against a provider one hop away —
+    /// which for the motivating case (a replicator that must open the same
+    /// sqlite file on the same filesystem) is silent data corruption.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_requirement_is_refused_when_its_only_provider_is_on_another_node() {
+        let (_tmp, state, rt) = state_with_recording_runtime_on_node("100.64.0.7");
+        let dep = mesh_spec("replicator", 5432);
+        // The record's mesh_ip is the answering node's own address (R844-B11),
+        // so a record carrying .9 is a provider on node .9 — not on us.
+        state
+            .service_records
+            .upsert_deployed(&dep, std::net::Ipv4Addr::new(100, 64, 0, 9), "dep-container");
+
+        let mut spec = mesh_spec("consumer", 8080);
+        spec.requires = vec![local_requirement("replicator")];
+
+        let resp = post_deploy(state, &spec).await;
+
+        assert_eq!(resp.status(), StatusCode::FAILED_DEPENDENCY);
+        assert!(
+            rt.specs().is_empty(),
+            "the backend must never have been asked to run a workload whose \
+             local requirement is satisfied only remotely"
+        );
+    }
+
+    /// The same spec, the same registry, one address changed: the provider is
+    /// on this node, so the gate opens. This is the assertion that proves
+    /// `node_mesh_ip` is actually threaded through — flip the wiring to a
+    /// hardcoded `None` and this test fails while the one above still passes.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_requirement_is_satisfied_by_a_provider_on_this_node() {
+        let (_tmp, state, rt) = state_with_recording_runtime_on_node("100.64.0.7");
+        let dep = mesh_spec("replicator", 5432);
+        state
+            .service_records
+            .upsert_deployed(&dep, std::net::Ipv4Addr::new(100, 64, 0, 7), "dep-container");
+
+        let mut spec = mesh_spec("consumer", 8080);
+        spec.requires = vec![local_requirement("replicator")];
+
+        let resp = post_deploy(state, &spec).await;
+
+        assert_eq!(
+            rt.specs().len(),
+            1,
+            "a co-located provider satisfies `local` (status was {})",
+            resp.status()
+        );
+    }
+
+    /// W338 §Ordering and readiness. The record is still in the registry — a
+    /// retracted record is exactly the "present but not Ready" shape
+    /// `ServiceRecords::get` keeps answering for — and the gate must block on
+    /// it. Presence was the old rule; a WAL-replaying restore is why it was
+    /// wrong.
+    #[tokio::test(start_paused = true)]
+    async fn a_present_but_not_ready_record_does_not_satisfy_the_gate() {
+        let (_tmp, state, rt) = state_with_recording_runtime_on_node("100.64.0.7");
+        let dep = mesh_spec("db", 5432);
+        state
+            .service_records
+            .upsert_deployed(&dep, std::net::Ipv4Addr::new(100, 64, 0, 7), "dep-container");
+        state
+            .service_records
+            .retract(&workload_spec::MeshIdent("db".into()));
+        assert!(
+            state
+                .service_records
+                .get(&workload_spec::MeshIdent("db".into()))
+                .is_some(),
+            "the record must still be present — this test is about readiness, \
+             not about absence"
+        );
+
+        let mut spec = mesh_spec("consumer", 8080);
+        spec.depends_on = vec![workload_spec::MeshIdent("db".into())];
+
+        let resp = post_deploy(state, &spec).await;
+
+        assert_eq!(resp.status(), StatusCode::FAILED_DEPENDENCY);
+        assert!(rt.specs().is_empty(), "an unready dependency must block");
+    }
+
+    /// `EnvValue::FromMesh` is rendered from real registry state on the deploy
+    /// path. Before this ticket the resolver had no production caller at all,
+    /// so such a workload could not deploy: kamaji refuses an unresolved
+    /// `FromMesh` outright (`kamaji-bin/src/native.rs`).
+    ///
+    /// The rendered host is the record's `mesh_ip`, not the ident — nothing
+    /// publishes mesh idents into DNS, so the ident is not a dialable address.
+    #[tokio::test(start_paused = true)]
+    async fn from_mesh_env_is_rendered_from_the_service_record_before_the_backend_sees_it() {
+        let (_tmp, state, rt) = state_with_recording_runtime();
+        let dep = mesh_spec("db", 5432);
+        state
+            .service_records
+            .upsert_deployed(&dep, std::net::Ipv4Addr::new(100, 64, 0, 7), "dep-container");
+
+        let mut spec = mesh_spec("consumer", 8080);
+        spec.depends_on = vec![workload_spec::MeshIdent("db".into())];
+        spec.env = vec![workload_spec::EnvVar {
+            name: "DATABASE_URL".into(),
+            value: workload_spec::EnvValue::FromMesh {
+                ident: workload_spec::MeshIdent("db".into()),
+                kind: workload_spec::MeshLookup::Url,
+            },
+        }];
+
+        let resp = post_deploy(state, &spec).await;
+        let specs = rt.specs();
+        assert_eq!(specs.len(), 1, "deploy did not reach the backend (status {})", resp.status());
+
+        let rendered = specs[0]
+            .env
+            .iter()
+            .find(|e| e.name == "DATABASE_URL")
+            .expect("DATABASE_URL survived to the backend");
+        assert_eq!(
+            rendered.value,
+            workload_spec::EnvValue::Literal {
+                value: "http://100.64.0.7:5432".into()
+            },
+            "the backend must receive a literal, never an unresolved FromMesh"
+        );
+    }
+
+    /// A `FromMesh` reference to something that is not on the mesh is a
+    /// rejection, not a workload started with a broken environment.
+    #[tokio::test(start_paused = true)]
+    async fn an_unresolvable_from_mesh_reference_rejects_the_deploy() {
+        let (_tmp, state, rt) = state_with_recording_runtime();
+        let mut spec = mesh_spec("consumer", 8080);
+        spec.env = vec![workload_spec::EnvVar {
+            name: "DATABASE_URL".into(),
+            value: workload_spec::EnvValue::FromMesh {
+                ident: workload_spec::MeshIdent("nowhere".into()),
+                kind: workload_spec::MeshLookup::Url,
+            },
+        }];
+
+        let resp = post_deploy(state, &spec).await;
+
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = body_json(resp).await;
+        assert!(
+            body["error"].as_str().unwrap().contains("mesh env resolution"),
+            "error should name mesh env resolution, got: {}",
+            body["error"]
+        );
+        assert!(rt.specs().is_empty(), "backend must not be called");
+    }
+
+    // ── R860-T6: `supply = "self"` provisioning + the teardown cascade ───────
+    //
+    // Same posture as the R860-B3 tests above and for the same reason: every
+    // one of these drives the real `POST /workloads/deploy` / `POST
+    // /workloads/{ident}/destroy` through the router and asserts on what the
+    // BACKEND was handed. A test that called `self_supplied_providers` directly
+    // would prove the helper and nothing about whether a provider is actually
+    // stood up before its requirer.
+
+    async fn post_destroy(state: Arc<ServerState>, ident: &str) -> axum::response::Response {
+        build_router(state)
+            .oneshot(
+                Request::post(format!("/workloads/{ident}/destroy"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn self_supplied(ident: &str, provider: workload_spec::WorkloadSpec) -> workload_spec::Requirement {
+        workload_spec::Requirement {
+            ident: workload_spec::MeshIdent(ident.into()),
+            locality: workload_spec::Locality::Local,
+            supply: workload_spec::Supply::SelfProvision,
+            provides: Some(Box::new(provider)),
+        }
+    }
+
+    /// A requirement on a provider **someone else** declares and owns.
+    ///
+    /// R860-T2 changed the locality here from `local` to `anywhere`, which is
+    /// what these tests always meant. `local` was inert when they were written
+    /// — the gate did a plain presence check for every locality — and became
+    /// load-bearing the moment locality was enforced: these fixtures run on a
+    /// `ServerState` with no bind address, so `node_mesh_ip()` is `None`, and a
+    /// `local` requirement on a node that cannot say where it is now fails
+    /// closed (424) by design. Nothing in these three tests is about locality;
+    /// they are about `supply`, and `anywhere` is the locality of "belongs to
+    /// whoever declared it". The `local` axis is covered by
+    /// `a_local_requirement_is_refused_when_its_only_provider_is_on_another_node`
+    /// and its co-located twin.
+    fn waits_on(ident: &str) -> workload_spec::Requirement {
+        workload_spec::Requirement {
+            ident: workload_spec::MeshIdent(ident.into()),
+            locality: workload_spec::Locality::Anywhere,
+            supply: workload_spec::Supply::Wait,
+            provides: None,
+        }
+    }
+
+    /// Part 1 of the ticket, and W338's motivating case: the replicator the
+    /// headscale spec carries inline is stood up FIRST, on this node, and the
+    /// requirer follows it. Order is the assertion — a group whose members both
+    /// exist but started in the wrong order is exactly the bug the design is
+    /// meant to remove from `on_became_leader`.
+    #[tokio::test(start_paused = true)]
+    async fn a_self_supplied_provider_is_deployed_before_its_requirer() {
+        let (_tmp, state, rt) = state_with_recording_runtime();
+        let mut requirer = mesh_spec("headscale", 8080);
+        requirer.requires = vec![self_supplied(
+            "headscale-replicator",
+            mesh_spec("headscale-replicator", 9000),
+        )];
+
+        let resp = post_deploy(Arc::clone(&state), &requirer).await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "requirer deploy was refused: {}",
+            body_json(resp).await
+        );
+        assert_eq!(
+            rt.deploy_order(),
+            vec!["headscale-replicator".to_string(), "headscale".to_string()],
+            "the carried provider must reach the backend BEFORE its requirer"
+        );
+    }
+
+    /// W338 §"Each member keeps its own mesh identity" — the load-bearing
+    /// constraint. The provider is not folded into the requirer: it reaches the
+    /// backend as its own spec under its own identity and publishes its own
+    /// service record, which is what makes it independently discoverable and
+    /// what makes the `anywhere` locality expressible at all.
+    #[tokio::test(start_paused = true)]
+    async fn each_group_member_keeps_its_own_identity_and_service_record() {
+        let (_tmp, state, rt) = state_with_recording_runtime();
+        let mut requirer = mesh_spec("headscale", 8080);
+        requirer.requires = vec![self_supplied(
+            "headscale-replicator",
+            mesh_spec("headscale-replicator", 9000),
+        )];
+
+        post_deploy(Arc::clone(&state), &requirer).await;
+
+        for ident in ["headscale", "headscale-replicator"] {
+            let mesh_ident = workload_spec::MeshIdent(ident.into());
+            assert!(
+                state.service_records.get(&mesh_ident).is_some(),
+                "{ident} must have its OWN service record — collapsing the group \
+                 under one identity is what W338 forbids"
+            );
+            assert!(
+                state
+                    .archetype_registry
+                    .lock()
+                    .unwrap()
+                    .contains_key(ident),
+                "{ident} must be registered as a live workload in its own right"
+            );
+        }
+        assert_eq!(rt.specs().len(), 2, "two workloads, two specs, two identities");
+    }
+
+    /// The other half of Part 1, and the one that protects other people's
+    /// workloads: a `wait` requirement names a provider SOMEONE ELSE declares,
+    /// so the requirer must never deploy it — it may only wait for it.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_provider_is_never_deployed_by_its_requirer() {
+        let (_tmp, state, rt) = state_with_recording_runtime();
+        let dep = mesh_spec("headscale-db", 5432);
+        state.service_records.upsert_deployed(
+            &dep,
+            std::net::Ipv4Addr::new(100, 64, 0, 7),
+            "db-container",
+        );
+
+        let mut requirer = mesh_spec("headscale", 8080);
+        requirer.requires = vec![waits_on("headscale-db")];
+
+        let resp = post_deploy(Arc::clone(&state), &requirer).await;
+
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            rt.deploy_order(),
+            vec!["headscale".to_string()],
+            "a wait provider belongs to whoever declared it; the requirer must \
+             not stand one up"
+        );
+    }
+
+    /// The gate had been reading `spec.depends_on` alone, so a requirement
+    /// declared in `requires` was gated on nothing — which would have let a
+    /// requirer start ahead of the very provider W338 exists to order it
+    /// against. It now reads `effective_requirements()`, the one supported
+    /// accessor.
+    #[tokio::test(start_paused = true)]
+    async fn a_requires_declared_wait_provider_that_never_appears_refuses_the_deploy() {
+        let (_tmp, state, rt) = state_with_recording_runtime();
+        let mut requirer = mesh_spec("headscale", 8080);
+        requirer.requires = vec![waits_on("headscale-db")];
+
+        let resp = post_deploy(Arc::clone(&state), &requirer).await;
+
+        assert_eq!(resp.status(), StatusCode::FAILED_DEPENDENCY);
+        assert!(
+            rt.specs().is_empty(),
+            "the gate must cover `requires`, not only the legacy `depends_on`"
+        );
+    }
+
+    /// Part 2 — W338 §"Placement consequences" 4, both halves in one test
+    /// because the claim is a *distinction*: teardown cascades along `self`
+    /// edges and NEVER along `wait` edges. Cascading into the waited-on provider
+    /// would delete a workload this requirer never owned.
+    #[tokio::test(start_paused = true)]
+    async fn destroy_cascades_into_self_providers_and_leaves_wait_providers_standing() {
+        let (_tmp, state, rt) = state_with_recording_runtime();
+
+        // Somebody else's workload: present on the mesh and live in the
+        // registry, but declared and owned elsewhere.
+        let waited = mesh_spec("headscale-db", 5432);
+        state.service_records.upsert_deployed(
+            &waited,
+            std::net::Ipv4Addr::new(100, 64, 0, 7),
+            "db-container",
+        );
+        state
+            .archetype_registry
+            .lock()
+            .unwrap()
+            .insert("headscale-db".into(), LifecycleArchetype::Server);
+
+        let mut requirer = mesh_spec("headscale", 8080);
+        requirer.requires = vec![
+            self_supplied(
+                "headscale-replicator",
+                mesh_spec("headscale-replicator", 9000),
+            ),
+            waits_on("headscale-db"),
+        ];
+        assert_eq!(
+            post_deploy(Arc::clone(&state), &requirer).await.status(),
+            StatusCode::CREATED
+        );
+
+        let resp = post_destroy(Arc::clone(&state), "headscale").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["cascaded"],
+            serde_json::json!(["headscale-replicator"]),
+            "destroy must report exactly what it took with the requirer"
+        );
+
+        assert_eq!(
+            rt.teardown_order(),
+            vec!["headscale".to_string(), "headscale-replicator".to_string()],
+            "requirer first, then its self-supplied provider — and the waited-on \
+             provider not at all"
+        );
+        assert!(
+            !state
+                .archetype_registry
+                .lock()
+                .unwrap()
+                .contains_key("headscale-replicator"),
+            "the self-supplied provider must be fully deregistered, not just stopped"
+        );
+        assert!(
+            state
+                .archetype_registry
+                .lock()
+                .unwrap()
+                .contains_key("headscale-db"),
+            "the wait provider belongs to someone else and must still be standing"
+        );
+    }
+
+    /// Redeploying a requirer must not try to stand its sidecar up a second
+    /// time. For an Appliance provider the single-instance guard would answer
+    /// 409 and take the requirer's redeploy down with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_redeploy_does_not_stand_an_already_live_provider_up_again() {
+        let (_tmp, state, rt) = state_with_recording_runtime();
+        let mut requirer = mesh_spec("headscale", 8080);
+        requirer.archetype = Some(LifecycleArchetype::Server);
+        let mut provider = mesh_spec("headscale-replicator", 9000);
+        provider.archetype = Some(LifecycleArchetype::Appliance);
+        requirer.requires = vec![self_supplied("headscale-replicator", provider)];
+
+        assert_eq!(
+            post_deploy(Arc::clone(&state), &requirer).await.status(),
+            StatusCode::CREATED
+        );
+        let resp = post_deploy(Arc::clone(&state), &requirer).await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "redeploy was refused: {}",
+            body_json(resp).await
+        );
+        assert_eq!(
+            rt.deploy_order(),
+            vec![
+                "headscale-replicator".to_string(),
+                "headscale".to_string(),
+                "headscale".to_string()
+            ],
+            "the live provider must be left alone; only the requirer redeploys"
+        );
+    }
+
+    /// The R860-T4 gap this ticket inherited, at the handler that had it: the
+    /// per-workload archetype skip let a Server bound to an Appliance by a
+    /// `local` edge drain alone. The requirement graph the deploy handler now
+    /// records is what `drain_workloads` consults to refuse that.
+    #[tokio::test(start_paused = true)]
+    async fn a_deployed_group_records_the_membership_drain_consults() {
+        let (_tmp, state, _rt) = state_with_recording_runtime();
+        let mut requirer = mesh_spec("headscale", 8080);
+        requirer.archetype = Some(LifecycleArchetype::Appliance);
+        let mut provider = mesh_spec("headscale-replicator", 9000);
+        provider.archetype = Some(LifecycleArchetype::Server);
+        requirer.requires = vec![self_supplied("headscale-replicator", provider)];
+
+        post_deploy(Arc::clone(&state), &requirer).await;
+
+        let graph = state.requirement_graph.lock().unwrap();
+        assert_eq!(
+            crate::deploy::self_supply::group_blocking_drain(&graph, "headscale-replicator")
+                .as_deref(),
+            Some("headscale"),
+            "the Server must be undrainable because its group holds an Appliance"
         );
     }
 

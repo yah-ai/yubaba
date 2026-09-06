@@ -110,16 +110,62 @@ runcmd:
   # migration — new config emitter, and a replica written by 0.3 is not a
   # replica 0.5 reads — not a version bump. Checksums below were computed by
   # downloading these exact assets, not copied from the release page.
-  - sh -c 'case "$(dpkg --print-architecture)" in
-      amd64) LS_ARCH=amd64; LS_SHA=eb75a3de5cab03875cdae9f5f539e6aedadd66607003d9b1e7a9077948818ba0 ;;
-      arm64) LS_ARCH=arm64; LS_SHA=9585f5a508516bd66af2b2376bab4de256a5ef8e2b73ec760559e679628f2d59 ;;
-      *) echo "litestream: unsupported arch $(dpkg --print-architecture), skipping" >&2; exit 0 ;;
-      esac;
-      curl -fsSL -o /tmp/litestream.tar.gz "https://github.com/benbjohnson/litestream/releases/download/v0.3.13/litestream-v0.3.13-linux-${LS_ARCH}.tar.gz" &&
-      echo "${LS_SHA}  /tmp/litestream.tar.gz" | sha256sum -c - &&
-      tar -xzf /tmp/litestream.tar.gz -C /usr/local/bin litestream &&
-      chmod +x /usr/local/bin/litestream &&
-      rm -f /tmp/litestream.tar.gz'
+  # A BLOCK SCALAR, not a plain multi-line one: the `echo "litestream: ..."`
+  # below contains a colon-space, which YAML reads as a mapping indicator and
+  # which broke this template's parse when it was first written inline.
+  - |-
+    sh -c '
+      case "$(dpkg --print-architecture)" in
+        amd64) LS_ARCH=amd64; LS_SHA=eb75a3de5cab03875cdae9f5f539e6aedadd66607003d9b1e7a9077948818ba0 ;;
+        arm64) LS_ARCH=arm64; LS_SHA=9585f5a508516bd66af2b2376bab4de256a5ef8e2b73ec760559e679628f2d59 ;;
+        *) echo "litestream: unsupported arch, skipping" >&2; exit 0 ;;
+      esac
+      curl -fsSL -o /tmp/litestream.tar.gz \
+        "https://github.com/benbjohnson/litestream/releases/download/v0.3.13/litestream-v0.3.13-linux-${LS_ARCH}.tar.gz"
+      echo "${LS_SHA}  /tmp/litestream.tar.gz" | sha256sum -c -
+      tar -xzf /tmp/litestream.tar.gz -C /usr/local/bin litestream
+      chmod +x /usr/local/bin/litestream
+      rm -f /tmp/litestream.tar.gz
+    '
+  # headscale — the coordination server's own binary, on EVERY node rather than
+  # only the one that was promoted (R858-T4).
+  #
+  # Why every node: `headscale_appliance::appliance_spec` is a NATIVE workload,
+  # so kamaji forks `/var/lib/yah-cloud/headscale/headscale` and pulls nothing.
+  # Until now the binary arrived only via `POST /headscale/deploy` — the promote
+  # path — which is why us-west-001 had it (51,593,368 bytes, mtime Jun 22) and
+  # us-south-001 had no binary, no config.yaml and no DB. On 2026-09-03
+  # ownership moved to south anyway and the appliance ran nowhere for 37 hours.
+  # A moveable native appliance needs its executable to be a PROVISIONED
+  # PREREQUISITE on every candidate, not a side effect of having once been the
+  # coordinator. Staged and never started: leader.rs decides who runs it.
+  #
+  # Pinned to 0.23.0 — the same pin `cloud::mesh::HEADSCALE_VERSION` and
+  # `yubaba::DEFAULT_HEADSCALE_VERSION` already carry, kept in lockstep by
+  # convention like the config renderers (there is no dependency edge from this
+  # template to either constant, so a bump has to touch all three).
+  #
+  # Checksums were computed by DOWNLOADING these exact assets, not copied off
+  # the release page — the same standard the litestream block above records. The
+  # amd64 size matches the binary already on us-west-001 byte-for-byte, which is
+  # the corroboration that this is the asset the fleet is already running.
+  #
+  # A BLOCK SCALAR for the same reason as litestream's: the `echo "headscale:
+  # ..."` below contains a colon-space, which YAML reads as a mapping indicator.
+  - |-
+    sh -c '
+      case "$(dpkg --print-architecture)" in
+        amd64) HS_ARCH=amd64; HS_SHA=d9193dad4b070b9b3f6d54c8f14366952944b6e917672c0bc1dfd8f5491287a7 ;;
+        arm64) HS_ARCH=arm64; HS_SHA=99fa9b2944c50759882b578e78aa11968d6fdec9bbfeced88237a1138b89e9fe ;;
+        *) echo "headscale: unsupported arch, skipping" >&2; exit 0 ;;
+      esac
+      mkdir -p /var/lib/yah-cloud/headscale
+      curl -fsSL -o /tmp/headscale \
+        "https://github.com/juanfont/headscale/releases/download/v0.23.0/headscale_0.23.0_linux_${HS_ARCH}"
+      echo "${HS_SHA}  /tmp/headscale" | sha256sum -c -
+      mv /tmp/headscale /var/lib/yah-cloud/headscale/headscale
+      chmod +x /var/lib/yah-cloud/headscale/headscale
+    '
   # Channel goes into a drop-in (yubaba.service's ExecStart bakes the default args;
   # the channel is operator-tunable per node).
   - mkdir -p /etc/systemd/system/yubaba.service.d

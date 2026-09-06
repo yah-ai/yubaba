@@ -258,6 +258,7 @@ mod tests {
             addr: "100.64.0.1:7443".into(),
             region: region.map(str::to_string),
             capacity,
+            machine: None,
         }
     }
 

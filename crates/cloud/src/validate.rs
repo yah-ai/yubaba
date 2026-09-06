@@ -21,6 +21,9 @@
 //! - **LAN dial target** ([`check_lan_dial_targets`]) — a machine whose
 //!   `[connect].yubaba` is an RFC1918 literal, i.e. a break-glass address
 //!   sitting in the field every automated path dials (R605-T10).
+//! - **ingress floating IP** ([`check_ingress_floating_ip`]) — a machine whose
+//!   `ingress_floating_ip` no adapter can move, or two machines in one
+//!   `sovereign_group` naming *different* ingress IPs (R859-F2).
 //! - **ingress collation** ([`collate_workspace_ingress`]) — two services
 //!   whose declared edges cannot share the node they both front through
 //!   (W305/R742-F2). The only check here that is *inherently* cross-service:
@@ -662,6 +665,148 @@ pub fn check_lan_dial_targets(workspace_root: &Path) -> anyhow::Result<Vec<LanDi
     Ok(found)
 }
 
+// ── R859-F2: the ingress floating IP declaration ───────────────────────────
+
+/// A machine whose [`MachineConfig::ingress_floating_ip`] cannot mean what it
+/// says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngressFloatingIpProblem {
+    pub machine: String,
+    pub machine_toml: PathBuf,
+    pub kind: IngressFloatingIpProblemKind,
+}
+
+/// The three ways an `ingress_floating_ip` declaration can be wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngressFloatingIpProblemKind {
+    /// Present but blank — a key that reads as a declaration and is not one.
+    Blank,
+    /// The machine's `provider` has no floating-IP adapter, so nothing in this
+    /// codebase could ever move that IP.
+    NoAdapter { provider: String },
+    /// Another machine in the same `sovereign_group` names a *different*
+    /// ingress IP.
+    CohortDisagreement {
+        group: String,
+        this_ip: String,
+        other_machine: String,
+        other_ip: String,
+    },
+}
+
+impl IngressFloatingIpProblem {
+    pub fn message(&self) -> String {
+        let body = match &self.kind {
+            IngressFloatingIpProblemKind::Blank => {
+                "declares an empty `ingress_floating_ip`\n\
+                 \u{2192} an empty string is not \"no floating IP\" — omit the key entirely for \
+                 that, which is the normal case and a clean skip. A blank value reads as a \
+                 declaration and resolves to nothing."
+                    .to_string()
+            }
+            IngressFloatingIpProblemKind::NoAdapter { provider } => format!(
+                "declares an `ingress_floating_ip` but its provider is {provider:?}, which has \
+                 no floating-IP adapter\n\
+                 \u{2192} floating/reserved IPs are implemented for hetzner, ovh and vultr \
+                 (cloud::provider::floating_ip's registry). Nothing in this codebase can move \
+                 this IP, so the declaration is inert — and inert in the worst way, because it \
+                 reads as a working failover path.\n\
+                 \u{2192} if the box really does carry a public IP that never moves, that is \
+                 what the `public-ip` taint plus `[connect].address` already say."
+            ),
+            IngressFloatingIpProblemKind::CohortDisagreement {
+                group,
+                this_ip,
+                other_machine,
+                other_ip,
+            } => format!(
+                "declares `ingress_floating_ip = {this_ip:?}` but {other_machine} in the same \
+                 sovereign_group {group:?} declares {other_ip:?}\n\
+                 \u{2192} the ingress floating IP is ONE resource that moves between the boxes \
+                 of a cohort as ownership flips. Two ids means an ownership flip reassigns a \
+                 different IP than the one currently serving traffic — the old IP stays pointed \
+                 at the dead box and the new one was never in DNS.\n\
+                 \u{2192} the symptom is a failover that reports success and serves nothing, \
+                 which is why this is refused here rather than discovered during one."
+            ),
+        };
+        format!(
+            "machine {:?} {body}\n  {}",
+            self.machine,
+            self.machine_toml.display(),
+        )
+    }
+}
+
+/// Flag every `ingress_floating_ip` declaration that cannot do what it claims
+/// (R859-F2).
+///
+/// Same lint family and camp-local-only scoping as [`check_inert_taints`], for
+/// a failure that is quiet in the ordinary way and loud exactly once: nothing
+/// reads the field until public ingress moves, so a wrong declaration sits
+/// green for months and then fails during the one event it exists for.
+///
+/// **Absence is never a finding.** Most machines have no floating IP — mesh-only
+/// nodes, tunnel-fronted boxes, every provider without an adapter — and that is
+/// the normal shape, not an omission. Only a *present* declaration is judged.
+///
+/// Machines with no `sovereign_group` are exempt from the cohort check: with no
+/// group there is no cohort to disagree with, and two standalone boxes that
+/// happen to hold different IPs are two independent facts rather than one
+/// contradiction.
+pub fn check_ingress_floating_ip(
+    workspace_root: &Path,
+) -> anyhow::Result<Vec<IngressFloatingIpProblem>> {
+    let machines = load_machine_tomls(workspace_root, MachineLoadMode::Tolerant)?;
+    let mut found = Vec::new();
+
+    // First declaration seen per group, in load order — the one every later
+    // member of that group is compared against, so a cohort of N disagreeing
+    // machines yields N-1 findings pointing at one anchor rather than N^2
+    // pairwise ones.
+    let mut anchor: BTreeMap<String, (String, String)> = BTreeMap::new();
+
+    for (path, machine) in &machines {
+        let Some(ip) = machine.ingress_floating_ip.as_deref() else {
+            continue;
+        };
+        let mut push = |kind| {
+            found.push(IngressFloatingIpProblem {
+                machine: machine.name.clone(),
+                machine_toml: path.clone(),
+                kind,
+            })
+        };
+        if ip.trim().is_empty() {
+            push(IngressFloatingIpProblemKind::Blank);
+            continue;
+        }
+        if !crate::provider::provider_has_floating_ip_adapter(&machine.provider) {
+            push(IngressFloatingIpProblemKind::NoAdapter {
+                provider: machine.provider.clone(),
+            });
+        }
+        let Some(group) = machine.sovereign_group.as_deref() else {
+            continue;
+        };
+        match anchor.get(group) {
+            None => {
+                anchor.insert(group.to_string(), (machine.name.clone(), ip.to_string()));
+            }
+            Some((other_machine, other_ip)) if other_ip != ip => {
+                push(IngressFloatingIpProblemKind::CohortDisagreement {
+                    group: group.to_string(),
+                    this_ip: ip.to_string(),
+                    other_machine: other_machine.clone(),
+                    other_ip: other_ip.clone(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(found)
+}
+
 // ── R742-F2 (W305): ingress edge collation ─────────────────────────────────
 
 /// One mirror, loaded with the identity every finding has to be able to name.
@@ -1282,6 +1427,150 @@ mod tests {
         )
         .unwrap();
         assert_machine_toml_parses(&path);
+    }
+
+    // ── R859-F2: the ingress floating IP declaration ──────────────────────
+
+    /// `provider` and the sovereign/floating-IP stamp are what vary; everything
+    /// else is the minimum a `MachineConfig` deserializes from.
+    fn write_fip_machine(workspace: &Path, name: &str, provider: &str, stamp: &str) {
+        let dir = workspace.join(".yah/infra/machines");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.toml"));
+        std::fs::write(
+            &path,
+            format!("name = \"{name}\"\nprovider = \"{provider}\"\nmesh_tags = []\n{stamp}\n"),
+        )
+        .unwrap();
+        assert_machine_toml_parses(&path);
+    }
+
+    /// The normal case, and it must be silent: most machines have no floating
+    /// IP, and a lint that fires on every mesh-only box is one an operator
+    /// learns to ignore.
+    #[test]
+    fn a_machine_with_no_ingress_floating_ip_is_never_flagged() {
+        let dir = tempdir().unwrap();
+        write_fip_machine(dir.path(), "us-west-002", "static", "");
+        write_fip_machine(dir.path(), "n1", "digitalocean", "");
+        assert!(check_ingress_floating_ip(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_valid_declaration_on_an_adapter_backed_provider_is_clean() {
+        let dir = tempdir().unwrap();
+        write_fip_machine(
+            dir.path(),
+            "us-west-001",
+            "hetzner",
+            "ingress_floating_ip = \"42\"",
+        );
+        assert!(check_ingress_floating_ip(dir.path()).unwrap().is_empty());
+    }
+
+    /// The declaration that reads as a working failover path and is not one.
+    #[test]
+    fn a_provider_with_no_floating_ip_adapter_is_flagged_with_what_is_supported() {
+        let dir = tempdir().unwrap();
+        write_fip_machine(
+            dir.path(),
+            "us-east-001",
+            "static",
+            "ingress_floating_ip = \"51.81.85.200\"",
+        );
+        let found = check_ingress_floating_ip(dir.path()).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].kind,
+            IngressFloatingIpProblemKind::NoAdapter {
+                provider: "static".into()
+            }
+        );
+        let msg = found[0].message();
+        assert!(msg.contains("us-east-001"), "{msg}");
+        assert!(msg.contains("hetzner"), "the message must name what IS supported: {msg}");
+        assert!(msg.ends_with("us-east-001.toml"), "{msg}");
+    }
+
+    /// An empty string is a declaration that resolves to nothing — distinct
+    /// from omitting the key, which is the supported "no floating-IP path".
+    #[test]
+    fn a_blank_declaration_is_flagged_rather_than_read_as_absent() {
+        let dir = tempdir().unwrap();
+        write_fip_machine(
+            dir.path(),
+            "us-west-001",
+            "hetzner",
+            "ingress_floating_ip = \"  \"",
+        );
+        let found = check_ingress_floating_ip(dir.path()).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].kind, IngressFloatingIpProblemKind::Blank);
+    }
+
+    /// The failure this check exists for: one IP moves between the boxes of a
+    /// cohort, so two ids means a failover reassigns an IP that is not the one
+    /// serving traffic — a flip that reports success and serves nothing.
+    #[test]
+    fn two_ids_in_one_sovereign_group_are_refused_and_name_both_machines() {
+        let dir = tempdir().unwrap();
+        write_fip_machine(
+            dir.path(),
+            "us-east-001",
+            "hetzner",
+            "sovereign_group = \"prod\"\ningress_floating_ip = \"42\"",
+        );
+        write_fip_machine(
+            dir.path(),
+            "us-west-001",
+            "hetzner",
+            "sovereign_group = \"prod\"\ningress_floating_ip = \"77\"",
+        );
+        let found = check_ingress_floating_ip(dir.path()).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        let msg = found[0].message();
+        assert!(msg.contains("us-west-001") && msg.contains("us-east-001"), "{msg}");
+        assert!(msg.contains("42") && msg.contains("77"), "{msg}");
+    }
+
+    #[test]
+    fn one_id_across_a_whole_cohort_is_clean() {
+        let dir = tempdir().unwrap();
+        for name in ["us-east-001", "us-west-001", "us-south-001"] {
+            write_fip_machine(
+                dir.path(),
+                name,
+                "hetzner",
+                "sovereign_group = \"prod\"\ningress_floating_ip = \"42\"",
+            );
+        }
+        assert!(check_ingress_floating_ip(dir.path()).unwrap().is_empty());
+    }
+
+    /// Two standalone boxes holding different IPs are two independent facts,
+    /// not one contradiction — there is no cohort for them to disagree within.
+    #[test]
+    fn machines_in_no_group_may_hold_different_ips() {
+        let dir = tempdir().unwrap();
+        write_fip_machine(
+            dir.path(),
+            "us-east-001",
+            "hetzner",
+            "ingress_floating_ip = \"42\"",
+        );
+        write_fip_machine(
+            dir.path(),
+            "us-west-001",
+            "vultr",
+            "ingress_floating_ip = \"a-uuid\"",
+        );
+        assert!(check_ingress_floating_ip(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn missing_machines_dir_is_not_error_for_ingress_floating_ip() {
+        let dir = tempdir().unwrap();
+        assert!(check_ingress_floating_ip(dir.path()).unwrap().is_empty());
     }
 
     #[test]

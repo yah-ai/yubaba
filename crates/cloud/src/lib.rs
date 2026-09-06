@@ -269,6 +269,7 @@ pub mod reconciler;
 pub mod release_manifest;
 pub mod state;
 pub mod status;
+pub mod topology;
 pub mod validate;
 
 pub use almanac_dispatch::dispatch_on_change;
@@ -306,7 +307,8 @@ pub use reconciler::{
     execute_prune, load_service_and_mirror, mesofact_static::WORKER_SCRIPT, new_sync_id,
     pond::MINIFLARE_SIM_SCRIPT, publish_to_pond, summarize, CellStatus, CloudflareWorkerReconciler,
     ContainerOptions, ContainerReconciler, DeriveCacheLiveHashes, DerivePruneCandidate, DriftEntry,
-    HealthState, LocalProcessReconciler, LocalStaticOptions, MesofactStaticReconciler,
+    HeadscaleReconciler, HealthState, LocalProcessReconciler, LocalStaticOptions,
+    MesofactStaticReconciler,
     MirrorObservation, PondOptions, PondPublishReport, PondState, ProviderScope, PruneCandidate,
     PruneOutcome, PruneReport, ReconcileCtx, Reconciler, RunningWorkload, RunningWorkloadSummary,
     Runtime, ServiceStatus, StaticAssetReconciler, StatusSummary, SyncHistoryEntry, SyncOutcome,

@@ -265,6 +265,14 @@ fn parse_u64(
 /// "the bucket is unreachable" into "no cert yet, order one", which is why
 /// [`ObjectCertStore::read_secret`] returns a `Result<Option<_>>` and this takes
 /// only the `Option`.
+///
+/// SAN coverage is deliberately not an input ([`acme_engine::CertSans::NotChecked`]),
+/// and unlike the fleet issuer's use of that variant this one is audited, not
+/// an open bug: a tenant order is always exactly `vec![domain]` (see
+/// [`issue_domain`]), derived from the enrollment key rather than from operator
+/// config, so there is no widening for a coverage check to catch. If a tenant
+/// cert ever gains a second SAN — a `www.` alias, say — this becomes the same
+/// silent-stale-cert hole as R853-B8 and must pass [`acme_engine::CertSans::Known`].
 pub fn needs_issuance(
     cert: Option<&SecretRecord>,
     cert_lifetime: Duration,
@@ -273,12 +281,15 @@ pub fn needs_issuance(
 ) -> bool {
     match cert {
         None => true,
-        Some(rec) => acme_engine::is_renewal_due(
+        Some(rec) => acme_engine::renewal_decision(
+            acme_engine::CertSans::NotChecked,
+            &[],
             UNIX_EPOCH + Duration::from_secs(rec.updated_at),
             cert_lifetime,
             renew_before,
             now,
-        ),
+        )
+        .is_due(),
     }
 }
 
@@ -473,6 +484,19 @@ async fn consider_domain(
     }
 }
 
+/// The identifiers one tenant order covers: exactly the enrolled domain.
+///
+/// Extracted as its own function only so the invariant is *pinned by a test*
+/// rather than asserted in prose — it is what makes [`needs_issuance`]'s
+/// `CertSans::NotChecked` an audited choice instead of R853-B9 repeated here.
+/// This list is derived from the enrollment key, never from operator config, so
+/// there is no widening for a coverage check to catch. **If this ever returns
+/// more than one name** (a `www.` alias, say), that reasoning dies with it and
+/// `needs_issuance` must start passing `CertSans::Known`.
+fn order_identifiers(domain: &str) -> Vec<String> {
+    vec![domain.to_string()]
+}
+
 /// One ACME order for exactly one identifier.
 ///
 /// No wildcard, no SAN list: a tenant domain gets a cert for itself. A SAN list
@@ -484,7 +508,7 @@ async fn issue_domain(
     domain: &str,
 ) -> Result<acme_engine::Issued, acme_engine::AcmeError> {
     let mut issue = cfg.issue.clone();
-    issue.domains = vec![domain.to_string()];
+    issue.domains = order_identifiers(domain);
     // DNS-01 needs no HTTP-01 token map, but the engine's signature takes one.
     let tokens: acme_engine::ChallengeTokens = Arc::new(RwLock::new(HashMap::new()));
     acme_engine::issue(&issue, &tokens).await
@@ -678,7 +702,19 @@ mod tests {
             updated_at: now.saturating_sub(days * 86_400),
             access: SecretAccess::AllowAny,
             digest: None,
+            sans: None,
         }
+    }
+
+    /// R853-B9 asked whether this issuer needs the fleet issuer's coverage
+    /// check. It does not, and this is the reason, pinned rather than argued:
+    /// a tenant order is exactly its own domain, derived from the enrollment
+    /// key, so config cannot drift ahead of the cert. Widen this and
+    /// `needs_issuance` must switch to `CertSans::Known`.
+    #[test]
+    fn a_tenant_order_covers_exactly_its_own_domain_and_nothing_else() {
+        assert_eq!(order_identifiers("shop.tenant.io"), vec!["shop.tenant.io"]);
+        assert_eq!(order_identifiers("tenant.io"), vec!["tenant.io"]);
     }
 
     const LIFETIME: Duration = Duration::from_secs(90 * 86_400);

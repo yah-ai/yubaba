@@ -302,6 +302,11 @@ async fn build(
             state_machine.clone(),
             region.clone(),
             Some(HARNESS_CAPACITY),
+            // R859-F2: the harness runs several nodes in one process, so
+            // `/etc/hostname` would give every one of them the same answer and
+            // make `node_for_machine` ambiguous. Publish a per-node stand-in
+            // instead — the production derivation is `leader::derive_machine_name`.
+            Some(format!("harness-node-{node_id}")),
         )
     } else {
         tokio::spawn(async {})

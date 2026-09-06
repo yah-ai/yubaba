@@ -65,6 +65,16 @@
 //!   from). Two nodes racing the same domain: one wins the `IfAbsent` put, the
 //!   other backs off; a dead holder's claim expires and is stolen under
 //!   `IfMatch`.
+//!
+//! @yah:ticket(R870-F1, "The :80 tier is single-tenant: build the HTTP Host-router that renders off Enrollment::http_backend")
+//! @yah:at(2026-09-05T20:31:19Z)
+//! @yah:status(open)
+//! @yah:phase(P1)
+//! @yah:parent(R870)
+//! @yah:next("THE GAP, verified in source not inherited from the doc. cert_store.rs render_demux_routes renders ONLY tls_backend, and its own doc comment states the intended shape: \"When an HTTP tier lands it gets its own render off Enrollment::http_backend rather than a second column here — the demux parser takes host=addr, and widening that format would break every existing PASSWAY_DEMUX_ROUTES string.\" Enrollment::http_backend exists (cert_store.rs:357), is settable via with_http_backend, is carried through domain_admin.rs:487-494 and surfaced in yubaba main.rs:1429 JSON — and NOTHING routes on it. Grep is conclusive: every http_backend hit is a carrier, none is a consumer.")
+//! @yah:next("THE CONSEQUENCE, which is why this is P1 and not cleanup: passway owns 0.0.0.0:80 DIRECTLY on each origin for the 308 redirect (PASSWAY_HTTP_REDIRECT_BIND, added on south by R853-T2), and the SNI demux only speaks TLS. So :80 has no fan-in tier at all. Tenant #2 — noisetable.com is the live case — gets no scheme-less redirect: every `curl noisetable.com/install.sh` and every scheme-less URL it documents is refused, while the identical yah.dev command works. https:// is unaffected.")
+//! @yah:next("DO NOT ADD A TLS LIBRARY OR A BUCKET CLIENT TO THE :443 DEMUX WHILE DOING THIS. The R777 invariant is that the demux holds no key and sees no plaintext; W267 §\"custom domains validate by DNS-01\" also records that keeping a SECOND protocol off the edge was the reason DNS-01 CNAME delegation was chosen over HTTP-01. An :80 router is a separate process with its own route render — it parses HTTP, so it must not share the :443 binary.")
+//! @arch:see(.yah/docs/working/W267-sovereign-public-ingress.md)
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -903,6 +913,7 @@ mod tests {
             updated_at: 1_700_000_000,
             access: SecretAccess::AllowAny,
             digest: None,
+            sans: None,
         }
     }
 

@@ -80,6 +80,7 @@ fn serving_spec(name: &str, ports: Vec<u16>) -> WorkloadSpec {
             ephemeral_storage_mb: 128,
         },
         depends_on: vec![],
+        requires: vec![],
         healthcheck: None,
         restart_policy: RestartPolicy::Never,
         archetype: None,

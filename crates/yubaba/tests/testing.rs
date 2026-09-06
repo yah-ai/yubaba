@@ -6,3 +6,4 @@ mod integration_operator_bridge;
 mod integration_ownership_smoke;
 mod integration_redeploy_failure;
 mod integration_service_records;
+mod raft_appliance_ownership;

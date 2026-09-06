@@ -98,8 +98,7 @@ pub use tenant_ownership::LocalOwnership;
 pub mod solo_node;
 pub use solo_node::{
     solo_node, solo_node_in_cell, solo_node_in_region, solo_node_in_sovereign_group,
-    solo_node_unregistered, solo_node_with_sovereign_role, SoloNode,
-    HARNESS_CAPACITY,
+    solo_node_unregistered, solo_node_with_sovereign_role, SoloNode, HARNESS_CAPACITY,
 };
 
 // ── MeshResponse ─────────────────────────────────────────────────────────────
@@ -281,6 +280,23 @@ struct ClusterNode {
     /// timings the rest of the cluster is running — a node that came back with
     /// different election bounds would campaign against peers that had not.
     policy: ClusterPolicy,
+    /// The live `ServerState` this node's router was built on (local tier).
+    ///
+    /// Held so a test can spawn the daemon loops the harness deliberately does
+    /// **not** spawn for it — `leader::spawn` is the one R858-T3 needs, the
+    /// same way `raft_leader_pin` spawns `leader_pin` and `raft_tenant_placement`
+    /// spawns schedulers. Replaced by [`Cluster::restart_node`], because a
+    /// restart builds a genuinely new `ServerState` and a test holding the old
+    /// one would be asserting against a dead process's memory.
+    state: Option<Arc<yubaba::ServerState>>,
+    /// This node's headscale state dir (local tier) — a path inside the node's
+    /// tempdir rather than the on-host `/var/lib/yah-cloud/headscale` default.
+    ///
+    /// Carried per node so `restart_node` re-binds the *same* dir: the whole
+    /// point of an appliance-restart test is that on-disk state outlives the
+    /// process, and a restarted node pointed at a fresh dir would prove the
+    /// opposite of what it was written to prove.
+    headscale_dir: Option<PathBuf>,
 }
 
 // ── Cluster ───────────────────────────────────────────────────────────────────
@@ -331,6 +347,24 @@ impl Cluster {
     /// Panics if `idx >= self.node_count()`.
     pub fn yubaba(&self, idx: usize) -> &WardenHandle {
         &self.nodes[idx].yubaba
+    }
+
+    /// The live `ServerState` behind node `idx`'s router (local tier,
+    /// multi-node), for a test that needs to spawn a daemon loop the harness
+    /// leaves to its callers.
+    ///
+    /// **Re-read it after [`Self::restart_node`]** — a restart builds a new
+    /// `ServerState`, and the handle you held is the dead process's.
+    ///
+    /// `None` on the smoke tier, where the state lives in another process.
+    pub fn server_state(&self, idx: usize) -> Option<Arc<yubaba::ServerState>> {
+        self.nodes[idx].state.clone()
+    }
+
+    /// Node `idx`'s headscale state dir — the tempdir path its `ServerState`
+    /// was pointed at, stable across [`Self::restart_node`].
+    pub fn headscale_dir(&self, idx: usize) -> Option<PathBuf> {
+        self.nodes[idx].headscale_dir.clone()
     }
 
     /// Number of nodes in this cluster.
@@ -521,10 +555,19 @@ impl Cluster {
         // registry is also deliberately raft-free.
         let rpo_registry = Arc::new(yubaba::lease_detector::RpoWatermarkRegistry::new());
 
+        // Same dir the node was founded with — see `ClusterNode::headscale_dir`.
+        // A restarted node pointed at a fresh dir loses the on-disk state whose
+        // survival is the point of restarting it.
+        let headscale_dir = node.headscale_dir.clone();
+
+        let mut builder = yubaba::ServerState::load(state_path)
+            .with_context(|| format!("restart_node: load state for node {idx}"))?
+            .with_runtime(runtime);
+        if let Some(dir) = headscale_dir {
+            builder = builder.with_headscale_dir(dir);
+        }
         let state = Arc::new(
-            yubaba::ServerState::load(state_path)
-                .with_context(|| format!("restart_node: load state for node {idx}"))?
-                .with_runtime(runtime)
+            builder
                 .with_cluster_policy(policy)
                 .with_raft(raft.clone())
                 .with_node_id(node_id)
@@ -558,6 +601,9 @@ impl Cluster {
         node.state_machine = Some(state_machine);
         node.lease_detector = Some(leases);
         node.rpo_registry = Some(rpo_registry);
+        // The old handle belongs to a process that no longer exists; a test
+        // that kept asserting against it would be reading a corpse's memory.
+        node.state = Some(state);
         Ok(())
     }
 
@@ -795,8 +841,45 @@ where
     if std::env::var("YAH_SMOKE").as_deref() == Ok("1") {
         test_cluster_smoke(provider, nodes).await
     } else {
-        test_cluster_local(runtime, nodes, policy).await
+        let runtime: Arc<dyn kamaji::Kamaji + Send + Sync> = Arc::new(runtime);
+        let runtimes = (0..nodes).map(|_| Arc::clone(&runtime)).collect();
+        test_cluster_local(runtimes, policy).await
     }
+}
+
+/// [`test_cluster_with_policy`], but giving **each node its own supervisor**
+/// instead of sharing one across the cluster (R858-T7).
+///
+/// # Why one shared runtime is not always honest
+///
+/// Sharing is fine — and is what every other suite does — as long as no
+/// assertion turns on *which* node a workload is running on. `raft_appliance_
+/// ownership`'s own module doc makes exactly that argument for its restart test:
+/// the answer is only consulted on the owner, so a shared registry cannot
+/// manufacture a pass.
+///
+/// It stops being fine the moment the property under test is "**exactly one**
+/// node is serving this", which is R858-T7's whole subject. Under one registry
+/// the two coordinators a fence exists to prevent are indistinguishable from one
+/// — they collapse onto a single entry under a single `MeshIdent` — and, worse,
+/// a *correct* fence fails the test: the resurrected node's `teardown_workload`
+/// deletes the very instance the new owner just deployed. A harness that turns a
+/// correct implementation red is not a strict test, it is a broken one.
+///
+/// `runtimes.len()` must equal the node count; the cluster is that long.
+pub async fn test_cluster_with_runtimes<P>(
+    provider: &P,
+    runtimes: Vec<Arc<dyn kamaji::Kamaji + Send + Sync>>,
+    policy: ClusterPolicy,
+) -> Result<Cluster>
+where
+    P: MachineProvider + Clone + Send + Sync + 'static,
+{
+    if std::env::var("YAH_SMOKE").as_deref() == Ok("1") {
+        let nodes = runtimes.len();
+        return test_cluster_smoke(provider, nodes).await;
+    }
+    test_cluster_local(runtimes, policy).await
 }
 
 // ── Local tier ────────────────────────────────────────────────────────────────
@@ -811,15 +894,14 @@ where
 /// Raft messages flow over HTTP between the in-process servers. The raft network
 /// uses `BasicNode.addr` = `"127.0.0.1:{port}"` which the `YubabaNetworkFactory`
 /// wraps as `"http://127.0.0.1:{port}"`.
-async fn test_cluster_local<R>(runtime: R, nodes: usize, policy: ClusterPolicy) -> Result<Cluster>
-where
-    R: kamaji::Kamaji + 'static,
-{
+async fn test_cluster_local(
+    runtimes: Vec<Arc<dyn kamaji::Kamaji + Send + Sync>>,
+    policy: ClusterPolicy,
+) -> Result<Cluster> {
+    let nodes = runtimes.len();
     if nodes == 0 {
         bail!("test_cluster_local: nodes must be >= 1");
     }
-
-    let runtime: Arc<dyn kamaji::Kamaji + Send + Sync> = Arc::new(runtime);
 
     let mut tmp_dirs: Vec<tempfile::TempDir> = Vec::with_capacity(nodes);
     let mut ports: Vec<u16> = Vec::with_capacity(nodes);
@@ -881,9 +963,17 @@ where
             None
         };
 
+        // Redirect headscale's state dir into this node's tempdir. The default
+        // is `/var/lib/yah-cloud/headscale`, which a test must never write to
+        // and cannot write to on a dev machine anyway.
+        let headscale_dir = tmp_dirs[i].path().join("headscale");
+        std::fs::create_dir_all(&headscale_dir)
+            .with_context(|| format!("creating headscale dir for node {i}"))?;
+
         let mut srv_state = yubaba::ServerState::load(state_path.clone())
             .with_context(|| format!("loading yubaba state for node {i}"))?
-            .with_runtime(Arc::clone(&runtime));
+            .with_runtime(Arc::clone(&runtimes[i]))
+            .with_headscale_dir(headscale_dir.clone());
 
         let mut lease_detector = None;
         let mut rpo_registry = None;
@@ -937,8 +1027,10 @@ where
             port: Some(port),
             node_id: node_id_opt,
             state_path: Some(state_path),
-            runtime: Some(Arc::clone(&runtime)),
+            runtime: Some(Arc::clone(&runtimes[i])),
             policy,
+            state: Some(state),
+            headscale_dir: Some(headscale_dir),
         });
     }
 
@@ -1093,6 +1185,10 @@ where
             // own `--cluster-profile` flag; this field is only read by
             // `restart_node`, which is local-tier-only.
             policy: HARNESS_POLICY,
+            // Both live in the smoke node's own process, out of reach from here
+            // — same reasoning as `runtime` and `state_path` above.
+            state: None,
+            headscale_dir: None,
         });
     }
 

@@ -81,6 +81,7 @@ fn operator_workload_spec(name: &str, tag: &str, port: u16) -> WorkloadSpec {
             ephemeral_storage_mb: 128,
         },
         depends_on: vec![],
+        requires: vec![],
         healthcheck: None,
         restart_policy: RestartPolicy::Always,
         archetype: None,

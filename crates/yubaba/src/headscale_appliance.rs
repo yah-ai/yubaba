@@ -48,15 +48,41 @@
 //!
 //! ## What is NOT here
 //!
-//! No `noise_private.key` handling. That key is the appliance's *identity*,
-//! not its data: move the appliance without it and every node's stored server
-//! identity mismatches at once. It travels through R600 / W273's
-//! raft-replicated cluster secret store (`SecretRef::Cluster` +
-//! `SecretMount` Cluster→File), the same path the TLS certs use. Do not invent
-//! a second secret channel for it.
+//! No `noise_private.key` handling, and `secrets` stays empty **on purpose**.
+//! That key is the appliance's *identity*, not its data: move the appliance
+//! without it and every node's stored server identity mismatches at once. It
+//! travels through R600 / W273's raft-replicated cluster secret store — but
+//! R858-T2 measured that a `SecretRef::Cluster` + `SecretMount` Cluster→File
+//! declaration here would be a silent no-op, because
+//! `deploy::secret_mount::materialize_file_secrets` runs only under
+//! `POST /workloads/deploy` and [`crate::leader::start_headscale`] deploys
+//! straight through the backend. So the read happens in `start_headscale`
+//! instead, before the appliance starts, and the bytes land in the *persistent*
+//! `headscale_dir` rather than on `/run/yah/secrets` tmpfs. Both halves live in
+//! [`crate::headscale_state`]. Do not add a `secrets` entry here expecting it to
+//! fire, and do not invent a second secret channel.
 //!
 //! [`RestartPolicy::Always`]: workload_spec::RestartPolicy::Always
 //! [`NATIVE_EXEC_ANNOTATION`]: workload_spec::NATIVE_EXEC_ANNOTATION
+//!
+//! @yah:ticket(R858-T2, "Carry headscale's noise_private.key through the cluster secret store so the appliance keeps its identity across a move")
+//! @yah:at(2026-09-04T23:42:36Z)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:parent(R858)
+//! @yah:next("Tier: Wizard — getting this wrong is silent and fleet-wide, and the failure is worse than the outage it prevents.")
+//! @yah:gotcha("MEASURED ON THE BOX 2026-09-04: /var/lib/yah-cloud/headscale/noise_private.key is 72 bytes, mode 0600, mtime Jun 22, and exists ONLY on us-west-001's local disk. It is the appliance's IDENTITY, not its data — move the appliance without it and EVERY node's stored server identity mismatches at once. That is silent and fleet-wide, i.e. WORSE than the R858 outage, because a restored DB plus a fresh noise key produces a headscale that runs, looks healthy, and rejects every node.")
+//! @yah:gotcha("LITESTREAM STRUCTURALLY CANNOT CARRY THIS AND DO NOT INVENT A SECOND SECRET CHANNEL. Both headscale_appliance.rs's module docs (\"What is NOT here\") and litestream.rs's own gotcha already name the mechanism: R600/W273's raft-replicated cluster secret store, SecretRef::Cluster + SecretMount Cluster->File, the same path the TLS certs use. litestream replicates the sqlite DB and nothing else. Note the native-exec interaction: headscale runs fork+exec'd on the host with no mount namespace, so a File-target secret mount materializes to /run/yah/secrets/<ident>/ (yubaba.service grants RuntimeDirectory=yah/secrets for exactly this) and the appliance must be pointed at it rather than at a bind that a native workload has no namespace to receive.")
+//! @yah:next("DO R858-T1 FIRST — it shrinks this ticket before you start it. Today the state that must survive a move is {headscale.db, noise_private.key, acme-cache}. Once TLS terminates at the passway doors, the ACME cache stops being state at all, leaving exactly two items: the DB (litestream, built in R858) and this key. Starting here instead means designing carriage for a third artifact that is about to stop existing.")
+//! @yah:verify("The acceptance test is the operator's rehearsal, not a unit test: with the key carried, bring us-west-001 down and confirm the headscale that comes up elsewhere is accepted by an EXISTING node — i.e. a node that never re-registered still reaches the tailnet. A fresh node joining proves nothing here; the failure this ticket prevents is specifically that already-registered nodes reject the new server identity.")
+//! @yah:gotcha("A FOURTH PIECE OF STATE NOBODY HAS ENUMERATED: `acls.yaml` (77 bytes, mtime Jun 22) sits in /var/lib/yah-cloud/headscale/ beside the DB and the noise key. litestream replicates ONLY headscale.db, so this file is carried by nothing — not the DB, not litestream, not the cluster secret store. A failover to a node without it gets a coordinator with different ACLs, and unlike the noise-key failure that would look healthy AND partially work, which is worse to diagnose. CONFIRM BEFORE ACTING: headscale 0.23 can source policy from a file OR from the database depending on its policy mode, and the config block I read did not include a `policy:` section — so establish whether this file is live or vestigial (`grep -i policy /var/lib/yah-cloud/headscale/config.yaml` on us-west-001) before designing carriage for it. If it IS live it belongs in this ticket's scope; if it is vestigial, delete it so the next reader does not re-discover the same question. Either way the general lesson stands: the appliance's state was enumerated as \"the DB plus the identity\" and that enumeration was incomplete — walk the whole state dir rather than trusting the list.")
+//! @yah:next("THE ACLS HALF HAS ITS OWN HOME NOW — R861-T1. If ACLs turn out to be declared and reconciled there, acls.yaml stops being state this ticket has to carry at all: declared config is regenerated on the new node rather than replicated to it, which is strictly better than carrying a file. Do not build carriage for it here until R861-T1 has answered whether the file is even live. The noise key is different and stays in this ticket's scope — it is an IDENTITY, not config, and cannot be regenerated by definition.")
+//! @yah:notify_on(R861-T1, "ACLS QUESTION ANSWERED — do not re-run the SSH check this ticket's gotcha asks for. Measured on us-west-001 2026-09-04 by @Ashguard:griffin: config.yaml lines 32-34 are `policy:` / `mode: file` / `path: /var/lib/yah-cloud/headscale/acls.yaml`, so acls.yaml is LIVE, not vestigial, and all three in-tree renderers emit the same. Practical consequence for THIS ticket: while the fleet stays in file mode, acls.yaml is still state a move must carry alongside noise_private.key — R861-T1's reconciler makes drift LOUD but cannot push a policy in file mode (headscale refuses; only database mode accepts PUT /api/v1/policy). It stops being carriable state only once policy.mode flips to database, which R861-T1 deliberately left as an operator call tied to the rehearsal. So keep acls.yaml in your enumeration for now, and drop it the day that flip lands.")
+//! @yah:handoff("DONE — the noise key now travels through the raft-replicated cluster secret store, and the appliance refuses to start with the wrong identity rather than starting and silently rejecting the fleet. New module oss/yubaba/crates/yubaba/src/headscale_state.rs holds the SINGLE writer for headscale_dir (write_state_file, owner-only 0600), now also used by the write_b64! macro behind POST /headscale/deploy so there is one write site rather than two. materialize_noise_key is called by start_headscale BEFORE either deploy path, via a ClusterResolver bound to SecretConsumer::of(&appliance_spec). Failure behaviour is loud by design, which is the other half of this relay's lesson: a store-held key that cannot be written or decrypted REFUSES TO START (starting with a wrong identity is worse than not starting); store-lacks-it-but-disk-has-it and store-lacks-it-and-no-disk both log at ERROR naming the seed command and carry on. Nothing ever auto-seeds the store from local disk — during a split-brain the losing node would otherwise publish its own identity over the real one. Seeding rail uses the existing verb, no new one invented: secret name headscale/noise-private-key, vault slot headscale-noise-private-key, declaration written at .yah/infra/secrets/headscale-noise-private-key.toml (encoding utf8, access workloads=[{workload=\"headscale\"}], target /var/lib/yah-cloud/headscale/noise_private.key mode 0o600).")
+//! @yah:handoff("Tree anchor at handoff: 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2 — the shared tree as I left it. Diff against it (`git diff 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:gotcha("THIS TICKET'S ORIGINAL DESIGN WOULD HAVE SHIPPED A SILENT NO-OP — do not restore it. The ticket said to declare a SecretRef::Cluster + File-target mount on appliance_spec the way the TLS certs do. Measured: materialize_file_secrets (oss/yubaba/crates/yubaba/src/deploy/secret_mount.rs:88) has EXACTLY ONE production caller, deploy_workload_spec behind POST /workloads/deploy (lib.rs:3708); every other reference is #[cfg(test)]. And start_headscale (leader.rs:357) deploys straight through backend.deploy_workload, deliberately bypassing that handler — its own comment at leader.rs:~382 says so. So `secrets: vec![...]` on appliance_spec would have changed nothing at runtime while reviewing as correct. SECOND reason the original design was wrong: a carriage channel ALREADY EXISTED — POST /headscale/deploy takes noise_key_base64 and writes the file (lib.rs:4678), and app/yah/cli/src/mesh.rs:989 reads it for a transplant — so the ticket's own \"do not invent a second secret channel\" instruction was violated by the ticket's own proposal. THIRD: the File-mount route would have opened a real hole. /run/yah/secrets is TMPFS (HOST_ROOT at oss/yah-base/crates/workload-spec/src/lib.rs:3650, RuntimeDirectory=yubaba yah/secrets at app/yah/cli/resources/yubaba.service:154-156), so it is wiped on reboot and a native fork+exec'd headscale starting before yubaba re-materialized would find no key at all. Writing to the persistent headscale_dir instead is why this needed no config-generator change.")
+//! @yah:gotcha("TWO QUESTIONS SETTLED BY MEASUREMENT SO NOBODY RE-OPENS THEM. (1) private.key, which sits beside the noise key in all three generators, is NOT identity-bearing and needs NO carriage — headscale v0.23.0's own config-key table (read out of the pinned binary) has only noise.private_key_path and derp.server.private_key_path, with no top-level private_key_path; this camp's mesh dir is a controlled experiment where 0.23 ran a clean serve/shutdown against a config that DOES set the top-level key, minted noise_private.key and never created private.key; and all three generators set derp.server.enabled=false. The file on us-west-001 exists only because an older headscale made it. Recorded in headscale_state.rs's module docs. THAT FINDING PRODUCED R858-B10 — `yah mesh promote` still REQUIRES private.key as a transplant input (mesh.rs:790 bail, :1020 read_b64) and therefore fails preflight on any coordinator that has only ever run 0.23, which is a landmine directly under R858-T8's rehearsal. (2) The self-bootstrap handler at lib.rs:4923-4940 minting its own identity is CORRECT and deliberately stays ungated: lib.rs:4941 states there is no state to transplant because bootstrap creates a new tailnet, and routing it through the gate would fire the fresh-identity ERROR on every legitimate first boot — devaluing the loudest signal in the system, which is exactly the mechanism by which R858's original warnings went unread.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib: 649 passed / 0 failed, against a 639 passed / 0 failed baseline measured before any edit (+10 = the new tests), run twice to a consistent result. Note the baseline was CLEANER than this relay expected — tests::headscale_deploy_downloads_from_url_override at lib.rs:7890, flagged as a pre-existing failure during R858-T1, was already green by the time T2 started, so a peer fixed it in between. cargo check -p yubaba --all-targets is clean apart from two pre-existing unused-import warnings in a peer's crates/cloud/src/reconciler/mesofact_static.rs. One intervening run died on an error[E0758] in fob that was a peer's torn mid-write, not ours — the file on disk had no block-comment markers at all and was 1145 lines against an error citing line 1823; the clean re-run confirms it.")
+//! @yah:verify("NOT DONE, STATED PLAINLY: the real key has NOT been seeded and no live node was touched. Nothing here proves carriage end-to-end — the unit tests exercise the resolve/write/refuse paths, not a real failover. The operator steps that remain are (1) read the 72 bytes off us-west-001 at /var/lib/yah-cloud/headscale/noise_private.key, (2) `yah keys set headscale-noise-private-key`, (3) commit .yah/infra/secrets/headscale-noise-private-key.toml, (4) `yah cloud secret put headscale/noise-private-key`. Until (4) lands, every yubaba leader that starts headscale will log the store-lacks-it ERROR — that is the intended, correct signal for the fleet's current state, not a regression. The actual acceptance test is R858-T8's rehearsal, and it is specifically that an ALREADY-REGISTERED node still reaches the tailnet after the coordinator moves; a fresh node joining proves nothing about this ticket.")
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -95,6 +121,17 @@ const STOP_GRACE_SECS: u64 = 30;
 /// Pure — no I/O, no host inspection — so the shape is unit-testable off a
 /// Linux box. The caller ([`crate::leader::on_became_leader`]) hands the result
 /// to whichever backend `ServerState::active_backend` resolves to.
+///
+/// @yah:ticket(R858-B9, "headscale's behind-a-proxy config binds loopback, so no remote front door can reach it — three places disagree about the port")
+/// @yah:at(2026-09-05T04:12:00Z)
+/// @yah:assignee(agent:claude)
+/// @yah:parent(R858)
+/// @yah:severity(high)
+/// @yah:next("TS2021 UPGRADE PASSTHROUGH IS A REAL CONSTRAINT, NOT A DETAIL. lib.rs:4776-4778 records that Cloudflare strips tailscale's Upgrade header and 500s /machine/register, which is why the bootstrap doc at :5117-5121 insists on no CF proxy. A passway door in front of headscale inherits that requirement — prove the door passes Upgrade through end to end before trusting a green /key?v=138, because /key is a plain GET and will pass even if the register path does not.")
+/// @yah:gotcha("DO NOT LAND THIS BEFORE THE A RECORD MOVES. This is step (4) of R858-T1's ordering and it is destructive out of order: headscale today serves the live fleet from the BOOTSTRAP config, which binds 0.0.0.0:443 and terminates its own Let's Encrypt TLS (generate_bootstrap_headscale_config, oss/yubaba/crates/yubaba/src/lib.rs:5122-5180, keys at :5139-5146). Flipping it to plain HTTP while cloud.mesh.yah.dev still resolves straight to 15.204.89.240 decapitates the mesh exactly as the 2026-09-03 outage did. Sequence is: doors serve the name, then the A record moves to the door set, THEN this.")
+/// @yah:assumes("That the intended end state is one headscale listener on the mesh IP, plain HTTP, fronted by the doors — inferred from generate_remote_headscale_config's own doc at lib.rs:5118-5119 (localhost-only coordinator fronted by a proxy) plus the fact that R858-T1 wired the doors to reach it. Not confirmed with the operator.")
+/// @yah:gotcha("THE DEFECT, three places that disagree, all read 2026-09-04. (1) generate_remote_headscale_config (oss/yubaba/crates/yubaba/src/lib.rs:4721-4770) emits `listen_addr: 127.0.0.1:8080` at :4734 — a LOOPBACK bind, so only a door on the same host can reach it and every REMOTE front door is structurally unable to, which is the exact case the follow-placement design exists for. (2) appliance_spec's HEADSCALE_PORTS (this file, `[443, 80]`) advertises the appliance on the mesh at 443/80 — matching NEITHER generator's listen_addr. (3) the health probe at lib.rs:4713 hardcodes `http://127.0.0.1:8080/health`, so it silently follows generator (1) and will lie if the bind moves. front_door_upstream_rule's `port` argument has no production value in-tree, so nothing today forces these three into agreement.")
+/// @yah:next("SEQUENCE, and step 1 is what @Ashguard:griffin is waiting on — T1's ingress half is DONE on east and south and cannot proceed to the A record until :443 is free on us-west-001. (1) LIVE, on west, inside the short-outage budget the operator granted 2026-09-05: drop `tls_letsencrypt_hostname` + the HTTP-01 block from /var/lib/yah-cloud/headscale/config.yaml, set `listen_addr: 0.0.0.0:8080`, add the ufw rules (allow 8080 from 100.64.0.0/10, allow from 127.0.0.1, deny otherwise), restart the appliance, confirm `ss -lntp` shows :443 and :80 free and 8080 bound, then ping griffin with the port. This is ssh-recoverable on the node you are standing on and the rollback is the previous config.yaml — take a copy first. (2) Griffin then stands passway-demux + passway-mesh on west with the CO-LOCATED pin 127.0.0.1:8080, and flips east+south's PASSWAY_UPSTREAM_TLS/SNI/port in the same window — the appliance has ONE TLS posture at a time, so a door left on TLS=true after this speaks TLS to a plaintext port and one flipped early speaks plaintext to a TLS port, and both read like proxy bugs. (3) Only then does the A record move onto all three doors. (4) RECONCILE THE CODE with what step 1 did by hand, or the next provision re-creates the disagreement: `generate_remote_headscale_config`'s listen_addr, the bootstrap renderer that actually produced the live file, the advertised-ports constant in headscale_appliance.rs (it still claims [443, 80] and must become the one real port), and `probe_headscale_local`'s hardcoded 127.0.0.1:8080 — that last one is also half of R858-B11, so take them together.")
 pub fn appliance_spec(headscale_dir: &Path) -> WorkloadSpec {
     let bin = headscale_dir.join("headscale");
     let config = headscale_dir.join("config.yaml");
@@ -158,6 +195,10 @@ pub fn appliance_spec(headscale_dir: &Path) -> WorkloadSpec {
             ephemeral_storage_mb: 1024,
         },
         depends_on: vec![],
+        // R860-T1 added this field; empty here keeps today's behaviour exactly.
+        // W338 models the litestream replicator this appliance needs as a
+        // `local` + `self` requirement — that's R860-T2/T6, not this line.
+        requires: vec![],
         healthcheck: None,
         // THE WHOLE POINT OF THIS TICKET. `Always` restarts on a clean exit 0
         // too — see the module docs for the seven-day outage that `on-failure`
@@ -190,48 +231,17 @@ pub fn appliance_ident() -> MeshIdent {
 
 /// Render one front door's `PASSWAY_UPSTREAMS` entry for the coordinator's
 /// hostname (R591-T2) — the sovereign form of "the external identity follows
-/// placement".
+/// placement". Full rationale, including why the co-located door dialing
+/// `127.0.0.1` is a bootstrap-cycle constraint rather than an optimisation,
+/// lives on the definition.
 ///
-/// `placed_at` is the mesh address of the node raft placed the appliance on
-/// (yubaba publishes it as the `headscale` service record; see
-/// [`crate::leader`]). `this_door` is the mesh address of the node *this* front
-/// door runs on. Every front door in the fleet gets a rule for the same
-/// hostname, so DNS never moves — a failover repoints upstreams, not records.
-///
-/// # The co-located door routes to loopback, and that is a constraint, not an
-/// optimisation
-///
-/// Fronting the coordinator over the mesh creates a cycle: a node dials
-/// `cloud.mesh.yah.dev` → DNS → a front door → headscale's *mesh* address, so
-/// the proxying node needs a working mesh to reach the thing that grants
-/// meshes. Steady state is fine (a rebooting node borrows a healthy peer's
-/// mesh). A **total-fleet cold start has no path** — nobody has a mesh, so no
-/// front door can reach the coordinator, so nobody can get a mesh.
-///
-/// The operator's answer to the general case is that a camp bootstraps a mesh
-/// **out of band** — over ssh, from a list of IPs — rather than over the mesh it
-/// is creating; that holds for any new mesh, not just this one. The in-design
-/// mitigation is this function: the front door sitting on the same node as the
-/// appliance dials `127.0.0.1`, so **one** path to the coordinator never
-/// traverses the mesh at all. Whichever node raft placed it on can bootstrap
-/// itself, and the rest follow from there.
-///
-/// (The deadlock is inference from the 2026-08-12 config + topology, not a
-/// tested failure. The dev cluster — us-west-011/013/014 — is the sanctioned
-/// place to prove it; see this relay's testbed gotcha.)
-pub fn front_door_upstream_rule(
-    hostname: &str,
-    placed_at: std::net::Ipv4Addr,
-    this_door: std::net::Ipv4Addr,
-    port: u16,
-) -> String {
-    let upstream = if placed_at == this_door {
-        std::net::Ipv4Addr::LOCALHOST
-    } else {
-        placed_at
-    };
-    format!("{hostname}={upstream}:{port}")
-}
+/// R858-T1 moved the definition down to `local-driver`, which already owns the
+/// `PASSWAY_UPSTREAMS` grammar this renders. It had to: the deploy path that
+/// finally calls it (`yah cloud ingress`) links `local-driver` but
+/// deliberately **not** the full `yubaba` lib, since that pulls openraft, axum
+/// and russh into the CLI for one pure six-line function (R483-T5). Re-exported
+/// here so this module's API and its four tests below are unchanged.
+pub use local_driver::passway_ingress::front_door_upstream_rule;
 
 #[cfg(test)]
 mod tests {

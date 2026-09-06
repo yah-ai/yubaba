@@ -1301,6 +1301,7 @@ mod tests {
             taints: vec![],
             sovereign_group: None,
             sovereign_role: None,
+            ingress_floating_ip: None,
         }
     }
 

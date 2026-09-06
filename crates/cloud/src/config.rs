@@ -124,7 +124,7 @@ use thiserror::Error;
 use workload_spec::secrets::SecretAccess;
 use workload_spec::sovereign::Membership;
 pub use workload_spec::sovereign::SovereignRole;
-use workload_spec::{validate, LifecycleArchetype, TenantId, WorkloadSpec};
+use workload_spec::{validate, LifecycleArchetype, Locality, TenantId, WorkloadSpec};
 
 /// Static node capacity declaration on `machine.toml` (R572-F3).
 ///
@@ -197,6 +197,44 @@ impl MachineRegistration {
 /// — operator intent under review and blame — except [`registration`], which
 /// carries what the fleet observed. See [`MachineRegistration`] for why the
 /// boundary is drawn there and what depends on it.
+///
+/// @yah:ticket(R860-T5, "Model per-node native-exec capability as an admission axis (W338 §Placement consequences 3 / R858-T4 gap)")
+/// @yah:status(review)
+/// @yah:phase(P1)
+/// @yah:at(2026-09-05T18:29:19Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R860)
+/// @yah:next("Cheapest defensible shape: express it on MachineConfig, which already has the two vocabularies — `mesh_tags: Vec<String>` (config.rs:246, superset match, already carries `arch:`/`os:`/`tag:build-worker`) and `taints: Vec<String>` (config.rs:337). A `native-exec` mesh tag required by any group member whose kind is native is a one-line admission axis in `admission_spec()`. Whichever is chosen, it must be declared in .yah/infra/machines/*.toml for the nodes that actually run kamaji with --native-exec-dir, and `check_inert_taints` (config.rs:703) lints unread taint keys dead — so a taint nobody reads will be flagged.")
+/// @yah:verify("cargo test -p cloud --lib config")
+/// @arch:see(.yah/docs/working/W338-workload-dependencies-and-appliance-composition.md)
+/// @yah:depends_on(R860-T4)
+/// @yah:gotcha("Verified 2026-09-04: native-exec capability is modelled NOWHERE in placement — `rg \"native\" oss/yubaba/crates/cloud/src/config.rs` returns zero hits, and the raft state machine models no member attributes, labels or taints at all (`rg \"taint|capabilit|labels|mesh_tag\"` over raft/{mod,store,network}.rs yields one unrelated comment at raft/store.rs:591). Native-exec is a node-local kamaji startup decision today: `--native-exec-dir` (oss/kamaji/crates/kamaji-bin/src/main.rs:152-156, :51-55) plus the `native-exec` cargo feature (kamaji-bin/src/server.rs:329-330). A node without it refuses the deploy at dispatch time and nothing upstream can see that in advance — which is exactly the deploy-time surprise W338 wants turned into a placement precondition.")
+/// @yah:handoff("NATIVE-EXEC IS NOW A PLACEMENT PRECONDITION, NOT A DISPATCH-TIME SURPRISE. New `pub const NATIVE_EXEC_MESH_TAG: &str = \"cap:native-exec\"` in oss/yubaba/crates/cloud/src/config.rs (declared just above `node_selector_mesh_tags`), and one axis in `admission_spec()` immediately after the R860-T4 group loop: if ANY member of `placement_group(ws, declared)` returns true from `WorkloadSpec::wants_native_exec()`, the tag is appended to the derived `RequiredSpec.mesh_tags` (deduped). No new field on `RequiredSpec`, no signature change anywhere, no wire or serde change — the mesh_tags axis is already an AND-ed superset check against `machine.mesh_tags` in `matches` and is already rendered by `describe`, so a refusal now reads `required.mesh_tags=[...,cap:native-exec]`.")
+/// @yah:handoff("ITEM 1 — HOW A NATIVE WORKLOAD IS DETECTED, settled by opening the type rather than guessing. There is no `kind` on `WorkloadSpec`: on the wire a native workload is still `Workload::Container(WorkloadSpec)`, and the ONLY difference is the annotation `yah.exec = native`, read through `WorkloadSpec::wants_native_exec()` (oss/yah-base/crates/workload-spec/src/lib.rs:2939; consts `NATIVE_EXEC_ANNOTATION` / `NATIVE_EXEC_VALUE` at :3402/:3407). That accessor is what the admission axis calls — matching kamaji, whose `deploy_container` checks the same marker first and routes to `deploy_native_exec` (oss/kamaji/crates/kamaji-bin/src/server.rs). The `yah.exec` key is a substrate selector with a second value, `microvm` (`wants_microvm`, same key, R605-F8), so per-node microVM capability is the obvious sibling axis and is NOT modelled here — see next-steps.")
+/// @yah:handoff("ITEM 2 — DECLARATIONS LANDED ON TWO NODES, FROM READINGS RECORDED IN-REPO, NOT INFERRED. `cap:native-exec` added to `mesh_tags` in .yah/infra/machines/us-west-001.toml and .yah/infra/machines/us-west-003.toml, each with a comment naming its evidence and its re-check condition. us-west-001: the R858 gotcha in its own header records a `ps` reading taken on the box 2026-09-05 — pid 515908 is `/usr/local/bin/kamaji --native-exec-dir /var/lib/yah/kamaji/native`, supervising headscale as a native child. us-west-003: its header's 'THE DEPLOYED KAMAJI PREDATES THE microVM BACKEND' note quotes the box's actual ExecStart, read over ssh 2026-09-01, carrying `--native-exec-dir /var/lib/yah/kamaji/native` (corroborated by .yah/docs/architecture/A043-yah-on-machine-daemons.md's @yah:verify for the same probe). Both comments say plainly that the capability lives in the systemd unit's ExecStart, not in the TOML, so it must be re-checked after any roll.")
+/// @yah:handoff("ITEM 2, THE NEGATIVES — TWO NODES ARE KNOWN NOT TO HAVE IT AND WERE DELIBERATELY LEFT UNSET. us-south-001: kamaji refused headscale there 2026-09-03 with 'native backend not configured — start kamaji with --native-exec-dir' (the R858 chain, quoted in .yah/infra/machines/us-west-001.toml and W267). I did NOT edit us-south-001.toml — it was already dirty in the working tree at the anchor SHA and @Ashguard:eclipse is live on R858, so I left it alone rather than race it; the mechanism fails closed there, which is the correct state. us-west-015 (the sole darwin builder): W254-darwin-build-nodes.md's own next-step records that its kamaji is built/started `--docker` only. I added a comment to us-west-015.toml explaining that the tag is deliberately absent, that this is the node where the axis changes an error message (a darwin build row is native by construction, so it is now refused at ELECTION naming cap:native-exec instead of reaching the box and being refused by kamaji), and the exact enable sequence: rebuild with `--features native-exec`, restart with `--native-exec-dir <dir>`, THEN add the tag. us-west-002/011/013/014 are unestablished from the repo and left unset. THE OPERATOR-FACING ANSWER: the file is `.yah/infra/machines/<node>.toml` and the key is `mesh_tags`; add the literal string `cap:native-exec` to that array, and only after the roll.")
+/// @yah:handoff("DECISIONS THE BRIEF LEFT OPEN, all recorded in doc comments at the site. (1) MESH TAG, NOT TAINT — as recommended, and the doc says why in the terms the brief asked for: mesh tags are positive capability with superset matching ('this node CAN'), which is the claim being made; a taint is repulsion and would have to be inverted to `no-native-exec` on every node LACKING the backend (declaration burden on the majority, and silently wrong for a node nobody has edited) AND taught to `taint_effect`, or `check_inert_taints` would correctly lint the key dead. (2) THE `cap:` NAMESPACE IS NEW. Live prefixes are `tag:` (operator-assigned role), `arch:`/`os:` (silicon and userland facts, emitted as requirements by qed::platform::build_worker_mesh_tags), and `tier:` which R763 RETIRED for architecture and reserved for the environment axis — so reusing any of them would have stated the wrong kind of fact. A capability the daemon was configured with is none of those. Nothing validates tag prefixes (only `check_retired_arch_tags` looks at one), so this costs no wiring. (3) COMPUTED OVER THE GROUP, not the requirer — that is literally W338's sentence ('supply = self specs must be placeable where their requirer lands'), and the second test proves it: an ordinary container requirer with a `local` edge to a native provider is pulled onto a capable node. (4) FAILS CLOSED, accepted deliberately: an undeclared node is simply not a candidate, so an undeclared fleet reports 'no node admits' at election rather than dispatching to a node that refuses. Nothing in `.yah/infra/workloads/` is native-marked today (only yah-cloud-admin.toml exists there), so the only live consumer is the qed darwin build row, where failing closed is strictly the better error.")
+/// @yah:handoff("BLAST RADIUS, MEASURED. `admission_spec` is private and its callers are unchanged: `admit_workload` / `admit_workload_candidates` / `admit_workload_in_group` (config.rs), reached from app/yah/cli/src/cloud.rs (deploy, rolling, topology analyzer), app/yah/cli/src/yubaba_client.rs `elect_node`, and cloud/src/migrate.rs. The headscale appliance path inside yubaba (headscale_appliance.rs) does NOT go through admission — it is node-internal — so nothing eclipse holds on R858 is touched by this. Files edited, in full: oss/yubaba/crates/cloud/src/config.rs; .yah/infra/machines/{us-west-001,us-west-003,us-west-015}.toml. Nothing in oss/yubaba/crates/yubaba/ was opened, and oss/kamaji/crates/kamaji-bin/src/server.rs was READ ONLY (to confirm the marker check), per @Ashguard:hydra's contention triage.")
+/// @yah:handoff("ONE SCOPE ADDITION, stated loudly rather than slipped in: `MachineConfig::mesh_tags` (config.rs:256) had NO doc comment at all — the operator-facing declaration key for four tag namespaces was undocumented. I gave it one enumerating `tag:` / `arch:`+`os:` / the new `cap:` / retired `tier:`, and noting that nothing validates the prefix (which is why the two lints exist). CONSEQUENCE TO KNOW: that field's doc is the source of the `mesh_tags` description in the GENERATED .yah/schema/machine.toml.schema.json, so it is schema-drift-affecting — see the gotcha.")
+/// @yah:handoff("Tree anchor at handoff: 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2 — the shared tree as I found it and left it. Quote this SHA rather than 'HEAD' in any revert/restore instruction; to undo a hunk, read it with `git show 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2:<path>` and put it back with Edit, never `git checkout`/`restore` (they restore whole files and would delete peers' uncommitted work).")
+/// @yah:handoff("Tree anchor at handoff: 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2 — the shared tree as I left it. Diff against it (`git diff 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+/// @yah:next("MICROVM IS THE IDENTICAL UNMODELLED GAP, one line away. `yah.exec` is a substrate selector with a second value: `WorkloadSpec::wants_microvm()` (workload-spec/src/lib.rs, R605-F8), and kamaji constructs MicroVmRuntime only when started with `--microvm-dir` — A043's probe records that us-west-003's deployed kamaji has `--native-exec-dir` but NOT `--microvm-dir`, so a microvm-marked deploy is refused there by exactly the same dispatch-time surprise this ticket removed for native. The shape is `cap:microvm` alongside NATIVE_EXEC_MESH_TAG in the same `if` in `admission_spec`. Not done here because no node in the fleet can host one yet (R605-F14 must land a guest kernel + rootfs first), so declaring the tag anywhere today would be the wrong fact.")
+/// @yah:next("us-south-001 needs `cap:native-exec` DECIDED, not defaulted, and it is the R858 node. It is the one machine the repo positively records as LACKING the backend (kamaji refused headscale there 2026-09-03), so leaving the tag off is correct TODAY — but if R858's fix is 'give us-south-001 a native-capable kamaji' rather than 'stop moving headscale', then the roll and the tag must land together, in that order. I left .yah/infra/machines/us-south-001.toml untouched because it was already dirty at anchor 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2 and @Ashguard:eclipse is live on R858.")
+/// @yah:next("R860-T6 (`supply = \"self\"` provisioning) inherits this for free — `admission_spec` already requires the capability of the whole group, so a self-provisioned native member cannot be elected onto a node that cannot run it. What T6 must still not do is re-elect per member: reuse the node URL `elect_node` returned for the requirer, per R860-T4's handoff.")
+/// @yah:verify("BASELINE RECORDED BEFORE EDITING, at tree anchor 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2: `cargo test -p yah-cloud --lib` from oss/yubaba = 1090 passed / 0 failed / 4 ignored, exit 0 — exactly the count the brief predicted. AFTER: 1093 passed / 0 failed / 4 ignored, exit 0 (+3, exactly the three tests added). `cargo check -p yah-cloud --all-targets` exit 0 and `cargo check -p yubaba --all-targets` exit 0 (yubaba consumes cloud, so it is where any signature change would surface — there is none). Every exit code echoed explicitly via an `EXIT=$?` / `${PIPESTATUS[0]}` marker and read back, never inferred from an empty grep. The four `yah-cloud` warnings are all pre-existing and in other files (object-store r2.rs, reconciler/mesofact_static.rs unused imports, app_manifest.rs, reconciler/mod.rs non_snake_case); config.rs contributes none.")
+/// @yah:verify("NEW TESTS (config.rs `mod tests`, R860-T5 section at the end, after the R860-T4 block). (1) a_node_without_the_native_exec_capability_cannot_host_a_native_workload — a `yah.exec = native` spec is refused by a bare node with an error naming `cap:native-exec`, and admitted by a node declaring it, with both nodes in the same fleet so the choice is provably the tag. (2) a_local_edge_to_a_native_provider_makes_the_requirer_need_the_capability — an ordinary container requirer (asserted `!wants_native_exec()`) with a `local` edge to a native provider lands on the capable node, while the SAME spec without the edge still lands on the plain one, so the constraint provably comes from the group. (3) a_group_with_no_native_member_does_not_require_the_capability — the regression guard: the axis is absent from `admission_spec`'s mesh_tags and a group with a local edge between two ordinary specs still admits on a node declaring nothing. Helper `native_spec()` asserts the marker reads back through `wants_native_exec()` before the test uses it, so a typo cannot make the test pass vacuously.")
+/// @yah:verify("Machine-config lints were considered and are unaffected by construction: `check_inert_taints` reads `taints` (I touched none), and `check_retired_arch_tags` flags only the `tier:` prefix. `cap:` is a new namespace and nothing validates prefixes, so no lint fires and no lint needs teaching.")
+/// @yah:gotcha("SCHEMA DRIFT IS EXPECTED FROM THIS TICKET AND WAS ALREADY RED BEFORE IT. `.yah/schema/machine.toml.schema.json` is generated from `cloud::config` by `cargo run -p xtask -- emit-schemas`, and MachineConfig's DOC COMMENT is what the generator emits as its `description` — which means (a) my new `mesh_tags` doc changes it, and (b) so does this very handoff, because R860-T5's @yah: annotation block lives inside MachineConfig's doc at config.rs:201. That file was ALSO already dirty in the working tree at anchor 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2, before I touched anything — `scripts/check-schema-drift.sh` compares the regenerated tree against git, so it is red for any uncommitted schema edit regardless of author. Regenerate with `cargo run -p xtask -- emit-schemas` (or `scripts/check-schema-drift.sh --update`) when the root target dir is not contended; the pre-commit hook no longer does it (disabled 2026-08-15, see CLAUDE.md).")
+/// @yah:verify("SCHEMA REGENERATED IN THIS SESSION, so the drift gate is not left for the next reader: `cargo run --quiet -p xtask -- emit-schemas` exit 0, run from the repo root after the handoff was written (so it captures the annotation text too). Two files moved. `.yah/schema/machine.toml.schema.json`: MachineConfig's `description` grows by this ticket's annotation block, plus a genuinely new `mesh_tags.description` from the doc comment I added. `.yah/schema/workload.toml.schema.json`: +104 lines that are NOT mine — the `Locality` / `Requirement` / `Supply` / `WorkloadSpec.requires` types R860-T1 landed had never been emitted, so the sibling ticket's schema drift was still outstanding and my regen swept it in. Derived artifacts are not ownable (shared-tree doctrine), so this is deliberate rather than accidental; @Ashguard, whoever picks up R860-T1's review should know the schema now describes `requires`.")
+/// @yah:verify("FINAL RE-RUN AFTER THE HANDOFF ANNOTATION WAS WRITTEN INTO config.rs (the board write edits MachineConfig's doc block, so the file changed under the earlier green): `cargo test -p yah-cloud --lib` = 1093 passed / 0 failed / 4 ignored, exit 0. Unchanged. Note for anyone reading the camp build rail's skew warnings on this session: the one `SUSPECT RESULT` it emitted names `oss/yubaba/crates/cloud/src/config.rs` as modified mid-run, and that modification was MY OWN board_handoff annotation write, not a peer — the two authoritative runs (full lib test, and both cargo checks) each came back `Input closure unchanged across the whole run: no skew`.")
+/// @yah:verify("All builds were run with `CARGO_TARGET_DIR=/tmp/r860t5-target` rather than the shared oss/yubaba/target, following R860-T4's recorded gotcha — a peer (session:83093d9d) held the shared target lock for the entire session (20+ minutes of `cargo check -p yubaba --lib`). Costs one cold dep build, then every subsequent run is seconds. Worth reaching for immediately when the queue message says you are behind someone.")
+/// @yah:handoff("LEADER RE-VERIFIED (session:69b18855, independent of the courier's self-report). `cargo test -p yah-cloud --lib` from oss/yubaba: 1093 passed / 0 failed / 4 ignored, exit 0, against the 1090/0/4 baseline this relay's own T4 established — +3 = exactly its new tests. Axis confirmed by content: `NATIVE_EXEC_MESH_TAG = \"cap:native-exec\"` at config.rs:2304, appended to the derived `RequiredSpec.mesh_tags` at :2112-2114 when any `placement_group` member returns true from `WorkloadSpec::wants_native_exec()`. No new `RequiredSpec` field, no signature change, no wire change — it rides the existing AND-ed superset check, so a refusal now reads `required.mesh_tags=[...,cap:native-exec]`.")
+/// @yah:handoff("Tree anchor at handoff: 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2 — the shared tree as I left it. Diff against it (`git diff 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+/// @yah:verify("MACHINE DECLARATIONS AUDITED FOR PROVENANCE, because a wrong capability declaration is worse than an absent one. Both are traceable to measurements ALREADY RECORDED IN-REPO, not inferred: us-west-001 from the `ps` reading at us-west-001.toml:21 (pid 517125, ppid 515908 = `/usr/local/bin/kamaji --native-exec-dir /var/lib/yah/kamaji/native`, cgroup `0::/yubaba.slice/kamaji.service/native`, 2026-09-05); us-west-003 from the actual ExecStart read over ssh 2026-09-01 at us-west-003.toml:141. us-west-015 was deliberately left WITHOUT the tag and carries enable instructions at :207-217 — unknown fails closed, which is the correct direction. No node was guessed at and nothing was probed live.")
+/// @yah:handoff("THIS TICKET MODELS THE EXACT DRIFT THAT CAUSED THE 25-HOUR MESH OUTAGE, which is worth stating because it turns an abstract W338 bullet into a measured one. us-west-001.toml:8 records the root-cause chain: on 2026-09-03T06:03:03Z leadership moved to us-south-001, which tried to deploy headscale and kamaji refused — \\\"workload requests native host execution (yah.exec=native) but no native backend is available (native backend not configured — start kamaji with --native-exec-dir)\\\" — then the systemd fallback failed too, both at WARN, and the mesh had no coordination server for 25 hours. us-west-001.toml:10 names it explicitly as \\\"a silent per-node capability drift that placement does not model\\\". After this ticket, placement models it: a group needing native exec can no longer be admitted onto a node that has not declared `cap:native-exec`.")
+/// @yah:handoff("Tree anchor at handoff: 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2 — the shared tree as I left it. Diff against it (`git diff 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+/// @yah:verify("RE-VERIFIED AT HEAD 00ee20d1 (session:aa5e882d, 2026-09-05). `NATIVE_EXEC_MESH_TAG` present in oss/yubaba/crates/cloud/src/config.rs (declared above `node_selector_mesh_tags`, appended to the derived `RequiredSpec.mesh_tags` when any `placement_group` member wants native exec). `cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib` = 1141 passed / 0 failed / 4 ignored, exit 0.")
+/// @yah:cleanup("cap:microvm remains the identical unmodelled axis, one line from done in the same `if` in `admission_spec`. Deliberately NOT taken: no node in the fleet can host a microvm until R605-F14 lands a guest kernel + rootfs, so declaring the tag today would assert a false fact. Do it when R605-F14 lands, not before.")
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct MachineConfig {
@@ -243,6 +281,25 @@ pub struct MachineConfig {
     /// that lands, this field and its readers are removed wholesale.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts_mirrors: Vec<String>,
+    /// Positive placement facts about this node, matched as a **superset**:
+    /// a workload is admitted only where every tag it requires is present, so
+    /// adding a tag can only ever make a machine match more, never fewer.
+    ///
+    /// Four namespaces are live, and they are not interchangeable:
+    /// - `tag:<role>` — a role the operator assigns (`tag:build-worker`,
+    ///   `tag:qed`, `tag:cloud-runner`, `tag:mac-builder`);
+    /// - `arch:<x86|arm>` / `os:<linux|darwin>` — facts about the silicon and
+    ///   userland, emitted as *requirements* by
+    ///   [`qed::platform::build_worker_mesh_tags`];
+    /// - `cap:<capability>` — something the node's daemons were configured to
+    ///   be able to do. Today just [`NATIVE_EXEC_MESH_TAG`] (R860-T5);
+    /// - `tier:` is **retired** for architecture (R763) and reserved for the
+    ///   environment axis — [`crate::validate::check_retired_arch_tags`]
+    ///   flags a machine still carrying `tier:<arch>`.
+    ///
+    /// Nothing validates the prefix, which is why the lint above exists: a tag
+    /// nobody requires is silently inert, and a *stale* one silently stops
+    /// matching and reports "no node" rather than "wrong tag".
     pub mesh_tags: Vec<String>,
     /// Canonical geo region label (latency axis), e.g. `"us-west"`. F16's three
     /// topology axes are orthogonal: `region` = geo (latency), `zone` = failure
@@ -294,6 +351,48 @@ pub struct MachineConfig {
     /// cloud-init so the new machine connects to CF edge on first boot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloudflared: Option<String>,
+    /// Provider-issued floating/reserved IP that follows **public-ingress
+    /// ownership** onto this box — R859-F2 (W267 §Tier 1).
+    ///
+    /// The value is the provider's own identifier, opaque here and interpreted
+    /// only by the matching adapter: a Hetzner numeric floating-IP id as a
+    /// string, an OVH Additional-IP address (`"51.81.85.200"`), a Vultr
+    /// reserved-IP UUID. Same "the adapter is the boundary" convention
+    /// [`crate::envoy::floating_ip::FloatingIpAssignInput::ip_id`] documents.
+    ///
+    /// # Why it lives on the machine
+    ///
+    /// [`crate::envoy::floating_ip`] shipped the `floating_ip.*` verbs and
+    /// three provider adapters with no config anywhere saying *which* floating
+    /// IP is "the" ingress IP — the gap R594-F5 recorded and deliberately left.
+    /// This is that field, and it sits beside [`cloudflared`](Self::cloudflared)
+    /// on purpose: that is already the per-node "how the world reaches this
+    /// box" handle, and a floating IP is the sovereign-tier answer to the same
+    /// question. `[[ingress]]`'s
+    /// [`tunnel_id`](crate::config::IngressEdge::tunnel_id) is the *service*
+    /// side of ingress identity — which cohort a given service fronts through —
+    /// and a floating IP is not per-service: one IP moves between boxes, so it
+    /// cannot be partitioned by slot or hostname.
+    ///
+    /// # Absent means "no floating-IP path", never an error
+    ///
+    /// Most machines have none, and that is the normal case: mesh-only nodes,
+    /// boxes behind a Cloudflare tunnel, and every provider without a
+    /// floating-IP adapter. The effector skips such a machine cleanly rather
+    /// than refusing — see
+    /// [`plan_ingress_owner_effect`](crate::provider::floating_ip::plan_ingress_owner_effect).
+    ///
+    /// # The cohort has to agree
+    ///
+    /// Every machine that can hold the same ingress IP must declare the *same*
+    /// id: the IP is one resource that moves, so two ids inside one
+    /// [`sovereign_group`](Self::sovereign_group) means an ownership flip
+    /// silently reassigns a *different* IP than the one currently serving
+    /// traffic. `yah cloud validate` refuses that
+    /// ([`crate::validate::check_ingress_floating_ip`]) rather than leaving it
+    /// to be discovered during a failover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_floating_ip: Option<String>,
     /// When `true`, this machine hosts operator-bridge workloads (Tailscale
     /// operator access to mesh-internal services). `yah cloud machine provision`
     /// will install tailscaled and run `tailscale up` during cloud-init via the
@@ -1718,7 +1817,7 @@ impl CloudConfig {
     /// repulsion/affinity by enriching [`RequiredSpec::matches`] /
     /// [`Self::resolve_machine`]. Do not fork a second selector.
     pub fn admit_workload(&self, ws: &WorkloadSpec) -> Result<&MachineConfig> {
-        self.resolve_machine(&admission_spec(ws))
+        self.resolve_machine(&admission_spec(ws, &self.workloads))
     }
 
     /// Every machine that admits `ws`, in declaration order — the *pool*
@@ -1751,7 +1850,7 @@ impl CloudConfig {
     /// message [`Self::admit_workload`] would have produced. "No node admits
     /// this" and "the pool is empty" are the same failure and must read the same.
     pub fn admit_workload_candidates(&self, ws: &WorkloadSpec) -> Result<Vec<&MachineConfig>> {
-        let req = admission_spec(ws);
+        let req = admission_spec(ws, &self.workloads);
         let all: Vec<&MachineConfig> = self.machines.iter().collect();
         let matched = matching(&all, &req);
         if matched.is_empty() {
@@ -1791,7 +1890,7 @@ impl CloudConfig {
         );
         first_match(
             &members,
-            &admission_spec(ws),
+            &admission_spec(ws, &self.workloads),
             &format!("machines in sovereign group '{group}'"),
             &empty_pool,
         )
@@ -1971,31 +2070,298 @@ fn matching<'a>(candidates: &[&'a MachineConfig], req: &RequiredSpec) -> Vec<&'a
 /// [`CloudConfig::admit_workload_in_group`] narrows the candidate set without
 /// restating the axes. Forking that derivation is how the two paths would
 /// silently disagree about whether a workload fits a node.
-fn admission_spec(ws: &WorkloadSpec) -> RequiredSpec {
+///
+/// # It admits a group, not a workload (R860-T4 / W338)
+///
+/// The axes come from [`placement_group`] — `ws` plus the transitive closure of
+/// its `local` requirement edges — because those members are placed together or
+/// not at all. Capacity is their **sum**, archetype repulsion their **union**,
+/// and mesh tags their union too. `prefer-local` and `anywhere` edges bind
+/// nothing: a spec with neither `requires` nor `depends_on` local edges has a
+/// group of exactly itself and resolves byte-identically to the pre-R860 axes.
+///
+/// This is the **only** gate. Node election is CLI-side
+/// (`MeshYubabaClient::elect_node`, which picks a live member of the pool this
+/// produces); the yubaba node process accepts whatever it is handed and never
+/// re-checks placement, so a wrong group here is not caught downstream.
+///
+/// @yah:ticket(R860-T4, "Admission: place the transitive closure of `local` edges as one group, not one workload")
+/// @yah:status(review)
+/// @yah:phase(P1)
+/// @yah:at(2026-09-05T18:29:13Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R860)
+/// @yah:next("W338 §Placement consequences 1 and 2. `admission_spec()` (config.rs:1974-1998) derives its axes from ONE spec; it must derive them from the group — the transitive closure of `local` requirement edges over `effective_requirements()`. `prefer-local` and `anywhere` edges do NOT bind the group. Three consequences: memory/cpu floor becomes the SUM of the group's requests, not the requirer's alone; `repel_archetype` becomes the union over members (so a group containing an Appliance is repelled by `no-appliance` even if the requirer is a Server); and the group is non-drainable if ANY member is an Appliance, which today is a per-workload check at yubaba/src/lib.rs:3117-3128 and now has to be computed over a set.")
+/// @yah:verify("cargo test -p cloud --lib config")
+/// @yah:gotcha("Node election is CLI-side, not cluster-side: `MeshYubabaClient::elect_node` (app/yah/cli/src/yubaba_client.rs:235-268) calls `admit_workload_candidates` (config.rs:1753), picks one node, and POSTs the deploy there. The yubaba node process never decides placement — it accepts whatever it is handed. So group admission has to be right in `config.rs` because there is no second gate downstream to catch it.")
+/// @arch:see(.yah/docs/working/W338-workload-dependencies-and-appliance-composition.md)
+/// @yah:depends_on(R860-T1)
+/// @yah:handoff("ADMISSION NOW PLACES A GROUP, NOT A WORKLOAD. `admission_spec` (oss/yubaba/crates/cloud/src/config.rs:2009) takes `(ws, declared: &[WorkloadConfig])` and derives every axis from `placement_group(ws, declared)` (:2108) — the transitive closure of `local` requirement edges over `effective_requirements()`, traversing `Requirement::provides` where present and resolving by ident against `cfg.workloads` (.yah/infra/workloads/) otherwise, mesh-identity first and workload name second. Capacity is the SUM of the members' `memory_request_mb()` / `resources.cpu_millis` (saturating). Only `local` binds: `prefer-local` and `anywhere` (which every legacy `depends_on` folds into) are skipped, so a spec without local edges has a group of exactly itself and its axes are bit-identical to the pre-R860 derivation.")
+/// @yah:handoff("REPEL BECAME A SET. `RequiredSpec::repel_archetype: Option<LifecycleArchetype>` is now `repel_archetypes: Vec<LifecycleArchetype>` (config.rs:3878), the union over group members; `matches` (:3971) rejects a node carrying `no-<taint_key()>` for ANY of them, `describe` emits one `not-tainted(...)` part per archetype, `is_unconstrained` tests `is_empty()`. The field is `#[serde(skip)]`, so no wire or schema drift, and grep over app/ crates/ oss/ xtask/ finds no other referent of the old name and no `RequiredSpec { .. }` literal outside config.rs — the rename is contained. `admit_workload` / `admit_workload_candidates` / `admit_workload_in_group` signatures are unchanged; all three now pass `&self.workloads`.")
+/// @yah:handoff("CYCLE GUARD, AND THE BUG IT TOOK TO GET RIGHT. The walker keeps TWO visited lists: `in_group` (member mesh identities) and `expanded` (requirement idents already resolved). The first version used one list and was silently wrong in the common case — a requirement's ident IS its provider's mesh identity, so marking the ident before resolving made every provider look already-present and `placement_group` returned a group of one. Five of the new tests caught it. If you refactor this, keep the two questions separate.")
+/// @yah:handoff("ELECT_NODE NEEDS NO CHANGE FOR THIS TICKET — read it (app/yah/cli/src/yubaba_client.rs:235-268). It calls `admit_workload_candidates`, so it now receives a pool already filtered to nodes that can host the WHOLE group, then probes for liveness within it. That is correct for T4 because only the requirer is deployed today. It becomes load-bearing at R860-T6: `supply = \"self\"` provisioning MUST reuse the node URL `elect_node` returned for the requirer and must not re-elect per member — the probe is liveness-sensitive, so a second election can legally return a different member of the same pool and split the group across two nodes.")
+/// @yah:handoff("DECISIONS THE BRIEF DID NOT COVER, all recorded in doc comments at the site. (1) `mesh_tags` are UNIONED over the group — the axis is already a superset/AND check, so a node that cannot host one member cannot host the group; zero regression risk since nothing in the tree declares `requires` yet. (2) `nodes` (the R833-F8 operator pin) stays REQUIRER-ONLY: it is a membership list, so intersecting two members' pins can yield an empty vec, which the axis reads as no-constraint — the exact inverse of the conflict. (3) `requires_taint` is a single Option: the requirer's wins, else the first member declaring one. Two members demanding DIFFERENT taints is not representable and would be an unplaceable group; widening that axis to a set is a follow-up if a real case appears. (4) An unresolvable `local` ident is SKIPPED, not an error — admission is a pure function of the declared inventory and must not start refusing deploys over a provider a later ticket declares; the cost is that its request does not count toward the floor, which is the exposure `depends_on` has always had.")
+/// @yah:handoff("DRAINABILITY: placement half landed, node half deliberately NOT touched. `group_is_drainable(members)` (config.rs:2160) is the set-valued predicate W338 §Placement consequences 2 asks for — false as soon as any member is an Appliance — and the `no-appliance` repulsion that follows from it is enforced through `repel_archetypes`. The node-side loop `drain_workloads` (oss/yubaba/crates/yubaba/src/lib.rs, the R572-F4 archetype_registry skip) still decides per workload and knows nothing about requirement edges, so a Server bound to an Appliance by a `local` edge would still be drained alone. Not fixed here for two reasons: that file has three sessions live in it (the brief named them), and the fix needs group edges plumbed to the node process, which is R860-T6's rail rather than a local edit. `yubaba` already depends on `cloud`, so the predicate is directly callable from there when that plumbing exists.")
+/// @yah:verify("BASELINE recorded before editing, tree anchor 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2: `cargo test -p yah-cloud --lib` (from oss/yubaba) = 1081 passed, 0 failed, 4 ignored, exit 0. AFTER: 1090 passed, 0 failed, 4 ignored, exit 0 — +9, exactly the nine tests added. `cargo check -p yah-cloud --all-targets` exit 0, and `cargo check -p yubaba --all-targets` exit 0 as well (yubaba consumes `cloud`, so it is where the `repel_archetypes` rename would have surfaced). Every exit code echoed explicitly, never inferred from an empty grep.")
+/// @yah:verify("NEW TESTS (config.rs `mod tests`, R860-T4 section at the end): a_local_edge_binds_the_provider_into_the_placement_group; prefer_local_and_anywhere_edges_do_not_bind_the_group (covers a legacy `depends_on` too); the_group_is_the_transitive_closure_and_traverses_inline_provides; an_ident_cycle_closes_the_group_instead_of_looping_forever; an_unresolvable_local_ident_is_skipped_rather_than_refused; the_capacity_floor_is_the_sum_of_the_group_not_the_requirer_alone (a 300 MiB node refuses two 256 MiB members and the error names memory_mb>=512; a 512 MiB node admits); a_server_requiring_an_appliance_locally_is_repelled_by_no_appliance (same requirer alone still lands on the tainted Pi, so the repulsion provably comes from the edge); a_group_containing_an_appliance_is_not_drainable; a_spec_with_no_local_edges_admits_exactly_as_it_did_before.")
+/// @yah:gotcha("The camp's `yah build run` rail killed three consecutive verification runs against the shared oss/yubaba/target dir: each ended with only `Blocking waiting for file lock on build directory` in the log and no exit code, after 121s / 720s. The green result above was obtained with `CARGO_TARGET_DIR=/tmp/r860t4-target`, which sidesteps the contended lock at the cost of one cold dep build. Worth reaching for directly when the yubaba target dir is busy rather than burning three cycles discovering it.")
+/// @yah:handoff("Tree anchor at handoff: 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2 — the shared tree as I left it. Diff against it (`git diff 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+/// @yah:next("R860-T6 (supply = \"self\"): deploy the group's non-requirer members onto the node `elect_node` already returned for the requirer — do NOT re-elect per member, or a liveness probe can split the group across two nodes. `placement_group` (config.rs:2108) hands you the member specs in traversal order, requirer first.")
+/// @yah:next("Node-side drain is still per-workload: teach `drain_workloads` (oss/yubaba/crates/yubaba/src/lib.rs) to consult `cloud::config::group_is_drainable` over the requesting workload's placement group once R860-T6 plumbs group membership to the node. Left untouched here on purpose — three sessions were live in that file.")
+/// @yah:handoff("LEADER RE-VERIFIED (session:69b18855, independent of the courier's self-report). `cargo test -p yah-cloud --lib` from oss/yubaba: 1090 passed / 0 failed / 4 ignored, exit 0, against the courier's recorded 1081/0/4 baseline — +9 = exactly its new tests. Confirmed by content in config.rs: `placement_group` :2120 with the `req.locality != Locality::Local` guard at :2136 (so `prefer-local` and `anywhere` correctly do NOT bind), `group_is_drainable` :2172, and `RequiredSpec::repel_archetype: Option&lt;_&gt;` widened to `repel_archetypes: Vec&lt;_&gt;` at :3890 with the union built at :2039-2050 and enforced at :4004/:4044. The repel rename is `#[serde(skip)]`, so no wire or schema drift.")
+/// @yah:handoff("Tree anchor at handoff: 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2 — the shared tree as I left it. Diff against it (`git diff 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+/// @yah:verify("cargo test -p yah-cloud --lib (from oss/yubaba): 1090 passed / 0 failed / 4 ignored, exit 0, vs a 1081/0/4 baseline. Exit codes echoed explicitly throughout rather than inferred from an empty grep — the trap that cost R860-T1 three misses.")
+/// @yah:gotcha("CORRECTION FROM R860-T6, and the leader propagated the error so it is worth naming: this ticket's handoff asserted \\\"`yubaba` already depends on `cloud`, so the predicate is directly callable from there\\\". THAT IS WRONG. `cloud` is a DEV-dependency of yubaba only — oss/yubaba/crates/yubaba/Cargo.toml:150-152, under the comment \\\"Integration test harness\\\" — and cloud's own Cargo.toml records that the runtime yubaba→cloud edge was DELIBERATELY avoided from R374-F3 onward. The leader repeated the claim verbatim in R860-T6's dispatch brief; T6's courier checked it against the manifest instead of trusting it, which is the only reason it did not become a runtime dependency inversion. Resolution: `group_is_drainable`'s body moved down to `workload_spec::group_is_drainable` (workload-spec/src/lib.rs:2365), the shared home both crates already depend on, and `cloud::config::group_is_drainable` (config.rs:2240) now delegates to it keeping its signature. Verified after the move: yah-cloud still 1093/0/4, yah-workload-spec 171+98/0.")
+/// @yah:handoff("Tree anchor at handoff: 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2 — the shared tree as I left it. Diff against it (`git diff 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+/// @yah:verify("RE-VERIFIED AT HEAD 00ee20d1 (session:aa5e882d, 2026-09-05). `cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib` = 1141 passed / 0 failed / 4 ignored, exit 0 (was 1093 at the first leader's check, 1110 at the second; the deltas are peers' tests). Group placement confirmed by content in oss/yubaba/crates/cloud/src/config.rs: `placement_group` derivation at :2073/:2108, `repel_archetypes: Vec&lt;LifecycleArchetype&gt;` at :3878. NOTE FOR ANYONE RE-RUNNING THIS: `cargo test -p yah-cloud --lib` from the repo root FAILS with \"package `yah-cloud` cannot be tested because it requires dev-dependencies and is not a member of the workspace\" — yah-cloud lives in the oss/yubaba workspace, so the invocation needs `--manifest-path oss/yubaba/Cargo.toml`.")
+fn admission_spec(ws: &WorkloadSpec, declared: &[WorkloadConfig]) -> RequiredSpec {
+    let group = placement_group(ws, declared);
+
+    // Capacity is the group's demand, not the requirer's (W338 §Placement
+    // consequences 1). Saturating rather than wrapping: an absurd declared
+    // request must read as "nothing is big enough", never as a small number.
+    //
+    // `memory_request_mb()` and NOT `resources.memory_mb`: the latter is a
+    // cgroup ceiling, and reading a ceiling as a floor made `for_forge`'s
+    // deliberately-roomy 32 GiB limit mean "only place me on a 32 GiB node".
+    // That excluded every build-worker in the fleet but one. The accessor falls
+    // back to `resources.memory_mb` when no request is declared, so specs that
+    // never set one are admitted exactly as before.
+    let mut memory_mb: u32 = 0;
+    let mut cpu_millis: u32 = 0;
+    // R572-F5 taint repulsion, unioned over the group (W338 §Placement
+    // consequences 2): a group is non-drainable — and `no-appliance`-repelled —
+    // if *any* member is an Appliance, even when the requirer is a Server.
+    let mut repel_archetypes: Vec<LifecycleArchetype> = Vec::new();
+    // Mesh tags are already AND-ed (a machine must be a superset), so unioning
+    // them over the group is the same predicate applied to every member: a node
+    // that cannot host one member cannot host the group.
+    let mut mesh_tags = node_selector_mesh_tags(ws);
+
+    for member in &group {
+        memory_mb = memory_mb.saturating_add(member.memory_request_mb());
+        cpu_millis = cpu_millis.saturating_add(member.resources.cpu_millis);
+        let arch = member.effective_archetype();
+        if !repel_archetypes.contains(&arch) {
+            repel_archetypes.push(arch);
+        }
+        for tag in node_selector_mesh_tags(member) {
+            if !mesh_tags.contains(&tag) {
+                mesh_tags.push(tag);
+            }
+        }
+    }
+
+    // R860-T5 / W338 §Placement consequences 3: per-node native-exec
+    // capability. Computed over the group for the same reason every other axis
+    // is — a `local` edge to a native provider makes the *requirer* unplaceable
+    // on a node without the backend, even when the requirer is an ordinary
+    // container workload. This is the `supply = "self"` precondition W338 names:
+    // a self-supplied native provider has to be placeable where its requirer
+    // lands, and until now nothing upstream could see whether it was.
+    //
+    // Appended to `mesh_tags` rather than given its own field: the axis is
+    // already an AND-ed superset check against `machine.mesh_tags`, `describe`
+    // already renders it, and `RequiredSpec` needs no new shape. See
+    // [`NATIVE_EXEC_MESH_TAG`] for why a tag and not a taint.
+    if group.iter().any(WorkloadSpec::wants_native_exec)
+        && !mesh_tags.iter().any(|t| t == NATIVE_EXEC_MESH_TAG)
+    {
+        mesh_tags.push(NATIVE_EXEC_MESH_TAG.to_string());
+    }
+
     RequiredSpec {
-        mesh_tags: node_selector_mesh_tags(ws),
+        mesh_tags,
         // R833-F8: imperative node pin. Derived here alongside the inferred
         // mesh tags rather than short-circuiting the resolver, so a pinned
         // workload is still checked against capacity and taints.
-        nodes: node_selector_node(ws).into_iter().collect(),
-        // R572-F5: capacity floor from the workload's resource request.
         //
-        // `memory_request_mb()` and NOT `resources.memory_mb`: the latter
-        // is a cgroup ceiling, and reading a ceiling as a floor made
-        // `for_forge`'s deliberately-roomy 32 GiB limit mean "only place
-        // me on a 32 GiB node". That excluded every build-worker in the
-        // fleet but one. The accessor falls back to `resources.memory_mb`
-        // when no request is declared, so specs that never set one are
-        // admitted exactly as before.
-        memory_mb: ws.memory_request_mb(),
-        cpu_millis: ws.resources.cpu_millis,
-        // R572-F5: taint repulsion derived from the workload's effective archetype.
-        repel_archetype: Some(ws.effective_archetype()),
-        // R572-F5: taint affinity from the requires-taint annotation.
-        requires_taint: ws.requires_taint().map(str::to_owned),
+        // Requirer-only on purpose: the pin is what the operator typed on
+        // *this* deploy, and `nodes` is a membership list, so intersecting two
+        // members' pins could yield an empty vec — which this axis reads as "no
+        // constraint", i.e. the exact opposite of the conflict it represents.
+        nodes: node_selector_node(ws).into_iter().collect(),
+        memory_mb,
+        cpu_millis,
+        repel_archetypes,
+        // R572-F5: taint affinity from the requires-taint annotation. The
+        // requirer's wins; otherwise the first member that declares one, since
+        // the group shares a node and this axis holds a single key. Two members
+        // demanding *different* taints is not representable here and would be
+        // an unplaceable group anyway — see the R860-T4 handoff.
+        requires_taint: group
+            .iter()
+            .find_map(|m| m.requires_taint().map(str::to_owned)),
         ..Default::default()
     }
 }
+
+/// The workloads that must be placed together with `ws`: the transitive closure
+/// of `local` requirement edges over [`WorkloadSpec::effective_requirements`],
+/// starting at the requirer (R860-T4 / W338 §"Each member keeps its own mesh
+/// identity").
+///
+/// **Only `local` binds.** `prefer-local` explicitly "never blocks placement"
+/// (W338's locality table) and `anywhere` is an ordinary service dependency —
+/// treating either as a co-scheduling constraint would turn every `depends_on`
+/// in the tree into one, since the legacy field folds in as `anywhere` + `wait`.
+///
+/// A group is **not** a new addressable object: every member keeps its own mesh
+/// identity, spec and healthcheck (W338). This function returns the members'
+/// specs so admission can take the sum / union over them, and nothing here
+/// deploys, provisions or tears anything down — `supply = "self"` provisioning
+/// is R860-T6 and per-node native-exec capability is R860-T5.
+///
+/// Two ways a member is reached, in this order:
+/// - [`Requirement::provides`], the inline spec a `supply = "self"` requirement
+///   carries;
+/// - otherwise an ident lookup against `declared` (`.yah/infra/workloads/`),
+///   matched on mesh identity first and on workload name second, because those
+///   coincide for every spec in the tree today but the requirement is written in
+///   the mesh-identity currency.
+///
+/// An ident that resolves to neither is **skipped**, not an error: admission is
+/// a pure function of the declared inventory and must not start failing deploys
+/// over a provider that a not-yet-written ticket will declare. The cost is that
+/// its request does not count toward the floor, which is the same exposure
+/// `depends_on` has always had.
+///
+/// **Cycle-guarded.** `validate::check_requires` bounds `provides` *nesting* to
+/// depth 1 but nothing stops two separately-declared specs from requiring each
+/// other, and this closure would otherwise not terminate. Each requirement ident
+/// is resolved at most once and each member joins the group at most once, so a
+/// cycle simply closes the group.
+pub fn placement_group(ws: &WorkloadSpec, declared: &[WorkloadConfig]) -> Vec<WorkloadSpec> {
+    let mut members = vec![ws.clone()];
+    // Two separate visited sets, because the two questions differ: `in_group`
+    // stops a workload being added twice, `expanded` stops an ident being
+    // resolved twice. Folding them into one list makes the ident of a member
+    // already in the group indistinguishable from the member itself — and since
+    // a requirement's ident *is* its provider's mesh identity, that reads every
+    // provider as already-present and silently returns a group of one.
+    let mut in_group: Vec<String> = vec![group_key(ws)];
+    let mut expanded: Vec<String> = Vec::new();
+    let mut next = 0;
+
+    while next < members.len() {
+        let requirements = members[next].effective_requirements();
+        next += 1;
+        for req in requirements {
+            if req.locality != Locality::Local {
+                continue;
+            }
+            if expanded.contains(&req.ident.0) {
+                continue;
+            }
+            expanded.push(req.ident.0.clone());
+
+            let provider = match req.provides.as_deref() {
+                Some(spec) => spec.clone(),
+                None => match resolve_requirement_ident(&req.ident, declared) {
+                    Some(spec) => spec,
+                    None => continue,
+                },
+            };
+            let key = group_key(&provider);
+            if in_group.contains(&key) {
+                continue;
+            }
+            in_group.push(key);
+            members.push(provider);
+        }
+    }
+
+    members
+}
+
+/// Whether a placement group may be drained off its node (W338 §Placement
+/// consequences 2): false as soon as **any** member is an Appliance.
+///
+/// The set-valued form of the per-workload check the node itself makes in
+/// `drain_workloads` (`oss/yubaba/crates/yubaba/src/lib.rs`), which skips an
+/// Appliance by its own archetype and knows nothing about requirement edges. A
+/// `Server` bound to an Appliance by a `local` edge has to move with it or not
+/// at all, so draining it alone breaks the group the same way placing it alone
+/// would.
+///
+/// R860-T6 moved the body to [`workload_spec::group_is_drainable`] and left this
+/// signature untouched. The node's `drain_workloads` needs the identical
+/// predicate, and yubaba has no runtime dependency on this crate by design
+/// (R374-F3) — so the one implementation now lives in the crate both sides
+/// already depend on, rather than being copied into the second caller.
+pub fn group_is_drainable(members: &[WorkloadSpec]) -> bool {
+    workload_spec::group_is_drainable(members)
+}
+
+/// Identity a placement-group member is deduplicated by — its mesh identity,
+/// which is the currency [`Requirement::ident`] is written in.
+fn group_key(ws: &WorkloadSpec) -> String {
+    ws.expose.mesh.identity.0.clone()
+}
+
+/// Resolve a requirement's ident to a separately-declared spec: mesh identity
+/// first, workload file name second.
+fn resolve_requirement_ident(
+    ident: &workload_spec::MeshIdent,
+    declared: &[WorkloadConfig],
+) -> Option<WorkloadSpec> {
+    declared
+        .iter()
+        .find(|w| w.spec.expose.mesh.identity == *ident)
+        .or_else(|| declared.iter().find(|w| w.spec.name == ident.0))
+        .map(|w| w.spec.clone())
+}
+
+/// The mesh tag a node declares to advertise that its kamaji can run **native**
+/// (fork+exec) workloads — R860-T5 / W338 §"Placement consequences" 3.
+///
+/// A workload marked `yah.exec = native` ([`WorkloadSpec::wants_native_exec`])
+/// is not containerized: kamaji fork+execs it on the node's own userland. That
+/// backend only exists when the node's kamaji was **built** with the
+/// `native-exec` cargo feature and **started** with `--native-exec-dir`
+/// (`oss/kamaji/crates/kamaji-bin/src/main.rs`). Both are node-local startup
+/// decisions, invisible to everything upstream — so before this tag, placement
+/// happily elected a node whose kamaji then refused the deploy with
+/// `BackendRefused: ... no native backend is available (native backend not
+/// configured — start kamaji with --native-exec-dir)`. That is exactly how the
+/// mesh lost its coordination server for 25 hours on 2026-09-03 (R858: raft
+/// leadership moved headscale, a native workload, to `us-south-001`, which has
+/// no such kamaji). [`admission_spec`] now requires this tag whenever any
+/// placement-group member is native, which turns that dispatch-time surprise
+/// into a placement precondition.
+///
+/// # Why a mesh tag and not a taint
+///
+/// The two vocabularies on [`MachineConfig`] mean opposite things. `mesh_tags`
+/// are **positive capability** matched as a superset — "this node CAN" — which
+/// is precisely the claim being made, and an extra tag on a machine can only
+/// ever make it match *more* requirement sets, so declaring it is regression-
+/// free. `taints` are **repulsion** — "keep this class off" — and would have to
+/// be inverted (`no-native-exec` on every node lacking the backend, i.e. the
+/// declaration burden falls on the majority) *and* taught to
+/// [`taint_effect`], or [`crate::validate::check_inert_taints`] would correctly
+/// lint the key dead.
+///
+/// # The `cap:` namespace
+///
+/// New here. The live prefixes are `tag:` (role — `tag:build-worker`,
+/// `tag:qed`, `tag:cloud-runner`), `arch:` and `os:` (facts about the silicon
+/// and userland), and `tier:` is reserved for the environment axis (R763, see
+/// [`crate::validate::check_retired_arch_tags`]). A *capability the daemon was
+/// configured with* is none of those: it is not a role an operator assigns and
+/// not a property of the hardware, it is a fact about how kamaji was started,
+/// and it changes when the node is rolled. Nothing validates tag prefixes, so
+/// this costs no wiring.
+///
+/// # Fails closed
+///
+/// A node that does not declare it is not a candidate. An undeclared fleet
+/// therefore reports "no node admits" at election time rather than dispatching
+/// to a node that will refuse — the refusal moves earlier and names the
+/// constraint, which is the whole point. Declared today (from readings recorded
+/// in-repo, not inferred) on `us-west-001` and `us-west-003`; see those
+/// machines' TOMLs for the evidence and the date.
+pub const NATIVE_EXEC_MESH_TAG: &str = "cap:native-exec";
 
 /// Parse the R594 mesh-tag node-selector off a workload's annotations into the
 /// requested tag set. Absent annotation or empty value ⇒ empty vec ("no
@@ -3612,9 +3978,10 @@ impl MirrorProviderSlot {
 ///   listed tag.
 /// - `memory_mb` / `cpu_millis` — *capacity floor* (R572-F5): the machine's
 ///   `allocatable` budget must cover the demand. `0` = no constraint.
-/// - `repel_archetype` — *taint repulsion* (R572-F5): the machine must not
-///   carry the taint `"no-<archetype.taint_key()>"` for the workload's class.
-///   `None` = no repulsion check. Absolute — see [`Self::repel_archetype`].
+/// - `repel_archetypes` — *taint repulsion* (R572-F5, widened to a set by
+///   R860-T4): the machine must not carry `"no-<archetype.taint_key()>"` for
+///   **any** archetype in the placement group. Empty = no repulsion check.
+///   Absolute — see [`Self::repel_archetypes`].
 /// - `requires_taint` — *taint affinity* (R572-F5): the machine must carry
 ///   this taint key (in `taints` or `mesh_tags`). `None` = no affinity.
 ///
@@ -3668,20 +4035,28 @@ pub struct RequiredSpec {
     /// [`CloudConfig::admit_workload`] from the workload's `resources.cpu_millis`.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cpu_millis: u32,
-    /// R572-F5: effective archetype of the workload being placed. The scheduler
-    /// rejects any node that carries the taint `"no-<archetype.taint_key()>"`.
-    /// `None` = no repulsion check (backwards-compat for callers that don't
-    /// thread a spec through).
+    /// R572-F5: effective archetypes of the workloads being placed. The
+    /// scheduler rejects any node carrying `"no-<archetype.taint_key()>"` for
+    /// any of them. Empty = no repulsion check (backwards-compat for callers
+    /// that don't thread a spec through).
+    ///
+    /// **A set, not a single value (R860-T4 / W338 §Placement consequences
+    /// 2).** [`admission_spec`] places the requirer's whole *placement group* —
+    /// the transitive closure of `local` requirement edges — so the axis is the
+    /// union of the members' archetypes. A `Server` that requires an
+    /// `Appliance` `local` must be repelled by `no-appliance`, because the two
+    /// land on one node or neither does; collapsing that back to one archetype
+    /// would place the group on a node that rejects half of it.
     ///
     /// **This is an absolute block, not a preference.**
     /// [`CloudConfig::admit_workload`] sets it unconditionally from the
-    /// workload's effective archetype, and nothing in the tree tolerates a
+    /// group's effective archetypes, and nothing in the tree tolerates a
     /// taint — so a workload cannot opt out of a `no-<archetype>` node
     /// (W305 finding 2 / R742-T4). Adding toleration means giving
     /// `WorkloadSpec` a tolerations list and consulting it here; until then,
     /// do not describe this as "repel-unless-tolerate".
     #[serde(skip)]
-    pub repel_archetype: Option<LifecycleArchetype>,
+    pub repel_archetypes: Vec<LifecycleArchetype>,
     /// R572-F5: taint the workload requires the target node to carry
     /// (annotation `yah.placement.requires-taint`). The node must have the
     /// key in its `taints` list or `mesh_tags`. `None` = no affinity constraint.
@@ -3735,7 +4110,7 @@ impl RequiredSpec {
             && self.nodes.is_empty()
             && self.memory_mb == 0
             && self.cpu_millis == 0
-            && self.repel_archetype.is_none()
+            && self.repel_archetypes.is_empty()
             && self.requires_taint.is_none()
     }
 
@@ -3748,8 +4123,10 @@ impl RequiredSpec {
     ///   cover `self.{memory,cpu}`. A machine with no `allocatable` block passes
     ///   unconditionally (capacity unknown → no constraint enforced).
     /// - **R572-F5 taint repulsion**: machine must not carry the taint
-    ///   `"no-<archetype.taint_key()>"` for the workload's class. Absolute —
-    ///   the workload has no way to tolerate it (W305 finding 2).
+    ///   `"no-<archetype.taint_key()>"` for *any* archetype in
+    ///   [`Self::repel_archetypes`] — every class in the placement group, not
+    ///   just the requirer's (R860-T4). Absolute — the workload has no way to
+    ///   tolerate it (W305 finding 2).
     /// - **R572-F5 taint affinity**: if `requires_taint` is set, the machine
     ///   must carry that key in its `taints` list or `mesh_tags`.
     ///
@@ -3793,7 +4170,7 @@ impl RequiredSpec {
 
         // R572-F5: taint repulsion. A node taint "no-<archetype>" rejects the
         // workload class outright — there is no toleration list to consult.
-        if let Some(arch) = self.repel_archetype {
+        for arch in &self.repel_archetypes {
             let repel_key = format!("no-{}", arch.taint_key());
             if machine.taints.iter().any(|t| *t == repel_key) {
                 return false;
@@ -3833,7 +4210,7 @@ impl RequiredSpec {
         if self.cpu_millis > 0 {
             parts.push(format!("cpu_millis>={}", self.cpu_millis));
         }
-        if let Some(arch) = self.repel_archetype {
+        for arch in &self.repel_archetypes {
             parts.push(format!("not-tainted(no-{})", arch.taint_key()));
         }
         if let Some(req) = &self.requires_taint {
@@ -4650,6 +5027,7 @@ mod tests {
             taints: vec![],
             sovereign_group: None,
             sovereign_role: None,
+            ingress_floating_ip: None,
         }
     }
 
@@ -5384,6 +5762,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             taints: vec![],
             sovereign_group: None,
             sovereign_role: None,
+            ingress_floating_ip: None,
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: MachineConfig = toml::from_str(&s).unwrap();
@@ -5590,6 +5969,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             taints: vec![],
             sovereign_group: None,
             sovereign_role: None,
+            ingress_floating_ip: None,
         };
         // Land in the legacy tree so the legacy machine loader picks it up.
         machine.save(&cloud_dir).unwrap();
@@ -5733,6 +6113,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
                 ephemeral_storage_mb: 512,
             },
             depends_on: vec![],
+            requires: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
             archetype: None,
@@ -5797,6 +6178,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
                 ephemeral_storage_mb: 128,
             },
             depends_on: vec![],
+            requires: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
             archetype: None,
@@ -5933,6 +6315,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
                 ephemeral_storage_mb: 512,
             },
             depends_on: vec![],
+            requires: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
             archetype: None,
@@ -6009,6 +6392,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
                 ephemeral_storage_mb: 256,
             },
             depends_on: vec![],
+            requires: vec![],
             healthcheck: None,
             restart_policy: RestartPolicy::Always,
             archetype: None,
@@ -6069,6 +6453,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             taints: vec![],
             sovereign_group: None,
             sovereign_role: None,
+            ingress_floating_ip: None,
         };
         machine.save(root).unwrap();
 
@@ -8279,7 +8664,7 @@ taints = ["no-server", "no-appliance", "no-job"]
         let noisy = make_machine_with_capacity("n", 8192, 4000, vec!["no-voter", "qa"]);
         for arch in LifecycleArchetype::ALL {
             let req = RequiredSpec {
-                repel_archetype: Some(arch),
+                repel_archetypes: vec![arch],
                 ..Default::default()
             };
             assert_eq!(req.matches(&clean), req.matches(&noisy));
@@ -8538,7 +8923,7 @@ sovereign_role = "non-voter"
                 ..Default::default()
             },
             RequiredSpec {
-                repel_archetype: Some(LifecycleArchetype::Appliance),
+                repel_archetypes: vec![LifecycleArchetype::Appliance],
                 ..Default::default()
             },
         ] {
@@ -9398,5 +9783,342 @@ path  = "../first"
             assert_eq!(origin.owner, "yah");
             assert_eq!(origin.mode, SourceMode::ReadOnly);
         }
+    }
+
+    // ─── R860-T4 (W338): placement groups ───────────────────────────────────
+
+    /// One requirement edge, written the way a spec author writes it.
+    fn requirement(ident: &str, locality: Locality) -> workload_spec::Requirement {
+        workload_spec::Requirement {
+            ident: workload_spec::MeshIdent(ident.into()),
+            locality,
+            supply: workload_spec::Supply::Wait,
+            provides: None,
+        }
+    }
+
+    /// A `minimal_spec` (256 MiB / 250 millicores, Server by inference) that
+    /// requires the given edges.
+    fn spec_requiring(name: &str, requires: Vec<workload_spec::Requirement>) -> WorkloadSpec {
+        WorkloadSpec {
+            requires,
+            ..minimal_spec(name, 1)
+        }
+    }
+
+    /// The declared inventory an ident is resolved against — `.yah/infra/workloads/`.
+    fn declared(specs: Vec<WorkloadSpec>) -> Vec<WorkloadConfig> {
+        specs.into_iter().map(|spec| WorkloadConfig { spec }).collect()
+    }
+
+    fn member_names(group: &[WorkloadSpec]) -> Vec<&str> {
+        group.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    /// The headline case: `local` means "same node", so the two specs are one
+    /// placement unit and admission has to reason about both.
+    #[test]
+    fn a_local_edge_binds_the_provider_into_the_placement_group() {
+        let inventory = declared(vec![minimal_spec("headscale-replicator", 1)]);
+        let requirer = spec_requiring(
+            "headscale",
+            vec![requirement("headscale-replicator", Locality::Local)],
+        );
+
+        assert_eq!(
+            member_names(&placement_group(&requirer, &inventory)),
+            vec!["headscale", "headscale-replicator"]
+        );
+    }
+
+    /// The edge that must NOT bind. `prefer-local` "never blocks placement"
+    /// (W338's locality table), and `anywhere` — which is what every legacy
+    /// `depends_on` folds into — is an ordinary service dependency. Binding
+    /// either would silently make every dependency in the tree a co-scheduling
+    /// constraint and start summing unrelated workloads into the capacity floor.
+    #[test]
+    fn prefer_local_and_anywhere_edges_do_not_bind_the_group() {
+        let inventory = declared(vec![
+            minimal_spec("headscale-db", 1),
+            minimal_spec("metrics", 1),
+            minimal_spec("legacy-dep", 1),
+        ]);
+
+        let requirer = WorkloadSpec {
+            depends_on: vec![workload_spec::MeshIdent("legacy-dep".into())],
+            ..spec_requiring(
+                "headscale",
+                vec![
+                    requirement("headscale-db", Locality::PreferLocal),
+                    requirement("metrics", Locality::Anywhere),
+                ],
+            )
+        };
+
+        assert_eq!(
+            member_names(&placement_group(&requirer, &inventory)),
+            vec!["headscale"]
+        );
+    }
+
+    /// Transitive, and via the inline spec a `supply = "self"` requirement
+    /// carries rather than via an ident lookup — the sidecar shape W338's
+    /// worked example is built on.
+    #[test]
+    fn the_group_is_the_transitive_closure_and_traverses_inline_provides() {
+        let inline = workload_spec::Requirement {
+            supply: workload_spec::Supply::SelfProvision,
+            provides: Some(Box::new(minimal_spec("headscale-restore", 1))),
+            ..requirement("headscale-restore", Locality::Local)
+        };
+        let middle = WorkloadSpec {
+            requires: vec![requirement("wal-shipper", Locality::Local)],
+            ..minimal_spec("headscale-replicator", 1)
+        };
+        let inventory = declared(vec![middle, minimal_spec("wal-shipper", 1)]);
+
+        let requirer = spec_requiring(
+            "headscale",
+            vec![
+                inline,
+                requirement("headscale-replicator", Locality::Local),
+            ],
+        );
+
+        assert_eq!(
+            member_names(&placement_group(&requirer, &inventory)),
+            vec![
+                "headscale",
+                "headscale-restore",
+                "headscale-replicator",
+                "wal-shipper"
+            ]
+        );
+    }
+
+    /// `validate::check_requires` bounds `provides` nesting to depth 1 but
+    /// cannot stop two separately-declared specs from naming each other. Without
+    /// the visited set this closure never terminates, so admission would hang
+    /// rather than refuse — the worst failure shape for a deploy gate.
+    #[test]
+    fn an_ident_cycle_closes_the_group_instead_of_looping_forever() {
+        let b = spec_requiring("b", vec![requirement("a", Locality::Local)]);
+        let a = spec_requiring("a", vec![requirement("b", Locality::Local)]);
+        let inventory = declared(vec![a.clone(), b]);
+
+        assert_eq!(member_names(&placement_group(&a, &inventory)), vec!["a", "b"]);
+    }
+
+    /// An unresolvable ident is skipped, not fatal: admission is a pure function
+    /// of the declared inventory, and refusing every deploy whose provider is
+    /// not yet declared would make `requires` unusable before R860-T6 lands.
+    #[test]
+    fn an_unresolvable_local_ident_is_skipped_rather_than_refused() {
+        let requirer = spec_requiring("headscale", vec![requirement("not-declared", Locality::Local)]);
+        assert_eq!(
+            member_names(&placement_group(&requirer, &[])),
+            vec!["headscale"]
+        );
+    }
+
+    /// W338 §Placement consequences 1: the capacity floor is the group's sum.
+    /// A node that fits the requirer alone must refuse the group — placing it
+    /// there would oversubscribe the node the moment the provider follows.
+    #[test]
+    fn the_capacity_floor_is_the_sum_of_the_group_not_the_requirer_alone() {
+        let provider = minimal_spec("headscale-replicator", 1);
+        let requirer = spec_requiring(
+            "headscale",
+            vec![requirement("headscale-replicator", Locality::Local)],
+        );
+        // Two `minimal_spec`s: 256 MiB + 250 millicores each.
+        let inventory = declared(vec![provider]);
+
+        let too_small = CloudConfig {
+            workloads: inventory.clone(),
+            ..make_empty_cfg(vec![make_machine_with_capacity("small", 300, 4000, vec![])])
+        };
+        let err = too_small.admit_workload(&requirer).unwrap_err().to_string();
+        assert!(
+            err.contains("memory_mb>=512"),
+            "the floor must name the group's summed demand, got: {err}"
+        );
+
+        let big_enough = CloudConfig {
+            workloads: inventory,
+            ..make_empty_cfg(vec![make_machine_with_capacity("roomy", 512, 4000, vec![])])
+        };
+        assert_eq!(
+            big_enough.admit_workload(&requirer).unwrap().name,
+            "roomy",
+            "a node covering the sum must still admit the group"
+        );
+    }
+
+    /// W338 §Placement consequences 2, and the reason repulsion is computed over
+    /// a set at all: the requirer is a `Server`, so the pre-R860 axis would have
+    /// let it onto a `no-appliance` dev Pi and dragged its Appliance provider
+    /// there with it.
+    #[test]
+    fn a_server_requiring_an_appliance_locally_is_repelled_by_no_appliance() {
+        let appliance = WorkloadSpec {
+            archetype: Some(LifecycleArchetype::Appliance),
+            ..minimal_spec("headscale", 1)
+        };
+        let requirer = spec_requiring("headscale-ui", vec![requirement("headscale", Locality::Local)]);
+        assert_eq!(
+            requirer.effective_archetype(),
+            LifecycleArchetype::Server,
+            "precondition: the requirer itself must not be an Appliance"
+        );
+
+        let cfg = CloudConfig {
+            workloads: declared(vec![appliance]),
+            ..make_empty_cfg(vec![
+                make_machine_with_capacity("dev-pi", 8192, 4000, vec!["no-appliance"]),
+                make_machine_with_capacity("us-west-001", 8192, 4000, vec![]),
+            ])
+        };
+
+        assert_eq!(
+            cfg.admit_workload(&requirer).unwrap().name,
+            "us-west-001",
+            "the dev Pi repels the group's Appliance member"
+        );
+
+        // And with the Appliance gone from the group, the same requirer is
+        // admissible on the same Pi — proving the repulsion came from the edge.
+        let alone = minimal_spec("headscale-ui", 1);
+        assert_eq!(cfg.admit_workload(&alone).unwrap().name, "dev-pi");
+    }
+
+    /// The set-valued form of the per-workload drain skip the node makes in
+    /// `drain_workloads`: one Appliance member pins the whole group.
+    #[test]
+    fn a_group_containing_an_appliance_is_not_drainable() {
+        let server = minimal_spec("headscale-ui", 1);
+        let appliance = WorkloadSpec {
+            archetype: Some(LifecycleArchetype::Appliance),
+            ..minimal_spec("headscale", 1)
+        };
+
+        assert!(group_is_drainable(std::slice::from_ref(&server)));
+        assert!(!group_is_drainable(&[server, appliance]));
+    }
+
+    /// The regression that matters most: nothing in the tree declares
+    /// `requires` yet, so every existing spec's group is exactly itself and its
+    /// admission axes must be bit-identical to the pre-R860 derivation.
+    #[test]
+    fn a_spec_with_no_local_edges_admits_exactly_as_it_did_before() {
+        let ws = ws_with_selector(Some("tag:build-worker,arch:x86"));
+        let req = admission_spec(&ws, &[]);
+
+        assert_eq!(req.mesh_tags, vec!["tag:build-worker", "arch:x86"]);
+        assert_eq!(req.memory_mb, ws.memory_request_mb());
+        assert_eq!(req.cpu_millis, ws.resources.cpu_millis);
+        assert_eq!(req.repel_archetypes, vec![ws.effective_archetype()]);
+    }
+
+    // ─── R860-T5 (W338 §Placement consequences 3): native-exec capability ────
+
+    /// A `minimal_spec` carrying the `yah.exec = native` marker — the only way
+    /// a workload says "fork+exec me on the host" (`WorkloadSpec::
+    /// wants_native_exec`). It stays a Container workload on the wire; the
+    /// marker is the whole difference.
+    fn native_spec(name: &str) -> WorkloadSpec {
+        let mut ws = minimal_spec(name, 1);
+        ws.annotations.insert(
+            workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+            workload_spec::NATIVE_EXEC_VALUE.to_string(),
+        );
+        assert!(ws.wants_native_exec(), "precondition: the marker must read back");
+        ws
+    }
+
+    /// The R858 failure, now caught at placement instead of at dispatch: a node
+    /// whose kamaji has no `--native-exec-dir` accepted the election and then
+    /// refused the deploy, and nothing upstream could see it coming.
+    #[test]
+    fn a_node_without_the_native_exec_capability_cannot_host_a_native_workload() {
+        let native = native_spec("headscale");
+
+        let incapable = make_empty_cfg(vec![make_machine("us-south-001", vec![])]);
+        let err = incapable.admit_workload(&native).unwrap_err().to_string();
+        assert!(
+            err.contains(NATIVE_EXEC_MESH_TAG),
+            "the refusal must name the missing capability, got: {err}"
+        );
+
+        let capable = make_empty_cfg(vec![
+            make_machine("us-south-001", vec![]),
+            make_machine("us-west-001", vec![NATIVE_EXEC_MESH_TAG]),
+        ]);
+        assert_eq!(
+            capable.admit_workload(&native).unwrap().name,
+            "us-west-001",
+            "a node declaring the capability admits the native workload"
+        );
+    }
+
+    /// W338's actual sentence: a `supply = "self"` spec "must be placeable where
+    /// its requirer lands". The requirer here is an ordinary container workload
+    /// — it is the *provider* reached by a `local` edge that needs the host
+    /// backend, so the capability has to be required of the group, not of the
+    /// spec being deployed.
+    #[test]
+    fn a_local_edge_to_a_native_provider_makes_the_requirer_need_the_capability() {
+        let requirer = spec_requiring(
+            "headscale-ui",
+            vec![requirement("headscale", Locality::Local)],
+        );
+        assert!(
+            !requirer.wants_native_exec(),
+            "precondition: the requirer itself is an ordinary container workload"
+        );
+
+        let cfg = CloudConfig {
+            workloads: declared(vec![native_spec("headscale")]),
+            ..make_empty_cfg(vec![
+                make_machine("plain", vec![]),
+                make_machine("us-west-001", vec![NATIVE_EXEC_MESH_TAG]),
+            ])
+        };
+
+        assert_eq!(
+            cfg.admit_workload(&requirer).unwrap().name,
+            "us-west-001",
+            "the group's native member pulls the requirer onto a capable node"
+        );
+
+        // Without the edge the same requirer is admissible on the plain node,
+        // so the constraint provably came from the group and not from the spec.
+        let alone = minimal_spec("headscale-ui", 1);
+        assert_eq!(cfg.admit_workload(&alone).unwrap().name, "plain");
+    }
+
+    /// The regression guard: nothing in the tree is native-marked today, so
+    /// every existing spec's axes must be untouched by this ticket.
+    #[test]
+    fn a_group_with_no_native_member_does_not_require_the_capability() {
+        let inventory = declared(vec![minimal_spec("headscale-replicator", 1)]);
+        let requirer = spec_requiring(
+            "headscale",
+            vec![requirement("headscale-replicator", Locality::Local)],
+        );
+
+        let req = admission_spec(&requirer, &inventory);
+        assert!(
+            !req.mesh_tags.iter().any(|t| t == NATIVE_EXEC_MESH_TAG),
+            "no native member ⇒ no capability axis, got: {:?}",
+            req.mesh_tags
+        );
+
+        // And it still lands on a node that declares nothing at all.
+        let cfg = CloudConfig {
+            workloads: inventory,
+            ..make_empty_cfg(vec![make_machine("plain", vec![])])
+        };
+        assert_eq!(cfg.admit_workload(&requirer).unwrap().name, "plain");
     }
 }

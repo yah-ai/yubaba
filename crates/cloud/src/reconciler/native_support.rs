@@ -92,6 +92,7 @@ pub(crate) fn native_spec(ident: &str, argv: Vec<String>, env: Vec<EnvVar>) -> W
             ephemeral_storage_mb: 512,
         },
         depends_on: vec![],
+        requires: vec![],
         healthcheck: None,
         restart_policy: RestartPolicy::Never,
         archetype: None,

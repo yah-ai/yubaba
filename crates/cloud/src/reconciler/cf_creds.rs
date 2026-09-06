@@ -101,9 +101,7 @@ impl CfProvider {
         tenant: &TenantId,
         namespace: &NamespaceId,
     ) -> Result<Self> {
-        let path = workspace_root
-            .join(".yah/infra/providers")
-            .join(format!("{provider_id}.toml"));
+        let path = crate::paths::provider_toml(workspace_root, provider_id);
         let cfg = ProviderConfig::load(&path).with_context(|| {
             format!(
                 "loading Cloudflare provider `{provider_id}` — expected at {}",

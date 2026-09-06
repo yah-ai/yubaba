@@ -413,8 +413,10 @@ mod tests {
                         addr: format!("100.64.0.{id}:7443"),
                         region: region.map(str::to_string),
                         // The pin judges regions only; capacity is R737-F1's
-                        // axis and is deliberately not part of this decision.
+                        // axis and machine is R859-F2's, and neither is part of
+                        // this decision.
                         capacity: None,
+                        machine: None,
                     },
                 )
             })

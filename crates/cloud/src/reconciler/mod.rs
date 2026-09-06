@@ -83,6 +83,7 @@ pub mod cloudflare_worker;
 pub mod container;
 pub mod derive_cache_prune;
 pub mod domain;
+pub mod headscale;
 pub mod ingress;
 pub mod ingress_verify;
 pub mod local_process;
@@ -110,7 +111,15 @@ pub use derive_cache_prune::{
     collect_live_derive_hashes, compute_derive_cache_candidates, execute_derive_cache_prune,
     DeriveCacheLiveHashes, DerivePruneCandidate,
 };
-pub use domain::ensure_r2_custom_domain;
+pub use domain::{
+    deploy_domain_passway, diff_apex_records, ensure_passway_apex, ensure_r2_custom_domain,
+    plan_domain_passway, public_origins, ApexRecordDiff, DomainPasswayPlan, LiveApexRecord,
+    PasswayApexOutcome, PasswayOrigin,
+};
+pub use headscale::{
+    DeclaredHeadscale, DeclaredPolicy, DeclaredPreauthKey, HeadscaleReconciler,
+    WORKLOAD_KIND as HEADSCALE_WORKLOAD_KIND,
+};
 pub use ingress::{
     collate_front_doors, declared as ingress_declared, ensure_tunnel_ingress, machine_mesh_addrs,
     plan_ingress, publish_tunnel_ingress, resolve_ingress_placements, Collation, IngressPlan,

@@ -774,6 +774,7 @@ mod tests {
                     updated_at: 1_700_000_000,
                     access: Default::default(),
                     digest: None,
+                    sans: None,
                 },
             )
             .unwrap();

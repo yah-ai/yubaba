@@ -344,6 +344,12 @@ pub enum YubabaRequest {
         /// therefore unschedulable, not as unlimited.
         #[serde(default)]
         capacity: Option<NodeCapacity>,
+        /// R859-F2: the machine name this node runs on — see
+        /// [`MemberInfo::machine`]. `#[serde(default)]` on the same contract as
+        /// `region` and `capacity`: a pre-R859-F2 node's replicated `SetMember`
+        /// still applies, landing as `None`.
+        #[serde(default)]
+        machine: Option<String>,
     },
     RemoveMember {
         node_id: YubabaNodeId,
@@ -422,6 +428,19 @@ pub enum YubabaRequest {
         /// field existed replays as `None` rather than failing.
         #[serde(default)]
         digest: Option<Vec<u8>>,
+        /// R853-B9: the leaf `dNSName` SANs when this record holds a cert chain,
+        /// `None` otherwise. See [`SecretRecord::sans`] for why it is plaintext
+        /// and why `None` must never be read as "covered". `#[serde(default)]`
+        /// on the same contract as `access` and `digest`: a log entry written
+        /// before this field existed replays as `None`.
+        ///
+        /// A *field* on an existing variant, not a new variant — so a
+        /// downgraded binary replaying a log that contains one drops the key
+        /// instead of failing to deserialize (`YubabaRequest` has no
+        /// `deny_unknown_fields`). That is why this needs a surface re-record
+        /// but no `state_epoch` bump, exactly as R720-F1's `digest` did.
+        #[serde(default)]
+        sans: Option<Vec<String>>,
     },
     /// Remove a cluster secret. Hard delete, no tombstone: a secret that should
     /// stop being served is removed and the consuming resolver (R600-F2) fails
@@ -1022,6 +1041,34 @@ pub struct SecretRecord {
     /// keyed digest costs nothing extra.
     #[serde(default)]
     pub digest: Option<Vec<u8>>,
+
+    /// R853-B9: for a record holding a **certificate chain**, the `dNSName`
+    /// SANs of its leaf — normalized, exactly what
+    /// `acme_engine::cert_dns_names` read out of the PEM before sealing.
+    /// `None` on every other kind of secret.
+    ///
+    /// Plaintext on purpose. A certificate's SAN list is public by
+    /// construction — every TLS client is handed it on connect — so storing it
+    /// beside the ciphertext discloses nothing, and it is the only way an
+    /// issuer can ask "does the cert I am holding still cover what I am
+    /// configured for" **without a KEK unseal on every tick**. The private key
+    /// record never carries this.
+    ///
+    /// Cert-shaped metadata on an otherwise generic record is a real layering
+    /// cost, and it was paid deliberately: the alternative is a second raft key
+    /// holding the SAN list, which can then disagree with the cert it
+    /// describes. `issue_and_store` already has to reason about a partial
+    /// cert/key write; a third write would widen exactly that window. Being
+    /// one `PutSecret` with the ciphertext makes divergence unrepresentable.
+    ///
+    /// **`None` does not mean "covered"** — same contract as `digest` and
+    /// `access` above. It means "written before this field existed, or not a
+    /// cert", and callers must degrade to an age-only decision
+    /// (`acme_engine::CertSans::NotChecked`) rather than assume a match. A
+    /// legacy record therefore behaves exactly as it did before this field
+    /// landed, and heals itself at the next issuance.
+    #[serde(default)]
+    pub sans: Option<Vec<String>>,
 }
 
 // Redact the opaque bytes from Debug (which `YubabaState`/snapshot dumps and any
@@ -1052,6 +1099,19 @@ impl std::fmt::Debug for SecretRecord {
                     match &self.digest {
                         Some(d) => format!("<{} bytes>", d.len()),
                         None => "None (pre-digest)".to_string(),
+                    }
+                ),
+            )
+            // Printed in full rather than counted: SAN names are public and a
+            // state dump is where you go to answer "why is it still serving
+            // the narrow cert".
+            .field(
+                "sans",
+                &format_args!(
+                    "{}",
+                    match &self.sans {
+                        Some(s) => s.join(", "),
+                        None => "None (not a cert, or pre-sans)".to_string(),
                     }
                 ),
             )
@@ -1104,6 +1164,53 @@ pub struct MemberInfo {
     /// it.
     #[serde(default)]
     pub capacity: Option<NodeCapacity>,
+
+    /// R859-F2: the **machine name** this node runs on — the `name` in
+    /// `/etc/hostname` — byte-for-byte the same string
+    /// [`YubabaState::ingress_owner`] carries for this node.
+    ///
+    /// This is the only bridge between the two identity spaces yubaba keeps.
+    /// Consensus, liveness and placement all speak [`YubabaNodeId`]; ingress
+    /// ownership speaks this string. Before this field nothing mapped one to
+    /// the other, so "node 3 is confirmed down" could not become "node 3 is
+    /// the ingress owner" — the effector R859-F2 exists to build had no way to
+    /// name its own subject. See [`YubabaStateMachine::machine_for_node`][mfn]
+    /// and [`YubabaStateMachine::node_for_machine`][nfm].
+    ///
+    /// Written from the same `derive_machine_name()` the leader path uses to
+    /// write `ingress_owner` ([`crate::leader`]), deliberately: one derivation
+    /// means the two strings are comparable by construction rather than by
+    /// convention.
+    ///
+    /// # It is a hostname, NOT the `.yah/infra/machines/` name
+    ///
+    /// That comparability is the whole guarantee this field makes, and it is
+    /// narrower than the field name suggests. `derive_machine_name()` reads
+    /// `/etc/hostname` (falling back to `$HOSTNAME`). On some boxes that
+    /// equals the declared machine name; on others it does not. R841's
+    /// incident record (`app/yah/cli/src/rollout/executor.rs`) has
+    /// `ingress_owner` holding `vps-4c1efa56` for the machine declared as
+    /// `us-west-001`, and `app/yah/cli/src/mesh.rs`'s R858-T3 gotcha says it
+    /// outright: this value is neither a mesh address nor a machine-TOML name.
+    ///
+    /// So a consumer that needs a `cloud::config::MachineConfig` must
+    /// **resolve** this string against the declared fleet and refuse when it
+    /// does not match exactly one machine — never assume equality.
+    /// `cloud::provider::floating_ip::resolve_ingress_owner` is that step, and
+    /// it refuses loudly by design: reassigning a floating IP onto a machine
+    /// picked by a wrong guess is the outage this ticket exists to prevent.
+    ///
+    /// `Option` + `#[serde(default)]` for snapshot compatibility, on the same
+    /// contract as [`region`](Self::region): [`YubabaState`] is a
+    /// JSON-snapshot-replicated state machine, so a snapshot written before
+    /// this field must still deserialize (landing as `None` — *unknown*, never
+    /// "no machine"). A node with `None` here is simply not resolvable by
+    /// name; every consumer treats that as "no mapping", never as a match.
+    ///
+    /// [mfn]: crate::raft::YubabaStateMachine::machine_for_node
+    /// [nfm]: crate::raft::YubabaStateMachine::node_for_machine
+    #[serde(default)]
+    pub machine: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1122,6 +1229,7 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
             addr,
             region,
             capacity,
+            machine,
         } => {
             state.members.insert(
                 *node_id,
@@ -1129,6 +1237,7 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
                     addr: addr.clone(),
                     region: region.clone(),
                     capacity: *capacity,
+                    machine: machine.clone(),
                 },
             );
             YubabaResponse::Ok
@@ -1216,6 +1325,7 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
             updated_at,
             access,
             digest,
+            sans,
         } => {
             // Opaque bytes in, opaque bytes stored — this layer never decrypts.
             // The access rule and digest are stored verbatim alongside them;
@@ -1231,6 +1341,7 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
                     updated_at: *updated_at,
                     access: access.clone(),
                     digest: digest.clone(),
+                    sans: sans.clone(),
                 },
             );
             YubabaResponse::Ok
@@ -1473,6 +1584,7 @@ mod tests {
                     memory_mb: 16384,
                     cpu_millis: 8000,
                 }),
+                machine: Some("us-west-001".into()),
             },
         );
         assert_eq!(
@@ -1489,6 +1601,124 @@ mod tests {
             }),
             "R737-F1: capacity must survive apply, or the scheduler has nothing to bin-pack \
              against"
+        );
+        assert_eq!(
+            state.members.get(&1).and_then(|m| m.machine.as_deref()),
+            Some("us-west-001"),
+            "R859-F2: the machine tag must survive apply, or nothing can map a confirmed-down \
+             node id onto the ingress_owner string that names the same box"
+        );
+    }
+
+    /// R859-F2's identity bridge, both directions, over the pure state.
+    ///
+    /// `ingress_owner` and `MemberInfo::machine` are written from the *same*
+    /// `derive_machine_name()`, so the round trip node id -> machine ->
+    /// node id is what lets a liveness fact keyed by node id be compared
+    /// against an ownership fact keyed by name. The accessors that expose this
+    /// on a live state machine are `YubabaStateMachine::machine_for_node` /
+    /// `node_for_machine`; this pins the underlying state relation.
+    #[test]
+    fn the_machine_tag_bridges_ingress_owner_back_to_a_node_id() {
+        let mut state = YubabaState::default();
+        for (node_id, machine) in [(1u64, "us-west-001"), (2, "vps-4c1efa56")] {
+            apply(
+                &mut state,
+                &YubabaRequest::SetMember {
+                    node_id,
+                    addr: format!("100.64.0.{node_id}:7443"),
+                    region: None,
+                    capacity: None,
+                    machine: Some(machine.into()),
+                },
+            );
+        }
+        apply(
+            &mut state,
+            &YubabaRequest::SetIngressOwner {
+                machine: "vps-4c1efa56".into(),
+            },
+        );
+
+        let owner = state.ingress_owner.clone().unwrap();
+        let owner_node = state
+            .members
+            .iter()
+            .find(|(_, m)| m.machine.as_deref() == Some(owner.as_str()))
+            .map(|(id, _)| *id);
+        assert_eq!(
+            owner_node,
+            Some(2),
+            "the ingress owner must resolve back to the node that claimed it"
+        );
+
+        // A machine no member row claims resolves to nothing rather than to an
+        // arbitrary node — the fail-closed direction.
+        assert!(state
+            .members
+            .values()
+            .all(|m| m.machine.as_deref() != Some("us-east-001")));
+    }
+
+    /// R859-F2, the `state_epoch` half — same contract R734-F2's `region` test
+    /// pins, for the same reason: `machine` is a `#[serde(default)]` *field* on
+    /// an existing struct, so both directions must hold or this is a bump
+    /// rather than a re-record.
+    #[test]
+    fn a_pre_r859_f2_snapshot_loads_untagged_and_a_downgrade_reads_a_tagged_one() {
+        // New reads old: a snapshot written before machine tags existed. Note
+        // it also carries `region`/`capacity`, i.e. a genuinely R737-era
+        // snapshot rather than a minimal one.
+        let legacy = r#"{"members":{"1":{"addr":"100.64.0.1:7443","region":"us-west","capacity":{"memory_mb":16384,"cpu_millis":8000}}},"service_placement":{},"locks":{},"ingress_owner":"us-west-001","rollouts":{},"secrets":{}}"#;
+        let state: YubabaState =
+            serde_json::from_str(legacy).expect("a pre-R859-F2 snapshot must still deserialize");
+        assert_eq!(
+            state.members.get(&1).and_then(|m| m.machine.as_deref()),
+            None,
+            "an untagged member must read as untagged, never as an invented default"
+        );
+        assert_eq!(
+            state.members.get(&1).and_then(|m| m.region.as_deref()),
+            Some("us-west"),
+            "the fields that were already there must survive the new one landing"
+        );
+        assert_eq!(state.ingress_owner.as_deref(), Some("us-west-001"));
+
+        // Old reads new: stand in for a pre-R859-F2 binary's decoder and
+        // confirm the extra key is ignored rather than fatal.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct PreR859MemberInfo {
+            addr: String,
+            #[serde(default)]
+            region: Option<String>,
+        }
+        let tagged = r#"{"addr":"100.64.0.1:7443","region":"us-west","machine":"us-west-001"}"#;
+        let old: PreR859MemberInfo = serde_json::from_str(tagged)
+            .expect("a downgraded binary must still parse a machine-tagged member row");
+        assert_eq!(old.addr, "100.64.0.1:7443");
+        assert_eq!(old.region.as_deref(), Some("us-west"));
+    }
+
+    /// The `cluster_protocol` half: a pre-R859-F2 node's replicated `SetMember`
+    /// carries no `machine` key at all and must still apply, landing as `None`,
+    /// rather than stalling the state machine at that log index.
+    #[test]
+    fn a_pre_r859_f2_set_member_still_applies_with_no_machine() {
+        let legacy = serde_json::json!({
+            "SetMember": { "node_id": 2, "addr": "100.64.0.2:7443", "region": "us-east" }
+        });
+        let req: YubabaRequest =
+            serde_json::from_value(legacy).expect("a machine-less SetMember must still parse");
+        let mut state = YubabaState::default();
+        apply(&mut state, &req);
+        assert_eq!(
+            state.members.get(&2).and_then(|m| m.machine.as_deref()),
+            None
+        );
+        assert_eq!(
+            state.members.get(&2).map(|m| m.addr.as_str()),
+            Some("100.64.0.2:7443")
         );
     }
 
@@ -1588,6 +1818,7 @@ mod tests {
                 updated_at: 1000,
                 access: SecretAccess::workloads(["ingress"]),
                 digest: Some(vec![0xaa; 32]),
+                sans: None,
             },
         );
         let rec = state.secrets.get("tls/yah.dev").expect("secret stored");
@@ -1606,6 +1837,7 @@ mod tests {
                 updated_at: 2000,
                 access: SecretAccess::workloads(["ingress"]),
                 digest: Some(vec![0xbb; 32]),
+                sans: None,
             },
         );
         let rec = state.secrets.get("tls/yah.dev").unwrap();
@@ -1649,6 +1881,7 @@ mod tests {
                 updated_at: 42,
                 access: SecretAccess::workloads(["ingress"]),
                 digest: Some(vec![0xcc; 32]),
+                sans: None,
             },
         );
         let json = serde_json::to_string(&state).unwrap();
@@ -1670,6 +1903,7 @@ mod tests {
                 updated_at: 500,
                 access: SecretAccess::workloads(["ingress"]),
                 digest: Some(vec![0x42; 32]),
+                sans: None,
             },
         );
         let rec = state.secrets.get("tls/yah.dev").unwrap();
@@ -2105,6 +2339,7 @@ mod tests {
                 addr: format!("100.64.0.{node}:7443"),
                 region: Some("us-west".into()),
                 capacity,
+                machine: None,
             },
         );
     }

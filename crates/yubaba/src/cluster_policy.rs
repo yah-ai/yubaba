@@ -374,6 +374,28 @@ pub enum IngressOwnership {
     /// and it must move when leadership moves.
     FollowsRaftLeader,
 
+    /// The appliance owner is **its own elected fact**, chosen from an
+    /// eligibility set — and a raft leadership change is not an input to it
+    /// (R858-T3).
+    ///
+    /// [`FollowsRaftLeader`](Self::FollowsRaftLeader) reads "exactly one node
+    /// holds the external identity" as "the leader holds it", which is a
+    /// non-sequitur that cost the fleet 37 hours of mesh downtime on
+    /// 2026-09-03: a routine `POST /raft/transfer-leader` tore the coordinator
+    /// off a healthy node and handed it to one that could not run it. Consensus
+    /// leadership answers "who may write"; nothing about it answers "which box
+    /// can serve tailnet clients".
+    ///
+    /// Under this variant ownership moves on owner **failure** only, the
+    /// candidate set is judged by
+    /// [`judge_appliance_candidate`](crate::appliance_ownership::judge_appliance_candidate),
+    /// a failed deploy backs that node off rather than being retried instantly,
+    /// and a node that cannot stand the appliance up claims nothing and reports
+    /// [`ApplianceHealth::Unhealthy`](crate::appliance_ownership::ApplianceHealth::Unhealthy).
+    /// See [`crate::appliance_ownership`] for the bounds that keep re-election
+    /// from flapping.
+    ElectedFromEligible,
+
     /// No node claims external ingress from the raft-leader path.
     ///
     /// For a cluster with no outside-the-mesh clients to serve — every peer is
@@ -392,8 +414,30 @@ pub enum IngressOwnership {
 impl IngressOwnership {
     /// Whether a leadership transition should drive the external-ingress
     /// services and the `SetIngressOwner` claim.
+    ///
+    /// False under [`ElectedFromEligible`](Self::ElectedFromEligible) — that is
+    /// the entire difference between the two managed variants, and reading it
+    /// through this predicate is what keeps the R858 coupling from creeping
+    /// back in at a new call site.
     pub fn follows_raft_leader(&self) -> bool {
         matches!(self, Self::FollowsRaftLeader)
+    }
+
+    /// Whether the appliance owner is elected from an eligibility set
+    /// (R858-T3), independently of raft leadership.
+    pub fn elects_from_eligibility_set(&self) -> bool {
+        matches!(self, Self::ElectedFromEligible)
+    }
+
+    /// Whether this cluster has an external identity for *some* node to hold at
+    /// all — true for both managed variants, false only for
+    /// [`Unmanaged`](Self::Unmanaged).
+    ///
+    /// The question every ingress call site actually asks, so that adding a
+    /// third managed variant is one arm here rather than an audit of every
+    /// `follows_raft_leader()` in the crate.
+    pub fn manages_ingress(&self) -> bool {
+        !matches!(self, Self::Unmanaged)
     }
 }
 
@@ -584,15 +628,18 @@ pub struct ClusterPolicy {
 
 impl ClusterPolicy {
     /// The cloud fleet: geographically distributed voters, a fixed voter set,
-    /// and an external Headscale/ingress identity that follows leadership.
+    /// and an external Headscale/ingress identity **elected from the eligible
+    /// nodes**, not carried by whoever holds raft leadership.
     ///
-    /// This is the behaviour yubaba had before the policy was named, so it is
-    /// also [`Default`].
+    /// This was [`IngressOwnership::FollowsRaftLeader`] until R858-T3. The fleet
+    /// is the deployment the 2026-09-03 outage happened to, so it is the
+    /// deployment the fix has to apply to; `FollowsRaftLeader` remains
+    /// constructible for an appliance that genuinely wants the coupling.
     pub const fn fleet() -> Self {
         Self {
             voter_admission: VoterAdmission::LearnerOnly,
             quorum_geography: QuorumGeography::MustSpanRegions,
-            ingress_ownership: IngressOwnership::FollowsRaftLeader,
+            ingress_ownership: IngressOwnership::ElectedFromEligible,
             timing: RaftTiming::wan(),
         }
     }
@@ -901,11 +948,28 @@ mod tests {
         );
     }
 
+    /// R858-T3 inverted this assertion, and the inversion is the point: no
+    /// preset ties external identity to leadership any more. The fleet still
+    /// *manages* an external identity — it simply elects who holds it.
     #[test]
-    fn only_the_fleet_ties_external_identity_to_leadership() {
-        assert!(ClusterPolicy::fleet()
-            .ingress_ownership
-            .follows_raft_leader());
-        assert!(!ClusterPolicy::rig().ingress_ownership.follows_raft_leader());
+    fn no_preset_ties_external_identity_to_leadership() {
+        let fleet = ClusterPolicy::fleet().ingress_ownership;
+        assert!(!fleet.follows_raft_leader());
+        assert!(fleet.elects_from_eligibility_set());
+        assert!(fleet.manages_ingress());
+
+        let rig = ClusterPolicy::rig().ingress_ownership;
+        assert!(!rig.follows_raft_leader());
+        assert!(!rig.elects_from_eligibility_set());
+        assert!(!rig.manages_ingress());
+    }
+
+    /// The coupling stays constructible for an appliance that wants it — this
+    /// is a new variant, not a replacement.
+    #[test]
+    fn follows_raft_leader_remains_available_as_a_choice() {
+        assert!(IngressOwnership::FollowsRaftLeader.follows_raft_leader());
+        assert!(IngressOwnership::FollowsRaftLeader.manages_ingress());
+        assert!(!IngressOwnership::FollowsRaftLeader.elects_from_eligibility_set());
     }
 }

@@ -91,15 +91,25 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 /// is load-bearing. A value that changed at deploy rate would not belong here,
 /// which is exactly why [`NodeLoad`](crate::raft::NodeLoad) is derived on the
 /// leader instead of published from the node.
+///
+/// `machine` (R859-F2) rides the same loop for the same reason: a node is the
+/// only thing that knows which machine it is, and the value never changes for
+/// the life of the box. It is derived by
+/// [`derive_machine_name`](crate::leader::derive_machine_name) — the *same*
+/// function the leader path uses to write `ingress_owner`, so the two strings
+/// are comparable by construction rather than by convention. `None` (no
+/// `/etc/hostname`, no `HOSTNAME`) publishes no mapping, which is the
+/// already-existing state, not a failure.
 pub fn spawn(
     node_id: YubabaNodeId,
     raft: YubabaRaft,
     state_machine: YubabaStateMachine,
     region: Option<String>,
     capacity: Option<NodeCapacity>,
+    machine: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        run(node_id, raft, state_machine, region, capacity).await;
+        run(node_id, raft, state_machine, region, capacity, machine).await;
     })
 }
 
@@ -135,6 +145,7 @@ fn plan_registration(
     recorded: Option<&MemberInfo>,
     region: Option<&str>,
     capacity: Option<NodeCapacity>,
+    machine: Option<&str>,
 ) -> Registration {
     let Some(addr) = self_addr else {
         return Registration::Wait("this node is not in raft membership yet");
@@ -143,6 +154,7 @@ fn plan_registration(
         addr: addr.to_string(),
         region: region.map(str::to_string),
         capacity,
+        machine: machine.map(str::to_string),
     };
     if recorded == Some(&desired) {
         return Registration::Converged;
@@ -159,6 +171,7 @@ async fn run(
     state_machine: YubabaStateMachine,
     region: Option<String>,
     capacity: Option<NodeCapacity>,
+    machine: Option<String>,
 ) {
     let client = match reqwest::Client::builder().timeout(FORWARD_TIMEOUT).build() {
         Ok(client) => client,
@@ -190,6 +203,7 @@ async fn run(
             state_machine.member(node_id).as_ref(),
             region.as_deref(),
             capacity,
+            machine.as_deref(),
         ) {
             Registration::Wait(why) => {
                 debug!(node_id, why, "member registration waiting");
@@ -206,6 +220,7 @@ async fn run(
                         addr = %row.addr,
                         region = ?row.region,
                         capacity = ?row.capacity,
+                        machine = ?row.machine,
                         "registered this node's raft member row"
                     );
                     backoff = RETRY_MIN;
@@ -248,6 +263,7 @@ async fn write_row(
         addr: row.addr.clone(),
         region: row.region.clone(),
         capacity: row.capacity,
+        machine: row.machine.clone(),
     };
     match raft.client_write(req.clone()).await {
         Ok(_) => Ok(()),
@@ -289,6 +305,14 @@ mod tests {
             addr: addr.to_string(),
             region: region.map(str::to_string),
             capacity: None,
+            machine: None,
+        }
+    }
+
+    fn row_named(addr: &str, region: Option<&str>, machine: &str) -> MemberInfo {
+        MemberInfo {
+            machine: Some(machine.to_string()),
+            ..row(addr, region)
         }
     }
 
@@ -311,7 +335,7 @@ mod tests {
     #[test]
     fn a_node_outside_membership_waits_rather_than_registering() {
         assert_eq!(
-            plan_registration(None, Some(1), None, Some("us-west"), None),
+            plan_registration(None, Some(1), None, Some("us-west"), None, None),
             Registration::Wait("this node is not in raft membership yet")
         );
     }
@@ -324,6 +348,7 @@ mod tests {
                 Some(1),
                 None,
                 Some("us-west"),
+                None,
                 None
             ),
             Registration::Write(row("100.64.0.1:7443", Some("us-west")))
@@ -342,6 +367,7 @@ mod tests {
                 Some(1),
                 Some(&recorded),
                 Some("us-west"),
+                None,
                 None
             ),
             Registration::Converged
@@ -360,6 +386,7 @@ mod tests {
                 Some(1),
                 Some(&recorded),
                 Some("us-west"),
+                None,
                 None
             ),
             Registration::Write(row("100.64.0.1:7443", Some("us-west")))
@@ -373,7 +400,7 @@ mod tests {
     #[test]
     fn an_untagged_node_registers_its_address_anyway() {
         assert_eq!(
-            plan_registration(Some("127.0.0.1:7443"), Some(1), None, None, None),
+            plan_registration(Some("127.0.0.1:7443"), Some(1), None, None, None, None),
             Registration::Write(row("127.0.0.1:7443", None))
         );
     }
@@ -385,7 +412,7 @@ mod tests {
     fn dropping_the_region_flag_clears_the_recorded_tag() {
         let recorded = row("127.0.0.1:7443", Some("us-west"));
         assert_eq!(
-            plan_registration(Some("127.0.0.1:7443"), Some(1), Some(&recorded), None, None),
+            plan_registration(Some("127.0.0.1:7443"), Some(1), Some(&recorded), None, None, None),
             Registration::Write(row("127.0.0.1:7443", None))
         );
     }
@@ -395,7 +422,7 @@ mod tests {
     #[test]
     fn a_leaderless_cluster_is_waited_out_not_written_to() {
         assert_eq!(
-            plan_registration(Some("100.64.0.1:7443"), None, None, Some("us-west"), None),
+            plan_registration(Some("100.64.0.1:7443"), None, None, Some("us-west"), None, None),
             Registration::Wait("no leader elected yet — a write would be refused")
         );
     }
@@ -419,7 +446,8 @@ mod tests {
                 Some(1),
                 Some(&recorded),
                 Some("us-west"),
-                Some(BOX_16G)
+                Some(BOX_16G),
+                None
             ),
             Registration::Write(row_with("100.64.0.1:7443", Some("us-west"), BOX_16G))
         );
@@ -438,7 +466,8 @@ mod tests {
                 Some(1),
                 Some(&recorded),
                 Some("us-west"),
-                Some(BOX_16G)
+                Some(BOX_16G),
+                None
             ),
             Registration::Converged
         );
@@ -452,7 +481,65 @@ mod tests {
     #[test]
     fn a_node_that_cannot_measure_itself_still_registers() {
         assert_eq!(
-            plan_registration(Some("127.0.0.1:7443"), Some(1), None, Some("us-west"), None),
+            plan_registration(Some("127.0.0.1:7443"), Some(1), None, Some("us-west"), None, None),
+            Registration::Write(row("127.0.0.1:7443", Some("us-west")))
+        );
+    }
+
+    /// R859-F2: the machine tag is compared like every other half of the row, so
+    /// a box whose hostname changed under it republishes. That matters more than
+    /// it looks — a stale tag does not merely go unused, it maps the *wrong* node
+    /// id to an `ingress_owner` string, which is a mis-aimed effector rather than
+    /// a missing one.
+    #[test]
+    fn a_renamed_box_republishes_its_machine_tag() {
+        let recorded = row_named("100.64.0.1:7443", Some("us-west"), "vps-4c1efa56");
+        assert_eq!(
+            plan_registration(
+                Some("100.64.0.1:7443"),
+                Some(1),
+                Some(&recorded),
+                Some("us-west"),
+                None,
+                Some("us-west-001"),
+            ),
+            Registration::Write(row_named("100.64.0.1:7443", Some("us-west"), "us-west-001"))
+        );
+    }
+
+    /// …and an unchanged tag is converged, which is what keeps the loop quiet
+    /// once the field rides it — the same property `capacity` had to have.
+    #[test]
+    fn an_unchanged_machine_tag_is_converged_and_writes_nothing() {
+        let recorded = row_named("100.64.0.1:7443", Some("us-west"), "us-west-001");
+        assert_eq!(
+            plan_registration(
+                Some("100.64.0.1:7443"),
+                Some(1),
+                Some(&recorded),
+                Some("us-west"),
+                None,
+                Some("us-west-001"),
+            ),
+            Registration::Converged
+        );
+    }
+
+    /// A node that cannot derive its own name registers everything else anyway,
+    /// exactly as an untagged node registers without a region. Refusing would
+    /// hide the node from the map — "not in the cluster" instead of "name
+    /// unknown" — and unknown is what `machine_for_node` already handles.
+    #[test]
+    fn a_node_that_cannot_name_itself_still_registers() {
+        assert_eq!(
+            plan_registration(
+                Some("127.0.0.1:7443"),
+                Some(1),
+                None,
+                Some("us-west"),
+                None,
+                None,
+            ),
             Registration::Write(row("127.0.0.1:7443", Some("us-west")))
         );
     }
@@ -470,6 +557,7 @@ mod tests {
                 None,
                 Some(&recorded),
                 Some("us-west"),
+                None,
                 None
             ),
             Registration::Converged

@@ -6,10 +6,13 @@
 //! the bucket and writes the CNAME into the parent zone automatically when
 //! the zone lives on the same account — no DNS-side call is needed here.
 //!
-//! Domains with `front_door = "worker"` (e.g. `yah-dev.toml`,
-//! `app-yah-dev.toml`) are out of scope for this shape; they get DNS + route
-//! management through the Worker reconciler below. `front_door = "passway"`
-//! is the sovereign-ingress path (W267) and has no reconciler here yet.
+//! Domains with `front_door = "worker"` (e.g. `app-yah-dev.toml`) are out of
+//! scope for this shape; they get DNS + route management through the Worker
+//! reconciler below. `front_door = "passway"` is the sovereign-ingress path
+//! (W267) and is reconciled by [`ensure_passway_apex`] — R859-F1 — which
+//! renders the apex A record set from the domain manifest plus the workspace
+//! ingress collation, DNS-only, through the provider-agnostic `dns.*` envoy
+//! verbs.
 //!
 //! Before R594-F12 the shape was *inferred* from the absence of `[[routes]]`,
 //! which meant a route-carrying manifest bound straight to R2 was accepted
@@ -28,7 +31,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::CloudflareClient;
 
@@ -379,6 +382,697 @@ pub fn plan_alias_claim(
     })
 }
 
+// ─── R859-F1: sovereign apex (front_door = "passway") ───────────────────────
+//
+// The two-source flip this dissolves: `.yah/domains/*.toml` DECLARED
+// `front_door`, while `scripts/cf-apex-mode.sh` imperatively MUTATED the apex
+// records, and nothing kept the two in agreement. The declaration drifted from
+// the live zone for 19 days once (R330-B36) and 4 more (R703-B4). Here the
+// manifest is the only source and the reconciler renders the records from it.
+//
+// Same house shape as the Worker arm: a pure planner (`plan_domain_passway` +
+// `diff_apex_records`) that is fully unit-testable offline, and an I/O applier
+// (`deploy_domain_passway`) that only executes the diff.
+
+use crate::config::MachineConfig;
+use crate::envoy::dns_record::{
+    DnsRecordDeleteInput, DnsRecordListInput, DnsRecordUpsertInput,
+};
+use crate::provider::cloudflare_envoy::CloudflareEnvoy;
+use std::net::Ipv4Addr;
+
+/// One declared public origin behind a sovereign apex — a machine that runs a
+/// passway front door and carries a routable IPv4 address.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PasswayOrigin {
+    /// Machine name, as declared in `.yah/infra/machines/<name>.toml`. Carried
+    /// so every error and log line names the box an operator would open.
+    pub machine: String,
+    /// The address the apex A record will publish.
+    pub address: Ipv4Addr,
+}
+
+/// What [`public_origins`] resolved: the origins to publish, and the ones it
+/// deliberately held back because their machine is confirmed down (R859-F2).
+///
+/// Two lists rather than one shorter one, because the difference is
+/// load-bearing downstream: an origin that is *absent* from a declaration and
+/// an origin that is *present and known dead* want opposite treatment when the
+/// declaration itself is untrustworthy. See
+/// [`DomainPasswayPlan::health_withdrawn`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedOrigins {
+    /// Origins the apex should publish.
+    pub origins: Vec<PasswayOrigin>,
+    /// Declared, resolvable origins withheld because their machine is
+    /// confirmed down.
+    pub health_withdrawn: Vec<PasswayOrigin>,
+}
+
+/// The apex record set one passway domain should carry — pure output of
+/// [`plan_domain_passway`], applied by [`deploy_domain_passway`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DomainPasswayPlan {
+    /// Parent Cloudflare zone apex name, from [`parent_zone_name`].
+    pub zone: String,
+    /// FQDN the records live at — the manifest's `domain`.
+    pub name: String,
+    /// Desired origins, deduplicated and sorted by address so two planning
+    /// runs over the same declaration are byte-identical.
+    pub origins: Vec<PasswayOrigin>,
+    /// Whether [`origins`](Self::origins) is the **whole** declared set.
+    ///
+    /// `false` when the ingress collation reported problems, because
+    /// [`collate_workspace_ingress`](crate::validate::collate_workspace_ingress)
+    /// returns `Ok` while *skipping* an edge whose declaration fails to plan —
+    /// so a passway edge with a config typo silently drops its machine from
+    /// `front_doors`. An absent machine and a withdrawn machine are then
+    /// indistinguishable from inside this plan, and the two want opposite
+    /// treatment: a withdrawal should prune the record, a typo must not.
+    ///
+    /// So the flag gates exactly one thing —
+    /// [`diff_apex_records`] withholds every prune when it is `false` —
+    /// and nothing else. Upserts still happen: growing the fleet must keep
+    /// working through an unrelated service's broken declaration, and an
+    /// upsert can never make the apex worse. **Fail-closed on withdrawal,
+    /// fail-open on addition.**
+    pub origins_complete: bool,
+    /// Addresses withdrawn because their machine is **confirmed down** —
+    /// R859-F2's cross-provider failover, rendered through R859-F1's existing
+    /// diff rather than through a second entry point.
+    ///
+    /// # Why this is not just "absent from `origins`"
+    ///
+    /// [`origins_complete`](Self::origins_complete) and this field are two
+    /// different facts and it is worth being exact about which is which, because
+    /// conflating them silently disables the failover this ticket exists for:
+    ///
+    /// - `origins_complete` answers **"is the *declaration* picture
+    ///   trustworthy?"** `false` means the collation skipped an edge, so an
+    ///   origin's absence might be a withdrawal or might be a config typo —
+    ///   indistinguishable, so every prune is withheld.
+    /// - `health_withdrawn` answers **"which declared machine do we know is
+    ///   down?"** It is *positive* evidence about a machine the collation
+    ///   plainly saw, not an inference from an absence.
+    ///
+    /// So a health withdrawal is **not** suppressed by `origins_complete =
+    /// false`. The discriminator `origins_complete` exists to protect is
+    /// exactly "did we see this machine declared?", and for these machines the
+    /// answer is yes — they were resolved, taint-checked and address-checked on
+    /// the way into this list. A broken edge elsewhere in the workspace says
+    /// nothing about a box we watched go down, and letting it veto the
+    /// withdrawal would leave a dead origin taking its share of the
+    /// round-robin for as long as some unrelated service's TOML is wrong.
+    ///
+    /// The fail-closed-on-withdrawal rule is not weakened by this: the gate for
+    /// a health withdrawal is the *quorum* verdict, applied one layer up in
+    /// [`plan_ingress_owner_effect`](crate::provider::floating_ip::plan_ingress_owner_effect),
+    /// which refuses to emit the exclusion at all out of a degraded quorum. Two
+    /// withdrawal paths, each fail-closed on the evidence that is actually
+    /// relevant to it.
+    pub health_withdrawn: Vec<PasswayOrigin>,
+}
+
+/// One A record currently live at the apex, as read back by
+/// `dns.record.list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveApexRecord {
+    /// The published address.
+    pub content: String,
+    /// Whether the provider proxies it (Cloudflare orange-cloud).
+    pub proxied: bool,
+}
+
+/// What one apply has to change to converge the apex.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApexRecordDiff {
+    /// Addresses to upsert as DNS-only A records.
+    pub upsert: Vec<String>,
+    /// Addresses to remove — surplus A records at the same name.
+    pub prune: Vec<String>,
+    /// Addresses that *would* have been pruned but were left in place because
+    /// [`DomainPasswayPlan::origins_complete`] was `false`.
+    ///
+    /// Kept rather than dropped so the applier can name the exact records it
+    /// declined to touch. A live A record sitting here is the visible symptom
+    /// of a broken ingress declaration somewhere in the workspace — it is
+    /// either a real withdrawal this apply refused to act on, or an origin the
+    /// collation could not see.
+    pub withheld_prune: Vec<String>,
+}
+
+impl ApexRecordDiff {
+    /// `true` when this apply has no write to make. Withheld prunes do not
+    /// count: they are deliberately not writes, and a converged-with-withheld
+    /// diff still has something to warn about.
+    pub fn is_converged(&self) -> bool {
+        self.upsert.is_empty() && self.prune.is_empty()
+    }
+}
+
+/// What [`deploy_domain_passway`] actually did, for the apply summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PasswayApexOutcome {
+    /// Addresses written (created or re-pointed to DNS-only).
+    pub upserted: Vec<String>,
+    /// Addresses withdrawn.
+    pub pruned: Vec<String>,
+    /// Addresses left in place that the declaration no longer names, because
+    /// the ingress collation was incomplete — see
+    /// [`DomainPasswayPlan::origins_complete`]. Surfaced in the outcome (not
+    /// only in the log) so `yah cloud apply` can print it: a withheld prune is
+    /// the operator's cue that some service's ingress declaration is broken.
+    pub withheld_prune: Vec<String>,
+}
+
+impl PasswayApexOutcome {
+    /// `true` when the live apex already matched the declaration and nothing
+    /// was written.
+    pub fn is_noop(&self) -> bool {
+        self.upserted.is_empty() && self.pruned.is_empty()
+    }
+}
+
+/// Parse `address` as a **publicly routable** IPv4, naming `machine` on
+/// failure.
+///
+/// This is the publicness cross-check nothing performs today: the `public-ip`
+/// taint and `connect.address` are two independent operator declarations, and
+/// [`crate::config::ConnectSpec::address`]'s own doc warns it is *whichever*
+/// address the operator chose to dial the box on — public, LAN, or tailnet
+/// (us-west-002 is deliberately pointed at its tailnet IP, R608-F10). Publishing
+/// a `100.64.0.x` or `192.168.x.x` A record on a public apex takes its share of
+/// the round-robin straight to a black hole, so a taint/address disagreement
+/// has to be a hard error rather than a silently-broken record.
+///
+/// Kept local to this arm on purpose (R859-F1 decision 4): a workspace-wide
+/// lint would fire on every machine that carries the taint for placement
+/// reasons while being dialled over the mesh, which is legitimate.
+fn public_ipv4_for(machine: &str, address: &str) -> Result<Ipv4Addr> {
+    let ip: Ipv4Addr = address.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "machine {machine}: connect.address = {address:?} is not an IPv4 address, so it \
+             cannot be published as an apex A record. Either set it to the box's public IPv4 \
+             or drop the `public-ip` taint from {machine}.toml."
+        )
+    })?;
+    let o = ip.octets();
+    // 100.64.0.0/10 — RFC 6598 shared address space, which is also the
+    // tailnet range this fleet's mesh addresses live in.
+    let is_cgnat = o[0] == 100 && (64..=127).contains(&o[1]);
+    let reason = if ip.is_unspecified() {
+        Some("unspecified")
+    } else if ip.is_loopback() {
+        Some("loopback")
+    } else if ip.is_private() {
+        Some("RFC 1918 private")
+    } else if ip.is_link_local() {
+        Some("link-local")
+    } else if is_cgnat {
+        Some("RFC 6598 shared / tailnet")
+    } else if ip.is_multicast() {
+        Some("multicast")
+    } else if ip.is_broadcast() {
+        Some("broadcast")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        anyhow::bail!(
+            "machine {machine}: connect.address = {address:?} is a {reason} address, not a \
+             public one — publishing it at a public apex would black-hole its share of the \
+             round-robin. Set connect.address to the box's public IPv4 or drop the \
+             `public-ip` taint from {machine}.toml."
+        );
+    }
+    Ok(ip)
+}
+
+/// Resolve collated front-door machine names to the public origins the apex
+/// should publish (R859-F1).
+///
+/// Keeps only machines carrying the [`workload_spec::PUBLIC_IP_TAINT`]
+/// affinity taint — the same declaration that makes yubaba willing to place a
+/// public ingress appliance there — and reads each one's
+/// [`ConnectSpec::address`](crate::config::ConnectSpec::address). A named
+/// machine that is absent from `machines` is an error, not a silent drop: the
+/// alternative is an apex that quietly shrinks because a machine TOML was
+/// renamed.
+///
+/// Machines without the taint are skipped silently. That is the intended
+/// filter, not a swallowed error — a passway edge may be collated onto a
+/// mesh-only box that fronts internal hostnames.
+///
+/// # `health_excluded` — R859-F2's withdrawal seam
+///
+/// Machines named in `health_excluded` are declared, resolvable, and dropped
+/// from the origin list anyway, because something confirmed they are down. The
+/// resulting shorter list flows through [`plan_domain_passway`] and
+/// [`diff_apex_records`] unchanged, so the withdrawal renders as an ordinary
+/// prune and needs no second entry point — the whole point of extending this
+/// function rather than adding a parallel one.
+///
+/// Exclusions are returned separately (see [`ResolvedOrigins`]) rather than
+/// silently vanishing, because "declared but withheld for health" is a
+/// different fact from "never declared", and [`diff_apex_records`] has to be
+/// able to tell them apart. See [`DomainPasswayPlan::health_withdrawn`].
+///
+/// An excluded machine is still *resolved* first: it must exist, carry the
+/// taint and have a public address, exactly as if it were staying. Skipping
+/// those checks would let a health exclusion paper over a config error, and a
+/// machine we cannot resolve is one we cannot honestly say we are withdrawing.
+///
+/// A name in `health_excluded` that is not a front door at all is ignored — the
+/// caller's liveness view covers the whole fleet, and most of it never fronts
+/// anything.
+pub fn public_origins(
+    front_door_machines: &[String],
+    machines: &[MachineConfig],
+    health_excluded: &[String],
+) -> Result<ResolvedOrigins> {
+    let mut resolved = ResolvedOrigins::default();
+    for name in front_door_machines {
+        let machine = machines
+            .iter()
+            .find(|m| &m.name == name)
+            .with_context(|| {
+                format!(
+                    "front door collated onto machine {name:?}, which has no \
+                     .yah/infra/machines/*.toml — cannot resolve its public address"
+                )
+            })?;
+        if !machine
+            .taints
+            .iter()
+            .any(|t| t == workload_spec::PUBLIC_IP_TAINT)
+        {
+            debug!(
+                machine = %name,
+                "front-door machine has no `public-ip` taint — not an apex origin"
+            );
+            continue;
+        }
+        let address = machine
+            .connect
+            .as_ref()
+            .map(|c| c.address.as_str())
+            .with_context(|| {
+                format!(
+                    "machine {name} carries the `public-ip` taint but declares no \
+                     [connect] address — nothing to publish at the apex"
+                )
+            })?;
+        let origin = PasswayOrigin {
+            machine: name.clone(),
+            address: public_ipv4_for(name, address)?,
+        };
+        if health_excluded.iter().any(|m| m == name) {
+            debug!(
+                machine = %name,
+                address = %origin.address,
+                "front-door machine confirmed down — withheld from the apex origin set"
+            );
+            resolved.health_withdrawn.push(origin);
+        } else {
+            resolved.origins.push(origin);
+        }
+    }
+    Ok(resolved)
+}
+
+/// Build the apex record plan for a `front_door = "passway"` manifest.
+///
+/// Refuses two shapes outright:
+///
+/// 1. A manifest declaring a different front door — the same guard
+///    [`plan_domain_worker`] carries, for the same reason.
+/// 2. An **empty** origin set. The desired set is what the applier prunes
+///    against, so an empty one would not mean "leave it alone", it would mean
+///    "delete every A record at the apex" — a live outage rendered from a
+///    collation that simply found nothing. Nothing about "no machine is
+///    declared" says "take the site down", so it is an error.
+///
+/// That empty-set guard is checked **before** `origins_complete` is consulted:
+/// an empty set is unusable whether or not the collation was clean, so it stays
+/// the louder failure.
+///
+/// `origins_complete` is the caller's answer to "did the collation see the
+/// whole picture?" — `false` withholds every prune downstream. See
+/// [`DomainPasswayPlan::origins_complete`].
+///
+/// # The empty-set guard is also the health failover's backstop (R859-F2)
+///
+/// Guard 2 is checked against the origins that **survive** health exclusion, and
+/// that is the load-bearing interaction of this whole feature: if every declared
+/// front door is confirmed down, `origins` is empty and this refuses. "All our
+/// front doors are down" must never render as "withdraw every A record and take
+/// the site down" — a dead origin still in DNS is a partial outage, an empty
+/// apex is a total one, and between those the first is strictly better. So the
+/// health withdrawal is capped at "all but the last origin" by construction,
+/// with no separate rule to keep in sync.
+///
+/// An address that is *also* served by a surviving origin is dropped from
+/// [`health_withdrawn`](DomainPasswayPlan::health_withdrawn) for the same
+/// reason, one level finer: two machines can share a floating IP (the dedup
+/// comment below names that case), and pruning the record because one of them
+/// died would withdraw an address the other is still answering on.
+pub fn plan_domain_passway(
+    domain: &DomainConfig,
+    resolved: ResolvedOrigins,
+    origins_complete: bool,
+) -> Result<DomainPasswayPlan> {
+    let ResolvedOrigins {
+        origins,
+        health_withdrawn,
+    } = resolved;
+    if domain.front_door != FrontDoor::Passway {
+        anyhow::bail!(
+            "domain {} ({}) declares front_door = \"{}\" — only \"passway\" domains \
+             get a sovereign apex rendered here",
+            domain.name,
+            domain.domain,
+            domain.front_door.as_str()
+        );
+    }
+
+    // By address, not by machine name: the address is what lands in DNS, so
+    // ordering on it is what makes two planning runs byte-identical even if a
+    // box is renamed. Dedup on the same key — two edges collated onto one
+    // machine (or two machines sharing a floating IP) publish one record.
+    let mut origins = origins;
+    origins.sort_by(|a, b| (a.address, &a.machine).cmp(&(b.address, &b.machine)));
+    origins.dedup_by(|a, b| a.address == b.address);
+
+    if origins.is_empty() {
+        anyhow::bail!(
+            "domain {} ({}) declares front_door = \"passway\" but no declared front-door \
+             machine carries the `public-ip` taint with a public address — refusing to \
+             render an empty apex, which would withdraw every A record and take the site \
+             down. Declare the ingress edge's machines (or their taints) first.",
+            domain.name,
+            domain.domain
+        );
+    }
+
+    // Same normalisation as `origins`, plus the survivor filter: an address a
+    // live origin still answers on is not withdrawn, however many of the
+    // machines sharing it went down.
+    let mut health_withdrawn = health_withdrawn;
+    health_withdrawn.retain(|w| !origins.iter().any(|o| o.address == w.address));
+    health_withdrawn.sort_by(|a, b| (a.address, &a.machine).cmp(&(b.address, &b.machine)));
+    health_withdrawn.dedup_by(|a, b| a.address == b.address);
+
+    Ok(DomainPasswayPlan {
+        zone: parent_zone_name(&domain.domain).to_string(),
+        name: domain.domain.clone(),
+        origins,
+        origins_complete,
+        health_withdrawn,
+    })
+}
+
+/// Diff the planned apex against the A records live at that name.
+///
+/// `live` must already be narrowed to **type A at `plan.name`** — MX, TXT and
+/// AAAA records share the apex and are never this arm's to touch.
+///
+/// A live record whose content is desired but which is *proxied* still lands in
+/// `upsert`: orange-cloud is a break-glass state
+/// (`scripts/cf-apex-mode.sh orange`) and this reconciler declares DNS-only, so
+/// re-writing the record with `proxied = false` is convergence, not churn.
+///
+/// When [`plan.origins_complete`](DomainPasswayPlan::origins_complete) is
+/// `false` the surplus records move to
+/// [`withheld_prune`](ApexRecordDiff::withheld_prune) instead of `prune`, and
+/// `upsert` is unaffected. An incomplete collation cannot tell a withdrawn
+/// origin from one whose declaration failed to plan, and only one of those two
+/// wants a DNS withdrawal.
+///
+/// # …with one exception, and it is the point of R859-F2
+///
+/// A surplus address that appears in
+/// [`plan.health_withdrawn`](DomainPasswayPlan::health_withdrawn) is pruned
+/// **regardless of `origins_complete`**. The two flags are not two strengths of
+/// the same doubt, they are answers to different questions, and the four cases
+/// come out like this:
+///
+/// | `origins_complete` | in `health_withdrawn` | verdict |
+/// |---|---|---|
+/// | `true`  | no  | `prune` — an ordinary withdrawal from a trusted declaration |
+/// | `true`  | yes | `prune` — a health withdrawal from a trusted declaration |
+/// | `false` | no  | `withheld_prune` — might be a withdrawal, might be a typo |
+/// | `false` | yes | `prune` — we saw this machine declared *and* saw it die |
+///
+/// The bottom-right cell is the one that matters. `origins_complete = false`
+/// protects against mistaking an absence for a withdrawal; a health withdrawal
+/// is not an absence, it is a positive observation about a machine the
+/// collation resolved. An unrelated service's broken TOML is not evidence about
+/// a box we watched go down, and letting it withhold the prune would leave a
+/// dead origin serving its share of the round-robin for as long as that typo
+/// lives.
+pub fn diff_apex_records(plan: &DomainPasswayPlan, live: &[LiveApexRecord]) -> ApexRecordDiff {
+    let desired: Vec<String> = plan
+        .origins
+        .iter()
+        .map(|o| o.address.to_string())
+        .collect();
+    let upsert = desired
+        .iter()
+        .filter(|ip| {
+            !live
+                .iter()
+                .any(|r| &&r.content == ip && !r.proxied)
+        })
+        .cloned()
+        .collect();
+    let surplus: Vec<String> = live
+        .iter()
+        .filter(|r| !desired.contains(&r.content))
+        .map(|r| r.content.clone())
+        .collect();
+    if plan.origins_complete {
+        return ApexRecordDiff {
+            upsert,
+            prune: surplus,
+            withheld_prune: Vec::new(),
+        };
+    }
+    // Incomplete declaration: withhold every prune EXCEPT the health
+    // withdrawals, which rest on a positive observation rather than on an
+    // absence. See this function's doc table.
+    let withdrawn: Vec<String> = plan
+        .health_withdrawn
+        .iter()
+        .map(|o| o.address.to_string())
+        .collect();
+    let (prune, withheld_prune) = surplus
+        .into_iter()
+        .partition(|content| withdrawn.contains(content));
+    ApexRecordDiff {
+        upsert,
+        prune,
+        withheld_prune,
+    }
+}
+
+/// Apply a [`DomainPasswayPlan`] against live DNS (R859-F1, live I/O).
+///
+/// **First production consumer of the `dns.*` envoy verbs** — every read and
+/// write here goes through [`CloudflareEnvoy`]'s typed verb handlers rather
+/// than the `CloudflareClient` methods the older arms call directly, so
+/// swapping the DNS provider is a matter of resolving a different adapter here
+/// and nothing else.
+///
+/// Two invariants, both borrowed from `scripts/cf-apex-mode.sh`, whose
+/// behaviour this replaces for the routine case:
+///
+/// - **List first, skip when converged.** Same shape as
+///   [`ensure_r2_custom_domain`], so a re-run of `yah cloud apply` writes
+///   nothing.
+/// - **Upsert before prune.** Desired records are written first and surplus
+///   ones removed last, so the apex is never momentarily recordless. Only
+///   `A` records at the name are ever pruned; the apex's MX and TXT records
+///   (mail routing, SPF, site verification) are outside the filter by
+///   construction.
+/// - **Fail-closed on withdrawal, fail-open on addition.** When the plan says
+///   the origin set is incomplete
+///   ([`origins_complete = false`](DomainPasswayPlan::origins_complete)) the
+///   upserts still run but every prune is withheld and warned about — an
+///   absent origin might be a withdrawal or might be a config typo upstream,
+///   and only one of those should take a live record away.
+///
+/// Always writes `proxied = false`: the manifest cannot express grey vs
+/// orange, and orange stays break-glass in the script (W267 tier ladder).
+pub async fn deploy_domain_passway(
+    workspace_root: &Path,
+    provider_id: &str,
+    plan: &DomainPasswayPlan,
+) -> Result<PasswayApexOutcome> {
+    let cf_provider = super::cf_creds::CfProvider::resolve(workspace_root, provider_id)?;
+    let envoy = CloudflareEnvoy::new(cf_provider.api_token()?, cf_provider.account_id.clone());
+
+    let listed = envoy
+        .dns_record_list(DnsRecordListInput {
+            zone: plan.zone.clone(),
+            name: Some(plan.name.clone()),
+            record_type: Some("A".to_string()),
+        })
+        .await
+        .with_context(|| format!("listing A records at {}", plan.name))?;
+    let live: Vec<LiveApexRecord> = listed
+        .records
+        .into_iter()
+        .map(|r| LiveApexRecord {
+            content: r.content,
+            proxied: r.proxied,
+        })
+        .collect();
+
+    let diff = diff_apex_records(plan, &live);
+
+    // Warned before the converged early-return: a withheld prune is worth
+    // saying out loud even on an apply that writes nothing, because the record
+    // it names stays live until someone fixes the declaration.
+    if !diff.withheld_prune.is_empty() {
+        warn!(
+            domain = %plan.name,
+            withheld = %diff.withheld_prune.join(", "),
+            "apex A records NOT withdrawn: the ingress collation reported problems, so an \
+             origin missing from it may be a broken declaration rather than a withdrawal. \
+             Run `yah cloud validate` and fix the reported ingress declaration; these \
+             records stay live until the collation is clean."
+        );
+    }
+
+    if diff.is_converged() {
+        debug!(
+            domain = %plan.name,
+            origins = plan.origins.len(),
+            "sovereign apex already matches the declaration — skipping"
+        );
+        return Ok(PasswayApexOutcome {
+            withheld_prune: diff.withheld_prune,
+            ..Default::default()
+        });
+    }
+
+    // Writes first: never leave the apex without a routing record.
+    for ip in &diff.upsert {
+        envoy
+            .dns_record_upsert(DnsRecordUpsertInput {
+                zone: plan.zone.clone(),
+                name: plan.name.clone(),
+                record_type: "A".to_string(),
+                content: ip.clone(),
+                ttl: 1,
+                proxied: false,
+                // A round-robin apex is a multi-valued RRset: without this the
+                // second origin would overwrite the first.
+                match_content: true,
+            })
+            .await
+            .with_context(|| format!("upserting A {} -> {ip}", plan.name))?;
+        info!(domain = %plan.name, origin = %ip, "sovereign apex A record written");
+    }
+
+    // Prune last, and only ever type A carrying an undeclared value.
+    for ip in &diff.prune {
+        envoy
+            .dns_record_delete(DnsRecordDeleteInput {
+                zone: plan.zone.clone(),
+                name: plan.name.clone(),
+                record_type: Some("A".to_string()),
+                content: Some(ip.clone()),
+            })
+            .await
+            .with_context(|| format!("pruning surplus A {} -> {ip}", plan.name))?;
+        info!(domain = %plan.name, origin = %ip, "surplus apex A record withdrawn");
+    }
+
+    Ok(PasswayApexOutcome {
+        upserted: diff.upsert,
+        pruned: diff.prune,
+        withheld_prune: diff.withheld_prune,
+    })
+}
+
+/// Reconcile one `front_door = "passway"` domain end to end — the entry point
+/// `yah cloud apply` calls (R859-F1).
+///
+/// Collates the workspace's declared ingress edges, keeps the passway front
+/// doors, resolves their machines to public addresses, plans, and applies.
+/// Every input is *declared* config: no network read decides which origins the
+/// apex publishes, which is what makes the manifest the single source the
+/// two-source flip lacked.
+///
+/// ## Why `report.problems` gates the prune
+///
+/// [`collate_workspace_ingress`](crate::validate::collate_workspace_ingress)
+/// returns `Ok` while **skipping** an edge whose declaration fails to plan
+/// (`validate.rs`, the `IngressProblem::Declaration` arms). A passway edge with
+/// a config typo therefore drops its machine out of `front_doors` silently, and
+/// from inside the plan that is indistinguishable from the operator having
+/// withdrawn the node — so without this gate a typo would render as a DNS
+/// withdrawal and take that origin's share of the apex offline.
+///
+/// Any non-empty `problems` therefore sets `origins_complete = false`, which
+/// withholds every prune for this apply. Deliberately *not* narrowed to the
+/// problems that mention this domain's edge: attributing a problem to an edge
+/// requires the very planning that failed, and "non-empty means the picture is
+/// incomplete" is the whole of what the prune path needs to know. Equally
+/// deliberately, problems do **not** fail the arm — one service's broken
+/// ingress declaration must not block another's DNS apply, and upserts can
+/// only ever add reachable origins.
+pub async fn ensure_passway_apex(
+    workspace_root: &Path,
+    provider_id: &str,
+    domain: &DomainConfig,
+) -> Result<PasswayApexOutcome> {
+    let report = crate::validate::collate_workspace_ingress(workspace_root)
+        .context("collating workspace ingress to find the passway front doors")?;
+
+    let origins_complete = report.problems.is_empty();
+    if !origins_complete {
+        for problem in &report.problems {
+            warn!(
+                domain = %domain.domain,
+                "ingress collation problem — apex prunes withheld this apply: {}",
+                problem.message()
+            );
+        }
+    }
+
+    let mut front_door_machines: Vec<String> = report
+        .collation
+        .front_doors
+        .iter()
+        .filter(|fd| fd.provider == crate::config::IngressProvider::Passway)
+        .map(|fd| fd.machine.clone())
+        .collect();
+    front_door_machines.sort();
+    front_door_machines.dedup();
+
+    let machines: Vec<MachineConfig> = crate::validate::load_machine_tomls(
+        workspace_root,
+        crate::validate::MachineLoadMode::Strict,
+    )?
+    .into_iter()
+    .map(|(_, m)| m)
+    .collect();
+
+    // R859-F2: no health exclusions on the `yah cloud apply` path, deliberately
+    // and not as a stub. The confirmed-down fact is a *fleet-runtime* one —
+    // it comes from a leader's lease hysteresis, gated on a healthy quorum
+    // (`plan_ingress_owner_effect`) — and `yah cloud apply` is an operator
+    // running a declarative converge from a laptop, which holds no such view.
+    // Feeding it a liveness guess here would let a laptop with a flaky uplink
+    // withdraw a live origin. The exclusion set enters through the effector
+    // that *has* the fact; this path renders the declaration as declared.
+    let resolved = public_origins(&front_door_machines, &machines, &[])?;
+    let plan = plan_domain_passway(domain, resolved, origins_complete)?;
+    deploy_domain_passway(workspace_root, provider_id, &plan).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::parent_zone_name;
@@ -573,5 +1267,516 @@ mod tests {
             format!("{err:#}").contains("invalid subdomain"),
             "got: {err:#}"
         );
+    }
+
+    // ── R859-F1: sovereign apex (front_door = "passway") ──
+    //
+    // Everything here is the pure half. The blast radius of this arm is LIVE
+    // DNS on a public apex, so the decision logic is exercised offline in full
+    // and `deploy_domain_passway` only executes the diff these produce.
+
+    use super::{
+        diff_apex_records, plan_domain_passway, public_origins, ApexRecordDiff, DomainPasswayPlan,
+        LiveApexRecord, PasswayOrigin, ResolvedOrigins,
+    };
+    use crate::config::{ConnectSpec, MachineConfig};
+    use std::net::Ipv4Addr;
+
+    /// Mirrors `.yah/domains/yah-dev.toml` — the only `front_door = "passway"`
+    /// manifest in the camp today.
+    fn passway_manifest() -> DomainConfig {
+        DomainConfig {
+            schema_version: 1,
+            name: "yah-dev".into(),
+            domain: "yah.dev".into(),
+            front_door: FrontDoor::Passway,
+            cdn_bucket: "yah-dev".into(),
+            worker_bundle_path: None,
+            routes: vec![DomainRoute {
+                headers: Default::default(),
+                path: "/*".into(),
+                mode: RouteMode::Static {
+                    component: "yah-marketing/site".into(),
+                },
+            }],
+        }
+    }
+
+    fn machine(name: &str, address: Option<&str>, taints: &[&str]) -> MachineConfig {
+        MachineConfig {
+            name: name.into(),
+            provider: "ovh".into(),
+            location: None,
+            server_type: None,
+            hosts_mirrors: vec![],
+            mesh_tags: vec![],
+            region: None,
+            zone: None,
+            arch: None,
+            bucket: None,
+            vendor: None,
+            nickname: None,
+            legacy_hostkey_fingerprint: None,
+            registration: Default::default(),
+            ssh_keys: vec![],
+            cloudflared: None,
+            hosts_operator_bridge: false,
+            connect: address.map(|a| ConnectSpec {
+                address: a.into(),
+                ssh: format!("root@{a}"),
+                yubaba_port: None,
+                yubaba: None,
+            }),
+            allocatable: None,
+            taints: taints.iter().map(|t| t.to_string()).collect(),
+            sovereign_group: None,
+            sovereign_role: None,
+            ingress_floating_ip: None,
+        }
+    }
+
+    /// The live fleet shape: us-east-001 and us-west-001 both carry the
+    /// `public-ip` taint with a public address (machines/*.toml), a third box
+    /// fronts internal hostnames over the mesh and must not reach the apex.
+    fn fleet() -> Vec<MachineConfig> {
+        vec![
+            machine("us-east-001", Some("51.81.85.145"), &["public-ip"]),
+            machine("us-west-001", Some("15.204.89.240"), &["public-ip"]),
+            machine("us-west-002", Some("100.64.0.4"), &[]),
+        ]
+    }
+
+    fn origins(names: &[&str]) -> ResolvedOrigins {
+        origins_excluding(names, &[])
+    }
+
+    /// R859-F2: the same resolution with `down` confirmed dead — declared and
+    /// resolvable, but held out of the published set.
+    fn origins_excluding(names: &[&str], down: &[&str]) -> ResolvedOrigins {
+        let fleet = fleet();
+        let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let down: Vec<String> = down.iter().map(|n| n.to_string()).collect();
+        public_origins(&names, &fleet, &down).unwrap()
+    }
+
+    /// A plan whose origin set is COMPLETE — the clean-collation case.
+    fn plan_of(names: &[&str]) -> DomainPasswayPlan {
+        plan_domain_passway(&passway_manifest(), origins(names), true).unwrap()
+    }
+
+    /// The same plan, but built from a collation that reported problems, so an
+    /// origin's absence cannot be read as a withdrawal.
+    fn plan_of_incomplete(names: &[&str]) -> DomainPasswayPlan {
+        plan_domain_passway(&passway_manifest(), origins(names), false).unwrap()
+    }
+
+    fn live(records: &[(&str, bool)]) -> Vec<LiveApexRecord> {
+        records
+            .iter()
+            .map(|(content, proxied)| LiveApexRecord {
+                content: (*content).into(),
+                proxied: *proxied,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn public_origins_keeps_tainted_machines_and_skips_the_rest() {
+        let got = origins(&["us-east-001", "us-west-001", "us-west-002"]);
+        assert!(
+            got.health_withdrawn.is_empty(),
+            "no exclusions were passed, so nothing may be withheld"
+        );
+        assert_eq!(
+            got.origins,
+            vec![
+                PasswayOrigin {
+                    machine: "us-east-001".into(),
+                    address: Ipv4Addr::new(51, 81, 85, 145),
+                },
+                PasswayOrigin {
+                    machine: "us-west-001".into(),
+                    address: Ipv4Addr::new(15, 204, 89, 240),
+                },
+            ],
+            "an untainted mesh-only front door is not an apex origin"
+        );
+    }
+
+    /// The publicness cross-check nothing did before R859-F1: the `public-ip`
+    /// taint and `connect.address` are independent declarations, and a machine
+    /// dialled over its tailnet address would otherwise publish `100.64.0.x`
+    /// at a public apex and black-hole its share of the round-robin.
+    #[test]
+    fn public_origins_rejects_a_non_public_address_and_names_the_machine() {
+        for bad in ["100.64.0.4", "10.0.0.7", "192.168.1.20", "127.0.0.1"] {
+            let fleet = vec![machine("us-west-002", Some(bad), &["public-ip"])];
+            let err = public_origins(&["us-west-002".to_string()], &fleet, &[]).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("us-west-002"), "{msg}");
+            assert!(msg.contains(bad), "{msg}");
+            assert!(msg.contains("public"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn public_origins_rejects_an_unparseable_address_and_names_the_machine() {
+        let fleet = vec![machine("us-east-001", Some("edge.example.net"), &["public-ip"])];
+        let err = public_origins(&["us-east-001".to_string()], &fleet, &[]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("us-east-001"), "{msg}");
+        assert!(msg.contains("not an IPv4 address"), "{msg}");
+    }
+
+    #[test]
+    fn public_origins_rejects_a_tainted_machine_with_no_connect_block() {
+        let fleet = vec![machine("us-east-001", None, &["public-ip"])];
+        let err = public_origins(&["us-east-001".to_string()], &fleet, &[]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("us-east-001"), "{msg}");
+        assert!(msg.contains("[connect]"), "{msg}");
+    }
+
+    #[test]
+    fn public_origins_rejects_a_machine_with_no_toml() {
+        let err = public_origins(&["ghost-001".to_string()], &fleet(), &[]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ghost-001"), "{msg}");
+    }
+
+    #[test]
+    fn plan_sorts_and_dedups_origins_and_resolves_the_apex_zone() {
+        let mut o = origins(&["us-west-001", "us-east-001"]);
+        o.origins.push(o.origins[0].clone()); // same machine collated twice
+        let plan = plan_domain_passway(&passway_manifest(), o, true).unwrap();
+        assert_eq!(plan.zone, "yah.dev");
+        assert_eq!(plan.name, "yah.dev");
+        assert_eq!(
+            plan.origins
+                .iter()
+                .map(|o| o.address.to_string())
+                .collect::<Vec<_>>(),
+            vec!["15.204.89.240", "51.81.85.145"],
+        );
+    }
+
+    /// The live-DNS blast radius this arm exists to bound: an empty desired
+    /// set is what the applier prunes against, so rendering it would withdraw
+    /// every A record at the apex. Nothing about "no machine declared it"
+    /// means "take the site down" — it must be an error, not a wipe.
+    #[test]
+    fn empty_origin_set_is_an_error_not_an_apex_wipe() {
+        let err = plan_domain_passway(&passway_manifest(), ResolvedOrigins::default(), true).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing to render an empty apex"), "{msg}");
+        assert!(msg.contains("yah.dev"), "{msg}");
+    }
+
+    #[test]
+    fn plan_bails_when_front_door_is_not_passway() {
+        for door in [FrontDoor::BucketDirect, FrontDoor::Worker] {
+            let mut dom = passway_manifest();
+            dom.front_door = door;
+            let err = plan_domain_passway(&dom, origins(&["us-east-001"]), true).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("front_door"), "{msg}");
+            assert!(msg.contains(door.as_str()), "{msg}");
+        }
+    }
+
+    #[test]
+    fn converged_apex_is_a_no_op() {
+        let plan = plan_of(&["us-east-001", "us-west-001"]);
+        let diff = diff_apex_records(
+            &plan,
+            &live(&[("51.81.85.145", false), ("15.204.89.240", false)]),
+        );
+        assert_eq!(diff, ApexRecordDiff::default());
+        assert!(diff.is_converged());
+    }
+
+    #[test]
+    fn adding_a_machine_yields_exactly_one_added_record_and_no_prune() {
+        let plan = plan_of(&["us-east-001", "us-west-001"]);
+        let diff = diff_apex_records(&plan, &live(&[("51.81.85.145", false)]));
+        assert_eq!(diff.upsert, vec!["15.204.89.240".to_string()]);
+        assert!(diff.prune.is_empty(), "{diff:?}");
+    }
+
+    #[test]
+    fn removing_a_machine_yields_exactly_one_prune_and_leaves_the_survivor() {
+        let plan = plan_of(&["us-east-001"]);
+        let diff = diff_apex_records(
+            &plan,
+            &live(&[("51.81.85.145", false), ("15.204.89.240", false)]),
+        );
+        assert_eq!(diff.prune, vec!["15.204.89.240".to_string()]);
+        assert!(
+            diff.upsert.is_empty(),
+            "the survivor is already correct: {diff:?}"
+        );
+    }
+
+    /// `scripts/cf-apex-mode.sh orange` is break-glass; the manifest declares
+    /// DNS-only. A proxied record carrying a desired address is therefore
+    /// drift, and re-upserting it (`proxied = false`) is the convergence.
+    #[test]
+    fn a_proxied_record_at_a_desired_address_is_rewritten_not_left_alone() {
+        let plan = plan_of(&["us-east-001"]);
+        let diff = diff_apex_records(&plan, &live(&[("51.81.85.145", true)]));
+        assert_eq!(diff.upsert, vec!["51.81.85.145".to_string()]);
+        assert!(
+            diff.prune.is_empty(),
+            "the address is declared — it must not be pruned: {diff:?}"
+        );
+    }
+
+    /// **Fail-closed on withdrawal.** `collate_workspace_ingress` returns `Ok`
+    /// while SKIPPING an edge whose declaration fails to plan, so a passway
+    /// edge with a config typo silently drops its machine from `front_doors` —
+    /// which, from inside the plan, is indistinguishable from the operator
+    /// withdrawing that node. Without this gate a typo would render as a DNS
+    /// withdrawal and take that origin offline. Upserts must still run: an
+    /// unrelated service's broken declaration cannot be allowed to block
+    /// growing the fleet, and an upsert can never make the apex worse.
+    #[test]
+    fn an_incomplete_collation_upserts_but_withholds_every_prune() {
+        // us-west-001 is missing from the front-door set, and the collation
+        // reported problems — so its absence is not trustworthy evidence of a
+        // withdrawal. us-east-001 is newly declared and must still be written.
+        let plan = plan_of_incomplete(&["us-east-001"]);
+        let diff = diff_apex_records(&plan, &live(&[("15.204.89.240", false)]));
+
+        assert_eq!(
+            diff.upsert,
+            vec!["51.81.85.145".to_string()],
+            "additions must still land through a dirty collation"
+        );
+        assert!(
+            diff.prune.is_empty(),
+            "a live record must never be withdrawn on an incomplete collation: {diff:?}"
+        );
+        assert_eq!(
+            diff.withheld_prune,
+            vec!["15.204.89.240".to_string()],
+            "the withheld record is reported so the applier can name it"
+        );
+
+        // Same inputs, clean collation: the prune is real. This is the
+        // control that proves the gate is what changed the outcome.
+        let trusted = plan_of(&["us-east-001"]);
+        let diff = diff_apex_records(&trusted, &live(&[("15.204.89.240", false)]));
+        assert_eq!(diff.prune, vec!["15.204.89.240".to_string()]);
+        assert!(diff.withheld_prune.is_empty(), "{diff:?}");
+    }
+
+    /// The empty-set guard stays AHEAD of the incompleteness gate: an empty
+    /// origin set is unusable whether or not the collation was clean, so it
+    /// remains the louder failure rather than degrading into a silent
+    /// everything-withheld apply.
+    #[test]
+    fn empty_origin_set_still_errors_on_an_incomplete_collation() {
+        let err = plan_domain_passway(&passway_manifest(), ResolvedOrigins::default(), false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("refusing to render an empty apex"),
+            "got: {err:#}"
+        );
+    }
+
+    // ── R859-F2: health-excluded origins ──────────────────────────────────
+
+    /// The exclusion happens after full resolution, and reports what it held
+    /// back rather than dropping it silently — `health_withdrawn` is what makes
+    /// "declared but dead" distinguishable from "never declared" downstream.
+    #[test]
+    fn a_confirmed_down_machine_is_resolved_then_withheld_not_dropped() {
+        let got = origins_excluding(&["us-east-001", "us-west-001"], &["us-east-001"]);
+        assert_eq!(
+            got.origins,
+            vec![PasswayOrigin {
+                machine: "us-west-001".into(),
+                address: Ipv4Addr::new(15, 204, 89, 240),
+            }]
+        );
+        assert_eq!(
+            got.health_withdrawn,
+            vec![PasswayOrigin {
+                machine: "us-east-001".into(),
+                address: Ipv4Addr::new(51, 81, 85, 145),
+            }],
+            "a withheld origin must still be reported, with the address it would have published"
+        );
+    }
+
+    /// An exclusion naming a machine that fronts nothing is not an error. The
+    /// caller's liveness view covers the whole fleet and most of it never
+    /// fronts anything, so requiring the sets to line up would make every
+    /// unrelated node failure an apex-render failure.
+    #[test]
+    fn excluding_a_machine_that_fronts_nothing_is_a_no_op() {
+        let got = origins_excluding(&["us-east-001"], &["us-west-001", "ghost-001"]);
+        assert_eq!(got.origins.len(), 1);
+        assert!(got.health_withdrawn.is_empty());
+    }
+
+    /// The catastrophic case, and the reason the empty-set guard is checked
+    /// against the *survivors*: "every front door is down" must not render as
+    /// "withdraw every A record". A dead origin still in DNS is a partial
+    /// outage; an empty apex is a total one.
+    #[test]
+    fn excluding_every_origin_is_an_error_not_an_apex_wipe() {
+        let resolved = origins_excluding(
+            &["us-east-001", "us-west-001"],
+            &["us-east-001", "us-west-001"],
+        );
+        assert_eq!(resolved.health_withdrawn.len(), 2);
+        let err = plan_domain_passway(&passway_manifest(), resolved, true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("refusing to render an empty apex"),
+            "got: {err:#}"
+        );
+    }
+
+    /// Two machines can share one address (a floating IP mid-move, or two edges
+    /// collated onto one box). Losing one of them must not withdraw a record
+    /// the other still answers on.
+    #[test]
+    fn an_address_a_live_origin_still_serves_is_not_withdrawn() {
+        let fleet = vec![
+            machine("us-east-001", Some("51.81.85.145"), &["public-ip"]),
+            machine("us-east-002", Some("51.81.85.145"), &["public-ip"]),
+        ];
+        let resolved = public_origins(
+            &["us-east-001".to_string(), "us-east-002".to_string()],
+            &fleet,
+            &["us-east-001".to_string()],
+        )
+        .unwrap();
+        let plan = plan_domain_passway(&passway_manifest(), resolved, true).unwrap();
+        assert_eq!(
+            plan.origins
+                .iter()
+                .map(|o| o.address.to_string())
+                .collect::<Vec<_>>(),
+            vec!["51.81.85.145"]
+        );
+        assert!(
+            plan.health_withdrawn.is_empty(),
+            "us-east-002 still answers on that address, so it must not be pruned"
+        );
+    }
+
+    /// **The cross-product.** `origins_complete` and `health_withdrawn` are two
+    /// different facts, and the bottom-right cell is the whole point of R859-F2:
+    /// an unrelated service's broken declaration must not veto a withdrawal
+    /// resting on a box we watched go down.
+    #[test]
+    fn health_withdrawal_and_declaration_completeness_are_independent() {
+        let live = live(&[("51.81.85.145", false), ("15.204.89.240", false)]);
+
+        // complete + healthy: an ordinary withdrawal from a trusted declaration.
+        let complete_healthy = plan_domain_passway(
+            &passway_manifest(),
+            origins(&["us-west-001"]),
+            true,
+        )
+        .unwrap();
+        let d = diff_apex_records(&complete_healthy, &live);
+        assert_eq!(d.prune, vec!["51.81.85.145"]);
+        assert!(d.withheld_prune.is_empty());
+
+        // complete + down: the same prune, now on health grounds.
+        let complete_down = plan_domain_passway(
+            &passway_manifest(),
+            origins_excluding(&["us-east-001", "us-west-001"], &["us-east-001"]),
+            true,
+        )
+        .unwrap();
+        let d = diff_apex_records(&complete_down, &live);
+        assert_eq!(d.prune, vec!["51.81.85.145"]);
+        assert!(d.withheld_prune.is_empty());
+
+        // incomplete + healthy: might be a withdrawal, might be a typo — withheld.
+        let incomplete_healthy = plan_domain_passway(
+            &passway_manifest(),
+            origins(&["us-west-001"]),
+            false,
+        )
+        .unwrap();
+        let d = diff_apex_records(&incomplete_healthy, &live);
+        assert!(
+            d.prune.is_empty(),
+            "an absence under an incomplete collation must never prune"
+        );
+        assert_eq!(d.withheld_prune, vec!["51.81.85.145"]);
+
+        // incomplete + down: PRUNED ANYWAY. We saw this machine declared and we
+        // saw it die; the incompleteness is about a different declaration.
+        let incomplete_down = plan_domain_passway(
+            &passway_manifest(),
+            origins_excluding(&["us-east-001", "us-west-001"], &["us-east-001"]),
+            false,
+        )
+        .unwrap();
+        let d = diff_apex_records(&incomplete_down, &live);
+        assert_eq!(
+            d.prune,
+            vec!["51.81.85.145"],
+            "a health withdrawal rests on a positive observation, not on an absence, so \
+             origins_complete = false must not suppress it"
+        );
+        assert!(d.withheld_prune.is_empty());
+    }
+
+    /// The two reasons for a prune coexist in one diff without merging: under an
+    /// incomplete collation, the health-excluded address is pruned and the
+    /// merely-absent one is still withheld.
+    #[test]
+    fn an_incomplete_collation_prunes_only_the_health_withdrawn_surplus() {
+        let plan = plan_domain_passway(
+            &passway_manifest(),
+            origins_excluding(&["us-east-001", "us-west-001"], &["us-east-001"]),
+            false,
+        )
+        .unwrap();
+        let d = diff_apex_records(
+            &plan,
+            &live(&[
+                ("51.81.85.145", false), // declared + confirmed down -> prune
+                ("15.204.89.240", false), // the surviving origin -> kept
+                ("203.0.113.9", false),  // never declared at all -> withheld
+            ]),
+        );
+        assert_eq!(d.prune, vec!["51.81.85.145"]);
+        assert_eq!(d.withheld_prune, vec!["203.0.113.9"]);
+        assert!(d.upsert.is_empty());
+    }
+
+    /// A withheld prune is not convergence — it is a write the applier
+    /// declined — but it is also not a write, so `is_converged` stays false
+    /// only when there is something to actually do.
+    #[test]
+    fn a_withheld_prune_alone_leaves_nothing_to_write() {
+        let plan = plan_of_incomplete(&["us-east-001"]);
+        let diff = diff_apex_records(
+            &plan,
+            &live(&[("51.81.85.145", false), ("15.204.89.240", false)]),
+        );
+        assert!(diff.upsert.is_empty(), "{diff:?}");
+        assert!(diff.prune.is_empty(), "{diff:?}");
+        assert!(diff.is_converged(), "no write to make: {diff:?}");
+        assert_eq!(diff.withheld_prune, vec!["15.204.89.240".to_string()]);
+    }
+
+    /// Ordering contract (`cf-apex-mode.sh:245-246,287-288`): the applier
+    /// writes `upsert` before `prune`, so a full origin swap never leaves the
+    /// apex without a routing record.
+    #[test]
+    fn a_full_origin_swap_writes_the_new_record_before_pruning_the_old() {
+        let plan = plan_of(&["us-west-001"]);
+        let diff = diff_apex_records(&plan, &live(&[("51.81.85.145", false)]));
+        assert_eq!(diff.upsert, vec!["15.204.89.240".to_string()]);
+        assert_eq!(diff.prune, vec!["51.81.85.145".to_string()]);
+        assert!(!diff.is_converged());
     }
 }

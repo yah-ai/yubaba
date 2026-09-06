@@ -65,6 +65,20 @@
 //! @yah:gotcha("NOT AN EPOCH QUESTION and do not re-open one. state_epoch was settled NOT BREAKING on 2026-09-02 (cluster-epochs.json surface_rerecords, closing R836-B2): new-reads-old migrates exactly, old-reads-new never opens the file, nothing replicated moved. Bumping the epoch would not fix this shape — it would only forbid the rollback that produces it, and the code is what should be robust to it.")
 //! @yah:gotcha("FAILS LOUDLY, which is why this is medium and not high: the node refuses to start with a storage error. No divergence, no stale read served, no silent corruption.")
 //! @yah:tier(Wizard)
+//!
+//! @yah:relay(R869, "Raft state has no off-fleet copy: total node loss is unrecoverable, and rebuilding resets tenant fencing epochs")
+//! @yah:at(2026-09-05T20:18:22Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @arch:see(.yah/docs/working/W267-sovereign-public-ingress.md)
+//! @yah:next("ESTABLISH THE RECOVERY SEMANTICS FIRST, before any replicator code. The operator's stated constraint (2026-09-05) is that downtime and DATA LOSS are both acceptable, but losing TRACK of state required for cluster health is not, and the acceptance property is 'delete every machine and move to new hardware'. That budget says this ticket is not about durability of the log — it is about being able to reconstitute a correct cluster on new hardware without a silent split-brain. Those are different designs and the cheaper one is probably sufficient: a periodic snapshot of the applied YubabaState plus a monotonic epoch floor, not continuous log streaming.")
+//! @yah:next("CHECK WHETHER AN EPOCH FLOOR ALONE CLOSES THE CORRECTNESS HALF. If the fresh cluster starts every tenant epoch above the highest value any survivor could hold, the resurrected-node hazard dies without restoring the log at all. The floor has to come from somewhere off-fleet and monotonic — the R2 sink already stores watermarks per tenant, so the number may already exist in the bucket. If so, the whole ticket collapses to 'read the floor at founding init', which is dramatically smaller than a replicator.")
+//! @yah:next("THEN decide what else is worth carrying. members / ingress_owner / service_placement are re-derivable from declared config plus a fresh election; rollouts is in-flight state that a rebuild can legitimately abandon; secrets is re-seedable from the fob vault but doing it by hand for N secrets is exactly the 'losing track' the operator ruled out, so a re-seed-from-declarations command is a candidate deliverable on its own.")
+//! @yah:next("ACCEPTANCE IS THE CHAOS TEST, not a unit test — the operator is standing up a chaos-monkey practice on the dev cluster and destroying nodes routinely as of 2026-09-05. Sign-off is: destroy every voter, rebuild from camp + R2, and prove (a) the cluster serves, (b) an intentionally-resurrected old node with a stale-high epoch is REFUSED rather than winning. (b) is the one that matters and is the one a happy-path rebuild test will silently skip.")
+//! @yah:gotcha("THE HAZARD IS FENCING EPOCHS, NOT THE DATA — read this before scoping, because it changes what 'recovery' has to mean. raft/mod.rs:98 states the single-writer invariant: 'a stale-high token cannot exist (only committed entries reach the state machine)'. That holds for every failure mode EXCEPT rebuild-from-nothing. Wipe the raft dir and re-form, and tenant epochs restart low; a node that comes back from the dead holding a HIGHER epoch then out-fences the fresh cluster at the R2 sink and legitimately wins. So a recovery design that only restores the DATA reintroduces the split-brain the epochs exist to prevent. Any scheme here must either restore epochs monotonically or bump them past any possible survivor.")
+//! @yah:gotcha("THIS HAS ALREADY HAPPENED ONCE, by accident rather than hardware loss — store.rs:40 records it. 2026-08-31: all three production voters (us-west-001, us-south-001, us-east-001) failed to restart with 'when Read LogIndex(0): log entry not found' and crash-looped under systemd. Reproduced on 0.8.28 AND 0.8.29, so not release-specific. The fleet had been up since ~2026-07-20, so a cold start had never been exercised — it was one reboot from unbootable for weeks. Recovery was wiping the raft dir. So the de-facto total-loss procedure today IS 'lose this state', undesigned. Treat that incident as the acceptance scenario, not a footnote.")
+//! @yah:gotcha("SCOPE IT BY WHAT ACTUALLY DIES, so nobody rebuilds something that is already safe. SURVIVES total fleet loss and needs nothing: the cluster KEK (fob vault slot cluster-kek, off-fleet), declared secret plaintexts (fob vault, 4 slots, declarations in .yah/infra/secrets/*.toml), machine config (.yah/infra/machines/*.toml + mirror.yml), and — importantly — certs AND the enrollment set, because cert_store.rs is yah_object_store-backed (R2) by R779 Decision 1, which deliberately kept 10k certs out of raft. DIES: YubabaState's members, service_placement, locks, ingress_owner, rollouts, secrets (re-seedable from the vault, so recoverable but not automatic), and tenant ownership + epochs. The genuinely-irrecoverable set is therefore SMALL — which is why this is a bounded ticket and not a redesign.")
+//! @yah:gotcha("COST IS LOW, WHICH IS THE ARGUMENT FOR DOING IT PROPERLY RATHER THAN DEFERRING. raft/store.rs's own module docs say state is KB-scale and persist() rewrites the whole file on every mutation, so an off-fleet copy is small and cheap. Do NOT reach for litestream here: that replicates a sqlite DB and this is four JSON files. oss/turso-backup already implements the R2 side of exactly this shape (frame keys, manifests, watermark CAS, epoch comparison) and raft/mod.rs:134 records a test driving a real turso-backup BackupTarget over an in-memory object store — check whether that machinery generalizes before writing a new replicator.")
 
 use std::collections::BTreeMap;
 use std::fmt::Display;
@@ -766,6 +780,53 @@ impl YubabaStateMachine {
         self.inner.read().unwrap().data.state.ingress_owner.clone()
     }
 
+    /// R859-F2: the machine name `node_id` runs on, per its replicated member
+    /// row — the half of the identity bridge that turns a consensus/liveness
+    /// fact into something the `cloud` config layer can name.
+    ///
+    /// `None` means *no mapping is recorded*, which covers three cases that
+    /// deliberately read the same: the node is not in the member map, it
+    /// registered before [`MemberInfo::machine`] existed, or it could not
+    /// derive its own machine name. Callers must treat all three as "cannot
+    /// resolve", never as a match — an effector that guessed here would
+    /// command the wrong box's floating IP.
+    pub fn machine_for_node(&self, node_id: super::YubabaNodeId) -> Option<String> {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .state
+            .members
+            .get(&node_id)
+            .and_then(|m| m.machine.clone())
+    }
+
+    /// The inverse of [`Self::machine_for_node`] — which node id runs
+    /// `machine`, if any member row claims it.
+    ///
+    /// This is the direction [`Self::ingress_owner`] needs: `ingress_owner`
+    /// holds a machine name, and every liveness/hysteresis judgement is keyed
+    /// by [`YubabaNodeId`](super::YubabaNodeId), so answering "is the ingress
+    /// owner confirmed down?" means coming back the other way.
+    ///
+    /// Ties are impossible in practice (each node writes only its own row, from
+    /// its own hostname) but are resolved deterministically anyway — the lowest
+    /// node id wins, because `members` is a `BTreeMap` and this scans it in
+    /// order. A tie would mean two nodes believe they are the same machine,
+    /// which is a misconfiguration; picking arbitrarily would make its symptom
+    /// depend on map iteration order.
+    pub fn node_for_machine(&self, machine: &str) -> Option<super::YubabaNodeId> {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .state
+            .members
+            .iter()
+            .find(|(_, m)| m.machine.as_deref() == Some(machine))
+            .map(|(id, _)| *id)
+    }
+
     /// The raft log index this replica has applied up to, or `None` before the
     /// first entry.
     ///
@@ -957,6 +1018,7 @@ mod tests {
                     updated_at: 1,
                     access: workload_spec::secrets::SecretAccess::AllowAny,
                     digest: None,
+                    sans: None,
                 },
             ),
         )

@@ -1,8 +1,8 @@
 {
   "cluster_protocol": 5,
-  "cluster_protocol_surface": "584af848d4b185ff3867a5009516ed50aaf495c3668f8a85eae7c08db6a7de24",
+  "cluster_protocol_surface": "6b573982f269bb8d369eca697381f5def31a4f37d3ee3140fbeb2e3345dad1e3",
   "cluster_protocol_surface_inputs": {
-    "rust-file oss/yubaba/crates/yubaba/src/raft/mod.rs": "3ed4864a337aceced297096cc808589300ada94d369c7d71418ac19595461e8b",
+    "rust-file oss/yubaba/crates/yubaba/src/raft/mod.rs": "2ac4dd0263247b9378248b85b6b76f6cabeee2788a62f39b2888822671f3d55a",
     "rust-file oss/yubaba/crates/yubaba/src/raft/network.rs": "05a7635543141404f302b0b63bf8a722a103783201a349b7af54dde480eed1fe",
     "rust-lines oss/yubaba/crates/yubaba/src/lib.rs containing /raft/": "bfd35e3b0fdefbab86e4b236a02e6bbb6234f4a2af2f0dc7fad377df4fbdcebb",
     "rust-items oss/yubaba/crates/yubaba/src/lib.rs fn raft_*": "9bb7aa8879a9e5279af05d43c326e4561138eea922b50442511e7b96101f7ed7",
@@ -16,10 +16,10 @@
     "5": "R737-F1 (W246) — tenant PLACEMENT INTENT, separate from ownership. `YubabaRequest` gained two variants (SetTenantPlacement, ClearTenantPlacement), `YubabaState` gained `placement: BTreeMap<TenantId, TenantPlacement>` (#[serde(default)]), and `MemberInfo` + `YubabaRequest::SetMember` each gained `capacity: Option<NodeCapacity>` (#[serde(default)]). THE DISCRIMINATOR IS THE SAME ONE R732-F1 RECORDED, and it is the variants alone that force this: `YubabaRequest` is externally tagged with no #[serde(other)] catch-all, so an epoch-4 node receiving a replicated SetTenantPlacement over AppendEntries gets `unknown variant \"SetTenantPlacement\"`, cannot apply it, cannot advance past that log index, and diverges. Pinned by raft::tests::an_unknown_request_variant_fails_to_parse_which_is_why_r732_bumped_both_epochs, which covers the mechanism rather than the specific variant name. THE FIELDS DID NOT NEED IT, checked rather than assumed. `capacity` is a tolerated struct field in both directions (the R720-F1 `digest` precedent, correctly NOT bumped), and the R706 hazard — a tolerated field that makes a mixed cluster silently WRONG rather than visibly broken — does not apply here. R706 bit because an old node dropped `access` and then served the secret to anybody. An old node dropping `capacity` records None, and None is defined as capacity-UNKNOWN, which YubabaState::node_headroom refuses to schedule onto. The degradation is fail-closed: the mixed window costs placement ONTO the un-upgraded nodes, never a placement that overcommits one. Same shape as R734-F5's region residual. NOTHING READS PLACEMENT YET — the scheduler is R737-F3. This ticket lands the state model and its publisher, so the mixed window has no behaviour to be wrong about beyond the divergence the variants already force."
   },
   "state_epoch": 4,
-  "state_epoch_surface": "1b7e11f385811d91733aec2c92bbd3bd4c1a2fe10ab66da949f8e92dd1c1a2a8",
+  "state_epoch_surface": "e6f6452c842ccee8280c325a0394da4d3d65fe1bb63acb91a3ac8dc5ea721ffc",
   "state_epoch_surface_inputs": {
-    "rust-file oss/yubaba/crates/yubaba/src/raft/mod.rs": "3ed4864a337aceced297096cc808589300ada94d369c7d71418ac19595461e8b",
-    "rust-file oss/yubaba/crates/yubaba/src/raft/store.rs": "cea42402724aa7e11110e0a62fc565099b4f867142986ca6e84abf3900399c0d",
+    "rust-file oss/yubaba/crates/yubaba/src/raft/mod.rs": "2ac4dd0263247b9378248b85b6b76f6cabeee2788a62f39b2888822671f3d55a",
+    "rust-file oss/yubaba/crates/yubaba/src/raft/store.rs": "5c423d46bde8d9a27bd12f15bac4df74f00c056073b75249b503b99b47bb2938",
     "cargo-dep oss/yubaba/crates/yubaba/Cargo.toml [openraft]": "2f157e5b8ae751caeeef44985ff36f25c2268d550b653ac00423fbd638875b5c"
   },
   "state_epoch_history": {
@@ -329,6 +329,44 @@
         "cargo test -p xtask --test cluster_epoch_drift = 8 passed / 0 failed after re-recording",
         "cargo test -p yubaba --lib = 372 passed / 0 failed (368 baseline + 4 new endpoint tests)"
       ]
+    },
+    {
+      "at": "2026-09-05",
+      "axes": [
+        "cluster_protocol",
+        "state_epoch"
+      ],
+      "verdict": "NOT BREAKING on BOTH axes — both hashes re-recorded, cluster_protocol stays 5 and state_epoch stays 4. This is the R734-F2 / R737-F1 / R782 shape exactly: a #[serde(default)] FIELD on an existing replicated struct plus two read-only accessors, not a new type, variant, route or on-disk layout.",
+      "cause": "R859-F2 (W267 §Tier 1). `MemberInfo` and `YubabaRequest::SetMember` each gained `machine: Option<String>` with #[serde(default)] — the node-id <-> ingress_owner identity bridge the floating-IP effector needs, written from the same `leader::derive_machine_name()` that writes `ingress_owner`. raft/store.rs gained `machine_for_node()` and `node_for_machine()`, both read-only clones/scans of the existing member map.",
+      "why_not_a_bump": [
+        "cluster_protocol: new-dials-old is a no-op. An old node deserializing the new `SetMember` drops the unknown `machine` key — `YubabaRequest` carries no `deny_unknown_fields` — and applies the entry exactly as it did before, so it never stalls at that log index. Pinned by `a_pre_r859_f2_snapshot_loads_untagged_and_a_downgrade_reads_a_tagged_one` (the PreR859MemberInfo stand-in decoder), not argued from serde's documented behaviour.",
+        "cluster_protocol: old-dials-new lands as `None`. A pre-R859-F2 node's `SetMember` has no `machine` key at all; #[serde(default)] applies it as unknown. Pinned by `a_pre_r859_f2_set_member_still_applies_with_no_machine`. No new request VARIANT was added — that is the R732-F1 shape that did require a bump, and this is deliberately not it.",
+        "cluster_protocol: no new route, no new handler, no openraft change. The axis's other four inputs (raft/network.rs, lib.rs `/raft/` route lines, lib.rs `fn raft_*`, the openraft pin =0.10.0-alpha.30) all hashed `same`; only raft/mod.rs moved.",
+        "state_epoch: new-reads-old is the ordinary #[serde(default)] path. A snapshot written before this field deserializes with `machine: None`, which reads as *unknown* and is what every consumer treats as 'no mapping' — never as a match, so an un-upgraded fleet's member rows simply do not resolve by name and the effector does nothing. Pinned by the same snapshot test, using a genuinely R737-era snapshot (region + capacity present) rather than a minimal one.",
+        "state_epoch: rollback is free. `YubabaState` is a JSON snapshot; a downgraded binary ignores the extra key and the other fields are byte-identical. Nothing about the on-disk layout, the four raft files, or their names changed.",
+        "state_epoch: raft/store.rs moved only by ADDING two read-only accessors. `machine_for_node` clones an Option<String> out of the existing member map; `node_for_machine` scans it. Neither adds state, a request variant, a serde attribute or an on-disk byte — the same reasoning as the 2026-08-10 entry for `tenant_ownership()`, which is the closest precedent in this file.",
+        "The one behavioural change worth naming: yubaba now POPULATES a field it did not before, via member_registration. That is the hazard R734-F5's entry flagged (a node emitting a replicated request it never emitted before), and it does NOT apply here — `SetMember` has been emitted in production since R734-F5, and this only widens its payload by one defaulted field."
+      ],
+      "residual_risk": "The value `machine` carries is `/etc/hostname` (leader::derive_machine_name), which is NOT always the `.yah/infra/machines/<name>.toml` name — R841's incident record has `ingress_owner` holding `vps-4c1efa56` for the box declared `us-west-001`, and app/yah/cli/src/mesh.rs's R858-T3 gotcha states it outright. That is a pre-existing property of `ingress_owner`, unchanged by this entry, and it is contained rather than papered over: `cloud::provider::floating_ip::resolve_ingress_owner` matches declared names EXACTLY and refuses an unresolvable owner by name, so the mismatch produces a loud refusal rather than a floating IP reassigned onto the wrong box. Closing it properly means either renaming hostnames to match machine names or adding a declared hostname alias to MachineConfig; neither is in R859-F2's scope."
+    },
+    {
+      "at": "2026-09-05",
+      "axes": [
+        "cluster_protocol",
+        "state_epoch"
+      ],
+      "verdict": "NOT BREAKING on BOTH axes — both hashes re-recorded, cluster_protocol stays 5 and state_epoch stays 4. Same shape as R720-F1's `digest`, R737-F1's `capacity` and R859-F2's `machine` (the entry immediately above): a #[serde(default)] FIELD on an existing replicated struct AND on an existing request variant — not a new variant, type, route or on-disk layout. The R732-F1 line still holds: added struct fields are tolerated in both directions, added variants on the externally-tagged YubabaRequest are not, and this is deliberately the former.",
+      "cause": "R853-B9. `SecretRecord` gained `sans: Option<Vec<String>>` (#[serde(default)], raft/mod.rs:1071) and `YubabaRequest::PutSecret` gained the matching field (:443), applied at :1344. It carries the issued leaf's actual dNSName set so the fleet ACME issuer can decide renewal from cert COVERAGE and not from `updated_at` alone — without it, widening YUBABA_ACME_EXTRA_DOMAINS was silently ignored until the age window opened, up to 60 days, with the env var reading as though it had taken effect. Stored as plaintext beside the sealed record on purpose: a leaf's SAN list is public by construction, so the coverage check costs no KEK unseal per tick. raft/store.rs moved in the same pass (constructor sites taking the new field).",
+      "why_not_a_bump": [
+        "cluster_protocol: old-applies-new drops the key. `YubabaRequest` carries no `#[serde(deny_unknown_fields)]` — verified by grep rather than inherited from the neighbouring entries: all four occurrences of that string in raft/mod.rs are PROSE inside doc comments and @yah: annotations asserting its absence (:54, :82, :440, :2705), not one is an actual attribute. So a pre-B9 node receiving a replicated PutSecret with `sans` applies the entry as it always did and never stalls at that log index.",
+        "cluster_protocol: new-applies-old lands as `None` via #[serde(default)]. No new request VARIANT was added — that is the R732-F1 shape that did require a bump.",
+        "cluster_protocol: the axis's other four inputs (raft/network.rs, lib.rs `/raft/` route lines, lib.rs `fn raft_*`, the openraft pin) all hashed unchanged; only raft/mod.rs moved.",
+        "state_epoch: `None` is DEFINED as 'not covered', never as 'covered'. It maps to `acme_engine::CertSans::NotChecked`, whose own doc says only age decides, so a legacy record degrades to exactly the pre-B9 age-only behaviour and heals itself at the next issuance. The field's doc comment at raft/mod.rs:1064-1069 states this contract explicitly.",
+        "state_epoch: rollback is free. `YubabaState` is a JSON snapshot; a downgraded binary ignores the extra key and every other field is byte-identical. Nothing about the on-disk layout or the four raft file names changed.",
+        "THE R706 DISCRIMINATOR, which is the one that actually needed thinking about, since `access` WAS bumped on this same file with this same #[serde(default)] Option-field shape. R706 bumped because `access` is a SECURITY GATE: an old node dropping it kept serving the secret under its own absent authorization check, so the mixed window silently defeated the guarantee the field exists to create — fail-OPEN. `sans` fails the other way. An old node dropping it yields a coverage check that is skipped, so renewal falls back to age; the cost is a MISSED re-order (the fleet keeps serving its older, narrower cert until the age window), never a cert served to someone who should not have it and never an order skipped that age would have triggered. Availability/coverage degradation, not an authorization bypass, and bounded by the renew-before window rather than unbounded.",
+        "The R734-F5 hazard — a node emitting a replicated request it never emitted before — does not apply. `PutSecret` has been emitted in production throughout; this only widens its payload by one defaulted field."
+      ],
+      "residual_risk": "TWO, both worth naming rather than smoothing over. (1) STATE DIVERGENCE IS REAL, JUST BOUNDED, and the neighbouring claim that 'openraft applies identical log bytes on every node, so there is no state-machine divergence path' is looser than it reads. The log BYTES are identical, but an old binary MATERIALIZES them without the key, so in a mixed cluster two nodes genuinely hold different `sans` for the same secret, and a snapshot shipped from the old node carries None to the new one. That is true of every #[serde(default)] field in this file and was accepted each time for the same reason it is accepted here — the degraded value is defined-safe and self-heals at the next issuance — but it is a bounded divergence, not the absence of one. (2) NONE OF THIS IS EXERCISED IN PRODUCTION TODAY, and that is the honest limit on the whole entry. Per R600-F10 and .yah/infra/machines/us-west-001.toml, the fleet ACME issuer gates on raft leadership; us-west-001 holds leadership, has no issuer drop-in, and cannot take a yubaba restart to get one because headscale is lifecycle-bound to leadership (`ingress_ownership: FollowsRaftLeader`) and a transfer reproduces the 37-hour outage of 2026-09-03. east and south have the drop-in and cannot legitimately become leader. So the issuer is configured on exactly the two nodes where it is guaranteed inert, no `tls/yah.dev/*` cluster secret exists yet, and no PutSecret carrying `sans` has ever been replicated on this fleet. The compatibility reasoning above is sound on the code and pinned by unit tests, but it is unobserved live and stays that way until R858-T3 makes leadership movable."
     }
   ]
 }

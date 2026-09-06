@@ -210,6 +210,7 @@ async fn seed_with_rpo_bound(
                 // which also exercises `decide_transfer`'s unconstrained arm.
                 region: None,
                 capacity: Some(CAPACITY),
+                machine: None,
             },
         )
         .await;

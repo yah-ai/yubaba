@@ -89,6 +89,7 @@ fn secret_spec(name: &str) -> WorkloadSpec {
             ephemeral_storage_mb: 128,
         },
         depends_on: vec![],
+        requires: vec![],
         healthcheck: None,
         // A long-running service, and deliberately no explicit `archetype`:
         // that combination is what R854's archetype fix is about — the

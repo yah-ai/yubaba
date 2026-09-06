@@ -13,6 +13,7 @@
 //! | `cloud.object.bucket.delete` | `DELETE /accounts/{id}/r2/buckets/{name}` |
 //! | `cloud.object.bucket.exists` | `GET /accounts/{id}/r2/buckets` + name scan |
 //! | `dns.record.upsert` | `GET` + `POST`/`PUT` `/zones/{id}/dns_records` |
+//! | `dns.record.list` | `GET /zones/{id}/dns_records` |
 //! | `dns.record.delete` | `GET` + `DELETE` `/zones/{id}/dns_records` |
 //! | `dns.zone.list` | `GET /zones` |
 //!
@@ -33,9 +34,9 @@ use crate::envoy::cloud_object::{
     CloudObjectBucketExists, CloudObjectBucketExistsInput, CloudObjectBucketExistsOutput,
 };
 use crate::envoy::dns_record::{
-    DnsRecordDelete, DnsRecordDeleteInput, DnsRecordDeleteOutput, DnsRecordUpsert,
-    DnsRecordUpsertInput, DnsRecordUpsertOutput, DnsZoneEntry, DnsZoneList, DnsZoneListInput,
-    DnsZoneListOutput,
+    DnsRecordDelete, DnsRecordDeleteInput, DnsRecordDeleteOutput, DnsRecordEntry, DnsRecordList,
+    DnsRecordListInput, DnsRecordListOutput, DnsRecordUpsert, DnsRecordUpsertInput,
+    DnsRecordUpsertOutput, DnsZoneEntry, DnsZoneList, DnsZoneListInput, DnsZoneListOutput,
 };
 use crate::envoy::{AdapterFlavor, EnvoyAdapter, InternalVerb, Tier};
 
@@ -144,13 +145,14 @@ impl CloudflareEnvoy {
             .with_context(|| format!("dns.record.upsert: resolve zone {:?}", input.zone))?;
         let id = self
             .client
-            .upsert_dns_record(
+            .upsert_dns_record_matching(
                 &zone_id,
                 &input.name,
                 &input.record_type,
                 &input.content,
                 input.ttl,
                 input.proxied,
+                input.match_content,
             )
             .await
             .with_context(|| {
@@ -174,10 +176,42 @@ impl CloudflareEnvoy {
             .with_context(|| format!("dns.record.delete: resolve zone {:?}", input.zone))?;
         let deleted = self
             .client
-            .delete_dns_records(&zone_id, &input.name, input.record_type.as_deref())
+            .delete_dns_records_matching(
+                &zone_id,
+                &input.name,
+                input.record_type.as_deref(),
+                input.content.as_deref(),
+            )
             .await
             .with_context(|| format!("dns.record.delete: {}/{}", input.zone, input.name))?;
         Ok(DnsRecordDeleteOutput { deleted })
+    }
+
+    /// Typed handler for `dns.record.list` (R859-F1).
+    pub async fn dns_record_list(&self, input: DnsRecordListInput) -> Result<DnsRecordListOutput> {
+        let zone_id = self
+            .client
+            .zone_id_for_name(&input.zone)
+            .await
+            .with_context(|| format!("dns.record.list: resolve zone {:?}", input.zone))?;
+        let records = self
+            .client
+            .list_dns_records(&zone_id, input.name.as_deref(), input.record_type.as_deref())
+            .await
+            .with_context(|| format!("dns.record.list: {}", input.zone))?;
+        Ok(DnsRecordListOutput {
+            records: records
+                .into_iter()
+                .map(|r| DnsRecordEntry {
+                    id: r.id,
+                    name: r.name,
+                    record_type: r.record_type,
+                    content: r.content,
+                    ttl: r.ttl,
+                    proxied: r.proxied,
+                })
+                .collect(),
+        })
     }
 
     /// Typed handler for `dns.zone.list`.
@@ -209,6 +243,7 @@ impl EnvoyAdapter for CloudflareEnvoy {
             CloudObjectBucketDelete::ID,
             CloudObjectBucketExists::ID,
             DnsRecordUpsert::ID,
+            DnsRecordList::ID,
             DnsRecordDelete::ID,
             DnsZoneList::ID,
         ]
@@ -237,6 +272,12 @@ impl EnvoyAdapter for CloudflareEnvoy {
                 let args: DnsRecordUpsertInput =
                     serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
                 let out = self.dns_record_upsert(args).await?;
+                Ok(serde_json::to_value(out)?)
+            }
+            id if id == DnsRecordList::ID => {
+                let args: DnsRecordListInput =
+                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
+                let out = self.dns_record_list(args).await?;
                 Ok(serde_json::to_value(out)?)
             }
             id if id == DnsRecordDelete::ID => {
@@ -278,6 +319,7 @@ mod tests {
         assert!(ids.contains(&"cloud.object.bucket.exists"), "{ids:?}");
         // dns.*
         assert!(ids.contains(&"dns.record.upsert"), "{ids:?}");
+        assert!(ids.contains(&"dns.record.list"), "{ids:?}");
         assert!(ids.contains(&"dns.record.delete"), "{ids:?}");
         assert!(ids.contains(&"dns.zone.list"), "{ids:?}");
     }

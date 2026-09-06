@@ -213,6 +213,7 @@ fn mesh_only_spec(name: &str) -> WorkloadSpec {
             ephemeral_storage_mb: 128,
         },
         depends_on: vec![],
+        requires: vec![],
         healthcheck: None,
         restart_policy: RestartPolicy::Always,
         archetype: None,

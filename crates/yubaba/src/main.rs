@@ -729,9 +729,7 @@ async fn main() -> Result<()> {
             // requests in the same second cannot disagree.
             server_state = server_state.with_domain_onboarding(
                 std::env::var(yubaba::domain_issuer::DELEGATE_ZONE_ENV).ok(),
-                yubaba::public_ingress_targets(
-                    std::env::var(yubaba::PUBLIC_INGRESS_ENV).ok(),
-                ),
+                yubaba::public_ingress_targets(std::env::var(yubaba::PUBLIC_INGRESS_ENV).ok()),
             );
 
             // R779 (W267): the object-store fallback for per-domain TLS material.
@@ -745,7 +743,8 @@ async fn main() -> Result<()> {
             // config knob. An invalid or absent issuer config is not reported
             // here — the issuer spawn below already logs it, and duplicating the
             // line on boot would suggest two separate faults.
-            if let Ok(Some(cfg)) = yubaba::acme_issuer::parse_issuer_config(|k| std::env::var(k).ok())
+            if let Ok(Some(cfg)) =
+                yubaba::acme_issuer::parse_issuer_config(|k| std::env::var(k).ok())
             {
                 if let Some(store_cfg) = &cfg.cert_store {
                     match store_cfg.connect(&cfg.issue.directory.url()) {
@@ -850,8 +849,7 @@ async fn main() -> Result<()> {
                     server_state.constable_client.clone(),
                 ) {
                     (Some(store), Some(kamaji)) => {
-                        let _tenant_passways =
-                            yubaba::tenant_passway::spawn(store, kamaji, tp_cfg);
+                        let _tenant_passways = yubaba::tenant_passway::spawn(store, kamaji, tp_cfg);
                     }
                     // Configured but unusable. Named rather than silent: the
                     // symptom otherwise is every tenant domain resolving,
@@ -1002,10 +1000,21 @@ async fn main() -> Result<()> {
                     }
                 }
                 let shared_state = Arc::new(server_state);
+                // R859-F2 / R858-T3: ONE derivation, handed to both consumers.
+                // `ingress_owner` (written by the leadership watcher) and
+                // `MemberInfo::machine` (written by the registration loop) are
+                // only comparable — and `node_for_machine` only answers — if
+                // they are the same string. Two calls to the same function made
+                // that a convention; one value makes it a fact.
+                let machine = yubaba::leader::derive_machine_name();
                 // Spawn leadership watcher before serving so Headscale starts
                 // immediately on the first leader election.
-                let _watcher =
-                    yubaba::leader::spawn(node_id, raft_node.clone(), Arc::clone(&shared_state));
+                let _watcher = yubaba::leader::spawn(
+                    node_id,
+                    raft_node.clone(),
+                    Arc::clone(&shared_state),
+                    machine.clone(),
+                );
                 // R734-F5: publish this node's own member row (address + region)
                 // into replicated state, and keep it correct. Convergent and
                 // non-fatal — see the module docs; nothing downstream waits on
@@ -1035,6 +1044,10 @@ async fn main() -> Result<()> {
                     state_machine.clone(),
                     region,
                     capacity,
+                    // R859-F2: the SAME derivation the leader path writes into
+                    // `ingress_owner` — now literally the same value, not a
+                    // second call that happens to agree (R858-T3).
+                    machine,
                 );
                 // R734-T4: soft leader pin. Started on every node, not just the
                 // leader — a follower's loop reaches `NotLeader` and does
@@ -1106,6 +1119,13 @@ async fn main() -> Result<()> {
                 // upgrades the consuming workload. No-op until a workload with a
                 // cluster File secret is deployed on this node.
                 tokio::spawn(yubaba::secret_reload::run(Arc::clone(&shared_state)));
+                // R600-F10: the same delivery for a door systemd supervises
+                // rather than kamaji. The watcher above finds its consumers in
+                // the deployed-workload registry, so on a node whose passway is
+                // a hand-rolled unit it has nothing to re-render; this writes
+                // the pair to two configured paths instead. Opt-in on
+                // YUBABA_CERT_FILES_DOMAIN and inert without it.
+                tokio::spawn(yubaba::cert_materialize::run(Arc::clone(&shared_state)));
                 // R600-F3 (W273): the fleet-shared ACME issuer. Opt-in — only
                 // spawns when YUBABA_ACME_DOMAIN et al are set (the HA fleet),
                 // and only one node issues at a time (raft-lock elected). Reads
@@ -1420,7 +1440,10 @@ fn run_domain_cmd(cmd: DomainCmd) -> Result<()> {
         DomainCmd::Status { domain, json } => {
             let report = DomainReport::collect(&store, &domain, zone)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&report.to_json(now_secs))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report.to_json(now_secs))?
+                );
             } else {
                 print!("{}", report.render(now_secs));
             }

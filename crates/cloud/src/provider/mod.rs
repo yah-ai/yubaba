@@ -42,6 +42,13 @@ pub use floating_ip::{
     on_ingress_owner_changed, reconcile_assignment, FloatingIpAssignOutcome, FloatingIpProvider,
     FloatingIpState, FloatingIpTarget,
 };
+// R859-F2: the registry R594-F5 left out (nothing mapped `machine.provider` to
+// an adapter, so the verbs were described but unreachable), plus the pure
+// planner that decides what an `ingress_owner` transition should command.
+pub use floating_ip::{
+    floating_ip_provider_for, plan_ingress_owner_effect, provider_has_floating_ip_adapter,
+    resolve_ingress_owner, IngressOwnerEffect, OwnerLiveness, QuorumHealth,
+};
 
 pub mod hetzner_floating_ip;
 pub use hetzner_floating_ip::HetznerFloatingIp;

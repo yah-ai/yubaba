@@ -180,6 +180,7 @@ pub fn lower_run_spec(spec: &ContainerRunSpec) -> Result<WorkloadSpec> {
             ephemeral_storage_mb: 0,
         },
         depends_on: vec![],
+        requires: vec![],
         healthcheck: None,
         // The point of the migration: dockerd restarts a crashed pond slot,
         // and an explicit stop is honoured. `Always` renders as

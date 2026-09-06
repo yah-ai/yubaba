@@ -273,7 +273,7 @@ pub trait EnvoyAdapter: Send + Sync {
 pub fn known_verb_descriptors() -> Vec<VerbDescriptor> {
     use cloud_object::{CloudObjectBucketCreate, CloudObjectBucketDelete, CloudObjectBucketExists};
     use cloud_vps::{CloudVpsCreate, CloudVpsDestroy, CloudVpsStatus};
-    use dns_record::{DnsRecordDelete, DnsRecordUpsert, DnsZoneList};
+    use dns_record::{DnsRecordDelete, DnsRecordList, DnsRecordUpsert, DnsZoneList};
     use floating_ip::{FloatingIpAssign, FloatingIpStatus};
 
     vec![
@@ -284,6 +284,7 @@ pub fn known_verb_descriptors() -> Vec<VerbDescriptor> {
         VerbDescriptor::for_verb::<CloudObjectBucketDelete>(),
         VerbDescriptor::for_verb::<CloudObjectBucketExists>(),
         VerbDescriptor::for_verb::<DnsRecordUpsert>(),
+        VerbDescriptor::for_verb::<DnsRecordList>(),
         VerbDescriptor::for_verb::<DnsRecordDelete>(),
         VerbDescriptor::for_verb::<DnsZoneList>(),
         VerbDescriptor::for_verb::<FloatingIpAssign>(),
@@ -333,6 +334,39 @@ pub fn default_adapters() -> Vec<std::sync::Arc<dyn EnvoyAdapter>> {
         adapters.push(std::sync::Arc::new(
             crate::provider::DigitalOceanEnvoy::new(client),
         ));
+    }
+
+    // R859-F2: the three `floating_ip.*` adapters. R594-F5 shipped them as
+    // `EnvoyAdapter` impls and listed their verbs in `known_verb_descriptors`,
+    // but registered none of them here — so `floating_ip.assign` /
+    // `floating_ip.status` were *described* by the catalog and dispatchable by
+    // nothing. A verb the registry cannot reach is a latent bug, not a
+    // half-finished feature, so they are registered on the same
+    // credentials-present-or-silently-absent policy as the two above.
+    //
+    // These carry their own credentials rather than reusing the Hetzner driver's
+    // because each is a purpose-built client scoped to its provider's
+    // floating-IP endpoints (see each adapter's module docs).
+    //
+    // NOTE on OVH: `OvhFloatingIp`'s module doc records that its auth is a
+    // **placeholder** — OVH signs requests with an application key + secret +
+    // consumer key + timestamped HMAC, not a bare header. Registering it makes
+    // the verb dispatchable, which is correct; it does not make it live-ready,
+    // and the real signing scheme must land before anyone points it at
+    // api.ovh.com. Gating on the credential's presence keeps it absent from
+    // every camp that has not deliberately set one.
+    if let Ok(Some(token)) = fob::get_or_env("hetzner-api-token", "HETZNER_API_TOKEN") {
+        adapters.push(std::sync::Arc::new(
+            crate::provider::HetznerFloatingIp::new(token),
+        ));
+    }
+    if let Ok(Some(key)) = fob::get_or_env("ovh-consumer-key", "OVH_CONSUMER_KEY") {
+        adapters.push(std::sync::Arc::new(crate::provider::OvhFloatingIp::new(key)));
+    }
+    if let Ok(Some(key)) = fob::get_or_env("vultr-api-key", "VULTR_API_KEY") {
+        adapters.push(std::sync::Arc::new(crate::provider::VultrFloatingIp::new(
+            key,
+        )));
     }
 
     adapters
@@ -465,6 +499,7 @@ mod tests {
             "cloud.object.bucket.delete",
             "cloud.object.bucket.exists",
             "dns.record.upsert",
+            "dns.record.list",
             "dns.record.delete",
             "dns.zone.list",
             "floating_ip.assign",
@@ -472,7 +507,7 @@ mod tests {
         ] {
             assert!(ids.contains(&expected), "missing descriptor for {expected}");
         }
-        assert_eq!(ids.len(), 11, "add new verbs here as they land: {ids:?}");
+        assert_eq!(ids.len(), 12, "add new verbs here as they land: {ids:?}");
     }
 
     #[cfg(feature = "json-schema")]

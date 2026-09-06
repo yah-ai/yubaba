@@ -349,6 +349,9 @@ pub fn seal_cluster_secret(
         updated_at,
         access,
         digest: None,
+        // Set by the caller when the plaintext is a cert chain — this fn seals
+        // arbitrary bytes and cannot know. See `SecretRecord::sans`.
+        sans: None,
     }
 }
 
@@ -722,6 +725,7 @@ mod tests {
             updated_at: 0,
             access,
             digest: None,
+            sans: None,
         }
     }
 

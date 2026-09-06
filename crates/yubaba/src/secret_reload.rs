@@ -38,6 +38,22 @@
 //! plaintext lives only in the host tmpfs file and the container's read-only
 //! bind, exactly as at initial materialization (R600-F6). This task never logs
 //! secret bytes.
+//!
+//! @yah:ticket(R600-F10, "Deliver the R600 fleet cert to the systemd-managed passway doors: nothing on a non-kamaji node consumes a cluster secret")
+//! @yah:at(2026-09-05T02:27:50Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R600)
+//! @yah:next("CUTOVER ORDER MATTERS. While per-node ACME and the fleet issuer both exist, the issuer must not request east's exact SAN set or it shares east's Let's Encrypt duplicate-certificate bucket (see R853-B7). Sequence: materialize -> point one door at the shared files with PASSWAY_TLS_MODE=manual -> verify -> repeat on the second -> only then remove the per-node ACME config. Once no node self-issues, the bucket question dies and south.origin.yah.dev can be dropped from south's SAN set.")
+//! @yah:verify("The issuer half is already proven live as of 2026-09-05: a 40-acme-issuer.conf drop-in on east + south elects a single issuer over the raft lock acme-issuer/yah.dev against LE STAGING. Sign-off for this ticket is a door serving a cert it never issued: stop the per-node ACME on one origin, confirm openssl s_client against that IP returns the fleet cert, and confirm a re-issue propagates to it with no manual step.")
+//! @yah:gotcha("THE GAP THAT KEPT R600 UNDEPLOYED, found 2026-09-05 while fixing R853-B7. All nine R600 children are in review, but the chain terminates at a consumer that does not exist on the live fleet. secret_reload::run walks DEPLOYED WorkloadSpecs holding a SecretMount and calls deploy::secret_mount::rerender_file_secrets — it is a documented no-op until a workload with a cluster File secret is deployed on the node. The two live yah.dev origins are hand-rolled systemd units (passway-test.service on us-east-001, passway.service on us-south-001) reading /var/lib/passway/{cert,key}.pem, NOT kamaji workloads. So R600-F5 (SecretMount Cluster -> File + PASSWAY_TLS_MODE=manual) has nothing to attach to, and enabling the issuer alone produces a replicated cert nobody serves.")
+//! @yah:next("STATE AS LEFT 2026-09-05: /etc/systemd/system/yubaba.service.d/40-acme-issuer.conf is installed on us-east-001 and us-south-001 (LE STAGING, YUBABA_ACME_CONSUMERS=ingress, CF token copied to /var/lib/yah/yubaba/cf-token), both yubabas restarted clean and both are in standby. It is NOT on us-west-001, the current raft leader, so no order has been placed and no cluster secret exists yet. Completing that step means restarting yubaba on the leader, which is deliberately left as an operator call while R858 is open — us-west-001 is the node that hosts headscale, and R858 records that leadership movement decapitates the mesh by construction.")
+//! @yah:gotcha("A CONFIGURED ISSUER ON A NON-LEADER IS INDISTINGUISHABLE FROM A BROKEN ONE. Measured live 2026-09-05: with the drop-in on us-east-001 and us-south-001, both logged 'acme issuer: watching (single issuer elected via raft lock acme-issuer/yah.dev)' at startup and then NOTHING for 6+ minutes — no issuance, no warning, no error. Cause is correct behaviour badly reported: run() gates the whole tick on `raft.metrics().current_leader == Some(node_id)` (acme_issuer.rs:401) to avoid ForwardToLeader spam, and IssuerAction::Standby logs nothing. us-west-001 (100.64.0.1) held leadership, and it had no issuer config, so no node ever attempted AcquireLock. An operator watching the journal sees a healthy-looking start line and a silent process. Fix shape: log the standby reason once on transition (leader vs lock-loser are different states and should read differently), and/or surface issuer state on an endpoint. Practical consequence for deployment: the drop-in must go on EVERY voter, not just the ingress nodes, because any voter can hold leadership.")
+//! @yah:next("LEADER RESTART HELD 2026-09-05 despite being operator-authorised, because the premise the authorisation rested on turned out to be false (see the leader-health gotcha). us-west-001 holds raft leadership AND is running the freshly-recovered headscale appliance; a yubaba restart there drops leadership, R858's chain says the appliance is torn down on leadership loss, and neither other voter can stand it up. Coordinating with the live R858 session instead. The issuer stays in standby on east + south, which costs nothing while no consumer exists.")
+//! @yah:gotcha("/mesh/leader-health LIES ABOUT HEADSCALE, and it nearly cost an outage. On 2026-09-05 all three voters reported {\"leader\":...,\"headscale\":\"stopped\"} while headscale was demonstrably RUNNING on us-west-001 — pid 517125, bound *:443 and *:80, started 01:54Z, and cloud.mesh.yah.dev/health returned 200 from the public internet. The field appears to read the systemd unit state (`systemctl is-active headscale` = inactive) while kamaji supervises the process as a native workload, so a healthy appliance reads as dead. I used that field to argue a leader restart was low-risk, and it was not. Told the live R858 session (session:83093d9d) directly; R858 owns the fix.")
+//! @yah:next("DELIBERATE LIMITATION worth reading before extending: the reload command is a shell string the operator writes, and for today's doors the honest value is `systemctl restart passway` — which DROPS in-flight connections on that origin. passway cannot hot-swap a cert (tls.rs \"The reload gap\": TlsSettings is static), and its zero-downtime path needs a REPLACEMENT process started with PASSWAY_UPGRADE=true before the old one gets SIGQUIT — orchestration no systemd unit on either node has wired. The rolling stagger means only one origin cycles at a time and the other keeps serving, so the fleet stays up; a single origin blips. Wiring the graceful-upgrade dance for a systemd door is the follow-on, and it is the same machinery R600-F7/F9 are settling for the kamaji case.")
+//! @yah:handoff("MATERIALIZER BUILT 2026-09-05 (operator chose the thin-yubaba-module option over moving the doors onto kamaji). NEW oss/yubaba/crates/yubaba/src/cert_materialize.rs: resolves tls/<domain>/{cert,key} through the SAME ClusterResolver + resolve_secrets path every other consumer uses (so the R706 access check cannot be skipped — there is no constructor that omits the consumer), writes the pair atomically to two configured paths, and runs one configured reload command only when the bytes actually changed. Opt-in on YUBABA_CERT_FILES_DOMAIN and completely inert without it; also required: _CERT_PATH, _KEY_PATH, _CONSUMER (must match the issuer's YUBABA_ACME_CONSUMERS), optional _RELOAD_CMD. Reuses secret_reload's DEBOUNCE and rolling_stagger (both widened to pub(crate), no behaviour change) so the issuer's key-first/cert-last pair is never observed half-rotated and a fleet-wide rotation does not cycle every origin at once. Spawned next to secret_reload in main.rs. cargo test -p yubaba --lib = 681 passed / 0 failed, 8 of them new; cargo check -p yubaba --bins clean.")
+//! @yah:gotcha("NOT PROVEN AGAINST A REAL CLUSTER SECRET, and cannot be until the issuer runs. The 8 unit tests cover config parsing (including the chain-overwrites-the-key footgun and each required key), the mount shapes the issuer's own naming produces, 0600 on the key, digest order-independence, and atomic write + mode + no leftover temp files. What they do NOT cover is the end-to-end path, because no tls/yah.dev/* record exists anywhere yet — the issuer is in standby on east + south and the leader restart that would start it is held (see the R858 coordination note). Treat the live behaviour as unverified until a cert actually lands.")
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -56,7 +72,7 @@ use crate::ServerState;
 /// key-first/cert-last two-write rotation is observed as one consistent pair
 /// rather than firing on the new-key/old-cert intermediate. Comfortably longer
 /// than the sub-second gap between F3's two `PutSecret`s.
-const DEBOUNCE: Duration = Duration::from_secs(2);
+pub(crate) const DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Width of one node's slot in the rolling-reload window (see
 /// [`rolling_stagger`]). Wide enough that a fronting load balancer / health
@@ -80,7 +96,7 @@ const ROLL_SLOTS: u64 = 8;
 /// connections still drop. Once F7 lands the per-node reload is itself
 /// zero-downtime and the stagger is merely cosmetic. Harmless for
 /// `Backend::Native` (already zero-downtime) — it just delays that node's swap.
-fn rolling_stagger(node_id: u64) -> Duration {
+pub(crate) fn rolling_stagger(node_id: u64) -> Duration {
     ROLL_SLOT * (node_id % ROLL_SLOTS) as u32
 }
 
@@ -404,6 +420,7 @@ mod tests {
                 updated_at: rec.updated_at,
                 access: rec.access,
                 digest: rec.digest,
+                sans: rec.sans,
             },
         )
     }
