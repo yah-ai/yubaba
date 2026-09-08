@@ -559,20 +559,31 @@ pub const POLICY_MODE: &str = "database";
 /// stable across Phase 1b promotion and Phase 2 leader changes — only DNS
 /// gets re-pointed, not the nodes.
 pub fn generate_headscale_config(server_url: &str, data_dir: &std::path::Path) -> String {
-    let private_key = data_dir.join("private.key").display().to_string();
+    // R858-B10: no top-level `private_key_path` is emitted. headscale v0.23's
+    // config-key table has only `noise.private_key_path` and
+    // `derp.server.private_key_path` (and `derp.server.enabled` is false
+    // below), so the bare key this used to render was a v0.22 leftover that
+    // 0.23 silently ignored — a line that read as live config and was not.
     let noise_key = data_dir.join("noise_private.key").display().to_string();
     let db_path = data_dir.join("headscale.db").display().to_string();
     let socket_path = data_dir.join("headscale.sock").display().to_string();
 
     // listen_addr is localhost-only; production-facing traffic goes through
     // cloudflared or a port-forward — the stable URL is the public face.
+    //
+    // R858-B9: 8080 is the fleet's one headscale port, and in the yubaba crate
+    // it is now the single constant `headscale_appliance::HEADSCALE_LISTEN_PORT`
+    // that the appliance's advertised ports, `generate_remote_headscale_config`
+    // and `probe_headscale_local` all derive from. This literal cannot import
+    // it — no dependency edge exists between the crates (see `POLICY_MODE`
+    // above) — so it is kept in lockstep by the same convention. Change one,
+    // grep for the other.
     format!(
         r#"---
 server_url: {server_url}
 listen_addr: 127.0.0.1:8080
 grpc_listen_addr: 127.0.0.1:50443
 metrics_listen_addr: 127.0.0.1:9090
-private_key_path: {private_key}
 noise:
   private_key_path: {noise_key}
 database:
@@ -813,8 +824,14 @@ mod tests {
     fn config_all_paths_in_data_dir() {
         let dir = std::path::PathBuf::from("/home/user/.yah/mesh");
         let config = generate_headscale_config("https://mesh.example.com", &dir);
-        assert!(config.contains("/home/user/.yah/mesh/private.key"));
+        assert!(config.contains("/home/user/.yah/mesh/noise_private.key"));
         assert!(config.contains("/home/user/.yah/mesh/headscale.db"));
+        // R858-B10: and the renderer must NOT emit a top-level
+        // `private_key_path`. v0.23 has no such config key, so the line it used
+        // to render was a v0.22 leftover that read as live config and was not.
+        // `noise.private_key_path` above is the real one, hence the anchor on
+        // the line start rather than on the bare key name.
+        assert!(!config.contains("\nprivate_key_path:"));
     }
 
     #[test]

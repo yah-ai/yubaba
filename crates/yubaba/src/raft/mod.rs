@@ -1373,6 +1373,15 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
                 // self-reclaim case must too. `map_or(0, ..)` makes "no record"
                 // epoch 0, so a first claim lands on 1 and 0 is never a valid
                 // token.
+                //
+                // R869: the +1-per-grant step is load-bearing OUTSIDE the
+                // steady state too. A cluster rebuilt from nothing starts here
+                // at 1 while the R2 sink still carries its dead predecessor's
+                // epoch, and repeated self-reclaims are how the recovery lifts
+                // the tenant back over that number — no request field carries a
+                // floor, deliberately, because a tolerated `min_epoch` would
+                // make a mixed cluster apply two different epochs for one log
+                // entry. See `tests/raft_rebuild_fencing.rs`.
                 _ => {
                     let epoch = current.as_ref().map_or(0, |rec| rec.epoch) + 1;
                     state.tenants.insert(
@@ -1972,6 +1981,64 @@ mod tests {
         let rec = state.tenants.get(&tenant("acme")).expect("record written");
         assert_eq!(rec.owner, 1);
         assert_eq!(rec.lease_expires, 1030);
+    }
+
+    /// R869 — **the arithmetic the total-loss recovery runs on**, pinned here
+    /// because a runbook that says "re-claim until the epoch clears the sink's
+    /// watermark" is only correct while a self-reclaim advances by exactly one
+    /// and never refuses.
+    ///
+    /// A cluster rebuilt from nothing has `tenants` empty and grants epoch 1,
+    /// while the R2 sink still carries the dead fleet's epoch (say 5). The
+    /// recovery lifts it back over that number with plain `ClaimTenant` writes
+    /// through the already-deployed `POST /raft/write` — which is the whole
+    /// reason no `min_epoch` request field exists: a `#[serde(default)]` floor
+    /// would be silently dropped by a node on an older binary, so one log entry
+    /// would apply as two different epochs and the state machines would
+    /// diverge. Cost of doing it this way is `floor` committed entries, on a
+    /// path that runs once per disaster.
+    ///
+    /// See `tests/raft_rebuild_fencing.rs` for the same recovery driven through
+    /// turso-backup's real `tail_frames`.
+    #[test]
+    fn repeated_self_reclaims_lift_a_rebuilt_cluster_over_the_sinks_epoch() {
+        let mut state = YubabaState::default();
+        // Same node, same second, no lease expiry in between: a self-reclaim
+        // takes the vacant/expired/self arm every time, so the recovery does
+        // not have to wait out a lease to make progress.
+        for expected in 1..=6u64 {
+            assert_eq!(
+                claim(&mut state, "acme", 1, 1000),
+                TenantOutcome::Granted { epoch: expected }
+            );
+        }
+        assert_eq!(
+            state.tenants.get(&tenant("acme")).unwrap().epoch,
+            6,
+            "six claims clear a sink stamped at epoch 5"
+        );
+    }
+
+    /// The recovery is available to the fleet's CURRENT binaries, which is what
+    /// picked it over a new request field. Pinned as a parse test because the
+    /// claim being made is about the wire: this exact JSON is what
+    /// `POST /raft/write` already accepts, with no field a deployed node would
+    /// drop.
+    #[test]
+    fn the_recovery_claim_is_the_wire_shape_already_deployed() {
+        let json = r#"{"ClaimTenant":{"tenant":"acme","node":1,"lease_secs":30,"now":1000}}"#;
+        let req: YubabaRequest = serde_json::from_str(json).expect("must parse");
+        let mut state = YubabaState::default();
+        assert_eq!(
+            outcome(apply(&mut state, &req)),
+            TenantOutcome::Granted { epoch: 1 }
+        );
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            serde_json::from_str::<serde_json::Value>(json).unwrap(),
+            "round-trips with no added key — a node on an older binary applies \
+             the identical entry, so the recovery cannot diverge a mixed cluster"
+        );
     }
 
     #[test]

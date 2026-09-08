@@ -76,7 +76,7 @@ use std::time::{Duration, Instant};
 use cloud::provider::HetznerDriver;
 use kamaji::fake::{FailMode, FakeRuntime, FaultTarget};
 use kamaji::WorkloadStatus;
-use yubaba::appliance_ownership::FenceTiming;
+use yubaba::appliance_ownership::{FenceTiming, BACKOFF_BASE_SECS};
 use yubaba::cluster_policy::ClusterPolicy;
 use yubaba::headscale_appliance;
 use yubaba_test_harness::{test_cluster_with_runtimes, Cluster};
@@ -638,11 +638,17 @@ async fn a_powered_off_owner_expires_and_the_appliance_comes_up_on_a_survivor() 
     );
 
     // ── The survivors must work it out from silence alone ────────────────────
-    let survivors: Vec<usize> = (0..cluster.node_count()).filter(|&i| i != owner_idx).collect();
+    let survivors: Vec<usize> = (0..cluster.node_count())
+        .filter(|&i| i != owner_idx)
+        .collect();
     wait_for(
         failover_budget(),
         "a survivor to expire the dead owner and stand the appliance up",
-        || survivors.iter().any(|&i| appliance_running_on(&runtimes, i)),
+        || {
+            survivors
+                .iter()
+                .any(|&i| appliance_running_on(&runtimes, i))
+        },
     )
     .await;
 
@@ -653,9 +659,9 @@ async fn a_powered_off_owner_expires_and_the_appliance_comes_up_on_a_survivor() 
         failover_budget(),
         "the ingress-owner record to stop naming the powered-off machine",
         || {
-            survivors.iter().any(|&i| {
-                recorded_owner(&cluster, i).is_some_and(|m| m != owner_machine)
-            })
+            survivors
+                .iter()
+                .any(|&i| recorded_owner(&cluster, i).is_some_and(|m| m != owner_machine))
         },
     )
     .await;
@@ -693,7 +699,9 @@ async fn a_resurrected_owner_is_fenced_and_cannot_serve() {
     }
 
     let (owner_idx, owner_machine) = settle_owner(&cluster, &runtimes).await;
-    let survivors: Vec<usize> = (0..cluster.node_count()).filter(|&i| i != owner_idx).collect();
+    let survivors: Vec<usize> = (0..cluster.node_count())
+        .filter(|&i| i != owner_idx)
+        .collect();
 
     loops.stop(owner_idx);
     cluster
@@ -704,7 +712,11 @@ async fn a_resurrected_owner_is_fenced_and_cannot_serve() {
     wait_for(
         failover_budget(),
         "a survivor to take the appliance over",
-        || survivors.iter().any(|&i| appliance_running_on(&runtimes, i)),
+        || {
+            survivors
+                .iter()
+                .any(|&i| appliance_running_on(&runtimes, i))
+        },
     )
     .await;
     let new_owner_idx = *survivors
@@ -770,6 +782,250 @@ async fn a_resurrected_owner_is_fenced_and_cannot_serve() {
         !after.is_empty() && after.iter().all(|m| m != &owner_machine),
         "ingress_owner went back to the powered-off machine {owner_machine} after it returned: \
          {after:?}"
+    );
+
+    cluster.destroy_all().await.ok();
+}
+
+// ─── R858-B13: the respawn loop ───────────────────────────────────────────────
+//
+// The live symptom these two cover, measured on us-west-001 on 2026-09-06:
+// kamaji's journal showed `native workload forked id=headscale` 132 times in one
+// 60-second window, `ss -lntp` showed nothing ever listening, and yubaba's own log
+// claimed a successful deploy on every one of those cycles. Two INDEPENDENT
+// defects produced it, and they need one test each — established by measurement,
+// not by symmetry: with only the crash-loop test present, reintroducing the
+// pacing defect left it green, and with only the pacing test present,
+// reintroducing `record_success` left that green.
+//
+//  1. **The reconcile clock could not fire on a leader.** `leader::run` built its
+//     `tokio::time::sleep(RECONCILE_INTERVAL)` *inside* the `select!`, so the
+//     openraft metrics arm cancelled and rebuilt it on every heartbeat. The
+//     ten-second arm was unreachable and reconciliation ran at consensus speed.
+//     Covered by `the_appliance_reconciler_runs_on_its_own_clock_...`.
+//  2. **A crash loop was recorded as a success.** `on_became_leader` returning
+//     `Ok` meant "the supervisor accepted the workload", never "the process is
+//     alive". `record_success` on that clears `OwnerElection`'s failure ledger,
+//     so the 30 s backoff that exists for a node which cannot run the appliance
+//     could never accumulate a single entry. Covered by
+//     `a_crash_looping_appliance_is_retried_on_the_backoff_...`.
+
+/// How long to wait for one deploy attempt to follow another.
+///
+/// Derived from the two clocks that bound a correct retry rather than written as
+/// a number: the crash is noticed on the reconcile tick after the start, and the
+/// retry is held for `BACKOFF_BASE_SECS` after that. Plus slack for a loaded camp
+/// machine.
+fn retry_budget() -> Duration {
+    leader_reconcile_interval() + Duration::from_secs(BACKOFF_BASE_SECS) + Duration::from_secs(25)
+}
+
+/// `leader::RECONCILE_INTERVAL`, which is private. Kept as one named function so
+/// the duplication is in one place and says so.
+fn leader_reconcile_interval() -> Duration {
+    Duration::from_secs(10)
+}
+
+/// Block until this runtime has answered one more `deploy_workload` than
+/// `baseline`, and return when that happened.
+async fn next_deploy_at(runtime: &FakeRuntime, baseline: usize, budget: Duration) -> Instant {
+    let deadline = Instant::now() + budget;
+    loop {
+        if runtime.deploy_calls().len() > baseline {
+            return Instant::now();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {budget:?} waiting for the appliance owner to attempt deploy \
+             #{} — a crash-looping appliance must be RETRIED on a backoff, and a fix that \
+             simply stops restarting it is the outage this relay exists to end, not a pass \
+             (R858-B13)",
+            baseline + 1
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// **The respawn loop.** An appliance that dies the instant it starts must be
+/// retried on `OwnerElection`'s backoff — not restarted on every pass of the
+/// control loop.
+///
+/// # The fixture
+///
+/// A reaper task flips the appliance out of `Running` in the owner's supervisor
+/// within ~10 ms of every deploy. That is what a `headscale` exiting immediately
+/// looks like to `observe_local_appliance`, which is the only evidence this node
+/// has: kamaji reports the workload gone, and yubaba has to decide what to do
+/// about it. Nothing else is injected — no fault, no fence, no kill. The node
+/// stays the leader, stays the recorded owner, and stays eligible.
+///
+/// # What is asserted, and why it is a GAP rather than a count
+///
+/// The interval between the deploy that placed the appliance and the retry after
+/// it died. A rate bound over a window was tried first and is **vacuous**:
+/// measured, with `record_success` restored on the start path, a 45-second window
+/// admits four redeploys and a correct backoff admits two, which no honest bound
+/// separates. The gap does separate them exactly — a backed-off retry cannot come
+/// sooner than `BACKOFF_BASE_SECS`, and a loop that records a crash as a success
+/// retries on the next `RECONCILE_INTERVAL`, three times sooner.
+///
+/// # Non-vacuity
+///
+/// Structural, in both directions. The retry is *waited for*, so this cannot pass
+/// because nothing happened: a fix that stopped restarting the appliance
+/// altogether — the other way to make a respawn loop go away, and a worse one —
+/// fails inside `next_deploy_at` rather than sliding through a gap assertion that
+/// is trivially satisfied by an infinite gap. And the reaper's kill count is
+/// asserted, so a run in which the appliance was never actually destroyed cannot
+/// report a passing gap between two events that had nothing to do with a crash.
+///
+/// # Falsification
+///
+/// Restore `election.record_success(node_id)` (and drop `*start_awaiting_proof =
+/// true`) in `ElectTo`'s `Ok` arm in `leader.rs`: the ledger is cleared on every
+/// start, the backoff never accumulates, and the gap collapses to one
+/// `RECONCILE_INTERVAL`.
+#[tokio::test]
+async fn a_crash_looping_appliance_is_retried_on_the_backoff_not_on_every_pass() {
+    let (mut cluster, runtimes) = power_off_cluster().await;
+
+    let mut loops = Loops(Vec::new());
+    for idx in 0..cluster.node_count() {
+        loops.start(&cluster, idx);
+    }
+
+    let (owner_idx, owner_machine) = settle_owner(&cluster, &runtimes).await;
+
+    // The reaper: `headscale` exiting the moment kamaji forks it.
+    let kills = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reaper = {
+        let runtime = runtimes[owner_idx].clone();
+        let kills = Arc::clone(&kills);
+        tokio::spawn(async move {
+            let ident = headscale_appliance::appliance_ident();
+            loop {
+                if appliance_running(&runtime) {
+                    let n = kills.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    runtime.mark_restarting(ident.0.clone(), 1, n as u32, 0);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+    };
+
+    // `settle_owner` returns within one 200 ms poll of the deploy that placed the
+    // appliance, so this is that deploy's timestamp to well inside the tolerance
+    // a thirty-second threshold has. Measuring from here rather than from a
+    // second observed deploy keeps the test to one backoff step: the ledger
+    // doubles (30 → 60 → …), so waiting for a *third* attempt would mean sitting
+    // out 60 s more for no extra claim.
+    let first = Instant::now();
+    let baseline = runtimes[owner_idx].deploy_calls().len();
+    let second = next_deploy_at(&runtimes[owner_idx], baseline, retry_budget()).await;
+    let gap = second - first;
+    reaper.abort();
+
+    let killed = kills.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        killed > 0,
+        "the fixture never armed: the reaper never caught the appliance running, so nothing \
+         crashed and the gap measured below is the gap between two unrelated events"
+    );
+    assert!(
+        gap >= Duration::from_secs(BACKOFF_BASE_SECS),
+        "the owner ({owner_machine}) restarted the crash-looping appliance {gap:?} after the \
+         previous attempt — below `BACKOFF_BASE_SECS` ({BACKOFF_BASE_SECS}s), so the failure \
+         ledger is not accumulating and the appliance is being respawned faster than it can \
+         bind its ports (R858-B13)"
+    );
+
+    // The loop must not have leaked onto the other nodes either: a follower that
+    // is not the recorded owner has nothing to start, and an owner in backoff
+    // must not be replaced by a peer that cannot see it is broken.
+    for idx in 0..cluster.node_count() {
+        if idx == owner_idx {
+            continue;
+        }
+        assert!(
+            !appliance_running_on(&runtimes, idx),
+            "node {idx} started a second appliance while the recorded owner was crash-looping — \
+             two coordinators is the failure that is worse than the outage"
+        );
+    }
+
+    cluster.destroy_all().await.ok();
+}
+
+/// How long the reconciler's cadence is sampled. A little over one
+/// `leader::RECONCILE_INTERVAL`, so a correctly-paced loop is expected to pass
+/// through it once or twice and a loop running at raft-heartbeat rate cannot
+/// look like one.
+const CADENCE_WINDOW: Duration = Duration::from_secs(12);
+
+/// The most reconcile passes that may happen inside [`CADENCE_WINDOW`] on a
+/// cluster where nothing is wrong.
+///
+/// One per ten seconds, plus slack for the boundary and for a leadership edge
+/// that legitimately forces one. Four is generous; the pre-fix loop produced
+/// upwards of twenty per second.
+const MAX_RECONCILES_IN_WINDOW: usize = 4;
+
+/// **The pacing.** With nothing wrong anywhere, the appliance reconciler must run
+/// on its own ten-second clock — not once per raft heartbeat.
+///
+/// # Why this is a separate test from the crash-loop one
+///
+/// Because the crash-loop test does not cover it, which was established by
+/// measurement rather than assumed: with the pacing defect reintroduced and the
+/// backoff fix left in place, that test still passes. `OwnerElection`'s backoff
+/// bounds the *deploys* whatever the loop's rate is. So the rate needs its own
+/// assertion, or a future edit could restore the heartbeat-rate loop and every
+/// test in this file would stay green while every node in the fleet went back to
+/// asking its supervisor about the appliance twenty times a second.
+///
+/// # What is being counted
+///
+/// `get_workload` calls on the owner's supervisor. `reconcile_appliance_ownership`
+/// asks exactly once per pass (through `observe_local_appliance`, before any
+/// early return), so this counter is the reconciler's cadence with nothing else
+/// mixed in — no HTTP handler is touched by this test and no other loop in the
+/// harness calls it.
+///
+/// # Falsification
+///
+/// Restore the pre-B13 shape of `leader::run` — drop the `reconcile_due` gate and
+/// build the timer as `_ = tokio::time::sleep(RECONCILE_INTERVAL)` inside the
+/// `select!` — and this fails with a count in the hundreds.
+#[tokio::test]
+async fn the_appliance_reconciler_runs_on_its_own_clock_not_at_raft_heartbeat_rate() {
+    let (mut cluster, runtimes) = power_off_cluster().await;
+
+    let mut loops = Loops(Vec::new());
+    for idx in 0..cluster.node_count() {
+        loops.start(&cluster, idx);
+    }
+
+    let (owner_idx, owner_machine) = settle_owner(&cluster, &runtimes).await;
+
+    // From here, not from the start: settling deliberately drives several passes
+    // (an election edge, a deploy, the record landing), and charging those to the
+    // steady state would measure the setup instead of the loop.
+    let before = runtimes[owner_idx].get_workload_calls();
+    tokio::time::sleep(CADENCE_WINDOW).await;
+    let passes = runtimes[owner_idx].get_workload_calls() - before;
+
+    assert!(
+        passes > 0,
+        "the reconciler did not run at all on the owner ({owner_machine}) in {CADENCE_WINDOW:?} — \
+         its clock is not merely slow, it has stopped, and every retry rule that depends on it is \
+         dead (R858-T3 defect 3)"
+    );
+    assert!(
+        passes <= MAX_RECONCILES_IN_WINDOW,
+        "the appliance reconciler ran {passes} times in {CADENCE_WINDOW:?} on the owner \
+         ({owner_machine}) — it is paced off the raft metrics watch rather than \
+         `leader::RECONCILE_INTERVAL`, which is what forked the live coordinator's headscale \
+         ~2.5 times a second on 2026-09-06 (R858-B13)"
     );
 
     cluster.destroy_all().await.ok();

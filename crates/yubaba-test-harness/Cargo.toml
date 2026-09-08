@@ -29,13 +29,13 @@ serde_json = "1.0"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tracing = "0.1"
-workload-spec = { package = "yah-workload-spec", version = "0.8.33" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.34" }
 yubaba = { path = "../yubaba" }
 # R732-T4: the OwnershipSource trait the LocalOwnership adapter implements, so
 # a chaos test can drive the real tail loop in-process. No cycle — the streamer
 # crate depends on neither yubaba nor this harness, by design.
 yubaba-tenant-streamer = { path = "../tenant-streamer" }
-kamaji = { version = "0.8.33" }
+kamaji = { version = "0.8.34" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

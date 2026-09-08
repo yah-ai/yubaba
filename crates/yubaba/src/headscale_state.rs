@@ -77,7 +77,7 @@
 
 use std::path::{Path, PathBuf};
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use workload_spec::secrets::{SecretError, SecretResolver};
 use workload_spec::SecretRef;
 
@@ -271,6 +271,131 @@ pub fn materialize_noise_key(
     Ok(NoiseIdentity::Fresh)
 }
 
+/// What happened to `config.yaml` before headscale was started (R858-T16).
+///
+/// A value rather than only a log line, for the same reason [`NoiseIdentity`]
+/// is one: the behaviour is assertable without a tracing subscriber. The doc on
+/// each variant records the level it logs at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplianceConfig {
+    /// The file was absent and has been rendered from
+    /// `crate::generate_remote_headscale_config`. Logs at `info`.
+    Rendered,
+
+    /// A config was already on disk and matches what the generator would emit
+    /// now. Logs at `info`.
+    KeptInSync,
+
+    /// A config was already on disk and differs from what the generator would
+    /// emit. **Left exactly as found**; logs at `warn` naming the drift.
+    KeptWithDrift,
+
+    /// A config was already on disk and there is no `server_url` to render a
+    /// comparison from, so drift cannot be assessed. Left as found; logs at
+    /// `warn`.
+    KeptUncheckable,
+
+    /// No config on disk and no `server_url` configured on this node, so
+    /// nothing could be rendered. Logs at `error` — the node stays a
+    /// non-candidate (`crate::leader::probe_native_exec` refuses it), which is
+    /// the correct outcome, but the operator has to know why.
+    Missing,
+}
+
+/// Place `config.yaml` in `headscale_dir` **if it is absent** — the third
+/// pre-start hydration step, beside the litestream DB restore and
+/// [`materialize_noise_key`].
+///
+/// # Why this exists
+///
+/// The appliance's argv is `headscale serve --config <headscale_dir>/config.yaml`
+/// and, until R858-T16, `POST /headscale/deploy` and `POST /headscale/bootstrap`
+/// were its only writers. So a node that was never hand-promoted had the binary
+/// and the noise key and *not* the config, and forking there exits immediately
+/// into `RestartPolicy::Always`. Measured on us-south-001 2026-09-06: binary
+/// present, noise key materialized, config absent.
+///
+/// # "Hydrate if absent" is a deliberate choice — do not simplify it into an
+/// unconditional write
+///
+/// us-west-001's live `config.yaml` was **hand-edited** on 2026-09-06 to move
+/// the coordinator off `0.0.0.0:443` + HTTP-01 and onto the loopback shape
+/// behind the passway doors (rollback copy on that node at
+/// `config.yaml.rollback-20260906-073155Z`). `start_headscale` runs on every
+/// leadership acquisition, so an unconditional render would silently overwrite
+/// that file on the next yubaba restart — re-decapitating the mesh exactly as
+/// the 2026-09-03 outage did, and exactly as R858-B9's 409 guard on the
+/// bootstrap handler exists to prevent. What it protects is the *live*
+/// coordinator's hand-tuned config; this step is for the node that has none.
+///
+/// Drift against the generator is reported at `warn` rather than corrected,
+/// because "the file on disk is not what this binary would write" is an
+/// operator's call to make, not a restart's.
+///
+/// # Permissions
+///
+/// Written with a plain `std::fs::write`, not [`write_state_file`]: this is not
+/// key material, and the promote path (`crate::headscale_deploy`) writes
+/// `config.yaml` the same way. A hydrated config and a promoted one must be the
+/// same file with the same mode, or a failover changes the appliance's
+/// readability under whatever user kamaji forks it as.
+pub fn hydrate_config(
+    headscale_dir: &Path,
+    server_url: Option<&str>,
+) -> std::io::Result<ApplianceConfig> {
+    // One path helper, shared with the placement probe and the spec's argv, so
+    // hydration cannot satisfy a file the appliance does not read.
+    let path = crate::headscale_appliance::config_path(headscale_dir);
+    let rendered = server_url.map(|url| crate::generate_remote_headscale_config(url, headscale_dir));
+
+    if path.exists() {
+        return Ok(match (rendered, std::fs::read_to_string(&path)) {
+            (Some(want), Ok(found)) if found == want => {
+                info!(path = %path.display(), "headscale config.yaml already on disk and in sync");
+                ApplianceConfig::KeptInSync
+            }
+            (Some(_), Ok(_)) => {
+                warn!(
+                    path = %path.display(),
+                    "headscale config.yaml on disk DIFFERS from what this binary would render \
+                     — left untouched on purpose (us-west-001's live config is hand-edited; \
+                     overwriting it re-decapitates the mesh). Reconcile it deliberately, not by \
+                     restarting yubaba"
+                );
+                ApplianceConfig::KeptWithDrift
+            }
+            (None, _) | (_, Err(_)) => {
+                warn!(
+                    path = %path.display(),
+                    "headscale config.yaml is on disk but could not be compared against the \
+                     generator — left untouched"
+                );
+                ApplianceConfig::KeptUncheckable
+            }
+        });
+    }
+
+    let Some(config) = rendered else {
+        error!(
+            path = %path.display(),
+            "no headscale config.yaml on this node and no coordinator server_url configured \
+             ({}), so none can be rendered — this node cannot host the appliance until one is \
+             set",
+            crate::HEADSCALE_URL_ENV
+        );
+        return Ok(ApplianceConfig::Missing);
+    };
+
+    std::fs::create_dir_all(headscale_dir)?;
+    std::fs::write(&path, config.as_bytes())?;
+    info!(
+        path = %path.display(),
+        server_url = server_url.unwrap_or_default(),
+        "headscale config.yaml hydrated — this node can now host the appliance"
+    );
+    Ok(ApplianceConfig::Rendered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +574,45 @@ mod tests {
             );
         }
         assert!(!dir.path().join(NOISE_KEY_FILE).exists());
+    }
+
+    // ── R858-T16: config.yaml hydration ─────────────────────────────────────
+
+    /// A node with no coordinator URL renders NOTHING rather than guessing one.
+    /// A config naming the wrong `server_url` is worse than no config: the
+    /// appliance starts, looks healthy, and every joining node dials a
+    /// coordinator that is not this one. The absent config keeps the node a
+    /// non-candidate, which `leader::probe_native_exec` already refuses on.
+    #[test]
+    fn no_coordinator_url_renders_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            hydrate_config(dir.path(), None).unwrap(),
+            ApplianceConfig::Missing
+        );
+        assert!(!crate::headscale_appliance::config_path(dir.path()).exists());
+    }
+
+    /// The rendered file is the generator's output byte-for-byte — so a second
+    /// hydration of an untouched node is a no-op rather than perpetual drift.
+    #[test]
+    fn a_hydrated_config_is_what_the_generator_emits() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "https://cloud.mesh.yah.dev";
+
+        assert_eq!(
+            hydrate_config(dir.path(), Some(url)).unwrap(),
+            ApplianceConfig::Rendered
+        );
+        let path = crate::headscale_appliance::config_path(dir.path());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            crate::generate_remote_headscale_config(url, dir.path()),
+        );
+        assert_eq!(
+            hydrate_config(dir.path(), Some(url)).unwrap(),
+            ApplianceConfig::KeptInSync
+        );
     }
 
     #[test]

@@ -399,6 +399,20 @@ pub const MESOFACT_STATIC_GRANTS: &[TokenGrant] = &[
         scope: GrantScope::Zone,
         fallback_id: "e17beae8b8cb423a99b1730f21238bed",
     },
+    // R859-F1: deploy_domain_passway (the sovereign-apex A-record reconciler)
+    // is the first production consumer of the dns.* envoy verbs against this
+    // token, and it both lists and upserts/prunes A records — hence both
+    // Read and Write, not just Read as the R324-F5 @yah:next follow-up noted.
+    TokenGrant {
+        group_name: "DNS Read",
+        scope: GrantScope::Zone,
+        fallback_id: "82e64a83756745bbbb1c9c2701bf816b",
+    },
+    TokenGrant {
+        group_name: "DNS Write",
+        scope: GrantScope::Zone,
+        fallback_id: "4755a26eedb94da69e1066d98aa820be",
+    },
 ];
 
 /// Result of minting an account-owned API token. `value` is the secret and is

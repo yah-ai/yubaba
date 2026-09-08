@@ -27,6 +27,12 @@
 //! ([`SecretConsumer::workload`]) and leaves the reload to a command the
 //! operator writes down.
 //!
+//! That command should be `systemctl reload <unit>`, and R870-T3 is what made
+//! `reload` mean something on a passway door — see [`RELOAD_CMD_ENV`]. Until
+//! then the honest value was `systemctl restart`, which drops every in-flight
+//! connection on public :443 and made a fleet rotation N connection-dropping
+//! restarts.
+//!
 //! ## Trust boundary, and one honest difference from R600-F6
 //!
 //! Decryption stays here: the node-local KEK is loaded per pass, never leaves
@@ -85,7 +91,22 @@ pub const KEY_PATH_ENV: &str = "YUBABA_CERT_FILES_KEY_PATH";
 /// Workload identity this node resolves *as*, checked against the record's
 /// R706 access rule. Must appear in the issuer's `YUBABA_ACME_CONSUMERS`.
 pub const CONSUMER_ENV: &str = "YUBABA_CERT_FILES_CONSUMER";
-/// Command run after the pair changes on disk (e.g. `systemctl restart passway`).
+/// Command run after the pair changes on disk.
+///
+/// **Write `systemctl reload <unit>`, not `systemctl restart <unit>`** — R870-T3
+/// is what made that distinction real. `restart` drops every in-flight
+/// connection on public :443, because pingora's `TlsSettings` is static and the
+/// only way a door picks up a new cert is a new process. `reload` runs the
+/// door's `ExecReload=`, which on a unit carrying
+/// `app/yah/cli/resources/passway-graceful-upgrade.conf` starts a replacement
+/// with `PASSWAY_UPGRADE=true`, hands it the listening sockets over pingora's
+/// SCM_RIGHTS upgrade protocol, and lets the old process drain. Nothing is
+/// dropped and nothing is refused.
+///
+/// A door WITHOUT that drop-in has no `ExecReload=`, so `systemctl reload`
+/// there fails rather than silently doing nothing, and [`run_reload`] logs the
+/// non-zero exit at ERROR. That is the failure worth having: the alternative is
+/// believing a rotation landed while the door still serves the previous cert.
 pub const RELOAD_CMD_ENV: &str = "YUBABA_CERT_FILES_RELOAD_CMD";
 
 /// Mode for the certificate chain — world-readable, like every other cert.
@@ -337,6 +358,9 @@ fn materialize_once(
 /// Run the configured reload command, if any. Failure is logged, never fatal:
 /// the new pair is already on disk, and a door that did not reload is serving
 /// the *old* cert — degraded, not down — which is not worth killing yubaba over.
+///
+/// See [`RELOAD_CMD_ENV`] for why the command should be `systemctl reload` and
+/// not `systemctl restart`.
 async fn run_reload(cfg: &MaterializeConfig) {
     let Some(cmd) = &cfg.reload_command else {
         tracing::warn!(

@@ -191,6 +191,9 @@
 //! @yah:verify("THREE INTEGRATION TESTS, EACH FALSIFIED AGAINST THE EXACT CHANGE IT COVERS — oss/yubaba/crates/yubaba/tests/raft_appliance_ownership.rs, real 3-node openraft on loopback, real leader::spawn + member_registration::spawn on every node, kamaji FakeRuntime. (1) a_yubaba_restart_on_the_owner_leaves_the_appliance_in_place — THE OPERATOR'S CRITERION. Probe: make recorded_owner return None (pre-fix local-memory-only). FAILS in 2.35s with 'the appliance was torn down after a yubaba restart on its owner (test-node-1)'. (2) transferring_raft_leadership_does_not_move_the_appliance — the literal 2026-09-03 POST /raft/transfer-leader, and the call `yah cloud rollout yubaba` makes. Probe: restore decide_owner's `None => {}` arm. FAILS in 2.53s with 'the appliance was torn down by a raft leadership transfer to node 2'. (3) a_follower_that_owns_the_appliance_restarts_it_without_a_leadership_change — the roll hole. Probe: gate reconcile on is_leader. FAILS in 47.79s with 'timed out after 45s waiting for the follower that owns the appliance to restart it on its own clock'. NON-VACUITY IS BUILT IN for (1) and (2): FaultTarget::DeployWorkload is armed BEFORE the disruption, and leader.rs answers a failed start by tearing down, so 'still Running at the end' asserts that NO NODE ATTEMPTED A START rather than that nothing was observed.")
 //! @yah:verify("cargo test -p yubaba --lib = 739 passed / 0 failed (23 in appliance_ownership, 5 new: an_owner_absent_from_the_candidate_map_is_unjudged_and_keeps_the_appliance, positive_evidence_still_moves_ownership_off_a_dead_owner, a_restarted_owner_reading_its_own_record_does_not_restart_the_appliance, a_new_raft_leader_does_not_take_the_appliance_from_the_recorded_owner, a_record_naming_this_node_over_a_stopped_appliance_re_elects, without_a_record_the_local_health_is_the_fallback). cargo test -p yubaba --test main = 64 passed / 0 failed. cargo test -p yubaba --features testing --test testing = 24 passed / 0 failed / 1 pre-existing ignored. cargo clippy -p yubaba --features testing --lib --bins --tests: ZERO findings on leader.rs, appliance_ownership.rs or the new test (crate-wide warnings are pre-existing and on files this ticket did not touch). rustfmt applied to the 5 changed files ONLY — `cargo fmt -p yubaba` would have reformatted a peer's dirty acme_issuer.rs, so it was not run.")
 //! @yah:gotcha("A FULL-PARALLELISM `cargo test -p yubaba --test main` FAILS 10 TESTS ON THIS MACHINE AND IT IS LOAD, NOT A REGRESSION — do not chase it. All 10 fail with 'nodes never agreed on a leader; last per-node current_leader was [None, None, None]' in raft_member_registration / raft_membership_loop / raft_quorum_geography. Attributed two ways: they all pass at --test-threads 2 (16/0) and the whole binary passes at --test-threads 4 (64/0); and structurally they use solo_node*, which this ticket did not touch — the harness edits are confined to test_cluster_local / restart_node / ClusterNode, and solo_node builds no ClusterNode. 64 default-parallel tests each standing up 3-5 raft nodes on one contended camp machine is the cause. Use --test-threads 4.")
+//! @yah:gotcha("YOUR UNVERIFIED PRECONDITION IS NOW MEASURED, AND THE ANSWER IS THE BAD ONE — but it is narrower than you feared. T3's @yah:assumes asks whether the DEPLOYED binary populates MemberInfo::machine, and names the check: one read-only GET /raft/status. Run 2026-09-06 by @Ashguard:hydra against the live fleet (both node 3 and node 1 answered identically): every member row carries ONLY `addr` and `region` — `{\\\"1\\\":{\\\"addr\\\":\\\"100.64.0.2:7443\\\",\\\"region\\\":null}, \\\"2\\\":{...}, \\\"3\\\":{...}}`. NO `machine` key on any of the three. The field is not missing from the CODE — raft/mod.rs defines it (R859-F2) and `git diff 4cf740bf..HEAD -- src/raft/` is EMPTY, so 0.8.33 shipped the struct — it is simply never populated by the running nodes, and it is `#[serde(default)]` so it serialises away. CONSEQUENCE EXACTLY AS T3 PREDICTED: once T3 rolls, a node resolving ANOTHER node's ingress ownership gets None from node_for_machine, falls back to its own health, tries to start the appliance, and fails loudly (us-east-001 and us-south-001 were both re-measured today and have no --native-exec-dir, no headscale binary and no /var/lib/yah-cloud/headscale at all). Loud refusal, not silent theft — but not the intended path, and R858-T4 is what closes it. WHAT IS NOT AFFECTED, and it is the case that matters right now: a node resolving its OWN ownership does not use the member map at all — recorded_owner compares the record against this node's own name directly. Verified concretely: raft `ingress_owner` = \\\"vps-4c1efa56\\\" and us-west-001's /etc/hostname = \\\"vps-4c1efa56\\\", so a T3-carrying yubaba restarted on west reads the record, sees itself, observes the appliance already Running under kamaji, and ADOPTS it. That is the a_yubaba_restart_on_the_owner_leaves_the_appliance_in_place path.")
+//! @yah:gotcha("FALSIFIED ON HARDWARE 2026-09-06 — DO NOT SIGN THIS OFF AS-IS. @Ashguard:hydra hand-built a musl yubaba from this tree (with R858-B13's fix), shipped it to us-west-001, ran it for ~90s and rolled it back. `cargo test -p yubaba --lib` was 766/0 and the policy line confirms T3 was live: `ingress_ownership: ElectedFromEligible`. The appliance was TORN DOWN anyway. Verbatim from west's journal, the whole sequence inside 400ms of startup: `headscale appliance deployed under kamaji supervision` -> `ERROR failed to set ingress owner in raft: has to forward request to: Some(1), BasicNode { addr: \\\"100.64.0.2:7443\\\" }` -> `elected appliance owner and started the appliance` -> `headscale appliance torn down on leadership loss` -> `headscale stopped on leadership loss` -> `APPLIANCE CRASH-LOOPING ... backing off`. Then a ~40s backoff cycle repeating that forever. TWO DEFECTS, BOTH THIS TICKET'S. D1: A FOLLOWER ELECTS ITSELF, DEPLOYS, AND ONLY THEN DISCOVERS IT CANNOT RECORD OWNERSHIP — west was a follower (south = node 1, term 20), SetIngressOwner must go to the leader and is NOT forwarded, so the node deploys an appliance it can never own on paper, once per backoff round, indefinitely. This ticket's own design says 'only a leader may claim a vacancy'; the code claims and DEPLOYS first and checks second. D2: THE LEADERSHIP-LOSS TEARDOWN FIRES ON A FOLLOWER THAT IS THE RECORDED OWNER — 4ms after starting the appliance the is_leader edge ran on_lost_leader -> stop_headscale. That directly contradicts this ticket's own stated fixes ('a follower may restart what it is already recorded as owning', 'the edge keeps only the teardown'). On a COLD START AS FOLLOWER that teardown is exactly wrong, and it is reachable on the adopt-eligible path, not only on a failed start. NOTE the integration test a_follower_that_owns_the_appliance_restarts_it_without_a_leadership_change passes in the harness while this fails on hardware — the harness evidently does not reproduce a cold yubaba start on a follower whose member row lacks `machine`.")
+//! @yah:gotcha("CORRECTION TO MY OWN FALSIFICATION GOTCHA ABOVE, from @Ashguard:golem who owns the code — read this WITH it, because two of its three claims are wrong and they point a reviewer at the wrong file. (1) D2 IS NOT PURELY T3's — IT IS A REGRESSION R858-B13 WIDENED, AND IT IS ALREADY FIXED. `on_leadership_loss_under_election` kept the appliance if `owner.serving` OR this process's ApplianceHealth was `Serving`. Pre-B13, `record_success` fired immediately after a successful deploy, so health was `Serving(self)` within microseconds and that second term covered exactly this case; B13 deliberately WITHHOLDS record_success until the appliance is observed running (that is what makes the backoff accumulate), so for one reconcile interval after a start neither term holds. The 6ms window I measured at 07:56:49.690->.696 IS that gap. golem has landed a third term, `start_awaiting_proof` — this node started the appliance and has not yet been able to judge it — extracted as the testable `appliance_survives_leadership_loss(owner, node_id, health, start_awaiting_proof)` with four unit tests. (2) D1 AS I WROTE IT IS OVERSTATED — FILE IT NARROWLY. `recorded_owner` does NOT need node_for_machine for the SELF case: it compares the record against this node's own machine name first and returns Some(node_id) on a hit. west's /etc/hostname = ingress_owner = \\\"vps-4c1efa56\\\", so west DID resolve itself as recorded owner, and the ElectTo(self) path I saw is T3 BEHAVING AS DESIGNED (a follower that is the recorded owner and is not serving is supposed to restart what it owns). The genuinely wrong part is much narrower: `on_became_leader` writes SetIngressOwner UNCONDITIONALLY and a follower cannot, producing the `has to forward request to: Some(1)` ERROR — a REDUNDANT write, since the record already named west. So the defect is 'a redundant SetIngressOwner from a follower logs a spurious ERROR', NOT 'a follower deploys an appliance it can never own'. (3) CONSEQUENTLY MY 'deploys every backoff round forever' CLAIM IS WRONG: once the appliance is running and adopted, decide_owner returns OwnerServing(self) and nothing redeploys. The repeating cycle I observed was D2 killing the appliance 6ms after each start, not an ownership loop. WHAT STANDS UNCHANGED: the missing `machine` key on every live member row is real, separate, and unexplained by any of the above — self-resolution bypasses the member map, but no node can resolve any OTHER node's ownership, so the entire remote half of recorded_owner is dead on the live fleet.")
 //!
 //! @yah:ticket(R858-T8, "The rehearsal: power off the owner, prove the HA-singleton takes over on the sovereign group")
 //! @yah:at(2026-09-04T20:47:59Z)
@@ -206,6 +209,21 @@
 //! @yah:verify("CONFIRM FIRST WHETHER /health TOUCHES THE DATABASE — not established, and it changes how much the probe is worth. If it only reports that the HTTP server is up, it returns `pass` on a coordinator serving an empty or half-restored DB, which is the other post-failover false green. Cheap test on the dev cluster: move the db file aside (or point config at a nonexistent path), restart, and see whether /health still says pass. If it does, the readiness gate for step 8 needs to be a real query — an Exec probe running a `headscale nodes list` against the unix socket at /var/lib/yah-cloud/headscale/headscale.sock would do it — rather than an HttpGet.")
 //! @yah:gotcha("DO NOT TRUST /health AS THE FAILOVER GATE — it cannot see the failure that matters most. headscale's `GET /health` returns 200 {\"status\":\"pass\"} (measured on v0.23.0, 2026-09-04), and it would return exactly that on a headscale that came up with a FRESH noise_private.key: the HTTP server is serving fine, it simply rejects every already-registered node. That is the R858-T2 failure, it is the single most likely way this rehearsal produces a false green, and no readiness probe can catch it. It is the reason this ticket's sign-off criterion is \"an ALREADY-REGISTERED node reaches the tailnet without re-registering\" rather than anything the coordinator says about itself.")
 //! @yah:notify_on(R858-T7, "R858-T7 landed EXPIRE + FENCE, which are your steps (2) and (3). Read T7's handoff before planning the run — it answers \"is the rehearsal runnable on dev\" explicitly and the answer is NOT YET, with the blockers named in order. Two things to take from it. (1) SPLIT THE REHEARSAL: the OWNERSHIP half (power off the owner, a survivor expires the record and claims it, power restored, the old node cannot serve) is decidable WITHOUT R858-T2 or R858-T5, because it does not care whether the new coordinator's DB is any good — only who may serve. Run that first; it is the half never demonstrated on hardware. The full criterion (\"an ALREADY-REGISTERED node reaches the tailnet without re-registering\") needs T2's noise key and T5's proven restore and must not be attempted before them. (2) STEP ZERO IS A ROLL: T3+T7 are local source only; us-west-011/013/014 run a binary with neither, so nothing in T7 is live until they are rolled. Also: T7's own \"LIVE HAZARD — systemctl disable headscale before the rehearsal\" gotcha is already satisfied on us-west-001 (measured disabled 2026-09-05 by @Ashguard:libra; yubaba disables the unit itself whenever it takes the appliance under kamaji) — re-check, but do not plan a manual step around a bit that is already clear.")
+//!
+//! @yah:ticket(R858-B14, "The appliance is never observable as Running, so ownership never converges — every backoff round redeploys and kills a healthy headscale")
+//! @yah:status(review)
+//! @yah:at(2026-09-06T08:29:24Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R858)
+//! @yah:severity(high)
+//! @yah:next("RAISE THE Err ARM AT leader.rs:1149 ABOVE debug! FIRST — it is one line and it decides the whole investigation. If get_workload is erroring over the UDS, the appliance was never unobservable at all and this is a plumbing bug; if it returns Ok with a non-Running status, the defect is in kamaji-bin's native supervisor's status reporting. Do not design a fix before that line tells you which.")
+//! @yah:gotcha("MEASURED ON us-west-001 2026-09-06 by @Ashguard:hydra, with R858-B13's fix AND its follow-up D2 fix both live in the binary (hand-built musl yubaba sha 7f6d24d07d4f7f030c7030c17227efd3df78eccf35184245a9897f3d433f4d36, `cargo test -p yubaba --lib` = 770/0). THIS IS A THIRD DEFECT, distinct from B13's pacing and from R858-T3's ownership resolution, and it is what actually keeps us-west-001 out of raft. THE EVIDENCE: over 90s with the D2 fix in, `torn down on leadership loss` occurred ZERO times (so D2 is genuinely fixed), yet the headscale pid still changed 720568 -> 720930 -> 721017 and kamaji logged `native workload forked id=headscale` at 08:05:45, 08:06:25, 08:07:35 — i.e. the backoff IS growing (40s then 70s, so golem's exponential backoff works) but the cycle never stops, and EVERY redeploy kills a healthy headscale that kamaji was already supervising correctly. THE MECHANISM: leader.rs::observe_local_appliance (leader.rs:1140) returns Some only for `Ok(Some(w)) if matches!(w.status, kamaji::WorkloadStatus::Running)`; anything else — including Err — is silently treated as \"not running here\" at :1149. Because the appliance is never observed Running, B13's deliberately-withheld `record_success` is never reached, `decide_owner` never returns OwnerServing(self), and so each backoff round re-elects and REDEPLOYS instead of adopting. Backoff bounds the RATE of this but cannot make it converge — no amount of backoff turns an unobservable appliance into an observed one.")
+//! @yah:assumes("I did NOT establish which side is wrong, and the ticket should not assume. The strongest hint is that yubaba logs `headscale appliance deployed under kamaji supervision` with `\"pid\":0` on EVERY deploy while kamaji simultaneously logs real forked pids (720878/720930/721017) — so the DeployResult crossing the UDS carries no pid even though the child is real. Two candidate sites, both unread by me: (a) kamaji-bin's server-side native supervisor, which is what the fleet actually runs (the journal line is `kamaji_bin::server: native workload forked`) and which may be a different implementation from the INLINED oss/kamaji/crates/kamaji/src/native.rs I did read — that one's get_workload at native.rs:822 does return `status: h.status.borrow().clone()` and would report Running, and its `pid` field is documented as \"0 when no child is running\"; (b) yubaba's side, if get_workload errors over the socket and is swallowed by the Err arm at leader.rs:1149, which logs at debug! and so is INVISIBLE at the fleet's default log level. THE FIRST STEP IS TO MAKE THAT ERR ARM LOUD, or query kamaji directly — there is no client CLI on the box (`kamaji --help` shows a server only), so this needs either a small probe or a log-level bump.")
+//! @yah:verify("FIXED AND VERIFIED ON PROD HARDWARE 2026-09-06T08:23-08:28Z by @Ashguard:hydra (session:8d1176d7). us-west-001 IS BACK IN RAFT QUORUM: /raft/status now reports all THREE peers live (1: silent_for_ms 236, 2: 391, 3: 569), term 20 unchanged, leader still node 1 — node 2 (west) went from state \"down\"/silent_for_ms 895028 to \"live\". ROOT CAUSE WAS NEITHER CANDIDATE IN THE ASSUMES BLOCK: get_workload did not error and kamaji did not misreport a status. kamaji-bin's List handler (oss/kamaji/crates/kamaji-bin/src/server.rs:1155) merges containerd, bundle (ctx.bundle.native), tenant-passway, microvm and docker, and NEVER merges ctx.native — the --native-exec-dir fork+exec backend that deploy_native_exec (:1809) actually forks headscale through. It opens with `ctx.registry.lock().await.list()` under the comment \"native workloads\", but Registry::workloads has NO writer anywhere in the crate (list() at :808 is the only reference to the field), so on a live daemon that vec is always empty. Chain: headscale forks and runs under ctx.native -> absent from every List reply -> KamajiClient::get_workload (oss/kamaji/crates/kamaji/src/sibling.rs:757) is list_workloads().find(ident) -> Ok(None) -> leader.rs treats it as not running here -> record_success never reached -> re-elect + redeploy every backoff round. THE FIX: a #[cfg(feature = \"native-exec\")] merge arm for ctx.native.list_workloads() mirroring the bundle arm, plus native-exec added to runtime_state_to_entry's cfg gate. `cargo test -p kamaji-bin --features containerd-integration,native-exec,bundle-serving --lib` = 285 passed / 0 failed. FALSIFIED, not just green: the new regression test a_native_exec_workload_is_visible_in_list FAILS with the merge arm cfg'd out, panicking \"a supervised native workload must appear in List, got []\" — an empty list, exactly the live symptom. HARDWARE METHOD: cross-built musl kamaji (scripts/cross-build-guarded.sh kamaji-bin x86_64-unknown-linux-musl '' containerd-integration,native-exec,bundle-serving oss/kamaji, sha256 daededfb201e174e6220209829be1ba13cf3601bf3aba6adff6d5aeb596b9691, static musl ELF), anchored the previous binary at /usr/local/bin/kamaji.rollback-20260906-hydra-b14 (sha 4f5a620b74d6dd394199457c8c95246c7481f446dd0730dfbcc4d0663b658040), installed, `systemctl restart kamaji`, `systemctl enable --now yubaba`. SINGLE VARIABLE: yubaba was NOT rebuilt — west still runs the same hand-built B13+D2 binary (sha 7f6d24d0...) whose behaviour B14 measured, so the only thing that changed is kamaji's List. RESULT, over 3m50s: exactly ONE fork (08:23:38, the deploy that replaced the child the kamaji restart killed), then `kamaji | grep -c \"native workload forked\"` = 0 over the following 3 minutes; headscale pid 721574 unchanged with etime marching 00:24 -> 03:50; `elected appliance owner and started` = 0 over the same window. The line that had never once appeared before arrived exactly one RECONCILE_INTERVAL after the deploy: 08:23:48.192 \"the appliance this node started is now observed running — recording the start as successful (R858-B13)\". That is B13's deliberately-withheld record_success finally being reachable. Mesh green throughout and after: https://cloud.mesh.yah.dev/key?v=138 = 200, http://100.64.0.3:7443/service-records?ready=true = 200. LAST STEP DONE: yubaba is `enabled` AND `active` (symlink /etc/systemd/system/multi-user.target.wants/yubaba.service created), kamaji likewise. headscale config.yaml UNTOUCHED — mtime still 07:36:55Z (pre-run), listen_addr still 127.0.0.1:8080, no tls_letsencrypt_* keys; no /headscale/deploy or /headscale/bootstrap was ever posted.")
+//! @yah:gotcha("RESTARTING kamaji ON WEST KILLS headscale WITH NO AUTOMATIC RESTORE — plan for it before you ship a kamaji binary there. kamaji.service is `KillMode=mixed` + `Delegate=yes` over yubaba.slice, so a restart SIGKILLs everything in the delegated cgroup including the appliance, and nothing resumes native-exec workloads on startup (resume_bundle_workloads covers bundles only). With yubaba disabled, that leaves the mesh coordinator dead and nothing to redeploy it. The escape hatch, if a future run needs to restore headscale without yubaba: `sudo systemd-run --unit=headscale-fallback --collect --working-directory=/var/lib/yah-cloud/headscale /var/lib/yah-cloud/headscale/headscale serve --config /var/lib/yah-cloud/headscale/config.yaml` — the exact argv, cwd and user (root) the kamaji-supervised child runs with. This run did not need it: kamaji restart and `enable --now yubaba` were issued back-to-back and the coordinator was down for roughly 20 seconds.")
+//! @yah:handoff("LANDED AND VERIFIED ON HARDWARE — us-west-001 is back in raft quorum (3/3 voters live). The full method and measurements are in the @yah:verify entry. CODE CHANGE, all in oss/kamaji/crates/kamaji-bin/src/server.rs, uncommitted in the working tree: (1) a `#[cfg(feature = \"native-exec\")]` merge arm in the `List` handler for `ctx.native.list_workloads()`, mirroring the bundle arm; (2) `native-exec` added to `runtime_state_to_entry`'s cfg gate (it already handled the `native-<pid>` container_id spelling — the native runtime IS the same NativeRuntime the bundle backend uses, only keyed on a different identity space); (3) the regression test `a_native_exec_workload_is_visible_in_list`, which asserts presence, `WorkloadState::Running`, a non-zero pid and the mesh_ident yubaba's get_workload matches on. NOT CHANGED: leader.rs. @Ashguard:golem had already split observe_local_appliance's negative arms into three (Ok(Some) non-Running at warn!, Ok(None) at debug!, Err at warn!) while I was reading; that split is correct and I left it alone — B14's first-action log line was answered by reading the code instead, so no diagnostic ship was needed. yubaba on west is UNCHANGED (still the hand-built B13+D2 binary, sha 7f6d24d0...), which is what made this a single-variable experiment.")
+//! @yah:verify("REVIEWER: the two claims worth re-deriving rather than taking from me are (a) that `Registry::workloads` has no writer — `rg -n \"workloads\\.push|self\\.workloads\" oss/kamaji/crates/kamaji-bin/src/server.rs` returns only the `list()` read at :808, which is what makes the handler's \"native workloads\" comment false; and (b) that the fleet build actually compiles the new arm — scripts/publish-yubaba-release.sh:173 builds kamaji-bin with `containerd-integration,native-exec,bundle-serving`. Also note the fix does NOT close R858 itself: this restored quorum, it did not give the fleet failover (R858-T4) and it did not touch the redundant SetIngressOwner ERROR a follower still logs on every start (\"failed to set ingress owner in raft: has to forward request to: Some(1)\"), which golem documented as the narrow, real form of D1 and which is still visible in west's journal at 08:23:38.527576Z.")
+//! @yah:gotcha("EAST AND SOUTH ARE UNAFFECTED BY THIS BUG, WHICH IS WHY IT ONLY EVER BIT WEST. The merge arm reads `ctx.native`, which is `None` on any node started without `--native-exec-dir` — and per R858-T4 that is exactly east and south. So the defect could only manifest on the one node that can actually run the appliance, and rolling the fix to the other two is a no-op that changes no behaviour there. It should still roll fleet-wide with the next release rather than being hand-installed on west alone.")
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -213,12 +231,13 @@ use std::sync::Arc;
 use openraft::async_runtime::watch::WatchReceiver;
 use tracing::{debug, error, info, warn};
 
-use kamaji::sibling::KamajiSibling;
+use kamaji::sibling::{ClientError, KamajiSibling};
+use kamaji_proto::NodeCapabilities;
 
 use crate::appliance_ownership::{
     decide_owner, judge_appliance_candidate, judge_self_fence, owner_lease_expired, owner_status,
     ApplianceCandidate, ApplianceHealth, FenceTiming, NativeExecCapability, OwnerElection,
-    OwnershipDecision, SelfFence,
+    OwnerStatus, OwnershipDecision, SelfFence,
 };
 use crate::lease_detector::Confirmed;
 use crate::raft::{YubabaNodeId, YubabaRaft, YubabaRequest};
@@ -261,6 +280,33 @@ async fn run(
     let mut prev_is_leader = false;
     let mut watcher = ApplianceWatcher::new();
 
+    // R858-B13: an `Interval`, NOT a `sleep` future built inside the `select!`.
+    //
+    // A `tokio::time::sleep(RECONCILE_INTERVAL)` written as a `select!` arm is
+    // constructed fresh on every iteration and **dropped** whenever another arm
+    // wins, so its deadline restarts from zero each time. The other arm here is
+    // the openraft metrics watch, and a raft leader republishes its metrics on
+    // every heartbeat and every replication-progress update — several times a
+    // second. So the ten-second arm was not merely late, it was unreachable, and
+    // `reconcile_appliance_ownership` ran at heartbeat rate: measured on
+    // us-west-001 on 2026-09-06 as 132 appliance deploys in one 60-second window
+    // (~2.5/s), each one killing the headscale the previous one had forked
+    // before it could finish binding its port.
+    //
+    // An `Interval` holds its next deadline in a value that outlives the
+    // `select!`, so cancelling `tick()` does not reset it. That is the whole
+    // difference, and it is the kind that does not show up in a code read.
+    let mut reconcile_tick = tokio::time::interval(RECONCILE_INTERVAL);
+    reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval` yields its first tick immediately. Consume it here so the loop's
+    // own first pass is the reconcile, rather than reconciling and then falling
+    // straight through a zero-delay tick into a second one.
+    reconcile_tick.tick().await;
+
+    // The first pass reconciles: a starting daemon must discover an appliance it
+    // already owns without waiting out a full interval (R858-T3's restart case).
+    let mut reconcile_due = true;
+
     loop {
         let view = {
             let metrics = watch.borrow_watched();
@@ -302,7 +348,7 @@ async fn run(
                     on_leadership_loss_under_election(
                         node_id,
                         &state,
-                        &watcher.election,
+                        &watcher,
                         machine.as_deref(),
                     )
                     .await;
@@ -316,19 +362,39 @@ async fn run(
                 );
             }
             prev_is_leader = is_leader;
+            // A leadership change is a genuine reason to re-evaluate now instead
+            // of at the next tick — it is the one raft event that changes what
+            // this node is *allowed* to do (only a leader may claim a vacancy).
+            reconcile_due = true;
         }
 
         // R858-T3: under an elected owner, ownership is evaluated on a CLOCK as
         // well as on leadership edges — see `reconcile_appliance_ownership` for
         // why an edge-only watcher cannot deliver this ticket's own retry rule.
-        if state
-            .cluster_policy
-            .ingress_ownership
-            .elects_from_eligibility_set()
+        //
+        // R858-B13: and on a clock *only*, plus that edge. Every other metrics
+        // wake is skipped, because none of them carries news this function acts
+        // on: `ingress_owner` moves through the state machine rather than the
+        // metrics channel, so a metrics update tells this node nothing about
+        // ownership it did not already know. Reconciling on all of them cost
+        // ~2.5 appliance deploys a second on the live coordinator.
+        if reconcile_due
+            && state
+                .cluster_policy
+                .ingress_ownership
+                .elects_from_eligibility_set()
         {
-            reconcile_appliance_ownership(node_id, view, &raft, &state, &mut watcher, machine.clone())
-                .await;
+            reconcile_appliance_ownership(
+                node_id,
+                view,
+                &raft,
+                &state,
+                &mut watcher,
+                machine.clone(),
+            )
+            .await;
         }
+        reconcile_due = false;
 
         tokio::select! {
             changed = watch.changed() => {
@@ -337,7 +403,9 @@ async fn run(
                     break;
                 }
             }
-            _ = tokio::time::sleep(RECONCILE_INTERVAL) => {}
+            _ = reconcile_tick.tick() => {
+                reconcile_due = true;
+            }
         }
     }
 }
@@ -350,6 +418,14 @@ async fn run(
 /// a suggestion. It is deliberately *not* derived from `RaftTiming`: nothing
 /// here is an election, and pacing an appliance's reconciliation at consensus
 /// speed is the coupling this ticket removes.
+///
+/// R858-B13: this constant was correct and inert for three days. Consuming it as
+/// a `sleep` arm of the `select!` in [`run`] meant the metrics watch reset it on
+/// every heartbeat, so the reconciler ran at consensus speed anyway — the exact
+/// coupling the paragraph above says it removes, reintroduced by the shape of
+/// the timer rather than by the number. It is now driven by a
+/// [`tokio::time::Interval`] held outside the `select!`; see [`run`] for why that
+/// distinction is load-bearing.
 const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// One tick's snapshot of this node's raft leadership view.
@@ -388,6 +464,26 @@ struct ApplianceWatcher {
     /// legitimate owner — and, if it is not, stops within one window instead of
     /// serving forever.
     ownership_confirmed_at: std::time::Instant,
+    /// R858-B13: this node started the appliance and has not since **observed**
+    /// it running.
+    ///
+    /// The brake on a crash loop, and the reason it needs one: a successful
+    /// `deploy_workload` proves only that the supervisor accepted the workload
+    /// and forked it, never that the process is still alive a moment later. On
+    /// the live coordinator `headscale` was exiting immediately, so every
+    /// reconcile found the appliance gone, re-elected this node, started it
+    /// again, and recorded *success* — which clears
+    /// [`OwnerElection`]'s failure ledger, so the 30 s backoff that exists for
+    /// exactly this could never accumulate.
+    ///
+    /// A boolean rather than a counter because one unproven start is all the
+    /// evidence needed: being asked to start an appliance this node started and
+    /// has never seen running is a crash, and the second attempt is where the
+    /// ledger has to begin. A restart requested after the appliance *was*
+    /// observed running (a teardown, a roll) clears this and is not penalised —
+    /// that is R858-T3's follower-restarts-what-it-owns path and it must stay
+    /// prompt.
+    start_awaiting_proof: bool,
 }
 
 impl ApplianceWatcher {
@@ -395,6 +491,7 @@ impl ApplianceWatcher {
         Self {
             election: OwnerElection::new(),
             ownership_confirmed_at: std::time::Instant::now(),
+            start_awaiting_proof: false,
         }
     }
 }
@@ -422,26 +519,62 @@ impl ApplianceWatcher {
 async fn on_leadership_loss_under_election(
     node_id: YubabaNodeId,
     state: &Arc<ServerState>,
-    election: &OwnerElection,
+    watcher: &ApplianceWatcher,
     machine: Option<&str>,
 ) {
+    let election = &watcher.election;
     let recorded = recorded_owner(state, node_id, machine);
     let running_here = observe_local_appliance(state).await.is_some();
     let owner = owner_status(recorded, node_id, running_here, election.health());
 
-    // Serving per the record OR per this process's memory — either is a reason
-    // not to tear the coordinator down for a leadership change.
-    if owner.is_some_and(|o| o.node == node_id && o.serving)
-        || matches!(election.health(), ApplianceHealth::Serving(_))
-    {
+    // Serving per the record OR per this process's memory OR just started here
+    // and not yet judged — any of the three is a reason not to tear the
+    // coordinator down for a leadership change.
+    //
+    // R858-B13 added the third, and it closes a window B13 itself widened.
+    // Withholding `record_success` until the appliance is observed running is
+    // what makes the crash-loop backoff accumulate — but it also means that for
+    // one reconcile interval after a start this process's memory does NOT say
+    // `Serving`. Measured on us-west-001 on 2026-09-06 by @Ashguard:hydra: a
+    // cold-started follower deployed the appliance at 07:56:49.690 and this
+    // function tore it down again at 07:56:49.696, six milliseconds later,
+    // because the supervisor had not yet flipped the workload to `Running` and
+    // the health verdict was deliberately still withheld. A start that has not
+    // been judged is not evidence of *absence*, and stopping on it converts an
+    // unproven appliance into a certainly-dead one.
+    if appliance_survives_leadership_loss(
+        owner,
+        node_id,
+        election.health(),
+        watcher.start_awaiting_proof,
+    ) {
         info!(
             node_id,
-            "lost raft leadership while serving the appliance — ownership is elected, not \
-             inherited from leadership (R858-T3); the appliance stays up"
+            unproven_start = watcher.start_awaiting_proof,
+            "lost raft leadership while the appliance is up (or is starting) here — ownership is \
+             elected, not inherited from leadership (R858-T3); the appliance stays up"
         );
         return;
     }
     on_lost_leader(state).await;
+}
+
+/// Does the appliance on this node survive a raft leadership change?
+///
+/// Split out of [`on_leadership_loss_under_election`] as arithmetic so it can be
+/// asserted without a cluster: every input is a value, and the one regression
+/// this predicate has already had (R858-B13's unproven-start window, measured on
+/// hardware as a six-millisecond gap between a deploy and a teardown) is a
+/// property of the *combination* of inputs rather than of any I/O around it.
+fn appliance_survives_leadership_loss(
+    owner: Option<OwnerStatus>,
+    node_id: YubabaNodeId,
+    health: &ApplianceHealth,
+    start_awaiting_proof: bool,
+) -> bool {
+    owner.is_some_and(|o| o.node == node_id && o.serving)
+        || matches!(health, ApplianceHealth::Serving(_))
+        || start_awaiting_proof
 }
 
 /// Bring this node's appliance state in line with who the cluster says owns it.
@@ -512,6 +645,29 @@ async fn on_leadership_loss_under_election(
 /// So the owner is read through [`owner_status`] from `ingress_owner`, which is
 /// replicated, survives the restart, and (since change 3) is written only after
 /// a successful start. Local memory is the fallback, not the source.
+///
+/// @yah:ticket(R858-B13, "Headscale respawn loop: kamaji fork-kills it every ~450ms, port never binds, no backoff")
+/// @yah:status(review)
+/// @yah:at(2026-09-06T08:14:33Z)
+/// @yah:assignee(agent:claude)
+/// @yah:parent(R858)
+/// @yah:gotcha("MEASURED LIVE on us-west-001, 2026-09-06, after rolling yubaba/kamaji to 0.8.33 (all 3 voters, followers-first-leader-last, via `yah cloud rollout`) and separately seeding `headscale/noise-private-key` into the cluster secret store (R858-T2's declared fix, `.yah/infra/secrets/headscale-noise-private-key.toml` — confirmed 72 bytes, `yah cloud secret put` succeeded, and yubaba's own log confirmed the read: \"headscale noise identity materialized from the cluster secret store — this appliance is portable\"). Neither the roll nor the secret fix stopped this: kamaji's journal shows `native workload forked id=headscale pid=<N>` repeating every ~350-450ms, continuously, for at least 10+ minutes straight (132 occurrences counted in one 60s window). Each cycle yubaba's own log pairs it with \"headscale appliance deployed under kamaji supervision\" `pid:0` (never a real pid) then \"elected appliance owner and the appliance is serving\" then \"ingress owner set in raft state\" — i.e. yubaba believes every cycle succeeded. `ss -lntp` on the box shows NOTHING listening on :443 or :80 at any point sampled. `RECONCILE_INTERVAL` in this file is `Duration::from_secs(10)` — the observed cadence is ~20x faster than that clock, so whatever is firing this is not the intended timer path. `cloud.mesh.yah.dev:443` is refused throughout (direct curl, not just a `tailscale status` read — that command's peer table is separately known-unreliable per `.yah/services/yah-analytics/mirrors/cloud.toml`'s gotcha, not relied on here). Raft leadership is stable throughout (node_id 2 / us-west-001, term unchanged across repeated `/raft/status` reads) — this is NOT a leadership-thrash symptom.")
+/// @yah:assumes("UNVERIFIED HYPOTHESIS, not confirmed: `reconcile_appliance_ownership`'s own writes (the \"ingress owner set in raft state\" line = a `SetIngressOwner` raft write) may be re-observed by the same watcher as a state change and re-trigger reconcile immediately, rather than the loop waiting out the full `RECONCILE_INTERVAL` — which would produce exactly this self-sustaining tight cycle regardless of the 10s `tokio::time::sleep` arm, if the `tokio::select!` in `spawn` (line ~333) also wakes on the raft metrics `watch.changed()` arm and that watch fires on the node's own writes. Have NOT read closely enough to confirm the metrics watch actually fires on a self-authored write vs. only on log/membership changes from OTHER nodes — that's the first thing to check. Also unverified: whether R858-T3's in-review, uncommitted changes (defect 1/2/3 fixes in that ticket's handoff) touch this exact path and would incidentally fix or worsen it — they were NOT rolled to this node (0.8.33 predates that ticket's changes per its own handoff), so this bug is independent of and predates T3's fix, but T3's reviewer should check for interaction before landing.")
+/// @yah:next("See R858-T1 (griffin) — the headscale-behind-passway migration is already decided (2026-09-05: dedicated passway-mesh per door, loopback :8444, demux-pinned route) and mostly built/proven on east+south; only blocked on R858-B9 giving west its own co-located door before the DNS cutover. This bug's fork-loop is on the SAME file (leader.rs) as R858-T3 (spade, ownership-election redesign, in review) — read both before touching reconcile_appliance_ownership or the deploy path, since T3's uncommitted changes may already touch this exact function.")
+/// @yah:gotcha("ROOT CAUSE CONFIRMED ON HARDWARE 2026-09-06 by @Ashguard:hydra (R858-T1), with a controlled single-variable experiment — @Ashguard:golem's read-only diagnosis is correct and needs no live re-derivation. METHOD: `sudo systemctl stop yubaba` on us-west-001, changing nothing else. RESULT: kamaji forks went from 68-per-30s to ZERO, and the headscale child — which had never been observed past etime 00:00 — stayed up immediately and bound *:443 and *:80. So the redeploy loop in yubaba is the killer and kamaji's own RestartPolicy::Always supervises the appliance correctly once yubaba stops redeploying it; \"the port never binds\" is a CONSEQUENCE of the loop, not a second failure. THE MESH WAS RESTORED BY THIS ALONE (cloud.mesh.yah.dev went from connection-refused to HTTP 200, and both doors from 503 to 200).")
+/// @yah:gotcha("THIS TICKET IS NOW THE CRITICAL PATH FOR RAFT QUORUM, AND ITS LANDING HAS A MANDATORY LAST STEP. To stop the loop I left us-west-001's yubaba `is-active`=inactive AND `is-enabled`=DISABLED (disabled deliberately: enabled-but-stopped means a reboot silently restarts the thrash and re-breaks the mesh, which is exactly how the \"restored with enable --now\" gotcha on R858 went stale). CONSEQUENCE: the cluster runs at 2/3 quorum — east (node 3) and south (node 1) only, west (node 2) is out — so ANY single voter failure now loses quorum. THE LAST STEP OF LANDING THIS FIX IS `sudo systemctl enable --now yubaba` ON us-west-001; without it the fix buys nothing, because the node it fixes is not running yubaba. ALSO RE-READ YOUR ASSUMPTIONS FIRST: the appliance moved under them. headscale no longer binds 0.0.0.0:443 — it is `listen_addr: 127.0.0.1:8080`, plain HTTP, `tls_letsencrypt_*` deleted, with west's public :443 now owned by passway-demux (-> passway-mesh 127.0.0.1:8444 -> headscale). So no port contention when your fix redeploys. But do NOT POST /headscale/deploy or /headscale/bootstrap at west: those two handlers (lib.rs:5097, :5379) are the only writers of config.yaml and would overwrite the hand-edited file with the 0.0.0.0:443 + Let's Encrypt bootstrap shape, re-creating the outage. A plain yubaba restart is safe — start_headscale does not rewrite config.")
+/// @yah:verify("VERIFIED ON PROD HARDWARE 2026-09-06 by @Ashguard:hydra — this fix works and is NOT what blocks west's return to raft. Method: cross-built a musl yubaba from the tree carrying @Ashguard:golem's fix (`scripts/cross-build-guarded.sh yubaba x86_64-unknown-linux-musl '' containerd-integration oss/yubaba`, sha256 d4b3d16da2b684b36e5eae381cd1a9f8884c10476caa4f6fa6ea9082b0505636, static musl ELF; `cargo test -p yubaba --lib` = 766 passed / 0 failed at that tree), installed it on us-west-001 with the previous 0.8.33 anchored at /usr/local/bin/yubaba.rollback-20260906-hydra (sha 8f9f6dab4ad9536080e64f25c5905b46ffa03e5fa499082a3c9a96470127a9ac), ran `systemctl enable --now yubaba`, observed 45s, then rolled back with `systemctl disable --now yubaba`. Total exposure ~90s; mesh verified healthy after rollback (/key?v=138 = 200, /service-records = 200, 0 forks, appliance stable). RESULT: kamaji forks went from 68-per-30s (pre-fix, measured earlier the same day) to 2 per 45s — roughly a 70x reduction — and the new arms announced themselves exactly as designed: `APPLIANCE CRASH-LOOPING: this node started the appliance and it was gone again before it was ever observed running. NOT starting it a second time on this tick — backing off` followed by `APPLIANCE UNHEALTHY: no eligible candidate can run the appliance` with `refusal: deploy-backoff` on a clean 10s cadence and a ~40s retry. So both halves — the Interval-outside-the-select pacing fix and the withheld-record_success/backoff fix — are confirmed on real hardware against a real 3-node raft cluster, not only in the loopback harness. WHAT STILL TEARS THE APPLIANCE DOWN IS R858-T3's ownership code riding the same binary (a follower elects itself, cannot write SetIngressOwner because it is not the leader, and the is_leader edge then fires on_lost_leader -> stop_headscale 4ms after the deploy) — recorded in full on R858-T3, which is in review and should not be signed off as-is.")
+/// @yah:handoff("TWO INDEPENDENT DEFECTS IN leader.rs::run, both fixed, and the filed hypothesis was a special case of the first rather than the whole of it. (1) THE 10s CLOCK COULD NOT FIRE ON A LEADER. `tokio::time::sleep(RECONCILE_INTERVAL)` was constructed FRESH INSIDE the `select!`, so every openraft-metrics wake cancelled and rebuilt it from zero — and a raft leader republishes metrics on every heartbeat and every replication-progress update. RECONCILE_INTERVAL was not merely late, it was unreachable; reconcile ran at consensus speed. The filed guess (the node's own SetIngressOwner re-triggering the watch) is true but incidental: ANY metrics update did it. FIX: a `tokio::time::Interval` held OUTSIDE the select (its deadline survives cancellation) plus a `reconcile_due` gate, so reconcile runs on the clock plus genuine leadership edges and on nothing else. (2) A CRASH LOOP WAS RECORDED AS A SUCCESS. `on_became_leader` returning Ok means the supervisor ACCEPTED the workload, never that the process is alive; `record_success` on that CLEARS OwnerElection's ledger, so the 30s backoff could never accumulate a single entry. FIX: the ElectTo(self) Ok arm sets `start_awaiting_proof` instead of recording success; success is recorded only where `observe_local_appliance` has actually SEEN the appliance running; and being asked to start an appliance this node started and has never seen running is now a `record_failure` + `APPLIANCE CRASH-LOOPING` error, putting the node on the 30/60/120/240/300s ladder.")
+/// @yah:verify("VERIFIED ON PRODUCTION HARDWARE by @Ashguard:hydra (R858-T1), who cross-built musl from this tree and ran it on us-west-001 for ~90s inside a rollback window: kamaji forks went from 68-per-30s to 2-per-45s, and the backoff announced itself with this ticket's exact log lines (`APPLIANCE CRASH-LOOPING: ... NOT starting it a second time on this tick`, then `APPLIANCE UNHEALTHY: ... refusal: deploy-backoff` on a clean 10s cadence, retrying at ~40s). They had already isolated the cause independently: `systemctl stop yubaba` alone took forks 68-per-30s to 0 and headscale immediately stayed up and bound *:443 and *:80 — so \"the port never binds\" is a CONSEQUENCE of the loop, not a separate failure.")
+/// @yah:verify("TWO HARNESS TESTS, ONE PER DEFECT, EACH FALSIFIED AGAINST ITS OWN — and two tests rather than one because a negative result forced it. `oss/yubaba/crates/yubaba/tests/raft_appliance_ownership.rs`, real 3-node openraft on loopback, one FakeRuntime per node. (a) `the_appliance_reconciler_runs_on_its_own_clock_not_at_raft_heartbeat_rate` — counts `get_workload` calls (one per reconcile pass) on the owner over 12s. PASSES at 1-2. Probe: restore the pre-B13 select (drop the `reconcile_due` gate, rebuild the timer as `sleep` inside the select) -> FAILS at 50 in 12s. (b) `a_crash_looping_appliance_is_retried_on_the_backoff_not_on_every_pass` — a reaper kills the appliance ~10ms after every deploy; asserts the gap to the retry is >= BACKOFF_BASE_SECS. PASSES at ~40s. Probe: restore `election.record_success(node_id)` on the start path -> FAILS at 9.886s, exactly one RECONCILE_INTERVAL. THE NEGATIVE RESULT, recorded because it is the reason for the split: with only (b) present, reintroducing the PACING defect left it GREEN — the backoff bounds deploys whatever the loop rate is — and with only (a) present, reintroducing `record_success` left THAT green. A single test covering both would have been a false green. An earlier rate-bound version of (b) was also discarded as vacuous by measurement: over a 45s window a correct backoff admits 2 redeploys and the broken path admits 4, which no honest bound separates; the GAP separates them exactly.")
+/// @yah:verify("LOCAL SUITES, all after the D2 follow-up landed: `cargo test -p yubaba --lib` = 770 passed / 0 failed (766 before, +4 new `leader::tests`). `cargo test -p yubaba --features testing --test testing -- --test-threads 1` = 28 passed / 0 failed / 1 pre-existing ignored, in 206s. `cargo test -p yubaba --test main -- --test-threads 4` = 64 passed / 0 failed. `cargo test -p kamaji --features testing --lib` = 71 passed / 0 failed. `cargo clippy -p yubaba --features testing --lib --tests` = ZERO findings on leader.rs or raft_appliance_ownership.rs; `cargo clippy -p kamaji --features testing --lib` has one finding on fake.rs:280 (`let first = ...; first` inside `check_fault`) which is PRE-EXISTING and in code this ticket did not touch. rustfmt applied to the three changed files ONLY — `cargo fmt` would have reformatted peers' dirty files. ONE FLAKE, ATTRIBUTED, NOT A REGRESSION: at `--test-threads 2` the `testing` suite failed `a_resurrected_owner_is_fenced_and_cannot_serve` (R858-T7's). It passes alone in 52.6s and passed in the serial full run; it is a 52s wall-clock-sensitive fence test now sharing a loaded machine with this ticket's 41s one. Use `--test-threads 1` for this suite.")
+/// @yah:handoff("A THIRD FIX, DISCOVERED FROM HARDWARE AND MINE TO MAKE — the leadership-edge teardown. @Ashguard:hydra's prod run caught west deploying the appliance at 07:56:49.690 and `on_leadership_loss_under_election` killing it at 07:56:49.696, six milliseconds later. That is a regression THIS TICKET widened, not a pre-existing T3 bug: the predicate kept the appliance if `owner.serving` OR this process's `ApplianceHealth` was `Serving`, and pre-B13 `record_success` fired microseconds after the deploy so the second term always caught it. Withholding that success is exactly what makes the backoff accumulate, so B13 opened a one-reconcile-interval window in which neither term holds. FIX: a third term, `start_awaiting_proof` — an unproven start is not evidence of absence, and stopping on it converts an unproven appliance into a certainly-dead one. The predicate is extracted as `leader::appliance_survives_leadership_loss(owner, node_id, health, start_awaiting_proof)` so it is assertable as arithmetic, with 4 unit tests including a precondition assert that the OLD input shape still returns false — so the test fails if anyone later widens it into \"never stop anything\".")
+/// @yah:handoff("FILES, and the tree anchor is fc754ce6ac4671d4705727df8764ba4e4381aa0d — quote that SHA, never HEAD, in any revert instruction. UNCOMMITTED; verify by CONTENT, not by `git status`. (1) `oss/yubaba/crates/yubaba/src/leader.rs` — grep `reconcile_tick`, `start_awaiting_proof`, `appliance_survives_leadership_loss`. (2) `oss/yubaba/crates/yubaba/tests/raft_appliance_ownership.rs` — appended, grep `a_crash_looping_appliance_is_retried_on_the_backoff`. Already registered via `tests/testing.rs`; no Cargo.toml change needed. (3) `oss/kamaji/crates/kamaji/src/fake.rs` — a DIFFERENT WORKSPACE, easy to miss when reverting: two additive read-only counters on `FakeRuntime`, `deploy_calls()` (attempts, recorded before the fault check) and `get_workload_calls()`, mirroring the existing `graceful_upgrade_calls()`. Both exist because no registry snapshot can show a control loop's RATE — a redeploy of an already-Running workload leaves the snapshot byte-identical, so a hundred deploys a second and a healthy steady state look identical from outside. ALSO IN leader.rs, ON REQUEST AND NOT MINE: `observe_local_appliance`'s arms were split three ways and the two informative ones raised to `warn!` for @Ashguard:hydra's R858-B14. No behaviour change — every arm still returns `None`.")
+/// @yah:gotcha("B13 BOUNDS THE DAMAGE; IT DOES NOT MAKE THE APPLIANCE CONVERGE — do not read \"verified on hardware\" as \"west is fixed\". Two things measured by @Ashguard:hydra on 2026-09-06 remain open and both are outside this ticket. (a) R858-B14: `observe_local_appliance` appears never to return `Some` on the live node, so `start_awaiting_proof` is never discharged and the owner cycles start -> \"gone\" -> record_failure -> backoff -> retry, forever. B13 turns that from ~2.5 forks/second into a 30/60/120/240/300s ladder with a loud `APPLIANCE CRASH-LOOPING` line, which is strictly better and is all this ticket claims. THE HARNESS CANNOT REPRODUCE B14 — its `FakeRuntime` answers `get_workload` correctly — so the green tests here say nothing about it. (b) `/raft/status` members carry NO `machine` key on any of the three voters (measured), so `node_for_machine` returns None and the REMOTE half of `recorded_owner` is dead on the live fleet. That is R858-T3's own `@yah:assumes`, now confirmed rather than suspected; it does not affect a node resolving ITSELF (that path compares the record to this node's own machine name directly), which is why west still took the elect path.")
+/// @yah:gotcha("us-west-001's yubaba is STOPPED AND DISABLED as of 2026-09-06 (@Ashguard:hydra, deliberate — so a reboot cannot restart the thrash), so the raft cluster is at 2/3 with NO margin and any single voter failure now loses quorum. `sudo systemctl enable --now yubaba` on west is the last step of landing this fix and it must not be forgotten. NOTE what changed under this ticket's feet while it was being worked: headscale no longer binds 0.0.0.0:443. It is `listen_addr: 127.0.0.1:8080`, plain HTTP, `tls_letsencrypt_*` removed, with west's public :443 served by passway-demux -> passway-mesh(127.0.0.1:8444) -> headscale, and all three doors now answering /key?v=138 at 200. That config.yaml is HAND-EDITED and live: `start_headscale` does not rewrite it (only the `POST /headscale/deploy` and `/headscale/bootstrap` handlers do, lib.rs:5097 and :5379), so a plain yubaba restart preserves it — but do NOT POST /headscale/deploy at west, that would overwrite it with the 0.0.0.0:443 + Let's Encrypt bootstrap shape and re-break the mesh.")
+/// @yah:assumes("SCOPE, STATED SO NOBODY READS THIS TICKET AS HAVING SETTLED IT: B13 did NOT touch `listen_addr`, `headscale_appliance::appliance_spec`, `demux_routes.rs`, or anything on the ownership/deploy path beyond the two pacing/backoff defects and the teardown regression they created. The 2026-09-06 operator decision that headscale must sit behind passway-demux rather than binding :443 is R858-T1's and R858-T3's, and T1 executed the live half of it while this was in flight. ONE UNVERIFIED THING I DID NOT CHASE, flagged because a redeploy would surface it: if a node ever DOES take the elect path on west now, `backend.deploy_workload(&appliance_spec(...))` declares the workload's ports to kamaji from the SPEC, not from the hand-edited config.yaml — and `headscale_appliance.rs` had an unattributed 2-line uncommitted change in the tree during this pass that I did not author and did not read. Whoever rolls should read those two lines first: a spec still declaring :443 would collide with the demux even though config.yaml says 127.0.0.1:8080.")
+/// @yah:gotcha("THE THING THAT KILLED HEADSCALE EVERY ~450ms IS THE REDEPLOY ITSELF, NOT THE TEARDOWN — verified from code 2026-09-06 across two crates, and it CORRECTS a reading of R858-T1's own hardware trace. (1) `NativeRuntime::deploy_workload` (oss/kamaji/crates/kamaji/src/native.rs, ~:763) opens by calling `self.teardown_workload(&ident)` — SIGTERM, 5s grace, SIGKILL — and only then forks. So every redeploy of an already-running native workload kills the previous child by construction. That is the `native workload forked id=headscale pid=<N>` cadence and the `ps` child stuck at etime 00:00. (2) Meanwhile yubaba's own teardown CANNOT kill it: `leader::stop_headscale` calls `backend.teardown_workload(&ident)`, `KamajiClient::teardown_workload` (oss/kamaji/crates/kamaji/src/sibling.rs:833) is `self.stop(&id)`, and `stop_workload` (oss/kamaji/crates/kamaji-bin/src/server.rs:3488) routes to containerd, tenant-passway, bundle, microvm and docker with NO `ctx.native` arm. It Acks and does nothing. CONSEQUENCE FOR THE 07:56:49.696 LINE in T1's D2 trace: `headscale appliance torn down on leadership loss` is logged on `Ok(())` from that Ack, so the teardown did not kill the appliance — the next redeploy did. The D2 window is real and the fix is right, but on today's fleet a spurious teardown is INERT.")
+/// @yah:gotcha("SEQUENCING CONSTRAINT FOR WHOEVER GIVES kamaji's `stop_workload` ITS MISSING `ctx.native` ARM — that fix is safe WITH B13 and dangerous WITHOUT it, and the order is not obvious from either ticket alone. Today `leader::stop_headscale` Acks and kills nothing on a native-exec appliance, so every spurious teardown path in yubaba is harmless by accident. Give `stop_workload` a native arm and each of those paths starts actually killing the mesh coordinator. B13's D2 fix (`start_awaiting_proof` as a third term in `appliance_survives_leadership_loss`) is the thing that removes the spurious teardown this would arm — it is currently latent-correct rather than load-bearing, and it becomes load-bearing the moment that arm lands. SO: ship the kamaji `Stop` fix only in a binary that also carries B13, and never to a node still running the fleet's 0.8.33 yubaba, which has neither the pacing fix nor D2. This is an argument for landing B13, not against the kamaji fix.")
 async fn reconcile_appliance_ownership(
     node_id: YubabaNodeId,
     view: RaftView,
@@ -572,7 +728,38 @@ async fn reconcile_appliance_ownership(
         return;
     }
 
-    let election = &mut watcher.election;
+    // ── R858-B13, THE DISCHARGE ──────────────────────────────────────────────
+    //
+    // Observing the appliance running on this node is the ONLY thing that turns
+    // a start into a success, and this is where that happens — not in a
+    // `decide_owner` arm. Two reasons it has to be here:
+    //
+    //   * `record_success` clears the backoff ledger, so it must be reachable
+    //     from every arm a healthy just-started appliance can land in, or a
+    //     recovered node stays in backoff it has already earned its way out of.
+    //   * On a node with no machine name nothing writes `ingress_owner`, so the
+    //     *only* thing that can make `owner_status` see an owner at all is this
+    //     process's own `ApplianceHealth`. Withholding the success until some
+    //     later arm records it would leave that node re-electing and
+    //     re-deploying itself on every tick — the bug this ticket is about,
+    //     moved rather than fixed.
+    if running_here.is_some() && watcher.start_awaiting_proof {
+        watcher.start_awaiting_proof = false;
+        watcher.election.record_success(node_id);
+        info!(
+            node_id,
+            "the appliance this node started is now observed running — recording the start as \
+             successful (R858-B13)"
+        );
+    }
+
+    // Destructured rather than `&mut watcher.election`, because the arms below
+    // need both fields at once and one whole-struct borrow would not allow it.
+    let ApplianceWatcher {
+        election,
+        start_awaiting_proof,
+        ..
+    } = watcher;
     let owner = owner_status(recorded, node_id, running_here.is_some(), election.health());
 
     // Only the leader may claim a vacancy; any node may restart what it is
@@ -713,13 +900,58 @@ async fn reconcile_appliance_ownership(
             );
         }
         OwnershipDecision::ElectTo(n) if n == node_id => {
+            // ── R858-B13, THE BRAKE ──────────────────────────────────────────
+            //
+            // Reached when this node started the appliance and the appliance is
+            // gone again without ever having been seen running. That is a crash
+            // loop, and the pre-B13 answer to it was to start it once more —
+            // forever, at whatever rate the loop ticked, with `record_success`
+            // wiping the backoff ledger on each pass so nothing ever slowed
+            // down. Recording it as the failure it is puts this node into
+            // `OwnerElection`'s 30→60→120→240→300 s backoff, which
+            // `judge_appliance_candidate` reads, so the next tick reports
+            // `APPLIANCE UNHEALTHY: no eligible candidate` instead of forking a
+            // process that cannot live.
+            if *start_awaiting_proof {
+                error!(
+                    node_id,
+                    round_exhausted = election.round_exhausted(),
+                    "APPLIANCE CRASH-LOOPING: this node started the appliance and it was gone \
+                     again before it was ever observed running. NOT starting it a second time \
+                     on this tick — backing off instead, so the process is not respawned faster \
+                     than it can bind its ports (R858-B13)"
+                );
+                election.record_failure(
+                    node_id,
+                    now,
+                    "the appliance exited before it was observed running after a successful start",
+                );
+                // Cleared, so the brake is a BACKOFF and not a permanent stop:
+                // the ledger now paces the retries (30 → 60 → 120 → 240 → 300 s)
+                // and the next attempt to survive that backoff must be allowed
+                // to happen. Leaving it armed would convert the first crash into
+                // a coordinator this node never tries to start again.
+                *start_awaiting_proof = false;
+                // Nothing half-started is left behind: the supervisor already
+                // reports it gone, which is how this arm was reached.
+                return;
+            }
             match on_became_leader(node_id, raft, state, machine).await {
                 Ok(()) => {
+                    // NOT `record_success` — deliberately, and this is the whole
+                    // of R858-B13's second half. `on_became_leader` returning
+                    // `Ok` means the supervisor accepted the workload, not that
+                    // the process is alive; a success recorded here clears the
+                    // backoff ledger and makes a crash loop indistinguishable
+                    // from a healthy appliance. The success is recorded on the
+                    // `OwnerServing` arm above, once the appliance has actually
+                    // been observed running.
+                    *start_awaiting_proof = true;
                     info!(
                         node_id,
-                        "elected appliance owner and the appliance is serving"
+                        "elected appliance owner and started the appliance — success is recorded \
+                         once it is observed running (R858-B13)"
                     );
-                    election.record_success(node_id);
                 }
                 Err(e) => {
                     // LOUD, and it claims nothing. The 37-hour version of this
@@ -791,20 +1023,6 @@ async fn reconcile_appliance_ownership(
     }
 }
 
-/// This node's own [`NodeEligibility`], for the single-node candidate set above.
-///
-/// A node executing this line is live by construction — it is the raft leader,
-/// it is running, and its own raft peer link is trivially healthy — so those two
-/// gates are asserted rather than measured. `admits` is `true` because the
-/// appliance is a [`LifecycleArchetype::Appliance`]: pinned and non-drainable,
-/// so it is not subject to the tenant headroom bin-packing `admits` exists for
-/// (R858-T3 change 4 — no priority class is needed to express that).
-///
-/// The gates that *are* measured for this node are the appliance-specific ones
-/// [`judge_appliance_candidate`] adds: native-exec capability and deploy-failure
-/// backoff.
-///
-/// [`LifecycleArchetype::Appliance`]: workload_spec::LifecycleArchetype::Appliance
 /// Ask this node whether it can actually run the appliance (R858-T4).
 ///
 /// Two facts, both of which were false on us-south-001 on 2026-09-03 and
@@ -832,16 +1050,51 @@ async fn reconcile_appliance_ownership(
 /// during a rolling upgrade that is *most* of the fleet. Only a kamaji that
 /// answers, and answers no, produces `Absent`.
 async fn probe_native_exec(state: &Arc<ServerState>) -> NativeExecCapability {
-    let Some(client) = state
-        .constable_client
-        .as_ref()
-        .and_then(KamajiSibling::current)
-    else {
+    probe_native_exec_with(
+        state
+            .constable_client
+            .as_ref()
+            .and_then(KamajiSibling::current)
+            .map(|client| async move { client.capabilities().await }),
+        &[
+            headscale_appliance::binary_path(&state.headscale_dir),
+            headscale_appliance::config_path(&state.headscale_dir),
+        ],
+    )
+    .await
+}
+
+/// [`probe_native_exec`] with its two host dependencies passed in.
+///
+/// `ask` is `None` when there is no sibling to ask — the in-process-runtime
+/// fallback — and `Some(future)` otherwise. It is deliberately *not* flattened
+/// to an `Option<NodeCapabilities>` by the caller: "there was nobody to ask" and
+/// "the one we asked did not answer" reach the same verdict for different
+/// reasons, and collapsing them upstream would leave this function unable to say
+/// which happened and a test unable to tell the two branches apart.
+///
+/// `argv_paths` are the host paths the deploy's own argv names — the binary and
+/// the config file — threaded from [`headscale_appliance::binary_path`] and
+/// [`headscale_appliance::config_path`] rather than re-derived, so a probe can
+/// never bless a node for a layout the spec would not run. Every one of them
+/// must exist: `headscale serve --config <missing>` exits immediately into
+/// [`RestartPolicy::Always`], which turns "this node cannot serve" from a
+/// refusal placement can act on into a crash loop that looks like a deploy.
+///
+/// [`RestartPolicy::Always`]: workload_spec::RestartPolicy::Always
+async fn probe_native_exec_with<F>(
+    ask: Option<F>,
+    argv_paths: &[std::path::PathBuf],
+) -> NativeExecCapability
+where
+    F: std::future::Future<Output = Result<NodeCapabilities, ClientError>>,
+{
+    let Some(ask) = ask else {
         debug!("no kamaji sibling to ask about native-exec — capability stays Unknown");
         return NativeExecCapability::Unknown;
     };
 
-    let caps = match client.capabilities().await {
+    let caps = match ask.await {
         Ok(caps) => caps,
         Err(e) => {
             // Deliberately not `warn!`: against a pre-R858-T4 kamaji this is the
@@ -854,21 +1107,33 @@ async fn probe_native_exec(state: &Arc<ServerState>) -> NativeExecCapability {
     };
 
     if !caps.native_exec {
+        // The remedy names a DROP-IN, not a roll, because that is what was
+        // measured. On 2026-09-06 us-south-001 was already running published
+        // 0.8.33 — the shipped `kamaji.service` has carried `--native-exec-dir`
+        // all along — and still reported `native_exec: false`, because
+        // `/etc/systemd/system/kamaji.service.d/20-bundle.conf` (R599-T5, dated
+        // 2026-07-21) resets `ExecStart=` and re-declares the whole command
+        // line, freezing the flag set as it stood before the flag existed.
+        // Rolling the node reinstalls the base unit and changes nothing.
         error!(
-            "this node's kamaji has no native backend (start it with --native-exec-dir): it \
-             cannot run the appliance and is refusing candidacy UP FRONT rather than failing \
-             the deploy after ownership has moved"
+            "this node's kamaji has no native backend: it cannot run the appliance and is \
+             refusing candidacy UP FRONT rather than failing the deploy after ownership has \
+             moved. `systemctl cat kamaji.service` and look for a drop-in that resets \
+             `ExecStart=` — one that predates `--native-exec-dir` silently drops it, and \
+             rolling the node will NOT fix that. Set the drop-in's extra options through \
+             `Environment=KAMAJI_BUNDLE_CACHE_DIR=`/`KAMAJI_BUNDLE_ORIGIN=` instead of \
+             re-declaring ExecStart, so the shipped unit stays the one source of the flag set"
         );
         return NativeExecCapability::Absent;
     }
 
-    let binary = state.headscale_dir.join("headscale");
-    if !binary.exists() {
+    if let Some(missing) = argv_paths.iter().find(|p| !p.exists()) {
         error!(
-            binary = %binary.display(),
+            missing = %missing.display(),
             native_exec_dir = caps.native_exec_dir.as_deref().unwrap_or("<unreported>"),
-            "this node's kamaji can fork native workloads but the appliance binary is not on \
-             disk: a native workload pulls nothing, so this node would refuse the deploy"
+            "this node's kamaji can fork native workloads but a path the appliance's own argv \
+             names is not on disk: a native workload pulls nothing, so forking it here would \
+             exit immediately and crash-loop rather than serve"
         );
         return NativeExecCapability::Absent;
     }
@@ -938,16 +1203,59 @@ pub(crate) async fn observe_local_appliance(
 ) -> Option<kamaji::WorkloadState> {
     let backend = state.active_backend()?;
     let ident = headscale_appliance::appliance_ident();
+    // R858-B14: both negative arms speak at `warn!`, and they say WHICH negative
+    // they are. This probe answering `None` forever is indistinguishable, from
+    // every caller, from an appliance that is genuinely down — so the node goes
+    // on re-electing and re-starting a coordinator that is already serving, and
+    // at `debug!` the fleet's log level hides the one line that would say why.
+    // R858-B13's backoff bounds how fast that happens; only this line says what
+    // it is.
     match backend.get_workload(&ident).await {
         Ok(Some(w)) if matches!(w.status, kamaji::WorkloadStatus::Running) => Some(w),
-        Ok(_) => None,
+        Ok(Some(w)) => {
+            warn!(
+                ident = %ident.0,
+                status = ?w.status,
+                "the supervisor knows the appliance but does not report it Running — treating it \
+                 as not running here"
+            );
+            None
+        }
+        Ok(None) => {
+            debug!(
+                ident = %ident.0,
+                "the supervisor has no workload under this identity — the appliance is not \
+                 placed here"
+            );
+            None
+        }
         Err(e) => {
-            debug!("could not ask the supervisor about the appliance ({e:#}) — treating it as not running here");
+            warn!(
+                ident = %ident.0,
+                "could not ask the supervisor about the appliance ({e:#}) — treating it as not \
+                 running here, which will make this node re-elect and re-start an appliance that \
+                 may already be serving (R858-B14)"
+            );
             None
         }
     }
 }
 
+/// This node's own [`NodeEligibility`], for the single-node candidate set in
+/// [`reconcile_appliance_ownership`].
+///
+/// A node executing this line is live by construction — it is the raft leader,
+/// it is running, and its own raft peer link is trivially healthy — so those two
+/// gates are asserted rather than measured. `admits` is `true` because the
+/// appliance is a [`LifecycleArchetype::Appliance`]: pinned and non-drainable,
+/// so it is not subject to the tenant headroom bin-packing `admits` exists for
+/// (R858-T3 change 4 — no priority class is needed to express that).
+///
+/// The gates that *are* measured for this node are the appliance-specific ones
+/// [`judge_appliance_candidate`] adds: native-exec capability
+/// ([`probe_native_exec`]) and deploy-failure backoff.
+///
+/// [`LifecycleArchetype::Appliance`]: workload_spec::LifecycleArchetype::Appliance
 fn self_eligibility() -> NodeEligibility {
     NodeEligibility {
         liveness: Some(Confirmed::Up),
@@ -1127,6 +1435,29 @@ async fn start_headscale(state: &Arc<ServerState>) -> Result<(), ApplianceStartE
         // now propagates instead of vanishing, so no claim is written on top of
         // a coordinator that would come up with the wrong identity.
         return Err(ApplianceStartError::NoiseIdentity(e.to_string()));
+    }
+
+    // R858-T16: the THIRD hydration step, beside the litestream DB restore in
+    // `on_became_leader` and the noise key above. The appliance's argv names two
+    // paths and only the binary was ever placed outside the promote handlers, so
+    // a node that was never hand-promoted forked `headscale serve --config
+    // <missing>` and crash-looped under `RestartPolicy::Always`.
+    //
+    // WRITE ONLY IF ABSENT, and see `hydrate_config`'s doc for why that is not
+    // timidity: us-west-001's live config.yaml is hand-edited, this function
+    // runs on every leadership acquisition, and an unconditional render would
+    // re-decapitate the mesh on the next restart.
+    //
+    // A write failure is logged, not raised. The node simply stays without a
+    // config, and `probe_native_exec` already refuses to place the appliance
+    // there — the refusal exists and does not need a second spelling.
+    match headscale_state::hydrate_config(&state.headscale_dir, state.headscale_url.as_deref()) {
+        Ok(outcome) => debug!(?outcome, "headscale config.yaml hydration"),
+        Err(e) => error!(
+            dir = %state.headscale_dir.display(),
+            "could not hydrate headscale config.yaml ({e}) — this node cannot host the appliance \
+             until one is placed"
+        ),
     }
 
     // Carried to the error so the operator gets *both* refusals in one line.
@@ -1332,4 +1663,281 @@ pub fn derive_machine_name() -> Option<String> {
         }
     }
     std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SELF: YubabaNodeId = 2;
+    const OTHER: YubabaNodeId = 1;
+
+    /// The regression R858-B13 introduced into R858-T3's teardown and then
+    /// closed, measured on us-west-001 before it was closed.
+    ///
+    /// The node has just started the appliance. The supervisor has not yet
+    /// flipped the workload to `Running` (six milliseconds had passed on the
+    /// live box), so `owner.serving` is false. `ApplianceHealth` is deliberately
+    /// **not** `Serving` either — withholding that until the appliance is
+    /// observed running is what makes the crash-loop backoff accumulate at all.
+    /// Both of the pre-B13 reasons to keep the appliance are therefore absent,
+    /// and without the third the leadership edge stops a coordinator this node
+    /// started six milliseconds ago.
+    #[test]
+    fn a_just_started_appliance_is_not_torn_down_by_a_leadership_change() {
+        let owner = Some(OwnerStatus {
+            node: SELF,
+            serving: false,
+        });
+        assert!(
+            !appliance_survives_leadership_loss(owner, SELF, &ApplianceHealth::Vacant, false),
+            "precondition: without the unproven-start term this is exactly the input that tore \
+             the appliance down on us-west-001 — if this now returns true the test is asserting \
+             nothing"
+        );
+        assert!(
+            appliance_survives_leadership_loss(owner, SELF, &ApplianceHealth::Vacant, true),
+            "a node that started the appliance and has not yet been able to judge it must not \
+             stop it for a leadership change — an unproven start is not evidence of absence \
+             (R858-B13)"
+        );
+    }
+
+    /// The unproven-start term must not become a blanket "never stop anything".
+    /// A node with nothing started and nothing recorded still cleans up on the
+    /// edge, which is the whole reason the teardown is edge-shaped.
+    #[test]
+    fn a_node_with_no_appliance_still_tears_down_on_leadership_loss() {
+        assert!(!appliance_survives_leadership_loss(
+            None,
+            SELF,
+            &ApplianceHealth::Vacant,
+            false
+        ));
+    }
+
+    /// R858-T3's own rule, re-asserted here because B13 rewrote the expression
+    /// that carries it: a serving owner keeps serving through a leadership
+    /// transfer. This is the 2026-09-03 outage in one line.
+    #[test]
+    fn a_serving_owner_keeps_the_appliance_through_a_leadership_transfer() {
+        let owner = Some(OwnerStatus {
+            node: SELF,
+            serving: true,
+        });
+        assert!(appliance_survives_leadership_loss(
+            owner,
+            SELF,
+            &ApplianceHealth::Vacant,
+            false
+        ));
+    }
+
+    /// And it is scoped to THIS node. A record naming someone else, over a local
+    /// process with no appliance of its own, is not a reason for this node to
+    /// keep anything — that direction is the fence's, not the teardown's.
+    #[test]
+    fn a_record_naming_another_node_does_not_keep_an_appliance_here() {
+        let owner = Some(OwnerStatus {
+            node: OTHER,
+            serving: true,
+        });
+        assert!(!appliance_survives_leadership_loss(
+            owner,
+            SELF,
+            &ApplianceHealth::Vacant,
+            false
+        ));
+    }
+
+    // ── R858-T4: probe_native_exec ───────────────────────────────────────────
+    //
+    // Both `Unknown` branches are asserted SEPARATELY and on purpose. They are
+    // one verdict reached two ways, and the permissive reading is the whole
+    // safety property here: an `Absent` returned for either would make every
+    // node that cannot be asked ineligible, which mid-roll is most of the fleet
+    // and is the 2026-09-03 outage reproduced from the other side.
+
+    /// The type annotation the `None` arm needs — never awaited.
+    type NeverAsked = std::future::Ready<Result<NodeCapabilities, ClientError>>;
+
+    fn caps(native_exec: bool) -> NodeCapabilities {
+        NodeCapabilities {
+            native_exec,
+            native_exec_dir: Some("/var/lib/yah/kamaji/native".into()),
+        }
+    }
+
+    /// The argv paths as the probe threads them, over a scratch `headscale_dir`.
+    fn argv_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        vec![
+            headscale_appliance::binary_path(dir),
+            headscale_appliance::config_path(dir),
+        ]
+    }
+
+    /// A node with every argv path on disk — the fully-provisioned case.
+    fn provisioned() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for p in argv_paths(dir.path()) {
+            std::fs::write(&p, b"#!/bin/true\n").unwrap();
+        }
+        dir
+    }
+
+    /// The in-process-runtime fallback: nobody to ask. Not knowing is not a
+    /// refusal.
+    #[tokio::test]
+    async fn no_kamaji_sibling_leaves_the_capability_unknown() {
+        let dir = provisioned();
+        assert_eq!(
+            probe_native_exec_with(None::<NeverAsked>, &argv_paths(dir.path())).await,
+            NativeExecCapability::Unknown,
+        );
+    }
+
+    /// A kamaji that predates the `Capabilities` variant fails the frame, and a
+    /// transient socket error looks the same from here. Neither is evidence
+    /// about the backend.
+    #[tokio::test]
+    async fn a_kamaji_that_does_not_answer_leaves_the_capability_unknown() {
+        let dir = provisioned();
+        let ask = std::future::ready(Err(ClientError::Unexpected("Ack { .. }".into())));
+        assert_eq!(
+            probe_native_exec_with(Some(ask), &argv_paths(dir.path())).await,
+            NativeExecCapability::Unknown,
+        );
+    }
+
+    /// us-south-001 on 2026-09-03: kamaji started without `--native-exec-dir`.
+    /// Only a kamaji that answers, and answers no, produces `Absent` — and this
+    /// is the one refusal that has to happen BEFORE ownership moves. Every argv
+    /// path is present, so the verdict can only come from the backend answer.
+    #[tokio::test]
+    async fn a_kamaji_with_no_native_backend_is_absent() {
+        let dir = provisioned();
+        let ask = std::future::ready(Ok(caps(false)));
+        assert_eq!(
+            probe_native_exec_with(Some(ask), &argv_paths(dir.path())).await,
+            NativeExecCapability::Absent,
+        );
+    }
+
+    /// The other half of the same measured gap: south had no binary either. A
+    /// native workload pulls nothing, so the flag without the executable refuses
+    /// the deploy just as hard.
+    #[tokio::test]
+    async fn a_capable_kamaji_with_no_appliance_binary_is_absent() {
+        let dir = provisioned();
+        std::fs::remove_file(headscale_appliance::binary_path(dir.path())).unwrap();
+        let ask = std::future::ready(Ok(caps(true)));
+        assert_eq!(
+            probe_native_exec_with(Some(ask), &argv_paths(dir.path())).await,
+            NativeExecCapability::Absent,
+        );
+    }
+
+    /// us-south-001 and us-east-001 as of 2026-09-06, after this pass placed the
+    /// binary on both: kamaji capable, binary present, and STILL not a candidate
+    /// — nothing in the leader path writes `config.yaml` (R858-B9: only
+    /// `POST /headscale/deploy`/`/bootstrap` do), so a node that was never
+    /// promoted has one argv path and not the other. Forking there exits
+    /// immediately and crash-loops under `RestartPolicy::Always`, which is why
+    /// this must be a refusal and not a `Present`.
+    #[tokio::test]
+    async fn a_node_with_the_binary_but_no_config_is_absent() {
+        let dir = provisioned();
+        std::fs::remove_file(headscale_appliance::config_path(dir.path())).unwrap();
+        let ask = std::future::ready(Ok(caps(true)));
+        assert_eq!(
+            probe_native_exec_with(Some(ask), &argv_paths(dir.path())).await,
+            NativeExecCapability::Absent,
+        );
+    }
+
+    // ── R858-T16: config.yaml hydration ─────────────────────────────────────
+
+    /// The coordinator URL a fleet node carries in `YUBABA_HEADSCALE_URL`.
+    const COORDINATOR_URL: &str = "https://cloud.mesh.yah.dev";
+
+    /// The positive twin of `a_node_with_the_binary_but_no_config_is_absent`:
+    /// us-south-001 as of 2026-09-06 — kamaji capable, binary present, noise key
+    /// materialized, config absent — becomes a candidate once
+    /// `start_headscale`'s third hydration step has run. This is the whole
+    /// ticket: the refusal was correct and the missing argv path is now placed
+    /// by the leader path instead of only by the promote handlers.
+    #[tokio::test]
+    async fn a_node_whose_config_was_hydrated_becomes_a_candidate() {
+        let dir = provisioned();
+        std::fs::remove_file(headscale_appliance::config_path(dir.path())).unwrap();
+        let ask = std::future::ready(Ok(caps(true)));
+        assert_eq!(
+            probe_native_exec_with(Some(ask), &argv_paths(dir.path())).await,
+            NativeExecCapability::Absent,
+            "precondition: without the config this node is refused"
+        );
+
+        assert_eq!(
+            headscale_state::hydrate_config(dir.path(), Some(COORDINATOR_URL)).unwrap(),
+            headscale_state::ApplianceConfig::Rendered,
+        );
+
+        let ask = std::future::ready(Ok(caps(true)));
+        assert_eq!(
+            probe_native_exec_with(Some(ask), &argv_paths(dir.path())).await,
+            NativeExecCapability::Present,
+        );
+    }
+
+    /// And hydration NEVER clobbers a config that is already there. us-west-001's
+    /// live `config.yaml` is hand-edited (R858-B9's loopback cutover), and
+    /// `start_headscale` runs on every leadership acquisition — so an
+    /// unconditional render would overwrite it on the next yubaba restart and
+    /// reproduce the 2026-09-03 decapitation through a different door. Drift is
+    /// reported, not corrected.
+    #[test]
+    fn hydration_leaves_an_existing_config_exactly_as_it_found_it() {
+        let dir = provisioned();
+        let path = headscale_appliance::config_path(dir.path());
+        let hand_edited = "# hand-edited on the live coordinator\nlisten_addr: 127.0.0.1:8080\n";
+        std::fs::write(&path, hand_edited).unwrap();
+
+        assert_eq!(
+            headscale_state::hydrate_config(dir.path(), Some(COORDINATOR_URL)).unwrap(),
+            headscale_state::ApplianceConfig::KeptWithDrift,
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), hand_edited);
+    }
+
+    /// Every fact true is the only way to `Present`, which is what makes
+    /// `Present` worth acting on.
+    #[tokio::test]
+    async fn a_capable_fully_provisioned_node_is_present() {
+        let dir = provisioned();
+        let ask = std::future::ready(Ok(caps(true)));
+        assert_eq!(
+            probe_native_exec_with(Some(ask), &argv_paths(dir.path())).await,
+            NativeExecCapability::Present,
+        );
+    }
+
+    /// The probe must ask about the paths the deploy would actually use. Both
+    /// sides come from [`headscale_appliance`]'s two exported helpers; this pins
+    /// that the spec's argv still names exactly those, so a future layout change
+    /// breaks a test rather than blessing a node the spec would crash on.
+    #[test]
+    fn the_probed_paths_are_the_ones_the_spec_names() {
+        let dir = std::path::PathBuf::from("/var/lib/yah-cloud/headscale");
+        let spec = headscale_appliance::appliance_spec(&dir);
+        let argv = spec.command.clone().unwrap_or_default();
+        for probed in argv_paths(&dir) {
+            let probed = probed.to_string_lossy().into_owned();
+            assert!(
+                argv.contains(&probed),
+                "placement checks {probed} for existence, but the deploy's argv is {argv:?} — a \
+                 probe that gates on a path the spec does not use is a placement lie in either \
+                 direction"
+            );
+        }
+    }
 }

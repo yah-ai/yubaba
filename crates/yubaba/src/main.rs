@@ -723,6 +723,18 @@ async fn main() -> Result<()> {
                 server_state = server_state.with_litestream_s3_url(s3_url);
             }
 
+            // R858-T16: the coordinator's public base URL. Two readers, one
+            // fact: the operator-bridge preauth path already used it, and
+            // `headscale_state::hydrate_config` now renders `config.yaml`'s
+            // `server_url` from it. Env rather than a flag for the same reason
+            // `YUBABA_LITESTREAM_S3_URL` is — see `yubaba::HEADSCALE_URL_ENV`.
+            // Unset leaves both readers exactly as they were.
+            if let Ok(url) = std::env::var(yubaba::HEADSCALE_URL_ENV) {
+                if !url.trim().is_empty() {
+                    server_state = server_state.with_headscale_url(url.trim());
+                }
+            }
+
             // R852-F2: what `GET /domains/{d}/onboarding` reports to a tenant.
             // Resolved here, once, rather than per request — the handler must
             // be a pure function of node config so it is testable and so two

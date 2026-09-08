@@ -38,6 +38,7 @@ mod raft_membership_loop;
 mod raft_pre_vote;
 mod raft_promote_voter;
 mod raft_quorum_geography;
+mod raft_rebuild_fencing;
 mod raft_sovereign_group;
 mod raft_tenant_placement;
 mod raft_transfer_leader;

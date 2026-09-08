@@ -67,14 +67,23 @@
 //!   `IfMatch`.
 //!
 //! @yah:ticket(R870-F1, "The :80 tier is single-tenant: build the HTTP Host-router that renders off Enrollment::http_backend")
-//! @yah:at(2026-09-05T20:31:19Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-09-06T07:26:06Z)
 //! @yah:phase(P1)
 //! @yah:parent(R870)
 //! @yah:next("THE GAP, verified in source not inherited from the doc. cert_store.rs render_demux_routes renders ONLY tls_backend, and its own doc comment states the intended shape: \"When an HTTP tier lands it gets its own render off Enrollment::http_backend rather than a second column here — the demux parser takes host=addr, and widening that format would break every existing PASSWAY_DEMUX_ROUTES string.\" Enrollment::http_backend exists (cert_store.rs:357), is settable via with_http_backend, is carried through domain_admin.rs:487-494 and surfaced in yubaba main.rs:1429 JSON — and NOTHING routes on it. Grep is conclusive: every http_backend hit is a carrier, none is a consumer.")
 //! @yah:next("THE CONSEQUENCE, which is why this is P1 and not cleanup: passway owns 0.0.0.0:80 DIRECTLY on each origin for the 308 redirect (PASSWAY_HTTP_REDIRECT_BIND, added on south by R853-T2), and the SNI demux only speaks TLS. So :80 has no fan-in tier at all. Tenant #2 — noisetable.com is the live case — gets no scheme-less redirect: every `curl noisetable.com/install.sh` and every scheme-less URL it documents is refused, while the identical yah.dev command works. https:// is unaffected.")
 //! @yah:next("DO NOT ADD A TLS LIBRARY OR A BUCKET CLIENT TO THE :443 DEMUX WHILE DOING THIS. The R777 invariant is that the demux holds no key and sees no plaintext; W267 §\"custom domains validate by DNS-01\" also records that keeping a SECOND protocol off the edge was the reason DNS-01 CNAME delegation was chosen over HTTP-01. An :80 router is a separate process with its own route render — it parses HTTP, so it must not share the :443 binary.")
 //! @arch:see(.yah/docs/working/W267-sovereign-public-ingress.md)
+//! @yah:handoff("BUILT AND GREEN: passway-http-router, a new crate in the passway workspace (oss/passway/crates/http-router, lib http_router, bin passway-http-router), plus the yubaba render + publish rail that feeds it. A SEPARATE PROCESS from the :443 demux, per the ticket's own constraint — it parses HTTP, the demux must not. No TLS library, no HTTP library, no credential: tokio + log only. head.rs reads request-line + Host bounded at 8 KiB; route.rs is HostTable over Disposition::{Redirect, Proxy(addr)} with the demux's exact match precedence (exact / one-label wildcard / typed catch-all, fail-closed); redirect.rs builds the 308 with strict Host validation; router.rs is accept -> read -> route -> answer-or-splice; routes_file.rs is the same never-make-the-table-worse reload policy.")
+//! @yah:handoff("THE DESIGN DECISION THAT MAKES A SECOND APEX FREE: a domain with NO http_backend renders as `<domain>=redirect`, not as an omission (cert_store::http_route_entries). Omitting it would have left every tenant but the first refused on :80 — the exact gap this ticket exists to close. So enrolling noisetable.com now makes `curl noisetable.com/install.sh` work with zero per-tenant :80 config; an http_backend is the EXCEPTION, for a tenant validating by http-01 rather than W267's DNS-01 CNAME delegation, and its requests are spliced to that address instead.")
+//! @yah:handoff("YUBABA SIDE — ONE LISTING, TWO RENDERS. cert_store gains http_route_entries / render_http_routes / HTTP_REDIRECT_TOKEN beside the tls pair, and render_demux_routes' stale 'when an HTTP tier lands' doc comment now points at them. demux_routes gains YUBABA_HTTP_ROUTES_FILE (HTTP_ROUTES_FILE_ENV) and publish_sweep(store, cfg) -> Sweep{tls, http}, which lists the enrollment set ONCE and renders both files; publish_once keeps its old signature (all 12 existing call sites untouched) and publish_http_once is its :80 twin. The fail-stale rules bind both files identically: an empty enrollment set writes neither. Pins stay :443-only and are tested not to leak onto :80 — they exist for fleet TLS hostnames that nothing dials over plaintext.")
+//! @yah:handoff("DISCOVERED WORK, DONE IN PASS — the router would otherwise have been undeployable. (1) Release + roll rail: added passway-http-router to scripts/publish-yubaba-release.sh (cross-build, staging copy, tarball layout gate), scripts/roll-node.sh (snapshot, expected-sha, before/after content gates) and oss/yah-base/crates/workload-spec/src/control_plane_install.sh (anchor, conditional install, content assert). Gated on ITS OWN tarball member, not on HAS_PASSWAY: it joins at 0.8.34, one release after the passway pair R870-B2 added, so rolling a 0.8.33 tarball must still succeed. (2) Deployment contract: app/yah/cli/resources/passway-http-router.{service,env}, beside passway-mesh.* and for the same reason — nothing generates them, so the file IS the contract.")
+//! @yah:verify("cargo test --manifest-path oss/passway/Cargo.toml (whole workspace, so the :443 demux is proven unbroken) = 291 passed / 0 failed across all targets; of those the new crate is 25 unit + 9 integration. The integration suite (crates/http-router/tests/fanin.rs) asserts the byte-exact head replay to the right backend, a body arriving in the same segment being replayed too, a fragmented head reassembled, 308 with Location for the exact and wildcard cases, 404-never-a-redirect for an unrouted Host, silent close on a TLS ClientHello aimed at :80, cut-off at the read deadline, and close on a dead backend. cargo clippy -p passway-http-router --all-targets: zero warnings. cargo fmt --check on the crate: clean.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib = 766 passed / 0 failed (was 745 at this tree; +21 covering the :80 render and the two-tier sweep). cargo test --manifest-path oss/yah-base/crates/workload-spec/Cargo.toml --lib control_plane_install = 11 passed, including the new gate that the :80 tier rides its own conditional. cargo test -p yah --test main camp_systemd_unit_emit = 9 passed, including the new template test. rustfmt --check on the four Rust files edited outside the new crate: every hunk in code I authored hand-applied; the remainder is PRE-EXISTING drift in cert_store.rs (26 sites), demux_routes.rs (2) and control_plane_install.rs (4), left alone rather than reformatting files this ticket does not own. bash -n on both scripts.")
+//! @yah:gotcha("THE CUT-OVER IS NOT FREE AND NOTHING LIVE WAS TOUCHED. Both origins hold :80 from INSIDE a passway today — /etc/passway.env (south) and /etc/passway-test.env (east) set PASSWAY_HTTP_REDIRECT_BIND=0.0.0.0:80, added by R853-T2. Two processes cannot bind one port, so this router CANNOT START until that line is gone and that passway has restarted, and a passway restart drops in-flight :443 connections (passway cannot hot-swap — tls.rs 'The reload gap'). Order per door: remove the line -> restart that passway (take the blip, OR wait for R870-T3's PASSWAY_UPGRADE handoff, which is exactly what makes that restart free) -> systemctl enable --now passway-http-router -> prove `curl -sI http://<host>/install.sh` is 308 for every enrolled name. The full sequence is written into app/yah/cli/resources/passway-http-router.env.")
+//! @yah:gotcha("TWO THINGS I CHOSE THAT A REVIEWER SHOULD AGREE WITH RATHER THAN DISCOVER. (1) A CONNECTION IS ROUTED BY ITS FIRST REQUEST and never re-examined — HTTP/1.1 lets a client reuse a socket for a different Host, so a pipelined follow-up can reach the first request's backend. Every response this process writes itself carries `Connection: close`, so the redirect leg (every enrolled domain by default) never invites a second request; the proxy leg's backend is an http-01 responder that 404s everything but one challenge path, so a misdirected follow-up gets a wrong answer, not another tenant's data. Re-parsing every request means buffering and re-emitting bodies on the shared plaintext tier — a much larger surface than the one it closes. Same trade haproxy makes in mode tcp. Documented at router.rs 'One connection, one host'. (2) redirect.rs DUPLICATES passway::redirect's Host validation rather than sharing it, because passway links pingora/rustls/an ACME client and this tier links tokio; sharing would either drag pingora onto :80 or put a third crate between passway and crates.io. Both sides carry the same tests and a cross-reference note.")
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -394,10 +403,10 @@ impl Enrollment {
 /// so an operator diffing two routes files sees only what actually changed.
 ///
 /// Only `tls_backend` is rendered: the demux is the `:443` tier and its table
-/// has one backend per host. When an HTTP tier lands it gets its own render off
-/// [`Enrollment::http_backend`] rather than a second column here — the demux's
-/// parser takes `host=addr`, and widening that format would break every existing
-/// `PASSWAY_DEMUX_ROUTES` string.
+/// has one backend per host. The `:80` tier gets its own render off
+/// [`Enrollment::http_backend`] ([`render_http_routes`], R870-F1) rather than a
+/// second column here — the demux's parser takes `host=addr`, and widening that
+/// format would break every existing `PASSWAY_DEMUX_ROUTES` string.
 pub fn render_demux_routes<'a>(
     enrolled: impl IntoIterator<Item = (&'a str, &'a Enrollment)>,
 ) -> String {
@@ -416,6 +425,53 @@ pub fn route_entries<'a>(
     let mut entries: Vec<String> = enrolled
         .into_iter()
         .map(|(domain, e)| format!("{domain}={}", e.tls_backend))
+        .collect();
+    entries.sort();
+    entries.dedup();
+    entries
+}
+
+/// The token `passway-http-router` reads as "answer the `308` yourself".
+///
+/// Kept next to the render that emits it, because the two ends of this string
+/// are in different Cargo workspaces and nothing else holds them to one
+/// spelling — same reason [`render_demux_routes`]'s tests assert the demux's
+/// `host=addr` shape here.
+pub const HTTP_REDIRECT_TOKEN: &str = "redirect";
+
+/// Render `PASSWAY_HTTP_ROUTER_ROUTES` from an enrollment set (R870-F1).
+///
+/// The `:80` twin of [`render_demux_routes`], with the same determinism and
+/// the same `host=` grammar, over [`Enrollment::http_backend`].
+pub fn render_http_routes<'a>(
+    enrolled: impl IntoIterator<Item = (&'a str, &'a Enrollment)>,
+) -> String {
+    http_route_entries(enrolled).join(",")
+}
+
+/// The `host=disposition` entries [`render_http_routes`] joins, sorted and
+/// deduped. Newline-joined for the routes *file*, comma-joined for the env var.
+///
+/// **A domain with no `http_backend` renders as
+/// `<domain>=`[`HTTP_REDIRECT_TOKEN`], not as an omission.** That is the whole
+/// point of the tier: enrolling a second apex makes scheme-less
+/// `curl example.com/install.sh` work — the router answers `308 https://…`
+/// itself — with no per-tenant `:80` process to run and nothing else to
+/// configure. Omitting it instead would leave every tenant but the first with a
+/// refused connection on port 80, which is the gap R870-F1 exists to close.
+///
+/// An `http_backend` is therefore the *exception*: a tenant that needs its own
+/// plaintext listener, which today means one validating by `http-01` rather
+/// than by W267's DNS-01 CNAME delegation.
+pub fn http_route_entries<'a>(
+    enrolled: impl IntoIterator<Item = (&'a str, &'a Enrollment)>,
+) -> Vec<String> {
+    let mut entries: Vec<String> = enrolled
+        .into_iter()
+        .map(|(domain, e)| match e.http_backend {
+            Some(addr) => format!("{domain}={addr}"),
+            None => format!("{domain}={HTTP_REDIRECT_TOKEN}"),
+        })
         .collect();
     entries.sort();
     entries.dedup();
@@ -1386,5 +1442,39 @@ mod tests {
             addr.parse::<SocketAddr>().expect("backend parses as a SocketAddr");
         }
         assert_eq!(render_demux_routes(std::iter::empty()), "");
+    }
+
+    #[test]
+    fn a_domain_with_no_http_backend_still_gets_a_port_80_route() {
+        // R870-F1: the gap this closes. Without the `redirect` default, a
+        // second apex is enrolled, routable on :443, and refuses every
+        // scheme-less `curl example.com/install.sh` — which is how the
+        // documented install path is written.
+        let set = [
+            ("b.example.com".to_string(), enrollment(8444)),
+            (
+                "a.example.com".to_string(),
+                enrollment(8443).with_http_backend(backend(8081)),
+            ),
+        ];
+        let rendered = render_http_routes(set.iter().map(|(d, e)| (d.as_str(), e)));
+        assert_eq!(
+            rendered,
+            "a.example.com=127.0.0.1:8081,b.example.com=redirect"
+        );
+        // The router's own parser shape: `host=disposition`, comma-separated,
+        // every disposition either the redirect token or a SocketAddr. Checked
+        // here because the two crates are in different workspaces and nothing
+        // else holds them to one format.
+        for entry in rendered.split(',') {
+            let (host, value) = entry.split_once('=').expect("host=disposition");
+            assert!(!host.is_empty());
+            if value != HTTP_REDIRECT_TOKEN {
+                value
+                    .parse::<SocketAddr>()
+                    .expect("a backend or `redirect`");
+            }
+        }
+        assert_eq!(render_http_routes(std::iter::empty()), "");
     }
 }

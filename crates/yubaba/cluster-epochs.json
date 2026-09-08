@@ -1,8 +1,8 @@
 {
   "cluster_protocol": 5,
-  "cluster_protocol_surface": "6b573982f269bb8d369eca697381f5def31a4f37d3ee3140fbeb2e3345dad1e3",
+  "cluster_protocol_surface": "6361fef0d08b15879b159c234f64bcf9af8b1eb7164940234409e02ee31e0b8f",
   "cluster_protocol_surface_inputs": {
-    "rust-file oss/yubaba/crates/yubaba/src/raft/mod.rs": "2ac4dd0263247b9378248b85b6b76f6cabeee2788a62f39b2888822671f3d55a",
+    "rust-file oss/yubaba/crates/yubaba/src/raft/mod.rs": "a593344eadb46ed12c20eedc1dc5568d939ffda3564656c0a75a63d56ef10935",
     "rust-file oss/yubaba/crates/yubaba/src/raft/network.rs": "05a7635543141404f302b0b63bf8a722a103783201a349b7af54dde480eed1fe",
     "rust-lines oss/yubaba/crates/yubaba/src/lib.rs containing /raft/": "bfd35e3b0fdefbab86e4b236a02e6bbb6234f4a2af2f0dc7fad377df4fbdcebb",
     "rust-items oss/yubaba/crates/yubaba/src/lib.rs fn raft_*": "9bb7aa8879a9e5279af05d43c326e4561138eea922b50442511e7b96101f7ed7",
@@ -16,9 +16,9 @@
     "5": "R737-F1 (W246) — tenant PLACEMENT INTENT, separate from ownership. `YubabaRequest` gained two variants (SetTenantPlacement, ClearTenantPlacement), `YubabaState` gained `placement: BTreeMap<TenantId, TenantPlacement>` (#[serde(default)]), and `MemberInfo` + `YubabaRequest::SetMember` each gained `capacity: Option<NodeCapacity>` (#[serde(default)]). THE DISCRIMINATOR IS THE SAME ONE R732-F1 RECORDED, and it is the variants alone that force this: `YubabaRequest` is externally tagged with no #[serde(other)] catch-all, so an epoch-4 node receiving a replicated SetTenantPlacement over AppendEntries gets `unknown variant \"SetTenantPlacement\"`, cannot apply it, cannot advance past that log index, and diverges. Pinned by raft::tests::an_unknown_request_variant_fails_to_parse_which_is_why_r732_bumped_both_epochs, which covers the mechanism rather than the specific variant name. THE FIELDS DID NOT NEED IT, checked rather than assumed. `capacity` is a tolerated struct field in both directions (the R720-F1 `digest` precedent, correctly NOT bumped), and the R706 hazard — a tolerated field that makes a mixed cluster silently WRONG rather than visibly broken — does not apply here. R706 bit because an old node dropped `access` and then served the secret to anybody. An old node dropping `capacity` records None, and None is defined as capacity-UNKNOWN, which YubabaState::node_headroom refuses to schedule onto. The degradation is fail-closed: the mixed window costs placement ONTO the un-upgraded nodes, never a placement that overcommits one. Same shape as R734-F5's region residual. NOTHING READS PLACEMENT YET — the scheduler is R737-F3. This ticket lands the state model and its publisher, so the mixed window has no behaviour to be wrong about beyond the divergence the variants already force."
   },
   "state_epoch": 4,
-  "state_epoch_surface": "e6f6452c842ccee8280c325a0394da4d3d65fe1bb63acb91a3ac8dc5ea721ffc",
+  "state_epoch_surface": "2b7fa7cccc29e51833a698cd665f5edaeb3451c133496c214ed6e0ae641307fd",
   "state_epoch_surface_inputs": {
-    "rust-file oss/yubaba/crates/yubaba/src/raft/mod.rs": "2ac4dd0263247b9378248b85b6b76f6cabeee2788a62f39b2888822671f3d55a",
+    "rust-file oss/yubaba/crates/yubaba/src/raft/mod.rs": "a593344eadb46ed12c20eedc1dc5568d939ffda3564656c0a75a63d56ef10935",
     "rust-file oss/yubaba/crates/yubaba/src/raft/store.rs": "5c423d46bde8d9a27bd12f15bac4df74f00c056073b75249b503b99b47bb2938",
     "cargo-dep oss/yubaba/crates/yubaba/Cargo.toml [openraft]": "2f157e5b8ae751caeeef44985ff36f25c2268d550b653ac00423fbd638875b5c"
   },
@@ -29,6 +29,23 @@
     "4": "R737-F1 (W246) — same change, and it moves this axis for the LOG, not for the snapshot. The snapshot half is a non-event: `placement` on YubabaState and `capacity` on MemberInfo are both #[serde(default)], so an epoch-3 snapshot loads on the new binary declaring nothing and unschedulable, and a new snapshot loads on the old binary with the unknown fields dropped. What breaks is the ROLLBACK question this axis actually asks. `raft_log.json` is a BTreeMap<u64, Entry> of serde_json, and an Entry's payload is EntryPayload::Normal(YubabaRequest) — so a log that has ever carried a SetTenantPlacement cannot be deserialized by an epoch-3 binary at all, and the node does not start rather than starting wrong. Identical reasoning to R732-F1's entry on this axis; recorded again rather than cross-referenced because the next reader will be deciding about a different change and needs the mechanism, not a pointer."
   },
   "surface_rerecords": [
+    {
+      "at": "2026-09-06",
+      "axes": [
+        "cluster_protocol",
+        "state_epoch"
+      ],
+      "verdict": "NOT BREAKING on either axis — both surfaces re-recorded, cluster_protocol stays 5 and state_epoch stays 4. One input moved on each axis and it is the same file: `rust-file oss/yubaba/crates/yubaba/src/raft/mod.rs` (2ac4dd02… -> a593344e…). The verdict is unusually cheap to make because the diff has exactly two hunks and NEITHER is a production item: one comment block inside `apply`'s ClaimTenant arm, and two new `#[test]` functions inside `#[cfg(test)] mod tests`. `git diff -U0` on the file shows `@@ -1375,0 +1376,9 @@` (all `//` lines) and `@@ -1976,0 +1986,58 @@ mod tests`, nothing else. The hasher strips comments (SurfaceInput::RustFile -> strip_rust_comments) but not `#[cfg(test)]` items, which is why an epoch-neutral change still turns the gate red here.",
+      "cause": "R869 — total-loss recovery for the raft state. The session established the recovery semantics and landed the evidence for them; it deliberately landed NO change to the replicated types. What is new in yubaba is two unit tests pinning the arithmetic the recovery runbook depends on (`repeated_self_reclaims_lift_a_rebuilt_cluster_over_the_sinks_epoch`, `the_recovery_claim_is_the_wire_shape_already_deployed`) plus the integration proofs in tests/raft_rebuild_fencing.rs. The off-fleet read half landed in turso-backup (`stream::read_fence_state`), which is not an input to either axis.",
+      "why_not_a_bump": [
+        "NO REPLICATED TYPE MOVED. YubabaRequest, YubabaResponse, YubabaState, MemberInfo and TenantOwnership are byte-identical to the previous surface; the only non-comment additions in the file are behind #[cfg(test)] and are not compiled into the binary a peer talks to or the log a rollback reads.",
+        "THE ALTERNATIVE WAS A BUMP AND WAS REJECTED FOR THAT REASON, which is the part worth carrying forward. The obvious implementation of the recovery is a `min_epoch: u64` field on ClaimTenant so a rebuilt cluster can jump its epoch over the one the R2 sink already carries. That field would be #[serde(default)] and therefore TOLERATED in both directions — which is exactly the R706 hazard, not the R720-F1/R737-F1 `capacity` precedent. A node on an older binary drops `min_epoch` and applies `current + 1` while an upgraded node applies `max(current, min_epoch) + 1`: one log entry, two applied epochs, state machines diverged. That is a bump on BOTH axes (cluster_protocol 5->6 for the wire, state_epoch 4->5 because raft_log.json replays the same enum).",
+        "AND A BUMP WOULD HAVE MADE THE RECOVERY WORSE, not just more expensive. A disaster-recovery mechanism gated on a fleet-wide binary upgrade cannot be used in the disaster it exists for. The shipped recovery instead lifts the epoch with repeated plain `ClaimTenant` writes over the generic POST /raft/write that R732-T4 already deployed (raft/mod.rs:98) — one committed entry per epoch of the gap, on a path that runs once per disaster, and usable against the binaries on the fleet today."
+      ],
+      "residual_risk": [
+        "THE CORRECTNESS HALF OF R869 IS NOT CLOSED BY THIS CHANGE AND NO EPOCH HIDES THAT. The epoch floor lets a rebuilt cluster write again; it does NOT fence a node resurrected from the dead fleet, because the sidecar's epoch is the highest anyone WROTE under, not the highest the dead raft group GRANTED. Proven, not argued: raft_rebuild_fencing::an_epoch_floor_alone_loses_to_a_survivor_that_outranks_it. Closing it needs the off-fleet pointer generation to reach the streamer, which is R736-F6's ratified design call (streamer.rs:144/:441 still pass 0)."
+      ]
+    },
     {
       "at": "2026-09-02",
       "axes": [

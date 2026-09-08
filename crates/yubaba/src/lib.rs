@@ -564,6 +564,25 @@ pub const DEFAULT_STATE_PATH: &str = "/var/lib/yah-cloud/identity.json";
 /// (the self-bootstrap path creates it + writes config/db), so it lives under
 /// the StateDirectory, not read-only /etc (R330-F28 #14).
 pub const DEFAULT_HEADSCALE_DIR: &str = "/var/lib/yah-cloud/headscale";
+/// Environment variable carrying the coordinator's public base URL into
+/// [`ServerState::headscale_url`] — e.g. `https://cloud.mesh.yah.dev`.
+///
+/// # Delivered by environment, not baked into the binary (R858-T16)
+///
+/// Same reasoning as [`ServerState::litestream_s3_url`]'s
+/// `YUBABA_LITESTREAM_S3_URL`, and the same reason it is not a hardcoded
+/// hostname: `yubaba.service` ships in the release tarball and is copied
+/// verbatim onto every node of every camp, so a URL baked in here would be one
+/// fleet's mesh domain compiled into a binary a rig also installs. A camp on a
+/// different mesh domain would then be silently wrong — which for the headscale
+/// `server_url` means every joining node dials a coordinator that is not this
+/// one. The control plane holds the same value in the `mesh-url` vault slot
+/// (`app/yah/cli/src/cloud.rs`, `COORDINATOR_URL_SLOT`).
+///
+/// Unset means [`headscale_state::hydrate_config`] renders nothing and the node
+/// stays a non-candidate, which is the honest answer: guessing the fleet's
+/// coordinator hostname is the failure this env var exists to avoid.
+pub const HEADSCALE_URL_ENV: &str = "YUBABA_HEADSCALE_URL";
 /// Pinned Headscale release used by the self-bootstrap path when the request
 /// omits an explicit version. Kept in lockstep with `cloud::mesh::HEADSCALE_VERSION`.
 pub const DEFAULT_HEADSCALE_VERSION: &str = "0.23.0";
@@ -1020,6 +1039,13 @@ pub struct ServerState {
     /// When `Some`, yubaba POSTs to `<headscale_url>/api/v1/preauthkey` for
     /// workloads with `expose.operator` set (unless `operator_bridge_mode` is
     /// `MeshPeer`). When `None`, operator exposure is skipped with a warning.
+    ///
+    /// R858-T16 gave it a second reader: it is also the `server_url`
+    /// [`headscale_state::hydrate_config`] renders `config.yaml` from, because
+    /// it is the same fact — the coordinator's public base URL, the one every
+    /// `tailscaled` in the fleet dials. Set from [`HEADSCALE_URL_ENV`] at
+    /// startup; the control plane keeps the same value in its `mesh-url` vault
+    /// slot (`app/yah/cli/src/cloud.rs`).
     pub headscale_url: Option<String>,
 
     /// How yubaba exposes workloads with `expose.operator` set.
@@ -4992,8 +5018,15 @@ pub struct HeadscaleDeployRequest {
     pub headscale_version: String,
     /// Headscale SQLite DB (base64-encoded).
     pub db_base64: String,
-    /// WireGuard private key for Headscale (base64-encoded).
-    pub private_key_base64: String,
+    /// Legacy DERP `private.key` (base64-encoded), OPTIONAL — absent is the
+    /// normal case. R858-B10: headscale v0.23 has no top-level
+    /// `private_key_path` config key and never mints this file, so a
+    /// coordinator that has only ever run 0.23 simply has nothing to send. It
+    /// is written when carried (so a move off the one node whose file predates
+    /// 0.23 leaves its dir byte-identical) and skipped when not. `serde(default)`
+    /// so a pre-B10 client, which always sends it, still parses.
+    #[serde(default)]
+    pub private_key_base64: Option<String>,
     /// Noise private key for Headscale (base64-encoded).
     pub noise_key_base64: String,
     /// ACL policy YAML (plain text).
@@ -5065,7 +5098,9 @@ async fn headscale_deploy(
     }
 
     write_b64!(req.db_base64, "headscale.db");
-    write_b64!(req.private_key_base64, "private.key");
+    if let Some(private_key_base64) = &req.private_key_base64 {
+        write_b64!(private_key_base64, "private.key");
+    }
     write_b64!(req.noise_key_base64, "noise_private.key");
 
     // R861-T2: the carried policy is NOT written to `acls.yaml` any more —
@@ -5215,6 +5250,12 @@ async fn headscale_liveness(s: &Arc<ServerState>) -> HeadscaleLiveness {
     }
 }
 
+/// R858-B9: the port comes from
+/// [`crate::headscale_appliance::HEADSCALE_LISTEN_PORT`], the single constant
+/// [`generate_remote_headscale_config`] renders its `listen_addr` from, so this
+/// probe cannot silently drift off the bind the way it did before. Loopback is
+/// correct and not a limitation — only the co-located passway ever dials the
+/// appliance, so this measures exactly the path that matters.
 async fn probe_headscale_local() -> bool {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -5223,8 +5264,9 @@ async fn probe_headscale_local() -> bool {
         Ok(c) => c,
         Err(_) => return false,
     };
+    let listen_port = crate::headscale_appliance::HEADSCALE_LISTEN_PORT;
     client
-        .get("http://127.0.0.1:8080/health")
+        .get(format!("http://127.0.0.1:{listen_port}/health"))
         .send()
         .await
         .map(|r| r.status().is_success())
@@ -5232,52 +5274,81 @@ async fn probe_headscale_local() -> bool {
 }
 
 /// Generate the headscale config for a remote machine (files under `headscale_dir`).
-fn generate_remote_headscale_config(server_url: &str, headscale_dir: &std::path::Path) -> String {
-    let private_key = headscale_dir.join("private.key").display().to_string();
+///
+/// `pub(crate)` since R858-T16: [`crate::headscale_state::hydrate_config`] calls
+/// it to place `config.yaml` on a node that is about to serve but was never
+/// hand-promoted. Widened rather than copied on purpose — a second renderer
+/// would be a fourth site to disagree about the appliance's shape, which is the
+/// exact defect R858-B9 spent a ticket collapsing.
+pub(crate) fn generate_remote_headscale_config(
+    server_url: &str,
+    headscale_dir: &std::path::Path,
+) -> String {
+    // R858-B10: no top-level `private_key_path` is emitted. v0.23's config-key
+    // table has only `noise.private_key_path` and `derp.server.private_key_path`
+    // (and `derp.server.enabled` is false below), so the bare key this used to
+    // render was a v0.22 leftover headscale silently ignored — a line that read
+    // as live config and was not.
     let noise_key = headscale_dir
         .join("noise_private.key")
         .display()
         .to_string();
     let db_path = headscale_dir.join("headscale.db").display().to_string();
     let socket_path = headscale_dir.join("headscale.sock").display().to_string();
+    // R858-B9: ONE constant, three consumers. Do not re-inline the number —
+    // see [`crate::headscale_appliance::HEADSCALE_LISTEN_PORT`] for what went
+    // wrong when the appliance's advertised ports, this `listen_addr` and
+    // [`probe_headscale_local`]'s URL were three independent literals.
+    let listen_port = crate::headscale_appliance::HEADSCALE_LISTEN_PORT;
 
+    // R858-B10 (discovered work): a RAW string, deliberately, and do not
+    // "tidy" it back into a `\`-continued one. Rust's `\<newline>` escape eats
+    // the newline AND every leading space on the next line, so the continued
+    // form this used to be rendered EVERY key at column zero — `noise:` then a
+    // top-level `private_key_path:`, `database:` then a top-level `type:` and
+    // `sqlite:`. That is not the config anyone reading the source sees, and it
+    // is what `POST /headscale/deploy` wrote onto a promoted coordinator. The
+    // sibling renderer in `cloud::mesh::generate_headscale_config` was already
+    // a raw string; `generate_bootstrap_headscale_config` below works around
+    // the same trap with `\x20\x20`. Covered by
+    // `remote_config_nests_the_noise_key_and_drops_the_dead_top_level_key`.
     format!(
-        "---\n\
-         server_url: {server_url}\n\
-         listen_addr: 127.0.0.1:8080\n\
-         grpc_listen_addr: 127.0.0.1:50443\n\
-         metrics_listen_addr: 127.0.0.1:9090\n\
-         private_key_path: {private_key}\n\
-         noise:\n\
-           private_key_path: {noise_key}\n\
-         database:\n\
-           type: sqlite\n\
-           sqlite:\n\
-             path: {db_path}\n\
-         unix_socket: {socket_path}\n\
-         unix_socket_permission: \"0770\"\n\
-         dns:\n\
-           magic_dns: true\n\
-           base_domain: mesh.internal\n\
-           nameservers:\n\
-             global:\n\
-               - 1.1.1.1\n\
-               - 8.8.8.8\n\
-         log:\n\
-           level: info\n\
-         prefixes:\n\
-           v4: 100.64.0.0/10\n\
-           v6: fd7a:115c:a1e0::/48\n\
-           allocation: sequential\n\
-         policy:\n\
-           mode: {HEADSCALE_POLICY_MODE}\n\
-         derp:\n\
-           server:\n\
-             enabled: false\n\
-           urls:\n\
-             - https://controlplane.tailscale.com/derpmap/default\n\
-           auto_update_enabled: false\n\
-           update_frequency: 24h\n"
+        r#"---
+server_url: {server_url}
+listen_addr: 127.0.0.1:{listen_port}
+grpc_listen_addr: 127.0.0.1:50443
+metrics_listen_addr: 127.0.0.1:9090
+noise:
+  private_key_path: {noise_key}
+database:
+  type: sqlite
+  sqlite:
+    path: {db_path}
+unix_socket: {socket_path}
+unix_socket_permission: "0770"
+dns:
+  magic_dns: true
+  base_domain: mesh.internal
+  nameservers:
+    global:
+      - 1.1.1.1
+      - 8.8.8.8
+log:
+  level: info
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+policy:
+  mode: {HEADSCALE_POLICY_MODE}
+derp:
+  server:
+    enabled: false
+  urls:
+    - https://controlplane.tailscale.com/derpmap/default
+  auto_update_enabled: false
+  update_frequency: 24h
+"#
     )
 }
 
@@ -5297,6 +5368,13 @@ pub struct HeadscaleBootstrapRequest {
     /// Headscale release to download. Defaults to [`DEFAULT_HEADSCALE_VERSION`].
     #[serde(default)]
     pub headscale_version: Option<String>,
+    /// Bootstrap over an existing coordinator's state. **Default `false`, and
+    /// leave it there** — see [`headscale_bootstrap`]'s guard for the outage
+    /// this exists to refuse. The escape hatch is here only because "the
+    /// previous bootstrap died half-written" is a real state a fresh node can
+    /// be in, and there is no other way out of it over the API.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// `POST /headscale/bootstrap` response.
@@ -5356,6 +5434,50 @@ async fn headscale_bootstrap(
             format!("server_url has no host: {}", req.server_url),
         )
     })?;
+
+    // R858-B9: REFUSE to bootstrap over an existing coordinator.
+    //
+    // This handler's contract is a BRAND-NEW mesh from scratch, and everything
+    // below is written for that: it renders the self-terminating-TLS config
+    // (`0.0.0.0:443` + Let's Encrypt HTTP-01), opens the two privileged ports,
+    // and lets headscale mint a fresh noise identity. Fired at a node that is
+    // ALREADY serving, every one of those is destructive — the config write
+    // stomps the behind-the-doors `listen_addr`, and the appliance comes back
+    // fighting passway-demux for `:443` with a cert it cannot obtain because
+    // the A record now points at the door set, not at this box. That is the
+    // 2026-09-03 decapitation, reproduced by one POST.
+    //
+    // `config.yaml` OR `headscale.db` is the test because they are the two
+    // artifacts a coordinator cannot be serving without, and because the two
+    // config writers (`headscale_deploy` above and this handler) are the only
+    // things in-tree that create the former.
+    //
+    // Deliberately NOT fixed by changing [`generate_bootstrap_headscale_config`]:
+    // that renderer is correct for the job it names, and neutering it would
+    // break first-node bootstrap to paper over a handler that should not have
+    // been called.
+    if !req.force {
+        let existing: Vec<&str> = ["config.yaml", "headscale.db"]
+            .into_iter()
+            .filter(|f| dir.join(f).exists())
+            .collect();
+        if !existing.is_empty() {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "refusing to bootstrap over existing headscale state in {}: {} already \
+                     present. Bootstrap is for the FIRST node of a brand-new mesh; running it \
+                     against a node that already has a coordinator overwrites config.yaml with \
+                     the self-terminating-TLS shape (0.0.0.0:443 + HTTP-01) and decapitates the \
+                     mesh. To move an EXISTING coordinator here use `POST /headscale/deploy` \
+                     (state transplant), or `yah mesh promote`. Pass `force: true` only to \
+                     finish a bootstrap that died half-written.",
+                    dir.display(),
+                    existing.join(" + "),
+                ),
+            ));
+        }
+    }
 
     std::fs::create_dir_all(dir).map_err(|e| {
         (
@@ -5634,12 +5756,26 @@ fn headscale_unit_text(bin_path: &std::path::Path, dir: &std::path::Path) -> Str
 /// coordinator fronted by a proxy), this listens publicly on :443 and
 /// terminates its own TLS via Let's Encrypt (HTTP-01 on :80) so the noise
 /// protocol reaches it directly — no CF proxy. Headscale creates the keys + DB.
+///
+/// # R858-B9: `0.0.0.0:443` here is CORRECT — do not reconcile it to
+/// [`crate::headscale_appliance::HEADSCALE_LISTEN_PORT`]
+///
+/// This is the only renderer that still emits the shape of the 2026-09-03
+/// outage, and that is not a bug: the first node of a brand-new mesh has no
+/// passway door in front of it yet, so there is nothing to be behind. A
+/// coordinator that bound loopback here would be unreachable by the very nodes
+/// it exists to enrol, and the bootstrap could never complete.
+///
+/// The real hazard was never this function but its **caller** —
+/// [`headscale_bootstrap`] could be fired at a node that already had a serving
+/// coordinator and would overwrite its config. That is refused there now.
 fn generate_bootstrap_headscale_config(
     server_url: &str,
     le_hostname: &str,
     headscale_dir: &std::path::Path,
 ) -> String {
-    let private_key = headscale_dir.join("private.key").display().to_string();
+    // R858-B10: no top-level `private_key_path` — see
+    // [`generate_remote_headscale_config`].
     let noise_key = headscale_dir
         .join("noise_private.key")
         .display()
@@ -5658,7 +5794,6 @@ fn generate_bootstrap_headscale_config(
          tls_letsencrypt_cache_dir: {tls_cache}\n\
          tls_letsencrypt_challenge_type: HTTP-01\n\
          tls_letsencrypt_listen: \":80\"\n\
-         private_key_path: {private_key}\n\
          noise:\n\
          \x20\x20private_key_path: {noise_key}\n\
          database:\n\
@@ -8216,6 +8351,60 @@ mod tests {
         assert!(config.contains("server_url: https://mesh.example.com"));
     }
 
+    /// R858-B10: the transplant must land when the source coordinator has no
+    /// `private.key` at all — the shape of every headscale that has only ever
+    /// been 0.23. The field is absent from the body entirely (not null, not an
+    /// empty string), which is what a post-B10 `yah mesh promote` sends, and
+    /// the handler must write the state that DOES matter rather than 400-ing on
+    /// a missing field. It must also not leave an empty `private.key` behind:
+    /// a zero-byte key file is a worse artifact than no file, because it reads
+    /// as present to anything that checks existence.
+    #[tokio::test]
+    async fn headscale_deploy_accepts_a_request_with_no_private_key() {
+        let (_tmp, state_base) = fresh_state();
+        let headscale_tmp = tempfile::TempDir::new().unwrap();
+        let state = {
+            let state_raw = Arc::try_unwrap(state_base).unwrap();
+            Arc::new(state_raw.with_headscale_dir(headscale_tmp.path()))
+        };
+        let app = build_router(state);
+
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let req_body = serde_json::json!({
+            "headscale_version": "0.23.0",
+            "db_base64": engine.encode(b"test-db"),
+            "noise_key_base64": engine.encode(b"test-noise-key"),
+            "acl_policy": "",
+            "server_url": "https://mesh.example.com"
+        });
+
+        let resp = app
+            .oneshot(
+                Request::post("/headscale/deploy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // No download URL override here, so the binary fetch may fail on a host
+        // without a `file`-capable curl — same tolerance the sibling deploy
+        // tests take. What is asserted is that it did not fail at the REQUEST
+        // boundary, and that the state files landed either way.
+        assert_ne!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            std::fs::read(headscale_tmp.path().join("headscale.db")).unwrap(),
+            b"test-db"
+        );
+        assert_eq!(
+            std::fs::read(headscale_tmp.path().join("noise_private.key")).unwrap(),
+            b"test-noise-key"
+        );
+        assert!(!headscale_tmp.path().join("private.key").exists());
+    }
+
     /// R861-T2. Under `policy.mode: database` the policy travels inside the
     /// transplanted `headscale.db`, so a carried non-permissive `acl_policy`
     /// means the SOURCE was still file-mode and its DB has no policy row.
@@ -8443,14 +8632,57 @@ mod tests {
         assert!(cfg.contains("tls_letsencrypt_challenge_type: HTTP-01"));
         assert!(cfg.contains("server_url: https://cloud.mesh.yah.dev"));
         // Keys + DB live under the headscale dir; headscale creates them itself.
-        assert!(cfg.contains("/etc/yah-cloud/headscale/private.key"));
+        assert!(cfg.contains("/etc/yah-cloud/headscale/noise_private.key"));
         assert!(cfg.contains("/etc/yah-cloud/headscale/headscale.db"));
+        // R858-B10: no top-level `private_key_path`. v0.23 has no such config
+        // key, so the line this used to render was a v0.22 leftover that read
+        // as live config and was not. `noise.private_key_path` above IS real,
+        // so anchor on the line start rather than on the bare key name.
+        assert!(!cfg.contains("\nprivate_key_path:"));
         // R861-T2: policy lives in headscale.db (litestream replicates it), not
         // in an acls.yaml that nothing replicates. This site is the one that
         // spells the block with escaped spaces (`\x20\x20mode:`), so a grep for
         // a literal two-space prefix misses it — assert on it explicitly.
         assert!(cfg.contains(&format!("mode: {HEADSCALE_POLICY_MODE}")));
         assert!(!cfg.contains("acls.yaml"));
+    }
+
+    /// R858-B10. The transplant path's renderer gets the same two assertions as
+    /// the bootstrap one above: the noise key must be nested under `noise:`
+    /// (that is the only `private_key_path` v0.23 reads), and no bare top-level
+    /// `private_key_path` may survive. Anchored on the line start because
+    /// `noise.private_key_path` legitimately ends in the same key name.
+    #[test]
+    fn remote_config_nests_the_noise_key_and_drops_the_dead_top_level_key() {
+        let dir = std::path::Path::new("/etc/yah-cloud/headscale");
+        let cfg = generate_remote_headscale_config("https://mesh.example.com", dir);
+        assert!(
+            cfg.contains("noise:\n  private_key_path: /etc/yah-cloud/headscale/noise_private.key"),
+            "noise key must stay nested under `noise:`; got:\n{cfg}"
+        );
+        assert!(!cfg.contains("\nprivate_key_path:"), "got:\n{cfg}");
+    }
+
+    /// R858-B9: the behind-the-doors `listen_addr` is derived from the same
+    /// constant the appliance advertises on the mesh and the health probe
+    /// dials, so the three cannot drift apart again. Asserted against the
+    /// constant rather than the literal `8080` — a test that hardcodes the
+    /// number is a fourth site to disagree with.
+    #[test]
+    fn remote_config_binds_the_one_declared_headscale_port() {
+        let port = crate::headscale_appliance::HEADSCALE_LISTEN_PORT;
+        let cfg = generate_remote_headscale_config(
+            "https://cloud.mesh.yah.dev",
+            std::path::Path::new("/var/lib/yah-cloud/headscale"),
+        );
+        assert!(
+            cfg.contains(&format!("listen_addr: 127.0.0.1:{port}")),
+            "got:\n{cfg}"
+        );
+        // The doors terminate TLS now; the appliance must claim neither
+        // privileged port nor an ACME challenge of its own.
+        assert!(!cfg.contains("0.0.0.0:443"), "got:\n{cfg}");
+        assert!(!cfg.contains("tls_letsencrypt"), "got:\n{cfg}");
     }
 
     #[tokio::test]
@@ -8493,6 +8725,128 @@ mod tests {
         let cfg = std::fs::read_to_string(headscale_tmp.path().join("config.yaml")).unwrap();
         assert!(cfg.contains("server_url: https://cloud.mesh.yah.dev"));
         assert!(cfg.contains("tls_letsencrypt_hostname: cloud.mesh.yah.dev"));
+    }
+
+    /// R858-B9. The failure this pins is a live outage, not a tidiness point:
+    /// `POST /headscale/bootstrap` at a node that already has a coordinator
+    /// rewrites `config.yaml` to `0.0.0.0:443` + Let's Encrypt HTTP-01, which
+    /// is exactly the shape the 2026-09-03 decapitation ran in — the appliance
+    /// comes back fighting passway-demux for `:443` holding a cert it can no
+    /// longer obtain, because the A record points at the door set now.
+    ///
+    /// Asserted on CONTENT, not on the status code alone: a 409 that had
+    /// already stomped the file would be worse than no guard, since it reads as
+    /// a refusal.
+    #[tokio::test]
+    async fn headscale_bootstrap_refuses_to_overwrite_a_serving_coordinator() {
+        let (_tmp, state_base) = fresh_state();
+        let headscale_tmp = tempfile::TempDir::new().unwrap();
+
+        // A coordinator already behind the doors, as us-west-001 is today.
+        let live_config = generate_remote_headscale_config(
+            "https://cloud.mesh.yah.dev",
+            headscale_tmp.path(),
+        );
+        std::fs::write(headscale_tmp.path().join("config.yaml"), &live_config).unwrap();
+
+        let state = {
+            let state_raw = Arc::try_unwrap(state_base).unwrap();
+            Arc::new(state_raw.with_headscale_dir(headscale_tmp.path()))
+        };
+        let app = build_router(state);
+
+        let req_body = serde_json::json!({ "server_url": "https://cloud.mesh.yah.dev" });
+        let resp = app
+            .oneshot(
+                Request::post("/headscale/bootstrap")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let after = std::fs::read_to_string(headscale_tmp.path().join("config.yaml")).unwrap();
+        assert_eq!(
+            after, live_config,
+            "the serving coordinator's config.yaml must be byte-identical after a refusal"
+        );
+        assert!(
+            !after.contains("tls_letsencrypt_hostname"),
+            "the bootstrap renderer's self-terminating-TLS shape must not have landed"
+        );
+    }
+
+    /// `headscale.db` alone is enough — a coordinator whose config was hand-
+    /// edited away still holds the tailnet, the node keys and the ACLs in that
+    /// file, and bootstrap would start a *second*, empty one beside it.
+    #[tokio::test]
+    async fn headscale_bootstrap_refuses_on_a_lone_database_too() {
+        let (_tmp, state_base) = fresh_state();
+        let headscale_tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(headscale_tmp.path().join("headscale.db"), b"not empty").unwrap();
+
+        let state = {
+            let state_raw = Arc::try_unwrap(state_base).unwrap();
+            Arc::new(state_raw.with_headscale_dir(headscale_tmp.path()))
+        };
+        let app = build_router(state);
+
+        let resp = build_router_bootstrap_post(app, false).await;
+        assert_eq!(resp, StatusCode::CONFLICT);
+        assert!(
+            !headscale_tmp.path().join("config.yaml").exists(),
+            "a refusal must not have written a config"
+        );
+    }
+
+    /// The escape hatch still works — `force` is what an operator finishing a
+    /// half-written bootstrap has, and without it the guard would be a wall.
+    /// Status is deliberately not asserted as success: the download/systemd
+    /// legs are unavailable in CI. What is asserted is that the guard let it
+    /// THROUGH, i.e. the response is anything but 409.
+    #[tokio::test]
+    async fn headscale_bootstrap_force_overrides_the_guard() {
+        let (tmp, state_base) = fresh_state();
+        let headscale_tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(headscale_tmp.path().join("config.yaml"), "stale: true\n").unwrap();
+        let dl_url = headscale_fixture_url(tmp.path());
+
+        let state = {
+            let state_raw = Arc::try_unwrap(state_base).unwrap();
+            Arc::new(
+                state_raw
+                    .with_headscale_dir(headscale_tmp.path())
+                    .with_headscale_download_url(dl_url),
+            )
+        };
+        let app = build_router(state);
+
+        let status = build_router_bootstrap_post(app, true).await;
+        assert_ne!(status, StatusCode::CONFLICT);
+        let cfg = std::fs::read_to_string(headscale_tmp.path().join("config.yaml")).unwrap();
+        assert!(
+            cfg.contains("tls_letsencrypt_hostname: cloud.mesh.yah.dev"),
+            "force must actually re-render the bootstrap config; got:\n{cfg}"
+        );
+    }
+
+    /// POST `/headscale/bootstrap` at `cloud.mesh.yah.dev` and return the status.
+    async fn build_router_bootstrap_post(app: axum::Router, force: bool) -> StatusCode {
+        let req_body = serde_json::json!({
+            "server_url": "https://cloud.mesh.yah.dev",
+            "force": force,
+        });
+        app.oneshot(
+            Request::post("/headscale/bootstrap")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
     }
 
     #[tokio::test]

@@ -51,6 +51,24 @@
 //! defeat the fail-stale rules above: a listing failure still writes nothing,
 //! and an empty enrollment set is still skipped, because writing pins-only
 //! would de-route every tenant — the exact thing those rules exist to prevent.
+//!
+//! ## The `:80` tier, from the same sweep (R870-F1)
+//!
+//! `passway-http-router` is the plaintext twin of the demux, and it reads the
+//! same shape of file. When [`HTTP_ROUTES_FILE_ENV`] is set, [`publish_sweep`]
+//! renders it too — from [`crate::cert_store::http_route_entries`], off
+//! `Enrollment::http_backend` — from **one** listing of the enrollment set.
+//! One listing, two renders, because the listing is the expensive half (one
+//! `list_prefix` plus one `get` per domain) and sweeping the bucket twice per
+//! cadence to serve two files on the same node is a bill with nothing behind
+//! it.
+//!
+//! The fail-stale rules bind both files identically: an empty enrollment set
+//! writes neither, and a write failure on one is reported without suppressing
+//! the other. The `:80` table has **no pin mechanism** — pins exist for the
+//! fleet's own hostnames (`cloud.mesh.yah.dev` and friends), which are dialled
+//! by `tailscaled` over TLS and have no plaintext tier to be de-routed from.
+//! If one ever does, the shape to copy is right above this paragraph.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -60,10 +78,17 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{info, warn};
 
-use crate::cert_store::{route_entries, CertStoreError, ObjectCertStore};
+use crate::cert_store::{
+    http_route_entries, route_entries, CertStoreError, Enrollment, ObjectCertStore,
+};
 
 /// Env key naming the file to publish. Its presence turns the publisher on.
 pub const ROUTES_FILE_ENV: &str = "YUBABA_DEMUX_ROUTES_FILE";
+/// Env key naming the `:80` tier's routes file
+/// (`PASSWAY_HTTP_ROUTER_ROUTES_FILE`), published from the same sweep. Unset
+/// means no `:80` table is written at all — see the module doc's *The `:80`
+/// tier* section.
+pub const HTTP_ROUTES_FILE_ENV: &str = "YUBABA_HTTP_ROUTES_FILE";
 /// Env key overriding the sweep cadence.
 pub const SWEEP_SECS_ENV: &str = "YUBABA_DEMUX_ROUTES_SWEEP_SECS";
 /// Env key naming routes this node publishes whether or not they are enrolled —
@@ -86,10 +111,13 @@ pub const DEFAULT_SWEEP_SECS: u64 = 300;
 pub struct RoutePublisherConfig {
     /// File the demux reloads (`PASSWAY_DEMUX_ROUTES_FILE`).
     pub routes_file: PathBuf,
+    /// File the `:80` router reloads (`PASSWAY_HTTP_ROUTER_ROUTES_FILE`), when
+    /// this node runs one. `None` publishes no `:80` table.
+    pub http_routes_file: Option<PathBuf>,
     /// Seconds between sweeps.
     pub sweep: Duration,
     /// Routes emitted on every sweep regardless of the enrollment set, in
-    /// declaration order. See [`PINNED_ROUTES_ENV`].
+    /// declaration order. See [`PINNED_ROUTES_ENV`]. `:443` only.
     pub pinned: Vec<PinnedRoute>,
 }
 
@@ -213,8 +241,16 @@ pub fn parse_publisher_config(
         return Err(format!("{SWEEP_SECS_ENV} must be greater than zero"));
     }
     let pinned = parse_pinned_routes(&get(PINNED_ROUTES_ENV).unwrap_or_default())?;
+    // Deliberately NOT a second arming switch: the `:443` tier is what makes a
+    // tenant reachable at all, so a node publishing only a `:80` table is not a
+    // shape that exists. This one adds a tier, it does not turn the publisher
+    // on.
+    let http_routes_file = get(HTTP_ROUTES_FILE_ENV)
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| PathBuf::from(p.trim()));
     Ok(Some(RoutePublisherConfig {
         routes_file,
+        http_routes_file,
         sweep: Duration::from_secs(sweep_secs),
         pinned,
     }))
@@ -253,17 +289,62 @@ pub enum PublishError {
     },
 }
 
-/// One sweep: list the enrollment set, render the table, write it if it changed.
+/// What one sweep did to each tier's file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sweep {
+    /// The `:443` demux table.
+    pub tls: Published,
+    /// The `:80` router table, when [`RoutePublisherConfig::http_routes_file`]
+    /// names one.
+    pub http: Option<Published>,
+}
+
+/// One sweep across every tier this node publishes: **one** listing of the
+/// enrollment set, one render per configured file.
 ///
 /// Synchronous — [`ObjectCertStore`] is, like every other object-store consumer
 /// in the tree — so an async caller runs it on a blocking thread. See
 /// [`spawn`].
+pub fn publish_sweep(
+    store: &ObjectCertStore,
+    cfg: &RoutePublisherConfig,
+) -> Result<Sweep, PublishError> {
+    let enrolled = store.enrolled()?;
+    let tls = publish_tls_table(&enrolled, &cfg.routes_file, &cfg.pinned)?;
+    let http = cfg
+        .http_routes_file
+        .as_deref()
+        .map(|path| publish_http_table(&enrolled, path))
+        .transpose()?;
+    Ok(Sweep { tls, http })
+}
+
+/// One sweep of the `:443` table alone: list the enrollment set, render, write
+/// it if it changed.
+///
+/// A node publishing both tiers should call [`publish_sweep`] instead — this
+/// one lists the bucket for a single file.
 pub fn publish_once(
     store: &ObjectCertStore,
     routes_file: &Path,
     pinned: &[PinnedRoute],
 ) -> Result<Published, PublishError> {
-    let enrolled = store.enrolled()?;
+    publish_tls_table(&store.enrolled()?, routes_file, pinned)
+}
+
+/// One sweep of the `:80` table alone (R870-F1). See [`publish_once`].
+pub fn publish_http_once(
+    store: &ObjectCertStore,
+    routes_file: &Path,
+) -> Result<Published, PublishError> {
+    publish_http_table(&store.enrolled()?, routes_file)
+}
+
+fn publish_tls_table(
+    enrolled: &[(String, Enrollment)],
+    routes_file: &Path,
+    pinned: &[PinnedRoute],
+) -> Result<Published, PublishError> {
     let enrolled = route_entries(enrolled.iter().map(|(d, e)| (d.as_str(), e)));
     // Checked BEFORE the merge, so a pin can never make an empty enrollment set
     // look non-empty and blank the tenants out of a live table.
@@ -274,9 +355,33 @@ pub fn publish_once(
         entries,
         overridden,
     } = merge_pinned_over_enrolled(&enrolled, pinned);
+    write_table(routes_file, entries, overridden)
+}
+
+fn publish_http_table(
+    enrolled: &[(String, Enrollment)],
+    routes_file: &Path,
+) -> Result<Published, PublishError> {
+    let entries = http_route_entries(enrolled.iter().map(|(d, e)| (d.as_str(), e)));
+    // Same guard as the `:443` tier, and the same reason: an empty listing and
+    // a bucket pointed at the wrong prefix are the same answer, and one of them
+    // stops every tenant's apex answering scheme-less HTTP at once.
+    if entries.is_empty() {
+        return Ok(Published::EmptySkipped);
+    }
+    // No pins on this tier, so nothing can be overridden.
+    write_table(routes_file, entries, Vec::new())
+}
+
+/// Write a rendered table, skipping a byte-identical rewrite.
+fn write_table(
+    routes_file: &Path,
+    entries: Vec<String>,
+    overridden: Vec<String>,
+) -> Result<Published, PublishError> {
     // One entry per line, trailing newline: a 10k-domain table has to be
-    // diffable and `grep`-able by an operator, and the demux's loader takes
-    // newlines as separators.
+    // diffable and `grep`-able by an operator, and both loaders take newlines
+    // as separators.
     let rendered = format!("{}\n", entries.join("\n"));
     let domains = entries.len();
 
@@ -322,46 +427,63 @@ pub fn spawn(
     tokio::spawn(async move {
         info!(
             routes_file = %cfg.routes_file.display(),
+            http_routes_file = cfg.http_routes_file.as_ref().map(|p| p.display().to_string()),
             sweep_secs = cfg.sweep.as_secs(),
             issuer = %store.issuer(),
             pinned = cfg.pinned.len(),
             "demux routes: publishing the enrollment set for passway-demux"
         );
         loop {
-            let (store, path, pinned) =
-                (store.clone(), cfg.routes_file.clone(), cfg.pinned.clone());
-            match tokio::task::spawn_blocking(move || publish_once(&store, &path, &pinned)).await {
-                Ok(Ok(Published::Written {
-                    domains,
-                    overridden,
-                })) => {
-                    if !overridden.is_empty() {
-                        warn!(
-                            hosts = %overridden.join(","),
-                            "demux routes: a pinned route displaced an enrolled one — the \
-                             pin wins, but two things claim these hostnames"
-                        );
+            let (store, sweep_cfg) = (store.clone(), cfg.clone());
+            match tokio::task::spawn_blocking(move || publish_sweep(&store, &sweep_cfg)).await {
+                Ok(Ok(Sweep { tls, http })) => {
+                    log_published(":443", &cfg.routes_file, cfg.pinned.len(), &tls);
+                    if let (Some(path), Some(http)) = (cfg.http_routes_file.as_ref(), http) {
+                        log_published(":80", path, 0, &http);
                     }
-                    info!(
-                        routes_file = %cfg.routes_file.display(),
-                        domains,
-                        "demux routes: route table published"
-                    )
                 }
-                Ok(Ok(Published::Unchanged { .. })) => {}
-                Ok(Ok(Published::EmptySkipped)) => warn!(
-                    routes_file = %cfg.routes_file.display(),
-                    pinned = cfg.pinned.len(),
-                    "demux routes: the enrollment set is empty — leaving the existing \
-                     route table in place rather than de-routing every tenant. Any \
-                     pinned routes are NOT written this sweep for the same reason"
-                ),
                 Ok(Err(e)) => warn!("demux routes: sweep failed (retry next sweep): {e}"),
                 Err(e) => warn!("demux routes: sweep task failed: {e}"),
             }
             tokio::time::sleep(cfg.sweep).await;
         }
     })
+}
+
+/// One tier's outcome, at the level it deserves: a write is `info`, a no-op is
+/// silent, and the empty-set skip is the `warn` that says the table on disk is
+/// deliberately stale.
+fn log_published(tier: &str, routes_file: &Path, pinned: usize, published: &Published) {
+    match published {
+        Published::Written {
+            domains,
+            overridden,
+        } => {
+            if !overridden.is_empty() {
+                warn!(
+                    tier,
+                    hosts = %overridden.join(","),
+                    "demux routes: a pinned route displaced an enrolled one — the \
+                     pin wins, but two things claim these hostnames"
+                );
+            }
+            info!(
+                tier,
+                routes_file = %routes_file.display(),
+                domains,
+                "demux routes: route table published"
+            )
+        }
+        Published::Unchanged { .. } => {}
+        Published::EmptySkipped => warn!(
+            tier,
+            routes_file = %routes_file.display(),
+            pinned,
+            "demux routes: the enrollment set is empty — leaving the existing \
+             route table in place rather than de-routing every tenant. Any \
+             pinned routes are NOT written this sweep for the same reason"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -672,6 +794,167 @@ mod tests {
         assert_eq!(
             publish_once(&certs, &path, &[]).unwrap(),
             Published::Unchanged { domains: 1 }
+        );
+    }
+
+    // ── The `:80` tier (R870-F1) ────────────────────────────────────────────
+
+    fn both_tiers(dir: &std::path::Path) -> RoutePublisherConfig {
+        RoutePublisherConfig {
+            routes_file: dir.join("demux.routes"),
+            http_routes_file: Some(dir.join("http.routes")),
+            sweep: Duration::from_secs(DEFAULT_SWEEP_SECS),
+            pinned: vec![],
+        }
+    }
+
+    #[test]
+    fn an_enrolled_domain_with_no_http_backend_publishes_a_redirect_route() {
+        // The gap R870-F1 closes: before this, tenant #2 was routable on :443
+        // and refused every scheme-less `curl tenant.example/install.sh`.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = both_tiers(dir.path());
+        let (_mem, certs) = store();
+        certs.enroll("a.example.com", &enrollment(8443)).unwrap();
+        certs
+            .enroll(
+                "b.example.com",
+                &enrollment(8444).with_http_backend(SocketAddr::from(([127, 0, 0, 1], 8081))),
+            )
+            .unwrap();
+
+        let sweep = publish_sweep(&certs, &cfg).unwrap();
+        assert_eq!(
+            sweep.tls,
+            Published::Written {
+                domains: 2,
+                overridden: vec![]
+            }
+        );
+        assert_eq!(
+            sweep.http,
+            Some(Published::Written {
+                domains: 2,
+                overridden: vec![]
+            })
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cfg.routes_file).unwrap(),
+            "a.example.com=127.0.0.1:8443\nb.example.com=127.0.0.1:8444\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cfg.http_routes_file.as_ref().unwrap()).unwrap(),
+            "a.example.com=redirect\nb.example.com=127.0.0.1:8081\n"
+        );
+    }
+
+    #[test]
+    fn a_sweep_with_no_http_file_configured_writes_only_the_443_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RoutePublisherConfig {
+            http_routes_file: None,
+            ..both_tiers(dir.path())
+        };
+        let (_mem, certs) = store();
+        certs.enroll("a.example.com", &enrollment(8443)).unwrap();
+
+        assert_eq!(publish_sweep(&certs, &cfg).unwrap().http, None);
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("demux.routes")]);
+    }
+
+    #[test]
+    fn an_empty_enrollment_set_blanks_neither_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = both_tiers(dir.path());
+        let (_mem, certs) = store();
+        certs.enroll("a.example.com", &enrollment(8443)).unwrap();
+        publish_sweep(&certs, &cfg).unwrap();
+
+        certs.unenroll("a.example.com").unwrap();
+        let sweep = publish_sweep(&certs, &cfg).unwrap();
+        assert_eq!(sweep.tls, Published::EmptySkipped);
+        assert_eq!(sweep.http, Some(Published::EmptySkipped));
+        assert_eq!(
+            std::fs::read_to_string(cfg.http_routes_file.as_ref().unwrap()).unwrap(),
+            "a.example.com=redirect\n",
+            "an empty listing must leave the last good :80 table on disk too"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_set_rewrites_neither_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = both_tiers(dir.path());
+        let (_mem, certs) = store();
+        certs.enroll("a.example.com", &enrollment(8443)).unwrap();
+        publish_sweep(&certs, &cfg).unwrap();
+
+        let sweep = publish_sweep(&certs, &cfg).unwrap();
+        assert_eq!(sweep.tls, Published::Unchanged { domains: 1 });
+        assert_eq!(sweep.http, Some(Published::Unchanged { domains: 1 }));
+    }
+
+    #[test]
+    fn pins_are_a_443_mechanism_and_do_not_leak_onto_port_80() {
+        // A pin exists for the fleet's own TLS hostnames; giving one a :80
+        // route would be inventing a plaintext tier nobody dials.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = RoutePublisherConfig {
+            pinned: vec![pin("cloud.mesh.yah.dev", "127.0.0.1:8444")],
+            ..both_tiers(dir.path())
+        };
+        let (_mem, certs) = store();
+        certs.enroll("a.example.com", &enrollment(8443)).unwrap();
+
+        publish_sweep(&certs, &cfg).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&cfg.routes_file).unwrap(),
+            "a.example.com=127.0.0.1:8443\ncloud.mesh.yah.dev=127.0.0.1:8444\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cfg.http_routes_file.as_ref().unwrap()).unwrap(),
+            "a.example.com=redirect\n"
+        );
+    }
+
+    #[test]
+    fn the_http_routes_file_comes_off_the_environment_and_is_optional() {
+        let get = |k: &str| match k {
+            ROUTES_FILE_ENV => Some("/etc/passway-demux.routes".to_string()),
+            HTTP_ROUTES_FILE_ENV => Some(" /etc/passway-http-router.routes ".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            parse_publisher_config(get)
+                .unwrap()
+                .unwrap()
+                .http_routes_file,
+            Some(PathBuf::from("/etc/passway-http-router.routes"))
+        );
+
+        // Unset, blank, and "set without the :443 file" all mean no :80 table —
+        // the last because the demux file is what arms the publisher at all.
+        let blank = |k: &str| match k {
+            ROUTES_FILE_ENV => Some("/etc/passway-demux.routes".to_string()),
+            HTTP_ROUTES_FILE_ENV => Some("  ".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            parse_publisher_config(blank)
+                .unwrap()
+                .unwrap()
+                .http_routes_file,
+            None
+        );
+        assert_eq!(
+            parse_publisher_config(|k| (k == HTTP_ROUTES_FILE_ENV)
+                .then(|| "/etc/passway-http-router.routes".to_string()))
+            .unwrap(),
+            None
         );
     }
 }
