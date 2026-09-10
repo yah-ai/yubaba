@@ -139,6 +139,31 @@ impl QuorumVerdict {
             Self::Degraded { reason, .. } | Self::Unknown { reason } => reason.clone(),
         }
     }
+
+    /// Cross this verdict into the `floating_ip` crate as plain data, for
+    /// [`floating_ip::plan_ingress_owner_effect`].
+    ///
+    /// [`Unknown`](Self::Unknown) collapses into
+    /// [`QuorumHealth::Degraded`](floating_ip::QuorumHealth::Degraded), which
+    /// is what that enum's doc has always said it would. The two are worth
+    /// distinguishing *here* — "a voter is down" and "I cannot tell" call for
+    /// different operator responses — and are not worth distinguishing *there*,
+    /// because the planner does exactly one thing with either: refuse the
+    /// withdrawal. The distinction survives in the reason string, which is what
+    /// the refusal actually prints.
+    ///
+    /// Crossed by value rather than by importing `QuorumVerdict` into
+    /// `floating_ip`: that crate sits below both consumers and depends on
+    /// neither, which is the whole reason it can be linked into the fleet
+    /// daemon.
+    pub fn as_ingress_health(&self) -> floating_ip::QuorumHealth {
+        match self {
+            Self::Healthy { .. } => floating_ip::QuorumHealth::Healthy,
+            Self::Degraded { .. } | Self::Unknown { .. } => floating_ip::QuorumHealth::Degraded {
+                reason: self.reason(),
+            },
+        }
+    }
 }
 
 /// Judge live quorum health from the voter set and one detector's report.
@@ -446,6 +471,39 @@ mod tests {
                 voters: 3,
                 available: 3,
                 margin: 1
+            }
+        );
+    }
+
+    /// R859-F2 phase B: the crossing into `floating_ip`. `Unknown` collapses
+    /// into `Degraded` — both refuse a withdrawal, which is the only thing the
+    /// planner does with either — and the reason string is what preserves the
+    /// distinction an operator needs.
+    #[test]
+    fn unknown_crosses_into_the_planner_as_degraded_carrying_its_own_reason() {
+        assert_eq!(
+            judge_quorum(&[1, 2, 3], &report(&[])).as_ingress_health(),
+            floating_ip::QuorumHealth::Healthy
+        );
+
+        // Empty membership — the `Unknown` arm.
+        let unknown = judge_quorum(&[], &report(&[]));
+        assert!(matches!(unknown, QuorumVerdict::Unknown { .. }));
+        assert_eq!(
+            unknown.as_ingress_health(),
+            floating_ip::QuorumHealth::Degraded {
+                reason: unknown.reason()
+            },
+            "an Unknown verdict must refuse like a Degraded one, and must say why in its own \
+             words rather than through a generic stand-in"
+        );
+
+        let degraded = judge_quorum(&[1, 2, 3], &report(&[(1, NodeLiveness::Down)]));
+        assert!(matches!(degraded, QuorumVerdict::Degraded { .. }));
+        assert_eq!(
+            degraded.as_ingress_health(),
+            floating_ip::QuorumHealth::Degraded {
+                reason: degraded.reason()
             }
         );
     }

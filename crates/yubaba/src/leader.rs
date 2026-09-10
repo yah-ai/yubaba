@@ -196,8 +196,8 @@
 //! @yah:gotcha("CORRECTION TO MY OWN FALSIFICATION GOTCHA ABOVE, from @Ashguard:golem who owns the code — read this WITH it, because two of its three claims are wrong and they point a reviewer at the wrong file. (1) D2 IS NOT PURELY T3's — IT IS A REGRESSION R858-B13 WIDENED, AND IT IS ALREADY FIXED. `on_leadership_loss_under_election` kept the appliance if `owner.serving` OR this process's ApplianceHealth was `Serving`. Pre-B13, `record_success` fired immediately after a successful deploy, so health was `Serving(self)` within microseconds and that second term covered exactly this case; B13 deliberately WITHHOLDS record_success until the appliance is observed running (that is what makes the backoff accumulate), so for one reconcile interval after a start neither term holds. The 6ms window I measured at 07:56:49.690->.696 IS that gap. golem has landed a third term, `start_awaiting_proof` — this node started the appliance and has not yet been able to judge it — extracted as the testable `appliance_survives_leadership_loss(owner, node_id, health, start_awaiting_proof)` with four unit tests. (2) D1 AS I WROTE IT IS OVERSTATED — FILE IT NARROWLY. `recorded_owner` does NOT need node_for_machine for the SELF case: it compares the record against this node's own machine name first and returns Some(node_id) on a hit. west's /etc/hostname = ingress_owner = \\\"vps-4c1efa56\\\", so west DID resolve itself as recorded owner, and the ElectTo(self) path I saw is T3 BEHAVING AS DESIGNED (a follower that is the recorded owner and is not serving is supposed to restart what it owns). The genuinely wrong part is much narrower: `on_became_leader` writes SetIngressOwner UNCONDITIONALLY and a follower cannot, producing the `has to forward request to: Some(1)` ERROR — a REDUNDANT write, since the record already named west. So the defect is 'a redundant SetIngressOwner from a follower logs a spurious ERROR', NOT 'a follower deploys an appliance it can never own'. (3) CONSEQUENTLY MY 'deploys every backoff round forever' CLAIM IS WRONG: once the appliance is running and adopted, decide_owner returns OwnerServing(self) and nothing redeploys. The repeating cycle I observed was D2 killing the appliance 6ms after each start, not an ownership loop. WHAT STANDS UNCHANGED: the missing `machine` key on every live member row is real, separate, and unexplained by any of the above — self-resolution bypasses the member map, but no node can resolve any OTHER node's ownership, so the entire remote half of recorded_owner is dead on the live fleet.")
 //!
 //! @yah:ticket(R858-T8, "The rehearsal: power off the owner, prove the HA-singleton takes over on the sovereign group")
-//! @yah:at(2026-09-04T20:47:59Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:at(2026-09-08T21:21:22Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R858)
 //! @yah:next("Tier: Warrior — this is the acceptance test the whole relay exists to pass, and it is easy to run in a way that proves less than it appears to.")
@@ -209,6 +209,20 @@
 //! @yah:verify("CONFIRM FIRST WHETHER /health TOUCHES THE DATABASE — not established, and it changes how much the probe is worth. If it only reports that the HTTP server is up, it returns `pass` on a coordinator serving an empty or half-restored DB, which is the other post-failover false green. Cheap test on the dev cluster: move the db file aside (or point config at a nonexistent path), restart, and see whether /health still says pass. If it does, the readiness gate for step 8 needs to be a real query — an Exec probe running a `headscale nodes list` against the unix socket at /var/lib/yah-cloud/headscale/headscale.sock would do it — rather than an HttpGet.")
 //! @yah:gotcha("DO NOT TRUST /health AS THE FAILOVER GATE — it cannot see the failure that matters most. headscale's `GET /health` returns 200 {\"status\":\"pass\"} (measured on v0.23.0, 2026-09-04), and it would return exactly that on a headscale that came up with a FRESH noise_private.key: the HTTP server is serving fine, it simply rejects every already-registered node. That is the R858-T2 failure, it is the single most likely way this rehearsal produces a false green, and no readiness probe can catch it. It is the reason this ticket's sign-off criterion is \"an ALREADY-REGISTERED node reaches the tailnet without re-registering\" rather than anything the coordinator says about itself.")
 //! @yah:notify_on(R858-T7, "R858-T7 landed EXPIRE + FENCE, which are your steps (2) and (3). Read T7's handoff before planning the run — it answers \"is the rehearsal runnable on dev\" explicitly and the answer is NOT YET, with the blockers named in order. Two things to take from it. (1) SPLIT THE REHEARSAL: the OWNERSHIP half (power off the owner, a survivor expires the record and claims it, power restored, the old node cannot serve) is decidable WITHOUT R858-T2 or R858-T5, because it does not care whether the new coordinator's DB is any good — only who may serve. Run that first; it is the half never demonstrated on hardware. The full criterion (\"an ALREADY-REGISTERED node reaches the tailnet without re-registering\") needs T2's noise key and T5's proven restore and must not be attempted before them. (2) STEP ZERO IS A ROLL: T3+T7 are local source only; us-west-011/013/014 run a binary with neither, so nothing in T7 is live until they are rolled. Also: T7's own \"LIVE HAZARD — systemctl disable headscale before the rehearsal\" gotcha is already satisfied on us-west-001 (measured disabled 2026-09-05 by @Ashguard:libra; yubaba disables the unit itself whenever it takes the appliance under kamaji) — re-check, but do not plan a manual step around a bit that is already clear.")
+//! @yah:handoff("THE REHEARSAL RAN, ON THE DEV GROUP, AS A REAL POWER-OFF — 2026-09-08 by @Ashguard:libra (session:18023eec). Method, stated because the ticket forbids substituting a graceful drain: `sudo systemctl reboot -ff` on us-west-011, the recorded ingress_owner — no clean shutdown, no SIGTERM to yubaba/kamaji, no retraction, nothing given a chance to hand anything over. Chosen over a sustained power-off because these are Raspberry Pis on the operator's LAN with no remote power control, and because the automatic resurrection ~2min later is what makes step (3), the fence, testable in the same run. THE ONE THING IT DOES NOT COVER is a LONG absence; every other property of a power-off holds. TEN-STEP TIMELINE, every line from a journal or a 1s-cadence HTTP observer, one UTC clock: 21:00:44 owner vanishes. 21:01:18 us-west-013 (raft leader) EXPIRES it — `expire_after_secs: 30`, so 34s from death, and the dwell IS the failover time. 21:01:19.191-21:01:20.043 litestream restore from s3://yah-headscale/dev, 852 ms. 21:01:20.043 noise identity: no KEK on the dev group, so the loud ERROR fires and headscale MINTS A FRESH ONE. 21:01:20.043 config.yaml already in sync. 21:01:20.054 kamaji forks headscale. 21:01:20.129 SetIngressOwner written. 21:01:22 the door answers /key. 21:01:28.172 B13 discharge, appliance observed running. DEATH TO SERVING COORDINATOR: 38 SECONDS, of which 30 is the expire dwell — the assumption on this ticket that data transfer is not the bottleneck is CONFIRMED, and hydration measured 852 ms against a 77 KB DB.")
+//! @yah:handoff("THE ACCEPTANCE CRITERION IS MET — an ALREADY-REGISTERED node reached the tailnet through the NEW coordinator without re-registering. Measured, and the client is a real one built for this: a SECOND tailscaled (userspace-networking, own state/socket/port, no TUN) on us-west-003, registered against the dev headscale BEFORE the power-off as node id 1 `r858t8-client`, machine_key mkey:ec79aa2e8b3873c, node_key nodekey:d0b558bd6150, 100.64.0.1. After failover it came back on us-west-013 with BackendState Running, Online true, AuthURL empty, and the SAME node key and SAME IP. us-west-013's `headscale nodes list` shows that identical row, restored out of R2 — so step (6) hydration and step (10) reconvergence both hold. BUT READ THE NEXT ENTRY BEFORE BANKING THIS: it passed for a reason the ticket did not predict, and step (7) was RED the whole time.")
+//! @yah:handoff("THE PREMISE UNDER R858-T2 IS FALSIFIED, AND IT IS THIS RELAY'S MOST LOAD-BEARING BELIEF. The claim, written verbatim in .yah/infra/secrets/headscale-noise-private-key.toml and repeated in this ticket's own gotchas, is that a coordinator which mints a fresh noise key \\\"comes up, answers GET /health with 200, and rejects every already-registered node — silent and fleet-wide, strictly worse than the 37-hour outage\\\". IT DOES NOT. Measured THREE times against headscale v0.23.0 + tailscale 1.102.3, each with a different coordinator identity (019f9888 -> cf07e1f7 -> 97e596e8 -> 020b9a81, read off /key?v=138 each time): the already-registered client reconnected with its ORIGINAL node key, Online true, AuthURL empty, no re-registration. THE THIRD RUN CLOSES THE LOOPHOLE — I EXPIRED THE PREAUTH KEY FIRST (`headscale preauthkeys expire`), so re-registration was not available as an explanation, then rotated the identity again; the client still came back as node id 1 on 100.64.0.1. MECHANISM: the client fetches the server's noise public key from /key on every connection and does not pin it. What authenticates an existing node is its MACHINE KEY against the row in headscale.db. So the thing that must survive a failover is THE DATABASE, not the server identity.")
+//! @yah:handoff("WHAT AN IDENTITY CHANGE DOES COST, measured, so T2 is re-priced rather than dismissed: an ALREADY-CONNECTED client is knocked offline and did NOT self-heal in 2.5 minutes. Its log names the mechanism — a failed noise dial makes tailscale escalate to `controlhttp: forcing port 443 dial due to recent noise dial`, and on this rig that dial is refused because the dev door is plain HTTP on 8080. Only restarting tailscaled recovered it. NOT MEASURED, AND IT MATTERS FOR PROD: prod's door DOES terminate TLS on 443, so that escalation would land on something real and the wedge may be shorter or absent there. So the honest re-pricing is: identity carriage buys a clean reconnect instead of a client-side stall of unknown length — worth having, cheap, and NOT the fleet-wide silent rejection the relay has been treating as the gating risk. RECOMMEND CORRECTING the secret declaration's prose and this relay's gotchas rather than deleting R858-T2; the seeding is still the right thing, it is just no longer the thing that decides whether a failover is survivable.")
+//! @yah:handoff("THE TICKET'S OPEN /health QUESTION IS ANSWERED, both halves, by an isolated probe on idle us-west-014 (scratch dir, port 18080, removed afterwards; the node's own state dir was never touched). (a) On an EMPTY database headscale returns `200 {\\\"status\\\":\\\"pass\\\"}` — confirmed with zero users and zero nodes. So /health is a FALSE GREEN on an empty or half-restored DB, exactly as suspected. (b) On an UNOPENABLE database path headscale FAILS TO START at all (`creating directory for sqlite: ... permission error`) and never binds, so /health is a true red there. CONCLUSION for step (8)'s readiness gate: /health distinguishes \\\"cannot open the DB\\\" from \\\"up\\\", and nothing else. It cannot see an empty DB and it cannot see a wrong identity. TWO CHEAP PROBES COVER WHAT IT MISSES, and the second is better than the exec probe this ticket proposed: a `headscale nodes list` over the unix socket catches the empty DB, and a plain `GET /key?v=138` catches the identity — it returns the coordinator's noise publicKey as an `mkey:`, which is how all three rotations above were detected, and it is an HttpGet rather than an Exec.")
+//! @yah:handoff("DISCOVERED WORK. (1) FILED R858-B20, high, and it is the real prize from this run: the resurrected old owner read its OWN stale raft record, elected itself, ran a SECOND coordinator on a stale DB for 9.7 s, and — the part that actually damages state — started litestream and pushed WAL frames from that losing database into the shared s3://yah-headscale/dev prefix at 21:02:43, extending the pre-failover generation e01101da3a30f8da to 82 s AFTER the winning generation 17578973eecfbf58 began. The R858-T7 fence did fire, with the right reason (`record-names-another-node`), but one reconcile tick too late to prevent any of it. Full timeline, root cause, three candidate fixes with a recommendation, and a reproduction are on B20. (2) FIXED IN PASSING, in this relay's own file: oss/yubaba/crates/yubaba/src/leader.rs printed `pid=0` on `headscale appliance deployed under kamaji supervision` for every live deployment, because `KamajiClient::deploy_workload` acks on admission before the fork and its `DeployResult::task_pid` is structurally 0 — while kamaji's own `native workload forked id=headscale pid=8651` sat one line above in the same journal. The field is removed with a comment saying why; a field that is always zero reads as \\\"the appliance has no pid\\\", which is the shape of a failed start.")
+//! @yah:gotcha("RIG STATE LEFT BEHIND, AND THREE TEMPORARY UNITS THAT ARE NOT IN THE 2026-09-08 R858-T5 ROLLBACK NOTE. The dev group is UP and coherent: leader 13, term 74, all three voters, ingress_owner us-west-013 (the appliance MOVED and stayed moved), dev client online at 100.64.0.1. us-west-013's noise key was hand-restored to the ORIGINAL dev identity 019f9888 (sha256 43016544236da8d4a64c9f1d04c766b799432ace8004b66f587e71d27c12466d) so it matches what us-west-011 still holds and a future failover between those two does not churn clients — HAND-PLACED, not carried, and us-west-014 deliberately left bare so the T2 gap stays visible. ADDED BY THIS SESSION, each with its rollback in its own file header: /etc/systemd/system/r858t8-door.{socket,service} on us-west-011/013/014 (systemd-socket-proxyd, LAN-IP:8080 -> 127.0.0.1:8080, the stand-in for prod's passway-mesh door); /etc/systemd/system/r858t8-devclient.service on us-west-003 (192.168.10.32) plus a `192.168.10.13 dev-mesh.yah.internal` line in its /etc/hosts and /var/lib/tailscale-dev. THE DEV CLIENT IS A SECOND tailscaled AND DOES NOT TOUCH THAT BOX'S PROD TAILNET MEMBERSHIP — userspace-networking, no TUN, no routes, no DNS, separate state/socket/port; us-west-003 was still on the prod tailnet at 100.64.0.9 throughout. NOTHING ON PROD WAS TOUCHED AT ANY POINT.")
+//! @yah:gotcha("STEP (9) WAS MANUAL AND THAT IS THE HONEST REPRESENTATION OF PROD TODAY, not a shortcut in the rehearsal. The dev client's control URL is a name in /etc/hosts and I repointed it by hand from us-west-011 to us-west-013 after the takeover; prod's equivalent is the three static /etc/passway-mesh.env upstreams that this relay's own 2026-09-08 recovery note records as \\\"OWNER-AWARE ONLY BY HAND\\\". So the rehearsal reproduces the gap rather than papering over it. WHAT IT COSTS, MEASURED: the coordinator was serving at 21:01:22 and the client did not return until I intervened at 21:05:03 — i.e. the automated legs took 38 s and the un-automated one took as long as it took a human to notice. That is the whole remaining outage, and it is the thing left to automate. Note the constraint the env file itself states and that this rehearsal does NOT lift: the door must work with a totally dead mesh, so \\\"point the door at the service record\\\" is already-rejected. The dev rig cannot help decide that design — it has no passway at all — but it can now measure any answer, because the door is a two-file systemd unit that can be pointed anywhere.")
+//! @yah:gotcha("THE PRIOR SESSION'S \\\"DEAD-OWNER FENCING DOES NOT FIRE\\\" GOTCHA (oss/yubaba/crates/yubaba/src/service_records.rs:300) IS REAL BUT DID NOT BITE HERE, AND THE DIFFERENCE IS ONE PRECONDITION WORTH WRITING DOWN. That measurement had us-west-013 win an election AFTER us-west-011 was already stopped, so its lease detector carried no entry for node 11, `silence(11)` was None, and expiry could never start its clock. In this run us-west-013 had ALREADY been leader for some time with node 11 live in its lease channel — I verified that before the power-off, `lease_liveness.peers` listing 11/13/14 all `live` — so the clock was running when 11 died and expiry fired on schedule at 30 s. BOTH FACTS ARE TRUE AND THEY COVER DIFFERENT CASES: expiry works when the survivor watched the owner die, and is structurally unreachable when it did not. Nothing here discharges that gotcha; this run simply exercised the other branch. Anyone testing the fix for it should reproduce the ORIGINAL shape — stop the owner, then restart or re-elect the survivor — not this one.")
+//! @yah:verify("FAILOVER, measured on one UTC clock from journals plus a 1s HTTP observer: death 21:00:44 -> expire 21:01:18 (expire_after_secs=30) -> litestream restore 852 ms -> kamaji fork 21:01:20.054 -> SetIngressOwner 21:01:20.129 -> door serving 21:01:22 -> B13 discharge 21:01:28. 38 s death-to-serving, 30 s of it the expire dwell.")
+//! @yah:verify("ACCEPTANCE: already-registered node id 1 `r858t8-client` (machine_key mkey:ec79aa2e8b3873c, node_key nodekey:d0b558bd6150, 100.64.0.1) reached the tailnet through us-west-013 with BackendState Running, Online true, AuthURL empty, identical node key and IP; us-west-013's `headscale nodes list` shows the same row restored out of R2.")
+//! @yah:verify("FALSIFICATION OF THE NOISE-KEY PREMISE, three runs, coordinator identity read off /key?v=138 each time (019f9888 -> cf07e1f7 -> 97e596e8 -> 020b9a81). The third was run with the preauth key EXPIRED first, so re-registration was unavailable as an explanation, and the client still returned as node id 1 on 100.64.0.1 with AuthURL empty.")
+//! @yah:verify("FENCE: the resurrected us-west-011 is not serving — no headscale process, litestream inactive, and it reads ingress_owner=us-west-013. Its journal carries the fence line at 21:02:50.264 with reason RecordNamesAnotherNode { owner: 13 } — but 9.7 s after it had started a second coordinator and replicated a stale DB. That gap is R858-B20, and it is why this ticket does NOT claim step (3) clean.")
+//! @yah:verify("/health: `200 {\"status\":\"pass\"}` on a database with zero users and zero nodes (isolated probe, us-west-014, scratch dir + port 18080, removed); fail-to-start with no bind on an unopenable DB path. CODE: `cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib` = 828 passed / 0 failed, after the one-line leader.rs `pid=0` removal. Nothing committed, nothing rolled, no prod node touched.")
 //!
 //! @yah:ticket(R858-B14, "The appliance is never observable as Running, so ownership never converges — every backoff round redeploys and kills a healthy headscale")
 //! @yah:status(review)
@@ -235,9 +249,9 @@ use kamaji::sibling::{ClientError, KamajiSibling};
 use kamaji_proto::NodeCapabilities;
 
 use crate::appliance_ownership::{
-    decide_owner, judge_appliance_candidate, judge_self_fence, owner_lease_expired, owner_status,
-    ApplianceCandidate, ApplianceHealth, FenceTiming, NativeExecCapability, OwnerElection,
-    OwnerStatus, OwnershipDecision, SelfFence,
+    decide_owner, judge_appliance_candidate, judge_self_fence, may_act_on_ownership,
+    owner_lease_expired, owner_status, record_is_settled, ApplianceCandidate, ApplianceHealth,
+    FenceTiming, NativeExecCapability, OwnerElection, OwnerStatus, OwnershipDecision, SelfFence,
 };
 use crate::lease_detector::Confirmed;
 use crate::raft::{YubabaNodeId, YubabaRaft, YubabaRequest};
@@ -315,6 +329,10 @@ async fn run(
                 has_leader: metrics.current_leader.is_some(),
             }
         };
+        // R858-B20: folded here, on the metrics watch, not inside the
+        // reconciler — the reconciler runs on a 10 s clock of its own and the
+        // quantity being measured is contact with the raft channel.
+        watcher.observe_leader_contact(view.has_leader);
         let is_leader = view.is_leader;
 
         if is_leader != prev_is_leader {
@@ -330,7 +348,12 @@ async fn run(
                     // The legacy coupling, kept working for an appliance that
                     // genuinely wants it. Even here the claim is now
                     // conditional — a failure is a failure under every policy.
-                    if let Err(e) = on_became_leader(node_id, &raft, &state, machine.clone()).await
+                    // `claim_required: true` — under `FollowsRaftLeader` this
+                    // arm runs on the leadership edge, so the node is claiming
+                    // ownership it did not previously hold and the record write
+                    // is load-bearing (R858-B20).
+                    if let Err(e) =
+                        on_became_leader(node_id, &raft, &state, machine.clone(), true).await
                     {
                         error!(node_id, "appliance did not start on the new leader: {e}");
                         watcher
@@ -464,6 +487,23 @@ struct ApplianceWatcher {
     /// legitimate owner — and, if it is not, stops within one window instead of
     /// serving forever.
     ownership_confirmed_at: std::time::Instant,
+    /// R858-B20: when this process most recently *established* contact with a
+    /// raft leader, or `None` while it has none.
+    ///
+    /// Not the same question as `has_leader`, which is why it is a separate
+    /// field rather than a boolean read off the metrics each tick: `has_leader`
+    /// answers "is there a leader right now", and this answers "have I been
+    /// hearing from them long enough for my own applied state to mean
+    /// anything". Reset to `None` on every loss of contact rather than kept as a
+    /// high-water mark, because a node that was partitioned and has just
+    /// rejoined is in exactly the position a node that has just booted is in.
+    ///
+    /// Seeded `None` rather than `Some(now)`: a starting daemon has *not* been
+    /// in contact, and seeding it at `now` would make the first reconcile pass —
+    /// the one that runs immediately, before any interval has elapsed — read as
+    /// settled, which is precisely the pass that started a second coordinator on
+    /// the dev group.
+    leader_contact_since: Option<std::time::Instant>,
     /// R858-B13: this node started the appliance and has not since **observed**
     /// it running.
     ///
@@ -491,8 +531,30 @@ impl ApplianceWatcher {
         Self {
             election: OwnerElection::new(),
             ownership_confirmed_at: std::time::Instant::now(),
+            leader_contact_since: None,
             start_awaiting_proof: false,
         }
+    }
+
+    /// Fold one tick's leadership view into [`Self::leader_contact_since`]
+    /// (R858-B20).
+    ///
+    /// Driven from [`run`]'s loop, which turns on the openraft metrics watch, so
+    /// contact is measured against the raft channel rather than against the
+    /// reconciler's own 10 s cadence. Those are different clocks and using the
+    /// slower one would make the settle window an accident of where in the
+    /// interval a node happened to boot.
+    fn observe_leader_contact(&mut self, has_leader: bool) {
+        match (has_leader, self.leader_contact_since) {
+            (true, None) => self.leader_contact_since = Some(std::time::Instant::now()),
+            (false, _) => self.leader_contact_since = None,
+            (true, Some(_)) => {}
+        }
+    }
+
+    /// How long this process has been continuously in contact with a leader.
+    fn leader_contact_for(&self) -> Option<std::time::Duration> {
+        self.leader_contact_since.map(|t| t.elapsed())
     }
 }
 
@@ -668,6 +730,26 @@ fn appliance_survives_leadership_loss(
 /// @yah:assumes("SCOPE, STATED SO NOBODY READS THIS TICKET AS HAVING SETTLED IT: B13 did NOT touch `listen_addr`, `headscale_appliance::appliance_spec`, `demux_routes.rs`, or anything on the ownership/deploy path beyond the two pacing/backoff defects and the teardown regression they created. The 2026-09-06 operator decision that headscale must sit behind passway-demux rather than binding :443 is R858-T1's and R858-T3's, and T1 executed the live half of it while this was in flight. ONE UNVERIFIED THING I DID NOT CHASE, flagged because a redeploy would surface it: if a node ever DOES take the elect path on west now, `backend.deploy_workload(&appliance_spec(...))` declares the workload's ports to kamaji from the SPEC, not from the hand-edited config.yaml — and `headscale_appliance.rs` had an unattributed 2-line uncommitted change in the tree during this pass that I did not author and did not read. Whoever rolls should read those two lines first: a spec still declaring :443 would collide with the demux even though config.yaml says 127.0.0.1:8080.")
 /// @yah:gotcha("THE THING THAT KILLED HEADSCALE EVERY ~450ms IS THE REDEPLOY ITSELF, NOT THE TEARDOWN — verified from code 2026-09-06 across two crates, and it CORRECTS a reading of R858-T1's own hardware trace. (1) `NativeRuntime::deploy_workload` (oss/kamaji/crates/kamaji/src/native.rs, ~:763) opens by calling `self.teardown_workload(&ident)` — SIGTERM, 5s grace, SIGKILL — and only then forks. So every redeploy of an already-running native workload kills the previous child by construction. That is the `native workload forked id=headscale pid=<N>` cadence and the `ps` child stuck at etime 00:00. (2) Meanwhile yubaba's own teardown CANNOT kill it: `leader::stop_headscale` calls `backend.teardown_workload(&ident)`, `KamajiClient::teardown_workload` (oss/kamaji/crates/kamaji/src/sibling.rs:833) is `self.stop(&id)`, and `stop_workload` (oss/kamaji/crates/kamaji-bin/src/server.rs:3488) routes to containerd, tenant-passway, bundle, microvm and docker with NO `ctx.native` arm. It Acks and does nothing. CONSEQUENCE FOR THE 07:56:49.696 LINE in T1's D2 trace: `headscale appliance torn down on leadership loss` is logged on `Ok(())` from that Ack, so the teardown did not kill the appliance — the next redeploy did. The D2 window is real and the fix is right, but on today's fleet a spurious teardown is INERT.")
 /// @yah:gotcha("SEQUENCING CONSTRAINT FOR WHOEVER GIVES kamaji's `stop_workload` ITS MISSING `ctx.native` ARM — that fix is safe WITH B13 and dangerous WITHOUT it, and the order is not obvious from either ticket alone. Today `leader::stop_headscale` Acks and kills nothing on a native-exec appliance, so every spurious teardown path in yubaba is harmless by accident. Give `stop_workload` a native arm and each of those paths starts actually killing the mesh coordinator. B13's D2 fix (`start_awaiting_proof` as a third term in `appliance_survives_leadership_loss`) is the thing that removes the spurious teardown this would arm — it is currently latent-correct rather than load-bearing, and it becomes load-bearing the moment that arm lands. SO: ship the kamaji `Stop` fix only in a binary that also carries B13, and never to a node still running the fleet's 0.8.33 yubaba, which has neither the pacing fix nor D2. This is an argument for landing B13, not against the kamaji fix.")
+///
+/// @yah:ticket(R858-B20, "A resurrected dead owner elects itself off its own stale raft record and runs a second coordinator for ~10s, replicating a losing DB into the shared replica")
+/// @yah:status(review)
+/// @yah:at(2026-09-08T22:16:28Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R858)
+/// @yah:severity(high)
+/// @yah:gotcha("MEASURED ON THE DEV RAFT GROUP 2026-09-08 by @Ashguard:libra (session:18023eec) during R858-T8's rehearsal, from us-west-011's own journal after a hard reset (`systemctl reboot -ff`, no clean shutdown). THE SEQUENCE, every line read from a journal. 21:00:44 us-west-011 (the recorded ingress_owner) vanishes. 21:01:18 us-west-013, the raft leader, expires it (expire_after_secs=30) and takes over; 21:01:20 it restores the DB from litestream, starts headscale, and writes SetIngressOwner{us-west-013} at raft index 129. 21:02:39 us-west-011 finishes booting. 21:02:40.369 it logs `litestream restore skipped: headscale.db already exists — serving the local DB`. 21:02:40.546 kamaji forks a SECOND headscale on that stale local DB. 21:02:40.574 the claim write FAILS — `failed to set ingress owner in raft: has to forward request to: Some(13)` — proving it was never the leader and had no standing to elect; yet on_became_leader returns Ok and leaves the appliance running. 21:02:40.574 it logs `elected appliance owner and started the appliance`. 21:02:50.264 — NINE POINT SEVEN SECONDS LATER — the R858-T7 fence finally fires with `record-names-another-node`, reason RecordNamesAnotherNode { owner: 13 }, and tears it down.")
+/// @yah:gotcha("THE HARM IS NOT HYPOTHETICAL AND IT IS NOT THE SECOND HTTP SERVER — IT IS THE REPLICA. on_became_leader step 3 starts the litestream sidecar after the start, so the fenced node replicated its STALE DB into the shared prefix: at 21:02:43 us-west-011's litestream wrote WAL segments to s3://yah-headscale/dev on generation e01101da3a30f8da, the pre-failover generation, 82 SECONDS AFTER the winning node's generation 17578973eecfbf58 began at 21:01:21. `litestream generations` then showed e01101da3a30f8da with end=2026-09-08T21:02:43Z beside 17578973eecfbf58 with start=21:01:21Z — two live branches of one database in one prefix. A restore issued inside that 82s window selects by latest end and would have picked the LOSING branch. Measured afterwards (`litestream restore -o /tmp/probe`): it now picks 17578973eecfbf58, because the winner kept writing — so the pollution is latent, not active, and only because nothing failed twice in 82 seconds. leader.rs's fence path already states this exact risk in a comment (\\\"a fenced node must also stop replicating, or it goes on pushing frames from a losing database into the shared litestream replica the new owner restores from\\\") — the fence does call on_lost_leader, it just calls it ~7s after the frames have already landed.")
+/// @yah:gotcha("ROOT CAUSE, INFERRED FROM THE CODE PLUS THE MEASURED TIMELINE (the inference is the middle step; the endpoints are measured). `reconcile_appliance_ownership` gates everything on `may_act = is_leader || recorded == Some(node_id)` and the R858-T7 fence on `confirmed_now = has_leader && recorded == Some(node_id)`. Both read `recorded_owner`, which reads THIS NODE'S OWN raft state machine. A node that has just booted replays its persisted log and, for a window, its SM holds the PRE-FAILOVER record naming itself — us-west-011 at 21:02:40 had not yet applied index 129. So the node reads its own name, `may_act` passes, `confirmed_now` is true so the fence stays silent, and it starts a coordinator. The fence is designed to run first precisely so \\\"a node that must not be serving must also not be electing\\\" — it is defeated because the node's own stale replica AGREES with it. The observer polled us-west-011's /cluster/singletons at 21:02:38 (\\\"none\\\") and 21:02:41 (\\\"us-west-013\\\"), bracketing the 21:02:40.52 reconcile that read Some(11): the window is roughly one raft catch-up, and it is a function of log length and boot speed, so PROD's window is not bounded by dev's 9.7s.")
+/// @yah:next("THREE CANDIDATE FIXES AND THE CHOICE IS AN ARCHITECT CALL — do not pick one without deciding, because a wrong pick re-arms split brain rather than merely failing to fix it. (a) LINEARIZE THE READ: require the node's SM to be caught up to the leader's committed index before `recorded_owner` is trusted on the elect path — openraft's read-index/ensure_linearizable. Correct, and costs a round trip per reconcile tick (10s cadence, so cheap); the objection is that it makes a reconcile pass depend on quorum reachability, which is exactly when you least want it to. (b) BOOT BARRIER: refuse to act on the ownership record until this process has applied at least one entry from the CURRENT term. Cheapest, no extra RPC, and it directly matches the failure (a stale replay can only produce old-term entries) — but it does nothing for a node that was partitioned rather than rebooted. (c) DISTRUST SELF-RECORDS ENTIRELY: drop `recorded == Some(node_id)` from `may_act` so only the raft leader may start an appliance. Simplest, but it deletes the deliberate R858-T3 property that a non-leader owner may restart what it already owns, which is what decouples ownership from leadership. RECOMMEND (b) FIRST as the narrow, testable fix, with (a) layered on if a partition case is ever demonstrated.")
+/// @yah:next("A SECOND, INDEPENDENT HALF THAT NEEDS FIXING WHICHEVER OF (a)/(b)/(c) WINS, and it is a two-line discrimination rather than a design call. `on_became_leader` step 4 treats a failed `SetIngressOwner` as cosmetic — it logs `error!` and returns Ok(()), with a comment arguing \\\"the appliance IS up; only the record is missing... the next tick re-writes it\\\". That reasoning holds for a transient write error and is FALSE for the error actually measured, `has to forward request to: Some(13)`, which means this node is not the leader: the next tick will never write it, and the node has just started a coordinator it can never legitimately claim. Distinguish ForwardToLeader from a transient failure and, on ForwardToLeader, stop the appliance you just started rather than returning Ok. That alone would have cut the measured 9.7s window to roughly the deploy round trip.")
+/// @yah:verify("REPRODUCTION IS CHEAP AND THE RIG IS UP: on the dev group (us-west-011/013/014, `yah@192.168.10.{11,13,14}`, key ~/.ssh/yah with `-o IdentitiesOnly=yes`), `sudo systemctl reboot -ff` on whichever node /cluster/singletons names as ingress_owner, then read that node's yubaba journal from the moment it boots. The tell is the pair `elected appliance owner and started the appliance` followed by `FENCED: ... record-names-another-node` — if both appear for the same boot, the window is still open. A harness version belongs in oss/yubaba/crates/yubaba/tests/raft_appliance_ownership.rs beside `a_resurrected_owner_is_fenced_and_cannot_serve`, which passes today precisely because it does not model a stale local SM: the fix is only proven when a test starts the resurrected node with an SM replayed to the PRE-failover index and asserts it never deploys.")
+/// @yah:gotcha("HEAD CARRIES A BROKEN INTERMEDIATE OF THIS FIX — DO NOT CUT A RELEASE FROM c0976aa0 WITHOUT THE UNCOMMITTED REMAINDER. A peer's wip-commit c0976aa0 (\\\"sync, retag v0.8.35\\\") swept this ticket's work into HEAD MID-SESSION, at a point where the `ForwardToLeader` backstop was still spelled `)) if claim_required => {` — the unqualified form. That form is MEASURED BROKEN: it fails `a_powered_off_owner_expires_and_the_appliance_comes_up_on_a_survivor` with a 90 s timeout, reproducibly and in isolation, because a freshly elected leader's `client_write` transiently returns `ForwardToLeader`, the unqualified guard reads that as fatal, and `OwnerElection` charges the new owner a 30 s backoff on the very tick it won the election. The working tree has the correction (`names_another_leader(&fwd, node_id)`, plus its helper) and the full suite is green with it. THE COMMIT MESSAGE SAYS \\\"retag v0.8.35\\\", so if 0.8.35 was re-cut at that SHA it ships a yubaba whose appliance failover is SLOWER AND FLAKIER THAN BEFORE THIS TICKET — a regression wearing a fix's name. Verify before releasing: `git show HEAD:oss/yubaba/crates/yubaba/src/leader.rs | grep -n 'if claim_required'` must show the `&& names_another_leader` form, not the bare one.")
+/// @yah:handoff("FIXED, TWO PARTS, AND THE SECOND ONE TOOK THREE ATTEMPTS BECAUSE THE FIRST TWO BROKE OTHER TESTS — recorded because the wrong versions are plausible and someone will re-derive them. (1) THE SETTLE GATE, the primary fix. `FenceTiming` gains `settle_after` = 1x down_after (5 s fleet, 1.5 s rig), derived by the same constructor as the other two so the ordering is a property of the code rather than of two constants; `appliance_ownership::record_is_settled(leader_contact_for, timing)` is the predicate; `ApplianceWatcher` gains `leader_contact_since: Option<Instant>`, seeded NONE (not `now`) and reset to None on every loss of contact, folded in `run()`'s loop off the openraft metrics watch rather than the reconciler's own 10 s clock. Both `confirmed_now` and the act gate now require it. The act gate is EXTRACTED as `may_act_on_ownership(is_leader, recorded, node_id, settled)` for the reason `appliance_survives_leadership_loss` was — a three-term boolean whose failure mode is one term being too weak cannot be asserted inline. The two clauses are deliberately asymmetric: a LEADER needs no settle term, because it has applied everything it committed; only a reader of somebody else's committed record can be behind. (2) THE BACKSTOP: a `SetIngressOwner` that fails is now fatal — tearing down what was just started — but ONLY when the claim was load-bearing AND raft names a different leader.")
+/// @yah:handoff("WHY THE BACKSTOP NEEDS BOTH QUALIFIERS, each learned from a test that went red — this is the part worth reading before touching it. FIRST ATTEMPT: any `ForwardToLeader` is fatal. That broke `a_follower_that_owns_the_appliance_restarts_it_without_a_leadership_change` (45 s timeout), because R858-T3's SUPPORTED path is a non-leader owner restarting the appliance it already owns; its `SetIngressOwner` is a redundant re-assertion of a record that already names it, the write fails purely because it is not the leader, and raising there tore down the appliance it had just legitimately restarted. Qualified with `claim_required = recorded != Some(node_id)`, threaded in from the caller rather than re-read inside `on_became_leader` so it cannot disagree with the read `may_act` was decided on. SECOND ATTEMPT: still broke `a_powered_off_owner_expires_and_the_appliance_comes_up_on_a_survivor` (90 s timeout), because a FRESHLY ELECTED leader also gets `ForwardToLeader` in the window before it establishes itself — so the node that just won the election was charged a 30 s `OwnerElection` backoff and never stood the appliance up inside the budget. Qualified further with `names_another_leader(&fwd, node_id)`: fatal only when `fwd.leader_id` is `Some(other)` and other != me, which is exactly the shape measured on hardware (`has to forward request to: Some(13)` at node 11). `None` or `Some(me)` is transient and the next tick retries.")
+/// @yah:handoff("DELIBERATELY NOT DONE, with the reason, so it is not re-litigated. The exactly-correct primitive here is a linearizable read against the leader, and openraft 0.10.0-alpha.30 HAS one — but `Raft::ensure_linearizable` asserts LEADERSHIP and errors on a follower (read at its source: \\\"Err if fails to assert leadership\\\"), and the follower-read form, `get_read_linearizer`, needs the read log id fetched from the leader over a channel this crate does not have. The two cheap local alternatives were both checked against the measured case and both fail it: the raft TERM does not change during an appliance failover (leadership never moved — only ownership did, so node 11 rebooted into term 74 having last applied a term-74 entry), and `last_applied` does not advance on a cluster where nothing else is being written. So elapsed leader contact is the honest available evidence, denominated in the same currency as every other `FenceTiming` deadline. IT IS A BOUND, NOT A PROOF, and the doc comment on `record_is_settled` says so — which is precisely why the backstop exists alongside it. A follow-up worth its own ticket, NOT filed because it needs a design call rather than a fix: plumb a follower read-index so `settled` becomes provable instead of timed.")
+/// @yah:verify("FALSIFIED, single variable, against the real 3-node openraft harness. New test `a_rebooted_owner_does_not_start_a_coordinator_off_its_stale_record` (oss/yubaba/crates/yubaba/tests/raft_appliance_ownership.rs) PASSES with the fix; restore `may_act_on_ownership` to the pre-B20 body and it FAILS with `left: 2, right: 1` — the rebooted node deployed while the record named test-node-3, which is the hardware bug reproduced in the harness.")
+/// @yah:verify("The new test models a REBOOT, not the suspend its sibling models: it tears the appliance out of the dead node's runtime so `observe_local_appliance` answers None and the path under test is the one that STARTS a coordinator rather than the one that stops one. Non-vacuity is two-sided — the deploy counter is snapshotted before the restart and compared across a window in which the node was demonstrably alive, and a survivor must be serving throughout, or the returning node's claim would be legitimate and refusing it would be the bug.")
+/// @yah:verify("SUITES, all re-run after the final `names_another_leader` correction and after rustfmt: `cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib` = 830 passed / 0 failed (828 before, +2 new unit tests). `cargo test -p yubaba --features testing --test testing -- --test-threads 1` = 29 passed / 0 failed / 1 pre-existing ignored, 269 s — INCLUDING the two tests the intermediate versions broke. `cargo clippy -p yubaba --features testing --lib --tests` = zero findings on leader.rs, appliance_ownership.rs or raft_appliance_ownership.rs. rustfmt applied to those three files ONLY, never `cargo fmt` (it would reformat peers' dirty files).")
 async fn reconcile_appliance_ownership(
     node_id: YubabaNodeId,
     view: RaftView,
@@ -699,7 +781,19 @@ async fn reconcile_appliance_ownership(
     // headscale went on answering `cloud.mesh.yah.dev`.
     //
     // First, because a node that must not be serving must also not be electing.
-    let confirmed_now = has_leader && recorded == Some(node_id);
+    //
+    // R858-B20 adds `settled` to what was `has_leader` alone. `has_leader` was
+    // carrying the whole freshness argument and could not: it turns `true` the
+    // instant this node learns who the leader is, which on a just-booted daemon
+    // is before it has received anything from them, so `recorded` is still the
+    // node's own replayed pre-failover state. A record naming *this* node, read
+    // in that window, is not a confirmation of anything — it is the last thing
+    // this node believed before it died.
+    // Read before the `ApplianceWatcher` destructure below borrows the whole
+    // struct; both values are plain `Copy` snapshots of this tick.
+    let leader_contact = watcher.leader_contact_for();
+    let settled = record_is_settled(leader_contact, timing);
+    let confirmed_now = has_leader && settled && recorded == Some(node_id);
     if confirmed_now {
         watcher.ownership_confirmed_at = std::time::Instant::now();
     }
@@ -767,12 +861,33 @@ async fn reconcile_appliance_ownership(
     // and, importantly, nothing to *say*: reaching the refusal arms below on
     // every tick of every follower would turn this ticket's loud channel into
     // the noise operators learn to skip.
-    let may_act = is_leader || recorded == Some(node_id);
+    //
+    // R858-B20: the non-leader half is `settled`-gated. The leader half is not,
+    // and does not need to be — a leader has applied every entry it committed,
+    // so its own view is authoritative by construction. It is only the *reader*
+    // of somebody else's committed record who can be behind.
+    let may_act = may_act_on_ownership(is_leader, recorded, node_id, settled);
     if !may_act {
+        // Said once per unsettled tick, and only by a node that would otherwise
+        // have acted — a follower with no claim at all still returns silently.
+        // The distinction matters because this line means "I am withholding an
+        // action I believe I am entitled to take", which is worth reading.
+        if recorded == Some(node_id) {
+            info!(
+                node_id,
+                settle_after_secs = timing.settle_after.as_secs(),
+                leader_contact_ms = leader_contact.map(|d| d.as_millis() as u64),
+                "this node's own applied record names it as appliance owner, but it has not been \
+                 in contact with a raft leader long enough for that to mean anything yet — \
+                 withholding until the record settles (R858-B20)"
+            );
+        }
         return;
     }
 
     let now = unix_now_secs();
+    // R858-T5: BEFORE the probe, not after. See `hydrate_config_before_probe`.
+    hydrate_config_before_probe(&state.headscale_dir, state.headscale_url.as_deref());
     let mut candidates = BTreeMap::from([(
         node_id,
         election.candidate(
@@ -936,7 +1051,7 @@ async fn reconcile_appliance_ownership(
                 // reports it gone, which is how this arm was reached.
                 return;
             }
-            match on_became_leader(node_id, raft, state, machine).await {
+            match on_became_leader(node_id, raft, state, machine, recorded != Some(node_id)).await {
                 Ok(()) => {
                     // NOT `record_success` — deliberately, and this is the whole
                     // of R858-B13's second half. `on_became_leader` returning
@@ -1049,6 +1164,51 @@ async fn reconcile_appliance_ownership(
 /// moment this shipped — the 37-hour outage reproduced from the other side, and
 /// during a rolling upgrade that is *most* of the fleet. Only a kamaji that
 /// answers, and answers no, produces `Absent`.
+/// Render `config.yaml` if this node has none, *before* [`probe_native_exec`]
+/// judges whether this node could host the appliance.
+///
+/// # Why this is not inside `start_headscale` (R858-T5)
+///
+/// It was, and the two halves deadlocked. R858-T16 hydrates `config.yaml` as a
+/// pre-start step of [`start_headscale`]; R858-T4's probe refuses candidacy
+/// when any argv path — including that same `config.yaml` — is missing. So a
+/// node that has never hosted the appliance could never become eligible to run
+/// the hydration that would have made it eligible. MEASURED on us-west-011
+/// 2026-09-08 with a binary carrying both children: `missing=…/config.yaml` →
+/// `APPLIANCE UNHEALTHY … refusal: missing-native-exec`, on a ten-second
+/// cadence, forever, on a node with the binary, the noise key and a kamaji that
+/// reports `native_exec: true`.
+///
+/// That is precisely R858's own acceptance check — "`probe_native_exec`
+/// returning `Present` on us-south-001, which today returns `Absent` naming
+/// config.yaml" — and until this ran first it could not pass anywhere.
+///
+/// # Only when absent
+///
+/// The early return is load-bearing, not an optimisation. [`hydrate_config`]
+/// deliberately never overwrites (us-west-001's live `config.yaml` is
+/// hand-edited, and clobbering it re-decapitates the mesh), and calling it on
+/// every ten-second tick of every acting node would log a line per tick for the
+/// life of the process. Checking first keeps this silent on the node that is
+/// already provisioned and loud exactly once on the node that is not.
+///
+/// [`hydrate_config`]: headscale_state::hydrate_config
+fn hydrate_config_before_probe(headscale_dir: &std::path::Path, server_url: Option<&str>) {
+    if headscale_appliance::config_path(headscale_dir).exists() {
+        return;
+    }
+    match headscale_state::hydrate_config(headscale_dir, server_url) {
+        Ok(outcome) => info!(
+            ?outcome,
+            "hydrated headscale config.yaml ahead of the appliance candidacy probe"
+        ),
+        Err(e) => warn!(
+            "could not hydrate headscale config.yaml ({e}) — this node will refuse candidacy \
+             until it exists"
+        ),
+    }
+}
+
 async fn probe_native_exec(state: &Arc<ServerState>) -> NativeExecCapability {
     probe_native_exec_with(
         state
@@ -1294,8 +1454,14 @@ async fn on_became_leader(
     raft: &YubabaRaft,
     state: &Arc<ServerState>,
     machine: Option<String>,
+    // R858-B20: is the `SetIngressOwner` write below load-bearing, or a
+    // redundant re-assertion of a record that already names this node? Only the
+    // first makes a `ForwardToLeader` refusal fatal. Passed in rather than
+    // re-derived here, because the caller has already read `recorded` for this
+    // tick and a second read could disagree with the one `may_act` was decided
+    // on.
+    claim_required: bool,
 ) -> Result<(), ApplianceStartError> {
-    let _ = node_id;
     let headscale_db = state.headscale_dir.join("headscale.db");
 
     // 1. Restore from S3 (no-op if no snapshot exists yet).
@@ -1344,15 +1510,90 @@ async fn on_became_leader(
         let req = YubabaRequest::SetIngressOwner { machine };
         match raft.client_write(req).await {
             Ok(_) => info!("ingress owner set in raft state"),
-            // The appliance IS up; only the record is missing. Not an
-            // `ApplianceStartError` — re-electing away from a node that is
-            // serving would be the flap this ticket exists to prevent. The next
-            // tick re-writes it.
+            // ── R858-B20, THE BACKSTOP ───────────────────────────────────────
+            //
+            // `ForwardToLeader` is not a transient write failure and must not be
+            // treated as one. It means this node is NOT the raft leader, so the
+            // reasoning below — "the next tick re-writes it" — is false: no tick
+            // of this node will ever write it. What has actually happened is
+            // that a node reached the elect path on a record naming itself,
+            // started a coordinator, and cannot claim it. That is one half of a
+            // split brain, and it is exactly what a resurrected owner produced
+            // on the dev group on 2026-09-08 while its stale database
+            // replicated into the shared litestream prefix.
+            //
+            // Raising it is what makes the caller's `Err` arm run
+            // `on_lost_leader`, which stops both the appliance and the
+            // replication. NOT forwarded through `raft::client_write_forwarded`,
+            // deliberately, even though that helper exists and every other
+            // off-leader write in this crate uses it: forwarding would make the
+            // leader *accept* a stale node's claim and overwrite the correct
+            // record with it, converting a caught error into silent data loss.
+            // The refusal is the point.
+            Err(openraft::error::RaftError::APIError(
+                openraft::error::ClientWriteError::ForwardToLeader(fwd),
+            )) if claim_required && names_another_leader(&fwd, node_id) => {
+                return Err(ApplianceStartError::ClaimRefused {
+                    leader: fwd
+                        .leader_id
+                        .map_or_else(|| "unknown".to_string(), |id| id.to_string()),
+                });
+            }
+            // The two survivors of that guard, both benign, both measured:
+            //
+            //  * `claim_required == false` — the record ALREADY names this node,
+            //    so the write was a redundant re-assertion and refusing it costs
+            //    nothing. This is R858-T3's non-leader owner restarting the
+            //    appliance it owns, and raising here tore that appliance back
+            //    down; `a_follower_that_owns_the_appliance_restarts_it_without_a_leadership_change`
+            //    caught it.
+            //  * `names_another_leader == false` — openraft returned
+            //    `ForwardToLeader` without naming somebody else, which is what a
+            //    *freshly elected* leader emits in the window before it has
+            //    established itself. Treating that as fatal put the new owner
+            //    into `OwnerElection`'s 30 s backoff on the very tick it won the
+            //    election, and
+            //    `a_powered_off_owner_expires_and_the_appliance_comes_up_on_a_survivor`
+            //    then timed out at 90 s. The next tick retries, which is the
+            //    correct answer to "not ready yet".
+            Err(openraft::error::RaftError::APIError(
+                openraft::error::ClientWriteError::ForwardToLeader(_),
+            )) => debug!(
+                claim_required,
+                "the ingress-owner record was not written on this pass — either it already names \
+                 this node, or raft has not settled on a leader yet. Retrying on the next tick \
+                 (R858-B20)"
+            ),
+            // Everything else keeps the original reading, and it is still the
+            // right one: the appliance IS up, only the record is missing, and
+            // re-electing away from a node that is serving would be the flap
+            // R858-T3 exists to prevent. The next tick re-writes it.
             Err(e) => error!("failed to set ingress owner in raft: {e}"),
         }
     }
 
     Ok(())
+}
+
+/// Does this `ForwardToLeader` name a leader that is definitively **not** this
+/// node (R858-B20)?
+///
+/// The distinction the backstop turns on, and it is not decoration. Two very
+/// different situations share the one error type:
+///
+///  * `leader_id: Some(other)`, `other != me` — measured on us-west-011 on
+///    2026-09-08 as `has to forward request to: Some(13)`. Raft has a leader and
+///    it is somebody else, so this node had no standing to elect itself and
+///    never will on any later tick. Fatal.
+///  * `leader_id: None`, or `Some(me)` — raft has not settled, or this node *is*
+///    the leader but is not yet able to serve the write. Transient: the next
+///    reconcile tick retries. Reading it as fatal charges a 30 s backoff to a
+///    node that just legitimately won the election.
+fn names_another_leader(
+    fwd: &openraft::error::ForwardToLeader<crate::raft::YubabaRaftConfig>,
+    node_id: YubabaNodeId,
+) -> bool {
+    fwd.leader_id.is_some_and(|id| id != node_id)
 }
 
 async fn on_lost_leader(state: &Arc<ServerState>) {
@@ -1483,8 +1724,15 @@ async fn start_headscale(state: &Arc<ServerState>) -> Result<(), ApplianceStartE
         let mesh = crate::mesh::MeshAssignment::inlined(mesh_ip);
         match backend.deploy_workload(&spec, &mesh).await {
             Ok(result) => {
+                // No `pid` field, deliberately (R858-T8). On the sibling path
+                // `DeployResult::task_pid` is structurally 0 — `KamajiClient`
+                // acks on *admission*, before the fork — so this line printed
+                // `pid=0` on every live deployment while kamaji's own
+                // `native workload forked id=headscale pid=<N>` sat one line
+                // above it in the same journal. A field that is always zero is
+                // worse than an absent one: it reads as "the appliance has no
+                // pid", which is the shape of a failed start.
                 info!(
-                    pid = result.task_pid,
                     mesh_ip = %mesh_ip,
                     "headscale appliance deployed under kamaji supervision"
                 );
@@ -1542,6 +1790,13 @@ pub enum ApplianceStartError {
     NoiseIdentity(String),
     /// Neither the kamaji path nor the systemd fallback started it.
     BothPathsFailed { kamaji: String },
+    /// R858-B20: the appliance started, but this node could not record itself as
+    /// the owner because it is not the raft leader.
+    ///
+    /// A start that cannot be claimed is not a start — it is the second half of
+    /// a split brain. The variant exists so the caller tears down what it just
+    /// stood up rather than leaving an unclaimable coordinator running.
+    ClaimRefused { leader: String },
 }
 
 impl std::fmt::Display for ApplianceStartError {
@@ -1557,6 +1812,14 @@ impl std::fmt::Display for ApplianceStartError {
                 f,
                 "no start path succeeded (kamaji: {kamaji}; systemd: `systemctl enable --now \
                  headscale` failed — unit missing or systemd unavailable)"
+            ),
+            Self::ClaimRefused { leader } => write!(
+                f,
+                "started the appliance but could not claim ownership: raft says the leader is \
+                 {leader}, not this node, so nothing here will ever write the record. This node \
+                 acted on an ownership record it had no standing to act on — stopping what it \
+                 started rather than leaving a coordinator the cluster does not know about \
+                 (R858-B20)"
             ),
         }
     }
@@ -1783,6 +2046,73 @@ mod tests {
             std::fs::write(&p, b"#!/bin/true\n").unwrap();
         }
         dir
+    }
+
+    /// R858-T5, the deadlock between T4's probe and T16's hydration. A node
+    /// carrying the binary but no `config.yaml` — every failover target the
+    /// fleet has — is `Absent` until something renders it, and the thing that
+    /// renders it used to sit downstream of this verdict. Measured on
+    /// us-west-011 before the fix; pinned here so it cannot come back by moving
+    /// the hydration call.
+    #[tokio::test]
+    async fn hydrating_the_config_first_is_what_turns_a_fresh_candidate_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            headscale_appliance::binary_path(dir.path()),
+            b"#!/bin/true\n",
+        )
+        .unwrap();
+
+        // Before: the binary is there, kamaji says yes, and the node still
+        // refuses — naming the file the hydration step would have written.
+        assert_eq!(
+            probe_native_exec_with(
+                Some(std::future::ready(Ok(caps(true)))),
+                &argv_paths(dir.path())
+            )
+            .await,
+            NativeExecCapability::Absent,
+            "a node with no config.yaml must refuse candidacy",
+        );
+
+        hydrate_config_before_probe(dir.path(), Some(COORDINATOR_URL));
+
+        assert_eq!(
+            probe_native_exec_with(
+                Some(std::future::ready(Ok(caps(true)))),
+                &argv_paths(dir.path())
+            )
+            .await,
+            NativeExecCapability::Present,
+            "hydration is what makes a fresh node an eligible failover target",
+        );
+    }
+
+    /// The early return is the guard on us-west-001's hand-edited `config.yaml`:
+    /// this runs on every acting node's ten-second tick, so an unconditional
+    /// render would rewrite that file forever — R858-T16's re-decapitation
+    /// hazard, reintroduced through a new door.
+    #[test]
+    fn hydration_before_the_probe_never_touches_a_config_that_is_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = headscale_appliance::config_path(dir.path());
+        std::fs::write(&path, b"hand-edited: do not clobber\n").unwrap();
+
+        hydrate_config_before_probe(dir.path(), Some(COORDINATOR_URL));
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "hand-edited: do not clobber\n",
+        );
+    }
+
+    /// No coordinator URL means nothing can be rendered. The node must stay
+    /// refusing rather than write a config the appliance cannot serve from.
+    #[test]
+    fn hydration_before_the_probe_writes_nothing_without_a_coordinator_url() {
+        let dir = tempfile::tempdir().unwrap();
+        hydrate_config_before_probe(dir.path(), None);
+        assert!(!headscale_appliance::config_path(dir.path()).exists());
     }
 
     /// The in-process-runtime fallback: nobody to ask. Not knowing is not a

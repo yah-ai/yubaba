@@ -59,7 +59,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use acme_engine::{AcmeChallengeKind, AcmeDirectory, IssueConfig};
+use acme_engine::{AcmeChallengeKind, IssueConfig};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use zeroize::Zeroizing;
@@ -178,9 +178,7 @@ pub fn parse_domain_issuer_config(
         )
     })?;
 
-    let directory = AcmeDirectory::parse(
-        &get("YUBABA_ACME_DIRECTORY").unwrap_or_else(|| "staging".to_string()),
-    );
+    let directory = crate::cert_store::acme_directory(&get);
     let account_cache_path = get("YUBABA_ACME_ACCOUNT_CACHE")
         .unwrap_or_else(|| "/var/lib/yah/yubaba/acme-account.json".to_string());
     let kek_path =
@@ -450,7 +448,11 @@ async fn consider_domain(
     }
     *last_order = Some(Instant::now());
 
-    match issue_domain(cfg, domain).await {
+    // R853-F10: name the cert we are replacing, read off the record we already
+    // fetched above for the age check — no extra round-trip and no KEK unseal,
+    // since `ari` is plaintext beside the ciphertext.
+    let replaces = existing.as_ref().and_then(|r| r.ari.clone());
+    match issue_domain(cfg, domain, replaces.as_deref()).await {
         Ok(issued) => {
             store_issued(store, cfg, kek, domain, &cert_name, &key_name, issued).await?;
             let (store, domain_owned) = (Arc::clone(store), domain.to_string());
@@ -506,12 +508,21 @@ fn order_identifiers(domain: &str) -> Vec<String> {
 async fn issue_domain(
     cfg: &DomainIssuerConfig,
     domain: &str,
+    replaces: Option<&str>,
 ) -> Result<acme_engine::Issued, acme_engine::AcmeError> {
     let mut issue = cfg.issue.clone();
     issue.domains = order_identifiers(domain);
     // DNS-01 needs no HTTP-01 token map, but the engine's signature takes one.
     let tokens: acme_engine::ChallengeTokens = Arc::new(RwLock::new(HashMap::new()));
-    acme_engine::issue(&issue, &tokens).await
+    // R853-F10: `replaces` is the ARI id of the cert this domain currently
+    // holds, off `SecretRecord::ari`. It buys this issuer less than it buys the
+    // fleet one — a tenant order is always exactly `order_identifiers(domain)`,
+    // one name that never widens, so every renewal here already qualifies under
+    // the CA's exact-identifier-set detection. What it adds is the
+    // failed-authorization limit, which a tenant whose CNAME is not yet in
+    // place is the one thing that actually walks into. `None` is the cold-start
+    // and legacy-record path and is exactly the pre-F10 behaviour.
+    acme_engine::issue(&issue, &tokens, replaces).await
 }
 
 /// Seal the freshly issued pair under the node KEK and write it to the store.
@@ -535,7 +546,23 @@ async fn store_issued(
     // domains, and `AllowAny` over-answers it by making every tenant private key
     // a bearer secret. See `tenant_passway::grant`.
     let access = crate::tenant_passway::grant(&cfg.access, domain);
-    let cert_rec = seal_cluster_secret(kek, issued.cert_chain_pem.as_bytes(), stamp, access.clone());
+    let mut cert_rec =
+        seal_cluster_secret(kek, issued.cert_chain_pem.as_bytes(), stamp, access.clone());
+    // R853-F10: stamp the ARI id of the chain the CA just returned, so the next
+    // sweep's renewal can name it. `sans` deliberately stays `None` here —
+    // `order_identifiers` pins a tenant order to exactly one name that cannot
+    // widen, which is what makes `needs_issuance`'s `CertSans::NotChecked` an
+    // audited choice rather than a gap (see `order_identifiers`). `ari` is not
+    // in that position: it is about naming the previous cert, not about
+    // coverage, so the fleet issuer's argument for it applies here unchanged.
+    cert_rec.ari = acme_engine::ari_certificate_id(&issued.cert_chain_pem);
+    if cert_rec.ari.is_none() {
+        warn!(
+            domain = %domain,
+            "domain issuer: could not derive an ARI id from the freshly issued chain — \
+             the next renewal for this domain forfeits the RFC 9773 exemption"
+        );
+    }
     // Zeroizing for the same reason the fleet issuer does it: this is the
     // node's own plaintext copy of a tenant's private key, and it should not
     // linger in a freed heap page after this frame.
@@ -703,6 +730,7 @@ mod tests {
             access: SecretAccess::AllowAny,
             digest: None,
             sans: None,
+            ari: None,
         }
     }
 

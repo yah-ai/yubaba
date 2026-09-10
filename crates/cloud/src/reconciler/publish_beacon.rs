@@ -136,6 +136,32 @@ impl PublishBeacon {
             .as_deref()
             .unwrap_or("(content-addressed bundle — no publish clock)")
     }
+
+    /// Whether this beacon came from [`PublishBeacon::for_bundle`] rather than
+    /// [`PublishBeacon::new`] — i.e. which mirror slot's check produced it.
+    ///
+    /// The absence of a clock IS the discriminator, not a proxy for one:
+    /// `published_at` is `None` for a bundle stamp by construction and
+    /// `Some(now)` for an R2 publish by construction, and the field's own docs
+    /// say so. Named as a method because [`serving_failure`] has to tell an
+    /// operator WHICH `[providers.*]` block holds the `verify_serving` knob it
+    /// is telling them about, and getting that wrong costs a whole apply cycle —
+    /// it cost one on 2026-09-08 (R870-T9), where the message said
+    /// `[providers.static]`, the failing check was the bundle arm reading
+    /// `BundleSlot::verify_serving`, and the edit therefore did nothing.
+    pub fn is_bundle_stamp(&self) -> bool {
+        self.published_at.is_none()
+    }
+
+    /// The mirror block whose `verify_serving` key governs the check that
+    /// produced this beacon.
+    pub fn verify_serving_slot(&self) -> &'static str {
+        if self.is_bundle_stamp() {
+            "[providers.bundle]"
+        } else {
+            "[providers.static]"
+        }
+    }
 }
 
 /// The `prefix` label a bundle stamp carries. Not an R2 key prefix — a bundle
@@ -398,7 +424,7 @@ pub fn serving_failure(
          \x20 curl -sI {}   # is the object even in the bucket\n\
          \n\
          If a front-door migration is deliberately in flight, set \
-         `verify_serving = false` in the mirror's [providers.static] block and \
+         `verify_serving = false` in the mirror's {} block and \
          name the ticket in a comment — do not delete this check.",
         short(&expected.digest),
         expected.published_label(),
@@ -410,6 +436,7 @@ pub fn serving_failure(
         front_door_beacon,
         front_door_state.summary(),
         origin_beacon,
+        expected.verify_serving_slot(),
     )
 }
 
@@ -802,6 +829,41 @@ component = "yah-marketing/site"
         assert!(err.contains(".yah/domains/yah-dev.toml"), "{err}");
         assert!(err.contains("passway"), "{err}");
         assert!(err.contains("verify_serving"), "{err}");
+    }
+
+    /// R870-T9: the escape-hatch sentence has to name the block that actually
+    /// holds the knob. It hardcoded `[providers.static]`, so an operator whose
+    /// BUNDLE check was failing edited the static block, changed nothing, and
+    /// burned a full apply cycle finding that out — a wrong pointer in an error
+    /// message is worse than none, because it is followed.
+    #[test]
+    fn serving_failure_names_the_block_that_holds_the_knob() {
+        let fail = |expected: &PublishBeacon| {
+            serving_failure(
+                "yah.dev",
+                "https://yah.dev",
+                &ServedState::Missing { status: 404 },
+                "https://cdn.yah.dev/yah-marketing/cloud",
+                &ServedState::Match,
+                expected,
+                Some(("yah-dev".to_string(), FrontDoor::Passway)),
+            )
+            .to_string()
+        };
+
+        // R2 publish → PublishBeacon::new → clock present → static slot.
+        let static_beacon = beacon();
+        assert!(!static_beacon.is_bundle_stamp());
+        let err = fail(&static_beacon);
+        assert!(err.contains("[providers.static]"), "{err}");
+        assert!(!err.contains("[providers.bundle]"), "{err}");
+
+        // Bundle stamp → PublishBeacon::for_bundle → clock-free → bundle slot.
+        let bundle_stamp = bundle_beacon(&bundle_manifest());
+        assert!(bundle_stamp.is_bundle_stamp());
+        let err = fail(&bundle_stamp);
+        assert!(err.contains("[providers.bundle]"), "{err}");
+        assert!(!err.contains("[providers.static]"), "{err}");
     }
 
     // ── W272 bundle stamp (R703-T7) ─────────────────────────────────────────

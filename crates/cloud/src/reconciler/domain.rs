@@ -657,8 +657,9 @@ pub fn public_origins(
             .find(|m| &m.name == name)
             .with_context(|| {
                 format!(
-                    "front door collated onto machine {name:?}, which has no \
-                     .yah/infra/machines/*.toml — cannot resolve its public address"
+                    "front door collated onto machine {name:?}, which is in neither this \
+                     camp's own .yah/infra/machines/*.toml nor any fleet it borrows through \
+                     .yah/infra/sources.toml — cannot resolve its public address"
                 )
             })?;
         if !machine
@@ -875,6 +876,70 @@ pub fn diff_apex_records(plan: &DomainPasswayPlan, live: &[LiveApexRecord]) -> A
     }
 }
 
+/// Resolve the DNS adapter one passway apply talks to.
+///
+/// Its own function only so the read path and the write path cannot drift onto
+/// different credentials or a different provider seam.
+fn passway_envoy(workspace_root: &Path, provider_id: &str) -> Result<CloudflareEnvoy> {
+    let cf_provider = super::cf_creds::CfProvider::resolve(workspace_root, provider_id)?;
+    Ok(CloudflareEnvoy::new(
+        cf_provider.api_token()?,
+        cf_provider.account_id.clone(),
+    ))
+}
+
+/// The `list` leg of [`deploy_domain_passway`] — the live A records at one
+/// name, as `dns.record.list` reports them.
+///
+/// Takes `zone`/`name` rather than a [`DomainPasswayPlan`] because the
+/// no-door-declared branch of [`ensure_passway_apex`] has to read the apex
+/// *without* a plan — there are no origins to build one from, and whether the
+/// apex is currently serving is exactly the question it needs answered.
+async fn read_live_apex(
+    envoy: &CloudflareEnvoy,
+    zone: &str,
+    name: &str,
+) -> Result<Vec<LiveApexRecord>> {
+    let listed = envoy
+        .dns_record_list(DnsRecordListInput {
+            zone: zone.to_string(),
+            name: Some(name.to_string()),
+            record_type: Some("A".to_string()),
+        })
+        .await
+        .with_context(|| format!("listing A records at {name}"))?;
+    Ok(listed
+        .records
+        .into_iter()
+        .map(|r| LiveApexRecord {
+            content: r.content,
+            proxied: r.proxied,
+        })
+        .collect())
+}
+
+/// Read the live apex A records **without being able to write any** — the
+/// read-only half of [`deploy_domain_passway`], exposed so convergence can be
+/// checked against a real Cloudflare account by something that has no write
+/// path at all (R859-F1's live acceptance check,
+/// `tests/passway_apex_live.rs`).
+///
+/// Pair it with [`plan_passway_apex`] and [`diff_apex_records`] to answer "what
+/// would `yah cloud apply` change?" against live DNS. That is the *whole* of
+/// what an apply decides — same planner, same list verb, same diff — minus the
+/// two `dns.record.upsert` / `dns.record.delete` calls, which this function
+/// cannot reach. A caller can therefore assert convergence against the real
+/// zone without a live-DNS blast radius, which is what makes the check safe to
+/// leave runnable rather than described in a handoff.
+pub async fn list_live_apex_records(
+    workspace_root: &Path,
+    provider_id: &str,
+    plan: &DomainPasswayPlan,
+) -> Result<Vec<LiveApexRecord>> {
+    let envoy = passway_envoy(workspace_root, provider_id)?;
+    read_live_apex(&envoy, &plan.zone, &plan.name).await
+}
+
 /// Apply a [`DomainPasswayPlan`] against live DNS (R859-F1, live I/O).
 ///
 /// **First production consumer of the `dns.*` envoy verbs** — every read and
@@ -908,25 +973,8 @@ pub async fn deploy_domain_passway(
     provider_id: &str,
     plan: &DomainPasswayPlan,
 ) -> Result<PasswayApexOutcome> {
-    let cf_provider = super::cf_creds::CfProvider::resolve(workspace_root, provider_id)?;
-    let envoy = CloudflareEnvoy::new(cf_provider.api_token()?, cf_provider.account_id.clone());
-
-    let listed = envoy
-        .dns_record_list(DnsRecordListInput {
-            zone: plan.zone.clone(),
-            name: Some(plan.name.clone()),
-            record_type: Some("A".to_string()),
-        })
-        .await
-        .with_context(|| format!("listing A records at {}", plan.name))?;
-    let live: Vec<LiveApexRecord> = listed
-        .records
-        .into_iter()
-        .map(|r| LiveApexRecord {
-            content: r.content,
-            proxied: r.proxied,
-        })
-        .collect();
+    let envoy = passway_envoy(workspace_root, provider_id)?;
+    let live = read_live_apex(&envoy, &plan.zone, &plan.name).await?;
 
     let diff = diff_apex_records(plan, &live);
 
@@ -1005,6 +1053,93 @@ pub async fn deploy_domain_passway(
 /// apex publishes, which is what makes the manifest the single source the
 /// two-source flip lacked.
 ///
+/// The planning half is [`plan_passway_apex`] (which also carries the
+/// `report.problems` prune gate); this function is that plan handed to
+/// [`deploy_domain_passway`].
+///
+/// # `Ok(None)`: the door is declared but not stood up yet
+///
+/// A camp can legitimately declare `front_door = "passway"` on a domain whose
+/// passway edge does not exist yet — the manifest field is how you *say* which
+/// door you intend, and R859-F1 made it the mechanism as well, so it is written
+/// before the edge is. The noisetable camp is exactly this: `noisetable.com`
+/// declares `passway`, its only ingress edge is a `cloudflare-tunnel` on a
+/// different domain, and its apex is deliberately NXDOMAIN pending a node.
+///
+/// Treating that as an error would have been wrong twice over. It fails the
+/// whole `yah cloud apply` — the domain loop `bail!`s at the first failure
+/// without `--continue-on-error` — so one not-yet-built door takes down the
+/// publish chain for every service and every other domain in the camp. And the
+/// empty-apex guard it would trip
+/// ([`plan_domain_passway`]'s "refusing to render an empty apex") exists to
+/// prevent a *wipe*, which skipping prevents equally well: this arm writes
+/// nothing at all on this path.
+///
+/// So "no passway edge collated" is `Ok(None)` — but only after checking that
+/// the apex is not **currently serving**. Those are two different worlds and
+/// only a DNS read tells them apart:
+///
+/// - Nothing live at the name → the door was never stood up. Skip.
+/// - Records live at the name → an edge that WAS fronting this apex has
+///   vanished from the collation, and the next apply would otherwise silently
+///   leave orphaned records pointing at whatever used to serve. That is a hard
+///   error, and it is the case the empty-apex guard was really written for.
+///
+/// The read costs nothing extra in practice: this arm only runs inside the
+/// domain pass, which already resolved a Cloudflare provider and an
+/// `account_id` before entering the loop.
+pub async fn ensure_passway_apex(
+    workspace_root: &Path,
+    provider_id: &str,
+    domain: &DomainConfig,
+) -> Result<Option<PasswayApexOutcome>> {
+    let Some(plan) = plan_passway_apex(workspace_root, domain)? else {
+        let zone = parent_zone_name(&domain.domain).to_string();
+        let envoy = passway_envoy(workspace_root, provider_id)?;
+        let live = read_live_apex(&envoy, &zone, &domain.domain).await?;
+        if live.is_empty() {
+            debug!(
+                domain = %domain.domain,
+                "declares front_door = \"passway\" with no passway ingress edge collated, and \
+                 nothing is live at the apex — nothing to render, skipping"
+            );
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "domain {} ({}) declares front_door = \"passway\" and {} A record(s) are live at \
+             the apex ({}), but no passway ingress edge collates onto it. An edge that was \
+             fronting this apex has disappeared from the declaration, and these records now \
+             point at whatever used to serve. Restore the ingress edge, or move the domain \
+             off `passway`, before applying again.",
+            domain.name,
+            domain.domain,
+            live.len(),
+            live.iter()
+                .map(|r| r.content.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    };
+    deploy_domain_passway(workspace_root, provider_id, &plan)
+        .await
+        .map(Some)
+}
+
+/// The pure half of [`ensure_passway_apex`]: collate, resolve, plan — no
+/// network, no credential, no write path.
+///
+/// Split out so the apex a given workspace *would* publish can be computed by a
+/// caller that must not be able to change it. `yah cloud apply` reaches it only
+/// through [`ensure_passway_apex`]; the live acceptance check
+/// (`tests/passway_apex_live.rs`) calls it directly and pairs it with
+/// [`list_live_apex_records`], so the check exercises this exact planner rather
+/// than a second copy of its logic that could agree with the live zone while
+/// production disagreed.
+///
+/// Every input is *declared* config: no network read decides which origins the
+/// apex publishes, which is what makes the manifest the single source the
+/// two-source flip lacked.
+///
 /// ## Why `report.problems` gates the prune
 ///
 /// [`collate_workspace_ingress`](crate::validate::collate_workspace_ingress)
@@ -1023,11 +1158,25 @@ pub async fn deploy_domain_passway(
 /// deliberately, problems do **not** fail the arm — one service's broken
 /// ingress declaration must not block another's DNS apply, and upserts can
 /// only ever add reachable origins.
-pub async fn ensure_passway_apex(
+///
+/// ## `Ok(None)` — no passway edge collates at all
+///
+/// Distinct from every error this can return, and the distinction is the whole
+/// point: a camp that declares `front_door = "passway"` before building the
+/// door has made no mistake, and must not have its apply failed for it. See
+/// [`ensure_passway_apex`], which decides what to do about it (and is the one
+/// that can tell "never stood up" from "the door vanished", because that takes
+/// a DNS read this pure function must not make).
+///
+/// Note the narrowness: `None` means the *collation* produced no passway edge.
+/// A declared edge whose machine lacks the `public-ip` taint, or carries a
+/// private address, still reaches [`plan_domain_passway`] and still trips its
+/// empty-apex guard as an error — an intended door that resolves to nothing is
+/// a misconfiguration, not an absence.
+pub fn plan_passway_apex(
     workspace_root: &Path,
-    provider_id: &str,
     domain: &DomainConfig,
-) -> Result<PasswayApexOutcome> {
+) -> Result<Option<DomainPasswayPlan>> {
     let report = crate::validate::collate_workspace_ingress(workspace_root)
         .context("collating workspace ingress to find the passway front doors")?;
 
@@ -1052,13 +1201,22 @@ pub async fn ensure_passway_apex(
     front_door_machines.sort();
     front_door_machines.dedup();
 
-    let machines: Vec<MachineConfig> = crate::validate::load_machine_tomls(
-        workspace_root,
-        crate::validate::MachineLoadMode::Strict,
-    )?
-    .into_iter()
-    .map(|(_, m)| m)
-    .collect();
+    // The door is declared but not built yet. Answered here rather than left to
+    // plan_domain_passway's empty-apex guard, because an absent edge and an
+    // edge that resolves to no public address want opposite treatment.
+    if front_door_machines.is_empty() {
+        return Ok(None);
+    }
+
+    // R870-B13: the camp's resolved fleet inventory, not its camp-local
+    // machine files. A camp that BORROWS another camp's fleet (empty
+    // `.yah/infra/machines/`, one `[[source]]` link in
+    // `.yah/infra/sources.toml`) declares no machines of its own, so reading
+    // the camp-local loader here failed the apex render on a front-door
+    // machine that was declared all along — in the owner's tree, which the
+    // link names. The inventory is the one reader every name lookup shares.
+    let inventory = crate::config::resolve_fleet_inventory(workspace_root)
+        .context("resolving the fleet inventory to place the apex origins")?;
 
     // R859-F2: no health exclusions on the `yah cloud apply` path, deliberately
     // and not as a stub. The confirmed-down fact is a *fleet-runtime* one —
@@ -1068,9 +1226,21 @@ pub async fn ensure_passway_apex(
     // Feeding it a liveness guess here would let a laptop with a flaky uplink
     // withdraw a live origin. The exclusion set enters through the effector
     // that *has* the fact; this path renders the declaration as declared.
-    let resolved = public_origins(&front_door_machines, &machines, &[])?;
-    let plan = plan_domain_passway(domain, resolved, origins_complete)?;
-    deploy_domain_passway(workspace_root, provider_id, &plan).await
+    //
+    // The source accounting rides along on the error rather than the success
+    // path: "no such machine" reads identically whether this camp declared no
+    // link, aimed one at a directory that is not a camp, or filtered the
+    // machine out with `select`, and the operator needs to know which.
+    let resolved =
+        public_origins(&front_door_machines, &inventory.machines, &[]).map_err(|e| {
+            let sources = inventory.describe_sources();
+            if sources.is_empty() {
+                e
+            } else {
+                e.context(sources)
+            }
+        })?;
+    plan_domain_passway(domain, resolved, origins_complete).map(Some)
 }
 
 #[cfg(test)]
@@ -1276,8 +1446,8 @@ mod tests {
     // and `deploy_domain_passway` only executes the diff these produce.
 
     use super::{
-        diff_apex_records, plan_domain_passway, public_origins, ApexRecordDiff, DomainPasswayPlan,
-        LiveApexRecord, PasswayOrigin, ResolvedOrigins,
+        diff_apex_records, plan_domain_passway, plan_passway_apex, public_origins, ApexRecordDiff,
+        DomainPasswayPlan, LiveApexRecord, PasswayOrigin, ResolvedOrigins,
     };
     use crate::config::{ConnectSpec, MachineConfig};
     use std::net::Ipv4Addr;
@@ -1324,6 +1494,7 @@ mod tests {
             connect: address.map(|a| ConnectSpec {
                 address: a.into(),
                 ssh: format!("root@{a}"),
+                identity_file: "~/.ssh/yah".into(),
                 yubaba_port: None,
                 yubaba: None,
             }),
@@ -1458,6 +1629,164 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["15.204.89.240", "51.81.85.145"],
         );
+    }
+
+    /// A camp may declare `front_door = "passway"` BEFORE the passway edge
+    /// exists — the field is how you say which door you intend, and R859-F1
+    /// made it the mechanism as well, so it gets written first. The noisetable
+    /// camp is exactly this: `noisetable.com` declares `passway`, its only
+    /// ingress edge is a `cloudflare-tunnel` on a different domain, and its
+    /// apex is deliberately NXDOMAIN pending a node of its own (passway serves
+    /// one cert per listener — R777).
+    ///
+    /// That must plan to `None`, never to an `Err`. The domain loop in `yah
+    /// cloud apply` bails at the first domain failure without
+    /// `--continue-on-error`, so an error here would take down the publish
+    /// chain of every service in the camp over a door nobody has built yet.
+    #[test]
+    fn a_passway_domain_with_no_ingress_edge_plans_to_none_rather_than_erroring() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A workspace with a services tree but nothing fronting anything —
+        // the shape of a camp whose door is declared but not stood up.
+        std::fs::create_dir_all(root.join(".yah/services")).unwrap();
+
+        let planned = plan_passway_apex(root, &passway_manifest())
+            .expect("an undeclared door is not an error");
+        assert!(
+            planned.is_none(),
+            "expected None (nothing to render), got {planned:?}"
+        );
+    }
+
+    /// R870-B13, end to end: a camp that BORROWS another camp's fleet renders
+    /// its sovereign apex from the owner's machine declaration.
+    ///
+    /// This is the ticket's defect in one test. The borrowing camp's own
+    /// `.yah/infra/machines/` is empty — it declares one `[[source]]` link in
+    /// `.yah/infra/sources.toml` and pins its front door by name. Before the
+    /// fix, `plan_passway_apex` read a camp-local-only loader, so the pinned
+    /// name resolved against an empty fleet and the render died with "has no
+    /// .yah/infra/machines/*.toml — cannot resolve its public address" on a
+    /// machine that was declared all along, one directory over.
+    ///
+    /// The camp-local control assertion is what makes this non-vacuous: the
+    /// borrowing camp genuinely holds no copy of the inventory, so a pass here
+    /// can only come from the link being followed.
+    #[test]
+    fn a_borrowing_camp_renders_its_apex_from_the_owners_machine_declaration() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // The owner camp — the ONE copy of the inventory.
+        let owner = dir.path().join("owner");
+        std::fs::create_dir_all(owner.join(".yah/infra/machines")).unwrap();
+        std::fs::write(
+            owner.join(".yah/infra/machines/us-east-001.toml"),
+            "name = \"us-east-001\"\nprovider = \"ovh\"\nmesh_tags = []\n\
+             taints = [\"public-ip\"]\n\
+             [connect]\naddress = \"51.81.85.145\"\nssh = \"root@51.81.85.145\"\n\
+             identity_file = \"~/.ssh/yah\"\n",
+        )
+        .unwrap();
+
+        // The borrowing camp: empty machines dir, one link, one pinned edge.
+        let borrower = dir.path().join("borrower");
+        std::fs::create_dir_all(borrower.join(".yah/infra/machines")).unwrap();
+        std::fs::write(
+            borrower.join(".yah/infra/sources.toml"),
+            "schema_version = 1\n[[source]]\nowner = \"owner\"\nkind = \"path\"\n\
+             path = \"../owner\"\nmode = \"read-only\"\n",
+        )
+        .unwrap();
+        let svc = borrower.join(".yah/services/marketing");
+        std::fs::create_dir_all(svc.join("mirrors")).unwrap();
+        std::fs::write(
+            svc.join("service.toml"),
+            "schema_version = 1\nname = \"marketing\"\ndomain = \"yah.dev\"\n\
+             [[components]]\nid = \"site\"\nkind = \"static-asset\"\n\
+             path = \"marketing/site\"\nrole = \"static\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            svc.join("mirrors/cloud.toml"),
+            "schema_version = 1\nshape = \"single-machine\"\n\
+             ingress = \"passway\"\ningress_machines = [\"us-east-001\"]\n\
+             [providers.compute]\nuse = \"hetzner\"\nzone = \"yah.dev\"\n\
+             port = 8080\nupstream_host = \"100.64.0.5\"\n",
+        )
+        .unwrap();
+
+        // Control: the camp holds no machine declaration of its own.
+        assert!(crate::validate::load_camp_local_machine_tomls(&borrower)
+            .unwrap()
+            .is_empty());
+
+        let plan = plan_passway_apex(&borrower, &passway_manifest())
+            .expect("a borrowed front-door machine must resolve")
+            .expect("the passway edge collates, so this is not the no-door case");
+        assert_eq!(
+            plan.origins
+                .iter()
+                .map(|o| o.address.to_string())
+                .collect::<Vec<_>>(),
+            vec!["51.81.85.145".to_string()],
+        );
+    }
+
+    /// The failure that remains a failure, with the diagnosis attached: a
+    /// pinned machine no linked source supplies must still error — and the
+    /// error must name the links that were consulted, since "no such machine"
+    /// alone cannot tell an undeclared link from a broken one.
+    #[test]
+    fn an_unresolvable_front_door_names_the_links_that_were_consulted() {
+        let dir = tempfile::tempdir().unwrap();
+        let borrower = dir.path().join("borrower");
+        std::fs::create_dir_all(borrower.join(".yah/infra/machines")).unwrap();
+        std::fs::write(
+            borrower.join(".yah/infra/sources.toml"),
+            "schema_version = 1\n[[source]]\nowner = \"owner\"\nkind = \"path\"\n\
+             path = \"../not-a-camp\"\n",
+        )
+        .unwrap();
+        let svc = borrower.join(".yah/services/marketing");
+        std::fs::create_dir_all(svc.join("mirrors")).unwrap();
+        std::fs::write(
+            svc.join("service.toml"),
+            "schema_version = 1\nname = \"marketing\"\ndomain = \"yah.dev\"\n\
+             [[components]]\nid = \"site\"\nkind = \"static-asset\"\n\
+             path = \"marketing/site\"\nrole = \"static\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            svc.join("mirrors/cloud.toml"),
+            "schema_version = 1\nshape = \"single-machine\"\n\
+             ingress = \"passway\"\ningress_machines = [\"us-east-001\"]\n\
+             [providers.compute]\nuse = \"hetzner\"\nzone = \"yah.dev\"\n\
+             port = 8080\nupstream_host = \"100.64.0.5\"\n",
+        )
+        .unwrap();
+
+        let err = plan_passway_apex(&borrower, &passway_manifest()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("us-east-001"), "{msg}");
+        assert!(msg.contains("sources.toml"), "{msg}");
+        assert!(msg.contains("owner"), "{msg}");
+        assert!(msg.contains("ABSENT"), "{msg}");
+    }
+
+    /// The other side of that discriminator, and the reason it is drawn at the
+    /// COLLATION rather than at the resolved-address set: a machine that IS
+    /// declared as a front door but yields no public address is a
+    /// misconfiguration of an intended door, and stays an error.
+    #[test]
+    fn a_declared_front_door_that_resolves_to_no_public_address_still_errors() {
+        // Declared as a front door, but carries no `public-ip` taint — so the
+        // taint filter empties the set even though the edge exists.
+        let machines = vec![machine("us-east-001", Some("51.81.85.145"), &[])];
+        let resolved = public_origins(&["us-east-001".to_string()], &machines, &[]).unwrap();
+        let err = plan_domain_passway(&passway_manifest(), resolved, true).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("empty apex"), "{msg}");
     }
 
     /// The live-DNS blast radius this arm exists to bound: an empty desired

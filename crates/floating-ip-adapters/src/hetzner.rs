@@ -1,42 +1,29 @@
-//! [`HetznerFloatingIp`] — `floating_ip.*` adapter for Hetzner Cloud
-//! floating IPs (R594-F5).
+//! [`HetznerFloatingIp`] — Hetzner Cloud floating IPs (R594-F5).
 //!
 //! Hetzner floating IPs reassign via API within a **network zone** (+ same
 //! project — a single envoy is already scoped to one Hetzner project by
-//! convention, mirroring [`super::hetzner_envoy::HetznerEnvoy`]) — verified
-//! 2026-07, W267 §Tier 1. [`hetzner_network_zone`] maps Hetzner's Cloud API
-//! location codes onto the three network zones Hetzner documents
-//! (`eu-central`, `us-east`, `us-west`); extend it as new locations open.
+//! convention, mirroring `cloud`'s `HetznerEnvoy`) — verified 2026-07,
+//! W267 §Tier 1. [`hetzner_network_zone`] maps Hetzner's Cloud API location
+//! codes onto the three network zones Hetzner documents (`eu-central`,
+//! `us-east`, `us-west`); extend it as new locations open.
 //!
-//! Layering mirrors [`super::hetzner_envoy::HetznerEnvoy`]: this is a thin,
-//! purpose-built client scoped to exactly the floating-IP endpoints this
-//! verb family needs (`GET /servers`, `GET /floating_ips/{id}`,
-//! `POST /floating_ips/{id}/actions/assign`) rather than a reuse of
-//! [`super::HetznerDriver`] (which is VPS + S3 bucket lifecycle-scoped). A
-//! follow-up can fold this into the shared `yah-hetzner` client crate if/when
-//! the two call sites want one transport; kept separate here to avoid
-//! widening this ticket's edit surface into a shared crate other consumers
-//! (desktop) depend on.
+//! A thin, purpose-built client scoped to exactly the floating-IP endpoints
+//! this adapter needs (`GET /servers`, `GET /floating_ips/{id}`,
+//! `POST /floating_ips/{id}/actions/assign`) rather than a reuse of `cloud`'s
+//! `HetznerDriver` (which is VPS + S3 bucket lifecycle-scoped) or of the shared
+//! `yah-hetzner` client. That separation is now structural rather than a
+//! judgement call: R859-F3 moved this crate below `cloud`, and `yah-hetzner`
+//! sits above it.
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use floating_ip::{FloatingIpMachine, FloatingIpProvider, FloatingIpState, FloatingIpTarget};
 use serde::Deserialize;
-use serde_json::Value;
-
-use super::floating_ip::{
-    reconcile_assignment, FloatingIpProvider, FloatingIpState, FloatingIpTarget,
-};
-use crate::config::MachineConfig;
-use crate::envoy::floating_ip::{
-    FloatingIpAssign, FloatingIpAssignInput, FloatingIpAssignOutput, FloatingIpStatus,
-    FloatingIpStatusInput, FloatingIpStatusOutput,
-};
-use crate::envoy::{AdapterFlavor, EnvoyAdapter, InternalVerb, Tier};
 
 const HETZNER_BASE: &str = "https://api.hetzner.cloud/v1";
 
-/// Hetzner Cloud floating-IP client. Bearer-token auth, same as
-/// [`super::hetzner::HetznerDriver`]'s Cloud API calls.
+/// Hetzner Cloud floating-IP client. Bearer-token auth, same as `cloud`'s
+/// `HetznerDriver` Cloud API calls.
 #[derive(Clone)]
 pub struct HetznerFloatingIp {
     http: reqwest::Client,
@@ -60,35 +47,6 @@ impl HetznerFloatingIp {
         self.base_url = url.into();
         self
     }
-
-    /// Typed handler for `floating_ip.assign`. Public so callers (and
-    /// tests) can bypass the JSON envelope.
-    pub async fn floating_ip_assign(
-        &self,
-        input: FloatingIpAssignInput,
-    ) -> Result<FloatingIpAssignOutput> {
-        let target = FloatingIpTarget {
-            attach_id: input.attach_id,
-            zone: input.zone,
-        };
-        let outcome = reconcile_assignment(self, &input.ip_id, &target).await?;
-        Ok(FloatingIpAssignOutput {
-            reassigned: outcome.reassigned,
-            attached_to: outcome.attached_to,
-        })
-    }
-
-    /// Typed handler for `floating_ip.status`.
-    pub async fn floating_ip_status(
-        &self,
-        input: FloatingIpStatusInput,
-    ) -> Result<FloatingIpStatusOutput> {
-        let state = self.current_assignment(&input.ip_id).await?;
-        Ok(FloatingIpStatusOutput {
-            zone: state.zone,
-            attached_to: state.attached_to,
-        })
-    }
 }
 
 #[async_trait]
@@ -98,9 +56,9 @@ impl FloatingIpProvider for HetznerFloatingIp {
     }
 
     /// `GET /servers?name=<machine.name>` — same name→id lookup convention
-    /// [`super::hetzner_envoy::HetznerEnvoy`]'s driver already relies on
-    /// (cloud-init sets the Hetzner server's `name` to `MachineConfig.name`).
-    async fn resolve_target(&self, machine: &MachineConfig) -> Result<FloatingIpTarget> {
+    /// `cloud`'s `HetznerEnvoy` driver already relies on (cloud-init sets the
+    /// Hetzner server's `name` to `MachineConfig.name`).
+    async fn resolve_target(&self, machine: &FloatingIpMachine) -> Result<FloatingIpTarget> {
         let zone = hetzner_network_zone(machine.location()).with_context(|| {
             format!(
                 "floating_ip: resolving target for machine {:?}",
@@ -187,39 +145,6 @@ impl FloatingIpProvider for HetznerFloatingIp {
     }
 }
 
-#[async_trait]
-impl EnvoyAdapter for HetznerFloatingIp {
-    fn id(&self) -> &str {
-        "hetzner"
-    }
-    fn tier(&self) -> Tier {
-        Tier::S
-    }
-    fn flavor(&self) -> AdapterFlavor {
-        AdapterFlavor::Native
-    }
-    fn supported_verb_ids(&self) -> Vec<&'static str> {
-        vec![FloatingIpAssign::ID, FloatingIpStatus::ID]
-    }
-    async fn dispatch(&self, verb_id: &str, input: Value) -> Result<Value> {
-        match verb_id {
-            id if id == FloatingIpAssign::ID => {
-                let args: FloatingIpAssignInput =
-                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
-                let out = self.floating_ip_assign(args).await?;
-                Ok(serde_json::to_value(out)?)
-            }
-            id if id == FloatingIpStatus::ID => {
-                let args: FloatingIpStatusInput =
-                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
-                let out = self.floating_ip_status(args).await?;
-                Ok(serde_json::to_value(out)?)
-            }
-            other => bail!("hetzner floating-ip envoy does not support verb {other:?}"),
-        }
-    }
-}
-
 /// Pure conversion: Hetzner Cloud API location code → Hetzner network
 /// zone. Hetzner documents three network zones today (`eu-central`,
 /// `us-east`, `us-west`); extend this table as Hetzner opens new
@@ -266,44 +191,27 @@ struct HetznerHomeLocation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::floating_ip::on_ingress_owner_changed;
+    use floating_ip::on_ingress_owner_changed;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
-    fn hil_machine(name: &str) -> MachineConfig {
-        MachineConfig {
+    fn hil_machine(name: &str) -> FloatingIpMachine {
+        FloatingIpMachine {
             name: name.into(),
             provider: "hetzner".into(),
             location: Some("hil".into()),
-            server_type: Some("cpx22".into()),
-            hosts_mirrors: vec![],
-            mesh_tags: vec![],
             region: Some("us-west".into()),
-            zone: None,
-            arch: None,
-            bucket: None,
-            vendor: None,
-            nickname: None,
-            legacy_hostkey_fingerprint: None,
-            registration: Default::default(),
-            ssh_keys: vec![],
-            cloudflared: None,
-            hosts_operator_bridge: false,
-            connect: None,
-            allocatable: None,
-            taints: vec![],
-            sovereign_group: None,
-            sovereign_role: None,
             ingress_floating_ip: None,
         }
     }
 
     /// Spin up an in-process axum server standing in for Hetzner's Cloud
-    /// API (same convention as `reconciler/pond.rs` / `reconciler/static_asset.rs`'s
-    /// tests: bind 127.0.0.1:0, serve canned/stateful JSON, point the
-    /// client's `with_base_url` at it). `attached` is the floating IP's
-    /// mutable current-server state so a test can drive two calls
-    /// (flip, then re-apply) against one mock and observe the call count.
+    /// API (same convention as `cloud`'s `reconciler/pond.rs` /
+    /// `reconciler/static_asset.rs` tests: bind 127.0.0.1:0, serve
+    /// canned/stateful JSON, point the client's `with_base_url` at it).
+    /// `attached` is the floating IP's mutable current-server state so a test
+    /// can drive two calls (flip, then re-apply) against one mock and observe
+    /// the call count.
     async fn spawn_mock(
         network_zone: &'static str,
         initial_server: Option<u64>,

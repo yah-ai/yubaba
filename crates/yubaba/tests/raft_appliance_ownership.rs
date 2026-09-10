@@ -196,9 +196,10 @@ impl Loops {
                 node_id,
                 raft.clone(),
                 sm.clone(),
-                None,
-                None,
-                Some(machine.clone()),
+                yubaba::raft::NodeDeclaration {
+                    machine: Some(machine.clone()),
+                    ..Default::default()
+                },
             ),
         ));
         if leases {
@@ -1026,6 +1027,137 @@ async fn the_appliance_reconciler_runs_on_its_own_clock_not_at_raft_heartbeat_ra
          ({owner_machine}) — it is paced off the raft metrics watch rather than \
          `leader::RECONCILE_INTERVAL`, which is what forked the live coordinator's headscale \
          ~2.5 times a second on 2026-09-06 (R858-B13)"
+    );
+
+    cluster.destroy_all().await.ok();
+}
+
+/// **SETTLE (R858-B20).** A rebooted owner must not start a coordinator off its
+/// own replayed record.
+///
+/// The sibling test above,
+/// `a_resurrected_owner_is_fenced_and_cannot_serve`, models a resurrection in
+/// which the appliance is *still running* on the returning node — a resuming
+/// supervisor, or the boot-persistent `systemctl enable headscale`. That is the
+/// teardown shape, and the fence handles it.
+///
+/// This is the other shape, and it is the one that was measured on real
+/// hardware. A hard reset does not resume anything: `us-west-011` came back on
+/// 2026-09-08 with kamaji holding no workloads at all, so
+/// `observe_local_appliance` answered `None` and the node did not need to be
+/// *stopped* — it needed to be stopped from **starting**. It read its own
+/// pre-failover state machine, found its own name in `ingress_owner` 0.6 s after
+/// learning who the leader was, took the elect path, forked a second headscale
+/// on a stale database, and pushed frames from that database into the shared
+/// litestream prefix for 9.7 s until the fence caught up.
+///
+/// So the assertion here is deliberately not "it stopped": it is that the
+/// resurrected node's supervisor is **never asked to deploy**, at all, for the
+/// whole of the window in which the old code deployed.
+///
+/// # Non-vacuity
+///
+/// Two guards, because "no deploy happened" is the easiest assertion in the file
+/// to pass for the wrong reason.
+///
+/// * The deploy counter is snapshotted *before* the restart and compared, so a
+///   node that never deployed anything in the first place cannot make this pass
+///   — the count has to be unchanged across a period in which the node was
+///   demonstrably alive and reconciling.
+/// * A survivor must be serving throughout. If the failover had not happened,
+///   the record would still name the returning node, its claim would be
+///   legitimate, and refusing to act would be a bug rather than the fix.
+#[tokio::test]
+async fn a_rebooted_owner_does_not_start_a_coordinator_off_its_stale_record() {
+    use kamaji::Kamaji;
+
+    let (mut cluster, runtimes) = power_off_cluster().await;
+
+    let mut loops = Loops(Vec::new());
+    for idx in 0..cluster.node_count() {
+        loops.start_with_leases(&cluster, idx);
+    }
+
+    let (owner_idx, owner_machine) = settle_owner(&cluster, &runtimes).await;
+    let survivors: Vec<usize> = (0..cluster.node_count())
+        .filter(|&i| i != owner_idx)
+        .collect();
+
+    // ── Pull the power, and lose the process with it ─────────────────────────
+    //
+    // The teardown is what makes this a REBOOT rather than the suspend the
+    // sibling test models. It is done on the runtime directly, not through
+    // yubaba, precisely because nothing in the cluster is supposed to have
+    // retracted anything — the box simply stopped existing and came back empty.
+    loops.stop(owner_idx);
+    cluster
+        .kill_node(owner_idx)
+        .await
+        .expect("power off the appliance owner");
+    runtimes[owner_idx]
+        .teardown_workload(&headscale_appliance::appliance_ident())
+        .await
+        .expect("a hard reset leaves the supervisor holding nothing");
+    assert!(
+        !appliance_running_on(&runtimes, owner_idx),
+        "precondition: this test is about a node that comes back with NO appliance, so that the \
+         path under test is the one that STARTS one rather than the one that stops one"
+    );
+
+    wait_for(
+        failover_budget(),
+        "a survivor to expire the dead owner and take the appliance over",
+        || {
+            survivors
+                .iter()
+                .any(|&i| appliance_running_on(&runtimes, i))
+        },
+    )
+    .await;
+    let new_owner_idx = *survivors
+        .iter()
+        .find(|&&i| appliance_running_on(&runtimes, i))
+        .expect("a survivor is serving, just waited for");
+    wait_for(
+        failover_budget(),
+        "the ingress-owner record to name the survivor",
+        || recorded_owner(&cluster, new_owner_idx).is_some_and(|m| m != owner_machine),
+    )
+    .await;
+
+    // ── Power comes back, on a state machine replayed from disk ──────────────
+    let deploys_before = runtimes[owner_idx].deploy_calls().len();
+    cluster
+        .restart_node(owner_idx)
+        .await
+        .expect("restore power to the old owner");
+    loops.start_with_leases(&cluster, owner_idx);
+
+    // Long enough to cover the settle window and a reconcile pass past it, so a
+    // pass that WOULD have deployed has had every opportunity to.
+    let timing = FenceTiming::from_thresholds(POLICY.liveness_thresholds());
+    let observation = timing.settle_after + Duration::from_secs(15);
+    let deadline = Instant::now() + observation;
+    while Instant::now() < deadline {
+        assert_eq!(
+            runtimes[owner_idx].deploy_calls().len(),
+            deploys_before,
+            "the rebooted owner ({owner_machine}) asked its supervisor to deploy the appliance. \
+             It is not the raft leader and the record names {:?} — it acted on its own replayed \
+             pre-failover state machine, which is R858-B20 and is one half of a split brain",
+            recorded_owner(&cluster, new_owner_idx)
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        !appliance_running_on(&runtimes, owner_idx),
+        "the rebooted owner is serving a coordinator it never legitimately claimed"
+    );
+    assert!(
+        appliance_running_on(&runtimes, new_owner_idx),
+        "the survivor stopped serving during the observation window — this test would then be \
+         asserting that nobody is a coordinator, which is the outage rather than the fix"
     );
 
     cluster.destroy_all().await.ok();

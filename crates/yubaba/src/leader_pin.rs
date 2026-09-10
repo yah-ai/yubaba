@@ -409,15 +409,17 @@ mod tests {
             .map(|(id, region)| {
                 (
                     *id,
-                    MemberInfo {
-                        addr: format!("100.64.0.{id}:7443"),
-                        region: region.map(str::to_string),
-                        // The pin judges regions only; capacity is R737-F1's
-                        // axis and machine is R859-F2's, and neither is part of
-                        // this decision.
-                        capacity: None,
-                        machine: None,
-                    },
+                    MemberInfo::from_declaration(
+                        format!("100.64.0.{id}:7443"),
+                        &crate::raft::NodeDeclaration {
+                            region: region.map(str::to_string),
+                            // The pin judges regions only; capacity is
+                            // R737-F1's axis and the machine/ingress
+                            // declaration is R859-F2's, and neither is part of
+                            // this decision.
+                            ..Default::default()
+                        },
+                    ),
                 )
             })
             .collect()

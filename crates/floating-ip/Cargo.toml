@@ -1,0 +1,36 @@
+[package]
+# R859-F2: carved out of `yah-cloud` so `yubaba` can drive ingress failover
+# without a runtime yubaba -> cloud dependency. Exactly the move R374-F3 made
+# for `local-driver` (see the comment on cloud's `yah-local-driver` dep), and
+# for the same reason: the fleet daemon shipped to every node must not gain
+# velveteen, velveteen-exec, yah-hetzner, yah-mesofact-bundle and yah-almanac
+# in order to move one floating IP. Operator decision, 2026-09-08.
+name = "yah-floating-ip"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Provider-agnostic floating/reserved-IP mobility: the FloatingIpProvider seam, the idempotent zone-checked reconcile core, and the pure ingress-owner failover planner. Vendor HTTP adapters live in the consumer."
+keywords = ["floating-ip", "failover", "ingress", "cloud", "ha"]
+categories = ["network-programming"]
+
+[lib]
+# Short extern name, so consumers write `floating_ip::` rather than
+# `yah_floating_ip::`. Same aliasing trick the rest of this workspace uses.
+name = "floating_ip"
+path = "src/lib.rs"
+
+[dependencies]
+# Deliberately two deps and no more. This crate is linked into the fleet
+# daemon, so every dep added here ships to every node — which is the entire
+# reason it exists. No reqwest (the vendor adapters own their transport), no
+# serde (nothing here crosses a wire), no fob (credential resolution is the
+# consumer's, not the seam's).
+anyhow = "1.0"
+async-trait = "0.1"
+
+[dev-dependencies]
+# `#[tokio::test]` for the four reconcile_assignment cases. Dev-only, so it
+# does not reach the fleet daemon.
+tokio = { version = "1", features = ["rt", "macros"] }

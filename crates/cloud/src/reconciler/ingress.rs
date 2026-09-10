@@ -362,6 +362,11 @@ pub struct IngressPlan {
     /// whichever slot happened to sort first can only do that if it can tell an
     /// explicit declaration from a derived one.
     pub edge_provider_id: Option<String>,
+    /// This edge's declared appliance image, verbatim from
+    /// [`IngressEdge::image`] (R870-F16). `None` is every mirror on disk
+    /// today, and means the passway arm of `yah cloud apply` can only print
+    /// the manual deploy step — there is no digest-pinned image to push.
+    pub image: Option<String>,
 }
 
 impl IngressPlan {
@@ -625,6 +630,49 @@ pub fn resolve_ingress_placements(
         );
     }
     Ok(placements)
+}
+
+/// Every machine a `required`-constrained slot COULD be placed on, not just
+/// where [`resolve_ingress_placements`] resolved it to today (R870-F16).
+///
+/// A discovery poll list built from the placement set renders exactly as many
+/// doors as the workload has replicas — one, for every mirror on disk today —
+/// which is a single point of failure baked into the render, not just into the
+/// placement: a future `yah cloud migrate` moving the workload to a sibling
+/// node leaves every front door polling the node it just vacated until an
+/// operator re-applies. Polling the wider candidate set costs nothing extra
+/// (discovery.rs's "answered with none retires only its own share" rule) and
+/// makes the door follow a move that placement hasn't even made yet.
+///
+/// Unbounded by [`RequiredSpec::replica_count`] on purpose — that count caps
+/// how many machines the workload is placed ON, not how many are eligible TO
+/// hold it, and the two must not be conflated here or this collapses back to
+/// the placement set it exists to widen.
+///
+/// A slot with a literal `machine`/`machines` field is absent from the
+/// returned map, exactly as in [`resolve_ingress_placements`] — nothing to
+/// widen when the operator pinned the node by hand.
+pub fn resolve_ingress_candidates(
+    machines: &[MachineConfig],
+    mirror: &MirrorConfig,
+) -> HashMap<String, Vec<String>> {
+    let mut candidates = HashMap::new();
+    for (role, slot) in &mirror.providers {
+        let fields = slot.fields();
+        if fields.contains_key(MACHINE_FIELD) || fields.contains_key(MACHINES_FIELD) {
+            continue;
+        }
+        let Some(required) = slot.required() else {
+            continue;
+        };
+        let matched: Vec<String> = machines
+            .iter()
+            .filter(|m| required.matches(m))
+            .map(|m| m.name.clone())
+            .collect();
+        candidates.insert(role.clone(), matched);
+    }
+    candidates
 }
 
 /// Every machine's declared mesh address, keyed by machine name (R844-F12).
@@ -906,6 +954,7 @@ fn partition(edges: &[IngressEdge], rules: Vec<IngressRule>) -> Result<Vec<Ingre
             front_doors,
             tunnel_id: edge.tunnel_id.clone(),
             edge_provider_id: edge.provider_id.clone(),
+            image: edge.image.clone(),
         });
     }
     Ok(plans)
@@ -1279,6 +1328,7 @@ mod tests {
             hostnames: Vec::new(),
             tunnel_id: None,
             provider_id: None,
+            image: None,
         }
     }
 
@@ -1464,6 +1514,48 @@ mod tests {
         assert_eq!(
             plan.front_doors,
             vec!["us-east-001".to_string(), "us-south-001".to_string()]
+        );
+    }
+
+    /// R870-F16 — the whole defect half (a) exists to fix: a `required` that
+    /// MATCHES several machines still PLACES on however many `replicas` asked
+    /// for (one, by default), and the candidate set must not collapse to that
+    /// narrower number. A test that only exercised the multi-placement case
+    /// (like the one above, which pre-resolves a 2-machine `placements` map by
+    /// hand) would pass today without this ticket's fix.
+    #[test]
+    fn the_candidate_set_is_wider_than_the_placement_set() {
+        fn machine(name: &str, region: &str) -> MachineConfig {
+            toml::from_str(&format!(
+                "name = \"{name}\"\nprovider = \"static\"\nmesh_tags = []\n\
+                 hosts_mirrors = []\nssh_keys = []\nregion = \"{region}\"\n"
+            ))
+            .expect("machine config parses")
+        }
+        let machines = vec![
+            machine("us-east-001", "us-east"),
+            machine("us-south-001", "us-east"),
+            machine("us-west-001", "us-west"),
+        ];
+        let m = mirror(
+            IngressProvider::Passway,
+            "[bundle]\nuse = \"cloudflare\"\nrequired = { regions = [\"us-east\"] }\n\
+             zone = \"yah.dev\"\nport = 8080\n",
+        );
+
+        let placements = resolve_ingress_placements(&machines, &m).expect("placements resolve");
+        assert_eq!(
+            placements.get("bundle"),
+            Some(&vec!["us-east-001".to_string()]),
+            "no `replicas` declared means exactly one placement (R844-F8's default)"
+        );
+
+        let candidates = resolve_ingress_candidates(&machines, &m);
+        assert_eq!(
+            candidates.get("bundle"),
+            Some(&vec!["us-east-001".to_string(), "us-south-001".to_string()]),
+            "both us-east machines are ELIGIBLE even though only one is PLACED — the door \
+             should still be able to poll the one placement didn't pick"
         );
     }
 
@@ -2209,6 +2301,7 @@ mod tests {
             front_doors: machines.iter().map(|s| s.to_string()).collect(),
             tunnel_id: None,
             edge_provider_id: None,
+            image: None,
         }
     }
 

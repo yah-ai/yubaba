@@ -9,15 +9,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::{error, info, warn};
 use turso_backup::snapshot::BackupTarget;
 use turso_backup::stream::{CoreWalSeam, StreamOutcome};
 use workload_spec::TenantId;
+use yubaba_tenant_streamer::rebuild::{
+    bump_pointer_generation, clear_tenant_fence, FenceClearance, FenceSource, PointerStep,
+    RebuildOptions, SinkFence,
+};
 use yubaba_tenant_streamer::streamer::TenantSink;
 use yubaba_tenant_streamer::{
-    build_store, verify_sink, HttpOwnership, RpoReporter, StreamerConfig, TenantStreamer,
-    TenantTick,
+    build_pointer_store, build_store, verify_sink, HttpOwnership, RpoReporter, StreamerConfig,
+    TenantStreamer, TenantTick,
 };
 
 #[derive(Parser)]
@@ -34,6 +38,40 @@ struct Args {
     /// that a bucket cannot fence before real tenants depend on it.
     #[arg(long)]
     check: bool,
+    /// Absent means "stream", which is what kamaji invokes.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Clear the R2 fence a destroyed cluster left behind (W339 / R869).
+    ///
+    /// Run this ONCE, on the rebuilt cluster, after `yubaba state restore` and
+    /// the founding `raft init`, before starting any streamer. It bumps each
+    /// tenant's global pointer generation, reads the epoch floor the dead fleet
+    /// stamped into the sink, and lifts this cluster's epoch over it.
+    Rebuild {
+        /// Restrict to these tenants (repeatable). Default: every tenant in the
+        /// config.
+        #[arg(long = "tenant")]
+        tenants: Vec<String>,
+        /// Report what each tenant's fence stands at and stop. Writes nothing —
+        /// no pointer bump, no raft entry. Run this first.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the pointer generation bump (step 1). Only correct when the
+        /// tenant pointers live somewhere this config cannot reach.
+        #[arg(long)]
+        skip_pointer: bool,
+        /// Ceiling on committed `ClaimTenant` entries per tenant.
+        #[arg(long, default_value_t = RebuildOptions::default().max_claims)]
+        max_claims: u64,
+        /// Ceiling on fence reads per tenant before declaring the predecessor
+        /// cluster alive.
+        #[arg(long, default_value_t = RebuildOptions::default().max_rounds)]
+        max_rounds: u32,
+    },
 }
 
 #[tokio::main]
@@ -47,6 +85,29 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let config = StreamerConfig::load(&args.config)?;
+
+    if let Some(Command::Rebuild {
+        tenants,
+        dry_run,
+        skip_pointer,
+        max_claims,
+        max_rounds,
+    }) = &args.command
+    {
+        return run_rebuild(
+            &config,
+            tenants,
+            *dry_run,
+            *skip_pointer,
+            RebuildOptions {
+                lease_secs: config.lease_secs,
+                max_rounds: *max_rounds,
+                max_claims: *max_claims,
+            },
+        )
+        .await;
+    }
+
     info!(
         node_id = config.node_id,
         tenants = config.tenants.len(),
@@ -125,6 +186,227 @@ async fn main() -> Result<()> {
         .await;
     info!("tenant streamer stopped");
     Ok(())
+}
+
+/// `yubaba-tenant-streamer rebuild` — W339's procedure, once, over every
+/// configured tenant.
+///
+/// Every tenant is attempted even after one fails, and the failures are
+/// reported together at the end. A recovery that stopped at the first bad
+/// tenant would make an operator discover the damage one restart at a time.
+async fn run_rebuild(
+    config: &StreamerConfig,
+    only: &[String],
+    dry_run: bool,
+    skip_pointer: bool,
+    opts: RebuildOptions,
+) -> Result<()> {
+    let selected = select_tenants(config, only)?;
+    let store = build_store(&config.sink)?;
+    let pointers: Option<Arc<dyn yah_object_store::ObjectStore>> = if skip_pointer {
+        None
+    } else {
+        Some(Arc::from(build_pointer_store(&config.sink)?))
+    };
+    let claims = HttpOwnership::new(config.yubaba_url.clone(), config.node_id);
+
+    info!(
+        tenants = selected.len(),
+        node_id = config.node_id,
+        dry_run,
+        skip_pointer,
+        "rebuild: clearing the sink fence a destroyed cluster left behind"
+    );
+
+    let mut failures = Vec::new();
+    for tenant in &selected {
+        if let Err(e) = rebuild_one(
+            config,
+            &store,
+            pointers.as_ref(),
+            &claims,
+            tenant,
+            dry_run,
+            &opts,
+        )
+        .await
+        {
+            error!(tenant = tenant.0.as_str(), error = %format!("{e:#}"), "rebuild failed");
+            failures.push(tenant.0.clone());
+        }
+    }
+
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "{} of {} tenants did not clear: {}. Nothing above them was rolled back — a pointer \
+             bump and a granted epoch are both monotonic, so re-running this command after fixing \
+             the cause is safe and costs only the entries it still needs.",
+            failures.len(),
+            selected.len(),
+            failures.join(", "),
+        );
+    }
+    if dry_run {
+        info!("rebuild --dry-run complete; nothing was written");
+    } else {
+        info!(
+            tenants = selected.len(),
+            "rebuild complete — start the streamers"
+        );
+    }
+    Ok(())
+}
+
+async fn rebuild_one(
+    config: &StreamerConfig,
+    store: &Arc<dyn object_store::ObjectStore>,
+    pointers: Option<&Arc<dyn yah_object_store::ObjectStore>>,
+    claims: &HttpOwnership,
+    tenant: &TenantId,
+    dry_run: bool,
+    opts: &RebuildOptions,
+) -> Result<()> {
+    let name = tenant.0.as_str();
+    let fence = SinkFence::new(BackupTarget {
+        store: store.clone(),
+        prefix: config.key_prefix(tenant)?,
+    });
+
+    // Step 1. Blocking IO on a blocking reqwest client, so it must not run on a
+    // runtime worker thread — `R2ObjectStore` owns its own runtime internally
+    // and panics if one is already driving the calling thread.
+    if let Some(pointers) = pointers {
+        let step = pointer_step(pointers, tenant, dry_run).await?;
+        match step {
+            PointerRead::Absent => info!(
+                tenant = name,
+                "no cell pointer — nothing to fence a resurrected node with (expected until \
+                 R736-F6 mints pointer generations)"
+            ),
+            PointerRead::Read { cell, generation } => info!(
+                tenant = name,
+                cell, generation, "cell pointer read (dry run; not bumped)"
+            ),
+            PointerRead::Bumped {
+                cell,
+                before,
+                after,
+            } => info!(
+                tenant = name,
+                cell, before, after, "pointer generation bumped"
+            ),
+        }
+    }
+
+    // Steps 2 and 3.
+    if dry_run {
+        match fence.fence(tenant).await? {
+            None => info!(tenant = name, "no sidecar — nothing has ever streamed here"),
+            Some(state) => info!(
+                tenant = name,
+                floor = state.epoch,
+                pointer_generation = state.pointer_generation,
+                "sink fence; a rebuilt cluster needs epoch > floor to write"
+            ),
+        }
+        return Ok(());
+    }
+
+    match clear_tenant_fence(&fence, claims, tenant, opts).await? {
+        FenceClearance::NeverStreamed => {
+            info!(
+                tenant = name,
+                "no sidecar — no fence to clear, nothing claimed"
+            )
+        }
+        FenceClearance::Cleared {
+            floor,
+            epoch,
+            claims,
+            rounds,
+        } => info!(
+            tenant = name,
+            floor, epoch, claims, rounds, "fence cleared; this cluster may write again"
+        ),
+    }
+    Ok(())
+}
+
+/// What step 1 saw, flattened across the dry-run and the writing path.
+enum PointerRead {
+    Absent,
+    Read {
+        cell: String,
+        generation: u64,
+    },
+    Bumped {
+        cell: String,
+        before: u64,
+        after: u64,
+    },
+}
+
+/// Run the synchronous pointer call off the runtime's worker threads.
+async fn pointer_step(
+    pointers: &Arc<dyn yah_object_store::ObjectStore>,
+    tenant: &TenantId,
+    dry_run: bool,
+) -> Result<PointerRead> {
+    let store = Arc::clone(pointers);
+    let tenant = tenant.clone();
+    tokio::task::spawn_blocking(move || {
+        if dry_run {
+            return Ok(
+                match yubaba_tenant_streamer::read_pointer_generation(&*store, &tenant)? {
+                    None => PointerRead::Absent,
+                    Some((cell, generation)) => PointerRead::Read { cell, generation },
+                },
+            );
+        }
+        Ok(match bump_pointer_generation(&*store, &tenant)? {
+            PointerStep::Absent => PointerRead::Absent,
+            PointerStep::Bumped {
+                cell,
+                before,
+                after,
+            } => PointerRead::Bumped {
+                cell,
+                before,
+                after,
+            },
+        })
+    })
+    .await
+    .context("the pointer step panicked")?
+}
+
+/// Resolve `--tenant` against the config, refusing ids the config does not
+/// know. A typo'd tenant that silently rebuilt nothing is the failure mode
+/// here: the operator would read a green run as "the fence is clear".
+fn select_tenants(config: &StreamerConfig, only: &[String]) -> Result<Vec<TenantId>> {
+    if only.is_empty() {
+        return Ok(config.tenants.iter().map(|t| t.tenant.clone()).collect());
+    }
+    let mut out = Vec::with_capacity(only.len());
+    for id in only {
+        let found = config
+            .tenants
+            .iter()
+            .find(|t| t.tenant.0 == *id)
+            .with_context(|| {
+                format!(
+                    "--tenant {id} is not in the config; configured tenants are: {}",
+                    config
+                        .tenants
+                        .iter()
+                        .map(|t| t.tenant.0.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+        out.push(found.tenant.clone());
+    }
+    Ok(out)
 }
 
 /// Push this tick's RPO status toward yubaba's leader (R782), if this tick

@@ -520,6 +520,23 @@ pub struct FenceTiming {
     /// Strictly greater than [`Self::self_fence_after`], and that gap is the
     /// only thing standing between a partition and two coordinators.
     pub expire_after: Duration,
+    /// **Reader side (R858-B20).** How long this node must have been in
+    /// continuous contact with a raft leader before its own applied
+    /// `ingress_owner` may be treated as current.
+    ///
+    /// The other two deadlines govern how long a node keeps serving; this one
+    /// governs when it may *start*. It exists because "in contact with a leader"
+    /// and "has received anything from that leader" are not the same instant,
+    /// and a just-booted node satisfies the first while its state machine still
+    /// holds a replayed, pre-failover record. On the dev group on 2026-09-08 a
+    /// resurrected owner read its own stale record 0.6 s after learning who the
+    /// leader was and started a second coordinator on it.
+    ///
+    /// Strictly *less* than [`Self::self_fence_after`], and that ordering is
+    /// load-bearing in the other direction from `fence_margin`: a node must be
+    /// able to confirm a legitimate claim well before the deadline that would
+    /// fence it for not having confirmed one.
+    pub settle_after: Duration,
 }
 
 impl FenceTiming {
@@ -528,6 +545,13 @@ impl FenceTiming {
     /// Multiplier on `down_after` for the cluster's expiry deadline. Must
     /// exceed [`Self::SELF_FENCE_HEARTBEATS`]; the difference is the margin.
     const EXPIRE_HEARTBEATS: u32 = 6;
+    /// Multiplier on `down_after` for the reader-side settle window
+    /// (R858-B20). One, because the quantity being waited out is a single
+    /// replication round: `down_after` is already this cluster's statement of
+    /// how long silence has to last before it means anything, so it is the
+    /// smallest honest unit in this family. Must be strictly below
+    /// [`Self::SELF_FENCE_HEARTBEATS`].
+    const SETTLE_HEARTBEATS: u32 = 1;
 
     pub const fn from_thresholds(thresholds: LivenessThresholds) -> Self {
         Self {
@@ -536,6 +560,9 @@ impl FenceTiming {
             ),
             expire_after: Duration::from_millis(
                 thresholds.down_after.as_millis() as u64 * Self::EXPIRE_HEARTBEATS as u64,
+            ),
+            settle_after: Duration::from_millis(
+                thresholds.down_after.as_millis() as u64 * Self::SETTLE_HEARTBEATS as u64,
             ),
         }
     }
@@ -577,6 +604,81 @@ impl FenceTiming {
 /// vocabulary this crate has, rather than through a second one.
 pub fn owner_lease_expired(silence: Option<Duration>, timing: FenceTiming) -> bool {
     silence.is_some_and(|s| s >= timing.expire_after)
+}
+
+/// **SETTLE (R858-B20).** May this node believe its own applied `ingress_owner`?
+///
+/// `leader_contact_for` is how long this *process* has been continuously in
+/// contact with a raft leader — `None` meaning "not in contact right now".
+///
+/// # Why "has a leader" was not already this
+///
+/// [`RaftView::has_leader`](crate::leader) was documented as *freshness*: "a node
+/// in contact with a leader is receiving `AppendEntries`, so its applied
+/// `ingress_owner` is at most one replication round behind". That is true of a
+/// node that has been in contact for a while and **false at the instant contact
+/// is established** — `current_leader` becomes `Some` as soon as this node
+/// learns who the leader is, which is strictly before it has received anything
+/// from them. A daemon that has just started has a state machine replayed from
+/// its own disk, so between those two instants it holds a record that may name
+/// *itself* as the owner of an appliance the cluster has since moved.
+///
+/// That is not hypothetical. On the dev raft group on 2026-09-08 a hard-reset
+/// owner booted, read its own pre-failover record 0.6 s after learning the
+/// leader's identity, started a second coordinator on a stale database, and
+/// replicated that database into the shared litestream prefix for 9.7 s before
+/// the fence caught it.
+///
+/// # Why a dwell rather than a linearizable read
+///
+/// The exactly-correct primitive is a read-index against the leader, and
+/// openraft has one — but [`Raft::ensure_linearizable`] asserts *leadership* and
+/// errors on a follower, and the follower-read form needs the read log id
+/// fetched from the leader over a channel this crate does not have. The two
+/// cheap local signals both fail on the measured case: the raft **term** does
+/// not change during an appliance failover (leadership never moved, only
+/// ownership), and `last_applied` does not advance on a cluster where nothing
+/// else is being written. So the honest available evidence is elapsed contact,
+/// which is the same currency every other deadline in [`FenceTiming`] is
+/// denominated in.
+///
+/// It is a *bound*, not a proof, and it is paired with one: a node that starts
+/// the appliance on a stale record still fails to write `SetIngressOwner`,
+/// because it is not the leader, and that refusal now tears the appliance back
+/// down instead of being logged and ignored.
+///
+/// [`Raft::ensure_linearizable`]: https://docs.rs/openraft
+pub fn record_is_settled(leader_contact_for: Option<Duration>, timing: FenceTiming) -> bool {
+    leader_contact_for.is_some_and(|d| d >= timing.settle_after)
+}
+
+/// **ACT.** May this node take an ownership action on this tick?
+///
+/// Extracted from `reconcile_appliance_ownership` by R858-B20 for the reason
+/// [`appliance_survives_leadership_loss`](crate::leader) was: the rule is a
+/// three-term boolean whose failure mode is one term being too weak, and an
+/// inline expression cannot be asserted against the input that broke it.
+///
+/// The two clauses are not symmetric, and the asymmetry is the fix:
+///
+/// * **A leader may always act.** It has applied everything it committed, so its
+///   own view of `ingress_owner` is authoritative by construction. No settle
+///   term, because there is nothing it could be behind.
+/// * **A non-leader may act only on a record it can believe.** Its evidence is
+///   somebody else's committed write arriving by replication, so it must have
+///   been receiving replication long enough for that to have happened —
+///   [`record_is_settled`].
+///
+/// A node with neither returns `false` and, importantly, says nothing: reaching
+/// the refusal arms on every tick of every follower is how a loud channel gets
+/// trained out of an operator.
+pub fn may_act_on_ownership(
+    is_leader: bool,
+    recorded: Option<YubabaNodeId>,
+    node_id: YubabaNodeId,
+    settled: bool,
+) -> bool {
+    is_leader || (settled && recorded == Some(node_id))
 }
 
 /// Why a node must stop serving the appliance it is currently running.
@@ -1409,7 +1511,10 @@ mod tests {
     /// thing that could silently invert them.
     #[test]
     fn expiry_cannot_outrun_the_self_fence_at_any_preset() {
-        for (name, policy) in [("fleet", ClusterPolicy::fleet()), ("rig", ClusterPolicy::rig())] {
+        for (name, policy) in [
+            ("fleet", ClusterPolicy::fleet()),
+            ("rig", ClusterPolicy::rig()),
+        ] {
             let t = FenceTiming::from_thresholds(policy.liveness_thresholds());
             assert!(
                 t.expire_after > t.self_fence_after,
@@ -1422,7 +1527,87 @@ mod tests {
                 !t.fence_margin().is_zero(),
                 "{name}: zero margin leaves the ordering to scheduling luck"
             );
+            // R858-B20. The settle window is how long a node waits before it may
+            // believe its own record; the self-fence deadline is how long it may
+            // keep serving without having confirmed one. Invert them and a node
+            // is fenced for failing to confirm a claim it was not yet allowed to
+            // look at — a coordinator that stops itself every time it boots.
+            assert!(
+                t.settle_after < t.self_fence_after,
+                "{name}: settle_after {:?} is not below self_fence_after {:?} — a booting owner \
+                 would be fenced before it was permitted to confirm its own claim",
+                t.settle_after,
+                t.self_fence_after
+            );
+            assert!(
+                !t.settle_after.is_zero(),
+                "{name}: a zero settle window is the pre-B20 behaviour spelled differently"
+            );
         }
+    }
+
+    /// R858-B20's rule, asserted against the input that actually broke, plus the
+    /// precondition that the OLD shape admitted it — so this fails if anyone
+    /// widens the gate back.
+    ///
+    /// The measured case: us-west-011 rebooted, its replayed state machine still
+    /// named it as owner, it was not the raft leader, and it had been in contact
+    /// with a leader for 0.6 s. Every other row exists to stop the fix being
+    /// "return false more often", which would break the two paths R858-T3 built.
+    #[test]
+    fn a_non_leader_may_not_act_on_an_unsettled_self_naming_record() {
+        const ME: YubabaNodeId = 11;
+        const OTHER: YubabaNodeId = 13;
+
+        // The bug, exactly as measured.
+        assert!(
+            !may_act_on_ownership(false, Some(ME), ME, false),
+            "a just-booted non-leader acted on its own replayed record — this is R858-B20 and it \
+             ran a second coordinator for 9.7s on the dev group"
+        );
+        // PRECONDITION: the pre-B20 rule admitted that same input. If this ever
+        // fails the test above has stopped discriminating and is passing for
+        // free.
+        fn pre_b20_gate(
+            is_leader: bool,
+            recorded: Option<YubabaNodeId>,
+            node_id: YubabaNodeId,
+        ) -> bool {
+            is_leader || recorded == Some(node_id)
+        }
+        assert!(
+            pre_b20_gate(false, Some(ME), ME),
+            "the pre-B20 gate `is_leader || recorded == Some(node_id)` no longer admits the \
+             input this ticket is about, so the assertion above proves nothing"
+        );
+
+        // Once settled, the same node acts — this is R858-T3's non-leader owner
+        // restarting the appliance it owns, and it must stay prompt.
+        assert!(may_act_on_ownership(false, Some(ME), ME, true));
+        // A leader never waits: it has applied everything it committed.
+        assert!(may_act_on_ownership(true, None, ME, false));
+        assert!(may_act_on_ownership(true, Some(OTHER), ME, false));
+        // A follower with no claim has nothing to do, settled or not.
+        assert!(!may_act_on_ownership(false, Some(OTHER), ME, true));
+        assert!(!may_act_on_ownership(false, None, ME, true));
+    }
+
+    /// The settle predicate itself, at its boundary.
+    #[test]
+    fn a_record_settles_only_after_continuous_leader_contact() {
+        let t = fleet_timing();
+        assert_eq!(t.settle_after, Duration::from_secs(5));
+        // No contact at all is the state of a daemon that has just started, and
+        // it is NOT "zero elapsed" — it is "no evidence", which must never read
+        // as settled however long the process has been alive.
+        assert!(!record_is_settled(None, t));
+        assert!(!record_is_settled(Some(Duration::from_millis(600)), t));
+        assert!(!record_is_settled(
+            Some(t.settle_after - Duration::from_millis(1)),
+            t
+        ));
+        assert!(record_is_settled(Some(t.settle_after), t));
+        assert!(record_is_settled(Some(Duration::from_secs(3600)), t));
     }
 
     /// The multipliers are also asserted concretely, so a change to them is a
@@ -1463,7 +1648,10 @@ mod tests {
     #[test]
     fn a_node_running_nothing_is_never_fenced() {
         let t = fleet_timing();
-        assert_eq!(judge_self_fence(Some(2), 1, false, None, t), SelfFence::Serve);
+        assert_eq!(
+            judge_self_fence(Some(2), 1, false, None, t),
+            SelfFence::Serve
+        );
         assert_eq!(
             judge_self_fence(None, 1, false, Some(Duration::from_secs(3600)), t),
             SelfFence::Serve

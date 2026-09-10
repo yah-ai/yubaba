@@ -361,6 +361,210 @@ impl VoterAdmission {
     }
 }
 
+/// A voter count the ratchet is allowed to **rest** at.
+///
+/// Odd by construction.
+///
+/// # Why this is a type and not a `usize`
+///
+/// The ratchet's whole safety argument is that it never comes to rest on an even
+/// voter count: an even set survives exactly the failures the odd set below it
+/// does while making every write wait on one more node, and the specific case
+/// `R118-F8` exists to prevent — resting at **2**, which tolerates zero further
+/// losses — is the one an operator is most likely to configure by accident.
+/// [`MembershipRatchet::ShrinkToSurvivors`]'s descent loop stops at the floor, so
+/// an even floor would make the ratchet rest on an even count *by
+/// configuration*, with every test still green.
+///
+/// There is no constructor that can produce one. [`VoterFloor::new`] returns
+/// `None` for an even value (and for zero — a cluster with no voters can never
+/// elect a leader or accept the membership change that would rescue it), so the
+/// invariant is carried by the type rather than by a rule someone has to
+/// remember. This is the same rule
+/// [`QuorumGeography::judge_voter_count`](QuorumGeography::judge_voter_count)
+/// states for a settled voter set, moved to where it cannot be skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VoterFloor(usize);
+
+impl VoterFloor {
+    /// Rest at a single voter — the small-rig answer (`W138`). A lone voter
+    /// commits on its own, where two commit only while both are up.
+    pub const ONE: Self = Self(1);
+
+    /// Rest at three voters: still fault-tolerant, for an installation that
+    /// would rather stop than degrade to a single writable node.
+    pub const THREE: Self = Self(3);
+
+    /// `None` for an even count or zero — see the type docs.
+    pub const fn new(count: usize) -> Option<Self> {
+        if count % 2 == 1 { Some(Self(count)) } else { None }
+    }
+
+    /// The count.
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+/// Whether this cluster **demotes voters it can prove are off**, and how far
+/// down it is willing to go (R118-F8, `W138`'s membership ratchet).
+///
+/// The question this answers is not "am I a rig?" but *"when a voter is proven
+/// dark, may the cluster take its vote away while it still has the quorum to
+/// commit that decision?"* Two deployments answer it differently for reasons
+/// that have nothing to do with a label:
+///
+/// - the **cloud fleet** answers no. Its voters are in different datacenters,
+///   its failures are network events far more often than power events, and the
+///   evidence that would license a shrink — a physically independent channel
+///   that can tell "off" from "unreachable" — does not exist between two
+///   regions. An automatic shrink there is a split brain waiting for a fibre
+///   cut.
+/// - a **self-contained rig** answers yes. Its failure domain is a power strip,
+///   not a network, and it has BLE as a second, physically independent channel
+///   (`R118-F7`), so "off" is a provable state rather than an inference from
+///   silence. Shrinking is how it avoids wedging: `W158` exists entirely because
+///   a 3-voter rig that loses 2 nodes at once cannot commit anything, including
+///   the membership change that would let it commit things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipRatchet {
+    /// The voter set changes only when an operator says so
+    /// (`POST /raft/remove-member`). No background loop proposes a membership
+    /// change, whatever a failure detector believes.
+    Frozen,
+
+    /// Voters that are **corroborated dark** are demoted to learners
+    /// automatically, while the cluster still holds the quorum to commit the
+    /// change.
+    ///
+    /// Demotion, not eviction: the change is made with openraft's
+    /// `retain = true`, so a removed voter stays in membership as a learner and
+    /// keeps replicating. That is what makes rehydration a promotion rather than
+    /// a full rejoin.
+    ShrinkToSurvivors {
+        /// The voter count the ratchet descends to rather than resting on an
+        /// even one.
+        ///
+        /// **`2` is a strictly worse resting place than `1`** — it tolerates
+        /// zero losses while requiring both nodes for every write — so when the
+        /// survivors would leave exactly two voters the ratchet takes one more
+        /// step, down to this floor, *while both are still alive and can
+        /// therefore still commit it*. Deciding the tie afterwards is not
+        /// possible: after the next loss there is no quorum left to decide
+        /// anything with. Odd by construction — see [`VoterFloor`].
+        floor: VoterFloor,
+
+        /// How long one node's liveness report about a peer stays worth
+        /// believing.
+        ///
+        /// Load-bearing, not hygiene. Reports are replicated, so a node that
+        /// has just lost power leaves its last opinions behind — including
+        /// `Alive` about the peer on the same power strip. Without an expiry
+        /// those stale opinions veto the shrink forever, and the ratchet never
+        /// fires in the exact scenario it was built for. A reporter that has
+        /// gone quiet this long is itself a failure, so its testimony stops
+        /// counting.
+        evidence_ttl_secs: u64,
+
+        /// How long a returned node must be **continuously** corroborated alive
+        /// before the cluster will trust it with a vote again (R118-F8 part 2).
+        ///
+        /// **This value is the entire feature.** Rehydration without it is not a
+        /// weaker version of rehydration, it is an *oscillator*: a plinth on a
+        /// failing PSU that comes up, votes, dies, comes up and votes again
+        /// moves quorum on every cycle, and the ratchet — built to keep the
+        /// cluster writable — becomes the thing that stops it committing.
+        ///
+        /// # Why it is 300 s on the rig, and what that number is really made of
+        ///
+        /// It is set **equal to `R118-F7`'s `DEFAULT_HOLD_DOWN`** (300 s,
+        /// `crates/society/core/src/liveness.rs`), and equal rather than merely
+        /// similar, because the two answer halves of one question. F7's
+        /// hold-down is how long silence must persist before a peer is called
+        /// `Dark`; this is how long presence must persist before that peer is
+        /// trusted again. If this were *shorter*, a node could complete a
+        /// down-up cycle and be re-promoted before the detector had even
+        /// finished deciding it was down — the flap would be invisible to the
+        /// mechanism built to absorb it. So the floor on this value is F7's, and
+        /// there is no case for going under it.
+        ///
+        /// F7's 300 s is itself **not measured** — its own doc says so, and
+        /// `R118-T14` is the hardware-in-the-loop trip that settles it by
+        /// timing power-on to first observed BLE advert on the OrangePi. This
+        /// value inherits that calibration and must be re-derived on the same
+        /// trip; a hold-down shorter than a clean reboot shrinks a node out of
+        /// its own cluster mid-restart, and one shorter than a *flap cycle*
+        /// re-admits it mid-flap.
+        promote_hold_down_secs: u64,
+    },
+}
+
+impl MembershipRatchet {
+    /// The floor this policy descends to, or `None` when it never shrinks.
+    pub const fn floor(&self) -> Option<VoterFloor> {
+        match self {
+            Self::Frozen => None,
+            Self::ShrinkToSurvivors { floor, .. } => Some(*floor),
+        }
+    }
+
+    /// Must this cluster **check where a joining node has been** before
+    /// admitting it as a learner (R118-F8 part 2)?
+    ///
+    /// True exactly when the ratchet is running, and that is the whole rule
+    /// rather than a coincidence. On a cluster that rehydrates, a learner gets a
+    /// vote back **by machinery** once it has been quiet-and-then-steady for a
+    /// hold-down — no human is in the loop at the moment it becomes a voter. So
+    /// the join is the last point at which anything can ask "is this the node we
+    /// demoted, or one from a cluster that no longer exists?", and a node
+    /// admitted unchecked there becomes an unchecked *voter* later.
+    ///
+    /// [`Frozen`](Self::Frozen) answers false for the mirror-image reason, not
+    /// out of leniency: nothing promotes automatically there — the fleet is
+    /// [`VoterAdmission::LearnerOnly`], so an unvetted joiner stays a learner
+    /// forever and a human remains the gate on every vote. Checking there would
+    /// cost a round trip on every `raft join` for a consumer that does not
+    /// exist.
+    ///
+    /// # "Vets", not "requires a declaration"
+    ///
+    /// This was `requires_declared_origin` for one revision, when the joiner's
+    /// lineage arrived as a field on the add-learner request body. It does not:
+    /// the leader dials the joiner and reads it off
+    /// ([`membership_ratchet::ask_origin`](crate::membership_ratchet::ask_origin)),
+    /// for the reason that module records — a request body cannot be the source
+    /// of a fact whose whole purpose is to catch a mis-aimed request, and a
+    /// *required* field could not tell a node with no history from a caller that
+    /// would not answer. Nothing is declared, so the name no longer says
+    /// "declared".
+    pub const fn vets_joiner_lineage(&self) -> bool {
+        matches!(self, Self::ShrinkToSurvivors { .. })
+    }
+
+    /// How long a returned node must stay continuously alive before it may be
+    /// promoted, or `None` when this policy never rehydrates.
+    pub const fn promote_hold_down(&self) -> Option<Duration> {
+        match self {
+            Self::Frozen => None,
+            Self::ShrinkToSurvivors {
+                promote_hold_down_secs,
+                ..
+            } => Some(Duration::from_secs(*promote_hold_down_secs)),
+        }
+    }
+
+    /// How long a replicated peer-liveness report is worth believing, or `None`
+    /// when this policy never reads one.
+    pub const fn evidence_ttl(&self) -> Option<Duration> {
+        match self {
+            Self::Frozen => None,
+            Self::ShrinkToSurvivors {
+                evidence_ttl_secs, ..
+            } => Some(Duration::from_secs(*evidence_ttl_secs)),
+        }
+    }
+}
+
 /// Who owns the cluster's **external** identity — the address clients outside
 /// the mesh reach it at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -624,6 +828,10 @@ pub struct ClusterPolicy {
     /// [`raft::open`](crate::raft::open) when constructing the node, and by
     /// failure detectors deriving their thresholds.
     pub timing: RaftTiming,
+    /// Whether the cluster demotes voters it can prove are off — read by
+    /// [`membership_ratchet::plan`](crate::membership_ratchet::plan) on every
+    /// tick of the leader-resident ratchet loop.
+    pub membership_ratchet: MembershipRatchet,
 }
 
 impl ClusterPolicy {
@@ -641,6 +849,11 @@ impl ClusterPolicy {
             quorum_geography: QuorumGeography::MustSpanRegions,
             ingress_ownership: IngressOwnership::ElectedFromEligible,
             timing: RaftTiming::wan(),
+            // The fleet's voter set is written by `raft init` and moves only
+            // when an operator moves it. See `MembershipRatchet::Frozen` for
+            // why the answer is a property of the deployment's failure mode and
+            // not of its name.
+            membership_ratchet: MembershipRatchet::Frozen,
         }
     }
 
@@ -653,6 +866,16 @@ impl ClusterPolicy {
             quorum_geography: QuorumGeography::SingleFailureDomain,
             ingress_ownership: IngressOwnership::Unmanaged,
             timing: RaftTiming::lan(),
+            // Rest at one voter, not two. `evidence_ttl_secs` is 30 because a
+            // rig reporter re-states its verdicts far more often than that (the
+            // LAN heartbeat is 150 ms and BLE adverts are seconds apart), so a
+            // report this stale means the reporter itself stopped — and a
+            // stopped reporter's last "Alive" must not veto a shrink forever.
+            membership_ratchet: MembershipRatchet::ShrinkToSurvivors {
+                floor: VoterFloor::ONE,
+                evidence_ttl_secs: 30,
+                promote_hold_down_secs: 300,
+            },
         }
     }
 
@@ -912,6 +1135,110 @@ mod tests {
                 "{name} must state the decision rather than inherit openraft's default"
             );
         }
+    }
+
+    /// `W158` §7.2(4), as a tripwire rather than a sentence in a doc.
+    ///
+    /// openraft's own docs say not to enable `allow_log_reversion` in
+    /// production. It is a **cluster-wide** switch that permanently tolerates a
+    /// follower coming back with a shorter log, which on the rig is exactly the
+    /// shape of a plinth whose card was reflashed — and tolerating it silently
+    /// is how a returning node's divergence becomes the cluster's. If a
+    /// rehydration path ever genuinely needs to accept one reverted follower,
+    /// the correct instrument is the per-node, per-occasion
+    /// `Trigger::allow_next_revert(to, allow)`, used deliberately and once.
+    ///
+    /// `None` rather than `Some(false)` is correct here, unlike
+    /// `enable_pre_vote` above: the pre-vote flag records a decision that went
+    /// *against* the obvious reading, so it is spelled out; this one records
+    /// that openraft's default is already the answer we want and that nothing
+    /// in this crate may quietly move off it.
+    #[test]
+    fn no_preset_ever_enables_log_reversion() {
+        for (name, policy) in [
+            ("fleet", ClusterPolicy::fleet()),
+            ("rig", ClusterPolicy::rig()),
+        ] {
+            let cfg = policy.timing.to_openraft_config().expect("valid timing");
+            assert_ne!(
+                cfg.allow_log_reversion,
+                Some(true),
+                "{name} must never enable Config::allow_log_reversion (W158 §7.2(4)); the \
+                 per-node Trigger::allow_next_revert is the right granularity if a rehydration \
+                 path ever needs one"
+            );
+        }
+    }
+
+    /// The ratchet is a policy FIELD, not a preset name — R118-F8's gate on
+    /// `ClusterPolicy::fleet()` being byte-for-byte unchanged.
+    #[test]
+    fn only_the_rig_preset_ratchets_its_voter_set() {
+        assert_eq!(
+            ClusterPolicy::fleet().membership_ratchet,
+            MembershipRatchet::Frozen,
+            "a fleet cluster must never shrink itself: its failure domain is the network, and \
+             an automatic shrink there is a split brain waiting for a fibre cut"
+        );
+        assert_eq!(
+            ClusterPolicy::rig().membership_ratchet,
+            MembershipRatchet::ShrinkToSurvivors {
+                floor: VoterFloor::ONE,
+                evidence_ttl_secs: 30,
+                promote_hold_down_secs: 300,
+            },
+            "the rig rests at ONE voter — two tolerates zero losses and is strictly worse"
+        );
+    }
+
+    /// The floor cannot be even, and that is a property of the TYPE rather than
+    /// of the presets — so it holds for a `ClusterPolicy` anyone constructs by
+    /// hand, not only for the two built here.
+    ///
+    /// An even floor would make the descent loop come to rest on an even voter
+    /// count by configuration, which is the exact failure R118-F8 exists to
+    /// prevent, and every existing test would stay green while it did.
+    #[test]
+    fn an_even_resting_floor_is_unrepresentable() {
+        assert_eq!(VoterFloor::new(1), Some(VoterFloor::ONE));
+        assert_eq!(VoterFloor::new(3), Some(VoterFloor::THREE));
+        assert_eq!(VoterFloor::new(5).map(VoterFloor::get), Some(5));
+        for even in [0usize, 2, 4, 100] {
+            assert_eq!(
+                VoterFloor::new(even),
+                None,
+                "a floor of {even} would rest the cluster on an even voter count — or, at 0, on \
+                 a cluster that can never elect a leader again"
+            );
+        }
+    }
+
+    /// The promotion hold-down is never shorter than the darkness hold-down it
+    /// is paired with. See the field's own docs for why that is a floor and not
+    /// a preference.
+    #[test]
+    fn the_rigs_promotion_hold_down_matches_r118_f7s_darkness_hold_down() {
+        /// `society_facility::liveness::DEFAULT_HOLD_DOWN`, restated here
+        /// because this crate cannot link that one (and must not — see
+        /// `membership_ratchet`'s module docs). A change on either side should
+        /// fail this.
+        const R118_F7_DEFAULT_HOLD_DOWN: Duration = Duration::from_secs(300);
+
+        let hold_down = ClusterPolicy::rig()
+            .membership_ratchet
+            .promote_hold_down()
+            .expect("the rig rehydrates");
+        assert_eq!(
+            hold_down, R118_F7_DEFAULT_HOLD_DOWN,
+            "a promotion hold-down under R118-F7's darkness hold-down lets a node complete a \
+             down-up cycle before the detector has finished deciding it was down, which makes \
+             the flap invisible to the mechanism built to absorb it"
+        );
+        assert_eq!(
+            ClusterPolicy::fleet().membership_ratchet.promote_hold_down(),
+            None,
+            "the fleet does not rehydrate, so it has no hold-down to state"
+        );
     }
 
     #[test]

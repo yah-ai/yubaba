@@ -40,13 +40,16 @@
 //!    pipeline also runs it `--nocapture` for the timing report, which merging
 //!    would interleave with every other test's output.
 //!
-//! The four modules below have no such conflict: `live_workspace_smoke` is
+//! The five modules below have no such conflict: `live_workspace_smoke` is
 //! read-only filesystem, `mesofact_static_e2e` binds `127.0.0.1:0` and is gated
 //! on `YAH_RECONCILER_E2E_BIN`, `pg_driver_live` is `#[ignore]`d and tempdir
-//! -scoped, and `whisper_derive_e2e` is entirely in-process on ephemeral ports
-//! inside a tempdir. No shared ports, no shared paths, no process-global state.
+//! -scoped, `passway_apex_live` is `#[ignore]`d and reaches the network
+//! read-only (R859-F1), and `whisper_derive_e2e` is entirely in-process on
+//! ephemeral ports inside a tempdir. No shared ports, no shared paths, no
+//! process-global state.
 
 mod live_workspace_smoke;
 mod mesofact_static_e2e;
+mod passway_apex_live;
 mod pg_driver_live;
 mod whisper_derive_e2e;

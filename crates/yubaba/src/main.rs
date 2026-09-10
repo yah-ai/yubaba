@@ -40,6 +40,23 @@
 //! @yah:next("Register kamaji-dispatched workloads in yubaba's state map at deploy time (or proxy GET /workloads/{id}/state through the kamaji UDS list/state RPC, which IS attached), so the ident is queryable for the run's lifetime and terminal state (Exited 0 / Failed) is observable. Cross-check R590-F2's MeshYubabaClient::connect_logs which polls this endpoint for terminal status.")
 //! @yah:verify("After deploying a forge workload, GET http://<node>:7443/workloads/{ident}/state returns the live state (not 404) through to a terminal Exited/Failed; `yah qed run rusty-v8-musl` reflects the container's real exit instead of failing on the 404 poll.")
 //! @yah:gotcha("PROVEN live (2026-07-11): a workload deploy succeeds (kamaji logs 'containerd workload deployed container_id=forge-... pid=...'), but the qed CLI's state poll gets `404 Not Found {\"error\":\"workload not found\"}` from GET /workloads/{id}/state on the SAME ident — so RemoteForgeDriver marks the run Failed regardless of the container's real outcome. Even a green long build would be reported Failed. The deploy goes yubaba->kamaji->containerd, but yubaba's queryable state registry doesn't hold the deployed ident.")
+//!
+//! @yah:ticket(R870-B20, "A door cannot have a cert store without an ACME issuer config — parse_issuer_config owns CertStoreConfig, so YUBABA_CERT_STORE_* is silently inert alone")
+//! @yah:status(review)
+//! @yah:at(2026-09-09T08:21:38Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R870)
+//! @yah:severity(medium)
+//! @yah:next("Hoist CertStoreConfig::parse to its own call in main.rs and pass the store INTO the issuer rather than reading it out — the issuer only wants it as a mirror (acme_issuer.rs `mirror_pair`), so IssuerConfig::cert_store can be deleted rather than made Option-of-Option. Per the workspace's below-1.0 rule: change the signature and fix the call sites, do not add a fallback beside it. The workaround R870-T17 shipped is that us-west-001 now carries a 40-acme-issuer.conf it does not otherwise need, which makes it a third standby candidate for the fleet-cert issuer lock; that drop-in can be removed once this lands.")
+//! @yah:verify("A node with YUBABA_CERT_STORE_BUCKET set and YUBABA_ACME_DOMAIN unset logs 'cert store: per-domain TLS material resolves from the object store...' and spawns the demux publisher. A node with neither logs nothing new. Unit test over the pure parse functions, no env.")
+//! @yah:gotcha("MEASURED 2026-09-09 on us-west-001 (R870-T17). CertStoreConfig::parse is called from acme_issuer::parse_issuer_config (acme_issuer.rs:400) and surfaces only as IssuerConfig::cert_store; main.rs:928 reads the store off `if let Ok(Some(cfg)) = parse_issuer_config(...)`. parse_issuer_config returns Ok(None) whenever YUBABA_ACME_DOMAIN is unset. So a door that sets YUBABA_CERT_STORE_BUCKET/_ACCOUNT_ID but has no issuer drop-in gets NO cert store, and therefore no route publisher, no per-domain issuer and no tenant-passway reconciler — with not one log line saying why. us-west-001 was in exactly that state (east and south got 40-acme-issuer.conf on 2026-09-05, west never did). This directly contradicts demux_routes.rs's own module doc and main.rs:941's comment, both of which say the publisher is spawned outside the raft branch precisely because 'the node holding :443 for a free tier need not be a raft member'. It equally need not be an ACME issuer.")
+//! @yah:handoff("SHIPPED AS SPECIFIED. CertStoreConfig::parse is now its own call in main.rs (the `match yubaba::cert_store::CertStoreConfig::parse(...)` block at main.rs:932-1026) and `IssuerConfig::cert_store` is DELETED, not made optional — no fallback beside the old path. The store, the demux route publisher, the per-domain issuer and (further down) the tenant-passway reconciler now all hang off YUBABA_CERT_STORE_BUCKET alone; YUBABA_ACME_DOMAIN is no longer in that path. acme_issuer::spawn/run gained a fifth parameter `mirror: Option<Arc<ObjectCertStore>>` and main.rs:1437-1440 hands it `shared_state.cert_store.clone()` — the issuer no longer parses or connects a store of its own, it is handed the node's. Three main.rs hunks only (932-947, 1018-1026, 1437-1440), deliberately tight because @Ashguard is editing demux_routes.rs + lib.rs for R870-F19 in the same tree; I touched neither.")
+//! @yah:handoff("WIDER THAN THE TITLE, one discovered fix: the ACME directory default (\"staging\") was duplicated in FOUR places — acme_issuer.rs, domain_issuer.rs, domain_admin.rs (which carried the DIRECTORY_ENV/DEFAULT_DIRECTORY consts plus a doc comment saying \"kept equal deliberately\"), and it would have become a fifth copy in main.rs, since main now needs the directory URL to connect the store without an issuer config. That value names the store's issuer path segment, so a drift between two copies means a reader addressing an empty prefix. Given one owner instead: cert_store.rs now holds DIRECTORY_ENV, DEFAULT_DIRECTORY and `pub fn acme_directory(get) -> AcmeDirectory` (cert_store.rs:300-324), and all four callers go through it. domain_admin's copies of the consts were deleted; nothing outside that module referenced them.")
+//! @yah:verify("BASELINE MEASURED FIRST on the dispatch anchor 718dfacba1f6bfc8f0587713a5d30bc15ac21f2f: `cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib --bins` = 864 passed / 0 failed / 0 ignored (the bin target has 0 tests). AFTER: 865 passed / 0 failed / 0 ignored. Net +1 is exactly accounted for: 3 tests deleted from acme_issuer (cert_store_mirror_is_off_unless_a_bucket_is_named, cert_store_mirror_parses_from_the_issuer_env, a_bucket_without_an_account_id_is_a_config_error — all asserted a field that no longer exists), 4 added. Unit tests over the pure parse functions with no env, as the ticket required: acme_issuer::a_cert_store_parses_with_no_acme_issuer_configured (the regression itself — bucket+account with no YUBABA_ACME_DOMAIN yields Some(store) AND None issuer), acme_issuer::issuer_config_no_longer_reads_the_cert_store_env (the reverse coupling), cert_store::a_bucket_without_an_account_id_is_rejected (the half-configured error, moved to where it now lives), cert_store::the_acme_directory_defaults_to_staging_and_is_overridable. `cargo check -p yubaba --all-targets` is clean — no errors and no warnings in any of the five files touched.")
+//! @yah:verify("NOT RUN: the yubaba integration binaries (`--test main`, domain_onboarding_endpoint). They compile clean under `--all-targets` and nothing in them spawns an issuer or a cert store, so the change cannot reach them; the raft suite there is also the documented pre-existing flake (see domain_admin.rs's R852-F2 gotcha). Also NOT run: any fleet node. The two behavioural claims in the ticket's verify line are structural after this change — the info line \"cert store: per-domain TLS material resolves from the object store...\" and the demux publisher spawn are now both inside the CertStoreConfig::parse branch, which no longer consults any YUBABA_ACME_* key; a node with neither variable takes the `Ok(None) => {}` arm and logs nothing new.")
+//! @yah:cleanup("NOW REMOVABLE, NOT TOUCHED BY ME (live fleet action, explicitly out of scope): us-west-001's `40-acme-issuer.conf`, the R870-T17 workaround. It exists only so parse_issuer_config would return Ok(Some(..)) and let west reach a cert store; after this change west gets its store from YUBABA_CERT_STORE_BUCKET alone. Removing it changes exactly one other thing: west stops being a third standby candidate for the fleet-cert issuer raft lock, which is the reason it should go rather than a side effect to tolerate.")
+//! @yah:gotcha("ONE DELIBERATE BEHAVIOUR CHANGE beyond the decoupling: the issuer used to build its own ObjectCertStore from its own config, so a bucket that failed to connect at boot got a second connect attempt when the issuer started. It now shares the node's store, so a failed connect means no mirror for that process lifetime — main logs \"cert store unavailable — per-domain TLS material will not resolve on this node\" at boot, and the issuer keeps writing to raft exactly as before (a missing mirror has never been allowed to stop issuance). Also new: a half-configured store (BUCKET set, ACCOUNT_ID missing) used to fail parse_issuer_config and take the whole issuer down with it; it is now reported on its own line (\"cert store config invalid — no per-domain TLS material on this node\") and leaves the issuer running.")
+//! @yah:verify("LEADER RE-VERIFICATION (session:abde2cbb, 2026-09-09), independent of the courier. `cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib --bins` = 865 passed / 0 failed, matching the courier's count against the 864 baseline it measured first on anchor 718dfacb. Then checked the two properties that mattered more than the count, because this ticket was ABOUT a hidden coupling and a shim would have preserved it: (1) `IssuerConfig::cert_store` is GONE — a grep of acme_issuer.rs for the field returns nothing, so the store is passed IN as a mirror rather than read back out, which is what the ticket asked for rather than an Option-of-Option; (2) `acme_directory` now has exactly one definition, at cert_store.rs:321. That second one was discovered work, not the brief: the ACME directory default was already duplicated in FOUR places and the hoist would have made main.rs a fifth, on a value that names the store's issuer path segment — so a drift between copies means a reader addressing an empty prefix. Collapsing it to one owner was the right call and is exactly the \"change the abstraction rather than shortcut around it\" case. A PostToolUse tree-drift warning fired on my run naming oss/yubaba/crates/cloud/src/reconciler/ingress.rs, which is R870-F16's file and not on this ticket's path, so the result stands.")
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -214,6 +231,59 @@ enum Cmd {
         /// region for a peer to read.
         #[arg(long)]
         region: Option<String>,
+        /// R859-F2 phase A: which provider hosts this box — `hetzner`, `ovh`,
+        /// `vultr`, `static`.
+        ///
+        /// One of four flags carrying this machine's **public-ingress
+        /// declaration** into its raft member row. Copy each from the
+        /// `.yah/infra/machines/<name>.toml` field of the same name, exactly as
+        /// `--region` and `--sovereign-group` are copied — same label space, one
+        /// source of truth, and a box whose flags and machine file disagree is a
+        /// bug nothing else would catch.
+        ///
+        /// # Why the fleet needs these at all
+        ///
+        /// A yubaba node never loads `.yah/infra/machines/`. So the raft leader
+        /// — the one process that sees `ingress_owner` move and sees a node die
+        /// — could observe both and act on neither: it had no provider to
+        /// command, no floating IP to move, and no address to pull out of DNS.
+        /// These four flags are that missing half, published by each node about
+        /// itself (operator decision 2, 2026-09-08). Unset means the effector
+        /// treats this box as *undeclared* and refuses to act on it, which is
+        /// every node's behaviour before R859-F2 and is safe.
+        ///
+        /// Requires `--raft-node-id`; without a cluster there is no member row.
+        #[arg(long)]
+        provider: Option<String>,
+        /// R859-F2 phase A: this box's provider DC code (`hil`, `ewr`, `sbg5`),
+        /// from its machine file's `location`.
+        ///
+        /// Read only by the vendor floating-IP adapters, to derive the mobility
+        /// zone an IP may move within. Carried now because adding it later
+        /// would cost a second raft-surface change and a second cluster-epoch
+        /// re-record for one optional string. See `--provider`.
+        #[arg(long)]
+        location: Option<String>,
+        /// R859-F2 phase A: the floating/reserved IP that follows public
+        /// ingress onto this box, from its machine file's
+        /// `ingress_floating_ip`.
+        ///
+        /// Unset is the common case and a supported shape, not a
+        /// misconfiguration: a fleet whose public ingress moves by DNS alone has
+        /// no floating IP anywhere, which is every machine this camp declares
+        /// today. See `--provider`.
+        #[arg(long)]
+        ingress_floating_ip: Option<String>,
+        /// R859-F2 phase A: the **public** address this box answers on — the
+        /// content of its A record at the ingress apex.
+        ///
+        /// Deliberately not the mesh address raft membership records: that is
+        /// `100.64.x.x`, which is exactly what a public apex must never carry.
+        /// This is the one fact the withdrawal path cannot work without, because
+        /// a Cloudflare record delete is content-matched — see
+        /// [`ingress_effector`](yubaba::ingress_effector). See `--provider`.
+        #[arg(long)]
+        public_address: Option<String>,
         /// R742-F1 (W305 §F1): which sovereign group this node votes in, e.g.
         /// `prod` or `dev`.
         ///
@@ -440,6 +510,69 @@ enum Cmd {
         #[command(subcommand)]
         cmd: DomainCmd,
     },
+    /// Holding-page bodies a parked domain's 503 carries (R870-F8).
+    ///
+    /// Same store and same credentials as `domain`, and for the same reason:
+    /// the pages sit beside the enrollment set in the bucket, not in raft.
+    Holding {
+        #[command(subcommand)]
+        cmd: HoldingCmd,
+    },
+    /// The off-fleet copy of the raft state: inspect, restore, adopt
+    /// (R869 / W339).
+    ///
+    /// Like `domain`, these read and write the object store directly — the copy
+    /// is one object, so they need no quorum, no leader and no running daemon,
+    /// only `YUBABA_STATE_BACKUP_CLUSTER` plus the `YUBABA_CERT_STORE_*` and
+    /// `cloudflare-r2-*` credentials the daemon already uses. That is the
+    /// point: the machine you rebuild from is not part of a cluster yet.
+    State {
+        #[command(subcommand)]
+        cmd: StateCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum StateCmd {
+    /// Show the off-fleet copy — how stale it is, and what it holds.
+    Show {
+        /// Read a retired lineage (see the `lineage` line in the default
+        /// output) instead of the current copy.
+        #[arg(long)]
+        lineage: Option<u64>,
+        /// Emit JSON — the whole snapshot, state included.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Seed an empty raft dir from the off-fleet copy.
+    ///
+    /// Run against every founding voter of the new cluster *before* `raft init`
+    /// and before yubaba starts, then init as usual. Refuses a dir that already
+    /// holds any of the four raft files.
+    ///
+    /// `locks` and `rollouts` are dropped: on a rebuild every lock holder is
+    /// dead by construction, and a lease with hours left on it would stall the
+    /// new cluster on a lock nobody will ever release.
+    Restore {
+        /// The raft dir to seed — the daemon's `--raft-dir`.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Restore a retired lineage rather than the current copy.
+        #[arg(long)]
+        lineage: Option<u64>,
+        /// Report what would be written without writing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Accept a rebuilt cluster as a new incarnation, so it can back up again.
+    ///
+    /// The backup refuses to overwrite a copy with a *lower* applied index —
+    /// that is what a wiped raft dir looks like from the object store, and an
+    /// unguarded backup would destroy the only surviving copy of the cluster
+    /// within one tick of the first node coming back. This is the operator
+    /// saying the low index is legitimate. The pre-rebuild copy is archived
+    /// under its lineage first, and `state show --lineage <n>` still reads it.
+    Adopt,
 }
 
 #[derive(Subcommand)]
@@ -509,6 +642,52 @@ enum DomainCmd {
         /// Emit JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Point a domain at a holding page, or back at passway's own (R870-F8).
+    ///
+    /// The page is the body a door serves on a fail-ready 503 — a parked
+    /// domain, or the seconds after a deploy before the new backend reports
+    /// ready. Which page is cosmetic and freely re-decided, so this is its own
+    /// verb rather than a re-enrolment: routing is untouched.
+    ///
+    /// Upload the page itself with `yubaba holding put`. The two can happen in
+    /// either order; a domain naming a page that is not there keeps the default.
+    Holding {
+        /// The enrolled domain to brand.
+        domain: String,
+        /// The page name, as `yubaba holding list` shows it.
+        #[arg(long, conflicts_with = "clear", required_unless_present = "clear")]
+        page: Option<String>,
+        /// Remove the override — back to passway's own page.
+        #[arg(long)]
+        clear: bool,
+    },
+}
+
+/// Manage the holding-page bodies domains point at (R870-F8).
+///
+/// A page is one object shared by every domain naming it, which is why these
+/// are their own commands: at ten thousand tenants and a handful of brands, the
+/// pages are the small set.
+#[derive(Subcommand)]
+enum HoldingCmd {
+    /// Store (or replace) a page from a local HTML file.
+    Put {
+        /// The page name domains will reference. Lowercase letters, digits,
+        /// `-` and `_`; it becomes a filename on every door.
+        name: String,
+        /// Path to the HTML document to upload.
+        file: PathBuf,
+    },
+    /// List stored page names.
+    List,
+    /// Delete a page.
+    ///
+    /// Domains naming it are left alone and fall back to passway's own page on
+    /// the next sweep; re-uploading the name restores them.
+    Remove {
+        /// The page name to delete.
+        name: String,
     },
 }
 
@@ -605,6 +784,10 @@ fn default_serve() -> Cmd {
         bootstrap_single_node: false,
         raft_advertise_addr: None,
         region: None,
+        provider: None,
+        location: None,
+        ingress_floating_ip: None,
+        public_address: None,
         sovereign_group: None,
         sovereign_role: SovereignRole::default(),
         jurisdiction: None,
@@ -643,6 +826,10 @@ async fn main() -> Result<()> {
             bootstrap_single_node,
             raft_advertise_addr,
             region,
+            provider,
+            location,
+            ingress_floating_ip,
+            public_address,
             sovereign_group,
             sovereign_role,
             jurisdiction,
@@ -750,16 +937,22 @@ async fn main() -> Result<()> {
             // unreachable bucket must not stop the daemon from booting, and a
             // node that cannot reach it simply has no per-domain certs.
             //
-            // The issuer's directory URL names the store's issuer segment, so
-            // the writer and the reader agree on one path without a second
-            // config knob. An invalid or absent issuer config is not reported
-            // here — the issuer spawn below already logs it, and duplicating the
-            // line on boot would suggest two separate faults.
-            if let Ok(Some(cfg)) =
-                yubaba::acme_issuer::parse_issuer_config(|k| std::env::var(k).ok())
-            {
-                if let Some(store_cfg) = &cfg.cert_store {
-                    match store_cfg.connect(&cfg.issue.directory.url()) {
+            // The ACME directory names the store's issuer segment, so writer and
+            // reader agree on one path without a second config knob — resolved
+            // by `cert_store::acme_directory`, the single owner of that default.
+            //
+            // R870-B20: parsed HERE, not read off the ACME issuer's config. It
+            // used to hang off `IssuerConfig`, which returns `Ok(None)` whenever
+            // YUBABA_ACME_DOMAIN is unset — so a door with a bucket and no
+            // issuer drop-in silently got no cert store, and therefore no route
+            // publisher, no per-domain issuer and no tenant passways, with
+            // nothing in the log to attribute it to (us-west-001, 2026-09-09).
+            // A cert store is a property of the node, not of the issuer.
+            match yubaba::cert_store::CertStoreConfig::parse(|k| std::env::var(k).ok()) {
+                Ok(Some(store_cfg)) => {
+                    let directory_url =
+                        yubaba::cert_store::acme_directory(|k| std::env::var(k).ok()).url();
+                    match store_cfg.connect(&directory_url) {
                         Ok(store) => {
                             tracing::info!(
                                 bucket = %store_cfg.bucket,
@@ -830,6 +1023,15 @@ async fn main() -> Result<()> {
                         ),
                     }
                 }
+                Ok(None) => {}
+                // Half-configured: the bucket is named but the account id is
+                // not. Loud, because the store's own parse treats that as an
+                // operator who meant to turn this on, and because silence here
+                // is exactly the failure R870-B20 fixed.
+                Err(e) => tracing::error!(
+                    "cert store config invalid — no per-domain TLS material on this node \
+                     (fix YUBABA_CERT_STORE_*): {e}"
+                ),
             }
 
             // Wire the container runtime. This is what flips `/workloads/deploy`
@@ -1054,12 +1256,22 @@ async fn main() -> Result<()> {
                     node_id,
                     raft_node.clone(),
                     state_machine.clone(),
-                    region,
-                    capacity,
-                    // R859-F2: the SAME derivation the leader path writes into
-                    // `ingress_owner` — now literally the same value, not a
-                    // second call that happens to agree (R858-T3).
-                    machine,
+                    yubaba::raft::NodeDeclaration {
+                        region,
+                        capacity,
+                        // R859-F2: the SAME derivation the leader path writes
+                        // into `ingress_owner` — now literally the same value,
+                        // not a second call that happens to agree (R858-T3).
+                        machine,
+                        // R859-F2 phase A: this box's public-ingress
+                        // declaration, straight off the flags. A fleet node has
+                        // no `.yah/infra/machines/` tree, so this row is the
+                        // only place the leader can learn them.
+                        provider,
+                        location,
+                        ingress_floating_ip,
+                        public_address,
+                    },
                 );
                 // R734-T4: soft leader pin. Started on every node, not just the
                 // leader — a follower's loop reaches `NotLeader` and does
@@ -1074,6 +1286,43 @@ async fn main() -> Result<()> {
                         yubaba::leader_pin::PinConfig::new(anchor, policy.timing),
                     );
                 }
+                // R859-F2 phase B: the public-ingress effector, built before
+                // the scheduler because it rides that loop's tick. Config is
+                // env-sourced (`YUBABA_INGRESS_APEX` + a fob-injected
+                // Cloudflare token file), matching the ACME issuer's shape
+                // rather than adding a fourth credential flag.
+                //
+                // A misconfiguration is fatal at startup ON PURPOSE. This is
+                // the opposite of member registration's never-wedge-a-boot
+                // rule, and the difference is what each failure costs: an
+                // unregistered node is metadata nobody waits on, whereas an
+                // effector that half-parsed its config discovers it during the
+                // 3am failover it exists to perform. Unset is not a
+                // misconfiguration — it is the default, and it is `None`.
+                let ingress_effector = match yubaba::ingress_effector::parse_effector_config(
+                    |k| std::env::var(k).ok(),
+                ) {
+                    Ok(Some(cfg)) => {
+                        tracing::info!(
+                            apex = cfg.apex.as_ref().map(|a| a.apex.as_str()).unwrap_or("-"),
+                            zone_id = cfg.apex.as_ref().map(|a| a.zone_id.as_str()).unwrap_or("-"),
+                            floating_ip_providers = %if cfg.floating_ip_token_files.is_empty() {
+                                "-".to_string()
+                            } else {
+                                cfg.floating_ip_token_files
+                                    .keys()
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            },
+                            "public-ingress effector armed: this node may withdraw dead origins \
+                             from the apex and/or move an ingress floating IP"
+                        );
+                        Some(yubaba::ingress_effector::IngressEffector::from_config(&cfg)?)
+                    }
+                    Ok(None) => None,
+                    Err(e) => anyhow::bail!("public-ingress effector configuration: {e}"),
+                };
                 // R737-F3: tenant placement scheduler. Started on every node
                 // for the same reason as the leader pin above — a follower's
                 // tick is a no-op. Unlike the pin, this has no operator flag
@@ -1083,19 +1332,57 @@ async fn main() -> Result<()> {
                     node_id,
                     raft_node.clone(),
                     state_machine.clone(),
-                    shared_state.lease_detector.clone(),
-                    // R737-F2: the raft-heartbeat channel supplies W253 §7's
-                    // `raft peer healthy` gate — as a veto only, never as
-                    // grounds to place. See the scheduler module doc for why
-                    // that direction is what keeps the two channels separate.
-                    shared_state.failure_detector.clone(),
-                    // R782: streamer_watermark_age's live source.
-                    shared_state.rpo_registry.clone(),
+                    yubaba::scheduler::SchedulerDeps {
+                        lease_detector: shared_state.lease_detector.clone(),
+                        // R737-F2: the raft-heartbeat channel supplies W253
+                        // §7's `raft peer healthy` gate — as a veto only, never
+                        // as grounds to place. See the scheduler module doc for
+                        // why that direction is what keeps the two channels
+                        // separate.
+                        raft_detector: shared_state.failure_detector.clone(),
+                        // R782: streamer_watermark_age's live source.
+                        rpo_registry: shared_state.rpo_registry.clone(),
+                        // R859-F2 phase B: public ingress follows placement.
+                        // `None` unless YUBABA_INGRESS_APEX is set, which is
+                        // every camp today — see `ingress_effector`'s module
+                        // doc for why the fleet is allowed to subtract from the
+                        // apex and nothing else.
+                        ingress: ingress_effector,
+                    },
                     yubaba::scheduler::SchedulerConfig::new(
                         policy.timing,
                         yubaba::lease_detector::HysteresisPolicy::from_thresholds(
                             policy.liveness_thresholds(),
                         ),
+                    ),
+                );
+                // R118-F8: the membership ratchet. Unlike the scheduler above
+                // this one is NOT started unconditionally — under
+                // `MembershipRatchet::Frozen` (the fleet) every tick would hold
+                // for the same reason forever, so not carrying the task is the
+                // honest expression of "this cluster does not shrink itself".
+                // Reads the policy FIELD, not a preset name.
+                let _membership_ratchet = policy.membership_ratchet.floor().map(|_| {
+                    yubaba::membership_ratchet::spawn(
+                        node_id,
+                        raft_node.clone(),
+                        state_machine.clone(),
+                        policy,
+                        yubaba::membership_ratchet::RatchetConfig::default(),
+                    )
+                });
+                // R118-T5: the rollout supervisor. Started on every node for
+                // the same reason as the scheduler above — a follower's tick is
+                // a no-op — and it is what makes an interrupted fleet image
+                // update finish: without it a rollout is driven only by the
+                // process that accepted it, and dies with that process.
+                let _rollout_supervisor = yubaba::rollout::supervisor::spawn(
+                    node_id,
+                    raft_node.clone(),
+                    state_machine.clone(),
+                    yubaba::rollout::supervisor::SupervisorConfig::new(
+                        policy.timing,
+                        shared_state.prometheus_url.clone(),
                     ),
                 );
                 // R737-F3: the client half of the node-lease channel — without
@@ -1138,6 +1425,40 @@ async fn main() -> Result<()> {
                 // the pair to two configured paths instead. Opt-in on
                 // YUBABA_CERT_FILES_DOMAIN and inert without it.
                 tokio::spawn(yubaba::cert_materialize::run(Arc::clone(&shared_state)));
+                // R869 (W339): the off-fleet copy of the applied raft state —
+                // the one input a cluster needs that lived nowhere but the
+                // voters' own disks. Opt-in on YUBABA_STATE_BACKUP_CLUSTER, and
+                // it rides the cert store's bucket and credentials rather than
+                // asking for its own: a disaster-recovery mechanism that needs
+                // config the fleet does not already carry is one that is not
+                // there when the disaster happens. Spawned on every node like
+                // the scheduler; only the leader ships a copy.
+                match yubaba::state_backup::StateBackupConfig::parse(|k| std::env::var(k).ok()) {
+                    Ok(Some(backup_cfg)) => match shared_state.cert_store.as_ref() {
+                        Some(cert_store) => {
+                            let _state_backup = yubaba::state_backup::spawn(
+                                node_id,
+                                raft_node.clone(),
+                                state_machine.clone(),
+                                cert_store.objects(),
+                                backup_cfg,
+                            );
+                        }
+                        // Reachable despite the config check, which reads env:
+                        // the store is built earlier and its connect() is
+                        // non-fatal, so an unreachable bucket lands here.
+                        None => tracing::error!(
+                            "state backup configured but the cert store did not connect — the \
+                             raft state has NO off-fleet copy on this node (fix the \
+                             YUBABA_CERT_STORE_* credentials)"
+                        ),
+                    },
+                    Ok(None) => {}
+                    Err(e) => tracing::error!(
+                        "state backup config invalid — the raft state has NO off-fleet copy \
+                         (fix YUBABA_STATE_BACKUP_*): {e}"
+                    ),
+                }
                 // R600-F3 (W273): the fleet-shared ACME issuer. Opt-in — only
                 // spawns when YUBABA_ACME_DOMAIN et al are set (the HA fleet),
                 // and only one node issues at a time (raft-lock elected). Reads
@@ -1150,6 +1471,10 @@ async fn main() -> Result<()> {
                             raft_node,
                             state_machine,
                             issuer_cfg,
+                            // R870-B20: the node's store, connected above, handed
+                            // in as the issuer's mirror. The issuer no longer
+                            // parses or connects one of its own.
+                            shared_state.cert_store.clone(),
                         );
                     }
                     Ok(None) => {}
@@ -1216,6 +1541,53 @@ async fn main() -> Result<()> {
                         "--leader-anchor has no effect without --raft-node-id: there is no \
                          raft leadership to steer"
                     );
+                }
+                // R859-F2 phase A. Same shape as `--region` and warned about as
+                // one group, because they are one declaration: they only ever
+                // travel together and a node missing any of them is equally
+                // un-actable. Dangerous to pass silently for the reason
+                // `--sovereign-group` is — an operator who set `--public-address`
+                // believes this box can be withdrawn from the apex when it dies,
+                // and with no raft there is no member row, no leader, and no
+                // effector.
+                if provider.is_some()
+                    || location.is_some()
+                    || ingress_floating_ip.is_some()
+                    || public_address.is_some()
+                {
+                    tracing::warn!(
+                        provider = ?provider,
+                        location = ?location,
+                        ingress_floating_ip = ?ingress_floating_ip,
+                        public_address = ?public_address,
+                        "the public-ingress declaration has no effect without --raft-node-id: \
+                         there is no raft member row to publish it into, so nothing can withdraw \
+                         this node from the apex when it dies"
+                    );
+                }
+                // The effector is leader-driven and is built inside the raft
+                // branch, so on this path it is never even parsed. Saying so
+                // matters more than the flags above: a configured apex plus a
+                // live Cloudflare token — or a vendor token file — reads like an
+                // armed failover. Both arms warn, because either alone is enough
+                // for an operator to believe this node will act (R859-F3).
+                if let Ok(apex) = std::env::var(yubaba::ingress_effector::APEX_ENV) {
+                    tracing::warn!(
+                        %apex,
+                        "{} has no effect without --raft-node-id: the ingress effector runs on \
+                         the raft leader, and there is no raft cluster here",
+                        yubaba::ingress_effector::APEX_ENV
+                    );
+                }
+                for (provider, _, _) in floating_ip::FLOATING_IP_PROVIDERS {
+                    let key = yubaba::ingress_effector::floating_ip_token_file_env(provider);
+                    if std::env::var(&key).is_ok() {
+                        tracing::warn!(
+                            %provider,
+                            "{key} has no effect without --raft-node-id: the ingress effector \
+                             runs on the raft leader, and there is no raft cluster here"
+                        );
+                    }
                 }
                 tracing::info!(
                     "yubaba running in single-node mode — \
@@ -1360,6 +1732,141 @@ async fn main() -> Result<()> {
             }
         },
         Cmd::Domain { cmd } => run_domain_cmd(cmd),
+        Cmd::Holding { cmd } => run_holding_cmd(cmd),
+        Cmd::State { cmd } => run_state_cmd(cmd),
+    }
+}
+
+/// R869 (W339) — the `state` verbs, against the object store directly.
+///
+/// Synchronous inside an async `main` for the same reason [`run_domain_cmd`]
+/// is: the object-store API is blocking and these are one-shot commands.
+fn run_state_cmd(cmd: StateCmd) -> Result<()> {
+    use yubaba::state_backup;
+
+    let backup = state_backup::connect_from_env(|k| std::env::var(k).ok())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Both readers name the same "there is nothing there" case, and it is worth
+    // a sentence rather than an empty print: on a rebuild, "no copy" and "a copy
+    // of an empty cluster" lead to completely different next actions.
+    let read = |lineage: Option<u64>| -> Result<state_backup::StateSnapshot> {
+        let found = match lineage {
+            Some(n) => backup.read_lineage(n)?,
+            None => backup.read_latest()?,
+        };
+        found.ok_or_else(|| match lineage {
+            Some(n) => anyhow::anyhow!(
+                "cluster {} has no retired lineage {n}. Retired lineages: {:?}",
+                backup.cluster(),
+                backup.lineages().unwrap_or_default()
+            ),
+            None => anyhow::anyhow!(
+                "cluster {} has never shipped an off-fleet copy ({} does not exist). Nothing to \
+                 restore from — this is not the same as a copy of an empty cluster.",
+                backup.cluster(),
+                backup.locate_latest()
+            ),
+        })
+    };
+
+    match cmd {
+        StateCmd::Show { lineage, json } => {
+            let snap = read(lineage)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+                return Ok(());
+            }
+            println!("cluster        {}", backup.cluster());
+            println!("object         {}", backup.locate_latest());
+            println!("lineage        {}", snap.lineage);
+            println!("applied index  {}", snap.applied_index);
+            println!(
+                "taken at       {} ({}s ago)",
+                snap.taken_at,
+                now.saturating_sub(snap.taken_at)
+            );
+            println!(
+                "written by     node {} on yubaba {}",
+                snap.node_id, snap.version
+            );
+            println!("retired        {:?}", backup.lineages().unwrap_or_default());
+            println!();
+            println!("members            {}", snap.state.members.len());
+            println!("service placement  {}", snap.state.service_placement.len());
+            println!("cluster secrets    {}", snap.state.secrets.len());
+            println!("tenants            {}", snap.state.tenants.len());
+            println!("tenant placement   {}", snap.state.placement.len());
+            println!("ingress owner      {:?}", snap.state.ingress_owner);
+            println!(
+                "dropped on restore locks={} rollouts={}",
+                snap.state.locks.len(),
+                snap.state.rollouts.len()
+            );
+            Ok(())
+        }
+        StateCmd::Restore {
+            dir,
+            lineage,
+            dry_run,
+        } => {
+            let snap = read(lineage)?;
+            let state = state_backup::restorable(snap.clone());
+            println!(
+                "restoring cluster {} lineage {} applied index {} (taken {}s ago) into {}",
+                backup.cluster(),
+                snap.lineage,
+                snap.applied_index,
+                now.saturating_sub(snap.taken_at),
+                dir.display()
+            );
+            println!(
+                "  members={} services={} secrets={} tenants={} placement={} (locks and rollouts \
+                 dropped)",
+                state.members.len(),
+                state.service_placement.len(),
+                state.secrets.len(),
+                state.tenants.len(),
+                state.placement.len()
+            );
+            if dry_run {
+                println!("dry run — nothing written");
+                return Ok(());
+            }
+            yubaba::raft::store::seed_state_machine(&dir, &state)
+                .with_context(|| format!("seeding {}", dir.display()))?;
+            println!("wrote {}/raft_state.json", dir.display());
+            println!(
+                "next: repeat on every founding voter, start yubaba with --raft-node-id, then \
+                 `yubaba raft init --member ...` exactly once, then \
+                 `yubaba-tenant-streamer rebuild` before starting any streamer. The restored \
+                 fencing epochs mean the first claim on each tenant outranks any survivor \
+                 holding an epoch from before this copy was taken — but the R2 sink is still the \
+                 authority on what it accepts, and `rebuild` is what reads its floor and lifts \
+                 over it if this copy was stale. Skipping it is silent: a fenced tenant is \
+                 dropped, not paged."
+            );
+            Ok(())
+        }
+        StateCmd::Adopt => {
+            let before = read(None)?;
+            let lineage = backup.adopt(now)?;
+            println!(
+                "adopted: cluster {} is now lineage {lineage}. The previous copy (lineage {}, \
+                 applied index {}) is archived — read it with `yubaba state show --lineage {}` \
+                 and restore from it with `yubaba state restore --lineage {}`.",
+                backup.cluster(),
+                before.lineage,
+                before.applied_index,
+                before.lineage,
+                before.lineage
+            );
+            Ok(())
+        }
     }
 }
 
@@ -1440,6 +1947,7 @@ fn run_domain_cmd(cmd: DomainCmd) -> Result<()> {
                             "tls_backend": r.enrollment.tls_backend.to_string(),
                             "http_backend": r.enrollment.http_backend.map(|a| a.to_string()),
                             "enrolled_at": r.enrollment.enrolled_at,
+                            "holding": r.enrollment.holding,
                         })
                     })
                     .collect();
@@ -1459,6 +1967,74 @@ fn run_domain_cmd(cmd: DomainCmd) -> Result<()> {
             } else {
                 print!("{}", report.render(now_secs));
             }
+            Ok(())
+        }
+        DomainCmd::Holding {
+            domain,
+            page,
+            clear,
+        } => {
+            let page = if clear { None } else { page.as_deref() };
+            store.set_holding(&domain, page)?;
+            match page {
+                Some(name) => println!(
+                    "{domain} now shows the {name:?} holding page — doors pick it up on \
+                     their next sweep"
+                ),
+                None => println!("{domain} is back to passway's own holding page"),
+            }
+            if let Some(name) = page {
+                if store.holding_page(name)?.is_none() {
+                    println!(
+                        "note: no page is stored under {name:?} yet — until one is \
+                         (`yubaba holding put {name} <file>`), those doors keep the \
+                         default page"
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `yubaba holding …` — the page bodies, beside the enrollment set (R870-F8).
+fn run_holding_cmd(cmd: HoldingCmd) -> Result<()> {
+    use yubaba::domain_admin;
+
+    let cfg = domain_admin::parse_admin_config(|k| std::env::var(k).ok())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let store = cfg
+        .connect()
+        .with_context(|| format!("opening cert store bucket {}", cfg.store.bucket))?;
+
+    match cmd {
+        HoldingCmd::Put { name, file } => {
+            let body =
+                std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
+            let bytes = body.len();
+            store.write_holding_page(&name, body)?;
+            println!(
+                "stored holding page {name:?} ({bytes} bytes) — doors serving a domain \
+                 that names it pick it up on their next sweep"
+            );
+            Ok(())
+        }
+        HoldingCmd::List => {
+            let names = store.holding_pages()?;
+            if names.is_empty() {
+                println!("no holding pages stored — every parked domain shows passway's own");
+            }
+            for name in names {
+                println!("{name}");
+            }
+            Ok(())
+        }
+        HoldingCmd::Remove { name } => {
+            store.delete_holding_page(&name)?;
+            println!(
+                "deleted holding page {name:?} — any domain still naming it falls back to \
+                 passway's own page"
+            );
             Ok(())
         }
     }

@@ -42,7 +42,8 @@ use openraft::async_runtime::watch::WatchReceiver;
 use tracing::{debug, info, warn};
 
 use crate::raft::{
-    MemberInfo, NodeCapacity, YubabaNodeId, YubabaRaft, YubabaRequest, YubabaStateMachine,
+    client_write_forwarded, MemberInfo, NodeDeclaration, YubabaNodeId, YubabaRaft, YubabaRequest,
+    YubabaStateMachine,
 };
 
 /// How long to wait before re-checking while there is nothing to do yet — this
@@ -69,9 +70,6 @@ const RETRY_MIN: Duration = Duration::from_secs(1);
 /// this cadence indefinitely: there is no deadline on registration and no
 /// failure state to give up into.
 const RETRY_MAX: Duration = Duration::from_secs(60);
-
-/// Timeout for the forward-to-leader HTTP write.
-const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Spawn this node's member-registration loop.
 ///
@@ -100,16 +98,29 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 /// are comparable by construction rather than by convention. `None` (no
 /// `/etc/hostname`, no `HOSTNAME`) publishes no mapping, which is the
 /// already-existing state, not a failure.
+///
+/// # The public-ingress declaration (R859-F2 phase A)
+///
+/// `provider`, `location`, `ingress_floating_ip` and `public_address` ride this
+/// loop too, and they are the reason it exists at all rather than being nice to
+/// have. A fleet node never loads `.yah/infra/machines/`, so the raft leader —
+/// the one process that watches `ingress_owner` move and watches nodes die —
+/// had no way to turn either observation into an action: no provider to
+/// command, no floating IP to move, no address to withdraw from DNS. These four
+/// fields are that missing half, and each node is the only thing that knows its
+/// own, so they publish exactly the way `region` does.
+///
+/// They also share `region`'s cheapness property: a box's provider, DC and
+/// public address change when it is rebuilt and never otherwise, so the
+/// converged branch stays converged and the loop stays quiet.
 pub fn spawn(
     node_id: YubabaNodeId,
     raft: YubabaRaft,
     state_machine: YubabaStateMachine,
-    region: Option<String>,
-    capacity: Option<NodeCapacity>,
-    machine: Option<String>,
+    declaration: NodeDeclaration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        run(node_id, raft, state_machine, region, capacity, machine).await;
+        run(node_id, raft, state_machine, declaration).await;
     })
 }
 
@@ -143,19 +154,12 @@ fn plan_registration(
     self_addr: Option<&str>,
     current_leader: Option<YubabaNodeId>,
     recorded: Option<&MemberInfo>,
-    region: Option<&str>,
-    capacity: Option<NodeCapacity>,
-    machine: Option<&str>,
+    declaration: &NodeDeclaration,
 ) -> Registration {
     let Some(addr) = self_addr else {
         return Registration::Wait("this node is not in raft membership yet");
     };
-    let desired = MemberInfo {
-        addr: addr.to_string(),
-        region: region.map(str::to_string),
-        capacity,
-        machine: machine.map(str::to_string),
-    };
+    let desired = MemberInfo::from_declaration(addr, declaration);
     if recorded == Some(&desired) {
         return Registration::Converged;
     }
@@ -169,11 +173,12 @@ async fn run(
     node_id: YubabaNodeId,
     raft: YubabaRaft,
     state_machine: YubabaStateMachine,
-    region: Option<String>,
-    capacity: Option<NodeCapacity>,
-    machine: Option<String>,
+    declaration: NodeDeclaration,
 ) {
-    let client = match reqwest::Client::builder().timeout(FORWARD_TIMEOUT).build() {
+    let client = match reqwest::Client::builder()
+        .timeout(crate::raft::FORWARD_TIMEOUT)
+        .build()
+    {
         Ok(client) => client,
         Err(e) => {
             // Only reachable if the TLS backend fails to initialise, in which
@@ -201,9 +206,7 @@ async fn run(
             self_addr.as_deref(),
             current_leader,
             state_machine.member(node_id).as_ref(),
-            region.as_deref(),
-            capacity,
-            machine.as_deref(),
+            &declaration,
         ) {
             Registration::Wait(why) => {
                 debug!(node_id, why, "member registration waiting");
@@ -221,6 +224,8 @@ async fn run(
                         region = ?row.region,
                         capacity = ?row.capacity,
                         machine = ?row.machine,
+                        provider = ?row.provider,
+                        public_address = ?row.public_address,
                         "registered this node's raft member row"
                     );
                     backoff = RETRY_MIN;
@@ -248,79 +253,64 @@ async fn run(
 /// Write `row` for `node_id` through consensus, forwarding to the leader when
 /// this node is not it.
 ///
-/// A follower cannot `client_write`; openraft answers `ForwardToLeader` and
-/// hands back the leader's `BasicNode`, whose `addr` is the same mesh address
-/// the raft transport dials. So the forward needs no extra discovery — it POSTs
-/// the identical request to `/raft/write` on that address.
+/// The forwarding itself lives in [`client_write_forwarded`] — this is just the
+/// row-to-request shape. The response is discarded because `SetMember` has
+/// nothing to say beyond "applied"; a caller that needs the applied value (the
+/// ACME issuer's `AcquireLock`) reads the helper's return instead.
 async fn write_row(
     node_id: YubabaNodeId,
     raft: &YubabaRaft,
     client: &reqwest::Client,
     row: &MemberInfo,
 ) -> anyhow::Result<()> {
-    let req = YubabaRequest::SetMember {
-        node_id,
-        addr: row.addr.clone(),
-        region: row.region.clone(),
-        capacity: row.capacity,
-        machine: row.machine.clone(),
-    };
-    match raft.client_write(req.clone()).await {
-        Ok(_) => Ok(()),
-        Err(openraft::error::RaftError::APIError(
-            openraft::error::ClientWriteError::ForwardToLeader(fwd),
-        )) => {
-            let Some(leader) = fwd.leader_node.as_ref() else {
-                // Known-no-leader, or a leader whose node record this replica has
-                // not seen. Both are transient and both are the caller's retry.
-                anyhow::bail!(
-                    "not the leader and no leader address to forward to \
-                     (leader_id={:?})",
-                    fwd.leader_id
-                );
-            };
-            let url = format!("http://{}/raft/write", leader.addr);
-            let resp = client
-                .post(&url)
-                .json(&serde_json::json!({ "request": req }))
-                .send()
-                .await?;
-            let status = resp.status();
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                anyhow::bail!("forwarding member row to leader at {url}: HTTP {status}: {body}");
-            }
-            Ok(())
-        }
-        Err(e) => Err(anyhow::anyhow!(e)),
-    }
+    client_write_forwarded(
+        raft,
+        client,
+        YubabaRequest::SetMember {
+            node_id,
+            addr: row.addr.clone(),
+            region: row.region.clone(),
+            capacity: row.capacity,
+            machine: row.machine.clone(),
+            provider: row.provider.clone(),
+            location: row.location.clone(),
+            ingress_floating_ip: row.ingress_floating_ip.clone(),
+            public_address: row.public_address.clone(),
+        },
+    )
+    .await
+    .map(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn row(addr: &str, region: Option<&str>) -> MemberInfo {
-        MemberInfo {
-            addr: addr.to_string(),
+    use crate::raft::NodeCapacity;
+
+    /// What a node declares about itself, narrowed to the three axes these
+    /// tests vary. The public-ingress fields (R859-F2 phase A) default to
+    /// `None` here and are exercised by
+    /// [`the_public_ingress_declaration_is_compared_like_every_other_field`].
+    fn decl(region: Option<&str>, capacity: Option<NodeCapacity>, machine: Option<&str>) -> NodeDeclaration {
+        NodeDeclaration {
             region: region.map(str::to_string),
-            capacity: None,
-            machine: None,
+            capacity,
+            machine: machine.map(str::to_string),
+            ..Default::default()
         }
+    }
+
+    fn row(addr: &str, region: Option<&str>) -> MemberInfo {
+        MemberInfo::from_declaration(addr, &decl(region, None, None))
     }
 
     fn row_named(addr: &str, region: Option<&str>, machine: &str) -> MemberInfo {
-        MemberInfo {
-            machine: Some(machine.to_string()),
-            ..row(addr, region)
-        }
+        MemberInfo::from_declaration(addr, &decl(region, None, Some(machine)))
     }
 
     fn row_with(addr: &str, region: Option<&str>, capacity: NodeCapacity) -> MemberInfo {
-        MemberInfo {
-            capacity: Some(capacity),
-            ..row(addr, region)
-        }
+        MemberInfo::from_declaration(addr, &decl(region, Some(capacity), None))
     }
 
     const BOX_16G: NodeCapacity = NodeCapacity {
@@ -335,7 +325,12 @@ mod tests {
     #[test]
     fn a_node_outside_membership_waits_rather_than_registering() {
         assert_eq!(
-            plan_registration(None, Some(1), None, Some("us-west"), None, None),
+            plan_registration(
+                None,
+                Some(1),
+                None,
+                &decl(Some("us-west"), None, None),
+            ),
             Registration::Wait("this node is not in raft membership yet")
         );
     }
@@ -347,9 +342,7 @@ mod tests {
                 Some("100.64.0.1:7443"),
                 Some(1),
                 None,
-                Some("us-west"),
-                None,
-                None
+                &decl(Some("us-west"), None, None),
             ),
             Registration::Write(row("100.64.0.1:7443", Some("us-west")))
         );
@@ -366,9 +359,7 @@ mod tests {
                 Some("100.64.0.1:7443"),
                 Some(1),
                 Some(&recorded),
-                Some("us-west"),
-                None,
-                None
+                &decl(Some("us-west"), None, None),
             ),
             Registration::Converged
         );
@@ -385,9 +376,7 @@ mod tests {
                 Some("100.64.0.1:7443"),
                 Some(1),
                 Some(&recorded),
-                Some("us-west"),
-                None,
-                None
+                &decl(Some("us-west"), None, None),
             ),
             Registration::Write(row("100.64.0.1:7443", Some("us-west")))
         );
@@ -400,7 +389,12 @@ mod tests {
     #[test]
     fn an_untagged_node_registers_its_address_anyway() {
         assert_eq!(
-            plan_registration(Some("127.0.0.1:7443"), Some(1), None, None, None, None),
+            plan_registration(
+                Some("127.0.0.1:7443"),
+                Some(1),
+                None,
+                &decl(None, None, None),
+            ),
             Registration::Write(row("127.0.0.1:7443", None))
         );
     }
@@ -412,7 +406,12 @@ mod tests {
     fn dropping_the_region_flag_clears_the_recorded_tag() {
         let recorded = row("127.0.0.1:7443", Some("us-west"));
         assert_eq!(
-            plan_registration(Some("127.0.0.1:7443"), Some(1), Some(&recorded), None, None, None),
+            plan_registration(
+                Some("127.0.0.1:7443"),
+                Some(1),
+                Some(&recorded),
+                &decl(None, None, None),
+            ),
             Registration::Write(row("127.0.0.1:7443", None))
         );
     }
@@ -422,7 +421,12 @@ mod tests {
     #[test]
     fn a_leaderless_cluster_is_waited_out_not_written_to() {
         assert_eq!(
-            plan_registration(Some("100.64.0.1:7443"), None, None, Some("us-west"), None, None),
+            plan_registration(
+                Some("100.64.0.1:7443"),
+                None,
+                None,
+                &decl(Some("us-west"), None, None),
+            ),
             Registration::Wait("no leader elected yet — a write would be refused")
         );
     }
@@ -445,9 +449,7 @@ mod tests {
                 Some("100.64.0.1:7443"),
                 Some(1),
                 Some(&recorded),
-                Some("us-west"),
-                Some(BOX_16G),
-                None
+                &decl(Some("us-west"), Some(BOX_16G), None),
             ),
             Registration::Write(row_with("100.64.0.1:7443", Some("us-west"), BOX_16G))
         );
@@ -465,9 +467,7 @@ mod tests {
                 Some("100.64.0.1:7443"),
                 Some(1),
                 Some(&recorded),
-                Some("us-west"),
-                Some(BOX_16G),
-                None
+                &decl(Some("us-west"), Some(BOX_16G), None),
             ),
             Registration::Converged
         );
@@ -481,7 +481,12 @@ mod tests {
     #[test]
     fn a_node_that_cannot_measure_itself_still_registers() {
         assert_eq!(
-            plan_registration(Some("127.0.0.1:7443"), Some(1), None, Some("us-west"), None, None),
+            plan_registration(
+                Some("127.0.0.1:7443"),
+                Some(1),
+                None,
+                &decl(Some("us-west"), None, None),
+            ),
             Registration::Write(row("127.0.0.1:7443", Some("us-west")))
         );
     }
@@ -499,9 +504,7 @@ mod tests {
                 Some("100.64.0.1:7443"),
                 Some(1),
                 Some(&recorded),
-                Some("us-west"),
-                None,
-                Some("us-west-001"),
+                &decl(Some("us-west"), None, Some("us-west-001")),
             ),
             Registration::Write(row_named("100.64.0.1:7443", Some("us-west"), "us-west-001"))
         );
@@ -517,9 +520,7 @@ mod tests {
                 Some("100.64.0.1:7443"),
                 Some(1),
                 Some(&recorded),
-                Some("us-west"),
-                None,
-                Some("us-west-001"),
+                &decl(Some("us-west"), None, Some("us-west-001")),
             ),
             Registration::Converged
         );
@@ -536,9 +537,7 @@ mod tests {
                 Some("127.0.0.1:7443"),
                 Some(1),
                 None,
-                Some("us-west"),
-                None,
-                None,
+                &decl(Some("us-west"), None, None),
             ),
             Registration::Write(row("127.0.0.1:7443", Some("us-west")))
         );
@@ -556,10 +555,43 @@ mod tests {
                 Some("100.64.0.1:7443"),
                 None,
                 Some(&recorded),
-                Some("us-west"),
-                None,
-                None
+                &decl(Some("us-west"), None, None),
             ),
+            Registration::Converged
+        );
+    }
+
+    /// R859-F2 phase A: the four public-ingress fields are compared like every
+    /// other half of the row, and — the part worth pinning — a row that is
+    /// identical on every *older* field still rewrites when only the ingress
+    /// declaration differs.
+    ///
+    /// That is the upgrade path. A node running a pre-phase-A binary published
+    /// a row with `provider`/`public_address` absent; the same box on the new
+    /// binary must republish rather than read its own stale row as converged,
+    /// or the leader would hold a member map it cannot withdraw anything from
+    /// and the failover would silently do nothing.
+    #[test]
+    fn the_public_ingress_declaration_is_compared_like_every_other_field() {
+        let declared = NodeDeclaration {
+            region: Some("us-west".into()),
+            machine: Some("us-west-001".into()),
+            provider: Some("static".into()),
+            public_address: Some("15.204.89.240".into()),
+            ..Default::default()
+        };
+        // The row a pre-phase-A binary would have left behind: same address,
+        // same region, same machine tag, no ingress declaration.
+        let recorded = row_named("100.64.0.1:7443", Some("us-west"), "us-west-001");
+        assert_eq!(
+            plan_registration(Some("100.64.0.1:7443"), Some(1), Some(&recorded), &declared),
+            Registration::Write(MemberInfo::from_declaration("100.64.0.1:7443", &declared))
+        );
+        // …and once it lands, the loop goes quiet again — the same property
+        // every other field on this row had to have.
+        let converged = MemberInfo::from_declaration("100.64.0.1:7443", &declared);
+        assert_eq!(
+            plan_registration(Some("100.64.0.1:7443"), Some(1), Some(&converged), &declared),
             Registration::Converged
         );
     }

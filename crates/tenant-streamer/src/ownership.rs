@@ -38,6 +38,28 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use workload_spec::TenantId;
 
+/// yubaba's `TenantOutcome`, as it comes back over `POST /raft/write`.
+///
+/// Every request in the tenant family — `ClaimTenant`, `TransferTenant`,
+/// `RenewTenantLease` — answers with this one shape, so the decode lives here
+/// once ([`parse_tenant_outcome`]) rather than at each caller.
+///
+/// [`LeaseRenewal`] stays a separate type over the same wire bytes on purpose:
+/// its contract is *narrower* (a renewal never advances the epoch, which is
+/// what makes heartbeating safe), and a claim's contract is the opposite —
+/// a grant **always** advances it. Collapsing them would put one doc comment
+/// on two invariants, only one of which is true at any call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantOutcome {
+    /// The write landed; `epoch` is the token the caller now holds.
+    Granted { epoch: u64 },
+    /// Refused, with who really owns the tenant and at what epoch.
+    Fenced {
+        current_epoch: u64,
+        current_owner: Option<u64>,
+    },
+}
+
 /// What a lease renewal did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseRenewal {
@@ -103,6 +125,56 @@ impl HttpOwnership {
             node_id,
         }
     }
+
+    /// The node id this client writes as.
+    pub fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
+    /// Take ownership of `tenant`, advancing its fencing epoch by exactly one.
+    ///
+    /// This is **not** part of [`OwnershipSource`], and deliberately so: the
+    /// tail loop must never claim (a claim as a heartbeat fences your own
+    /// streamer every beat — `raft/mod.rs`'s `ClaimTenant` docs). The one
+    /// caller is R869's rebuild, which lifts a rebuilt cluster's epoch back
+    /// over the floor its dead predecessor left in the R2 sidecar; see
+    /// [`crate::rebuild`].
+    pub async fn claim_tenant(&self, tenant: &TenantId, lease_secs: u64) -> Result<TenantOutcome> {
+        // Hand-built for the same reason `renew_lease` is: no dependency on the
+        // yubaba server crate. Pinned on the other side by
+        // `raft::tests::the_recovery_claim_is_the_wire_shape_already_deployed`,
+        // which asserts this exact JSON round-trips with no added key — so a
+        // node on an older binary applies the identical entry and the recovery
+        // cannot diverge a mixed cluster.
+        let body = serde_json::json!({
+            "request": {
+                "ClaimTenant": {
+                    "tenant": tenant.0,
+                    "node": self.node_id,
+                    "lease_secs": lease_secs,
+                    "now": unix_secs(),
+                }
+            }
+        });
+        parse_tenant_outcome(&self.raft_write(body).await?)
+    }
+
+    /// POST one `YubabaRequest` through the generic write route and hand back
+    /// the decoded response body.
+    async fn raft_write(&self, body: serde_json::Value) -> Result<serde_json::Value> {
+        let url = format!("{}/raft/write", self.base_url);
+        self.client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?
+            .error_for_status()
+            .with_context(|| format!("POST {url} returned an error status"))?
+            .json()
+            .await
+            .with_context(|| format!("decoding the write outcome from {url}"))
+    }
 }
 
 /// `GET /tenants/{id}` response. Kept structurally minimal so the two sides
@@ -157,7 +229,6 @@ impl OwnershipSource for HttpOwnership {
         // a contract test on yubaba's side
         // (`the_streamer_lease_renewal_body_deserializes`), which fails if
         // anyone renames a field on `YubabaRequest::RenewTenantLease`.
-        let url = format!("{}/raft/write", self.base_url);
         let body = serde_json::json!({
             "request": {
                 "RenewTenantLease": {
@@ -169,26 +240,13 @@ impl OwnershipSource for HttpOwnership {
                 }
             }
         });
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?
-            .error_for_status()
-            .with_context(|| format!("POST {url} returned an error status"))?;
-        let value: serde_json::Value = resp
-            .json()
-            .await
-            .with_context(|| format!("decoding the renewal outcome from {url}"))?;
-        parse_renewal(&value)
+        parse_renewal(&self.raft_write(body).await?)
     }
 }
 
 /// Decode a `YubabaResponse::Tenant(TenantOutcome)` body. Split out and pure so
 /// the wire shape is testable without a server.
-fn parse_renewal(value: &serde_json::Value) -> Result<LeaseRenewal> {
+pub fn parse_tenant_outcome(value: &serde_json::Value) -> Result<TenantOutcome> {
     let tenant = value
         .get("Tenant")
         .with_context(|| format!("expected a Tenant outcome, got {value}"))?;
@@ -197,15 +255,30 @@ fn parse_renewal(value: &serde_json::Value) -> Result<LeaseRenewal> {
             .get("epoch")
             .and_then(|e| e.as_u64())
             .context("Granted without an epoch")?;
-        return Ok(LeaseRenewal::Renewed { epoch });
+        return Ok(TenantOutcome::Granted { epoch });
     }
     if let Some(fenced) = tenant.get("Fenced") {
-        return Ok(LeaseRenewal::Fenced {
+        return Ok(TenantOutcome::Fenced {
             current_epoch: fenced.get("current_epoch").and_then(|e| e.as_u64()).unwrap_or(0),
             current_owner: fenced.get("current_owner").and_then(|o| o.as_u64()),
         });
     }
     bail!("unrecognised tenant outcome {tenant}")
+}
+
+/// The renewal reading of [`parse_tenant_outcome`] — same bytes, narrower
+/// contract (see [`TenantOutcome`]).
+fn parse_renewal(value: &serde_json::Value) -> Result<LeaseRenewal> {
+    Ok(match parse_tenant_outcome(value)? {
+        TenantOutcome::Granted { epoch } => LeaseRenewal::Renewed { epoch },
+        TenantOutcome::Fenced {
+            current_epoch,
+            current_owner,
+        } => LeaseRenewal::Fenced {
+            current_epoch,
+            current_owner,
+        },
+    })
 }
 
 pub(crate) fn unix_secs() -> u64 {

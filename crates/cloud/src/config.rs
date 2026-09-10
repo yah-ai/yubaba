@@ -115,6 +115,46 @@
 //! @yah:handoff("ALL GATES CLOSED as of 2026-08-20. Both items listed as outstanding in the earlier handoff notes are done: emit-schemas ran (machine.toml.schema.json carries sovereign_role + the SovereignRole voter/non-voter enum, drift guard satisfied), and cargo test -p yah-cloud --lib is 896 passed / 0 failed once R555 and R772 settled. 45 tests green across workload-spec (9), yubaba lib (13), yubaba raft integration (11), yah-cloud lib (10 of this ticket's, within 896), xtask fleet (2). Ready for review. NOTE for whoever commits: the working tree's schema diff is not purely this ticket - .yah/schema/machine.toml.schema.json (+32) is R605-F12, .yah/schema/secret.toml.schema.json (+34) is R555-F5, both correct generated output from one emit-schemas run. Ashguard:spade has agreed to carry theirs.")
 //! @yah:verify("cargo test -p yah-cloud --lib (from oss/yubaba) -- 896 passed, 0 FAILED, 4 ignored. The blocked check from earlier is now clean: R555 landed the velveteen-exec and TransformRecipe.secrets fixes, R772's ingress-collate work settled (they replaced the CloudConfig::load in collate_workspace_ingress with a narrower machines-only loader, so cross_ref_validate can no longer fail the collate over an unrelated provider typo). All 45 R605-F12 tests across the four crates are green simultaneously on one tree.")
 //! @yah:verify("Confirmed by NAME rather than by total, since a passing count proves nothing about which tests ran: cargo test -p yah-cloud --lib -- role voter voting lists all ten of this ticket's cloud tests green - a_non_voting_member_is_refused_into_its_own_group, a_non_voting_target_has_no_quorum_to_grow, a_refusal_names_the_group_when_fixing_the_role_would_not_help, an_unwritten_role_still_joins_its_group, a_non_voter_is_still_in_the_group_it_names, sovereign_role_round_trips_and_is_omitted_when_unwritten, a_group_with_no_role_is_reported_with_the_declaring_file, either_stated_role_is_clean, a_machine_in_no_group_is_not_asked_for_a_role, unroled_findings_are_ordered_by_file_so_output_is_stable.")
+//!
+//! @yah:ticket(R876-B7, "Node taints are structurally inert for mirror-declared placements: you cannot drain a node, and it fails silently")
+//! @yah:at(2026-09-09T09:05:55Z)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R876)
+//! @yah:severity(high)
+//! @yah:next("SECOND HALF, and it is what makes the relay's headline question answerable: a working taint must produce a MOVE, not a refusal. Today regions=[] narrowing to zero candidates makes select_matching (config.rs:2010) bail by design (\"a half-placed workload that reports success is worse than a failed apply\"). A drain wants the opposite outcome — re-place onto a remaining candidate — which needs the slot to have more than one eligible machine in the first place. Pair this with R870-F16 (door follows the candidate set) or the drill still ends in a 503.")
+//! @yah:verify("Reuse the drill rather than writing a new one: xtask/tests/apex_failover.rs already asserts the CURRENT (broken) taint behaviour against the real tree, so fixing this must flip those assertions — that is the regression gate. Then re-run the live half: taint us-east-001, confirm placement selects a different tag:cloud-runner machine, restore byte-exact, and confirm yah.dev stays 200 throughout.")
+//! @yah:gotcha("IT FAILS SILENTLY, WHICH IS THE SHARP EDGE. \"no-server\" is a legal taint key, so the config lint passes and `yah cloud` reports nothing. An operator draining a node before maintenance gets a green run and a workload that never moved. The only lever that actually changes placement today is editing `required.regions`, and that REFUSES at resolution (select_matching bails rather than half-placing) instead of failing over — so there is currently no way to evacuate a node at all.")
+//! @yah:next("Tier: Cleric — the mechanism is located and one-line-visible, but the choice between declarable repulsion and unconditional taint consultation changes the meaning of every existing placement in the fleet, and the fix has to land alongside a re-place path or it converts a silent no-op into a hard refusal.")
+//! @yah:gotcha("MEASURED, NOT INFERRED — R876-S2's drill, 2026-09-09. `taints = [\"public-ip\", \"no-server\"]` was written onto the REAL .yah/infra/machines/us-east-001.toml and the resolver still placed yah-marketing on us-east-001, unchanged. Restored byte-exact (diff empty, sha256 back to 17dd15e2..., git clean against blob d66ab6d8); yah.dev stayed 200 throughout and no mutating apply was run.")
+//! @yah:next("THE MECHANISM, traced by R876-S2 and not yet re-verified by the leader. Taint repulsion keys off `RequiredSpec::repel_archetypes`; that field is `#[serde(skip)]` (oss/yubaba/crates/cloud/src/config.rs:4067), so a slot declared in a mirror's `required = {...}` ALWAYS deserializes with it empty. `matches` (config.rs:4182) consequently never reads `machine.taints` at all. Confirm both line anchors before editing — the shared tree moves.")
+//! @yah:handoff("SEMANTICS LANDED — repel-by-default + declarable toleration. `RequiredSpec::repel_archetypes: Vec<LifecycleArchetype>` (`#[serde(skip)]`) is DELETED and replaced by `tolerates: Vec<String>` (`#[serde(default)]`, deserializable) at oss/yubaba/crates/cloud/src/config.rs:4319. `matches` (config.rs:4397) no longer iterates a field of `self`: it walks `machine.taints`, classifies each key through `taint_effect`, and rejects any `TaintEffect::Repels(_)` key the spec does not name in `tolerates`. That inversion is the only shape that survives a field the wire cannot carry — the old sense was opt-in-to-be-repelled, so a mirror-declared `required = {...}` always deserialized with an empty archetype set and `machine.taints` was never read at all. Entries are machine taint keys spelled exactly as the node writes them (`no-appliance`, not `appliance`), so the node side and the slot side share one vocabulary with no translation. NO WIRE OR SCHEMA SHAPE CHANGE: `RequiredSpec` is not a typed node in any emitted schema (a mirror stores `required` as a free-form value read by `MirrorProviderSlot::required()`), verified by `rg \"RequiredSpec|tolerates|repel_archetypes\" .yah/schema/*.json` — the only hits are prose inside a doc-comment description.")
+//! @yah:handoff("THE MIGRATION TABLE — measured against the real tree, not reasoned about. FLEET TAINTS, all nine machines (`grep -rE \"^\\s*taints\\s*=\" .yah/infra/machines/*.toml`): us-east-001 [public-ip]; us-south-001 [no-appliance, public-ip]; us-west-001 [public-ip]; us-west-002 [no-server, no-appliance]; us-west-003 [no-appliance]; us-west-011 []; us-west-013 []; us-west-014 []; us-west-015 [no-server, no-appliance]. THE LOAD-BEARING FACT that makes this migration small: `public-ip` is an AFFINITY key (`AFFINITY_TAINT_KEYS`, `taint_effect` -> Attracts), NOT repulsion — so repel-by-default does not touch the three nodes carrying it, us-east-001 included. Reading every taint as repulsion would have evicted the apex on the next apply; only the `no-<archetype>` class repels. Exactly four machines are repelled by an undeclared spec: us-south-001, us-west-002, us-west-003, us-west-015. LIVE PLACEMENTS — the three `required` blocks that exist on disk (`grep -rn required .yah/services/*/mirrors/*.toml`): (1) yah-marketing providers.bundle, cloud.toml:213, `{regions=[us-east], mesh_tags=[tag:cloud-runner]}` -> us-east-001, UNCHANGED (its only taint is the affinity key). (2) yah-cloud providers.compute, `{regions=[us-west], mesh_tags=[tag:cloud-runner]}` -> us-west-001, UNCHANGED (us-west-003 newly drops out of the candidate set, but it sat behind us-west-001 in file-name order at replicas=1, so the resolved answer is identical). (3) yah-cloud-admin providers.compute, same constraint -> us-west-001, UNCHANGED. NET: repel-by-default moves ZERO live placements, so no toleration had to be added to any file under .yah/services/ or .yah/infra/ and none was. No file under .yah/infra/machines/ or .yah/services/ was written by this ticket at all.")
+//! @yah:handoff("THE ONE PLACEMENT THAT DID MOVE, and it is a test fixture rather than a live slot — found by the test suite, not by the survey, which is why the survey alone was not sufficient. `xtask/tests/mirror_ingress.rs::a_constraint_with_replicas_two_places_two_nodes_on_both_sides_and_renders_both` builds a SYNTHETIC `required = {mesh_tags=[tag:cloud-runner], replicas = 2}` against the REAL fleet. Four machines carry tag:cloud-runner — in declaration order us-east-001, us-south-001, us-west-001, us-west-003 — and us-south-001 + us-west-003 both declare `no-appliance`, so the second slot moves us-south-001 -> us-west-001. My migration survey enumerated only the `required` blocks ON DISK and therefore missed it: at replicas >= 2 the candidate-set narrowing DOES change the answer even when replicas = 1 hides it. Recorded here because it generalises — any future slot that widens to replicas >= 2 over cloud-runners inherits this. Fixed at the site that caught it (mirror_ingress.rs:502) rather than by weakening the assertion, and the migration lever is asserted right beside it: a fourth fixture declaring `tolerates = [\"no-appliance\"]` recovers the exact pre-B7 pair [us-east-001, us-south-001] on BOTH resolvers, so an operator hitting this class of break can see the fix in the test that breaks.")
+//! @yah:verify("BASELINE MEASURED BEFORE EDITING, then re-measured after. `cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib` = 1129 passed / 0 failed / 4 ignored, exit 0 (the run completed and printed its result line before my first Edit; a deferred W298 skew advisory later named config.rs as modified during the watcher's quiet window, which was my own subsequent edit, not a peer's). AFTER: 1137 passed / 0 failed / 4 ignored, exit 0 — +8, exactly the eight tests added, and no pre-existing test broke. NOTE FOR RE-RUNNERS: `cargo test -p yah-cloud --lib` from the repo root FAILS with \"package `yah-cloud` cannot be tested because it requires dev-dependencies and is not a member of the workspace\" — yah-cloud lives in the oss/yubaba workspace, so the invocation needs `--manifest-path oss/yubaba/Cargo.toml`. Also `cargo check --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --all-targets` exit 0 and `-p yubaba --all-targets` exit 0 (yubaba consumes cloud, so it is where the field removal would have surfaced). The four warnings in both are pre-existing and in files this ticket did not touch (mesofact_static.rs unused imports, app_manifest.rs dead field, pond_door.rs unused fn, reconciler/mod.rs non-snake-case).")
+//! @yah:verify("EIGHT NEW UNIT TESTS in config.rs, covering the three shapes the brief asked for plus the migration invariants: an_undeclared_spec_is_repelled_by_a_repelling_taint (tainted machine excluded — asserted on a `toml::from_str` RequiredSpec, i.e. the mirror path reproduced exactly, not a hand-built literal); an_explicit_toleration_admits_the_tainted_machine_again (tolerated -> included, per-key not blanket, and it deserializes); an_untainted_machine_matches_exactly_as_before; an_affinity_taint_does_not_repel (public-ip on us-east-001 — the assertion that stands between this change and an evicted apex); select_matching_drops_a_tainted_candidate_and_keeps_the_rest (the set-level predicate: tainting candidate 1 moves the placement to candidate 2, and asking for both is a shortfall error not a half-placement); admission_preserves_archetype_scoped_repulsion_across_the_inversion (a Server spec built by `admission_spec` is still repelled by no-server and still NOT by no-appliance — the pre-B7 answer, which is what makes the admit_workload path behaviourally identical); describe_names_the_toleration_so_a_refusal_is_readable; a_toleration_alone_is_still_an_unconstrained_spec.")
+//! @yah:verify("REGRESSION GATE FLIPPED, not deleted. `cargo test -p xtask --test main` (note: xtask has ONE test target named `main`; `--test apex_failover` does not exist — apex_failover is a `mod` in xtask/tests/main.rs). Result 65 passed / 1 failed. xtask/tests/apex_failover.rs: the drill's finding-1 test was inverted and renamed every_repelling_taint_at_once_leaves_the_apex_bundle_exactly_where_it_was -> ..._now_makes_the_apex_node_ineligible; it now asserts that ONE repelling key is enough (checked before the all-three case so a regression handling only the union is still caught), that all three refuse, and that restoring us-east-001's real taint list [\"public-ip\"] puts the placement straight back. The module header was rewritten to say the hole is closed. ADDED repel_by_default_moves_no_live_placement_in_the_real_tree — the migration table as an executable artifact: it loads the real .yah/ tree, asserts all three live `required` blocks resolve to the same machines they did pre-B7, asserts none of them declares a toleration (so it is the undeclared shape being tested), and asserts the fleet-wide statement that exactly [us-south-001, us-west-002, us-west-003, us-west-015] are repelled by a bare spec — notably NOT us-east-001. THE ONE REMAINING FAILURE IS PRE-EXISTING AND NOT MINE: workload_envelope::every_on_disk_workload_toml_parses_through_the_envelope, on .yah/infra/state/sources/scrabcake/site/site/workload.toml (`unknown field routes`). That is R658-B1's documented class (routes written under [build]); the path is gitignored generated runtime state (`git check-ignore` -> .yah/.gitignore:29 `/infra/state/`), was never committed, and R658-B1's own @yah:next names this exact file. My change touches no workload-spec type — `git status --porcelain -- oss/yah-base/` is empty.")
+//! @yah:handoff("SCOPE BOUNDARY HELD, deliberately. yah-marketing's candidate set was NOT widened: `.yah/services/yah-marketing/mirrors/cloud.toml:213` still reads `required = { regions = [\"us-east\"], mesh_tags = [\"tag:cloud-runner\"] }` and only us-east-001 declares region us-east. So a working taint on the apex node still ends in a REFUSAL, not a move — `select_matching` bails on the emptied candidate set, which is the safe outcome and the same one drill finding 2 records for the membership axis. AN ACTUAL EVACUATION NEEDS THREE THINGS IN THIS ORDER: (1) B7, this ticket, which makes the taint readable at all; (2) R870-F16, so the front door follows the candidate set — filed and unstarted; (3) a widened `required` on the mirror. Doing (3) before (2) buys a workload that relocates and a yah.dev that 503s, which is why it was not done here. Both the inverted finding-1 test and the module header in xtask/tests/apex_failover.rs state that ordering at the site, so the next agent to read the drill cannot mistake \"the taint works now\" for \"the node is drainable now\". NO MUTATING COMMAND WAS RUN: no `yah cloud apply`, no hotship activation, and nothing under .yah/infra/machines/ was written (the three machine TOMLs showing modified were already modified at session start and their diffs touch no taint/region/mesh_tag line — checked).")
+//! @yah:handoff("GENERATED ARTIFACTS REGENERATED, and one of them is a peer's. `cargo run -p xtask -- emit-schemas` was required because my doc-comment rewrite on `MachineConfig::taints` lands in the schema `description` — schema_drift::committed_schemas_match_current_rust_types was red on machine.toml.schema.json. The regen also swept in mirror.toml.schema.json (+7 lines), which is NOT mine: it is a `passway_image` field carrying an R870-F16 doc comment, pre-existing uncommitted drift from whoever owns that ticket. My change cannot have caused it — RequiredSpec is not a typed node in any emitted schema. Regenerated per CLAUDE.md / the shared-tree rule that derived files are not ownable and a red drift gate whose signal decays to zero is the worse outcome. @Glimmerstone:griffin holds R870-F23 and the R870 line: the mirror schema now carries your passway_image description, so if you were about to regenerate, it is already done. Both schema files are the only two under .yah/schema/ that changed.")
+//! @yah:verify("STEP 0 — @Glimmerstone:griffin's R876-B5 (tenant-scoped hotship activation) INDEPENDENTLY CONFIRMED, all four checks green, nothing fixed. (1) `bash -n scripts/hotship.sh` clean. (2) `./scripts/hotship.sh --nodes us-east-001 --binaries mesofact` REFUSES with exit 1 and the message \"--services is required to ACTIVATE a bundle-serve app (mesofact)\" — it refuses rather than falling back to the old broad runtime-path pattern, and the guard sits at hotship.sh:507 ahead of the version stamp and every remote call. (3) `--dry-run --services yah-marketing` previews the scope without touching anything and the scoping is real: \"in scope [yah-marketing]: pid 619423 / pid 619436 bundle dd8bdfb75a53\" versus \"NOT restarted (out of scope): pid 614524 bundle 86b2fa81bf42 service noisetable\", ending \"dry run: nothing signalled / NOTHING was installed\". (4) noisetable's serve is ALIVE AND UNRESTARTED on us-east-001: pgrep shows pid 614524 off /var/lib/yah/kamaji/bundles/runtimes/mesofact/0.8.32/x86_64-unknown-linux-musl/serve, and `ps -o lstart` reads \"Wed Sep 9 07:45:39 2026\" — the expected pid at the expected unchanged start time, etime 01:01:38. `curl -sS -o /dev/null -w %{http_code} https://yah.dev/` = 200. No real hotship activation was run.")
+//! @yah:verify("BUILDS. `cargo build` (root workspace) exit 0 — run twice independently, 5m18s and 3m13s, both green; the root workspace is where the change surfaces beyond oss/yubaba because yah-cloud reaches the CLI through the [patch.crates-io] bridge. `cargo check --manifest-path oss/yubaba/Cargo.toml -p yubaba --all-targets` exit 0. Clean re-measure of `cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib` after all annotation writes: 1137 passed / 0 failed / 4 ignored, exit 0 — identical to the first post-change measurement, so the earlier W298 skew advisory naming config.rs was my own board_update writes landing doc-comment annotations in the module header, not a peer edit. A later advisory on the root build named app/yah/cli/src/cloud.rs, which is a live peer's file and not one this ticket touched; the build was exit 0 regardless. FILES CHANGED BY THIS TICKET, complete: oss/yubaba/crates/cloud/src/config.rs, xtask/tests/apex_failover.rs, xtask/tests/mirror_ingress.rs, .yah/schema/machine.toml.schema.json, .yah/schema/mirror.toml.schema.json. Nothing under .yah/infra/ or .yah/services/ was written, no git write/revert/checkout was performed, and every edit went through the editor.")
+//! @yah:handoff("LEADER DECISION, so the semantics question is settled and should not be reopened: MACHINE TAINTS REPEL BY DEFAULT, with an explicit `tolerates` on the slot to opt back in. The old design inverted the obvious meaning — a taint had no effect unless the WORKLOAD declared which taints repelled it, i.e. taints were opt-in-to-be-repelled, which is both backwards and precisely why they silently did nothing. `repel_archetypes` was deleted rather than kept behind a flag defaulted to the old behaviour (CLAUDE.md, \"break it, don't tape it\").")
+//! @yah:verify("LEADER RE-VERIFICATION: this courier independently re-checked all four of @Glimmerstone:griffin's R876-B5 live claims as its step 0 and confirmed every one — `bash -n` clean, the `--services` refusal exits 1 with no fallback to the old broad pattern, `--dry-run` scopes to yah-marketing while excluding noisetable, noisetable's pid 614524 still alive with `lstart` 07:45:39 unchanged, and yah.dev 200. Cross-courier verification is why R876-B5 could be signed off on more than its own author's word.")
+//! @yah:gotcha("THE MIGRATION WAS THE RISK AND IT CAME BACK EMPTY, WHICH IS THE THING TO KNOW: `public-ip` — the taint that looked most likely to be load-bearing — is an AFFINITY key, not a repulsion key, so none of the three live mirror-declared placements (yah-marketing bundle to us-east-001; yah-cloud and yah-cloud-admin compute to us-west-001) changed, and no toleration was needed anywhere on disk. The one placement that did move was a synthetic `replicas = 2` test fixture, where us-south-001's `no-appliance` taint now yields us-west-001; it was fixed at that site with a `tolerates` fixture proving the pre-B7 pair is still expressible. Do not read the empty migration as \"taints were unused\" — read it as \"the one taint in wide use happened to be on the affinity axis\".")
+//!
+//! @yah:ticket(R870-F23, "Render and supervise the inner door: the service.toml + domain-manifest join that feeds passway's PathRouter config")
+//! @yah:at(2026-09-09T08:23:48Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:parent(R870)
+//! @yah:next("THE CONSUMER SIDE IS DONE AND ITS FORMAT IS FIXED (R870-T18, in review). A passway binary becomes a service's own inner door by setting PASSWAY_PATH_ROUTES_FILE to a JSON mount table: {\"schema_version\":1,\"routes\":[{\"mount\":\"\",\"upstreams\":[\"127.0.0.1:8081\"]},{\"mount\":\"/app\",\"upstreams\":[\"127.0.0.1:8082\"],\"headers\":{\"cross-origin-opener-policy\":\"same-origin\"}}]}. Parser + validation: oss/passway/crates/passway/src/path_routes_file.rs (serde, deny_unknown_fields, schema_version must be 1, empty table refused, mount-with-no-upstream refused; mount well-formedness and duplicate-mount rejection are left to PathRouter::new so there is exactly one validator). Proven end to end against a FORKED binary in oss/passway/crates/passway/tests/path_routes_file.rs. This ticket is the producer: write that file.")
+//! @yah:next("WHY THIS IS A SEPARATE TICKET AND NOT HALF OF R870-T18. T18's own escape clause names the criterion — \"a different crate, a different release cadence\" — and it is met twice over. (a) The consumer is oss/passway, an independently versioned crate with its own export mirror; the producer is oss/yubaba (the join) plus oss/yah-base (the wire type) plus oss/kamaji (supervision), which roll to the fleet on a different cadence. (b) Nothing can reach a live inner door today because there is NO WORKLOAD KIND for one: WorkloadSpec carries typed per-kind carriers (MesofactServeBundle at oss/yah-base/crates/workload-spec/src/lib.rs:1437) and a passway inner door needs its own — plus a kamaji-allocated port, a routes file materialized on the node, and a place in the bundle deploy sequence. Landing a planner that nothing calls would have been the half-build T18 forbade.")
+//! @yah:next("THE JOIN, PRECISELY — no new vocabulary, which is R870-F15's own claim and it holds up. Inputs: .yah/services/<svc>/service.toml (ServiceComponent { id, kind, mount, ... }, config.rs:3427) and .yah/domains/<zone>.toml (DomainRoute { path, headers, mode }, config.rs:4558, where front_door = passway). Per mount: mount = path_route::mount_from_component(component.mount) — that function already exists and is already the ONE place the \"app\"/None to \"/app\"/\"\" translation happens; headers = the DomainRoute whose route_path_prefix(path) equals normalize_mount(component.mount) (cross_ref_validate already PROVES those two agree, config.rs:1688-1725, so the join cannot silently mismatch); upstreams = the address of the deployed unit serving that mount. Only the last one is placement-time and is why this needs the workload kind above. Group by DEPLOYED UNIT, not by component: every bundle-tier component of a service shares ONE bundle workload (that is config 1, R870-B11), so config-1 mounts collapse to a single root upstream and only independently-deployed units earn their own mount.")
+//! @yah:next("THE TWO ADMISSION RULES, and where each one goes. Both belong to the GENERATOR, never to passway — passway proxies whatever PathRouter it is handed and has no view of how many components a service declares. (1) A service with ONE independently-deployed unit gets NO inner tier at all — enforce by construction: the planner returns Option<InnerDoorPlan> and answers None below two units, so there is no config to write and no process to supervise, and the negative is assertable on the ABSENCE of the plan rather than on a site staying up. (2) A component cannot be both bundle-staged (config 1) and its own workload. R870-B11 landed the config-1-internal half in CloudConfig::cross_ref_validate (config.rs:1621-1657, two bundle components at one mount are refused); put this half in the SAME loop rather than a parallel one. NOTE, checked not assumed: the second half is NOT EXPRESSIBLE TODAY — [providers.bundle] is a per-MIRROR slot, not per-component, so there is no way to say \"give this one component its own workload\" at all. The rule becomes writable in the same commit that introduces that vocabulary, which is this ticket. Do not invent the vocabulary separately.")
+//! @yah:gotcha("DESIGN WRINKLE FOUND WHILE BUILDING R870-T18, and it is an operator call, not a coding one. passway ALWAYS terminates TLS on its listener: TlsMode has exactly two variants, Manual and Acme (oss/passway/crates/passway/src/tls.rs:215), and main() unconditionally calls proxy_service.add_tls_with_settings(&listen, None, tls_settings). So an inner door on loopback still needs a cert on disk, and the outer door still needs PASSWAY_UPSTREAM_TLS=true plus an SNI to reach it. That works — T18's binary-level test does exactly this with an rcgen self-signed leaf — but it means the \"cheap inner tier\" costs a cert, a renewal story, and an upstream TLS handshake per request on loopback. The obvious fix is a plaintext listener mode, and it was deliberately NOT taken in T18: adding a way for a public-facing trust-boundary door to serve cleartext is a security decision with a blast radius past this relay. Decide it before building the supervisor, because it changes what the workload spec has to carry.")
+//! @yah:verify("A two-component service whose components deploy INDEPENDENTLY gets an inner door: one yah cloud apply leaves both https://<host>/ and https://<host>/app/ at 200, and curl -sI on /app/ carries cross-origin-opener-policy: same-origin AND cross-origin-embedder-policy: require-corp from the /app/* route in the domain manifest, while / carries neither.")
+//! @yah:verify("THE NEGATIVE, asserted on absence rather than on uptime: a single-component service (yah-marketing) produces NO inner-door config and NO inner-door process — no routes file materialized on the node, no extra supervised workload in kamaji's table, and a byte-identical workload spec to today. A unit test on the planner returning None is the cheap half; the node-side absence check is the half that matters.")
+//! @yah:gotcha("OPERATOR CALL ASKED AND NOT ANSWERED (R870 relay leader, session:abde2cbb, 2026-09-09). The TLS question in this ticket first gotcha was put to the operator as a three-way choice and the prompt timed out unanswered after 30 minutes, so it remains genuinely open — it was not skipped and not decided by default. The three options as framed, so whoever picks this up does not have to re-derive them: (A) add a plaintext listener mode gated so it is structurally impossible to combine with a public bind — refuse at config load unless the bind is loopback, keep it mutually exclusive with ACME/cert paths; this was the leader recommendation, on the grounds that it makes the inner tier actually cheap as R870-F15 design claimed while keeping the risk a bounded testable invariant rather than an operator remembering not to misconfigure it. (B) keep TLS everywhere and have F23 carry a cert-issuance plus renewal story for every inner door, which is safest by construction and already proven working in R870-T18 binary-level test with an rcgen self-signed leaf, but makes every service with 2+ independently-deployed components pay a cert, a renewal and a loopback handshake per request. (C) park the tier — nothing regresses, because config 1 (bundle staging, R870-B11, in review) already covers the deploy-together case, which is the one noisetable actually needs. THIS IS THE ONLY THING BLOCKING F23 DESIGN; the join itself, both admission rules and the workload-kind vocabulary are all specified in this ticket next entries and need no further decisions.")
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -412,16 +452,25 @@ pub struct MachineConfig {
     /// to check whether a new workload fits. Absent means unconstrained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allocatable: Option<NodeAllocatable>,
-    /// Placement taint keys (R572-F3). **There is no toleration** — a
-    /// `no-<archetype>` taint is an absolute block, not a preference
-    /// (W305/R742-T4; the pre-2026-08-11 "repel-unless-tolerate" wording here
-    /// described an `unless` that was never built).
+    /// Placement taint keys (R572-F3). A repelling key blocks placement by
+    /// default, and a placement opts back in by naming that exact key in
+    /// [`RequiredSpec::tolerates`] (R876-B7).
+    ///
+    /// The `unless` is real now. It was not between R742-T4 and R876-B7: the
+    /// spec side declared which archetypes it *was* rather than which taints it
+    /// tolerated, that field was `#[serde(skip)]`, and so every placement
+    /// declared as `required = {...}` in a mirror TOML read this list as empty
+    /// and could not be drained at all. See [`RequiredSpec::tolerates`].
     ///
     /// A key in this list influences placement in exactly one of two ways, and
     /// [`taint_effect`] is the authority on which:
     ///
     /// - **repulsion** — `"no-server"` / `"no-appliance"` / `"no-job"` reject
-    ///   workloads of that [`LifecycleArchetype`] outright;
+    ///   any placement that does not tolerate them. The archetype in the key is
+    ///   now vocabulary rather than a filter: `matches` does not compare it
+    ///   against the workload's class, it checks the toleration list, and
+    ///   [`admission_spec`] is what turns a workload's class into the
+    ///   tolerations that reproduce the old archetype-scoped behaviour;
     /// - **affinity** — a key in [`AFFINITY_TAINT_KEYS`] (today just
     ///   `"public-ip"`) that a workload names in
     ///   `yah.placement.requires-taint`, which then *requires* this node.
@@ -532,8 +581,10 @@ pub const AFFINITY_TAINT_KEYS: &[&str] = &[workload_spec::PUBLIC_IP_TAINT];
 /// were invisible for exactly that reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaintEffect {
-    /// `"no-<archetype>"`: rejects workloads of that archetype outright. Read
-    /// by [`RequiredSpec::matches`] via `repel_archetype`.
+    /// `"no-<archetype>"`: rejects placement outright unless the constraint
+    /// names this key in [`RequiredSpec::tolerates`]. Read by
+    /// [`RequiredSpec::matches`], which walks `machine.taints` and classifies
+    /// each key through [`taint_effect`] (R876-B7).
     Repels(LifecycleArchetype),
     /// A key in [`AFFINITY_TAINT_KEYS`]: a workload naming it in
     /// `yah.placement.requires-taint` is restricted to nodes carrying it.
@@ -1042,14 +1093,14 @@ fn ipv4_host_of(url: &str) -> Option<&str> {
 /// collapse in practice today (mesh membership grants everything) and the data
 /// model must not fuse them, so do not add an authorization field here.
 ///
-/// `address` and `ssh` stay whole, literal, operator-authored strings even
-/// though their values often *look* derived. They are not: us-west-001 dials
-/// SSH over its public IP while us-west-002 was deliberately repointed at its
-/// tailnet IP (R608-F10) precisely because the LAN address is unreachable
-/// off-LAN. Decomposing them into user + host and recomposing would silently
-/// undo per-machine decisions like that one. `yubaba` is the field that *was*
-/// derived — mesh IP plus a fixed port, rewritten by mesh-join — so that is
-/// where R707-T1 cut.
+/// `address`, `ssh` and `identity_file` stay whole, literal, operator-authored
+/// strings even though their values often *look* derived. They are not:
+/// us-west-001 dials SSH over its public IP while us-west-002 was deliberately
+/// repointed at its tailnet IP (R608-F10) precisely because the LAN address is
+/// unreachable off-LAN. Decomposing them into user + host and recomposing
+/// would silently undo per-machine decisions like that one. `yubaba` is the
+/// field that *was* derived — mesh IP plus a fixed port, rewritten by
+/// mesh-join — so that is where R707-T1 cut.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ConnectSpec {
@@ -1058,9 +1109,18 @@ pub struct ConnectSpec {
     /// choice (public IP vs. LAN IP vs. tailnet IP).
     pub address: String,
     /// SSH target the camp dials for bootstrap + (pre-mesh) tunneled deploys,
-    /// e.g. `"root@45.32.194.254"` or `"struc@100.64.0.4"`. Uses the operator's
-    /// `~/.ssh/yah` key. Declared, whole — see the type doc.
+    /// e.g. `"root@45.32.194.254"` or `"struc@100.64.0.4"`. Declared, whole —
+    /// see the type doc. Pair with `identity_file` for a copy-pasteable
+    /// `ssh -i <identity_file> <ssh>`.
     pub ssh: String,
+    /// Private key path the camp uses to authenticate `ssh`, e.g.
+    /// `"~/.ssh/yah"`. Every node in the fleet uses the same operator key
+    /// today, but this is declared per-machine rather than assumed globally
+    /// for the same reason `ssh` is whole rather than decomposed: a future
+    /// node with a different key should not have to fight a hardcoded
+    /// default. `~` is not shell-expanded by this crate — callers that shell
+    /// out to `ssh`/`scp` pass it through `-i`, which expands it itself.
+    pub identity_file: String,
     /// Port yubaba listens on. Declared reach; defaults to 7443 when omitted,
     /// which is every machine in the fleet today. Composed with the *observed*
     /// [`MachineRegistration::mesh_ipv4`] by [`MachineConfig::yubaba_url`].
@@ -1438,18 +1498,16 @@ impl CloudConfig {
         // Legacy `.yah/cloud/` reads — empty in post-B1 workspaces. Wrapped in
         // a helper so a missing tree is silent (no error, no warning).
         let cloud_dir = crate::paths::legacy_cloud_dir(workspace_root);
-        let (legacy_machines, legacy_mirrors, legacy_workloads, topology, legacy_services) =
-            if cloud_dir.exists() {
-                (
-                    load_dir::<MachineConfig>(cloud_dir.join("machines"))?,
-                    load_mirrors(cloud_dir.join("mirrors"))?,
-                    load_workloads(cloud_dir.join("workloads"))?,
-                    load_topology(cloud_dir.join("topology.toml"))?,
-                    load_dir::<LegacyServiceConfig>(cloud_dir.join("services"))?,
-                )
-            } else {
-                Default::default()
-            };
+        let (legacy_mirrors, legacy_workloads, topology, legacy_services) = if cloud_dir.exists() {
+            (
+                load_mirrors(cloud_dir.join("mirrors"))?,
+                load_workloads(cloud_dir.join("workloads"))?,
+                load_topology(cloud_dir.join("topology.toml"))?,
+                load_dir::<LegacyServiceConfig>(cloud_dir.join("services"))?,
+            )
+        } else {
+            Default::default()
+        };
 
         // Workloads come from `.yah/infra/workloads/` (R215+). R568-T7: before
         // that path was read here, this field was populated *only* from the
@@ -1468,41 +1526,33 @@ impl CloudConfig {
             }
         }
 
-        // Machines come from `.yah/infra/machines/` (R215+); the pre-R215
-        // tree shouldn't have any since B1 moved them, but if it does we
-        // dedupe by name (R215 wins).
-        let mut machines = load_dir::<MachineConfig>(crate::paths::machines_dir(workspace_root))?;
-        let names: std::collections::HashSet<String> =
-            machines.iter().map(|m| m.name.clone()).collect();
-        for m in legacy_machines {
-            if !names.contains(&m.name) {
-                machines.push(m);
-            }
-        }
+        // R870-B13: machines are resolved by [`resolve_fleet_inventory`] —
+        // camp-local, the pre-R215 legacy tree, and every machine borrowed
+        // through `.yah/infra/sources.toml`, in that precedence. This used to
+        // be spelled out inline here, which made `CloudConfig::load` the only
+        // reader that saw borrowed machines at all; the two *resolution*
+        // callers in `validate`/`reconciler::domain` read a camp-local-only
+        // loader and could not see a borrowing camp's fleet. There is now one
+        // implementation and three callers.
+        let fleet = resolve_fleet_inventory(workspace_root)?;
 
-        // R615-F2: overlay every linked `.yah/infra/sources.toml` source's
-        // machines/providers UNDER what's already loaded above, so camp-local
-        // (including the legacy-tree entries just merged in) always wins on a
-        // name collision. `SourcesConfig::load` itself never touches the
-        // network — git sources are read from `yah infra sync`'s cache
-        // (R615-T3), so this call keeps `load()`'s whole offline contract.
-        let sources = SourcesConfig::load(&crate::paths::infra_dir(workspace_root))?;
-        let mut machine_origins = BTreeMap::new();
+        // Providers overlay here rather than inside `resolve_fleet_inventory`:
+        // that function answers "which machines does this camp have", which is
+        // the question with three readers. Providers have exactly one reader —
+        // this load — so hoisting them would build a seam nothing crosses.
         let mut provider_origins = BTreeMap::new();
-        overlay_infra_sources(
+        overlay_source_providers(
             workspace_root,
-            &sources,
-            &mut machines,
+            &fleet.sources,
             &mut providers,
-            &mut machine_origins,
             &mut provider_origins,
         );
 
         Ok(Self {
             workspace_root: workspace_root.to_path_buf(),
-            machines,
+            machines: fleet.machines,
             providers,
-            machine_origins,
+            machine_origins: fleet.origins,
             provider_origins,
             services,
             domains,
@@ -1602,6 +1652,44 @@ impl CloudConfig {
                             );
                         }
                     }
+                }
+            }
+        }
+
+        // R870-B11. Two bundle-tier components sharing a mount would stage
+        // into the same `app/dist/<mount>/` prefix inside the service's one
+        // assembled bundle and silently clobber each other on disk — the
+        // exact failure class this ticket exists to fix, one level down
+        // (there it was two components silently overwriting the same
+        // *workload*; here it would be two components silently overwriting
+        // the same *path inside* the workload). A mount is owned by exactly
+        // one component; refuse the config before the clobber happens.
+        for (svc_name, svc) in services {
+            let mut owner_by_mount: BTreeMap<String, &str> = BTreeMap::new();
+            for component in &svc.service.components {
+                if component.kind != "mesofact-static" && component.kind != "mesofact-spa" {
+                    continue;
+                }
+                let mount = component
+                    .mount
+                    .as_deref()
+                    .map(normalize_mount)
+                    .unwrap_or_default();
+                if let Some(existing) = owner_by_mount.insert(mount.clone(), &component.id) {
+                    let where_ = if mount.is_empty() {
+                        "the service root (no `mount`)".to_string()
+                    } else {
+                        format!("mount = \"/{mount}\"")
+                    };
+                    anyhow::bail!(
+                        "services/{svc_name}/service.toml: components \"{existing}\" and \
+                         \"{}\" both declare {where_} — a bundle-tier component's mount is a \
+                         storage prefix inside the service's single assembled bundle \
+                         (app/dist/<mount>/), so two components at the same mount would stage \
+                         into the same path and silently overwrite each other. Give one of \
+                         them a distinct `mount`.",
+                        component.id,
+                    );
                 }
             }
         }
@@ -2132,7 +2220,12 @@ fn admission_spec(ws: &WorkloadSpec, declared: &[WorkloadConfig]) -> RequiredSpe
     // R572-F5 taint repulsion, unioned over the group (W338 §Placement
     // consequences 2): a group is non-drainable — and `no-appliance`-repelled —
     // if *any* member is an Appliance, even when the requirer is a Server.
-    let mut repel_archetypes: Vec<LifecycleArchetype> = Vec::new();
+    //
+    // R876-B7 inverted the sense. Repulsion is now unconditional in `matches`,
+    // so what this loop collects is still the group's archetype union, but it is
+    // converted below into the complementary TOLERATION set. Same predicate,
+    // stated from the other side.
+    let mut group_archetypes: Vec<LifecycleArchetype> = Vec::new();
     // Mesh tags are already AND-ed (a machine must be a superset), so unioning
     // them over the group is the same predicate applied to every member: a node
     // that cannot host one member cannot host the group.
@@ -2142,8 +2235,8 @@ fn admission_spec(ws: &WorkloadSpec, declared: &[WorkloadConfig]) -> RequiredSpe
         memory_mb = memory_mb.saturating_add(member.memory_request_mb());
         cpu_millis = cpu_millis.saturating_add(member.resources.cpu_millis);
         let arch = member.effective_archetype();
-        if !repel_archetypes.contains(&arch) {
-            repel_archetypes.push(arch);
+        if !group_archetypes.contains(&arch) {
+            group_archetypes.push(arch);
         }
         for tag in node_selector_mesh_tags(member) {
             if !mesh_tags.contains(&tag) {
@@ -2183,7 +2276,23 @@ fn admission_spec(ws: &WorkloadSpec, declared: &[WorkloadConfig]) -> RequiredSpe
         nodes: node_selector_node(ws).into_iter().collect(),
         memory_mb,
         cpu_millis,
-        repel_archetypes,
+        // R876-B7: the archetype union, restated as tolerations — every
+        // repelling key that is NOT this group's own class. A Server group
+        // tolerates `no-appliance` and `no-job` and is still blocked by
+        // `no-server`, which is precisely what the pre-B7 `repel_archetypes`
+        // axis computed. That equivalence is the migration: the `admit_workload`
+        // path's placement answers are unchanged for every fleet machine, while
+        // the mirror-declared path — which could never populate an archetype set
+        // and so read no taints at all — becomes repel-by-default.
+        //
+        // Derived from `LifecycleArchetype::ALL` rather than a literal list, so
+        // a fourth archetype is tolerated by unrelated groups automatically,
+        // exactly as `taint_effect` already derives the repulsion half.
+        tolerates: LifecycleArchetype::ALL
+            .into_iter()
+            .filter(|a| !group_archetypes.contains(a))
+            .map(|a| format!("no-{}", a.taint_key()))
+            .collect(),
         // R572-F5: taint affinity from the requires-taint annotation. The
         // requirer's wins; otherwise the first member that declares one, since
         // the group shares a node and this axis holds a single key. Two members
@@ -3109,31 +3218,176 @@ fn machine_matches_select(machine: &MachineConfig, select: &[String]) -> bool {
             .any(|s| *s == machine.name || machine.mesh_tags.contains(s))
 }
 
-/// Overlay every linked `.yah/infra/sources.toml` source's machines and
-/// providers into `machines`/`providers`, recording provenance into
-/// `machine_origins`/`provider_origins` (R615-F2 / W274). Must be called
-/// AFTER camp-local entries are already in both vectors and both origin maps
-/// are seeded with every camp-local name/id already `HashSet`-tracked as
-/// "seen": collision resolution is "first writer wins," so seeding with
-/// camp-local first is what makes camp-local win over every source, and an
-/// earlier source win over a later one.
+/// What one `[[source]]` in `.yah/infra/sources.toml` actually contributed to
+/// [`FleetInventory`] on this load (R870-B13).
 ///
-/// `select` filters which machines a source contributes; it does not apply
-/// to providers (nothing in W274 or the source ticket describes a
-/// provider-scoped filter — every provider a source declares either overlays
-/// whole or, on a name collision, doesn't).
-fn overlay_infra_sources(
+/// Recorded because a link that resolves to *nothing* is indistinguishable, at
+/// every downstream use site, from a camp that declared no link at all — and
+/// that is precisely the failure this ticket exists to fix. A source that
+/// contributes zero machines is not an error here (an unsynced `kind = "git"`
+/// source is legitimately empty, and `load()` must stay offline), so instead
+/// the fact is *carried* to whoever fails for want of a machine. See
+/// [`FleetInventory::describe_sources`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceContribution {
+    /// [`InfraSource::owner`] — the name this camp knows the fleet by.
+    pub owner: String,
+    /// The source, rendered — see [`InfraSource::describe`].
+    pub source: String,
+    /// Where the link resolved to, i.e. the foreign `.yah/infra/`.
+    pub root: std::path::PathBuf,
+    /// Whether `root` exists on disk. `false` for a `kind = "path"` link
+    /// aimed at a directory that is not a camp, and for a `kind = "git"`
+    /// source that `yah infra sync` has never fetched.
+    pub root_exists: bool,
+    /// How many machines this source actually added to the inventory — after
+    /// [`InfraSource::select`] filtering and after losing every name a
+    /// camp-local entry or an earlier source already claimed.
+    pub machines: usize,
+}
+
+/// A camp's resolved machine inventory: **the** answer to "which machines does
+/// this camp have", with exactly one implementation
+/// ([`resolve_fleet_inventory`]) behind it (R870-B13).
+///
+/// A borrowing camp — one whose own `.yah/infra/machines/` is empty and which
+/// declares `[[source]]` links to another camp's fleet in
+/// `.yah/infra/sources.toml` — is the case this type exists for. Before it,
+/// the overlay was applied inline inside [`CloudConfig::load`], so the two
+/// callers that resolve a *machine name to a machine* (ingress collation and
+/// the sovereign apex render) read a camp-local-only loader and saw an empty
+/// fleet. There was no bug in either of them; the inventory simply had two
+/// readers that disagreed about what the inventory was.
+#[derive(Debug)]
+pub struct FleetInventory {
+    /// Camp-local machines first, then each source's contribution in
+    /// declaration order. Camp-local wins any name collision; among sources,
+    /// the earlier-declared one wins.
+    pub machines: Vec<MachineConfig>,
+    /// Provenance for the borrowed entries, keyed by [`MachineConfig::name`].
+    /// A name absent here is camp-local. Same shape and meaning as
+    /// [`CloudConfig::machine_origins`], which is populated from this.
+    pub origins: BTreeMap<String, InfraOrigin>,
+    /// The parsed `.yah/infra/sources.toml`, kept so a caller that already has
+    /// an inventory in hand does not re-read it (`CloudConfig::load` overlays
+    /// providers from the same list).
+    pub sources: SourcesConfig,
+    /// Per-source accounting — see [`SourceContribution`].
+    pub contributions: Vec<SourceContribution>,
+}
+
+impl FleetInventory {
+    /// One line per declared `[[source]]`, for attaching to the error a caller
+    /// raises when a machine name does not resolve (R870-B13).
+    ///
+    /// The failure being diagnosed is always "I was told about machine X and
+    /// cannot find it", and the three ways a borrowing camp gets there — no
+    /// link declared, a link pointing somewhere that is not a camp, a link
+    /// whose `select` filtered X out — are indistinguishable from the name
+    /// alone. Empty string when the camp declares no sources, so the caller
+    /// can append it unconditionally without emitting a dangling header.
+    pub fn describe_sources(&self) -> String {
+        if self.contributions.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("linked infra sources consulted:");
+        for c in &self.contributions {
+            out.push_str(&format!(
+                "\n  {} ({}) -> {}{} — contributed {} machine(s)",
+                c.owner,
+                c.source,
+                c.root.display(),
+                if c.root_exists {
+                    ""
+                } else {
+                    " [ABSENT: not a camp, or an unsynced git source]"
+                },
+                c.machines,
+            ));
+        }
+        out
+    }
+}
+
+/// Resolve a camp's machine inventory: camp-local `.yah/infra/machines/`, the
+/// pre-R215 `.yah/cloud/machines/` tree, then every machine borrowed through
+/// `.yah/infra/sources.toml` (R870-B13, on R615-F2's mechanism).
+///
+/// **How a camp names another camp's fleet**, decided here rather than
+/// invented: through the `[[source]]` entry R615-F1 already defines — `owner`
+/// is the logical name an operator sees, `kind = "path"` resolves against the
+/// borrowing camp's own root and `kind = "git"` against `yah infra sync`'s
+/// cache. There is deliberately no second naming scheme: a camp that could
+/// name a foreign fleet two ways would be a camp whose inventory can drift
+/// from itself, which is the thing this ticket rejected.
+///
+/// **There is exactly one copy.** A `kind = "path"` source reads the owner's
+/// live tree at `<path>/.yah/infra/` on every load — the borrowing camp
+/// persists nothing, so the two can never disagree. `kind = "git"` reads a
+/// synced checkout, which *is* a copy, but an explicit one with a named
+/// refresh verb (`yah infra sync`) and a pinned `ref`; that is the cache with
+/// an invalidation story, as against a hand-maintained second inventory.
+///
+/// Camp-local files are strict (a malformed TOML this camp owns is a hard
+/// error) and foreign files are tolerant per-file (R615-F2: a foreign entry
+/// whose schema this binary predates must not sink the load). A foreign
+/// machine skipped that way is not silently lost — it fails loudly at the
+/// point some caller needs it, with [`FleetInventory::describe_sources`]
+/// naming the link it should have come from.
+///
+/// Deliberately *without* [`CloudConfig::load`]'s R844-B7 wrong-root guard: a
+/// missing `.yah/infra/machines/` is an empty inventory here, because the
+/// callers that resolve against it (ingress collation, apex render) are handed
+/// a root that a `CloudConfig::load` already accepted.
+pub fn resolve_fleet_inventory(workspace_root: &Path) -> Result<FleetInventory> {
+    let mut machines = load_dir::<MachineConfig>(crate::paths::machines_dir(workspace_root))?;
+
+    // Pre-R215 `.yah/cloud/machines/`. Shouldn't have anything since R215-B1
+    // moved them, but if it does we dedupe by name — R215+ wins.
+    let cloud_dir = crate::paths::legacy_cloud_dir(workspace_root);
+    if cloud_dir.exists() {
+        let names: std::collections::HashSet<String> =
+            machines.iter().map(|m| m.name.clone()).collect();
+        for m in load_dir::<MachineConfig>(cloud_dir.join("machines"))? {
+            if !names.contains(&m.name) {
+                machines.push(m);
+            }
+        }
+    }
+
+    // `SourcesConfig::load` never touches the network — git sources are read
+    // from `yah infra sync`'s cache (R615-T3) — so this keeps the whole
+    // offline contract `CloudConfig::load` has always had.
+    let sources = SourcesConfig::load(&crate::paths::infra_dir(workspace_root))?;
+    let mut origins = BTreeMap::new();
+    let contributions = overlay_source_machines(workspace_root, &sources, &mut machines, &mut origins);
+
+    Ok(FleetInventory {
+        machines,
+        origins,
+        sources,
+        contributions,
+    })
+}
+
+/// Overlay every linked `.yah/infra/sources.toml` source's machines into
+/// `machines`, recording provenance into `machine_origins` (R615-F2 / W274).
+/// Must be called AFTER camp-local entries are already in the vector:
+/// collision resolution is "first writer wins," so seeding with camp-local
+/// first is what makes camp-local win over every source, and an earlier source
+/// win over a later one.
+///
+/// `select` filters which machines a source contributes. Returns one
+/// [`SourceContribution`] per declared source, in declaration order.
+fn overlay_source_machines(
     workspace_root: &Path,
     sources: &SourcesConfig,
     machines: &mut Vec<MachineConfig>,
-    providers: &mut Vec<ProviderConfig>,
     machine_origins: &mut BTreeMap<String, InfraOrigin>,
-    provider_origins: &mut BTreeMap<String, InfraOrigin>,
-) {
+) -> Vec<SourceContribution> {
     let mut seen_machine_names: std::collections::HashSet<String> =
         machines.iter().map(|m| m.name.clone()).collect();
-    let mut seen_provider_ids: std::collections::HashSet<String> =
-        providers.iter().map(|p| p.id.clone()).collect();
+    let mut contributions = Vec::with_capacity(sources.source.len());
 
     for source in &sources.source {
         let root = source.infra_root(workspace_root);
@@ -3152,6 +3406,7 @@ fn overlay_infra_sources(
                 path.display()
             );
         }
+        let mut added = 0usize;
         for m in foreign_machines {
             if seen_machine_names.contains(&m.name) {
                 continue; // camp-local, or an earlier source, already claimed this name
@@ -3162,9 +3417,48 @@ fn overlay_infra_sources(
             seen_machine_names.insert(m.name.clone());
             machine_origins.insert(m.name.clone(), origin.clone());
             machines.push(m);
+            added += 1;
         }
 
-        let (foreign_providers, skipped) = load_dir_tolerant::<ProviderConfig>(&root.join("providers"));
+        contributions.push(SourceContribution {
+            owner: source.owner.clone(),
+            source: source.describe(),
+            root_exists: root.is_dir(),
+            root,
+            machines: added,
+        });
+    }
+
+    contributions
+}
+
+/// Overlay every linked source's providers into `providers`, recording
+/// provenance into `provider_origins` (R615-F2 / W274). Same first-writer-wins
+/// rule as [`overlay_source_machines`], and the same requirement that
+/// camp-local entries already be in the vector.
+///
+/// [`InfraSource::select`] deliberately does not apply: nothing in W274 or
+/// R615-F1 describes a provider-scoped filter — every provider a source
+/// declares either overlays whole or, on an id collision, doesn't.
+fn overlay_source_providers(
+    workspace_root: &Path,
+    sources: &SourcesConfig,
+    providers: &mut Vec<ProviderConfig>,
+    provider_origins: &mut BTreeMap<String, InfraOrigin>,
+) {
+    let mut seen_provider_ids: std::collections::HashSet<String> =
+        providers.iter().map(|p| p.id.clone()).collect();
+
+    for source in &sources.source {
+        let root = source.infra_root(workspace_root);
+        let origin = InfraOrigin {
+            owner: source.owner.clone(),
+            source: source.describe(),
+            mode: source.mode,
+        };
+
+        let (foreign_providers, skipped) =
+            load_dir_tolerant::<ProviderConfig>(&root.join("providers"));
         for (path, e) in skipped {
             tracing::warn!(
                 "infra source {:?} ({}): skipping unparseable provider {}: {e:#}",
@@ -3514,6 +3808,18 @@ pub struct IngressEdge {
     /// mirror written before this field meant.
     #[serde(default, rename = "use", skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    /// Digest-pinned image reference for this edge's front-door appliance,
+    /// e.g. `localhost/passway:tag@sha256:<hex>` (R870-F16).
+    ///
+    /// `None` is the state of every mirror on disk today: the passway arm of
+    /// `yah cloud apply` cannot deploy an appliance the mirror doesn't name an
+    /// image for, so it renders the manual `yah cloud ingress deploy …
+    /// --image <passway-ref>` step instead of running it. Declaring this field
+    /// is what makes the arm self-sufficient, matching the CloudflareTunnel
+    /// arm's real-API-call shape rather than only printing for an operator to
+    /// copy by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 impl IngressEdge {
@@ -3527,6 +3833,7 @@ impl IngressEdge {
             hostnames: Vec::new(),
             tunnel_id: None,
             provider_id: None,
+            image: None,
         }
     }
 
@@ -3978,14 +4285,14 @@ impl MirrorProviderSlot {
 ///   listed tag.
 /// - `memory_mb` / `cpu_millis` — *capacity floor* (R572-F5): the machine's
 ///   `allocatable` budget must cover the demand. `0` = no constraint.
-/// - `repel_archetypes` — *taint repulsion* (R572-F5, widened to a set by
-///   R860-T4): the machine must not carry `"no-<archetype.taint_key()>"` for
-///   **any** archetype in the placement group. Empty = no repulsion check.
-///   Absolute — see [`Self::repel_archetypes`].
+/// - *taint repulsion* — **unconditional** (R876-B7): the machine must not
+///   carry any taint that [`taint_effect`] classifies as
+///   [`TaintEffect::Repels`], unless that exact key is listed in
+///   [`Self::tolerates`]. This axis is not declared; it applies to every spec.
 /// - `requires_taint` — *taint affinity* (R572-F5): the machine must carry
 ///   this taint key (in `taints` or `mesh_tags`). `None` = no affinity.
 ///
-/// These two are the **only** readers of [`MachineConfig::taints`], which is
+/// These are the **only** readers of [`MachineConfig::taints`], which is
 /// what makes [`taint_effect`]'s closed vocabulary well-founded.
 ///
 /// [`MachineConfig::sovereign_group`] is deliberately **not** an axis here and
@@ -4035,28 +4342,43 @@ pub struct RequiredSpec {
     /// [`CloudConfig::admit_workload`] from the workload's `resources.cpu_millis`.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub cpu_millis: u32,
-    /// R572-F5: effective archetypes of the workloads being placed. The
-    /// scheduler rejects any node carrying `"no-<archetype.taint_key()>"` for
-    /// any of them. Empty = no repulsion check (backwards-compat for callers
-    /// that don't thread a spec through).
+    /// R876-B7: repelling node taints this placement **opts back in to**.
+    /// Each entry is a machine taint key spelled exactly as it appears in
+    /// [`MachineConfig::taints`] — `"no-appliance"`, not `"appliance"` — so the
+    /// node side and the workload side share one vocabulary and nothing has to
+    /// translate between them.
     ///
-    /// **A set, not a single value (R860-T4 / W338 §Placement consequences
-    /// 2).** [`admission_spec`] places the requirer's whole *placement group* —
-    /// the transitive closure of `local` requirement edges — so the axis is the
-    /// union of the members' archetypes. A `Server` that requires an
-    /// `Appliance` `local` must be repelled by `no-appliance`, because the two
-    /// land on one node or neither does; collapsing that back to one archetype
-    /// would place the group on a node that rejects half of it.
+    /// # Why this replaced `repel_archetypes`
     ///
-    /// **This is an absolute block, not a preference.**
-    /// [`CloudConfig::admit_workload`] sets it unconditionally from the
-    /// group's effective archetypes, and nothing in the tree tolerates a
-    /// taint — so a workload cannot opt out of a `no-<archetype>` node
-    /// (W305 finding 2 / R742-T4). Adding toleration means giving
-    /// `WorkloadSpec` a tolerations list and consulting it here; until then,
-    /// do not describe this as "repel-unless-tolerate".
-    #[serde(skip)]
-    pub repel_archetypes: Vec<LifecycleArchetype>,
+    /// Repulsion used to be **opt-in-to-be-repelled**: the spec named the
+    /// archetypes it was, and only a `no-<that archetype>` taint blocked it.
+    /// That field was `#[serde(skip)]`, so a slot declared as
+    /// `required = { ... }` in a mirror TOML always deserialized with it empty
+    /// and [`Self::matches`] never read [`MachineConfig::taints`] at all. Node
+    /// taints were therefore structurally inert for every mirror-declared
+    /// placement, and inert *silently* — `no-server` is a legal key, so
+    /// `yah cloud validate` passed and an operator draining a node before
+    /// maintenance got a green run and a workload that never moved (R876-S2's
+    /// drill measured exactly this against the real tree).
+    ///
+    /// The sense is now inverted, which is the only shape that can survive a
+    /// field the wire does not carry: **repulsion is unconditional and
+    /// toleration is declared.** A spec that says nothing is repelled by every
+    /// repelling taint — the reading an operator writing `taints = ["no-server"]`
+    /// on a machine already assumed they were getting.
+    ///
+    /// Toleration is per-key and absolute; there is no wildcard. Listing a key
+    /// no machine declares is harmless and matches nothing.
+    ///
+    /// [`admission_spec`] fills this from the placement group's archetypes —
+    /// every repelling key that is *not* the group's own class — which is what
+    /// makes the `admit_workload` path behave identically across this change
+    /// (R860-T4 / W338 §Placement consequences 2 still hold: the group's
+    /// archetypes are the union over `local` requirement edges, so a `Server`
+    /// bound to an `Appliance` tolerates neither `no-server` nor
+    /// `no-appliance`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tolerates: Vec<String>,
     /// R572-F5: taint the workload requires the target node to carry
     /// (annotation `yah.placement.requires-taint`). The node must have the
     /// key in its `taints` list or `mesh_tags`. `None` = no affinity constraint.
@@ -4101,7 +4423,17 @@ impl RequiredSpec {
         self.replicas.unwrap_or(1) as usize
     }
 
-    /// True when no axis carries a constraint — every machine matches.
+    /// True when no *declared* axis carries a constraint — every untainted
+    /// machine matches.
+    ///
+    /// R876-B7: taint repulsion is deliberately absent from this conjunction,
+    /// unlike the `repel_archetypes` it replaced. Repulsion is no longer an axis
+    /// a spec declares — it applies to every spec — so including it would make
+    /// the answer a property of the fleet rather than of the constraint. Nor
+    /// does [`Self::tolerates`] belong here: a toleration *widens* the candidate
+    /// set, and the callers of this predicate ask "did the operator narrow
+    /// anything" in order to refuse an underspecified placement. A slot that
+    /// declares only a toleration has still narrowed nothing.
     pub fn is_unconstrained(&self) -> bool {
         self.regions.is_empty()
             && self.zones.is_empty()
@@ -4110,7 +4442,6 @@ impl RequiredSpec {
             && self.nodes.is_empty()
             && self.memory_mb == 0
             && self.cpu_millis == 0
-            && self.repel_archetypes.is_empty()
             && self.requires_taint.is_none()
     }
 
@@ -4122,17 +4453,20 @@ impl RequiredSpec {
     /// - **R572-F5 capacity floor**: `machine.allocatable.{memory,cpu}` must
     ///   cover `self.{memory,cpu}`. A machine with no `allocatable` block passes
     ///   unconditionally (capacity unknown → no constraint enforced).
-    /// - **R572-F5 taint repulsion**: machine must not carry the taint
-    ///   `"no-<archetype.taint_key()>"` for *any* archetype in
-    ///   [`Self::repel_archetypes`] — every class in the placement group, not
-    ///   just the requirer's (R860-T4). Absolute — the workload has no way to
-    ///   tolerate it (W305 finding 2).
+    /// - **Taint repulsion (R876-B7)**: machine must not carry *any* taint that
+    ///   [`taint_effect`] classifies as [`TaintEffect::Repels`], unless that key
+    ///   is listed in [`Self::tolerates`]. Applied unconditionally — this is the
+    ///   axis no spec has to declare, and the one that makes a node drainable.
     /// - **R572-F5 taint affinity**: if `requires_taint` is set, the machine
     ///   must carry that key in its `taints` list or `mesh_tags`.
     ///
-    /// Any *other* taint on the machine is ignored here, which is precisely
-    /// why [`crate::validate::check_inert_taints`] refuses to let one be
-    /// declared: it would read as a constraint and be none.
+    /// A [`TaintEffect::Attracts`] key (today just `public-ip`) does **not**
+    /// repel: it is the affinity vocabulary, so reading it as repulsion would
+    /// evict every workload from the three nodes that carry it. Only the
+    /// `no-<archetype>` class repels, and [`taint_effect`] is the single
+    /// authority on which is which — which is why
+    /// [`crate::validate::check_inert_taints`] refuses to let an unclassifiable
+    /// key be declared: it would read as a constraint and be none.
     pub fn matches(&self, machine: &MachineConfig) -> bool {
         let member_ok = |constraint: &[String], value: Option<&str>| -> bool {
             constraint.is_empty() || value.map_or(false, |v| constraint.iter().any(|c| c == v))
@@ -4168,11 +4502,18 @@ impl RequiredSpec {
             }
         }
 
-        // R572-F5: taint repulsion. A node taint "no-<archetype>" rejects the
-        // workload class outright — there is no toleration list to consult.
-        for arch in &self.repel_archetypes {
-            let repel_key = format!("no-{}", arch.taint_key());
-            if machine.taints.iter().any(|t| *t == repel_key) {
+        // R876-B7: taint repulsion, repel-by-default. Every repelling taint on
+        // the machine blocks placement unless this spec names it in
+        // `tolerates`. Driven off `machine.taints` rather than off a field of
+        // `self`, which is the whole point: a spec that arrives by deserializing
+        // a mirror's `required = {...}` carries no repulsion declaration and
+        // never could, so making repulsion conditional on one made node taints
+        // structurally unreadable on that path (R876-S2).
+        for taint in &machine.taints {
+            if !matches!(taint_effect(taint), TaintEffect::Repels(_)) {
+                continue;
+            }
+            if !self.tolerates.iter().any(|t| t == taint) {
                 return false;
             }
         }
@@ -4204,14 +4545,15 @@ impl RequiredSpec {
         push("zones", &self.zones);
         push("providers", &self.providers);
         push("mesh_tags", &self.mesh_tags);
+        // Kept with the other list axes, and NOT moved below: `push` borrows
+        // `parts` mutably for as long as it is live, so interleaving it with the
+        // direct `parts.push` calls under it does not compile.
+        push("tolerates", &self.tolerates);
         if self.memory_mb > 0 {
             parts.push(format!("memory_mb>={}", self.memory_mb));
         }
         if self.cpu_millis > 0 {
             parts.push(format!("cpu_millis>={}", self.cpu_millis));
-        }
-        for arch in &self.repel_archetypes {
-            parts.push(format!("not-tainted(no-{})", arch.taint_key()));
         }
         if let Some(req) = &self.requires_taint {
             parts.push(format!("requires_taint={req}"));
@@ -6823,6 +7165,7 @@ mesh_tags = ["tag:cloud-runner", "tag:voter-candidate"]
 [connect]
 address = "45.32.194.254"
 ssh = "root@45.32.194.254"
+identity_file = "~/.ssh/yah"
 yubaba = "http://127.0.0.1:7443"
 arch = "x86_64"
 "#;
@@ -6862,6 +7205,7 @@ hostkey_fingerprint = "SHA256:dmpq"
 [connect]
 address = "15.204.89.240"
 ssh = "debian@15.204.89.240"
+identity_file = "~/.ssh/yah"
 yubaba = "http://100.64.0.1:7443"
 "#;
         let cfg: MachineConfig = toml::from_str(src).unwrap();
@@ -6884,6 +7228,7 @@ hostkey_fingerprint = "SHA256:dmpq"
 [connect]
 address = "15.204.89.240"
 ssh = "debian@15.204.89.240"
+identity_file = "~/.ssh/yah"
 yubaba = "http://100.64.0.1:7443"
 "#;
         let split = r#"
@@ -6894,6 +7239,7 @@ mesh_tags = []
 [connect]
 address = "15.204.89.240"
 ssh = "debian@15.204.89.240"
+identity_file = "~/.ssh/yah"
 
 [registration]
 hostkey_fingerprint = "SHA256:dmpq"
@@ -6918,6 +7264,7 @@ mesh_tags = []
 [connect]
 address = "10.0.0.1"
 ssh = "yah@10.0.0.1"
+identity_file = "~/.ssh/yah"
 yubaba_port = 9443
 
 [registration]
@@ -6946,6 +7293,7 @@ mesh_tags = []
 [connect]
 address = "192.168.10.14"
 ssh = "yah@192.168.10.14"
+identity_file = "~/.ssh/yah"
 yubaba = "http://192.168.10.14:7443"
 
 [registration]
@@ -6978,6 +7326,7 @@ mesh_tags = []
 [connect]
 address = "192.168.10.11"
 ssh = "yah@192.168.10.11"
+identity_file = "~/.ssh/yah"
 yubaba = "http://192.168.10.11:7443"
 "#;
         let cfg: MachineConfig = toml::from_str(src).unwrap();
@@ -7002,6 +7351,7 @@ mesh_tags = []
 [connect]
 address = "192.168.10.99"
 ssh = "yah@192.168.10.99"
+identity_file = "~/.ssh/yah"
 yubaba = "http://127.0.0.1:7443"
 "#;
         let cfg: MachineConfig = toml::from_str(src).unwrap();
@@ -7042,6 +7392,7 @@ hostkey_fingerprint = "SHA256:dmpq"
 [connect]
 address = "15.204.89.240"
 ssh = "debian@15.204.89.240"
+identity_file = "~/.ssh/yah"
 yubaba = "http://100.64.0.1:7443"
 "#;
         let mut cfg: MachineConfig = toml::from_str(src).unwrap();
@@ -7073,6 +7424,7 @@ mesh_tags = []
 [connect]
 address = "192.168.10.11"
 ssh = "yah@192.168.10.11"
+identity_file = "~/.ssh/yah"
 yubaba = "http://127.0.0.1:7443"
 "#;
         let mut cfg: MachineConfig = toml::from_str(src).unwrap();
@@ -7101,6 +7453,7 @@ hostkey_fingerprint = "SHA256:dmpq"
 [connect]
 address = "15.204.89.240"
 ssh = "debian@15.204.89.240"
+identity_file = "~/.ssh/yah"
 yubaba = "http://100.64.0.1:7443"
 "#;
         let cfg: MachineConfig = toml::from_str(src).unwrap();
@@ -8271,6 +8624,103 @@ component = "yah-marketing/site"
         assert_eq!(route_path_prefix("/"), "");
     }
 
+    // ── R870-B11: a mount is owned by exactly one bundle-tier component ────
+
+    /// Two bundle-tier components at the same explicit mount would stage into
+    /// the same `app/dist/<mount>/` prefix inside one assembled bundle and
+    /// silently clobber each other — reject at load, before that happens.
+    #[test]
+    fn two_bundle_components_at_the_same_mount_are_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let svc = ServiceConfig {
+            schema_version: 1,
+            name: "noisetable-marketing".into(),
+            domain: "noisetable.com".into(),
+            db: DbCatalog::default(),
+            components: vec![
+                ServiceComponent {
+                    mount: Some("/app".into()),
+                    id: "app".into(),
+                    kind: "mesofact-static".into(),
+                    path: "app/browser".into(),
+                    role: "static".into(),
+                    publishes: None,
+                    wave: 0,
+                    git: None,
+                },
+                ServiceComponent {
+                    mount: Some("app/".into()),
+                    id: "app2".into(),
+                    kind: "mesofact-spa".into(),
+                    path: "app/other".into(),
+                    role: "static".into(),
+                    publishes: None,
+                    wave: 0,
+                    git: None,
+                },
+            ],
+        };
+        svc.save(root).unwrap();
+        let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
+        assert!(err.contains("\"app\""), "{err}");
+        assert!(err.contains("\"app2\""), "{err}");
+        assert!(err.contains("mount = \"/app\""), "{err}");
+    }
+
+    /// The unmounted case: two bundle-tier components both leaving `mount`
+    /// unset both claim the service root, which collides exactly the same
+    /// way — this is the noisetable shape the ticket was filed against, if
+    /// `app`'s mount had been forgotten instead of declared.
+    #[test]
+    fn two_bundle_components_with_no_mount_are_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let svc = ServiceConfig {
+            schema_version: 1,
+            name: "noisetable-marketing".into(),
+            domain: "noisetable.com".into(),
+            db: DbCatalog::default(),
+            components: vec![
+                ServiceComponent {
+                    mount: None,
+                    id: "site".into(),
+                    kind: "mesofact-spa".into(),
+                    path: "web/landing".into(),
+                    role: "static".into(),
+                    publishes: None,
+                    wave: 0,
+                    git: None,
+                },
+                ServiceComponent {
+                    mount: None,
+                    id: "app".into(),
+                    kind: "mesofact-static".into(),
+                    path: "app/browser".into(),
+                    role: "static".into(),
+                    publishes: None,
+                    wave: 0,
+                    git: None,
+                },
+            ],
+        };
+        svc.save(root).unwrap();
+        let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
+        assert!(err.contains("\"site\""), "{err}");
+        assert!(err.contains("\"app\""), "{err}");
+        assert!(err.contains("the service root"), "{err}");
+    }
+
+    /// The legitimate shape (distinct mounts) is untouched — regression guard
+    /// so the new check does not become the next silent-overwrite bug.
+    #[test]
+    fn bundle_components_at_distinct_mounts_still_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_two_component_service(root);
+        assert!(CloudConfig::load(root).is_ok());
+    }
+
     #[test]
     fn worker_with_no_routes_is_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -8656,19 +9106,169 @@ taints = ["no-server", "no-appliance", "no-job"]
         assert_eq!(m.inert_taints(), vec!["no-voter", "qa"]);
     }
 
+    // ─── R876-B7: repel-by-default + declarable toleration ──────────────────
+
+    /// The headline inversion. A bare `RequiredSpec` — which is exactly what
+    /// deserializing a mirror's `required = { regions, mesh_tags }` produces,
+    /// since no TOML in the tree writes `tolerates` — is now repelled by a
+    /// repelling taint. Before B7 it matched, because repulsion was conditional
+    /// on a `#[serde(skip)]` field that this path could never fill.
+    #[test]
+    fn an_undeclared_spec_is_repelled_by_a_repelling_taint() {
+        let tainted = make_machine_with_capacity("n", 8192, 4000, vec!["no-server"]);
+        assert!(!RequiredSpec::default().matches(&tainted));
+
+        // And it is the DESERIALIZED shape that matters, not a hand-built one:
+        // this is the mirror path reproduced exactly.
+        let from_toml: RequiredSpec =
+            toml::from_str("regions = [\"us-east\"]\n").expect("a mirror-shaped required parses");
+        assert!(from_toml.tolerates.is_empty());
+        let mut in_region = tainted.clone();
+        in_region.region = Some("us-east".to_string());
+        assert!(
+            !from_toml.matches(&in_region),
+            "a mirror-declared placement must now read machine.taints"
+        );
+    }
+
+    /// The opt-back-in half, and the one an operator writes by hand.
+    #[test]
+    fn an_explicit_toleration_admits_the_tainted_machine_again() {
+        let tainted = make_machine_with_capacity("n", 8192, 4000, vec!["no-server"]);
+        let spec = RequiredSpec {
+            tolerates: vec!["no-server".to_string()],
+            ..Default::default()
+        };
+        assert!(spec.matches(&tainted));
+
+        // Per-key, not a blanket pass: tolerating one repelling key says nothing
+        // about another.
+        let both = make_machine_with_capacity("n", 8192, 4000, vec!["no-server", "no-appliance"]);
+        assert!(!spec.matches(&both));
+
+        // And it deserializes — the whole point of replacing a `#[serde(skip)]`
+        // field is that a mirror can now declare this.
+        let from_toml: RequiredSpec = toml::from_str("tolerates = [\"no-server\"]\n")
+            .expect("a slot can declare a toleration");
+        assert!(from_toml.matches(&tainted));
+    }
+
+    /// An untainted machine is unaffected, which is what makes the migration
+    /// bounded: six of the nine fleet machines carry no repelling taint at all.
+    #[test]
+    fn an_untainted_machine_matches_exactly_as_before() {
+        let clean = make_machine_with_capacity("n", 8192, 4000, vec![]);
+        assert!(RequiredSpec::default().matches(&clean));
+        assert!(RequiredSpec {
+            tolerates: vec!["no-server".to_string()],
+            ..Default::default()
+        }
+        .matches(&clean));
+    }
+
+    /// THE MIGRATION'S LOAD-BEARING FACT. `public-ip` is on three fleet nodes
+    /// including us-east-001, the only origin serving the yah.dev apex. It is an
+    /// *affinity* key, so repel-by-default must not touch it — reading every
+    /// taint as repulsion would evict the apex on the next apply.
+    #[test]
+    fn an_affinity_taint_does_not_repel() {
+        let public = make_machine_with_capacity("us-east-001", 8192, 4000, vec!["public-ip"]);
+        assert!(
+            RequiredSpec::default().matches(&public),
+            "public-ip attracts; it must never be read as repulsion"
+        );
+    }
+
+    /// `select_matching` filters on the same predicate, so a tainted machine
+    /// leaves the candidate set rather than being silently placed onto.
+    #[test]
+    fn select_matching_drops_a_tainted_candidate_and_keeps_the_rest() {
+        let drained = make_machine_with_capacity("drained", 8192, 4000, vec!["no-server"]);
+        let healthy = make_machine_with_capacity("healthy", 8192, 4000, vec![]);
+        let pool = [&drained, &healthy];
+
+        let picked = select_matching(&pool, &RequiredSpec::default(), 1, "test pool", "empty")
+            .expect("one candidate remains");
+        assert_eq!(
+            picked.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["healthy"],
+            "tainting the first candidate moves the placement to the second"
+        );
+
+        // Asking for both is a shortfall, not a half-placement.
+        let err = select_matching(&pool, &RequiredSpec::default(), 2, "test pool", "empty")
+            .expect_err("only one of two matches");
+        assert!(format!("{err:#}").contains("only 1 of 2 machines match"));
+    }
+
+    /// The `admit_workload` path must be behaviourally unchanged: its spec is
+    /// built by `admission_spec`, which now emits the complementary tolerations.
+    #[test]
+    fn admission_preserves_archetype_scoped_repulsion_across_the_inversion() {
+        let ws = minimal_spec("srv", 1); // a Server
+        let req = admission_spec(&ws, &[]);
+        assert_eq!(ws.effective_archetype(), LifecycleArchetype::Server);
+
+        let no_server = make_machine_with_capacity("n", 8192, 4000, vec!["no-server"]);
+        let no_appliance = make_machine_with_capacity("n", 8192, 4000, vec!["no-appliance"]);
+        assert!(!req.matches(&no_server), "its own class still repels it");
+        assert!(
+            req.matches(&no_appliance),
+            "another class's taint still does not — this is the pre-B7 answer"
+        );
+    }
+
+    #[test]
+    fn describe_names_the_toleration_so_a_refusal_is_readable() {
+        let spec = RequiredSpec {
+            regions: vec!["us-west".to_string()],
+            tolerates: vec!["no-appliance".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            spec.describe(),
+            "required.regions=[us-west] + required.tolerates=[no-appliance]"
+        );
+    }
+
+    /// A toleration widens; it must not make an underspecified slot look
+    /// specified, or the deploy side stops refusing one.
+    #[test]
+    fn a_toleration_alone_is_still_an_unconstrained_spec() {
+        assert!(RequiredSpec {
+            tolerates: vec!["no-server".to_string()],
+            ..Default::default()
+        }
+        .is_unconstrained());
+    }
+
     #[test]
     fn an_inert_taint_changes_no_placement_decision() {
         // The reason this is a lint and not a behaviour change: the guard's
         // whole premise is that these keys are invisible to `matches`.
         let clean = make_machine_with_capacity("n", 8192, 4000, vec![]);
         let noisy = make_machine_with_capacity("n", 8192, 4000, vec!["no-voter", "qa"]);
+        // R876-B7: still true under repel-by-default, and for a sharper reason —
+        // `matches` now walks `machine.taints` itself, so an unclassifiable key
+        // is skipped by `taint_effect` rather than merely never looked up.
         for arch in LifecycleArchetype::ALL {
             let req = RequiredSpec {
-                repel_archetypes: vec![arch],
+                tolerates: tolerations_excluding(&[arch]),
                 ..Default::default()
             };
             assert_eq!(req.matches(&clean), req.matches(&noisy));
+            assert!(req.matches(&noisy), "neither key repels");
         }
+    }
+
+    /// The toleration set [`admission_spec`] derives for a group of `archetypes`
+    /// — every repelling key that is not the group's own class.
+    fn tolerations_excluding(archetypes: &[LifecycleArchetype]) -> Vec<String> {
+        LifecycleArchetype::ALL
+            .into_iter()
+            .filter(|a| !archetypes.contains(a))
+            .map(|a| format!("no-{}", a.taint_key()))
+            .collect()
     }
 
     #[test]
@@ -8923,7 +9523,7 @@ sovereign_role = "non-voter"
                 ..Default::default()
             },
             RequiredSpec {
-                repel_archetypes: vec![LifecycleArchetype::Appliance],
+                tolerates: tolerations_excluding(&[LifecycleArchetype::Appliance]),
                 ..Default::default()
             },
         ] {
@@ -10017,7 +10617,19 @@ path  = "../first"
         assert_eq!(req.mesh_tags, vec!["tag:build-worker", "arch:x86"]);
         assert_eq!(req.memory_mb, ws.memory_request_mb());
         assert_eq!(req.cpu_millis, ws.resources.cpu_millis);
-        assert_eq!(req.repel_archetypes, vec![ws.effective_archetype()]);
+        // R876-B7: the axis is now the complement — every repelling key EXCEPT
+        // this spec's own class, which is the same predicate stated from the
+        // other side. Asserted against the derivation rather than a literal so
+        // it stays true if a fourth archetype is added.
+        assert_eq!(
+            req.tolerates,
+            tolerations_excluding(&[ws.effective_archetype()])
+        );
+        let own = format!("no-{}", ws.effective_archetype().taint_key());
+        assert!(
+            !req.tolerates.contains(&own),
+            "a spec never tolerates the taint aimed at its own class"
+        );
     }
 
     // ─── R860-T5 (W338 §Placement consequences 3): native-exec capability ────

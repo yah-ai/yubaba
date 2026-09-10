@@ -774,6 +774,7 @@ mod tests {
                     "name = \"{name}\"\nprovider = \"static\"\nmesh_tags = []\n\
                      {group_line}{extra}\n\
                      [connect]\naddress = \"10.0.0.1\"\nssh = \"root@{name}\"\n\
+                     identity_file = \"~/.ssh/yah\"\n\
                      yubaba = \"http://{name}:7443\"\n"
                 ),
             )

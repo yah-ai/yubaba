@@ -381,6 +381,7 @@ async fn a_refused_bundle_deploy_publishes_no_service_record() {
             // Declared, so the port is not the reason nothing is published.
             port: Some(8080),
             env: Default::default(),
+            origin: None,
         }),
         revalidate_receiver: None,
     });

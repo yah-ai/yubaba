@@ -50,7 +50,7 @@
 use std::net::SocketAddr;
 use std::time::SystemTime;
 
-use acme_engine::{dns01_record_name, AcmeDirectory};
+use acme_engine::dns01_record_name;
 use serde_json::json;
 
 use crate::acme_issuer::{cert_secret_name, key_secret_name};
@@ -58,20 +58,6 @@ use crate::cert_store::{
     CertStoreConfig, CertStoreError, Enrollment, IssuanceClaim, ObjectCertStore, BUCKET_ENV,
 };
 use crate::domain_issuer::DELEGATE_ZONE_ENV;
-
-/// Env key naming the ACME directory, shared with the issuers.
-///
-/// Read here for one reason only: the directory URL is what
-/// [`crate::cert_store::issuer_key`] turns into the store's issuer path segment,
-/// so an admin command reading a *different* default from the daemon would list
-/// an empty prefix and report a fleet of enrolled domains as having no
-/// certificates.
-pub const DIRECTORY_ENV: &str = "YUBABA_ACME_DIRECTORY";
-
-/// The default when [`DIRECTORY_ENV`] is unset — **staging**, matching
-/// [`crate::acme_issuer::parse_issuer_config`]. Kept equal deliberately; see
-/// [`DIRECTORY_ENV`].
-pub const DEFAULT_DIRECTORY: &str = "staging";
 
 /// What an admin command needs from the environment.
 ///
@@ -101,10 +87,10 @@ pub fn parse_admin_config(get: impl Fn(&str) -> Option<String>) -> Result<AdminC
         "{BUCKET_ENV} is unset — the domain commands read the enrollment set \
          straight from the object store, so it must name the bucket the daemon uses"
     ))?;
-    let directory_url = AcmeDirectory::parse(
-        &get(DIRECTORY_ENV).unwrap_or_else(|| DEFAULT_DIRECTORY.to_string()),
-    )
-    .url();
+    // The issuer segment an admin command lists under must be the one the
+    // daemon writes to, so the directory is resolved by cert_store's single
+    // owner rather than re-derived here (R870-B20).
+    let directory_url = crate::cert_store::acme_directory(&get).url();
     let delegate_zone = get(DELEGATE_ZONE_ENV)
         .map(|s| s.trim().trim_matches('.').to_string())
         .filter(|s| !s.is_empty());
@@ -522,6 +508,11 @@ fn secs(d: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use acme_engine::AcmeDirectory;
+    // R870-B20 moved this const to its single owner; the tests still pin the
+    // key an operator sets, so they name it explicitly.
+    use crate::cert_store::DIRECTORY_ENV;
     use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -775,6 +766,7 @@ mod tests {
                     access: Default::default(),
                     digest: None,
                     sans: None,
+                    ari: None,
                 },
             )
             .unwrap();

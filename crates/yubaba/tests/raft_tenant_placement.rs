@@ -53,7 +53,7 @@ use yubaba::raft::{
     MemberInfo, NodeCapacity, SlaTier, TenantDemand, TenantPlacement, YubabaNodeId, YubabaRequest,
 };
 use yubaba::runtime::DummyRuntime;
-use yubaba::scheduler::{self, SchedulerConfig};
+use yubaba::scheduler::{self, SchedulerConfig, SchedulerDeps};
 use yubaba_test_harness::{test_cluster_with_policy, Cluster};
 
 /// The tenant every test here places.
@@ -162,12 +162,19 @@ fn start_schedulers(cluster: &Cluster, policy: ClusterPolicy) -> Schedulers {
             node_id,
             raft.clone(),
             sm.clone(),
-            cluster.lease_detector(idx).cloned(),
-            Some(Arc::new(RaftHeartbeatDetector::new(
-                raft.clone(),
-                policy.liveness_thresholds(),
-            ))),
-            cluster.rpo_registry(idx).cloned(),
+            SchedulerDeps {
+                lease_detector: cluster.lease_detector(idx).cloned(),
+                raft_detector: Some(Arc::new(RaftHeartbeatDetector::new(
+                    raft.clone(),
+                    policy.liveness_thresholds(),
+                ))),
+                rpo_registry: cluster.rpo_registry(idx).cloned(),
+                // R859-F2 phase B: no ingress effector on a rig fixture. These
+                // nodes declare no public address and there is no apex to
+                // withdraw from, which is exactly the `None` production
+                // default.
+                ingress: None,
+            },
             SchedulerConfig::new(
                 policy.timing,
                 HysteresisPolicy::from_thresholds(policy.liveness_thresholds()),
@@ -211,6 +218,14 @@ async fn seed_with_rpo_bound(
                 region: None,
                 capacity: Some(CAPACITY),
                 machine: None,
+                // R859-F2 phase A: the public-ingress declaration. A rig
+                // fixture declares none — the placement scheduler never reads
+                // it, and a row with no machine name is exactly the "not
+                // resolvable" shape the effector must skip.
+                provider: None,
+                location: None,
+                ingress_floating_ip: None,
+                public_address: None,
             },
         )
         .await;

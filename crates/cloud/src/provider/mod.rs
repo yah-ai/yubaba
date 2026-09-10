@@ -34,9 +34,10 @@ pub mod digitalocean;
 pub use digitalocean::{DigitalOceanClient, DigitalOceanEnvoy, DoCreateDropletSpec};
 
 // R594-F5: `floating_ip.*` envoy verb — raft `ingress_owner` follow-placement
-// for sovereign-tier public ingress (W267 §Tier 1). `floating_ip` holds the
-// provider-abstracted trait + idempotent reconcile core; the three
-// `*_floating_ip` modules are the Hetzner/OVH/Vultr adapters.
+// for sovereign-tier public ingress (W267 §Tier 1). Three crates now, not one
+// module: `yah-floating-ip` holds the seam + reconcile core + planner,
+// `yah-floating-ip-adapters` holds the three vendor HTTP clients (R859-F3), and
+// what is left here is the credentialed constructor and the envoy verb layer.
 pub mod floating_ip;
 pub use floating_ip::{
     on_ingress_owner_changed, reconcile_assignment, FloatingIpAssignOutcome, FloatingIpProvider,
@@ -50,14 +51,15 @@ pub use floating_ip::{
     resolve_ingress_owner, IngressOwnerEffect, OwnerLiveness, QuorumHealth,
 };
 
-pub mod hetzner_floating_ip;
-pub use hetzner_floating_ip::HetznerFloatingIp;
+// R859-F3: the vendor transports moved to `yah-floating-ip-adapters` so the
+// fleet daemon can link them; re-exported here at their historical paths so
+// `cloud::provider::HetznerFloatingIp` still resolves for every call site.
+// `floating_ip_envoy` is what stayed: the `EnvoyAdapter` impls that make these
+// three dispatchable as `floating_ip.assign` / `floating_ip.status`.
+pub use floating_ip_adapters::{HetznerFloatingIp, OvhFloatingIp, VultrFloatingIp};
 
-pub mod ovh_floating_ip;
-pub use ovh_floating_ip::OvhFloatingIp;
-
-pub mod vultr_floating_ip;
-pub use vultr_floating_ip::VultrFloatingIp;
+pub mod floating_ip_envoy;
+pub use floating_ip_envoy::{dispatch_floating_ip_verb, FloatingIpEnvoy};
 
 #[cfg(feature = "local-docker")]
 pub mod local_docker;

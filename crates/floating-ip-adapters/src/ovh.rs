@@ -1,5 +1,4 @@
-//! [`OvhFloatingIp`] — `floating_ip.*` adapter for OVH Additional IPs
-//! (R594-F5).
+//! [`OvhFloatingIp`] — OVH Additional IPs (R594-F5).
 //!
 //! OVH Additional IPs move via API within a **datacentre/country region**
 //! (the eu-west GRA/RBX/SBG trio has cross-DC flexibility *within* that
@@ -9,33 +8,21 @@
 //!
 //! **No OVH driver exists anywhere in this codebase today** (OVH boxes in
 //! `.yah/infra/machines/` are brought up over SSH as `provider = "static"`
-//! — see `us-east-001.toml` / `us-west-001.toml`). This client is new,
-//! purpose-built for exactly the floating-IP endpoints this verb family
-//! needs, modeled on OVH's publicly documented `dedicated/server` +
-//! `ip` API families (`ipMove` / IP routing lookup). **Auth is a
-//! placeholder**: OVH's real API uses an application key + secret +
-//! consumer key with a timestamped HMAC signature, not a bearer token —
-//! modeling that signing scheme is out of scope for this ticket (code +
-//! mock tests only, no live calls per the ticket's hard constraints). The
-//! `consumer_key` field below is sent as a raw header so the *shape* of the
-//! adapter is right; swap in real OVH request-signing before any live use.
-//! Live-verification against OVH's actual API is explicitly deferred to
-//! the operator (same as every other cloud envoy adapter in this crate).
+//! — see `us-east-001.toml` / `us-west-001.toml`). This client is
+//! purpose-built for exactly the floating-IP endpoints this adapter needs,
+//! modeled on OVH's publicly documented `dedicated/server` + `ip` API families
+//! (`ipMove` / IP routing lookup). **Auth is a placeholder**: OVH's real API
+//! uses an application key + secret + consumer key with a timestamped HMAC
+//! signature, not a bearer token — the `consumer_key` field below is sent as a
+//! raw header so the *shape* of the adapter is right. Swap in real OVH
+//! request-signing before any live use. Live verification against OVH's actual
+//! API is explicitly deferred to the operator (same as every other cloud envoy
+//! adapter).
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use floating_ip::{FloatingIpMachine, FloatingIpProvider, FloatingIpState, FloatingIpTarget};
 use serde::Deserialize;
-use serde_json::Value;
-
-use super::floating_ip::{
-    reconcile_assignment, FloatingIpProvider, FloatingIpState, FloatingIpTarget,
-};
-use crate::config::MachineConfig;
-use crate::envoy::floating_ip::{
-    FloatingIpAssign, FloatingIpAssignInput, FloatingIpAssignOutput, FloatingIpStatus,
-    FloatingIpStatusInput, FloatingIpStatusOutput,
-};
-use crate::envoy::{AdapterFlavor, EnvoyAdapter, InternalVerb, Tier};
 
 const OVH_BASE: &str = "https://api.ovh.com/1.0";
 
@@ -62,34 +49,6 @@ impl OvhFloatingIp {
         self.base_url = url.into();
         self
     }
-
-    /// Typed handler for `floating_ip.assign`.
-    pub async fn floating_ip_assign(
-        &self,
-        input: FloatingIpAssignInput,
-    ) -> Result<FloatingIpAssignOutput> {
-        let target = FloatingIpTarget {
-            attach_id: input.attach_id,
-            zone: input.zone,
-        };
-        let outcome = reconcile_assignment(self, &input.ip_id, &target).await?;
-        Ok(FloatingIpAssignOutput {
-            reassigned: outcome.reassigned,
-            attached_to: outcome.attached_to,
-        })
-    }
-
-    /// Typed handler for `floating_ip.status`.
-    pub async fn floating_ip_status(
-        &self,
-        input: FloatingIpStatusInput,
-    ) -> Result<FloatingIpStatusOutput> {
-        let state = self.current_assignment(&input.ip_id).await?;
-        Ok(FloatingIpStatusOutput {
-            zone: state.zone,
-            attached_to: state.attached_to,
-        })
-    }
 }
 
 #[async_trait]
@@ -102,7 +61,7 @@ impl FloatingIpProvider for OvhFloatingIp {
     /// name-is-the-key convention the Hetzner adapter uses for its
     /// `GET /servers?name=` lookup) — `GET /dedicated/server/{serviceName}`
     /// confirms the box exists at OVH before anything is attempted.
-    async fn resolve_target(&self, machine: &MachineConfig) -> Result<FloatingIpTarget> {
+    async fn resolve_target(&self, machine: &FloatingIpMachine) -> Result<FloatingIpTarget> {
         let zone = ovh_zone_for(machine)?;
         let resp = self
             .http
@@ -182,39 +141,6 @@ impl FloatingIpProvider for OvhFloatingIp {
     }
 }
 
-#[async_trait]
-impl EnvoyAdapter for OvhFloatingIp {
-    fn id(&self) -> &str {
-        "ovh"
-    }
-    fn tier(&self) -> Tier {
-        Tier::A
-    }
-    fn flavor(&self) -> AdapterFlavor {
-        AdapterFlavor::Native
-    }
-    fn supported_verb_ids(&self) -> Vec<&'static str> {
-        vec![FloatingIpAssign::ID, FloatingIpStatus::ID]
-    }
-    async fn dispatch(&self, verb_id: &str, input: Value) -> Result<Value> {
-        match verb_id {
-            id if id == FloatingIpAssign::ID => {
-                let args: FloatingIpAssignInput =
-                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
-                let out = self.floating_ip_assign(args).await?;
-                Ok(serde_json::to_value(out)?)
-            }
-            id if id == FloatingIpStatus::ID => {
-                let args: FloatingIpStatusInput =
-                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
-                let out = self.floating_ip_status(args).await?;
-                Ok(serde_json::to_value(out)?)
-            }
-            other => bail!("ovh floating-ip envoy does not support verb {other:?}"),
-        }
-    }
-}
-
 /// Pure conversion: OVH datacenter code → coarse mobility region. The
 /// eu-west trio (GRA/RBX/SBG) is called out explicitly in W267 as having
 /// cross-DC flexibility within the region; extend as more OVH DCs are
@@ -230,16 +156,16 @@ fn ovh_datacenter_region(dc: &str) -> Result<&'static str> {
     }
 }
 
-/// `MachineConfig.location` is provisioning-only and OVH has no
-/// auto-provision driver in this codebase (`provider_has_machine_driver`
-/// doesn't list `"ovh"`), so today's OVH machines declare `region` (the
-/// coarser, provider-neutral geo label) but not `location`. Prefer the
-/// precise datacenter-derived region when `location` happens to carry an
-/// OVH DC code (future onboarding may start setting it informationally);
-/// fall back to the already-coarse `region` field otherwise — our region
-/// labels (`"us-east"`, `"eu-west"`, …) are deliberately at the same
-/// granularity OVH's own zone concept needs.
-fn ovh_zone_for(machine: &MachineConfig) -> Result<String> {
+/// `location` is provisioning-only and OVH has no auto-provision driver in this
+/// codebase (`cloud::config::provider_has_machine_driver` doesn't list
+/// `"ovh"`), so today's OVH machines declare `region` (the coarser,
+/// provider-neutral geo label) but not `location`. Prefer the precise
+/// datacenter-derived region when `location` happens to carry an OVH DC code
+/// (future onboarding may start setting it informationally); fall back to the
+/// already-coarse `region` field otherwise — our region labels (`"us-east"`,
+/// `"eu-west"`, …) are deliberately at the same granularity OVH's own zone
+/// concept needs.
+fn ovh_zone_for(machine: &FloatingIpMachine) -> Result<String> {
     if let Some(dc) = machine.location.as_deref().filter(|s| !s.is_empty()) {
         return Ok(ovh_datacenter_region(dc)?.to_string());
     }
@@ -261,41 +187,22 @@ struct OvhIpInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::floating_ip::on_ingress_owner_changed;
+    use floating_ip::on_ingress_owner_changed;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
-    fn gra_machine(name: &str) -> MachineConfig {
-        MachineConfig {
+    fn gra_machine(name: &str) -> FloatingIpMachine {
+        FloatingIpMachine {
             name: name.into(),
             provider: "ovh".into(),
             location: None,
-            server_type: None,
-            hosts_mirrors: vec![],
-            mesh_tags: vec![],
             region: Some("eu-west".into()),
-            zone: None,
-            arch: None,
-            bucket: None,
-            vendor: None,
-            nickname: None,
-            legacy_hostkey_fingerprint: None,
-            registration: Default::default(),
-            ssh_keys: vec![],
-            cloudflared: None,
-            hosts_operator_bridge: false,
-            connect: None,
-            allocatable: None,
-            taints: vec![],
-            sovereign_group: None,
-            sovereign_role: None,
             ingress_floating_ip: None,
         }
     }
 
     /// Spin up an in-process axum server standing in for OVH's API. See
-    /// `hetzner_floating_ip.rs`'s `spawn_mock` for the pattern this
-    /// mirrors.
+    /// `hetzner.rs`'s `spawn_mock` for the pattern this mirrors.
     async fn spawn_mock(
         datacenter: &'static str,
         initial_routed_to: Option<String>,

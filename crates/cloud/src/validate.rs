@@ -317,32 +317,33 @@ pub fn check_port_collisions(workspace_root: &Path) -> anyhow::Result<Vec<PortCo
 
 // ── Shared machine-TOML loader (R787) ───────────────────────────────────────
 
-/// How [`load_machine_tomls`] handles a `.yah/infra/machines/*.toml` that
-/// fails to read or parse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MachineLoadMode {
-    /// Skip the file with a `tracing::warn!` and continue — the lint sweeps'
-    /// existing behavior. A peer's half-written scaffold on a shared tree
-    /// must not blind the sweep to every other finding it would report.
-    Tolerant,
-    /// Fail the whole load on the first read/parse error — for callers where
-    /// silently dropping a machine could produce a wrong-but-successful
-    /// result, e.g. [`collate_workspace_ingress`] resolving a `required`
-    /// placement constraint onto a node that isn't actually a candidate.
-    Strict,
-}
-
-/// Every `.yah/infra/machines/*.toml`, paired with the path that declared it
-/// — every lint finding names the file the operator opens, and
-/// [`collate_workspace_ingress`]'s placement resolution has no use for the
-/// path but takes it anyway rather than forcing a second loader to exist.
+/// Every `.yah/infra/machines/*.toml` **this camp itself declares**, paired
+/// with the path that declared it — every lint finding names the file the
+/// operator opens.
 ///
-/// Missing `.yah/infra/machines/` is not an error — a fresh camp declares no
-/// nodes. Files are walked in sorted-filename order so callers that report
-/// findings (or resolve a first match) are deterministic across runs.
-pub fn load_machine_tomls(
+/// Camp-local by construction, and that is the whole of its contract: a lint
+/// exists to tell an operator about a file they can edit, and a borrowed
+/// machine is declared in another camp's tree where they cannot. A lint that
+/// cannot be resolved is noise that trains the operator to ignore the check.
+///
+/// **This is not the camp's fleet inventory.** For any caller that resolves a
+/// machine *name* to a machine — placement, ingress collation, the sovereign
+/// apex render — use [`crate::config::resolve_fleet_inventory`], which
+/// additionally overlays every fleet borrowed through
+/// `.yah/infra/sources.toml`. R870-B13: this function used to carry a
+/// `MachineLoadMode::Strict` arm and serve both jobs, which made a borrowing
+/// camp (empty local `machines/`, one `[[source]]` link) resolve against an
+/// empty fleet and fail its apex render on a machine that was declared all
+/// along, one directory over.
+///
+/// Missing `.yah/infra/machines/` is not an error — a fresh camp, and every
+/// borrowing camp, declares no nodes of its own. An unreadable or unparseable
+/// file is skipped with a `tracing::warn!` rather than failing the sweep: a
+/// peer's half-written scaffold on a shared tree must not blind the sweep to
+/// every other finding it would report. Files are walked in sorted-filename
+/// order so findings are deterministic across runs.
+pub fn load_camp_local_machine_tomls(
     workspace_root: &Path,
-    mode: MachineLoadMode,
 ) -> anyhow::Result<Vec<(PathBuf, MachineConfig)>> {
     let dir = machines_dir(workspace_root);
     if !dir.exists() {
@@ -361,19 +362,17 @@ pub fn load_machine_tomls(
         let path = entry.path();
         let src = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(e) if mode == MachineLoadMode::Tolerant => {
+            Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "skipping unreadable machine toml");
                 continue;
             }
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
         let machine: MachineConfig = match toml::from_str(&src) {
             Ok(m) => m,
-            Err(e) if mode == MachineLoadMode::Tolerant => {
+            Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "skipping unparseable machine toml");
                 continue;
             }
-            Err(e) => return Err(e).with_context(|| format!("parsing {}", path.display())),
         };
         out.push((path, machine));
     }
@@ -433,7 +432,7 @@ impl InertTaint {
 /// is a bigger problem than a taint key and surfaces on the load path.
 pub fn check_inert_taints(workspace_root: &Path) -> anyhow::Result<Vec<InertTaint>> {
     let mut found = Vec::new();
-    for (path, machine) in load_machine_tomls(workspace_root, MachineLoadMode::Tolerant)? {
+    for (path, machine) in load_camp_local_machine_tomls(workspace_root)? {
         for key in machine.inert_taints() {
             found.push(InertTaint {
                 machine: machine.name.clone(),
@@ -500,7 +499,7 @@ impl RetiredArchTag {
 /// failure with no hint that a tag rename caused it.
 pub fn check_retired_arch_tags(workspace_root: &Path) -> anyhow::Result<Vec<RetiredArchTag>> {
     let mut found = Vec::new();
-    for (path, machine) in load_machine_tomls(workspace_root, MachineLoadMode::Tolerant)? {
+    for (path, machine) in load_camp_local_machine_tomls(workspace_root)? {
         for tag in machine
             .mesh_tags
             .iter()
@@ -569,7 +568,7 @@ pub fn check_unroled_sovereign_members(
     workspace_root: &Path,
 ) -> anyhow::Result<Vec<UnroledSovereignMember>> {
     let mut found = Vec::new();
-    for (path, machine) in load_machine_tomls(workspace_root, MachineLoadMode::Tolerant)? {
+    for (path, machine) in load_camp_local_machine_tomls(workspace_root)? {
         if let (Some(group), None) = (&machine.sovereign_group, &machine.sovereign_role) {
             found.push(UnroledSovereignMember {
                 machine: machine.name.clone(),
@@ -648,7 +647,7 @@ impl LanDialTarget {
 /// roll that silently picked a different address than the one written down.
 pub fn check_lan_dial_targets(workspace_root: &Path) -> anyhow::Result<Vec<LanDialTarget>> {
     let mut found = Vec::new();
-    for (path, machine) in load_machine_tomls(workspace_root, MachineLoadMode::Tolerant)? {
+    for (path, machine) in load_camp_local_machine_tomls(workspace_root)? {
         let Some(url) = machine.connect.as_ref().and_then(|c| c.yubaba.as_deref()) else {
             continue;
         };
@@ -757,7 +756,7 @@ impl IngressFloatingIpProblem {
 pub fn check_ingress_floating_ip(
     workspace_root: &Path,
 ) -> anyhow::Result<Vec<IngressFloatingIpProblem>> {
-    let machines = load_machine_tomls(workspace_root, MachineLoadMode::Tolerant)?;
+    let machines = load_camp_local_machine_tomls(workspace_root)?;
     let mut found = Vec::new();
 
     // First declaration seen per group, in load order — the one every later
@@ -988,18 +987,20 @@ pub struct IngressReport {
 /// and simply has no address yet.
 pub fn collate_workspace_ingress(workspace_root: &Path) -> anyhow::Result<IngressReport> {
     // Needed only to resolve a slot's `required = { … }` into a machine name
-    // (R772) — `plan_ingress` itself stays pure. Reads `.yah/infra/machines/`
-    // directly rather than going through the full `CloudConfig::load`: this
-    // walk collates every mirror in the workspace, and has no business
-    // hard-failing over an unrelated mirror's `providers.X.use = "<id>"` typo,
-    // which cross-ref validation would do. Strict mode: silently dropping a
-    // machine here could resolve a `required` constraint onto the wrong node
-    // with no error, unlike the tolerant lint sweeps below.
+    // (R772) — `plan_ingress` itself stays pure. Reads the fleet inventory
+    // rather than going through the full `CloudConfig::load`: this walk
+    // collates every mirror in the workspace, and has no business hard-failing
+    // over an unrelated mirror's `providers.X.use = "<id>"` typo, which
+    // cross-ref validation would do.
+    //
+    // R870-B13: the *inventory*, not the camp-local machine files. A borrowing
+    // camp declares no machines of its own, so the camp-local loader resolved
+    // `required = { regions, mesh_tags }` against an empty candidate set there
+    // — which is exactly why such a camp has to pin `machines = [...]` by name
+    // instead of declaring constraints. Reading the inventory is what makes
+    // constraint-based placement expressible in a borrowing camp at all.
     let machines: Vec<MachineConfig> =
-        load_machine_tomls(workspace_root, MachineLoadMode::Strict)?
-            .into_iter()
-            .map(|(_, m)| m)
-            .collect();
+        crate::config::resolve_fleet_inventory(workspace_root)?.machines;
 
     // R844-F12: name -> declared mesh address, built once for the whole walk.
     // Same slice, second lookup — the offline stand-in for the discovery read
@@ -1343,8 +1344,9 @@ mod tests {
 
     // ── R763: the retired `tier:` arch mesh tag ────────────────────────────
 
-    /// Writes and re-parses the TOML immediately: [`load_machine_tomls`]'s
-    /// tolerant mode *skips* a file that fails to deserialize, so a fixture
+    /// Writes and re-parses the TOML immediately:
+    /// [`load_camp_local_machine_tomls`] *skips* a file that fails to
+    /// deserialize, so a fixture
     /// missing a required `MachineConfig` field would otherwise make every
     /// assert-empty test using it pass vacuously instead of failing loud.
     fn assert_machine_toml_parses(path: &Path) {
@@ -1670,6 +1672,7 @@ mod tests {
             root,
             "us-west-011",
             "address = \"192.168.10.11\"\nssh = \"yah@192.168.10.11\"\n\
+             identity_file = \"~/.ssh/yah\"\n\
              yubaba = \"http://192.168.10.11:7443\"",
             "",
         );
@@ -1693,6 +1696,7 @@ mod tests {
             root,
             "us-west-014",
             "address = \"192.168.10.14\"\nssh = \"yah@192.168.10.14\"\n\
+             identity_file = \"~/.ssh/yah\"\n\
              yubaba = \"http://192.168.10.14:7443\"",
             "mesh_ipv4 = \"100.64.0.6\"",
         );
@@ -1714,13 +1718,15 @@ mod tests {
         write_reach_machine(
             root,
             "meshed",
-            "address = \"192.168.10.15\"\nssh = \"yah@192.168.10.15\"",
+            "address = \"192.168.10.15\"\nssh = \"yah@192.168.10.15\"\n\
+             identity_file = \"~/.ssh/yah\"",
             "mesh_ipv4 = \"100.64.0.7\"",
         );
         write_reach_machine(
             root,
             "tunnelled",
             "address = \"192.168.10.16\"\nssh = \"yah@192.168.10.16\"\n\
+             identity_file = \"~/.ssh/yah\"\n\
              yubaba = \"http://127.0.0.1:7443\"",
             "",
         );
@@ -1728,6 +1734,7 @@ mod tests {
             root,
             "public",
             "address = \"45.32.194.254\"\nssh = \"debian@45.32.194.254\"\n\
+             identity_file = \"~/.ssh/yah\"\n\
              yubaba = \"http://45.32.194.254:7443\"",
             "",
         );
@@ -1831,10 +1838,10 @@ mod tests {
         assert_eq!(found[0].machine, "good");
     }
 
-    // ── R787: the shared loader's Strict/Tolerant contract ──────────────────
+    // ── R787 / R870-B13: the two loaders' split contract ────────────────────
 
     #[test]
-    fn tolerant_mode_skips_an_unparseable_toml_and_still_pairs_the_path() {
+    fn the_lint_loader_skips_an_unparseable_toml_and_still_pairs_the_path() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         let mdir = root.join(".yah/infra/machines");
@@ -1842,16 +1849,18 @@ mod tests {
         std::fs::write(mdir.join("broken.toml"), "name = \n").unwrap();
         write_machine(root, "good", &["qa"]);
 
-        let loaded = load_machine_tomls(root, MachineLoadMode::Tolerant).unwrap();
+        let loaded = load_camp_local_machine_tomls(root).unwrap();
         assert_eq!(loaded.len(), 1, "{loaded:?}");
         assert_eq!(loaded[0].1.name, "good");
         assert!(loaded[0].0.ends_with("good.toml"));
     }
 
     #[test]
-    fn strict_mode_fails_the_whole_load_on_one_unparseable_toml() {
-        // The behavior collate_workspace_ingress relies on: a bad machine toml
-        // must not silently resolve a `required` placement onto the wrong node.
+    fn the_fleet_inventory_fails_the_whole_load_on_one_unparseable_camp_local_toml() {
+        // The behavior collate_workspace_ingress relies on, now carried by
+        // resolve_fleet_inventory rather than a Strict mode on the lint loader:
+        // a bad machine toml this camp OWNS must not silently resolve a
+        // `required` placement onto the wrong node.
         let dir = tempdir().unwrap();
         let root = dir.path();
         let mdir = root.join(".yah/infra/machines");
@@ -1859,8 +1868,167 @@ mod tests {
         std::fs::write(mdir.join("broken.toml"), "name = \n").unwrap();
         write_machine(root, "good", &["qa"]);
 
-        let err = load_machine_tomls(root, MachineLoadMode::Strict).unwrap_err();
+        let err = crate::config::resolve_fleet_inventory(root).unwrap_err();
         assert!(format!("{err:#}").contains("broken.toml"), "{err:#}");
+    }
+
+    /// R870-B13, the defect this ticket was filed for, at the collation layer.
+    ///
+    /// A borrowing camp — empty `.yah/infra/machines/`, one `[[source]]` link
+    /// to the owner's tree — must collate a mirror that pins a machine by name
+    /// into a front door whose placement resolves. Before the fix,
+    /// `collate_workspace_ingress` read the camp-local loader, saw an empty
+    /// fleet, and every later name lookup failed on a machine that was
+    /// declared all along one directory over.
+    #[test]
+    fn a_borrowing_camp_collates_a_front_door_on_a_machine_it_declares_nowhere() {
+        let dir = tempdir().unwrap();
+        // The owner camp, whose tree holds the only copy of the inventory.
+        let owner = dir.path().join("owner");
+        write_machine(&owner, "us-east-001", &["public-ip"]);
+
+        // The borrowing camp: no machines of its own, one link.
+        let borrower = dir.path().join("borrower");
+        std::fs::create_dir_all(borrower.join(".yah/infra/machines")).unwrap();
+        std::fs::write(
+            borrower.join(".yah/infra/sources.toml"),
+            "schema_version = 1\n\
+             [[source]]\n\
+             owner = \"owner\"\n\
+             kind = \"path\"\n\
+             path = \"../owner\"\n\
+             mode = \"read-only\"\n",
+        )
+        .unwrap();
+
+        // Control: the camp-local loader still sees nothing, which is correct
+        // — that is what makes this a *borrowing* camp and not a copy.
+        assert!(load_camp_local_machine_tomls(&borrower).unwrap().is_empty());
+
+        let inventory = crate::config::resolve_fleet_inventory(&borrower).unwrap();
+        assert_eq!(
+            inventory.machines.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["us-east-001"],
+            "the borrowed fleet must resolve through sources.toml"
+        );
+        assert_eq!(
+            inventory.origins.get("us-east-001").map(|o| o.owner.as_str()),
+            Some("owner"),
+            "a borrowed machine keeps its provenance"
+        );
+        assert_eq!(inventory.contributions.len(), 1);
+        assert!(inventory.contributions[0].root_exists);
+        assert_eq!(inventory.contributions[0].machines, 1);
+
+        // And the collation walk itself — the caller that regressed — resolves
+        // the pinned name onto a real machine and collates a front door.
+        write_service(&borrower, "marketing", "marketing/site");
+        write_mirror(
+            &borrower,
+            "marketing",
+            "cloud",
+            &fronted_mirror("passway", &["us-east-001"], "api.example.com", 8080),
+        );
+        let report = collate_workspace_ingress(&borrower).unwrap();
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        assert_eq!(
+            report
+                .collation
+                .front_doors
+                .iter()
+                .map(|fd| fd.machine.as_str())
+                .collect::<Vec<_>>(),
+            vec!["us-east-001"],
+        );
+    }
+
+    /// R870-B13, the second thing the fix buys: **constraint-based placement
+    /// becomes expressible in a borrowing camp.**
+    ///
+    /// `resolve_ingress_placements` resolves a slot's `required = { regions,
+    /// mesh_tags }` against the machine slice this walk loads. With the
+    /// camp-local loader that slice was empty in a borrowing camp, so the
+    /// constraint matched nothing and the mirror failed to plan — which is
+    /// exactly why such a camp had to pin `machines = [...]` by name instead.
+    /// Reading the inventory removes that constraint on the constraint.
+    #[test]
+    fn a_borrowing_camp_can_place_by_constraint_rather_than_by_pin() {
+        let dir = tempdir().unwrap();
+        let owner = dir.path().join("owner");
+        std::fs::create_dir_all(owner.join(".yah/infra/machines")).unwrap();
+        std::fs::write(
+            owner.join(".yah/infra/machines/us-east-001.toml"),
+            "name = \"us-east-001\"\nprovider = \"static\"\nregion = \"us-east\"\n\
+             mesh_tags = [\"tag:cloud-runner\"]\ntaints = [\"public-ip\"]\n",
+        )
+        .unwrap();
+
+        let borrower = dir.path().join("borrower");
+        std::fs::create_dir_all(borrower.join(".yah/infra/machines")).unwrap();
+        std::fs::write(
+            borrower.join(".yah/infra/sources.toml"),
+            "schema_version = 1\n[[source]]\nowner = \"owner\"\nkind = \"path\"\n\
+             path = \"../owner\"\nmode = \"read-only\"\n",
+        )
+        .unwrap();
+        write_service(&borrower, "marketing", "marketing/site");
+        // No `machines` pin anywhere — placement is stated as a constraint.
+        // The inline `required = { … }` form, never the `[providers.X.required]`
+        // header form, which silently reparents every key below it (R772).
+        write_mirror(
+            &borrower,
+            "marketing",
+            "cloud",
+            "schema_version = 1\nshape = \"single-machine\"\n\
+             ingress = \"passway\"\ningress_machines = [\"us-east-001\"]\n\
+             [providers.compute]\nuse = \"hetzner\"\nzone = \"api.example.com\"\n\
+             port = 8080\n\
+             required = { regions = [\"us-east\"], mesh_tags = [\"tag:cloud-runner\"] }\n",
+        );
+
+        let report = collate_workspace_ingress(&borrower).unwrap();
+        assert!(
+            report.problems.is_empty(),
+            "a constraint must resolve against the borrowed fleet: {:?}",
+            report.problems
+        );
+        assert_eq!(
+            report
+                .collation
+                .front_doors
+                .iter()
+                .map(|fd| fd.machine.as_str())
+                .collect::<Vec<_>>(),
+            vec!["us-east-001"],
+        );
+    }
+
+    /// The diagnostic half: a link that resolves to nothing must SAY so, since
+    /// "no such machine" reads identically whether the camp declared no link,
+    /// aimed one at a directory that is not a camp, or filtered the machine
+    /// out with `select`.
+    #[test]
+    fn a_broken_link_is_reported_as_absent_rather_than_as_an_empty_fleet() {
+        let dir = tempdir().unwrap();
+        let borrower = dir.path().join("borrower");
+        std::fs::create_dir_all(borrower.join(".yah/infra/machines")).unwrap();
+        std::fs::write(
+            borrower.join(".yah/infra/sources.toml"),
+            "schema_version = 1\n\
+             [[source]]\n\
+             owner = \"owner\"\n\
+             kind = \"path\"\n\
+             path = \"../not-a-camp\"\n",
+        )
+        .unwrap();
+
+        let inventory = crate::config::resolve_fleet_inventory(&borrower).unwrap();
+        assert!(inventory.machines.is_empty());
+        assert!(!inventory.contributions[0].root_exists);
+
+        let described = inventory.describe_sources();
+        assert!(described.contains("owner"), "{described}");
+        assert!(described.contains("ABSENT"), "{described}");
     }
 
     // ── R742-F2 (W305): workspace ingress collation ──

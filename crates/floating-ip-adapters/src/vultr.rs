@@ -1,33 +1,22 @@
-//! [`VultrFloatingIp`] — `floating_ip.*` adapter for Vultr reserved IPs
-//! (R594-F5).
+//! [`VultrFloatingIp`] — Vultr reserved IPs (R594-F5).
 //!
-//! Vultr reserved IPs are **region-bound** (BGP-implemented inside
-//! AS20473) — verified 2026-07, W267 §Tier 1. Unlike Hetzner (network
-//! zone, a bucket of locations) or OVH (datacentre/country region, a
-//! bucket of datacenters), Vultr's own region code *is* the mobility unit
-//! — no further coarsening/mapping is needed, so this adapter uses
-//! `MachineConfig.location()` (Vultr's region slug, e.g. `"ewr"`) directly
-//! as the zone on both sides of the comparison in
-//! [`crate::provider::reconcile_assignment`].
+//! Vultr reserved IPs are **region-bound** (BGP-implemented inside AS20473) —
+//! verified 2026-07, W267 §Tier 1. Unlike Hetzner (network zone, a bucket of
+//! locations) or OVH (datacentre/country region, a bucket of datacenters),
+//! Vultr's own region code *is* the mobility unit — no further
+//! coarsening/mapping is needed, so this adapter uses
+//! [`floating_ip::FloatingIpMachine::location`] (Vultr's region slug, e.g.
+//! `"ewr"`) directly as the zone on both sides of the comparison in
+//! [`floating_ip::reconcile_assignment`].
 //!
-//! `"vultr"` already has an auto-provision driver bucket in
-//! [`crate::config::provider_has_machine_driver`], so a Vultr-provider
-//! machine is expected to declare `location`.
+//! `"vultr"` already has an auto-provision driver bucket in `cloud`'s
+//! `provider_has_machine_driver`, so a Vultr-provider machine is expected to
+//! declare `location`.
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use floating_ip::{FloatingIpMachine, FloatingIpProvider, FloatingIpState, FloatingIpTarget};
 use serde::Deserialize;
-use serde_json::Value;
-
-use super::floating_ip::{
-    reconcile_assignment, FloatingIpProvider, FloatingIpState, FloatingIpTarget,
-};
-use crate::config::MachineConfig;
-use crate::envoy::floating_ip::{
-    FloatingIpAssign, FloatingIpAssignInput, FloatingIpAssignOutput, FloatingIpStatus,
-    FloatingIpStatusInput, FloatingIpStatusOutput,
-};
-use crate::envoy::{AdapterFlavor, EnvoyAdapter, InternalVerb, Tier};
 
 const VULTR_BASE: &str = "https://api.vultr.com/v2";
 
@@ -55,34 +44,6 @@ impl VultrFloatingIp {
         self.base_url = url.into();
         self
     }
-
-    /// Typed handler for `floating_ip.assign`.
-    pub async fn floating_ip_assign(
-        &self,
-        input: FloatingIpAssignInput,
-    ) -> Result<FloatingIpAssignOutput> {
-        let target = FloatingIpTarget {
-            attach_id: input.attach_id,
-            zone: input.zone,
-        };
-        let outcome = reconcile_assignment(self, &input.ip_id, &target).await?;
-        Ok(FloatingIpAssignOutput {
-            reassigned: outcome.reassigned,
-            attached_to: outcome.attached_to,
-        })
-    }
-
-    /// Typed handler for `floating_ip.status`.
-    pub async fn floating_ip_status(
-        &self,
-        input: FloatingIpStatusInput,
-    ) -> Result<FloatingIpStatusOutput> {
-        let state = self.current_assignment(&input.ip_id).await?;
-        Ok(FloatingIpStatusOutput {
-            zone: state.zone,
-            attached_to: state.attached_to,
-        })
-    }
 }
 
 #[async_trait]
@@ -94,7 +55,7 @@ impl FloatingIpProvider for VultrFloatingIp {
     /// `GET /v2/instances?label=<machine.name>` — Vultr instances are
     /// looked up by their `label`, the same name-is-the-key convention
     /// as Hetzner's `GET /servers?name=`.
-    async fn resolve_target(&self, machine: &MachineConfig) -> Result<FloatingIpTarget> {
+    async fn resolve_target(&self, machine: &FloatingIpMachine) -> Result<FloatingIpTarget> {
         let zone = machine.location.clone().filter(|s| !s.is_empty()).with_context(|| {
             format!(
                 "vultr: machine {:?} has no `location` set — required as its region (mobility zone)",
@@ -181,39 +142,6 @@ impl FloatingIpProvider for VultrFloatingIp {
     }
 }
 
-#[async_trait]
-impl EnvoyAdapter for VultrFloatingIp {
-    fn id(&self) -> &str {
-        "vultr"
-    }
-    fn tier(&self) -> Tier {
-        Tier::S
-    }
-    fn flavor(&self) -> AdapterFlavor {
-        AdapterFlavor::Native
-    }
-    fn supported_verb_ids(&self) -> Vec<&'static str> {
-        vec![FloatingIpAssign::ID, FloatingIpStatus::ID]
-    }
-    async fn dispatch(&self, verb_id: &str, input: Value) -> Result<Value> {
-        match verb_id {
-            id if id == FloatingIpAssign::ID => {
-                let args: FloatingIpAssignInput =
-                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
-                let out = self.floating_ip_assign(args).await?;
-                Ok(serde_json::to_value(out)?)
-            }
-            id if id == FloatingIpStatus::ID => {
-                let args: FloatingIpStatusInput =
-                    serde_json::from_value(input).with_context(|| format!("{id}: decode input"))?;
-                let out = self.floating_ip_status(args).await?;
-                Ok(serde_json::to_value(out)?)
-            }
-            other => bail!("vultr floating-ip envoy does not support verb {other:?}"),
-        }
-    }
-}
-
 #[derive(Deserialize)]
 struct VultrInstancesResponse {
     instances: Vec<VultrInstanceLite>,
@@ -241,41 +169,22 @@ struct VultrReservedIpBody {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::floating_ip::on_ingress_owner_changed;
+    use floating_ip::on_ingress_owner_changed;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
-    fn ewr_machine(name: &str) -> MachineConfig {
-        MachineConfig {
+    fn ewr_machine(name: &str) -> FloatingIpMachine {
+        FloatingIpMachine {
             name: name.into(),
             provider: "vultr".into(),
             location: Some("ewr".into()),
-            server_type: Some("vc2-1c-1gb".into()),
-            hosts_mirrors: vec![],
-            mesh_tags: vec![],
             region: None,
-            zone: None,
-            arch: None,
-            bucket: None,
-            vendor: None,
-            nickname: None,
-            legacy_hostkey_fingerprint: None,
-            registration: Default::default(),
-            ssh_keys: vec![],
-            cloudflared: None,
-            hosts_operator_bridge: false,
-            connect: None,
-            allocatable: None,
-            taints: vec![],
-            sovereign_group: None,
-            sovereign_role: None,
             ingress_floating_ip: None,
         }
     }
 
     /// Spin up an in-process axum server standing in for Vultr's API. See
-    /// `hetzner_floating_ip.rs`'s `spawn_mock` for the pattern this
-    /// mirrors.
+    /// `hetzner.rs`'s `spawn_mock` for the pattern this mirrors.
     async fn spawn_mock(
         instance_region: &'static str,
         reserved_ip_region: &'static str,

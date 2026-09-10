@@ -2,6 +2,18 @@
 members = [
     "crates/hetzner",
     "crates/cloud",
+    # R859-F2 (2026-09-08, operator decision): the floating-IP seam + the pure
+    # ingress-failover planner, carved out of `cloud` so `yubaba` can drive
+    # failover without a runtime yubaba -> cloud edge. Same move R374-F3 made
+    # for local-driver; see the crate's own header for why the dep list stays
+    # at two.
+    "crates/floating-ip",
+    # R859-F3 (2026-09-08): the Hetzner/OVH/Vultr HTTP adapters, carved out of
+    # `cloud` in turn so the fleet daemon can MOVE a floating IP and not merely
+    # decide to. Sits between the two: above `floating-ip` (whose dep list is
+    # capped at two), below `cloud` (whose envoy layer and `fob` lookup must not
+    # ship to a node).
+    "crates/floating-ip-adapters",
     # R732-T4 (W245/W253): the per-node WAL→R2 streamer. A data-plane service,
     # deliberately not part of the yubaba server crate — see its crate doc.
     "crates/tenant-streamer",
@@ -13,7 +25,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.34"
+version = "0.8.36"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

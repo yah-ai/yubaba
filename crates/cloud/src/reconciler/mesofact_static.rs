@@ -204,6 +204,22 @@
 //! for the split, and `crate::almanac_dispatch` for the caller-side switch.
 //! Ticket record lives in `.yah/docs/working/W225-mesofact-consumer-deployment-model.md`
 //! (single declaration site — not duplicated here per Rule11).
+//!
+//! @yah:ticket(R875-B1, "Adopted mesofact-dev gets a no-op shutdown and no logs — dev-tier Stop lies, log pane is empty")
+//! @yah:at(2026-09-09T01:58:02Z)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R875)
+//! @yah:severity(high)
+//! @yah:gotcha("Reproduced live on this camp 2026-09-08: three orphaned mesofact-dev processes, all PPID 1 (yah-marketing/site on 4321, scrabcake/site on 4353, and a leaked test-svc on 55506 from a 13:12 test run). The 4321 one survived both a desktop quit and a camp-daemon restart, which is the operator report that opened this relay.")
+//! @yah:gotcha("\"Stop makes it go away for a second then it comes back\" is NOT a respawn and NOT kamaji. The dev cell's running-state is a live port probe, not the registry: mirror_run_list -> observe_mirrors -> probe_dev_cell (app/yah/desktop/src/mirror_observation.rs:268), polled every 3s by MirrorPanel. Stop empties the desktop registry, the row briefly renders from the stopped snapshot, the next poll re-probes 4321, finds the server still serving, and the row returns. The UI was reporting honestly; the stop was the lie.")
+//! @yah:handoff("FIXED. Mechanism: try_adopt_identified returned RunningWorkload::adopted(), whose shutdown() is a documented no-op (shutdown/supervisor/teardown all None) and whose log_buffer is None. mirror_run_down called it, got Ok(()), set stopped=true and reported success. The spawn arm has always had a real teardown and a LogBuffer — but the desktop re-adopts on every launch, so the only run that ever got a live handle was the one that first spawned the server. This is R714-B1 one reconciler over, and that ticket's own handoff had already decided the adopt arm must carry teardown too; the decision was applied to container.rs and not here.")
+//! @yah:handoff("Landed in four parts. (1) try_adopt_identified is now identity-verification only, returning Result<Option<SocketAddr>>; the new MesofactStaticReconciler::adopted_workload builds the handle where ReconcileCtx is in scope. (2) native_support::stop_process_listening_on(addr, grace) — SIGTERM, wait for the port to go quiet, SIGKILL, then FAIL if the port is still accepting. (3) native_support::spawn_capture_tail — a tail-only supervisor for a workload this process does not hold a NativeRuntime handle for, plus FileTail::from_end. (4) RunningWorkload::owns_teardown() replaces mirror_run_down's `kind == \"container\"` test.")
+//! @yah:handoff("DESIGN CALL, and the one a reviewer should push on: teardown resolves the pid FROM THE PORT (`lsof -nP -iTCP:<port> -sTCP:LISTEN -t`) rather than from a pid recorded at spawn time. local_process.rs already has the pid-sidecar shape (owner.json, write_owner/reap_owner) and reusing it was the obvious move — rejected because a sidecar is only ever stale in exactly the orphan case this exists to fix, and a recycled pid on a long-lived mac names an innocent process. The port has no staleness window: the caller has already confirmed via /__mesofact/info that the listener IS this service+component, and success is verified by effect (the port stops accepting), so a kill that misses is reported as a failed stop instead of a silent success. Cost: a shell-out to lsof, and an honest error if lsof is absent.")
+//! @yah:handoff("BUG MY OWN TESTS CAUGHT, worth knowing before touching the log half: the adopt tail must start at end-of-file, not offset 0. An adopted server is not reliably the process that wrote the capture file — the mesofact-dev holding 4321 here started at 17:43 while .yah/jit/native/mesofact-dev-yah-marketing-site/stdout.log had not been touched since 17:39 — so draining from 0 replays a dead run's output as the live server's. FileTail::from_end seeds the offset at the current length; the spawn path keeps FileTail::new (offset 0) because NativeRuntime truncated the file for that child. Both arms pinned by tests.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib -- native_support teardown_tests adopt_identified  # 17 passed, 0 failed (2026-09-08)")
+//! @yah:verify("MANUAL, blocked on a desktop rebuild+install (app/yah/desktop/install-app.sh): with mesofact-dev orphaned on 4321 (PPID 1), press Stop on the yah-marketing dev cell — `lsof -nP -iTCP:4321 -sTCP:LISTEN` must come back empty and the cell must stay idle across the next 3s poll, not flip back to running.")
+//! @yah:verify("MANUAL: a Stop that cannot free the port must surface the error chip, never a silent success — mirror_run_down now returns Err for any workload whose owns_teardown() is true.")
 
 /// Bundled Worker script embedded at compile time from `worker/router.bundle.js`.
 ///
@@ -242,7 +258,8 @@ use workload_spec::{
 };
 
 use super::native_support::{
-    capture_paths, native_spec, sanitize_ident, spawn_native_log_supervisor, NATIVE_IDENTITY_DIGEST,
+    capture_paths, native_spec, sanitize_ident, spawn_capture_tail, spawn_native_log_supervisor,
+    stop_process_listening_on, NATIVE_IDENTITY_DIGEST,
 };
 use super::{
     into_running, pond, slot_field_u16, wait_for_port, LogBuffer, ReconcileCtx, Reconciler,
@@ -563,8 +580,8 @@ impl MesofactStaticReconciler {
         // serve the wrong site (R602-B4). `/__mesofact/info` is the oracle;
         // identity mismatch is a hard error, not a fall-through to spawn (the
         // port is taken — there is nothing safe to do but surface it).
-        if let Some(adopted) = try_adopt_identified(addr, svc, comp, "configured").await? {
-            return Ok(adopted);
+        if let Some(addr) = try_adopt_identified(addr, svc, comp, "configured").await? {
+            return Ok(self.adopted_workload(ctx, addr));
         }
 
         // Camp may have fallen back to a dynamic port (OS-assigned when configured
@@ -573,10 +590,10 @@ impl MesofactStaticReconciler {
         if let Some(actual_port) = jit_port {
             if actual_port != port {
                 let actual_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), actual_port);
-                if let Some(adopted) =
+                if let Some(addr) =
                     try_adopt_identified(actual_addr, svc, comp, "dynamic").await?
                 {
-                    return Ok(adopted);
+                    return Ok(self.adopted_workload(ctx, addr));
                 }
             }
         }
@@ -656,6 +673,59 @@ impl MesofactStaticReconciler {
         // log surface (NativeRuntime captures stdio to files, not a pipe).
         self.spawn_via_constable(ctx, &binary, &workload_dir, spawn_port)
             .await
+    }
+
+    /// Wrap an already-running mesofact-dev (identity confirmed by
+    /// [`try_adopt_identified`]) in a handle that can actually stop it and can
+    /// show its logs.
+    ///
+    /// **R875-B1.** This used to be `RunningWorkload::adopted(...)`, whose
+    /// `shutdown()` is a documented no-op and whose `log_buffer` is `None`. On
+    /// the dev tier that made the Stop button lie and the log pane empty — and
+    /// not rarely: the desktop re-adopts on every launch, so the *only* run
+    /// that ever got a real handle was the one that first spawned the server.
+    /// Every run after a restart got the dead one. It is the same defect
+    /// R714-B1 fixed for `kind = "container"`, and that ticket's conclusion
+    /// applies here verbatim: attaching teardown to the spawn arm alone leaves
+    /// the button a no-op after any app restart, which is the bug.
+    ///
+    /// Both halves work on an *orphan* — a server whose spawning desktop is
+    /// long gone and which has reparented to init — because neither depends on
+    /// holding the child:
+    ///
+    /// * **Teardown** asks the OS who holds the port right now
+    ///   ([`stop_process_listening_on`]) rather than trusting a pid recorded at
+    ///   spawn time, which in the orphan case is exactly the stale one.
+    /// * **Logs** tail the capture files NativeRuntime left at a deterministic
+    ///   path, which the orphan is still appending to.
+    ///
+    /// The capture files may be absent, or may belong to an earlier run rather
+    /// than to the process actually holding the port (a mesofact-dev started by
+    /// hand, or one whose spawner wrote elsewhere). The tail therefore starts
+    /// at end-of-file: an empty pane that fills as the live server logs, never
+    /// a dead run's output presented as this one's.
+    fn adopted_workload(&self, ctx: &ReconcileCtx<'_>, addr: SocketAddr) -> RunningWorkload {
+        let state_dir = ctx.workspace_root.join(".yah/jit/native");
+        let ident_str = native_ident(&ctx.service.name, &ctx.component.id);
+        let (stdout_path, stderr_path) = capture_paths(&state_dir, &ident_str);
+
+        let log_buf = LogBuffer::new();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let supervisor =
+            spawn_capture_tail(log_buf.clone(), stdout_path, stderr_path, shutdown_rx);
+
+        into_running(
+            "mesofact-static",
+            "static",
+            Some(format!("http://{addr}")),
+            None,
+            Some(log_buf),
+            shutdown_tx,
+            supervisor,
+        )
+        .with_teardown(move || async move {
+            stop_process_listening_on(addr, Duration::from_secs(5)).await
+        })
     }
 
     /// Lower the mesofact-dev invocation to a [`WorkloadSpec`], deploy it on a
@@ -1173,6 +1243,7 @@ pub(crate) fn lower_build_to_forge_spec(
             shift: "build".into(),
         },
         mesh_access: MeshAccess::default(),
+        cache_key: None,
     })
 }
 
@@ -1511,12 +1582,15 @@ fn is_unix_socket_live(_path: &std::path::Path) -> bool {
     false
 }
 
-/// Adopt a mesofact-dev already listening on `addr` — but only when it
-/// identifies as `(expected_service, expected_component)` via `/__mesofact/info`
-/// (R602-B4). Returns:
+/// Confirm that a mesofact-dev already listening on `addr` identifies as
+/// `(expected_service, expected_component)` via `/__mesofact/info` (R602-B4).
+///
+/// Identity check only — building the [`RunningWorkload`] is the caller's job,
+/// because an adopted workload needs a teardown hook and a log tail that both
+/// need `ReconcileCtx` (R875-B1). Returns:
 /// - `Ok(None)` — nothing is listening on `addr` (caller falls through to the
 ///   next candidate / spawns a fresh server).
-/// - `Ok(Some(_))` — a matching mesofact-dev is running; adopt it.
+/// - `Ok(Some(addr))` — a matching mesofact-dev is running; adopt it.
 /// - `Err(_)` — a listener is present but is a *different* service/component,
 ///   or is not an identifiable mesofact-dev at all. Adoption is refused; the
 ///   port is taken by a foreign workload, so there is nothing to spawn — surface
@@ -1528,7 +1602,7 @@ async fn try_adopt_identified(
     expected_service: &str,
     expected_component: &str,
     label: &str,
-) -> Result<Option<RunningWorkload>> {
+) -> Result<Option<SocketAddr>> {
     // Liveness gate first: no listener → nothing to adopt (spawn path).
     if tokio::net::TcpStream::connect(addr).await.is_err() {
         return Ok(None);
@@ -1536,18 +1610,12 @@ async fn try_adopt_identified(
 
     match probe_dev_identity(addr).await {
         Some((svc, comp)) if svc == expected_service && comp == expected_component => {
-            let dev_url = format!("http://{addr}");
             info!(
-                dev_url = %dev_url,
                 port = addr.port(),
                 %label,
                 "mesofact-dev already running; identity matches, adopting"
             );
-            Ok(Some(RunningWorkload::adopted(
-                "mesofact-static",
-                "static",
-                Some(dev_url),
-            )))
+            Ok(Some(addr))
         }
         Some((svc, comp)) => anyhow::bail!(
             "port {} is serving {svc}/{comp}, but component {expected_component} of service \

@@ -111,7 +111,7 @@ impl Hello {
     pub fn new(node_id: impl Into<String>, hostkey_fingerprint: Option<String>) -> Self {
         Self {
             name: "yah-yubaba".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::VERSION.to_string(),
             node_id: node_id.into(),
             hostkey_fingerprint,
         }
@@ -402,7 +402,7 @@ mod tests {
             got.hostkey_fingerprint.as_deref(),
             Some(id.hostkey_fingerprint.as_str())
         );
-        assert_eq!(got.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(got.version, crate::VERSION);
 
         dialer.close().await;
         server.close().await;

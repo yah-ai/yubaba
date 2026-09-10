@@ -43,6 +43,14 @@
 //!    `mesh_ip` must equal the answering node's own mesh address — that is the
 //!    invariant to check when reading `GET /service-records` off a live node.
 //!
+//!    Since R876-B3 it is also **enforced at the write boundary** rather than
+//!    only declared here: `authoritative_mesh_ip` makes `node_mesh_ip` beat a
+//!    backend's disagreeing self-report on every sweep, warning loudly. It had
+//!    to be, because a wrong address survives the deploy path being fixed — it
+//!    is persisted in the workload's `yah.mesh_ip` container label and replayed
+//!    on every `list_workloads`, so west was still publishing east's address
+//!    for `yah-cloud-admin` long after `alloc_mesh_ip` was deleted.
+//!
 //!    Either way that pairing is admission-time knowledge that exists nowhere
 //!    else, which is why it cannot be recovered by step 2.
 //! 2. **On every subsequent read** ([`ServiceRecords::reconcile`]): the
@@ -297,6 +305,7 @@
 //! @yah:handoff("WHAT *IS* RUNNABLE ON DEV ONCE T3+T7 ARE ROLLED, and it is worth running before the rest lands, because it is the half that has never been demonstrated on real hardware: the OWNERSHIP half of T8. Power off the dev owner and watch (a) a survivor expire the record and claim it, (b) the record stop naming the dead machine, (c) power restored, and the old node NOT serve. That is decidable without T2/T5 — it does not care whether the new coordinator's database is any good, only who is permitted to serve. T8's full acceptance criterion ('an ALREADY-REGISTERED node reaches the tailnet through the new coordinator without re-registering') is the one that needs T2 and T5, and it should not be attempted before them. Splitting the rehearsal that way turns one blocked ten-step run into one runnable four-step run plus a gated remainder.")
 //! @yah:handoff("R858-T7 COMPLETE. EXPIRE: a leader now widens decide_owner's candidate map with the recorded owner, as Confirmed::Down, once the node-lease channel says it has been silent past FenceTiming::expire_after — the record is then overwritten by SetIngressOwner, or ClearIngressOwner'd if nothing can take over. FENCE: appliance_ownership::judge_self_fence runs in leader.rs BEFORE the may_act early return, because the node that must be stopped is precisely one with no standing to act; it stops on a record naming another node, or on failing to confirm its own claim for self_fence_after. The fork was decided as a LEASE, not a raft epoch, with the reasoning in the handoff — an epoch cannot fence a node holding stale state, which is the power-off shape. Three defects were found and fixed along the way, one of which (leader-only lease renewal) made expiry structurally unreachable. Files: oss/yubaba/crates/yubaba/src/{appliance_ownership,leader,lease_detector,lease_renewal}.rs, crates/yubaba-test-harness/src/lib.rs, crates/yubaba/tests/raft_appliance_ownership.rs. Nothing rolled; no live node touched.")
 //! @yah:assumes("The fence's freshness proxy is `raft metrics.current_leader.is_some()` — reasoned, not measured against a real partition. The argument: a node in contact with a leader is receiving AppendEntries, so its applied `ingress_owner` is at most one replication round behind, and the 10s fleet margin covers that by orders of magnitude. What I did NOT establish is openraft's exact behaviour for a leader that has lost quorum contact but has not yet stepped down — if `current_leader` stayed Some(self) through such a window, that node would keep refreshing its own ownership clock and would not self-fence. openraft has pre-vote and leader step-down (see tests/raft_pre_vote.rs) so this should be bounded by the election timeout, but I did not read the step-down path. Worth one read of openraft's leader-lease handling before the prod rehearsal; it does not affect the follower case, which is the common one.")
+//! @yah:gotcha("DEAD-OWNER FENCING DOES NOT FIRE WHEN THE SURVIVING LEADER HAS NO LEASE HISTORY FOR THE DEAD OWNER — MEASURED 2026-09-08 by @Ashguard:libra (session:6eed47dc) on the dev raft group, found while completing R858-T5. DO NOT SIGN THIS OFF AS-IS. The sequence, every step measured: us-west-011 was the recorded ingress_owner and was stopped outright (yubaba+kamaji+litestream-headscale, no headscale process left). us-west-013 won the election (term 74) and then sat there. It hydrated config.yaml, its probe went Present, and it NEVER expired the dead owner or took the appliance — no further appliance line after startup, on a 10s reconcile cadence, indefinitely. THE CAUSE, read straight off 013's own /raft/status: the node-lease channel carries entries ONLY for 13 and 14 — node 11 is absent from it entirely — while the raft-heartbeat channel does list 11 as {\"silent_for_ms\": null, \"state\": \"unknown\"}. leader.rs's expired_owner filter calls owner_lease_expired(state.lease_detector.silence(11), timing), silence(11) is None, and owner_lease_expired is `silence.is_some_and(|s| s >= expire_after)` (appliance_ownership.rs:578) — so None is read as \"no evidence\" and the owner is never expired. CONSEQUENCE, which is this relay's own outage shape reproduced by construction: a leader that restarted after the owner died, or that was elected after the owner died, has no lease history for it and therefore can NEVER fail the appliance over. 30s of expire_after never elapses because the clock never starts. NOTE the anti-churn rule this collides with is deliberate and documented in leader.rs (\"the owner enters the map on positive evidence that it is gone, and on nothing else\"), so the fix is a design call, not a one-liner: absence of an entry after the detector's own uptime exceeds expire_after IS positive evidence, but seeding that naively would expire a live owner 30s after every cold boot. R858-T5 did NOT fix this — it completed its own assertion by wiping the owner's local DB and restarting the SAME node instead, so nothing here is exercised by that result.")
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -348,6 +357,52 @@ impl Health {
             WorkloadStatus::Failed { .. } => Health::NotReady { reason: "failed" },
         }
     }
+}
+
+/// [`Health::NotReady`] reason for a workload whose declared ports are bound
+/// somewhere this node cannot name an address for (R881-B1).
+///
+/// Machine-stable like every other reason tag, and distinct from the
+/// `WorkloadStatus`-derived ones on purpose: the workload is not sick. It is
+/// *running perfectly* and unreachable, which is precisely the combination
+/// that cost an operator a front-door hunt when it shipped as `ready`.
+pub const REASON_UNROUTABLE: &str = "unroutable";
+
+/// Does this workload bind its declared ports in the **node's** network
+/// namespace — the only shape whose service record may advertise the node's
+/// own address (R881-B1)?
+///
+/// Every [`ServiceRecord`] this node publishes carries *this node's* address
+/// (R844-B11, and [`authoritative_mesh_ip`] re-asserts it every sweep). That is
+/// honest exactly when the workload answers on that address, and the spec says
+/// when it does:
+///
+/// - **`yah.network = "host"`** ([`WorkloadSpec::wants_host_network`]) — the
+///   container shares the host netns and binds host ports directly. kamaji
+///   permits it only for `tier = "infra"`.
+/// - **`yah.docker.publish`** — the docker backend maps host ports onto the
+///   container's (`docker run -p`). Only that backend publishes host ports at
+///   all; the annotation is the operator's explicit request for it.
+///
+/// Anything else gets a fresh, empty netns with nothing but `lo`
+/// (`kamaji-containerd-core`'s OCI builder emits a bare `{"type":"network"}`
+/// with no path, so runc unshares one and stops). There is no veth, no bridge,
+/// no CNI and no NAT rule anywhere in the deploy path, and the mesh IP reaches
+/// such a container only as a label and an environment variable — never as an
+/// interface address. So the node's address is not where it answers, and there
+/// is no other address to name either.
+///
+/// `join_netns` is deliberately not consulted: both containerd deploy paths
+/// hard-code it to `None` (its only intended use is passway's graceful-upgrade
+/// fd handoff), so treating it as a reachable shape would be describing code
+/// that does not run. If it ever becomes live, a container joining a
+/// *host-networked* sibling's netns belongs on the `true` side of this
+/// predicate and one joining an isolated sibling does not.
+pub fn binds_node_ports(spec: &WorkloadSpec) -> bool {
+    spec.wants_host_network()
+        || spec
+            .annotations
+            .contains_key(crate::pond::launcher::PUBLISH_ANNOTATION)
 }
 
 /// One serving-workload's mesh endpoint(s) + health, as known to yubaba.
@@ -431,6 +486,23 @@ pub struct ServiceRecord {
     pub container_id: String,
     /// Current readiness.
     pub health: Health,
+    /// Whether [`Self::mesh_ip`] is an address this workload actually answers
+    /// on — [`binds_node_ports`] evaluated against its [`WorkloadSpec`] at
+    /// admission (R881-B1).
+    ///
+    /// **A record, not a side table, because the fact has to survive a
+    /// restart.** The spec is available exactly once, at deploy; every later
+    /// sweep sees only a `kamaji::WorkloadState`, which carries no netns shape.
+    /// Held anywhere non-persistent, the first `reconcile` after a yubaba
+    /// restart would rehydrate the record from the ledger and promote it
+    /// straight back to `Ready` off `WorkloadStatus::Running` — re-publishing
+    /// the dead upstream this field exists to withhold.
+    ///
+    /// `false` pins [`Self::health`] to
+    /// `NotReady { reason: `[`REASON_UNROUTABLE`]` }` on every path, so the
+    /// record still appears in `GET /service-records` (with the reason, for the
+    /// operator) and never in `?ready=true` (for the front door).
+    pub routable: bool,
     /// Wall-clock time (Unix ms) this record was last written. Lets a
     /// consumer notice a record that hasn't been refreshed in a long time
     /// even if `health` still says `Ready` (staleness, not correctness).
@@ -592,6 +664,25 @@ struct LedgerEntry {
     #[serde(default, deserialize_with = "de_ports")]
     resolved_ports: BTreeMap<String, u16>,
     container_id: String,
+    /// R881-B1 — [`ServiceRecord::routable`], the one recovered fact that
+    /// cannot be re-derived after a restart (the `WorkloadSpec` it comes from
+    /// is gone; sweeps see only a `kamaji::WorkloadState`).
+    ///
+    /// Defaults to `true` for a ledger written before this field existed, and
+    /// that direction is deliberate. Every workload in such a ledger was
+    /// admitted `Ready` by the yubaba that wrote it, so `true` reproduces the
+    /// old binary's behaviour exactly; `false` would silently withdraw every
+    /// live upstream on the boot that installs the new binary — an outage
+    /// produced by a default. The next deploy of an unroutable workload writes
+    /// the honest value.
+    #[serde(default = "ledger_routable_default")]
+    routable: bool,
+}
+
+/// See [`LedgerEntry::routable`] — pre-R881-B1 ledgers predate the field and
+/// held only workloads their writer considered routable.
+fn ledger_routable_default() -> bool {
+    true
 }
 
 /// Deserialize a port set written either as a named map (`{"http": 8080}`, the
@@ -631,6 +722,24 @@ impl Default for ServiceRecords {
     }
 }
 
+/// @yah:ticket(R876-B3, "yubaba publishes a service record for another node's mesh_ip and marks it ready, violating the R844-B11 per-node invariant")
+/// @yah:at(2026-09-09T08:24:05Z)
+/// @yah:status(review)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R876)
+/// @yah:severity(medium)
+/// @yah:gotcha("MEASURED LIVE 2026-09-09, three independent probes. `curl http://100.64.0.1:7443/service-records` on us-west-001 returns one record: ident `yah-cloud-admin`, `\"mesh_ip\":\"100.64.0.3\"`, `\"endpoints\":[\"100.64.0.3:4325\"]`, `\"health\":\"ready\"`. But (a) the workload actually runs ON us-west-001 — `ss -lntp` there shows `100.64.0.1:4325` bound by pid 502611 /usr/local/bin/yah-cloud-admin under containerd shim 502590; (b) us-west-001's own yubaba binds 100.64.0.1:7443 and its tailscale0 is 100.64.0.1/32; (c) on us-east-001 (100.64.0.3) NOTHING is listening on 4325, there is no cloud-admin process, and its own /service-records lists only `noisetable` and `yah-marketing`. So west publishes a ready-marked, dialable-looking endpoint at an address where the service does not exist.")
+/// @yah:next("WHY IT MATTERS RATHER THAN BEING COSMETIC: this is the same discovery rail the yah.dev apex rides. Both yah.dev doors run `PASSWAY_UPSTREAM_SOURCE=yubaba` and take address AND port from these records, so a record that names the wrong node with `health: ready` is indistinguishable to a door from a correct one — it routes to a dead endpoint and reports success. service_records.rs states the invariant explicitly (\"A record's `mesh_ip` must equal the answering node's own mesh address\", R844-B11) and nothing enforces it at write time.")
+/// @yah:next("WHERE TO START, traced but not fixed. `ServiceRecords::reconcile` (oss/yubaba/crates/yubaba/src/service_records.rs:1008) takes `node_mesh_ip` as the COLD-ADMIT fallback only: at :1021 it does `if let Some(ip) = state.mesh_ip { record.mesh_ip = ip }`, preferring the backend's report unconditionally, and at :1037 `state.mesh_ip.or(node_mesh_ip)`. `WorkloadState::mesh_ip` (oss/kamaji/crates/kamaji/src/lib.rs:295) carries the deploy-time `MeshAssignment::mesh_ip` (lib.rs:217), assigned from raft's 100.64.0.0/10 pool — so a stale or cross-node assignment propagates straight into a published record. The candidate fix is that reconcile should REFUSE (or override + warn) a state whose mesh_ip disagrees with node_mesh_ip, since the module doc already declares that case impossible. Confirm the assignment's provenance before choosing between refuse and override — a host-networked containerd workload arguably should not be carrying a pool-assigned mesh_ip at all.")
+/// @yah:next("Tier: Cleric — the measurement is done and the seam is named, but choosing between refusing the record and overriding it needs reading how MeshAssignment is populated for a host-networked containerd workload, and the fix lands in the rail the production apex discovers through.")
+/// @yah:handoff("FIXED AT THE WRITE BOUNDARY, override + warn, and the upstream half is ANSWERED rather than open. (a) New private `authoritative_mesh_ip(state, node_mesh_ip)` in oss/yubaba/crates/yubaba/src/service_records.rs, called from BOTH arms of `ServiceRecords::reconcile`: the refresh arm (was `if let Some(ip) = state.mesh_ip { record.mesh_ip = ip }`, took the backend's report unconditionally) and the cold-admit arm (was `state.mesh_ip.or(node_mesh_ip)`). `node_mesh_ip` now WINS whenever it exists; a disagreeing `state.mesh_ip` is overridden and `tracing::warn!`-ed with ident, container_id, reported_mesh_ip and node_mesh_ip. `node_mesh_ip: None` (dev host, no mesh plane) is unchanged — the backend's report passes through and cold admission still declines on a state reporting none. Override not refuse, per the ticket's decision: refusing converts a wrong-address bug into a service-vanishes bug, and passway's `addrs_from_body` would simply lose the apex upstream. warn! not debug! because a wrong address carrying `health: ready` is indistinguishable from a right one to every consumer, so this log is the only place the defect is visible.")
+/// @yah:handoff("(b) THE UPSTREAM IS ALREADY FIXED — R844-B11 DID IT — AND THE WRONG VALUE SURVIVES THAT FIX AS PERSISTED CONTAINER STATE. That is the finding, read end to end, and it is why (a) is not merely a correction on the way out but the ONLY thing that repairs the live fleet. (1) No live code path assigns a foreign address any more: `alloc_mesh_ip` and its `next_mesh_ip: AtomicU32` are DELETED; the container deploy path is `MeshAssignment::stub(s.workload_bind_ip())` at oss/yubaba/crates/yubaba/src/lib.rs:3772, the pond/leader paths use `MeshAssignment::inlined(<own or loopback>)`, and `workload_bind_ip()` (lib.rs:1744) is `self.node_mesh_ip.unwrap_or(LOCALHOST)`. Every `MeshAssignment::{stub,inlined}` construction site in oss/ and crates/ was enumerated; none draws from a pool. (2) But the address is DURABLE STATE on the container, not a value recomputed per sweep: containerd writes it as the `yah.mesh_ip` label at deploy (oss/kamaji/crates/kamaji/src/containerd.rs:411) and reads it straight back into `WorkloadState::mesh_ip` on every `list_workloads` (:872) and `get_workload` (:917); docker.rs:414/:283 is the same mechanism. So `yah-cloud-admin` on us-west-001 — placed by a pre-B11 yubaba as that process's 3rd container deploy, hence 100.64.0.3 — keeps reporting east's address forever, and the refresh arm kept re-asserting it into the published record. NOTHING was left to fix upstream, so (a) is the whole code fix. (3) Clearing it AT SOURCE on the live fleet is a redeploy of yah-cloud-admin on us-west-001 — a production action, operator's call, deliberately not taken here. After (a) the published record is correct without it; the redeploy only silences the recurring warn.")
+/// @yah:handoff("DISCOVERED WORK, fixed in this pass: a doc-comment claim on `ServerState::workload_bind_ip` (oss/yubaba/crates/yubaba/src/lib.rs, R844-B11's own text) said loopback \"is the honest answer for the isolated-netns shape too\". The one line under it cannot do that — it keys on whether THIS NODE has a mesh plane, not on the workload's shape — so an isolated-netns container on a mesh node gets the node's own address and would advertise a port nothing on the host is listening on. Nothing live hits it (the fleet's one container workload is host-networked, `.yah/infra/workloads/yah-cloud-admin.toml` sets `\"yah.network\" = \"host\"`), and correcting the BEHAVIOUR needs the `WorkloadSpec` that function is deliberately not given — so the claim is replaced by a paragraph naming the real gap instead. Doc-only; no behaviour change. TEST DEBT PAID, and it is the falsification proof for the new override test: `reconcile_refreshes_mesh_ip_when_it_changes` asserted the exact opposite of the fix (deploy at 100.64.0.9, backend reports 100.64.0.10, node is 100.64.0.3, assert the record moved to .10) and passed on the baseline. A per-node store has no \"the workload moved to another node\" case, so what it pinned was the bug; it is rewritten as `reconcile_reasserts_the_node_address_and_leaves_ports_alone`. `first_sweep_promotes_a_rehydrated_record_to_ready` had the same incoherent data (deploy at .22, sweep node .3) and now uses the node's own address — it is about ready-promotion, not addresses.")
+/// @yah:verify("BASELINE MEASURED BEFORE ANY EDIT, then re-measured after. `cargo test -p yubaba --lib`: baseline 861 passed / 0 failed -> after 864 passed / 0 failed (+3 = the three new tests; the 4th change is a rename, not an addition). `cargo build -p yubaba`: clean, twice, the second run after the lib.rs doc correction. `cargo test -p yubaba --features testing --test testing` (the group that holds integration_service_records): 29 passed / 0 failed / 1 ignored. `cargo test -p yubaba --test main`: baseline 54 passed / 14 failed -> after 49 passed / 19 failed. NOT MINE, and the evidence is that the failing SET differs between the two runs rather than growing: every failure in both is a raft_*/rig_singleton_ownership test that stands up a real 3-node openraft cluster on loopback and dies on \"leader election timed out after 15s during cluster bootstrap\"; baseline failed raft_add_learner + raft_promote_voter, the after-run passed those and failed raft_leader_pin + raft_tenant_placement instead. That is load flap on a camp running many concurrent builds. The one main-group test that touches this rail, integration_deploy_through_kamaji::a_refused_bundle_deploy_publishes_no_service_record, PASSED in the after-run. Three runs also carried a W298 rung-0 skew advisory naming peers' in-flight edits (cloud/src/reconciler/mesofact_bundle.rs, yah-base/crates/mesofact-bundle/src/{assemble,lib}.rs, yubaba/src/demux_routes.rs) - none in the -p yubaba lib closure that the service_records tests exercise.")
+/// @yah:verify("THREE UNIT TESTS ON `reconcile`, in oss/yubaba/crates/yubaba/src/service_records.rs, each named for the case the ticket asked for. (1) `reconcile_leaves_an_agreeing_mesh_ip_alone_and_says_nothing` - agreeing report: record unchanged, endpoint still dialable, and NOTHING warned (this is the non-vacuity anchor for (2); without it a helper that warned unconditionally would pass). (2) `reconcile_overrides_a_backend_reporting_another_nodes_mesh_ip` - the measured shape verbatim: node 100.64.0.1, backend reports 100.64.0.3, asserts the record carries .1, is STILL ready (not withdrawn), resolves to 100.64.0.1:4325, and that the warning text names the ident AND both addresses. (3) `cold_admission_still_falls_back_to_the_node_address` - backend reports no address at all: still cold-admitted at the node's, dialable, and silent. Warnings are captured with a thread-local `tracing::subscriber::with_default` + a small MakeWriter (`capture_warnings` helper), so the assertion is on what was really emitted and stays correct under cargo's parallel test threads. FALSIFICATION for (2) comes free from the baseline rather than from a probe edit: the pre-existing `reconcile_refreshes_mesh_ip_when_it_changes` asserted the EXACT OPPOSITE on the same code path (assert the record moved to the backend's foreign address) and was green in the 861-pass baseline, so the old code demonstrably fails the new assertion.")
+/// @yah:verify("STEP-0 FAVOUR FOR THE SIBLING COURIER (apex_failover), both checks pass, nothing touched. `cargo test -p xtask --test main -- apex_failover`: 4 passed / 0 failed / 61 filtered out - the harness is the single `xtask/tests/main.rs` binary and `mod apex_failover;` is registered at main.rs:5, so the filter runs them as `apex_failover::*`. `git status --porcelain .yah/infra/machines/us-east-001.toml`: EMPTY - the temporary edit was restored byte-exactly as claimed.")
+/// @yah:handoff("LEADER DECISION, so the ticket's open \"refuse vs override+warn\" question is settled and should not be reopened: OVERRIDE + WARN, because the record store is node-local by construction and the answering node's own address is therefore authoritative — a backend's self-report about a DIFFERENT node's address is never the more trustworthy of the two. Refusing was rejected as the worse trade: it converts a wrong-address bug into a service-vanishes bug on the exact rail the yah.dev apex discovers through.")
+/// @yah:verify("LEADER RE-VERIFICATION by an independent second session (@Miravel:libra, session:d24aac7e), and it came back BETTER than the implementing courier reported. The courier attributed a 54p/14f -> 49p/19f move on yubaba's `main` integration binary to pre-existing raft/rig election flap; two clean re-runs of that binary returned 68 passed / 0 failed BOTH times, with no service_records or mesh_ip failure in either. The service_records unit tests are 49/0. So the reported regression did not reproduce at all and the failures the courier saw were camp load, not this change.")
 impl ServiceRecords {
     /// In-memory only — nothing is persisted and nothing is rehydrated.
     pub fn new() -> Self {
@@ -658,6 +767,7 @@ impl ServiceRecords {
                     ports: entry.ports,
                     resolved_ports: entry.resolved_ports,
                     container_id: entry.container_id,
+                    routable: entry.routable,
                     health: Health::NotReady {
                         reason: "rehydrated",
                     },
@@ -792,6 +902,7 @@ impl ServiceRecords {
                 ports: r.ports.clone(),
                 resolved_ports: r.resolved_ports.clone(),
                 container_id: r.container_id.clone(),
+                routable: r.routable,
             })
             .collect();
         // Stable order so an unchanged registry produces a byte-identical
@@ -828,6 +939,26 @@ impl ServiceRecords {
         // R844-F2: the caller only reaches here for a spec with non-empty
         // `expose.mesh.ports`, so arriving at all IS the serving declaration.
         self.declare_serving(&ident);
+        // R881-B1: this is the one moment the spec is in hand, so it is the
+        // one moment the netns shape can be read. See `binds_node_ports`.
+        let routable = binds_node_ports(spec);
+        if !routable {
+            tracing::warn!(
+                ident = %ident.0,
+                mesh_ip = %mesh_ip,
+                ports = ?spec.expose.mesh.ports,
+                tier = ?spec.tier,
+                "service_records: workload declares mesh ports but binds none of \
+                 them in this node's network namespace — it is in its own netns \
+                 with no veth, bridge or published host port, so no address here \
+                 reaches it. Publishing the record NOT-READY (reason \
+                 '{REASON_UNROUTABLE}'): it stays visible on GET \
+                 /service-records for diagnosis and is withheld from \
+                 ?ready=true, so an ingress apply fails to resolve an upstream \
+                 instead of rendering one nothing answers on (R881-B1). Giving \
+                 a tenant-tier workload a reachable address is R881-S2."
+            );
+        }
         let record = ServiceRecord {
             ident: ident.clone(),
             mesh_ip,
@@ -837,7 +968,8 @@ impl ServiceRecords {
             // the declaration. See [`ServiceRecord::resolved_ports`].
             resolved_ports: BTreeMap::new(),
             container_id: container_id.into(),
-            health: Health::Ready,
+            routable,
+            health: health_for(routable, Health::Ready),
             observed_at_unix_ms: now_unix_ms(),
         };
         let mut next = (*self.tx.borrow()).as_ref().clone();
@@ -879,6 +1011,10 @@ impl ServiceRecords {
             // ident is the only handle kamaji correlates it by, so repeating
             // it here is the honest answer rather than an invented id.
             container_id: ident.0.clone(),
+            // R881-B1: a forked host process has no namespace of its own — it
+            // binds the node's address by construction, which is the same fact
+            // `admit_bundle` already relies on to publish `node_mesh_ip` here.
+            routable: true,
             health: Health::Ready,
             observed_at_unix_ms: now_unix_ms(),
         };
@@ -998,12 +1134,14 @@ impl ServiceRecords {
     ///    i.e. the runtime no longer knows about it, which is exactly what
     ///    happens after a teardown — is retracted.
     ///
-    /// `node_mesh_ip` is this node's own mesh address, used as the cold-admit
-    /// fallback when a state reports none. A bundle is a forked host process
-    /// with no namespace of its own, so it binds the node's address by
-    /// construction — the same reasoning `admit_bundle` already relies on.
-    /// `None` (a dev host on loopback) disables cold admission: there is no
-    /// mesh-plane address another node could dial.
+    /// `node_mesh_ip` is this node's own mesh address, and since R876-B3 it is
+    /// the *authoritative* one on both arms rather than only the cold-admit
+    /// fallback — see `authoritative_mesh_ip` for why the backend's own
+    /// report loses to it and what a disagreement means. A bundle is a forked
+    /// host process with no namespace of its own, so it binds the node's
+    /// address by construction — the same reasoning `admit_bundle` already
+    /// relies on. `None` (a dev host on loopback) disables cold admission:
+    /// there is no mesh-plane address another node could dial.
     pub fn reconcile(&self, states: &[WorkloadState], node_mesh_ip: Option<Ipv4Addr>) {
         let mut next = (*self.tx.borrow()).as_ref().clone();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1017,7 +1155,7 @@ impl ServiceRecords {
                 {
                     let record = next.get_mut(key).expect("checked above");
                     seen.insert(key.to_string());
-                    if let Some(ip) = state.mesh_ip {
+                    if let Some(ip) = authoritative_mesh_ip(state, node_mesh_ip) {
                         record.mesh_ip = ip;
                     }
                     // Only overwrite from a supervisor that actually reported
@@ -1029,11 +1167,16 @@ impl ServiceRecords {
                         record.resolved_ports = state.ports.clone();
                     }
                     record.container_id = state.container_id.clone();
-                    record.health = Health::from_status(&state.status);
+                    // R881-B1: `Running` is a statement about the process, not
+                    // about whether anything can reach it. An unroutable record
+                    // stays unroutable however healthy the supervisor says the
+                    // workload is — that combination *is* the bug.
+                    record.health =
+                        health_for(record.routable, Health::from_status(&state.status));
                     record.observed_at_unix_ms = now_unix_ms();
                 }
             } else if !state.ports.is_empty() && self.is_declared_serving(&state.ident) {
-                let Some(mesh_ip) = state.mesh_ip.or(node_mesh_ip) else {
+                let Some(mesh_ip) = authoritative_mesh_ip(state, node_mesh_ip) else {
                     tracing::debug!(
                         ident = %state.ident.0,
                         "service_records: reconcile saw an unadmitted workload \
@@ -1061,6 +1204,16 @@ impl ServiceRecords {
                         ports: BTreeMap::new(),
                         resolved_ports: state.ports.clone(),
                         container_id: state.container_id.clone(),
+                        // R881-B1: cold admission is reached only via a
+                        // supervisor-*resolved* port, and a resolved port is a
+                        // host port — the container backends resolve none by
+                        // construction (their declared port is their bound
+                        // port, inside the namespace). So the workload holds a
+                        // port in this node's netns, which is what routable
+                        // asserts. An unroutable workload cannot arrive here
+                        // anyway: it is admitted with a record at deploy, so it
+                        // takes the refresh arm above.
+                        routable: true,
                         health: Health::from_status(&state.status),
                         observed_at_unix_ms: now_unix_ms(),
                     },
@@ -1106,6 +1259,89 @@ impl ServiceRecords {
             self.publish(next);
         }
     }
+}
+
+/// Gate a health verdict on routability (R881-B1) — the single place
+/// [`ServiceRecord::routable`] turns into a [`Health`].
+///
+/// `observed` is what the workload's own state says; the answer is that verdict
+/// unless the record is unroutable, in which case it is
+/// `NotReady { reason: `[`REASON_UNROUTABLE`]` }` no matter how healthy the
+/// process is. Every write path funnels through here so no future one can
+/// promote an unroutable record to `Ready` by writing `Health::from_status`
+/// directly — which is exactly how the fabricated address survived three
+/// sweeps' worth of correct-looking code before.
+fn health_for(routable: bool, observed: Health) -> Health {
+    if routable {
+        observed
+    } else {
+        Health::NotReady {
+            reason: REASON_UNROUTABLE,
+        }
+    }
+}
+
+/// Resolve the address a record may advertise for `state`, enforcing the
+/// per-node invariant this module's header declares: **a record's `mesh_ip`
+/// must equal the answering node's own mesh address** (R844-B11).
+///
+/// This store is node-local by construction — one yubaba answers `GET
+/// /service-records` about workloads it placed on its own host — so
+/// `node_mesh_ip` is authoritative and a backend's self-report about some
+/// *other* node's address is never the more trustworthy of the two. It
+/// therefore wins on the refresh arm as well as the cold-admit arm. Before
+/// R876-B3 the refresh arm took `state.mesh_ip` unconditionally, which is how
+/// us-west-001 came to publish `yah-cloud-admin` at `100.64.0.3:4325`
+/// (us-east-001) with `health: ready`, while the process was in fact bound to
+/// west's own `100.64.0.1:4325` and east had nothing on that port at all.
+///
+/// **Overridden, not refused.** Dropping the record would convert a
+/// wrong-address bug into a service-vanishes bug, which is strictly worse for
+/// the apex that discovers through this rail: passway's `addrs_from_body`
+/// (`oss/passway/crates/passway/src/discovery.rs`) would simply lose the
+/// upstream. So the record stays published, at the address that actually
+/// answers, and the defect is made loud instead — `warn!`, not `debug!`,
+/// because a wrong address carrying `health: ready` is indistinguishable from
+/// a right one to every consumer, so this log is the only place it can be
+/// seen at all.
+///
+/// `None` for `node_mesh_ip` is a dev host with no mesh plane (`--bind
+/// 0.0.0.0`): there is no node address to enforce against, so the backend's
+/// report passes through unchanged and cold admission still declines on a
+/// state that reports none.
+///
+/// Where a disagreement can still come from, now that no deploy path produces
+/// one: containerd writes the deploy-time address as the `yah.mesh_ip`
+/// container **label** and reads it straight back out on every
+/// `list_workloads` sweep (`oss/kamaji/crates/kamaji/src/containerd.rs`). That
+/// label is durable container state, so a container placed by a pre-R844-B11
+/// yubaba keeps reporting that process's deleted `alloc_mesh_ip()` counter
+/// draw until it is redeployed — which is exactly the live record above. This
+/// check is what repairs those in place, with no redeploy.
+fn authoritative_mesh_ip(
+    state: &WorkloadState,
+    node_mesh_ip: Option<Ipv4Addr>,
+) -> Option<Ipv4Addr> {
+    let Some(node) = node_mesh_ip else {
+        return state.mesh_ip;
+    };
+    if let Some(reported) = state.mesh_ip {
+        if reported != node {
+            tracing::warn!(
+                ident = %state.ident.0,
+                container_id = %state.container_id,
+                reported_mesh_ip = %reported,
+                node_mesh_ip = %node,
+                "service_records: the backend reports this workload at a mesh \
+                 address that is not this node's own; publishing the node's \
+                 address instead (R876-B3). A record may only ever advertise \
+                 the node answering for it (R844-B11) — the known source is a \
+                 stale `yah.mesh_ip` container label from a pre-R844-B11 \
+                 deploy, which a redeploy of this workload clears at source."
+            );
+        }
+    }
+    Some(node)
 }
 
 /// Read the port ledger. Every failure mode — missing file, unreadable file,
@@ -1439,11 +1675,35 @@ mod tests {
         StopPolicy, TierTag,
     };
 
-    /// Mirrors the `test_workload_spec` helper already used by
-    /// `tests/integration_mesh.rs` / `integration_single_node.rs` — a
-    /// minimal-but-real `WorkloadSpec` with a configurable mesh identity +
-    /// ports.
+    /// A minimal-but-real serving `WorkloadSpec` — configurable mesh identity
+    /// and ports, **host-networked**.
+    ///
+    /// The host-network annotation is R881-B1's doing and it is not decoration:
+    /// since that ticket a workload's record is only `Ready` if the workload
+    /// binds its ports in the node's netns ([`binds_node_ports`]), and every
+    /// test below this line is about something else — port naming, health
+    /// transitions, the ledger, retraction. Spelling the reachable shape here
+    /// keeps each of those asking its own question. `.yah/infra/workloads/
+    /// yah-cloud-admin.toml` is the live spec this mirrors.
+    ///
+    /// The *unreachable* shape is [`isolated_spec`], and only the R881-B1 tests
+    /// use it.
     fn test_spec(name: &str, ports: Vec<u16>) -> WorkloadSpec {
+        let mut spec = isolated_spec(name, ports);
+        spec.annotations.insert(
+            workload_spec::HOST_NETWORK_ANNOTATION.to_string(),
+            workload_spec::HOST_NETWORK_VALUE.to_string(),
+        );
+        spec
+    }
+
+    /// The same spec with **no** networking annotation — a container alone in
+    /// a fresh netns with nothing but `lo`, which is what a tenant-tier
+    /// workload gets (R881-B1). Nothing on the node listens on its ports.
+    ///
+    /// Mirrors the `test_workload_spec` helper in `tests/integration_mesh.rs` /
+    /// `integration_single_node.rs`.
+    fn isolated_spec(name: &str, ports: Vec<u16>) -> WorkloadSpec {
         WorkloadSpec {
             schema_version: SchemaVersion::V1,
             name: name.to_string(),
@@ -1545,8 +1805,49 @@ mod tests {
     }
 
     /// This node's mesh address, as `reconcile` is given it by the sweep.
+    ///
+    /// Since R876-B3 this is also the address every record a sweep touches
+    /// ends up carrying, so a test that deploys at some *other* address and
+    /// then sweeps is asserting the bug rather than the behaviour.
     fn sweep_node_ip() -> Option<Ipv4Addr> {
         Some(Ipv4Addr::new(100, 64, 0, 3))
+    }
+
+    /// Collect the WARN-and-above lines emitted while `f` runs.
+    ///
+    /// `with_default` installs the subscriber on this thread only, so this
+    /// stays correct under cargo's parallel test threads — a global default
+    /// would leak one test's capture into another's.
+    fn capture_warnings(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(captured.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = captured.0.lock().unwrap().clone();
+        String::from_utf8(bytes).expect("tracing writes utf-8")
     }
 
     #[test]
@@ -2037,24 +2338,142 @@ mod tests {
         assert_eq!(record.health, Health::NotReady { reason: "stopping" });
     }
 
+    /// A sweep re-asserts the record's host from the node's own address, and
+    /// leaves the admission-time ports alone.
+    ///
+    /// This test used to read `reconcile_refreshes_mesh_ip_when_it_changes` and
+    /// pinned the opposite: a record deployed at `100.64.0.9` was *moved* to
+    /// the `100.64.0.10` the backend reported, on a node whose own address is
+    /// `100.64.0.3`. R876-B3 removed that behaviour rather than narrowing it —
+    /// a per-node store has no "the workload moved to another node" case to
+    /// serve, so what the old assertion actually pinned was the bug.
     #[test]
-    fn reconcile_refreshes_mesh_ip_when_it_changes() {
+    fn reconcile_reasserts_the_node_address_and_leaves_ports_alone() {
         let records = ServiceRecords::new();
         let spec = test_spec("moved", vec![443]);
-        let old_ip = Ipv4Addr::new(100, 64, 0, 9);
-        records.upsert_deployed(&spec, old_ip, "container-moved");
+        let node = sweep_node_ip().expect("the sweep supplies a node address");
+        records.upsert_deployed(&spec, node, "container-moved");
 
-        let new_ip = Ipv4Addr::new(100, 64, 0, 10);
-        let state = running_state("moved", Some(new_ip));
+        let state = running_state("moved", Some(node));
         records.reconcile(std::slice::from_ref(&state), sweep_node_ip());
 
         let record = records.get(&MeshIdent("moved".into())).unwrap();
         assert!(record.is_ready());
-        assert_eq!(record.mesh_ip, new_ip);
+        assert_eq!(record.mesh_ip, node);
         assert_eq!(
             record.ports,
             named(&[("http", 443)]),
             "ports are untouched by reconcile"
+        );
+    }
+
+    // ── R876-B3: the per-node mesh_ip invariant, enforced on write ─────────
+
+    /// The steady state, and the non-vacuity anchor for the override test
+    /// below: when the backend agrees with the node, the record is unchanged
+    /// and nothing is warned about.
+    #[test]
+    fn reconcile_leaves_an_agreeing_mesh_ip_alone_and_says_nothing() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 1);
+        records.upsert_deployed(&test_spec("yah-cloud-admin", vec![4325]), node, "c-admin");
+
+        let logs = capture_warnings(|| {
+            records.reconcile(&[running_state("yah-cloud-admin", Some(node))], Some(node));
+        });
+
+        let record = records.get(&MeshIdent("yah-cloud-admin".into())).unwrap();
+        assert_eq!(record.mesh_ip, node);
+        assert_eq!(
+            record.endpoints(),
+            vec![SocketAddrV4::new(node, 4325)],
+            "the record still dials the node it is served from"
+        );
+        assert!(
+            logs.is_empty(),
+            "an agreeing report is the normal case and must be silent, else \
+             the warning below is noise nobody reads: {logs}"
+        );
+    }
+
+    /// THE DEFECT R876-B3 EXISTS FOR, in the shape measured on us-west-001 on
+    /// 2026-09-09: `yah-cloud-admin` runs on west (`100.64.0.1:4325`) under a
+    /// containerd shim, but west published it at `100.64.0.3:4325` —
+    /// us-east-001, where nothing listens on that port — with `health: ready`.
+    ///
+    /// The backend's report is the stale `yah.mesh_ip` label of a container
+    /// placed before R844-B11 deleted `alloc_mesh_ip`. The node's own address
+    /// wins, the record stays published (refusing it would take the apex's
+    /// upstream away, a strictly worse failure), and the disagreement is
+    /// warned about — the only place it is visible at all, since `health:
+    /// ready` at a dead address reads exactly like a healthy record to
+    /// passway.
+    #[test]
+    fn reconcile_overrides_a_backend_reporting_another_nodes_mesh_ip() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 1);
+        let neighbour = Ipv4Addr::new(100, 64, 0, 3);
+        records.upsert_deployed(&test_spec("yah-cloud-admin", vec![4325]), node, "c-admin");
+
+        let logs = capture_warnings(|| {
+            records.reconcile(
+                &[running_state("yah-cloud-admin", Some(neighbour))],
+                Some(node),
+            );
+        });
+
+        let record = records.get(&MeshIdent("yah-cloud-admin".into())).unwrap();
+        assert_eq!(
+            record.mesh_ip, node,
+            "a node-local store may only advertise the node answering for it"
+        );
+        assert!(
+            record.is_ready(),
+            "the record is corrected, not withdrawn — a vanished upstream is \
+             a worse failure than a corrected one"
+        );
+        assert_eq!(
+            record.endpoints(),
+            vec![SocketAddrV4::new(node, 4325)],
+            "and the endpoint a door dials points at the live process"
+        );
+        assert!(
+            logs.contains("yah-cloud-admin")
+                && logs.contains("100.64.0.3")
+                && logs.contains("100.64.0.1"),
+            "the warning must name the workload and BOTH addresses, or it \
+             cannot be acted on: {logs}"
+        );
+    }
+
+    /// The cold-admit fallback is unchanged by the override: a backend that
+    /// reports no address at all (every bundle — a forked host process has no
+    /// address of its own to report) is still admitted at the node's.
+    #[test]
+    fn cold_admission_still_falls_back_to_the_node_address() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 1);
+        assert!(!records.admit_bundle(&MeshIdent("yah-marketing".into()), Some(node), None));
+
+        let logs = capture_warnings(|| {
+            records.reconcile(
+                &[running_state_on_ports("yah-marketing", None, vec![43117])],
+                Some(node),
+            );
+        });
+
+        let record = records.get(&MeshIdent("yah-marketing".into())).unwrap();
+        assert!(record.is_ready());
+        assert_eq!(record.mesh_ip, node);
+        assert_eq!(
+            record.endpoints(),
+            vec![SocketAddrV4::new(node, 43117)],
+            "cold admission still publishes a dialable endpoint"
+        );
+        assert!(
+            logs.is_empty(),
+            "reporting no address is normal for a bundle, not a disagreement: \
+             {logs}"
         );
     }
 
@@ -2524,7 +2943,11 @@ mod tests {
     fn first_sweep_promotes_a_rehydrated_record_to_ready() {
         let tmp = tempfile::TempDir::new().unwrap();
         let ledger = tmp.path().join(LEDGER_FILE_NAME);
-        let ip = Ipv4Addr::new(100, 64, 0, 22);
+        // R876-B3: this node's own address, because the sweep below now
+        // re-asserts it — a workload deployed here cannot have been placed at
+        // some other node's address, and using one would make this test about
+        // the override instead of about ready-promotion.
+        let ip = sweep_node_ip().expect("the sweep supplies a node address");
         {
             let records = ServiceRecords::with_ledger(ledger.clone());
             records.upsert_deployed(&test_spec("api", vec![8080]), ip, "c-api");
@@ -2708,5 +3131,170 @@ mod tests {
             "c-eph",
         );
         assert!(records.get(&MeshIdent("ephemeral".into())).is_some());
+    }
+
+    // ── R881-B1: a workload nothing can reach is never Ready ──────────────────
+
+    /// The measured live shape, verbatim: `noisetable-account`, tenant tier,
+    /// its own netns, `[expose.mesh] ports = [4332]`, on the mesh node
+    /// `100.64.0.3`. Inside the namespace the service answered HTTP 200; on the
+    /// host `ss -lntp` showed nothing on 4332 and `curl
+    /// http://100.64.0.3:4332/` returned 000 — yet the record said `ready` and
+    /// `yah cloud apply` rendered `PASSWAY_UPSTREAMS=api.noisetable.com=
+    /// 100.64.0.3:4332`.
+    ///
+    /// Three assertions, and the third is the one the old code could not
+    /// satisfy however strict the deploy path got: the sweep must not promote
+    /// the record back. `Health::from_status(Running)` is `Ready`, and the
+    /// workload genuinely *is* running.
+    #[test]
+    fn an_isolated_netns_workload_is_published_unroutable_and_no_sweep_promotes_it() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        let ident = MeshIdent("noisetable-account".into());
+
+        let warnings = capture_warnings(|| {
+            records.upsert_deployed(&isolated_spec("noisetable-account", vec![4332]), node, "c-nt")
+        });
+
+        let record = records.get(&ident).expect(
+            "the record must still EXIST — withholding it entirely would hide \
+             the workload from `GET /service-records`, which is where an \
+             operator looks",
+        );
+        assert!(!record.routable);
+        assert_eq!(
+            record.health,
+            Health::NotReady {
+                reason: REASON_UNROUTABLE
+            }
+        );
+        assert!(
+            records.ready().is_empty(),
+            "an unreachable workload was offered to the front door as a ready \
+             upstream at {:?}",
+            record.endpoints()
+        );
+        assert!(
+            warnings.contains("noisetable-account") && warnings.contains(REASON_UNROUTABLE),
+            "the one place this defect is visible is this log line; got: {warnings}"
+        );
+
+        // The sweep: kamaji reports the container Running, because it is.
+        records.reconcile(&[running_state("noisetable-account", Some(node))], Some(node));
+        let after = records.get(&ident).expect("still tracked");
+        assert_eq!(
+            after.health,
+            Health::NotReady {
+                reason: REASON_UNROUTABLE
+            },
+            "a healthy supervisor report promoted an unreachable workload to \
+             Ready — `Running` describes the process, not whether anything can \
+             reach it"
+        );
+        assert!(records.ready().is_empty());
+    }
+
+    /// Non-vacuity anchor for the test above: change one annotation and the
+    /// same workload is `Ready` and dialable. Without this, a `binds_node_ports`
+    /// that answered `false` unconditionally would pass everything above.
+    #[test]
+    fn the_same_workload_host_networked_is_ready_and_dialable() {
+        let records = ServiceRecords::new();
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        let ident = MeshIdent("noisetable-account".into());
+
+        let warnings = capture_warnings(|| {
+            records.upsert_deployed(&test_spec("noisetable-account", vec![4332]), node, "c-nt")
+        });
+
+        let record = records.get(&ident).expect("published");
+        assert!(record.routable);
+        assert_eq!(record.health, Health::Ready);
+        assert_eq!(
+            record.endpoints(),
+            vec![SocketAddrV4::new(node, 4332)],
+            "the reachable shape must still advertise the node's address — \
+             that is R844-B11's invariant and R881-B1 does not narrow it"
+        );
+        assert_eq!(records.ready().len(), 1);
+        assert!(warnings.is_empty(), "nothing to warn about; got: {warnings}");
+
+        records.reconcile(&[running_state("noisetable-account", Some(node))], Some(node));
+        assert_eq!(records.get(&ident).unwrap().health, Health::Ready);
+    }
+
+    /// A docker-published workload is namespaced too, but its host ports are
+    /// mapped onto the node — so the node's address *is* where it answers.
+    /// This is the pond shape, and it is why the predicate is not simply
+    /// `wants_host_network()`.
+    #[test]
+    fn a_docker_published_workload_is_routable_despite_its_own_namespace() {
+        let mut spec = isolated_spec("minio", vec![9000]);
+        spec.annotations.insert(
+            crate::pond::launcher::PUBLISH_ANNOTATION.to_string(),
+            "9000:9000".to_string(),
+        );
+        assert!(binds_node_ports(&spec));
+
+        let records = ServiceRecords::new();
+        records.upsert_deployed(&spec, Ipv4Addr::new(100, 64, 0, 3), "c-minio");
+        assert_eq!(
+            records.get(&MeshIdent("minio".into())).unwrap().health,
+            Health::Ready
+        );
+    }
+
+    /// The restart hole, and the reason `routable` is a persisted record field
+    /// rather than an in-memory set: after a reboot the `WorkloadSpec` is gone,
+    /// so a sweep sees only `WorkloadStatus::Running` and would re-publish the
+    /// dead upstream. The ledger has to carry the fact across.
+    #[test]
+    fn an_unroutable_record_survives_a_restart_still_unroutable() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join(LEDGER_FILE_NAME);
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        let ident = MeshIdent("noisetable-account".into());
+
+        let before = ServiceRecords::with_ledger(path.clone());
+        before.upsert_deployed(&isolated_spec("noisetable-account", vec![4332]), node, "c-nt");
+
+        // A new process reading the ledger the old one wrote.
+        let after = ServiceRecords::with_ledger(path);
+        assert!(!after.get(&ident).expect("rehydrated").routable);
+        after.reconcile(&[running_state("noisetable-account", Some(node))], Some(node));
+        assert_eq!(
+            after.get(&ident).unwrap().health,
+            Health::NotReady {
+                reason: REASON_UNROUTABLE
+            },
+            "a restart laundered an unroutable record into a ready one"
+        );
+        assert!(after.ready().is_empty());
+    }
+
+    /// A ledger written before R881-B1 has no `routable` key at all, and every
+    /// record in it was one its writer served as `Ready`. Defaulting to `false`
+    /// would withdraw every live upstream on the boot that installs this
+    /// binary — an outage caused by a serde default.
+    #[test]
+    fn a_pre_r881_ledger_rehydrates_as_routable() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join(LEDGER_FILE_NAME);
+        std::fs::write(
+            &path,
+            r#"{"version":1,"services":[
+                 {"ident":"yah-cloud-admin","mesh_ip":"100.64.0.1",
+                  "ports":{"http":4325},"container_id":"c-admin"}]}"#,
+        )
+        .expect("write ledger");
+
+        let records = ServiceRecords::with_ledger(path);
+        let ident = MeshIdent("yah-cloud-admin".into());
+        assert!(records.get(&ident).expect("rehydrated").routable);
+
+        let node = Ipv4Addr::new(100, 64, 0, 1);
+        records.reconcile(&[running_state("yah-cloud-admin", Some(node))], Some(node));
+        assert_eq!(records.get(&ident).unwrap().health, Health::Ready);
     }
 }

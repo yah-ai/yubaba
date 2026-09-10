@@ -33,7 +33,7 @@
 //! @yah:next("Add YubabaRequest variants: SetRolloutState, ClearRolloutState")
 //! @yah:next("In-memory store on ServerState for v1; raft variants defined for forward-compat")
 //! @arch:see(.yah/docs/architecture/A032-yah-cluster-mesh.md)
-//! @yah:handoff("YubabaState.rollouts: BTreeMap<String, RolloutRaftRecord> added. YubabaRequest::SetRolloutState + ClearRolloutState variants defined and apply() arms wired. YubabaState serialises with #[serde(default)] so old snapshots load cleanly. In-memory RolloutStore on ServerState is the v1 authoritative path; raft variants are forward-compat for when R277 lands.")
+//! @yah:handoff("YubabaState.rollouts: BTreeMap<String, RolloutRaftRecord> added. YubabaRequest::SetRolloutState + ClearRolloutState variants defined and apply() arms wired. YubabaState serialises with #[serde(default)] so old snapshots load cleanly. REWRITTEN BY R118-T5 (2026-09-09) BECAUSE THE ORIGINAL SENTENCE IS NOW FALSE: it said the in-memory RolloutStore on ServerState was the v1 authoritative path and the raft variants forward-compat until R277 landed. There is no RolloutStore type in this crate any more. R118-T5 deleted it, made YubabaState.rollouts the sole authority, widened RolloutRaftRecord with the RolloutPolicy a new leader needs to resume, and wired the producer these variants never had (crate::rollout + rollout::supervisor). R277 was never the blocker - it is parked with zero children and its charter has been live and exercised for months.")
 //!
 //! @yah:ticket(R597-T2, "Rename yubaba-internal raft symbols YubabaState/YubabaRequest/YubabaNodeId/YubabaRaft -> Yubaba*")
 //! @yah:status(review)
@@ -350,6 +350,22 @@ pub enum YubabaRequest {
         /// still applies, landing as `None`.
         #[serde(default)]
         machine: Option<String>,
+        /// R859-F2 phase A: the provider hosting this node — see
+        /// [`MemberInfo::provider`].
+        #[serde(default)]
+        provider: Option<String>,
+        /// R859-F2 phase A: this node's provider DC code — see
+        /// [`MemberInfo::location`].
+        #[serde(default)]
+        location: Option<String>,
+        /// R859-F2 phase A: the floating IP that follows public ingress onto
+        /// this node — see [`MemberInfo::ingress_floating_ip`].
+        #[serde(default)]
+        ingress_floating_ip: Option<String>,
+        /// R859-F2 phase A: the public address this node answers on — see
+        /// [`MemberInfo::public_address`].
+        #[serde(default)]
+        public_address: Option<String>,
     },
     RemoveMember {
         node_id: YubabaNodeId,
@@ -381,9 +397,17 @@ pub enum YubabaRequest {
         machine: String,
     },
     ClearIngressOwner,
-    // R278-F3: rollout mirror metadata — defined for forward-compat with the
-    // raft path; the in-process RolloutStore is the v1 store until R277 lands.
+    // R278-F3 defined these; R118-T5 (W138) gave them their producer. Rollout
+    // state is now REPLICATED, not mirrored: `crate::rollout` reads and writes
+    // `YubabaState::rollouts` through these two variants and holds no store of
+    // its own, so a leader that loses power mid-rollout leaves the next leader
+    // everything it needs to pick the rollout up.
     /// Record that a rollout is in progress so a new leader can resume it.
+    ///
+    /// **Compare-and-swap on [`Self::SetRolloutState::expected_revision`].** A
+    /// rollout record has two legitimate writers — the engine driving it and an
+    /// operator overriding it — and both move `status`, so an unguarded
+    /// read-modify-write loses whichever landed first. See that field.
     SetRolloutState {
         rollout_id: String,
         artifact: String,
@@ -391,11 +415,125 @@ pub enum YubabaRequest {
         status_json: String,
         current_step: usize,
         started_at: u64,
+        /// R118-T5: the [`RolloutRaftRecord::revision`] this write expects to
+        /// replace — `0` to create a record that does not exist yet. The apply
+        /// arm **rejects** the write with
+        /// [`RolloutWriteOutcome::Stale`] when it does not match, rather than
+        /// clobbering; the writer re-reads and retries its intent.
+        ///
+        /// `#[serde(default)]` and the default is fail-safe rather than
+        /// convenient: an entry written without this field expects revision 0,
+        /// so it can only ever *create*. A hand-rolled `POST /raft/write` that
+        /// forgets it cannot silently overwrite a live rollout.
+        #[serde(default)]
+        expected_revision: u64,
+        /// R118-T5: the policy the rollout is being driven under — which nodes
+        /// in what order, under which health gates. **Not** `#[serde(default)]`,
+        /// unlike every other field added to this enum: see
+        /// [`RolloutRaftRecord::policy`] for why a defaulted policy would be
+        /// worse than a parse failure.
+        policy: workload_spec::rollout::RolloutPolicy,
+        /// R118-T5: opaque trigger metadata from the request that opened the
+        /// rollout. `#[serde(default)]` because, unlike `policy`, absence is
+        /// harmless — nothing decides anything from it.
+        #[serde(default)]
+        trigger: serde_json::Value,
     },
     /// Remove a completed or aborted rollout from the raft snapshot.
+    ///
+    /// Guarded by the same CAS as `SetRolloutState` — uniformly, rather than
+    /// after an argument about whether *this* writer can race. A record that
+    /// was revived (or overridden) between the retirement decision and this
+    /// write has a new revision, so the delete is rejected instead of silently
+    /// removing a rollout somebody just started caring about.
     ClearRolloutState {
         rollout_id: String,
+        /// The [`RolloutRaftRecord::revision`] this delete expects to remove.
+        /// `#[serde(default)]` = 0, which matches no live record, so a
+        /// hand-rolled write that omits it deletes nothing.
+        #[serde(default)]
+        expected_revision: u64,
     },
+    /// R118-T5: file one node's boot-health verdict against an in-flight
+    /// rollout — the evidence its step gate advances or reverts on.
+    ///
+    /// **Not compare-and-swapped, unlike the two above, and that asymmetry is
+    /// the design.** A rollout record has two writers racing for one field; a
+    /// health map has N writers each owning a distinct key, so there is no
+    /// lost update to prevent and a CAS would only give a rebooting plinth a
+    /// revision to lose against. The one ordering rule this write *does* need
+    /// is severity monotonicity — `Failed` is sticky — and that lives in the
+    /// apply arm for exactly the reason the rollout CAS does: `POST /raft/write`
+    /// accepts an arbitrary request, so a rule enforced anywhere else is a rule
+    /// a caller can skip.
+    ReportNodeHealth {
+        /// The rollout this verdict is about. A report naming a rollout this
+        /// node has no record of is **rejected**, not stored: health for a
+        /// rollout that does not exist is unbounded growth keyed on a string a
+        /// caller chose.
+        rollout_id: String,
+        /// The reporting node, as `policy.steps[].mirrors` names it.
+        node: String,
+        verdict: NodeHealthVerdict,
+        #[serde(default)]
+        detail: String,
+        /// Caller-stamped unix seconds.
+        #[serde(default)]
+        reported_at: u64,
+    },
+    /// R118-F8: one node's corroborated liveness verdict about **one peer** —
+    /// the evidence the membership ratchet shrinks on.
+    ///
+    /// Replicated for R118-T5's reason and one more. T5's: the verdict that
+    /// matters most is filed by a node the leader may be about to lose, so a new
+    /// leader must inherit the evidence rather than re-derive a clean bill of
+    /// health. F8's: the detector that produces this verdict is **not in this
+    /// process**. It is noisetable's `society_facility::liveness` (`R118-F7`),
+    /// which corroborates an IP path against BLE and deliberately links no
+    /// yubaba crate, so it cannot implement the in-process
+    /// [`FailureDetector`](crate::failure_detector::FailureDetector) trait. It
+    /// reports over loopback to the yubaba beside it — exactly the seam
+    /// `POST /v1/nodes/{node}/boot-health` opened — and this variant is what
+    /// carries that report to the node that acts on it.
+    ///
+    /// **Not compare-and-swapped**, for `ReportNodeHealth`'s reason: N observers
+    /// each own a distinct `(observer, subject)` key, so there is no lost update
+    /// to prevent.
+    ///
+    /// The one rule the apply arm *does* enforce is that **a node may not
+    /// testify about itself**. Self-testimony is not merely useless: the node
+    /// whose verdict would matter is the one that is off, and a stale
+    /// self-reported `Alive` is precisely the record that would veto the shrink
+    /// it is evidence against.
+    ReportPeerLiveness {
+        /// The reporting node.
+        observer: YubabaNodeId,
+        /// The node being reported on.
+        subject: YubabaNodeId,
+        verdict: PeerLivenessVerdict,
+        /// The observer's own sentence — `"no raft heartbeat 4m, no BLE advert
+        /// 4m"`. Nothing decides anything from it; it is what an operator reads
+        /// when asking why the cluster shrank.
+        #[serde(default)]
+        detail: String,
+        /// Caller-stamped unix seconds. Read against
+        /// [`MembershipRatchet::evidence_ttl`](crate::cluster_policy::MembershipRatchet::evidence_ttl)
+        /// — a report older than that stops counting, in **either** direction.
+        #[serde(default)]
+        observed_at: u64,
+    },
+    /// R118-F8: record that the ratchet moved the voter set, and under which
+    /// membership log id.
+    ///
+    /// Written by the leader **after** the membership change it describes
+    /// commits, and deliberately not folded into it: openraft owns the
+    /// membership entry's shape and there is nowhere in it to put this. The two
+    /// writes are therefore not atomic, which is acceptable because nothing
+    /// reads this record to make a safety decision — raft's own membership is
+    /// still the authority on who votes. This is the *provenance* `W158` §7.2(3)
+    /// asks for, so a returning node can tell "I was demoted" from "my cluster
+    /// was replaced" without asking anyone.
+    RecordMembershipRatchet { record: MembershipRatchetRecord },
     // R600-F1 (W273): cluster secret store. Values are AES-256-GCM CIPHERTEXT
     // ONLY — the raft layer never sees plaintext or the KEK. The issuer
     // (R600-F3) encrypts with the node-local cluster KEK before PutSecret; the
@@ -441,6 +579,13 @@ pub enum YubabaRequest {
         /// but no `state_epoch` bump, exactly as R720-F1's `digest` did.
         #[serde(default)]
         sans: Option<Vec<String>>,
+        /// R853-F10: the RFC 9773 ARI certificate identifier of the chain this
+        /// record holds, `None` otherwise. See [`SecretRecord::ari`] for why it
+        /// is plaintext and what `None` costs. `#[serde(default)]` on the same
+        /// contract as `access`, `digest` and `sans`: a log entry written
+        /// before this field existed replays as `None`.
+        #[serde(default)]
+        ari: Option<String>,
     },
     /// Remove a cluster secret. Hard delete, no tombstone: a secret that should
     /// stop being served is removed and the consuming resolver (R600-F2) fails
@@ -583,6 +728,66 @@ pub enum YubabaResponse {
     LockGranted(bool),
     /// R732-F1: outcome of a tenant ownership transition.
     Tenant(TenantOutcome),
+    /// R118-T5: outcome of a compare-and-swap on a rollout record.
+    Rollout(RolloutWriteOutcome),
+    /// R118-T5: outcome of filing a node's boot-health verdict.
+    NodeHealth(NodeHealthOutcome),
+    /// R118-F8: outcome of filing one node's liveness verdict about a peer.
+    PeerLiveness(PeerLivenessOutcome),
+}
+
+/// The answer to a [`YubabaRequest::ReportPeerLiveness`] (R118-F8).
+///
+/// `Unchanged` is separated from `Recorded` because it is the answer a
+/// well-behaved reporter should almost always get: the ratchet's evidence
+/// channel is meant to carry **transitions**, not renewals, and a reporter
+/// seeing a run of `Unchanged` is one that is writing a raft log entry per tick
+/// for no reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerLivenessOutcome {
+    /// Stored, and it changed something (a new subject, or a new verdict).
+    Recorded { verdict: PeerLivenessVerdict },
+    /// Stored — the timestamp moved so the report stays fresh — but the verdict
+    /// is the one that was already on file.
+    Unchanged { verdict: PeerLivenessVerdict },
+    /// Refused: `observer == subject`. A node does not testify about itself.
+    SelfReport,
+}
+
+/// The answer to a [`YubabaRequest::ReportNodeHealth`] (R118-T5).
+///
+/// Three outcomes rather than a bool because each one sends the reporter
+/// somewhere different: recorded is done, superseded means a worse verdict
+/// already stands and re-reporting will not clear it, and no-such-rollout means
+/// the reporter is talking about something this cluster has never heard of —
+/// which on the appliance is the ordinary case (a plain reboot, no rollout in
+/// flight) and must not read as an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeHealthOutcome {
+    /// Stored. `verdict` is what the record now holds.
+    Recorded { verdict: NodeHealthVerdict },
+    /// Ignored: this node already reported [`NodeHealthVerdict::Failed`] for
+    /// this rollout, and a failure is sticky. `standing` is that verdict.
+    Superseded { standing: NodeHealthVerdict },
+    /// No rollout with that id in applied state.
+    NoSuchRollout,
+}
+
+/// The answer to a guarded rollout write (R118-T5).
+///
+/// Deliberately not a `bool`, for the same reason [`TenantOutcome`] is not: a
+/// rejected writer needs the revision raft actually holds so its retry can be
+/// built against the truth rather than by polling until it guesses right.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RolloutWriteOutcome {
+    /// Applied. `revision` is what the record now carries — the value the next
+    /// write from this writer must expect.
+    Committed { revision: u64 },
+    /// Refused: somebody else moved the record first. `current_revision` is
+    /// what raft holds (`0` when there is no record at all, which is also what
+    /// a create expects — so a create losing to another create is reported the
+    /// same way and retried the same way).
+    Stale { current_revision: u64 },
 }
 
 /// The answer to a tenant ownership request (R732-F1 / W245).
@@ -614,12 +819,34 @@ pub struct YubabaState {
     pub service_placement: BTreeMap<String, String>,
     pub locks: BTreeMap<String, LockEntry>,
     pub ingress_owner: Option<String>,
-    /// R278-F3: in-flight rollout metadata replicated via raft so a new leader
-    /// can resume a rollout after leader change. The in-process RolloutStore
-    /// (on ServerState) is the authoritative v1 store; this map is updated
-    /// alongside it via SetRolloutState / ClearRolloutState YubabaRequests.
+    /// R278-F3 / R118-T5: rollout state, replicated so a new leader can resume
+    /// a rollout the old one was driving when it lost power.
+    ///
+    /// **This map is the authority.** The in-process `RolloutStore` this used
+    /// to shadow is gone (R118-T5): `crate::rollout` reads rollouts from a
+    /// node's applied state and writes them with `SetRolloutState` /
+    /// `ClearRolloutState`, so there is one source of truth and it survives the
+    /// death of the node that created it.
     #[serde(default)]
     pub rollouts: BTreeMap<String, RolloutRaftRecord>,
+    /// R118-T5: per-node boot-health evidence for an in-flight rollout, keyed
+    /// `rollout_id -> node -> record`.
+    ///
+    /// Replicated for the same reason the rollout itself is: the verdict that
+    /// matters most — "the node I just updated did not come back" — is filed by
+    /// a node the *driving* node may be about to lose. A new leader that
+    /// inherits a rollout must inherit the evidence too, or it re-derives a
+    /// clean bill of health for a fleet that has already reported a failure.
+    ///
+    /// **Beside [`Self::rollouts`] and not inside it, deliberately.** A rollout
+    /// record is written under a compare-and-swap on
+    /// [`RolloutRaftRecord::revision`] by two writers who must not clobber each
+    /// other; health is written by N plinths, concurrently, none of which has
+    /// any business contending on the revision the engine is stepping. Folding
+    /// health into the record would put every reporting node into that CAS and
+    /// make an ordinary boot report able to lose to a step advance.
+    #[serde(default)]
+    pub rollout_health: BTreeMap<String, BTreeMap<String, NodeHealthRecord>>,
     /// R600-F1 (W273): raft-replicated cluster secrets, keyed by logical name
     /// (e.g. `"tls/yah.dev"`). Values are AES-256-GCM ciphertext — see
     /// [`SecretRecord`]. This is the fleet-shared store backing
@@ -648,6 +875,27 @@ pub struct YubabaState {
     /// placement for everything.
     #[serde(default)]
     pub placement: BTreeMap<TenantId, TenantPlacement>,
+    /// R118-F8 (W138): per-observer liveness verdicts about peers, keyed
+    /// `observer -> subject -> record`.
+    ///
+    /// Nested by observer rather than flattened to a `(observer, subject)` key
+    /// because the fold that matters — [`Self::corroborated_liveness`] — is
+    /// *"what does every observer say about this subject"*, and because a
+    /// reporter's whole testimony must be able to age out together when the
+    /// reporter itself stops.
+    ///
+    /// `#[serde(default)]` so pre-F8 snapshots load empty, the same
+    /// forward-compat contract as `rollouts` / `secrets` / `tenants`. An empty
+    /// map means nothing is known, which is the safe default: the ratchet reads
+    /// no evidence as [`PeerLivenessVerdict::Unknown`], and `Unknown` vetoes.
+    #[serde(default)]
+    pub peer_liveness: BTreeMap<YubabaNodeId, BTreeMap<YubabaNodeId, PeerLivenessRecord>>,
+    /// R118-F8 / `W158` §7.2(3): the last membership change the ratchet made.
+    ///
+    /// One record, not a log: a returning node only ever asks one question of
+    /// it, and the answer is about the membership it is *currently* out of.
+    #[serde(default)]
+    pub last_membership_ratchet: Option<MembershipRatchetRecord>,
 }
 
 impl YubabaState {
@@ -735,6 +983,292 @@ impl YubabaState {
         };
         demand.memory_mb <= headroom.memory_mb && demand.cpu_millis <= headroom.cpu_millis
     }
+}
+
+impl YubabaState {
+    /// What the cluster as a whole currently believes about `subject`, folded
+    /// from every observer's fresh report (R118-F8).
+    ///
+    /// `now` and `ttl` are unix seconds. A report older than `ttl` is not
+    /// consulted **in either direction** — see
+    /// [`MembershipRatchet::ShrinkToSurvivors::evidence_ttl_secs`][ttl] for why
+    /// a stale `Alive` is the dangerous half of that.
+    ///
+    /// [ttl]: crate::cluster_policy::MembershipRatchet::ShrinkToSurvivors::evidence_ttl_secs
+    ///
+    /// # The fold is minimum-rank, and the rank is the safety rule
+    ///
+    /// [`PeerLivenessVerdict::rank`] orders the five verdicts by how much
+    /// *evidence of presence* each one carries, and this returns the smallest —
+    /// so [`Dark`](PeerLivenessVerdict::Dark) is returned only when **every**
+    /// fresh observer says `Dark`, and a single dissenting `Alive`, `Unknown` or
+    /// `SilentWithinHoldDown` is enough to veto. No fresh report at all is
+    /// `Unknown`, which also vetoes. This is `R118-F7`'s inverted rule applied
+    /// across observers: absence of evidence is the permission, presence of it
+    /// is a veto.
+    ///
+    /// # One witness is enough, and that is not a shortcut
+    ///
+    /// There is no quorum-of-observers requirement, because the corroboration
+    /// this design rests on is *across physical channels*, not across nodes: an
+    /// observer only says `Dark` when an IP path **and** an independent radio
+    /// have both been silent past a hold-down, and it says `Unknown` rather than
+    /// `Dark` when either channel is not running. Demanding a second witness
+    /// would add a rule that fires precisely when the cluster is smallest — at
+    /// two voters, where there is only one other node left to witness anything.
+    pub fn corroborated_liveness(
+        &self,
+        subject: YubabaNodeId,
+        now: u64,
+        ttl: u64,
+    ) -> PeerLivenessVerdict {
+        let mut folded: Option<PeerLivenessVerdict> = None;
+        for (observer, reports) in &self.peer_liveness {
+            if *observer == subject {
+                // Belt to the apply arm's braces: self-testimony is refused on
+                // the way in, and ignored on the way out.
+                continue;
+            }
+            let Some(record) = reports.get(&subject) else {
+                continue;
+            };
+            if now.saturating_sub(record.observed_at) > ttl {
+                continue;
+            }
+            folded = Some(match folded {
+                Some(current) if current.rank() <= record.verdict.rank() => current,
+                _ => record.verdict,
+            });
+        }
+        folded.unwrap_or(PeerLivenessVerdict::Unknown)
+    }
+
+    /// Since when has `subject` been **continuously** corroborated alive, or
+    /// `None` if it is not (R118-F8 part 2).
+    ///
+    /// The input rehydration's hold-down is measured against. `None` and
+    /// `Some(t)` are two different refusals and one permission: `None` means the
+    /// fold is not `Alive` at all (so promotion is out of the question) or that
+    /// no observer can say when presence began, and `Some(t)` means every fresh
+    /// observer says alive and the *least convinced* of them has believed it
+    /// since `t`.
+    ///
+    /// # The fold takes the MAXIMUM `since`, which is the shortest claim
+    ///
+    /// Deliberately the opposite direction from
+    /// [`corroborated_liveness`](Self::corroborated_liveness)'s minimum-rank.
+    /// Both pick the answer that is hardest on the subject: there, the observer
+    /// with the most evidence of presence vetoes a shrink; here, the observer
+    /// who has been convinced for the *shortest* time sets the clock. A node
+    /// that one peer has seen for an hour and another has seen for ten seconds
+    /// has been continuously visible to the cluster for ten seconds.
+    ///
+    /// # A `since` of 0 is refused rather than read as "since the epoch"
+    ///
+    /// `since` is `#[serde(default)]`, so a pre-latch record — or one written by
+    /// a node whose RTC has not been set — carries `0`. Read literally that is
+    /// "alive since 1970", i.e. every hold-down instantly satisfied, which is
+    /// the unsafe direction and exactly the shape of bug a default value causes.
+    /// It is treated as *unknown* instead, which refuses.
+    pub fn corroborated_alive_since(&self, subject: YubabaNodeId, now: u64, ttl: u64) -> Option<u64> {
+        if self.corroborated_liveness(subject, now, ttl) != PeerLivenessVerdict::Alive {
+            return None;
+        }
+        let mut newest: Option<u64> = None;
+        for (observer, reports) in &self.peer_liveness {
+            if *observer == subject {
+                continue;
+            }
+            let Some(record) = reports.get(&subject) else {
+                continue;
+            };
+            if now.saturating_sub(record.observed_at) > ttl {
+                continue;
+            }
+            if record.since == 0 {
+                // Unknown, not "since the epoch". One such observer is enough to
+                // make the whole claim unmeasurable — the alternative is to
+                // ignore it, which is to let the best-informed observer answer
+                // for the least-informed one.
+                return None;
+            }
+            newest = Some(newest.map_or(record.since, |n: u64| n.max(record.since)));
+        }
+        newest
+    }
+
+    /// The node id running on machine `machine`, per the replicated member rows.
+    ///
+    /// The one bridge between yubaba's two identity spaces — see
+    /// [`MemberInfo::machine`]. Stated here on the state rather than only on
+    /// [`YubabaStateMachine`](super::YubabaStateMachine) so a reader holding the
+    /// state itself (the membership ratchet, resolving a singleton owner to a
+    /// voter) does not re-derive it.
+    pub fn node_for_machine(&self, machine: &str) -> Option<YubabaNodeId> {
+        self.members
+            .iter()
+            .find(|(_, m)| m.machine.as_deref() == Some(machine))
+            .map(|(id, _)| *id)
+    }
+}
+
+/// One node's corroborated verdict about one peer, as `R118-F7`'s detector
+/// produces it (R118-F8).
+///
+/// **Deliberately the same five states** as
+/// `society_facility::liveness::Liveness`, in the same order, rather than a
+/// reduction to three. The two extra states are what makes failing closed
+/// *sayable*: a rebooting plinth is `SilentWithinHoldDown` and not yet anything
+/// else, and a detector whose own radio has faulted says `Unknown` rather than
+/// projecting its blindness onto the peer. Collapsing either into `Dark` on the
+/// wire would put the shrink decision behind a lossy translation.
+///
+/// The noisetable enum carries a reason payload on `Unknown` and this one does
+/// not: the reason is an *observer* diagnostic, it is already in
+/// [`YubabaRequest::ReportPeerLiveness::detail`] as operator-readable text, and
+/// no consumer here branches on it — every `Unknown` vetoes identically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerLivenessVerdict {
+    /// Fresh evidence on an IP-path channel. The peer is reachable.
+    Alive,
+    /// No IP path, but the independent radio still hears it. **This is a
+    /// partition**, and shrinking here is the split brain the whole design
+    /// exists to prevent — no amount of elapsed time promotes it to `Dark`.
+    UnreachableButRadiating,
+    /// Silent on every channel, but not yet for a full hold-down. A clean reboot
+    /// lives here.
+    SilentWithinHoldDown,
+    /// Silent on every channel, continuously, past the hold-down, with the
+    /// observer healthy on both an IP-path and an independent-radio channel.
+    /// **The only verdict that licenses a shrink.**
+    Dark,
+    /// The observer cannot answer. Its own fault, never the peer's — and it
+    /// vetoes exactly as `UnreachableButRadiating` does.
+    Unknown,
+}
+
+impl PeerLivenessVerdict {
+    /// May the ratchet take this node's vote away? **Only `Dark`.**
+    ///
+    /// The inverted safety rule in one place, so no call site re-derives it.
+    pub const fn licenses_shrink(self) -> bool {
+        matches!(self, Self::Dark)
+    }
+
+    /// How much evidence of *presence* this verdict carries, ascending — the
+    /// ordering [`YubabaState::corroborated_liveness`] folds on.
+    ///
+    /// `Dark` is deliberately last and alone: it is the only value that is the
+    /// **absence** of evidence, and a fold that takes the minimum therefore
+    /// reaches it only by unanimity.
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Alive => 0,
+            Self::UnreachableButRadiating => 1,
+            Self::SilentWithinHoldDown => 2,
+            Self::Unknown => 3,
+            Self::Dark => 4,
+        }
+    }
+
+    /// Stable lowercase wire/CLI spelling, matching the serde rename.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Alive => "alive",
+            Self::UnreachableButRadiating => "unreachable_but_radiating",
+            Self::SilentWithinHoldDown => "silent_within_hold_down",
+            Self::Dark => "dark",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One observer's stored report about one peer (R118-F8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerLivenessRecord {
+    pub observer: YubabaNodeId,
+    pub subject: YubabaNodeId,
+    pub verdict: PeerLivenessVerdict,
+    /// The observer's operator-readable sentence — `"no raft heartbeat 4m, no
+    /// BLE advert 4m"`. Provenance, not input.
+    #[serde(default)]
+    pub detail: String,
+    /// Unix seconds, stamped by the observer. Judged against the policy's
+    /// evidence TTL, so a reporter that stops reporting stops voting.
+    pub observed_at: u64,
+    /// When this observer **first** reached the verdict it currently holds —
+    /// the *"continuously since T"* half, and the input rehydration's hold-down
+    /// is measured against (R118-F8 part 2).
+    ///
+    /// Stamped by the apply arm, not by the reporter: it is set to
+    /// [`observed_at`](Self::observed_at) when the verdict CHANGES and carried
+    /// forward untouched when the same verdict is restated. That makes it a
+    /// **latch** rather than a re-armable timer, which is the whole of the
+    /// hysteresis — a plinth that flaps resets its own `since` on every cycle
+    /// and can therefore never accumulate a full hold-down of continuous
+    /// presence, however many times it comes back.
+    ///
+    /// `#[serde(default)]` for the same forward-compat contract as everything
+    /// else here. A record loaded without one reads `0`, i.e. "alive since the
+    /// epoch" — and that is the **unsafe** direction for a hold-down, so
+    /// [`YubabaState::corroborated_alive_since`] returns `None` rather than
+    /// `Some(0)` for it. See that function.
+    #[serde(default)]
+    pub since: u64,
+}
+
+/// What the ratchet did, and under which membership entry (R118-F8, `W158`
+/// §7.2(3)).
+///
+/// # What "the epoch" is here, precisely
+///
+/// `W158` asks for an epoch stamp so a returning node can distinguish *"I was
+/// demoted"* from *"my cluster was replaced"*. **yubaba has no cluster
+/// incarnation epoch today** — this was `W158` §8's first open question, and the
+/// answer is no: [`cluster_epoch`](crate::cluster_epoch) declares
+/// `CLUSTER_PROTOCOL` and `STATE_EPOCH`, which are *build* compatibility
+/// integers ("may these two binaries share a cluster", "can this binary read
+/// that one's log"). Neither identifies an incarnation, so `W158` §5.2's
+/// `(cluster_id, epoch)` fence is a new mechanism a recovery ticket must build,
+/// not a consumer of an existing one.
+///
+/// What this record stamps instead is the thing that already answers the
+/// question: the **membership entry's own log id**. A node demoted by
+/// `retain = true` stays a learner and replicates that very entry, so it finds
+/// its own id in [`demoted`](Self::demoted) at a `(term, index)` continuous with
+/// its own log — that is "I was demoted", provable locally. A node whose log
+/// cannot contain this entry is from a different incarnation and must be
+/// re-adopted rather than handed to `add_learner`, which is exactly the routing
+/// rule `W158` §7.2(2) asks F8's rehydration entry point to apply. The build
+/// epochs are carried alongside because a returner failing *those* cannot rejoin
+/// on any path, and finding that out from one record is cheaper than finding it
+/// out from a failed join.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipRatchetRecord {
+    /// Unix seconds, stamped by the leader that made the change.
+    pub at: u64,
+    /// The term of the membership entry this record describes.
+    pub membership_term: u64,
+    /// The log index of that entry.
+    pub membership_index: u64,
+    /// The voter set before the change.
+    pub before: Vec<YubabaNodeId>,
+    /// The voter set after it.
+    pub after: Vec<YubabaNodeId>,
+    /// The voters demoted to learners. A node finding itself here, at a log id
+    /// its own log contains, was demoted — it was not evicted and its cluster
+    /// was not replaced.
+    pub demoted: Vec<YubabaNodeId>,
+    /// [`cluster_epoch::CLUSTER_PROTOCOL`](crate::cluster_epoch::CLUSTER_PROTOCOL)
+    /// of the build that made the change.
+    pub cluster_protocol: u32,
+    /// [`cluster_epoch::STATE_EPOCH`](crate::cluster_epoch::STATE_EPOCH) of that
+    /// build.
+    pub state_epoch: u32,
+    /// Why — the folded verdicts that licensed it, as operator-readable text.
+    #[serde(default)]
+    pub reason: String,
 }
 
 /// Which node owns a tenant's write path, and the monotonic epoch that makes
@@ -974,11 +1508,21 @@ pub struct NodeLoad {
     pub cpu_millis: u32,
 }
 
-/// Minimal rollout metadata stored in raft state (R278-F3).
+/// A rollout as stored in raft state (R278-F3, widened by R118-T5).
 ///
-/// Contains only what's needed for leader-resume after a raft leader change.
-/// The full `RolloutRecord` (including the policy and trigger) lives in the
-/// in-process `RolloutStore`.
+/// This is the **whole** rollout, not a mirror of one: there is no second
+/// in-process copy any more (R118-T5 deleted `RolloutStore`), so a new leader
+/// resumes from this record alone. That is what forced the widening — the
+/// original five fields told a new leader that *a* rollout was in flight
+/// without telling it which nodes to touch in what order or what health gate
+/// to hold them to, which is not enough to resume and therefore not enough to
+/// satisfy the power-loss-mid-update case the variants exist for.
+///
+/// `status_json` stays JSON-encoded while `policy` is typed, and the asymmetry
+/// is deliberate rather than an oversight: `RolloutPolicy` is a
+/// [`workload_spec`] type this module already depends on, whereas
+/// `RolloutStatus` lives in [`crate::rollout`] and typing it here would point
+/// the raft layer at a domain module that reads *from* it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RolloutRaftRecord {
     pub rollout_id: String,
@@ -986,8 +1530,90 @@ pub struct RolloutRaftRecord {
     /// JSON-serialised `RolloutStatus` (avoids a cross-crate dep on yubaba's
     /// rollout module from the raft module).
     pub status_json: String,
+    /// Index of the next step to execute (0-based) — where a resuming leader
+    /// picks up.
     pub current_step: usize,
     pub started_at: u64,
+    /// R118-T5: the resolved rollout policy — steps, mirrors, gate windows,
+    /// gates. **Required, with no `#[serde(default)]`**, which is the opposite
+    /// of the treatment every other field added to this file has had
+    /// (`capacity`, `digest`, `sans`, `ari`, `machine`). Those are annotations
+    /// whose absence degrades a decision; this one *is* the decision. A
+    /// defaulted policy would be an empty step list, and an empty step list
+    /// drives to `Succeeded` immediately — a resuming leader would declare a
+    /// half-applied fleet update finished. Failing to parse is strictly better
+    /// than that, and it is a hazard nothing can actually hit: no record
+    /// predates this field (see the type doc for `SetRolloutState`).
+    pub policy: workload_spec::rollout::RolloutPolicy,
+    /// R118-T5: opaque trigger metadata carried from the creating request, for
+    /// operators reading `GET /v1/rollouts`. `#[serde(default)]` — nothing
+    /// decides anything from it.
+    #[serde(default)]
+    pub trigger: serde_json::Value,
+    /// R118-T5: monotonically increasing per record, bumped by `apply` on every
+    /// accepted write. This is the compare-and-swap token — see
+    /// [`YubabaRequest::SetRolloutState::expected_revision`].
+    ///
+    /// It exists because a rollout has **two** legitimate writers that both
+    /// move `status`: the engine driving it (`Running` → `Succeeded`) and an
+    /// operator overriding it (`Overridden`). Both do read-modify-write on the
+    /// whole record, so without a CAS the engine's next step advance — carrying
+    /// the status it read a moment earlier — silently reverts an override that
+    /// landed in between, and the operator's rollback simply disappears. Field
+    /// splitting does not help: the collision is *on* `status`.
+    ///
+    /// `#[serde(default)]` = 0. No record predates the field, so this never
+    /// applies in practice; if one somehow did, revision 0 is what a *create*
+    /// expects, which makes a legacy record writable exactly once and by
+    /// exactly one writer rather than by everybody at once.
+    #[serde(default)]
+    pub revision: u64,
+}
+
+/// What one node said about its own boot of a rollout's artifact (R118-T5).
+///
+/// Two values and no third, on purpose. "We have not heard from that node" is
+/// **not** a variant here — it is the absence of a record, and keeping it that
+/// way is what makes the fail-closed rule impossible to write wrong: a gate
+/// asking "is every node good?" of a map with a missing key gets `None`, not an
+/// `Unknown` that some later `match` arm can be talked into treating as a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeHealthVerdict {
+    /// The node came up on the new artifact and stayed up. On the appliance
+    /// this is `rauc-health.sh good`, i.e. the same verdict that spends the
+    /// U-Boot dead-man's-switch — one authority, two observers.
+    Good,
+    /// The node did not become healthy on a slot under trial. On the appliance
+    /// this is `rauc-health.sh failed`, filed immediately before it reboots so
+    /// U-Boot can fall back to the other slot.
+    Failed,
+}
+
+/// One node's boot-health report for one rollout (R118-T5).
+///
+/// # A failure is sticky, and that rule lives in `apply`
+///
+/// Once a node has reported [`NodeHealthVerdict::Failed`] for a rollout, a
+/// later `Good` from the same node does **not** replace it — see the
+/// `ReportNodeHealth` apply arm. That is not conservatism for its own sake: the
+/// appliance's failure path *reboots*, U-Boot falls back to the previous slot,
+/// and the node then comes up perfectly healthy on the OLD image and files a
+/// `good`. Last-write-wins would read that as the update having succeeded on
+/// the very node it had to be rolled back on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeHealthRecord {
+    /// The reporting node's own name for itself, as the rollout policy's
+    /// `steps[].mirrors` names it. Opaque to raft.
+    pub node: String,
+    pub verdict: NodeHealthVerdict,
+    /// Free text from the reporter — which slot, which bundle version, why.
+    /// Nothing decides anything from it; it is what an operator reads.
+    #[serde(default)]
+    pub detail: String,
+    /// Unix seconds, stamped by the node that accepted the report (the domain
+    /// owns "when", like [`YubabaRequest::AcquireLock`]'s `acquired_at`).
+    pub reported_at: u64,
 }
 
 /// A cluster secret as stored in raft state (R600-F1 / W273).
@@ -1069,6 +1695,34 @@ pub struct SecretRecord {
     /// landed, and heals itself at the next issuance.
     #[serde(default)]
     pub sans: Option<Vec<String>>,
+
+    /// R853-F10: for a record holding a **certificate chain**, the RFC 9773
+    /// ARI identifier of its leaf — `"<base64url AKI>.<base64url serial>"`,
+    /// exactly what `acme_engine::ari_certificate_id` read out of the PEM the
+    /// CA returned, before sealing. `None` on every other kind of secret.
+    ///
+    /// Plaintext for the same reason as `sans`, and the argument is if
+    /// anything stronger: both halves of this identifier — the leaf's
+    /// Authority Key Identifier and its serial number — are handed to every
+    /// TLS client on connect and published in the CT logs, so storing it
+    /// beside the ciphertext discloses nothing. It is also the only way an
+    /// issuer can name the certificate it is replacing **without a KEK unseal
+    /// on every renewal**: the previous chain lives here sealed, and reaching
+    /// for it through `secrets::open_cluster_secret` would need a
+    /// `SecretConsumer` the record's own access rule admits — a policy
+    /// question the issuer has no answer to.
+    ///
+    /// **`None` costs a rate-limit exemption, never correctness.** An order
+    /// placed without `replaces` falls back to the CA's exact-identifier-set
+    /// renewal detection, which is what every order did before this field
+    /// existed; only a *widening* order (a SAN set the CA has not seen before)
+    /// loses the exemption and lands against New Certificates per Exact Set of
+    /// Identifiers. So a legacy record, an unparseable chain, and a downgraded
+    /// node that dropped the field all behave identically and identically
+    /// safely, and heal at the next issuance. The private key record never
+    /// carries this.
+    #[serde(default)]
+    pub ari: Option<String>,
 }
 
 // Redact the opaque bytes from Debug (which `YubabaState`/snapshot dumps and any
@@ -1112,6 +1766,19 @@ impl std::fmt::Debug for SecretRecord {
                     match &self.sans {
                         Some(s) => s.join(", "),
                         None => "None (not a cert, or pre-sans)".to_string(),
+                    }
+                ),
+            )
+            // Also printed in full, and for the same reason: an ARI id is
+            // public certificate metadata, and a state dump is where you go to
+            // answer "why did that renewal not claim the exemption".
+            .field(
+                "ari",
+                &format_args!(
+                    "{}",
+                    match &self.ari {
+                        Some(id) => id.clone(),
+                        None => "None (not a cert, or pre-ari)".to_string(),
                     }
                 ),
             )
@@ -1211,6 +1878,126 @@ pub struct MemberInfo {
     /// [nfm]: crate::raft::YubabaStateMachine::node_for_machine
     #[serde(default)]
     pub machine: Option<String>,
+
+    /// R859-F2 phase A: the provider hosting this node — `"hetzner"`, `"ovh"`,
+    /// `"vultr"`, `"static"` — copied from the `provider` its
+    /// `.yah/infra/machines/<name>.toml` declares.
+    ///
+    /// This and the three fields below exist because **a fleet node has no
+    /// fleet-wide machine declarations.** `rg MachineConfig` over
+    /// `oss/yubaba/crates/yubaba/src/` finds only prose: yubaba never loads
+    /// `.yah/infra/machines/`, and each node knows only its own declared facts,
+    /// passed as flags. So before phase A the leader could see `ingress_owner`
+    /// move and could see a node die, and could do nothing about either — it
+    /// could not resolve an owner to a provider, a floating IP, or a public
+    /// address. Publishing each node's own five declared facts into its member
+    /// row is what lets the leader assemble
+    /// [`floating_ip::FloatingIpMachine`](../../floating_ip/struct.FloatingIpMachine.html)
+    /// rows for the whole cluster and drive
+    /// `floating_ip::plan_ingress_owner_effect` from them (operator decision 2,
+    /// 2026-09-08: *ship declarations to the nodes and write DNS from the
+    /// fleet*).
+    ///
+    /// The declaration flows one way only. The fleet may **subtract** (pull a
+    /// dead origin's A record); the `.yah/` declaration may **add** (`yah cloud
+    /// apply` re-renders the apex). Neither reads the other's writes, which is
+    /// what makes two writers of one apex safe — see
+    /// [`crate::ingress_effector`].
+    ///
+    /// `Option` + `#[serde(default)]` for snapshot compatibility, same contract
+    /// as [`machine`](Self::machine). `None` is *unknown*, never `"static"`.
+    #[serde(default)]
+    pub provider: Option<String>,
+
+    /// R859-F2 phase A: this node's provider DC code (Hetzner `hil`, Vultr
+    /// `ewr`, …), from the machine file's `location`.
+    ///
+    /// R859-F3 made this load-bearing on the fleet path: it is the field every
+    /// vendor floating-IP adapter needs to derive a mobility zone
+    /// (`floating_ip_adapters::hetzner`'s network-zone table,
+    /// `floating_ip_adapters::vultr`'s region check), and
+    /// `ingress_effector::apply_effect` now hands the member row's
+    /// [`FloatingIpMachine`] straight to one of them. A node that declares no
+    /// `--location` is refused by the adapter rather than guessed at.
+    ///
+    /// [`FloatingIpMachine`]: ../../floating_ip/struct.FloatingIpMachine.html
+    #[serde(default)]
+    pub location: Option<String>,
+
+    /// R859-F2 phase A: the floating/reserved IP that follows public ingress
+    /// onto this node, from the machine file's `ingress_floating_ip`.
+    ///
+    /// `None` is the common case and a supported shape, not a
+    /// misconfiguration: a fleet whose ingress moves by DNS alone has no
+    /// floating IP anywhere, which is every machine this camp declares today.
+    #[serde(default)]
+    pub ingress_floating_ip: Option<String>,
+
+    /// R859-F2 phase A: the **public** address this node answers on — the
+    /// content of its A record at the ingress apex.
+    ///
+    /// Deliberately not [`addr`](Self::addr): that is the Tailscale mesh
+    /// address peers dial (`100.64.x.x:7443`), which is exactly what a public
+    /// apex must never contain. The two are separate facts about one box and
+    /// conflating them would publish the mesh to the world.
+    ///
+    /// This is the one fact the withdrawal path cannot do without: an
+    /// [`IngressOwnerEffect::Withdraw`] names a *machine*, and a Cloudflare
+    /// record delete is content-matched, so without this the leader knows a box
+    /// is dead and cannot say which A record is its.
+    ///
+    /// [`IngressOwnerEffect::Withdraw`]: ../../floating_ip/enum.IngressOwnerEffect.html
+    #[serde(default)]
+    pub public_address: Option<String>,
+}
+
+/// The half of a [`MemberInfo`] a node declares **about itself** — everything
+/// except `addr`, which comes from raft membership rather than from the node.
+///
+/// One value instead of six positional `Option<String>`s threaded through
+/// [`member_registration::spawn`](crate::member_registration::spawn) →
+/// `run` → `plan_registration` → `write_row`. R859-F2 phase A took that count
+/// from three to six, at which point the argument list stopped being readable
+/// and two adjacent `Option<String>`s could be swapped at a call site with no
+/// type error — `provider` and `location` are both "a short lowercase string
+/// naming where this box lives".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeDeclaration {
+    /// [`MemberInfo::region`].
+    pub region: Option<String>,
+    /// [`MemberInfo::capacity`].
+    pub capacity: Option<NodeCapacity>,
+    /// [`MemberInfo::machine`].
+    pub machine: Option<String>,
+    /// [`MemberInfo::provider`].
+    pub provider: Option<String>,
+    /// [`MemberInfo::location`].
+    pub location: Option<String>,
+    /// [`MemberInfo::ingress_floating_ip`].
+    pub ingress_floating_ip: Option<String>,
+    /// [`MemberInfo::public_address`].
+    pub public_address: Option<String>,
+}
+
+impl MemberInfo {
+    /// The row `addr` + this node's own declaration make.
+    ///
+    /// The registration loop's whole job is comparing this against what the
+    /// cluster already recorded, so building it in one place is what keeps
+    /// "what we would write" and "what we did write" from drifting a field
+    /// apart.
+    pub fn from_declaration(addr: impl Into<String>, decl: &NodeDeclaration) -> Self {
+        Self {
+            addr: addr.into(),
+            region: decl.region.clone(),
+            capacity: decl.capacity,
+            machine: decl.machine.clone(),
+            provider: decl.provider.clone(),
+            location: decl.location.clone(),
+            ingress_floating_ip: decl.ingress_floating_ip.clone(),
+            public_address: decl.public_address.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1230,6 +2017,10 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
             region,
             capacity,
             machine,
+            provider,
+            location,
+            ingress_floating_ip,
+            public_address,
         } => {
             state.members.insert(
                 *node_id,
@@ -1238,6 +2029,10 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
                     region: region.clone(),
                     capacity: *capacity,
                     machine: machine.clone(),
+                    provider: provider.clone(),
+                    location: location.clone(),
+                    ingress_floating_ip: ingress_floating_ip.clone(),
+                    public_address: public_address.clone(),
                 },
             );
             YubabaResponse::Ok
@@ -1301,7 +2096,24 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
             status_json,
             current_step,
             started_at,
+            policy,
+            trigger,
+            expected_revision,
         } => {
+            // Compare-and-swap. A record absent from the map is revision 0, so
+            // "create" and "update" are the same rule and a create that loses
+            // to another create is rejected rather than silently merged.
+            let current = state
+                .rollouts
+                .get(rollout_id)
+                .map(|r| r.revision)
+                .unwrap_or(0);
+            if current != *expected_revision {
+                return YubabaResponse::Rollout(RolloutWriteOutcome::Stale {
+                    current_revision: current,
+                });
+            }
+            let revision = current + 1;
             state.rollouts.insert(
                 rollout_id.clone(),
                 RolloutRaftRecord {
@@ -1310,12 +2122,122 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
                     status_json: status_json.clone(),
                     current_step: *current_step,
                     started_at: *started_at,
+                    policy: policy.clone(),
+                    trigger: trigger.clone(),
+                    revision,
                 },
             );
-            YubabaResponse::Ok
+            YubabaResponse::Rollout(RolloutWriteOutcome::Committed { revision })
         }
-        YubabaRequest::ClearRolloutState { rollout_id } => {
+        YubabaRequest::ClearRolloutState {
+            rollout_id,
+            expected_revision,
+        } => {
+            let current = state
+                .rollouts
+                .get(rollout_id)
+                .map(|r| r.revision)
+                .unwrap_or(0);
+            if current != *expected_revision {
+                return YubabaResponse::Rollout(RolloutWriteOutcome::Stale {
+                    current_revision: current,
+                });
+            }
             state.rollouts.remove(rollout_id);
+            // The evidence retires with the rollout it was evidence for.
+            // Leaving it would grow the snapshot by one entry per node per
+            // rollout, forever, keyed on ids nothing can look up any more.
+            state.rollout_health.remove(rollout_id);
+            // The record is gone, so the revision a later writer must expect is
+            // 0 again — the same value a create expects.
+            YubabaResponse::Rollout(RolloutWriteOutcome::Committed { revision: 0 })
+        }
+        YubabaRequest::ReportNodeHealth {
+            rollout_id,
+            node,
+            verdict,
+            detail,
+            reported_at,
+        } => {
+            if !state.rollouts.contains_key(rollout_id) {
+                return YubabaResponse::NodeHealth(NodeHealthOutcome::NoSuchRollout);
+            }
+            let per_node = state.rollout_health.entry(rollout_id.clone()).or_default();
+            // Severity is monotonic: a `Failed` already on file stands, whatever
+            // arrives later. See `NodeHealthRecord` — the appliance's failure
+            // path reboots into the PREVIOUS slot, where the node is genuinely
+            // healthy and says so, and last-write-wins would read that as the
+            // update having worked on the node it had to be rolled back on.
+            if let Some(standing) = per_node.get(node) {
+                if standing.verdict == NodeHealthVerdict::Failed {
+                    return YubabaResponse::NodeHealth(NodeHealthOutcome::Superseded {
+                        standing: standing.verdict,
+                    });
+                }
+            }
+            per_node.insert(
+                node.clone(),
+                NodeHealthRecord {
+                    node: node.clone(),
+                    verdict: *verdict,
+                    detail: detail.clone(),
+                    reported_at: *reported_at,
+                },
+            );
+            YubabaResponse::NodeHealth(NodeHealthOutcome::Recorded { verdict: *verdict })
+        }
+        YubabaRequest::ReportPeerLiveness {
+            observer,
+            subject,
+            verdict,
+            detail,
+            observed_at,
+        } => {
+            // A node does not testify about itself. Enforced here rather than at
+            // the HTTP handler for `ReportNodeHealth`'s reason: `POST
+            // /raft/write` accepts an arbitrary request, so a rule enforced
+            // anywhere else is a rule a caller can skip — and this particular
+            // rule is what stops a node's last self-reported `Alive` from
+            // outliving it and vetoing the shrink it is evidence against.
+            if observer == subject {
+                return YubabaResponse::PeerLiveness(PeerLivenessOutcome::SelfReport);
+            }
+            let per_subject = state.peer_liveness.entry(*observer).or_default();
+            let standing = per_subject.get(subject);
+            let changed = standing.is_none_or(|s| s.verdict != *verdict);
+            // The latch. A restatement carries the original `since` forward, so
+            // "continuously alive since T" survives every renewal; a CHANGE
+            // re-stamps it, so a flap resets the clock it would otherwise be
+            // accumulating. This is why the hysteresis cannot be defeated by
+            // reporting faster.
+            let since = match standing {
+                Some(s) if !changed => s.since,
+                _ => *observed_at,
+            };
+            per_subject.insert(
+                *subject,
+                PeerLivenessRecord {
+                    observer: *observer,
+                    subject: *subject,
+                    verdict: *verdict,
+                    detail: detail.clone(),
+                    observed_at: *observed_at,
+                    since,
+                },
+            );
+            // Deliberately last-write-wins, unlike `ReportNodeHealth`'s sticky
+            // `Failed`. Stickiness there models an irreversible fact (an update
+            // that had to be rolled back); liveness is the opposite — a plinth
+            // that comes back must be able to say so, or the ratchet could
+            // never be told to stop.
+            YubabaResponse::PeerLiveness(if changed {
+                PeerLivenessOutcome::Recorded { verdict: *verdict }
+            } else {
+                PeerLivenessOutcome::Unchanged { verdict: *verdict }
+            })
+        }
+        YubabaRequest::RecordMembershipRatchet { record } => {
+            state.last_membership_ratchet = Some(record.clone());
             YubabaResponse::Ok
         }
         YubabaRequest::PutSecret {
@@ -1326,6 +2248,7 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
             access,
             digest,
             sans,
+            ari,
         } => {
             // Opaque bytes in, opaque bytes stored — this layer never decrypts.
             // The access rule and digest are stored verbatim alongside them;
@@ -1342,6 +2265,7 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
                     access: access.clone(),
                     digest: digest.clone(),
                     sans: sans.clone(),
+                    ari: ari.clone(),
                 },
             );
             YubabaResponse::Ok
@@ -1574,11 +2498,333 @@ pub async fn bootstrap_single_node(
     }
 }
 
+/// Default timeout for the forward-to-leader HTTP write in
+/// [`client_write_forwarded`].
+pub const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Write `req` through consensus from **any** node, forwarding to the leader
+/// when this one is not it, and return the leader's [`YubabaResponse`].
+///
+/// # Why this exists as a shared helper
+///
+/// Only the raft leader can `client_write`; a follower gets `ForwardToLeader`
+/// back. Two background loops need to write from wherever they happen to run, so
+/// each grew its own forwarding arm — and the *absence* of one is a silent
+/// functional bug rather than a noisy failure. R600-F10 measured that: the ACME
+/// issuer gated its whole tick on `current_leader == Some(node_id)` to dodge the
+/// `ForwardToLeader` errors, which quietly collapsed "single issuer elected via
+/// the raft lock" into "the issuer is whoever leads raft". With the issuer
+/// configured on two nodes and leadership on a third that had no issuer config,
+/// no node ever attempted `AcquireLock` and no cert was ever ordered — with
+/// nothing in any journal to say so.
+///
+/// So the forward is the thing that has to be easy to reach for. The leader's
+/// `BasicNode.addr` that openraft hands back in the error is the same mesh
+/// address the raft transport dials, so the forward needs no extra discovery.
+///
+/// # Errors
+///
+/// Every failure is the caller's to retry — none is terminal. In particular a
+/// leaderless raft (mid-election, or quorum lost) is reported as an error rather
+/// than waited out here, because the callers have their own backoff and their
+/// own idea of how long a tick is.
+pub async fn client_write_forwarded(
+    raft: &YubabaRaft,
+    client: &reqwest::Client,
+    req: YubabaRequest,
+) -> anyhow::Result<YubabaResponse> {
+    match raft.client_write(req.clone()).await {
+        Ok(resp) => Ok(resp.data),
+        Err(openraft::error::RaftError::APIError(
+            openraft::error::ClientWriteError::ForwardToLeader(fwd),
+        )) => {
+            let Some(leader) = fwd.leader_node.as_ref() else {
+                // Known-no-leader, or a leader whose node record this replica has
+                // not seen. Both are transient and both are the caller's retry.
+                anyhow::bail!(
+                    "not the leader and no leader address to forward to (leader_id={:?})",
+                    fwd.leader_id
+                );
+            };
+            let url = format!("http://{}/raft/write", leader.addr);
+            let resp = client
+                .post(&url)
+                .json(&serde_json::json!({ "request": req }))
+                .send()
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("forwarding raft write to leader at {url}: HTTP {status}: {body}");
+            }
+            // `POST /raft/write` replies with the applied `YubabaResponse`, so a
+            // forwarded write is indistinguishable from a local one to the
+            // caller — which is what lets `AcquireLock` be decided by the lock
+            // rather than by which node happens to lead.
+            Ok(resp.json::<YubabaResponse>().await?)
+        }
+        Err(e) => Err(anyhow::anyhow!(e)),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── R118-F8: peer liveness + the corroboration fold ──────────────────────
+
+    fn report_liveness(
+        state: &mut YubabaState,
+        observer: YubabaNodeId,
+        subject: YubabaNodeId,
+        verdict: PeerLivenessVerdict,
+        observed_at: u64,
+    ) -> YubabaResponse {
+        apply(
+            state,
+            &YubabaRequest::ReportPeerLiveness {
+                observer,
+                subject,
+                verdict,
+                detail: String::new(),
+                observed_at,
+            },
+        )
+    }
+
+    #[test]
+    fn a_node_may_not_testify_about_itself() {
+        let mut state = YubabaState::default();
+        let resp = report_liveness(&mut state, 3, 3, PeerLivenessVerdict::Alive, 100);
+        assert!(
+            matches!(
+                resp,
+                YubabaResponse::PeerLiveness(PeerLivenessOutcome::SelfReport)
+            ),
+            "a self-report must be refused, not stored: the node whose verdict matters is the \
+             one that is off, and its own stale `Alive` is precisely the record that would veto \
+             the shrink it is evidence against. Got {resp:?}"
+        );
+        assert!(state.peer_liveness.is_empty(), "nothing may be stored");
+    }
+
+    #[test]
+    fn restating_a_verdict_is_reported_as_unchanged_but_still_refreshes_it() {
+        let mut state = YubabaState::default();
+        report_liveness(&mut state, 1, 2, PeerLivenessVerdict::Dark, 100);
+        let resp = report_liveness(&mut state, 1, 2, PeerLivenessVerdict::Dark, 160);
+        assert!(
+            matches!(
+                resp,
+                YubabaResponse::PeerLiveness(PeerLivenessOutcome::Unchanged { .. })
+            ),
+            "a restatement must be legible to a reporter that should be sending transitions: \
+             {resp:?}"
+        );
+        assert_eq!(
+            state.peer_liveness[&1][&2].observed_at, 160,
+            "the timestamp must still move, or a correctly-behaving reporter's evidence would \
+             age out under the policy TTL while it was still true"
+        );
+    }
+
+    /// The **other half of the latch**, and the half whose regression is silent.
+    ///
+    /// `restating_a_verdict_is_reported_as_unchanged_but_still_refreshes_it`
+    /// above pins that `observed_at` advances, and
+    /// `a_flapping_node_never_gets_its_vote_back` pins that `since` is RE-STAMPED
+    /// on a verdict change. Neither pins that `since` is left ALONE on a
+    /// restatement — and that is the direction that fails quietly and badly: the
+    /// rig's reporter restates every unchanged verdict every 10 s
+    /// (`LivenessReporter::restate_after`), so a `since` that moved on a
+    /// restatement would reset the promotion clock six times a minute, no node
+    /// could ever accumulate the 300 s of continuous presence a promotion needs,
+    /// and the cluster would simply never rehydrate. Nothing would fail; it would
+    /// just sit at one voter forever.
+    ///
+    /// The two fields therefore have to be asserted in opposite directions in
+    /// one test, which is also the clearest statement of what the latch IS.
+    #[test]
+    fn a_restatement_refreshes_freshness_without_disturbing_the_since_latch() {
+        let mut state = YubabaState::default();
+        report_liveness(&mut state, 1, 2, PeerLivenessVerdict::Alive, 100);
+        assert_eq!(state.peer_liveness[&1][&2].since, 100);
+
+        // Six restatements, a reporter's ordinary cadence across a minute.
+        for t in [110, 120, 130, 140, 150, 160] {
+            report_liveness(&mut state, 1, 2, PeerLivenessVerdict::Alive, t);
+        }
+        let record = &state.peer_liveness[&1][&2];
+        assert_eq!(
+            record.observed_at, 160,
+            "freshness must track the latest restatement"
+        );
+        assert_eq!(
+            record.since, 100,
+            "…and `since` must NOT. It is the instant this verdict was FIRST reached; a \
+             restatement is evidence that it still holds, not that it began again. If this \
+             moves, the promotion hold-down is re-armed on every reporter tick, no node can \
+             ever be promoted, and the cluster silently never rehydrates."
+        );
+        assert_eq!(
+            state.corroborated_alive_since(2, 160, 3_600),
+            Some(100),
+            "so the fold reports 60s of continuous presence, not 0"
+        );
+
+        // And the change direction still re-stamps, in the same test, so the two
+        // behaviours cannot drift apart.
+        report_liveness(&mut state, 1, 2, PeerLivenessVerdict::Dark, 170);
+        report_liveness(&mut state, 1, 2, PeerLivenessVerdict::Alive, 180);
+        assert_eq!(
+            state.peer_liveness[&1][&2].since, 180,
+            "a Dark -> Alive transition restarts the clock; the node was not present in between"
+        );
+    }
+
+    #[test]
+    fn liveness_is_last_write_wins_unlike_sticky_boot_health() {
+        let mut state = YubabaState::default();
+        report_liveness(&mut state, 1, 2, PeerLivenessVerdict::Dark, 100);
+        let resp = report_liveness(&mut state, 1, 2, PeerLivenessVerdict::Alive, 110);
+        assert!(matches!(
+            resp,
+            YubabaResponse::PeerLiveness(PeerLivenessOutcome::Recorded {
+                verdict: PeerLivenessVerdict::Alive
+            })
+        ));
+        assert_eq!(
+            state.corroborated_liveness(2, 110, 30),
+            PeerLivenessVerdict::Alive,
+            "a plinth that comes back must be able to say so, or the ratchet could never be \
+             told to stop"
+        );
+    }
+
+    #[test]
+    fn one_dissenting_observer_vetoes_a_unanimous_dark() {
+        let mut state = YubabaState::default();
+        report_liveness(&mut state, 1, 4, PeerLivenessVerdict::Dark, 100);
+        report_liveness(&mut state, 2, 4, PeerLivenessVerdict::Dark, 100);
+        assert_eq!(
+            state.corroborated_liveness(4, 100, 30),
+            PeerLivenessVerdict::Dark
+        );
+        report_liveness(&mut state, 3, 4, PeerLivenessVerdict::UnreachableButRadiating, 100);
+        assert_eq!(
+            state.corroborated_liveness(4, 100, 30),
+            PeerLivenessVerdict::UnreachableButRadiating,
+            "presence of evidence is a veto: one peer that can still hear node 4 makes this a \
+             partition, whatever the other two believe"
+        );
+    }
+
+    #[test]
+    fn no_evidence_at_all_is_unknown_and_never_dark() {
+        let state = YubabaState::default();
+        assert_eq!(
+            state.corroborated_liveness(9, 100, 30),
+            PeerLivenessVerdict::Unknown,
+            "absence of a REPORT is not absence of a NODE; only a detector saying `dark` is"
+        );
+    }
+
+    #[test]
+    fn a_dead_observers_stale_alive_stops_vetoing_once_it_ages_out() {
+        // The failure this TTL exists to prevent: nodes 4 and 5 share a power
+        // strip, node 4 said node 5 was alive, and then both went. Without an
+        // expiry that last opinion vetoes the shrink forever — in exactly the
+        // correlated-failure scenario the ratchet was built for.
+        let mut state = YubabaState::default();
+        report_liveness(&mut state, 4, 5, PeerLivenessVerdict::Alive, 100);
+        report_liveness(&mut state, 1, 5, PeerLivenessVerdict::Dark, 100);
+        assert_eq!(
+            state.corroborated_liveness(5, 100, 30),
+            PeerLivenessVerdict::Alive,
+            "while node 4's report is fresh it legitimately vetoes"
+        );
+        // 60s later node 1 is still reporting and node 4 is not.
+        report_liveness(&mut state, 1, 5, PeerLivenessVerdict::Dark, 160);
+        assert_eq!(
+            state.corroborated_liveness(5, 160, 30),
+            PeerLivenessVerdict::Dark,
+            "a reporter that has gone quiet past the TTL is itself a failure; its last opinion \
+             must stop counting or the ratchet never fires"
+        );
+    }
+
+    #[test]
+    fn a_peer_liveness_record_survives_a_snapshot_round_trip() {
+        let mut state = YubabaState::default();
+        report_liveness(&mut state, 1, 2, PeerLivenessVerdict::SilentWithinHoldDown, 100);
+        let json = serde_json::to_string(&state).expect("serialise");
+        let back: YubabaState = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(
+            back.corroborated_liveness(2, 100, 30),
+            PeerLivenessVerdict::SilentWithinHoldDown
+        );
+    }
+
+    #[test]
+    fn a_pre_r118_f8_snapshot_loads_with_no_liveness_and_no_ratchet_record() {
+        // new-reads-old: the state_epoch direction for these two fields.
+        let old = r#"{"members":{},"service_placement":{},"locks":{},"ingress_owner":null}"#;
+        let state: YubabaState = serde_json::from_str(old).expect("pre-F8 snapshot must load");
+        assert!(state.peer_liveness.is_empty());
+        assert!(state.last_membership_ratchet.is_none());
+        assert_eq!(
+            state.corroborated_liveness(1, 0, 30),
+            PeerLivenessVerdict::Unknown,
+            "an empty map must read as `unknown`, which vetoes — never as a licence"
+        );
+    }
+
+    #[test]
+    fn the_ratchet_record_round_trips_and_names_its_membership_entry() {
+        let mut state = YubabaState::default();
+        let record = MembershipRatchetRecord {
+            at: 1000,
+            membership_term: 7,
+            membership_index: 42,
+            before: vec![1, 2, 3],
+            after: vec![1],
+            demoted: vec![2, 3],
+            cluster_protocol: crate::cluster_epoch::CLUSTER_PROTOCOL,
+            state_epoch: crate::cluster_epoch::STATE_EPOCH,
+            reason: "two of three corroborated dark".into(),
+        };
+        apply(
+            &mut state,
+            &YubabaRequest::RecordMembershipRatchet {
+                record: record.clone(),
+            },
+        );
+        let json = serde_json::to_string(&state).expect("serialise");
+        let back: YubabaState = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(back.last_membership_ratchet, Some(record));
+    }
+
+    #[test]
+    fn a_pre_f8_binary_still_applies_the_requests_it_understands() {
+        // cluster_protocol direction, stated as a test rather than as prose:
+        // `YubabaRequest` is externally tagged, so a build without these two
+        // variants CANNOT decode them — which is what makes this a breaking
+        // wire change and why the epoch moves. What this pins is the other
+        // half: adding them changed no existing variant's encoding.
+        let put = YubabaRequest::AcquireLock {
+            key: "rig/egress-gateway".into(),
+            owner: "plinth-a".into(),
+            ttl_secs: 30,
+            acquired_at: 100,
+        };
+        let encoded = serde_json::to_value(&put).expect("encode");
+        assert_eq!(
+            encoded["AcquireLock"]["key"], "rig/egress-gateway",
+            "an existing variant's wire shape must be untouched by the new ones"
+        );
+    }
 
     #[test]
     fn apply_set_member() {
@@ -1594,6 +2840,10 @@ mod tests {
                     cpu_millis: 8000,
                 }),
                 machine: Some("us-west-001".into()),
+                provider: Some("static".into()),
+                location: None,
+                ingress_floating_ip: None,
+                public_address: Some("15.204.89.240".into()),
             },
         );
         assert_eq!(
@@ -1617,6 +2867,17 @@ mod tests {
             "R859-F2: the machine tag must survive apply, or nothing can map a confirmed-down \
              node id onto the ingress_owner string that names the same box"
         );
+        assert_eq!(
+            state.members.get(&1).and_then(|m| m.public_address.as_deref()),
+            Some("15.204.89.240"),
+            "R859-F2 phase A: the public address must survive apply — it is the only fact that \
+             turns `withdraw us-west-001` into an A record the fleet may delete, and a \
+             content-matched delete cannot be performed without it"
+        );
+        assert_eq!(
+            state.members.get(&1).and_then(|m| m.provider.as_deref()),
+            Some("static")
+        );
     }
 
     /// R859-F2's identity bridge, both directions, over the pure state.
@@ -1639,6 +2900,10 @@ mod tests {
                     region: None,
                     capacity: None,
                     machine: Some(machine.into()),
+                    provider: None,
+                    location: None,
+                    ingress_floating_ip: None,
+                    public_address: None,
                 },
             );
         }
@@ -1828,6 +3093,7 @@ mod tests {
                 access: SecretAccess::workloads(["ingress"]),
                 digest: Some(vec![0xaa; 32]),
                 sans: None,
+                ari: None,
             },
         );
         let rec = state.secrets.get("tls/yah.dev").expect("secret stored");
@@ -1847,6 +3113,7 @@ mod tests {
                 access: SecretAccess::workloads(["ingress"]),
                 digest: Some(vec![0xbb; 32]),
                 sans: None,
+                ari: None,
             },
         );
         let rec = state.secrets.get("tls/yah.dev").unwrap();
@@ -1891,6 +3158,7 @@ mod tests {
                 access: SecretAccess::workloads(["ingress"]),
                 digest: Some(vec![0xcc; 32]),
                 sans: None,
+                ari: None,
             },
         );
         let json = serde_json::to_string(&state).unwrap();
@@ -1913,6 +3181,7 @@ mod tests {
                 access: SecretAccess::workloads(["ingress"]),
                 digest: Some(vec![0x42; 32]),
                 sans: None,
+                ari: None,
             },
         );
         let rec = state.secrets.get("tls/yah.dev").unwrap();
@@ -1939,6 +3208,123 @@ mod tests {
         }"#;
         let rec: SecretRecord = serde_json::from_str(legacy).unwrap();
         assert_eq!(rec.digest, None);
+    }
+
+    // ── R853-F10: the ARI certificate id on a cert record ─────────────────
+    //
+    // Three tests, one per compatibility direction the surface re-record
+    // claims, because the re-record's whole argument is that this is a
+    // `#[serde(default)]` FIELD on an existing struct and an existing request
+    // variant — tolerated both ways — rather than a new variant needing a
+    // `cluster_protocol` bump. Argued from serde's documented behaviour it
+    // would be an assumption; pinned here it is a fact.
+
+    /// The `state_epoch` half, new-reads-old: a snapshot written before this
+    /// field carries no `ari` key, and it must land on `None` — "predates ARI,
+    /// or not a cert", never an invented id. Deliberately a genuinely B9-era
+    /// record (it carries `sans` and `digest`) rather than a minimal one.
+    #[test]
+    fn a_pre_r853_f10_secret_record_deserializes_with_no_ari() {
+        let legacy = r#"{
+            "ciphertext": [1, 2, 3],
+            "nonce": [4, 4, 4],
+            "updated_at": 7,
+            "access": "allow_any",
+            "digest": [170, 170],
+            "sans": ["yah.dev", "*.yah.dev"]
+        }"#;
+        let rec: SecretRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(rec.ari, None, "an id-less record must read as id-less");
+        assert_eq!(
+            rec.sans.as_deref(),
+            Some(&["yah.dev".to_string(), "*.yah.dev".to_string()][..]),
+            "the fields already there must survive the new one landing"
+        );
+    }
+
+    /// The `state_epoch` half, old-reads-new: stand in for a downgraded
+    /// binary's decoder and confirm the extra key is ignored rather than fatal,
+    /// so a rollback is free.
+    #[test]
+    fn a_downgraded_binary_still_parses_an_ari_bearing_secret_record() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct PreR853F10SecretRecord {
+            ciphertext: Vec<u8>,
+            nonce: Vec<u8>,
+            updated_at: u64,
+            #[serde(default)]
+            sans: Option<Vec<String>>,
+        }
+        let tagged = r#"{
+            "ciphertext": [1, 2, 3],
+            "nonce": [4, 4, 4],
+            "updated_at": 7,
+            "access": "allow_any",
+            "sans": ["yah.dev"],
+            "ari": "aki.serial"
+        }"#;
+        let old: PreR853F10SecretRecord = serde_json::from_str(tagged)
+            .expect("a downgraded binary must still parse an ari-bearing record");
+        assert_eq!(old.updated_at, 7);
+        assert_eq!(old.sans.as_deref(), Some(&["yah.dev".to_string()][..]));
+    }
+
+    /// The `cluster_protocol` half: a pre-F10 node's replicated `PutSecret`
+    /// carries no `ari` key at all and must still apply — landing as `None` —
+    /// rather than stalling the state machine at that log index. `YubabaRequest`
+    /// carries no `deny_unknown_fields`, so the reverse (an old node applying a
+    /// new entry) drops the key for the same reason.
+    #[test]
+    fn a_pre_r853_f10_put_secret_still_applies_with_no_ari() {
+        let legacy = serde_json::json!({
+            "PutSecret": {
+                "name": "tls/yah.dev/cert",
+                "ciphertext": [1, 2, 3],
+                "nonce": [0, 0, 0],
+                "updated_at": 9,
+                "access": "allow_any",
+                "sans": ["yah.dev"]
+            }
+        });
+        let req: YubabaRequest =
+            serde_json::from_value(legacy).expect("an ari-less PutSecret must still parse");
+        let mut state = YubabaState::default();
+        apply(&mut state, &req);
+        let rec = state.secrets.get("tls/yah.dev/cert").expect("secret stored");
+        assert_eq!(rec.ari, None);
+        assert_eq!(rec.sans.as_deref(), Some(&["yah.dev".to_string()][..]));
+    }
+
+    /// And the ordinary path: an id written by the issuer survives apply and a
+    /// snapshot round-trip byte-identically. Without this the *next* renewal
+    /// has nothing to name and silently forfeits the RFC 9773 exemption — the
+    /// failure mode is a lost rate-limit exemption, which is invisible until
+    /// the account is already over the limit.
+    #[test]
+    fn ari_round_trips_through_the_state_machine() {
+        let mut state = YubabaState::default();
+        apply(
+            &mut state,
+            &YubabaRequest::PutSecret {
+                name: "tls/yah.dev/cert".into(),
+                ciphertext: vec![1, 2, 3],
+                nonce: vec![4; 12],
+                updated_at: 500,
+                access: SecretAccess::workloads(["ingress"]),
+                digest: None,
+                sans: Some(vec!["yah.dev".into()]),
+                ari: Some("aki.serial".into()),
+            },
+        );
+        assert_eq!(
+            state.secrets.get("tls/yah.dev/cert").unwrap().ari.as_deref(),
+            Some("aki.serial")
+        );
+
+        let json = serde_json::to_string(&state).unwrap();
+        let restored: YubabaState = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.secrets, state.secrets);
     }
 
     // ── R732-F1: tenant ownership + fencing epochs ────────────────────────
@@ -1981,6 +3367,156 @@ mod tests {
         let rec = state.tenants.get(&tenant("acme")).expect("record written");
         assert_eq!(rec.owner, 1);
         assert_eq!(rec.lease_expires, 1030);
+    }
+
+    // ── R118-T5: per-node boot health, and why the rules live in apply() ──────
+
+    /// A rollout record to file health against. Only the id matters here — the
+    /// health arm looks it up to refuse reports for rollouts that do not exist.
+    fn seed_rollout(state: &mut YubabaState, id: &str) {
+        let policy: workload_spec::rollout::RolloutPolicy = serde_json::from_value(
+            serde_json::json!({ "strategy": "linear", "window_seconds": 600 }),
+        )
+        .expect("policy fixture");
+        assert!(matches!(
+            apply(
+                state,
+                &YubabaRequest::SetRolloutState {
+                    rollout_id: id.to_string(),
+                    artifact: "release:rig-image@v2".to_string(),
+                    status_json: r#"{"kind":"running"}"#.to_string(),
+                    current_step: 0,
+                    started_at: 1,
+                    policy,
+                    trigger: serde_json::Value::Null,
+                    expected_revision: 0,
+                },
+            ),
+            YubabaResponse::Rollout(RolloutWriteOutcome::Committed { .. })
+        ));
+    }
+
+    fn report(
+        state: &mut YubabaState,
+        id: &str,
+        node: &str,
+        verdict: NodeHealthVerdict,
+    ) -> NodeHealthOutcome {
+        match apply(
+            state,
+            &YubabaRequest::ReportNodeHealth {
+                rollout_id: id.to_string(),
+                node: node.to_string(),
+                verdict,
+                detail: String::new(),
+                reported_at: 100,
+            },
+        ) {
+            YubabaResponse::NodeHealth(o) => o,
+            other => panic!("expected a NodeHealth outcome, got {other:?}"),
+        }
+    }
+
+    /// **A failure is sticky, and nothing can un-file it.**
+    ///
+    /// This is not caution for its own sake — it is the appliance's actual
+    /// sequence. `rauc-health.sh failed` reports and then REBOOTS; U-Boot falls
+    /// back to the previous slot; the board comes up entirely healthy on the OLD
+    /// image and its supervisor calls `good`. Last-write-wins would read that
+    /// second, truthful report as the update having worked on the one node it
+    /// demonstrably did not, and the rollout would promote over it.
+    ///
+    /// It lives in `apply` rather than in a handler for the same reason the
+    /// rollout CAS does: `POST /raft/write` takes an arbitrary request, so a
+    /// rule enforced anywhere else is a rule a caller can skip.
+    #[test]
+    fn a_good_report_after_a_failed_one_does_not_clear_it() {
+        let mut state = YubabaState::default();
+        seed_rollout(&mut state, "rt-1");
+
+        assert_eq!(
+            report(&mut state, "rt-1", "plinth-1", NodeHealthVerdict::Failed),
+            NodeHealthOutcome::Recorded {
+                verdict: NodeHealthVerdict::Failed
+            }
+        );
+        assert_eq!(
+            report(&mut state, "rt-1", "plinth-1", NodeHealthVerdict::Good),
+            NodeHealthOutcome::Superseded {
+                standing: NodeHealthVerdict::Failed
+            },
+            "the board that rebooted into the previous slot is healthy and says \
+             so; the rollout still failed on it"
+        );
+        assert_eq!(
+            state.rollout_health["rt-1"]["plinth-1"].verdict,
+            NodeHealthVerdict::Failed
+        );
+    }
+
+    /// The converse, so stickiness is not mistaken for "the first report wins":
+    /// a node that reported healthy and has since fallen over must be able to
+    /// say so.
+    #[test]
+    fn a_failed_report_after_a_good_one_replaces_it() {
+        let mut state = YubabaState::default();
+        seed_rollout(&mut state, "rt-1");
+        report(&mut state, "rt-1", "plinth-1", NodeHealthVerdict::Good);
+        assert_eq!(
+            report(&mut state, "rt-1", "plinth-1", NodeHealthVerdict::Failed),
+            NodeHealthOutcome::Recorded {
+                verdict: NodeHealthVerdict::Failed
+            }
+        );
+        assert_eq!(
+            state.rollout_health["rt-1"]["plinth-1"].verdict,
+            NodeHealthVerdict::Failed
+        );
+    }
+
+    /// Health for a rollout nobody has heard of is refused rather than stored.
+    /// Otherwise the map grows without bound, keyed on a string the caller
+    /// chose, and nothing ever reads or retires it.
+    #[test]
+    fn health_for_an_unknown_rollout_is_refused() {
+        let mut state = YubabaState::default();
+        assert_eq!(
+            report(&mut state, "rt-nope", "plinth-1", NodeHealthVerdict::Good),
+            NodeHealthOutcome::NoSuchRollout
+        );
+        assert!(state.rollout_health.is_empty());
+    }
+
+    /// Retiring a rollout retires its evidence with it — a snapshot must not
+    /// accumulate one entry per node per rollout for ever.
+    #[test]
+    fn clearing_a_rollout_clears_its_health() {
+        let mut state = YubabaState::default();
+        seed_rollout(&mut state, "rt-1");
+        report(&mut state, "rt-1", "plinth-1", NodeHealthVerdict::Good);
+        let revision = state.rollouts["rt-1"].revision;
+        apply(
+            &mut state,
+            &YubabaRequest::ClearRolloutState {
+                rollout_id: "rt-1".to_string(),
+                expected_revision: revision,
+            },
+        );
+        assert!(state.rollouts.is_empty());
+        assert!(
+            state.rollout_health.is_empty(),
+            "the evidence outlived the rollout it was evidence for"
+        );
+    }
+
+    /// A pre-R118-T5 snapshot loads with no health at all rather than failing —
+    /// the `#[serde(default)]` contract every added `YubabaState` field has.
+    #[test]
+    fn a_snapshot_without_rollout_health_loads_empty() {
+        let state: YubabaState =
+            serde_json::from_str(r#"{"members":{},"service_placement":{},"locks":{},"ingress_owner":null}"#)
+                .expect("an older snapshot must still load");
+        assert!(state.rollout_health.is_empty());
     }
 
     /// R869 — **the arithmetic the total-loss recovery runs on**, pinned here
@@ -2407,6 +3943,10 @@ mod tests {
                 region: Some("us-west".into()),
                 capacity,
                 machine: None,
+                provider: None,
+                location: None,
+                ingress_floating_ip: None,
+                public_address: None,
             },
         );
     }

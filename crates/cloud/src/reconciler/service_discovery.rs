@@ -602,6 +602,7 @@ mod tests {
             front_doors: Vec::new(),
             tunnel_id: None,
             edge_provider_id: None,
+            image: None,
         }
     }
 

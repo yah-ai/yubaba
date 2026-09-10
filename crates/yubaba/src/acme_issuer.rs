@@ -50,22 +50,41 @@
 //! @yah:gotcha("THIS FIX CANNOT RUN IN PRODUCTION TODAY, and it is gated outside R853 entirely — found by @Ashguard:griffin reading .yah/infra/machines/us-west-001.toml rather than the R858 summary. The fleet issuer gates on raft leadership (acme_issuer.rs). us-west-001 holds leadership, has NO issuer drop-in, and cannot take a yubaba restart to get one: headscale is lifecycle-bound to leadership (`ingress_ownership: FollowsRaftLeader`), `cloud.mesh.yah.dev` is a fixed A record to west's IP, `headscale.db` is local disk and not raft-replicated, and a transfer reproduces the 37-hour outage of 2026-09-03. us-east-001 and us-south-001 HAVE the drop-in and can never legitimately become leader. So the issuer is configured on exactly the two nodes where it is guaranteed inert, no tls/yah.dev/* cluster secret exists, and no PutSecret carrying `sans` has ever been replicated on this fleet. The fix is correct and unit-tested but UNOBSERVED LIVE, and stays that way until R858-T3 makes leadership movable. This is not an argument against having fixed it: when leadership does become movable the coverage hole would have been live and silent for up to 60 days, so it was closed before the thing that arms it.")
 //! @yah:gotcha("DO NOT ROLL 0.8.33 ACROSS THE WHOLE FLEET on the strength of this ticket. `yah cloud rollout yubaba` drains the leader with an explicit POST /raft/transfer-leader under FollowersFirstLeaderLast, which is the same Sept-3 chain as above. A followers-only roll (east + south to 0.8.33, west left at 0.8.32) is safe for THIS change specifically — `sans` is #[serde(default)] on an existing struct and an existing variant, tolerated in both directions, per the surface_rerecords entry — but that is a statement about this field, not a general clearance for the release.")
 //! @yah:gotcha("The every-voter deployment invariant that R600-F10:51 records as the fix for silent standby is currently UNSATISFIABLE for the reason above. It stands as a correct statement and is simply unreachable on this fleet until R858 lands. My IssuerPresence logging is what makes the interim state legible — an edge-triggered NotLeader line naming the leader is the only thing distinguishing 'correctly inert' from 'misconfigured' while that is true.")
+//!
+//! @yah:ticket(R853-F10, "Carry the ARI certificate id on SecretRecord so yubaba's issuers can declare renewals")
+//! @yah:phase(P1)
+//! @yah:status(review)
+//! @yah:at(2026-09-09T07:33:12Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R853)
+//! @yah:next("THE DESIGN IS ALREADY DECIDED — do not re-derive it, and do not redesign the storage. Add `ari: Option<String>` to `SecretRecord` (raft/mod.rs, beside `sans`) plus the matching field on `YubabaRequest::PutSecret` and its apply arm, all `#[serde(default)]`. It holds `acme_engine::ari_certificate_id(&issued.cert_chain_pem)` — the RFC 9773 \"<base64url AKI>.<base64url serial>\" identifier — written at issuance from the chain the CA actually returned, never from config. Then `acme_issuer::issue_and_store` and `domain_issuer::issue_domain` pass the PREVIOUS record's `ari` as the third argument to `acme_engine::issue`, which today they both pass `None` to with a comment pointing here.")
+//! @yah:next("PLAINTEXT IS THE POINT, and it is the same argument R853-B9 already settled for `sans`: an ARI identifier is derived from public certificate fields (a leaf's AKI and serial are handed to every TLS client on connect), so storing it beside the ciphertext discloses nothing — and it is the only way an issuer can name the cert it is replacing WITHOUT a KEK unseal per renewal. Do not reach for `open_cluster_secret` instead: it needs a `SecretConsumer` the record's own access rule admits, which is a policy question the issuer has no answer to, and its doc comment is explicit that a second decryption path is exactly the code that drifts.")
+//! @yah:gotcha("THIS IS A RAFT SURFACE CHANGE AND NEEDS THE FULL R853-B9 CEREMONY, which is most of the cost of this ticket. Adding the field means `cargo run -p xtask -- cluster-epochs --write` plus a HAND-WRITTEN `surface_rerecords` entry — the tool writes hashes but not the reasoning, and the gate asks a real compatibility question. The argument for `ari` is the same shape as B9's for `sans` and lands the same way: an old node that drops the field omits `replaces`, the order falls back to the CA's exact-identifier-set detection, and the cost is a forfeited rate-limit exemption — never a cert served to the wrong party. That is the R706 discriminator (`access` failed OPEN; this fails closed), so a `#[serde(default)] Option` field on an existing struct and an existing variant needs no `state_epoch` bump.")
+//! @yah:gotcha("SEQUENCE THIS AFTER R858, AND CHECK camp.roster FIRST — that is why it is a separate ticket and not part of R853-F4. The struct-literal sites this field touches include `oss/yubaba/crates/yubaba/src/raft/store.rs:1042` and `src/secret_reload.rs:449`, both of which R858 (@Ashguard:libra) has had uncommitted edits in; as of 2026-09-08 `cargo check -p yubaba --lib --tests` does not compile at all, on 4 errors in `ingress_effector.rs:468` and `raft/store.rs:1548/1555` that belong to that relay. There is also no hurry: the fleet issuer this arms is INERT in production per R853-B9's own gotcha — it gates on raft leadership, the two nodes carrying the issuer drop-in can never legitimately lead, and no `tls/yah.dev/*` cluster secret has ever been written. Other literal sites to update: secrets.rs:354 + :728, cert_store.rs:972, domain_admin.rs:777, domain_issuer.rs:705, acme_issuer.rs:815 + :1067, and the destructuring assert at crates/yah/cloud-client/src/lib.rs:2513.")
+//! @yah:handoff("SHIPPED AS SPECIFIED — the design on this ticket was followed, not re-derived. `SecretRecord` gained `ari: Option<String>` (raft/mod.rs, immediately after `sans`) and `YubabaRequest::PutSecret` the matching field, both `#[serde(default)]`, applied in the existing arm and printed by the `Debug` impl. Nine literal/destructure sites updated: raft/mod.rs (apply + 4 test literals), raft/store.rs, secret_reload.rs, secrets.rs x2, cert_store.rs, domain_admin.rs, domain_issuer.rs, acme_issuer.rs, and the exhaustive destructure at crates/yah/cloud-client/src/lib.rs (which gained an `assert_eq!(ari, None)` on the same contract as its `sans` one — the camp ship path must not claim an id it cannot have).")
+//! @yah:handoff("BOTH ISSUERS NOW DECLARE RENEWALS; the hard-coded `None` third argument to `acme_engine::issue` is gone from the tree (grep: the only remaining call sites are acme-engine's own Pebble test and passway, which was already wired by R853-F4). Fleet issuer: `issue_and_store` gained `replaces: Option<&str>`, stamps `cert_rec.ari = acme_engine::ari_certificate_id(&issued.cert_chain_pem)` from the chain the CA actually returned (same discipline as `sans` — never from config), warns when it cannot derive one, and logs `renewed_via_ari` on the success line. The read is a named seam, `replaces_id(cert: Option<&SecretRecord>)`, extracted for the reason `renewal_decision_for` was: which cert this identifies is not observable from `issue_and_store` without a raft node and a CA. Domain issuer: `issue_domain` gained the same parameter, `store_issued` stamps `ari` the same way, and the caller reads it off the `existing` record it had already fetched for the age check — no extra round-trip, no unseal. `sans` deliberately stays `None` there: `order_identifiers` pins a tenant order to one name that cannot widen, which is what makes `needs_issuance`'s `CertSans::NotChecked` audited rather than a gap; `ari` is about naming the previous cert, not coverage, so that reasoning does not exclude it.")
+//! @yah:handoff("THE CEREMONY WAS RUN IN FULL, and it is most of what this ticket cost. `cargo run -p xtask -- cluster-epochs --write`: cluster_protocol stays 5, state_epoch stays 4, both surface hashes re-recorded (cluster_protocol d4b539bd -> 9f685c20, state_epoch 5b11870a -> 25ec0a43). The hand-written `surface_rerecords` entry is now #21, dated 2026-09-09, and answers the compatibility question rather than restating the hash. Verdict NOT BREAKING on both axes; the R706 discriminator resolves the same way this ticket predicted but more weakly than `sans` did — `access` failed OPEN (an old node dropping it kept serving under an absent authorization check), whereas a dropped `ari` only omits `replaces`, the CA falls back to exact-identifier-set detection, and the cost is a forfeited rate-limit exemption. Never a wrong cert, never a skipped order, never a working issuance turned into a failing one. `#[serde(deny_unknown_fields)]` re-verified absent by grep for this entry rather than inherited: all five occurrences in raft/mod.rs are prose asserting its absence.")
+//! @yah:verify("GREEN, run after every edit landed. `cargo test -p yubaba --lib` (FROM oss/yubaba) = 864 passed / 0 failed. `cargo test -p cloud-client --lib` = 39/0. `cargo test -p xtask --lib` = 52/0. `cargo test -p xtask --test main -- cluster_epoch_drift schema_drift` = 11/0. `cargo run -p xtask -- cluster-epochs` = both surfaces match their recorded hashes. Six new tests, each named for the direction it pins: raft::tests::a_pre_r853_f10_secret_record_deserializes_with_no_ari (state_epoch new-reads-old, against a genuinely B9-era record carrying sans+digest, not a minimal one), ::a_downgraded_binary_still_parses_an_ari_bearing_secret_record (old-reads-new, via a stand-in PreR853F10SecretRecord decoder — the R859-F2 pattern), ::a_pre_r853_f10_put_secret_still_applies_with_no_ari (cluster_protocol: an ari-less replicated PutSecret parses AND applies, so it cannot stall the state machine at that log index), ::ari_round_trips_through_the_state_machine, acme_issuer::tests::a_renewal_names_the_cert_it_replaces and ::a_cold_start_or_a_legacy_record_declares_no_replacement. The serde compat pins are new work: R853-B9 argued its `sans` case from serde's documented behaviour and left no test behind, so these are the first ones on this field family since R859-F2's.")
+//! @yah:gotcha("THE SEQUENCING GOTCHA'S \"DOES NOT COMPILE AT ALL\" WAS A WRONG INVOCATION, NOT A BROKEN TREE — worth knowing because it will mislead the next person the same way. `cargo check -p yubaba` FROM THE REPO ROOT resolves yubaba as a patched non-member (root Cargo.toml `[patch.crates-io]`), so none of its dev-dependencies resolve and you get ~154 cascading `unresolved import` errors on tempfile/http_body_util/cloud/yubaba_test_harness/object_store/turso_backup/kamaji_bin. From `oss/yubaba` the identical command is clean. Newer cargo says this outright on `cargo test`: \"package `yubaba` cannot be tested because it requires dev-dependencies and is not a member of the workspace\". Run every yubaba lib/test command with cwd=oss/yubaba. The 4 errors the gotcha named in ingress_effector.rs / raft/store.rs are also gone — R858's work landed and it is in handoff with no live session, so the sequencing constraint was satisfied when this was claimed (checked camp.roster: no peer on R858).")
+//! @yah:gotcha("STILL INERT IN PRODUCTION, unchanged from R853-B9's gotcha and restated so nobody reads a green test run as a live one: the fleet issuer gates on raft leadership, us-west-001 holds leadership and has no issuer drop-in, east and south carry the drop-in and cannot legitimately lead, and no `tls/yah.dev/*` cluster secret has ever been written — so no PutSecret carrying `ari` has been replicated on this fleet either. It stays that way until R858-T3 makes leadership movable. The half that is NOT leadership-gated is `domain_issuer.rs`, which writes to the object cert store rather than to raft — it can exercise the field's producer and consumer without exercising the replication path the surface_rerecords entry reasons about. ALSO: two integration tests in `cargo test -p yubaba` (--test main) fail under parallel load on this machine — 8 of 68 at --test-threads=4, all in raft_member_registration / raft_membership_loop, all \"nodes never agreed on a leader\". Serially they are 11/11 green. Leader-election timeouts under camp contention, not this change; none of them touch SecretRecord.")
+//! @yah:handoff("TWO DISCOVERED FIXES OUTSIDE THE TITLE, both closed in this pass rather than filed. (1) `xtask/src/install.rs:108` (R836-B1) recorded a live xtask test failure — cluster_epochs::tests::the_declaration_records_current_per_input_digests_for_every_axis, red on R853-B9's then-uncommitted `sans` field. This ticket's `--write` re-recorded both axes and swept that drift up with it; `cargo test -p xtask --lib` is now 52/0. Appended the closure to R836-B1's verify. (2) `oss/passway/crates/acme-engine/src/lib.rs:115` (R853-F4) states \"Both yubaba issuers pass `None`\", which this change made false. Appended a superseding note to R853-F4's handoff naming exactly what moved. Neither file's code was touched — annotation-only, and both are the kind of stale claim that costs the next reader a full debugging loop.")
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use acme_engine::{AcmeChallengeKind, AcmeDirectory, IssueConfig};
+use acme_engine::{AcmeChallengeKind, IssueConfig};
 use openraft::async_runtime::watch::WatchReceiver;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
 use crate::raft::{
-    SecretRecord, YubabaNodeId, YubabaRaft, YubabaRequest, YubabaResponse, YubabaStateMachine,
+    client_write_forwarded, SecretRecord, YubabaNodeId, YubabaRaft, YubabaRequest, YubabaResponse,
+    YubabaStateMachine,
 };
-use crate::cert_store::{CertStoreConfig, ObjectCertStore};
+use crate::cert_store::ObjectCertStore;
 use crate::secrets::{load_cluster_kek, seal_cluster_secret, CLUSTER_KEK_PATH};
 use workload_spec::secrets::SecretAccess;
 
@@ -137,26 +156,43 @@ pub fn decide_issuer_action(lock_won: bool, renewal_due: bool) -> IssuerAction {
 /// R600-F10 measured the failure this exists to close: with the issuer drop-in
 /// installed on us-east-001 and us-south-001 on 2026-09-05, both nodes logged
 /// the `acme issuer: watching` start line and then **nothing at all** for six
-/// minutes — no issuance, no warning, no error. The behaviour was correct
-/// (neither held raft leadership, so neither reached `AcquireLock`) but it is
-/// indistinguishable in a journal from a wedged process, and the operator's
-/// decision to roll the drop-in onto *every* voter makes silence the normal
-/// state on all but one node.
+/// minutes — no issuance, no warning, no error. The behaviour was *correct for
+/// the code as written* (neither held raft leadership, so neither reached
+/// `AcquireLock`) but it is indistinguishable in a journal from a wedged
+/// process. That leadership gate is now gone — see [`run`] — so the states below
+/// describe the lock election itself rather than raft's.
 ///
-/// The two standby reasons are genuinely different conditions and must read
-/// differently: `NotLeader` means this node never tried, `LockHeldElsewhere`
-/// means it tried and lost. Logged once per transition, never per tick — a line
-/// every `check_interval` would be its own kind of unreadable.
+/// The two non-issuing reasons are genuinely different conditions and must read
+/// differently: `LockHeldElsewhere` means this node asked and another owner
+/// holds the lease, `LockUnavailable` means the ask itself did not land. Logged
+/// once per transition, never per tick — a line every `check_interval` would be
+/// its own kind of unreadable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IssuerPresence {
-    /// Holds raft leadership and won the issuer lock: this node is the issuer.
+    /// Won the issuer lock: this node is the issuer, wherever raft leadership is.
     Active,
-    /// Another node holds raft leadership, so the tick short-circuits before
-    /// `AcquireLock`.
-    NotLeader,
-    /// This node is the raft leader, but another owner's lock lease is still
-    /// live and has not lapsed.
+    /// Asked for the lock and lost — another owner's lease is still live.
     LockHeldElsewhere,
+    /// The `AcquireLock` write could not be applied at all: no leader elected, or
+    /// the forward to the leader failed. Distinct from losing the lock, because
+    /// this one means *nobody* may be issuing.
+    LockUnavailable,
+}
+
+/// Map the tick's `AcquireLock` outcome onto the presence to report.
+///
+/// `None` is "the write did not land" and is deliberately its own state rather
+/// than folded into `Some(false)`. They look identical from inside the loop —
+/// neither issues — but they are opposite facts about the *fleet*: losing the
+/// lock means another node is issuing, failing to ask means possibly no node is.
+/// Reporting the second as the first is the R600-F10 bug exactly, so the mapping
+/// is pure and pinned by test rather than inlined at the call site.
+fn presence_for(lock_won: Option<bool>) -> IssuerPresence {
+    match lock_won {
+        Some(true) => IssuerPresence::Active,
+        Some(false) => IssuerPresence::LockHeldElsewhere,
+        None => IssuerPresence::LockUnavailable,
+    }
 }
 
 /// Log `now` iff it differs from `last`, then record it.
@@ -187,22 +223,20 @@ fn report_presence(
     match now {
         IssuerPresence::Active => info!(
             leader = %leader,
-            "acme issuer: ACTIVE — this node holds raft leadership and the issuer \
-             lock {lock_key}; it is the node that places ACME orders"
-        ),
-        IssuerPresence::NotLeader => info!(
-            leader = %leader,
-            "acme issuer: standby — another node holds raft leadership, so this \
-             node does not attempt the issuer lock. This is the normal state for \
-             a non-leader voter and is NOT an error; the issuer runs on the \
-             leader. If no node is issuing, check that the leader also has the \
-             issuer configured"
+            "acme issuer: ACTIVE — this node holds the issuer lock {lock_key}; it \
+             is the node that places ACME orders"
         ),
         IssuerPresence::LockHeldElsewhere => info!(
             leader = %leader,
-            "acme issuer: standby — this node is the raft leader but another \
-             owner still holds the issuer lock {lock_key}; taking over when that \
-             lease lapses"
+            "acme issuer: standby — another owner holds the issuer lock \
+             {lock_key}; taking over when that lease lapses. This is the normal \
+             state for every voter but one and is NOT an error"
+        ),
+        IssuerPresence::LockUnavailable => warn!(
+            leader = %leader,
+            "acme issuer: the {lock_key} lock write is not landing — no leader \
+             elected, or the forward to the leader is failing. NO node is issuing \
+             while this holds; retrying every tick"
         ),
     }
 }
@@ -235,18 +269,6 @@ pub struct IssuerConfig {
     pub cert_lifetime: Duration,
     /// Renew when within this margin of expiry (default 30d).
     pub renew_before: Duration,
-    /// R779 (W267): also write the sealed pair to an object store, when the node
-    /// is configured with one ([`crate::cert_store::CertStoreConfig::parse`]).
-    ///
-    /// Additive, not a replacement: the fleet wildcard is *one* KB-scale record
-    /// and raft is exactly the right home for it. The mirror exists because a
-    /// free-tier edge node fronting 10k domains is not a raft member and so
-    /// cannot read a cluster secret at all — the object store is how cert
-    /// material reaches it, and R779's DECISION 1 puts the per-domain certs
-    /// there for the separate reason that 10k of them would rewrite the whole
-    /// raft state on every `PutSecret`. `None` on an unconfigured node, which
-    /// then behaves exactly as it did before R779.
-    pub cert_store: Option<CertStoreConfig>,
 }
 
 /// Parse the issuer config from a `key -> value` lookup (a pure function over
@@ -287,9 +309,7 @@ pub fn parse_issuer_config(
          unrestricted",
     )?;
 
-    let directory = AcmeDirectory::parse(
-        &get("YUBABA_ACME_DIRECTORY").unwrap_or_else(|| "staging".to_string()),
-    );
+    let directory = crate::cert_store::acme_directory(&get);
     let account_cache_path = get("YUBABA_ACME_ACCOUNT_CACHE")
         .unwrap_or_else(|| "/var/lib/yah/yubaba/acme-account.json".to_string());
     let kek_path =
@@ -363,7 +383,6 @@ pub fn parse_issuer_config(
         lock_ttl: Duration::from_secs(lock_ttl_secs),
         cert_lifetime: Duration::from_secs(cert_lifetime_days * 86_400),
         renew_before: Duration::from_secs(renew_before_days * 86_400),
-        cert_store: CertStoreConfig::parse(&get)?,
     }))
 }
 
@@ -439,16 +458,29 @@ fn parse_u64(
 /// Spawn the issuer background task. Aborted on daemon shutdown; also exits on
 /// its own if the node-local KEK can't be loaded (this node then can't seal, so
 /// it can't be the issuer — consumers still resolve via the F2 path).
+///
+/// R870-B20: `mirror` is the node's cert store, connected by the caller, or
+/// `None` on a node without one. Handed IN rather than parsed from the issuer's
+/// own config — a cert store is a property of the *node*, not of the issuer, and
+/// owning it here made `YUBABA_CERT_STORE_*` silently inert on every node that
+/// is not also an ACME issuer.
 pub fn spawn(
     node_id: YubabaNodeId,
     raft: YubabaRaft,
     state_machine: YubabaStateMachine,
     config: IssuerConfig,
+    mirror: Option<Arc<ObjectCertStore>>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move { run(node_id, raft, state_machine, config).await })
+    tokio::spawn(async move { run(node_id, raft, state_machine, config, mirror).await })
 }
 
-async fn run(node_id: YubabaNodeId, raft: YubabaRaft, sm: YubabaStateMachine, cfg: IssuerConfig) {
+async fn run(
+    node_id: YubabaNodeId,
+    raft: YubabaRaft,
+    sm: YubabaStateMachine,
+    cfg: IssuerConfig,
+    mirror: Option<Arc<ObjectCertStore>>,
+) {
     let kek = match load_cluster_kek(&cfg.kek_path) {
         Ok(k) => k,
         Err(e) => {
@@ -459,29 +491,32 @@ async fn run(node_id: YubabaNodeId, raft: YubabaRaft, sm: YubabaStateMachine, cf
             return;
         }
     };
-    // R779: build the object-store mirror once, up front. A misconfigured or
-    // unreachable bucket disables the mirror and is loud about it — it must not
-    // stop the fleet cert from renewing, which is what returning here would do.
-    let mirror = match &cfg.cert_store {
-        None => None,
-        Some(store_cfg) => match store_cfg.connect(&cfg.issue.directory.url()) {
-            Ok(store) => {
-                info!(
-                    bucket = %store_cfg.bucket,
-                    issuer = %store.issuer(),
-                    "acme issuer: mirroring the sealed pair to the object cert store"
-                );
-                Some(store)
-            }
-            Err(e) => {
-                error!(
-                    bucket = %store_cfg.bucket,
-                    "acme issuer: object cert store unavailable — mirroring disabled, \
-                     raft writes continue: {e}"
-                );
-                None
-            }
-        },
+    // R779: the object-store mirror, connected by the caller (R870-B20). A node
+    // without a store — or one whose bucket did not connect, which main already
+    // logged — mirrors nothing and keeps renewing the fleet cert through raft;
+    // a missing mirror must never stop issuance.
+    if let Some(store) = &mirror {
+        info!(
+            issuer = %store.issuer(),
+            "acme issuer: mirroring the sealed pair to the object cert store"
+        );
+    }
+    // Every raft write this loop makes goes through the leader, and this node is
+    // usually not it — so the forwarding client is as load-bearing as the KEK,
+    // and the same "then this node cannot be the issuer" exit applies. Only
+    // reachable if the TLS backend fails to initialise.
+    let client = match reqwest::Client::builder()
+        .timeout(crate::raft::FORWARD_TIMEOUT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!(
+                "acme issuer: could not build the forward-to-leader HTTP client — \
+                 issuer disabled on this node: {e}"
+            );
+            return;
+        }
     };
     let owner = node_id.to_string();
     let lock_key = issuer_lock_key(&cfg.domain);
@@ -500,71 +535,86 @@ async fn run(node_id: YubabaNodeId, raft: YubabaRaft, sm: YubabaStateMachine, cf
 
     loop {
         let cert_present = sm.cluster_secret(&cert_key);
-
-        // Only the raft leader can `client_write`; a follower's AcquireLock would
-        // just ForwardToLeader. Gate on leadership to avoid the spam, then let
-        // the lock be the linearizable single-issuer guard: during a transient
-        // double-leader, raft orders the two AcquireLocks and the second sees a
-        // live owner and is denied, so two nodes never issue concurrently.
         let current_leader = { raft.metrics().borrow_watched().current_leader };
-        let is_leader = current_leader == Some(node_id);
+
+        // EVERY configured node asks for the lock, wherever raft leadership sits
+        // — the lock IS the election (W273 §"exactly one issuer per SAN set"),
+        // and a follower's write reaches the leader through
+        // `client_write_forwarded`. This deliberately replaces an earlier
+        // `current_leader == Some(node_id)` gate that existed only to dodge
+        // `ForwardToLeader` errors: it silently intersected the issuer set with
+        // {leader}, so a fleet whose leader had no issuer config ordered nothing
+        // and said nothing (R600-F10, measured 2026-09-05).
+        //
+        // Single-issuer safety is unchanged, because it never came from the
+        // gate: raft orders the concurrent AcquireLocks and every one after the
+        // first sees a live owner and is denied. Issuer identity is now *more*
+        // stable, not less — it no longer moves on every raft election.
+        let lock_won = match client_write_forwarded(
+            &raft,
+            &client,
+            YubabaRequest::AcquireLock {
+                key: lock_key.clone(),
+                owner: owner.clone(),
+                ttl_secs: cfg.lock_ttl.as_secs(),
+                acquired_at: unix_now(),
+            },
+        )
+        .await
+        {
+            Ok(resp) => Some(matches!(resp, YubabaResponse::LockGranted(true))),
+            Err(e) => {
+                // `None` = the ask did not land, which is NOT the same as losing
+                // the lock and must not be reported as standby: nobody may be
+                // issuing. Detail at debug because the edge-triggered
+                // `LockUnavailable` warning carries the operator-facing half and
+                // this repeats every tick through an election.
+                debug!("acme issuer: AcquireLock write failed (retry next tick): {e:#}");
+                None
+            }
+        };
+
         // Stays true unless an issuance leaves the store MISMATCHED (new key
         // written, cert write failed); that must retry promptly, not sleep the
         // full renewal interval, or consumers see a new-key/old-cert TLS
         // failure until then.
         let mut store_consistent = true;
-        if is_leader {
-            let lock_won = match raft
-                .client_write(YubabaRequest::AcquireLock {
-                    key: lock_key.clone(),
-                    owner: owner.clone(),
-                    ttl_secs: cfg.lock_ttl.as_secs(),
-                    acquired_at: unix_now(),
-                })
-                .await
-            {
-                Ok(resp) => matches!(resp.data, YubabaResponse::LockGranted(true)),
-                Err(e) => {
-                    warn!("acme issuer: AcquireLock write failed (retry next tick): {e}");
-                    false
-                }
-            };
 
-            let decision = renewal_decision_for(cert_present.as_ref(), &cfg, SystemTime::now());
-            if let acme_engine::RenewalDecision::DueForCoverage(missing) = &decision {
-                warn!(
-                    domain = %cfg.domain,
-                    have = %cert_present.as_ref().and_then(|r| r.sans.as_ref()).map(|s| s.join(", ")).unwrap_or_default(),
-                    want = %cfg.issue.domains.join(", "),
-                    missing = %missing.join(", "),
-                    "acme issuer: the stored fleet cert does not cover every configured \
-                     domain — re-ordering regardless of its age"
-                );
-            }
-            let renewal_due = decision.is_due();
-
-            report_presence(
-                &mut last_presence,
-                if lock_won {
-                    IssuerPresence::Active
-                } else {
-                    IssuerPresence::LockHeldElsewhere
-                },
-                current_leader,
-                &lock_key,
+        let decision = renewal_decision_for(cert_present.as_ref(), &cfg, SystemTime::now());
+        if let acme_engine::RenewalDecision::DueForCoverage(missing) = &decision {
+            warn!(
+                domain = %cfg.domain,
+                have = %cert_present.as_ref().and_then(|r| r.sans.as_ref()).map(|s| s.join(", ")).unwrap_or_default(),
+                want = %cfg.issue.domains.join(", "),
+                missing = %missing.join(", "),
+                "acme issuer: the stored fleet cert does not cover every configured \
+                 domain — re-ordering regardless of its age"
             );
+        }
+        let renewal_due = decision.is_due();
 
-            if decide_issuer_action(lock_won, renewal_due) == IssuerAction::Issue {
-                store_consistent =
-                    issue_and_store(&raft, &kek, &cfg, mirror.as_ref(), &cert_key, &key_key).await;
-            }
-        } else {
-            report_presence(
-                &mut last_presence,
-                IssuerPresence::NotLeader,
-                current_leader,
-                &lock_key,
-            );
+        report_presence(
+            &mut last_presence,
+            presence_for(lock_won),
+            current_leader,
+            &lock_key,
+        );
+
+        if decide_issuer_action(lock_won.unwrap_or(false), renewal_due) == IssuerAction::Issue {
+            store_consistent = issue_and_store(
+                &raft,
+                &client,
+                &kek,
+                &cfg,
+                mirror.as_deref(),
+                &cert_key,
+                &key_key,
+                // R853-F10: the id of the chain we are holding right now, so
+                // the order declares itself a renewal of it. Plaintext on the
+                // record, so this costs no unseal.
+                replaces_id(cert_present.as_ref()),
+            )
+            .await;
         }
 
         // Poll fast until a cert exists (cold-start first issuance) OR the last
@@ -589,16 +639,27 @@ async fn run(node_id: YubabaNodeId, raft: YubabaRaft, sm: YubabaStateMachine, cf
 /// retries promptly instead of sleeping the renewal interval.
 async fn issue_and_store(
     raft: &YubabaRaft,
+    client: &reqwest::Client,
     kek: &[u8; 32],
     cfg: &IssuerConfig,
     mirror: Option<&ObjectCertStore>,
     cert_key: &str,
     key_key: &str,
+    replaces: Option<&str>,
 ) -> bool {
     info!(domain = %cfg.domain, "acme issuer: issuing/renewing the fleet cert");
     // DNS-01 needs no HTTP-01 token map, but the engine's signature takes one.
     let tokens: acme_engine::ChallengeTokens = Arc::new(RwLock::new(HashMap::new()));
-    let issued = match acme_engine::issue(&cfg.issue, &tokens).await {
+    // R853-F10: `replaces` is the ARI identifier of the chain we are currently
+    // holding, read out of `SecretRecord::ari` by the caller — plaintext, so no
+    // KEK unseal per renewal. Declaring the order as a renewal of that exact
+    // certificate is what buys the RFC 9773 rate-limit exemption for a
+    // *widened* order, which is precisely the case exact-identifier-set
+    // detection cannot recognise (a new `YUBABA_ACME_EXTRA_DOMAINS` name makes
+    // the set new by definition). `None` — cold start, a legacy pre-`ari`
+    // record, or a chain we could not parse an id out of — falls back to that
+    // exact-set detection, i.e. to exactly the pre-F10 behaviour.
+    let issued = match acme_engine::issue(&cfg.issue, &tokens, replaces).await {
         Ok(i) => i,
         Err(e) => {
             error!("acme issuer: issuance failed (retry next tick): {e}");
@@ -627,6 +688,21 @@ async fn issue_and_store(
              storing it without coverage metadata, so renewal falls back to age alone"
         );
     }
+    // R853-F10: and the ARI id of that same chain, so the NEXT renewal can name
+    // this certificate as the one it replaces. Read from the returned PEM for
+    // the same reason `sans` is: it must describe the cert we actually hold.
+    // `issued.renewed_via_ari` reports whether the order we just placed was
+    // itself accepted as a renewal — logged rather than stored, since it is a
+    // fact about this order and not about the chain.
+    cert_rec.ari = acme_engine::ari_certificate_id(&issued.cert_chain_pem);
+    if cert_rec.ari.is_none() {
+        warn!(
+            domain = %cfg.domain,
+            "acme issuer: could not derive an ARI id from the freshly issued chain — \
+             storing it without one, so the next renewal forfeits the RFC 9773 \
+             rate-limit exemption and falls back to exact-identifier-set detection"
+        );
+    }
     // Copy the private-key PEM into a zeroizing buffer so the plaintext key is
     // scrubbed when it drops at the end of this fn, rather than lingering in a
     // freed `String`'s heap page (the engine hands us a plain `String`; this is
@@ -639,12 +715,12 @@ async fn issue_and_store(
     // a partial failure leaves the cert stale/absent, so `renewal_due` stays
     // true and the next tick re-issues and heals — the store never gets wedged
     // with a fresh cert paired to a stale key.
-    if let Err(e) = put_secret(raft, key_key, key_rec.clone()).await {
+    if let Err(e) = put_secret(raft, client, key_key, key_rec.clone()).await {
         // Key write is first, so nothing was overwritten — store still consistent.
         error!("acme issuer: PutSecret(key) failed (prior state intact): {e}");
         return true;
     }
-    if let Err(e) = put_secret(raft, cert_key, cert_rec.clone()).await {
+    if let Err(e) = put_secret(raft, client, cert_key, cert_rec.clone()).await {
         error!(
             "acme issuer: PutSecret(cert) failed AFTER the key write — store has a \
              new key against the old cert; retrying promptly to heal: {e}"
@@ -653,6 +729,7 @@ async fn issue_and_store(
     }
     info!(
         domain = %cfg.domain,
+        renewed_via_ari = issued.renewed_via_ari,
         "acme issuer: sealed cert+key written to cluster store — replicating to all nodes"
     );
 
@@ -746,18 +823,47 @@ pub fn renewal_decision_for(
     )
 }
 
-async fn put_secret(raft: &YubabaRaft, name: &str, rec: SecretRecord) -> anyhow::Result<()> {
-    raft.client_write(YubabaRequest::PutSecret {
-        name: name.to_string(),
-        ciphertext: rec.ciphertext,
-        nonce: rec.nonce,
-        updated_at: rec.updated_at,
-        access: rec.access,
-        digest: rec.digest,
-        sans: rec.sans,
-    })
-    .await?;
-    Ok(())
+/// The ARI id to declare the next order a renewal of — the one on the cert
+/// record we are currently holding (R853-F10).
+///
+/// A named seam rather than an inline `and_then` for the same reason
+/// [`renewal_decision_for`] is one: the interesting property is *which* cert
+/// this identifies, and it is not observable from `issue_and_store` without a
+/// raft node and a CA. `None` on all three of cold start, a record written
+/// before the field existed, and a chain `acme_engine::ari_certificate_id`
+/// could not parse — every one of which falls back to the CA's own
+/// exact-identifier-set detection, i.e. to the pre-F10 behaviour.
+fn replaces_id(cert: Option<&SecretRecord>) -> Option<&str> {
+    cert.and_then(|r| r.ari.as_deref())
+}
+
+/// Store one sealed record through consensus.
+///
+/// Forwarded like the lock write: the issuer is elected by the lock, so the node
+/// holding it is very often not the raft leader, and a bare `client_write` here
+/// would fail on exactly the nodes the election is now free to pick.
+async fn put_secret(
+    raft: &YubabaRaft,
+    client: &reqwest::Client,
+    name: &str,
+    rec: SecretRecord,
+) -> anyhow::Result<()> {
+    client_write_forwarded(
+        raft,
+        client,
+        YubabaRequest::PutSecret {
+            name: name.to_string(),
+            ciphertext: rec.ciphertext,
+            nonce: rec.nonce,
+            updated_at: rec.updated_at,
+            access: rec.access,
+            digest: rec.digest,
+            sans: rec.sans,
+            ari: rec.ari,
+        },
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Parse `YUBABA_ACME_CONSUMERS` into a [`SecretAccess`] rule (R706 / W294).
@@ -797,6 +903,8 @@ fn unix_now() -> u64 {
 mod tests {
     use super::*;
 
+    use acme_engine::AcmeDirectory;
+
     #[test]
     fn secret_key_naming() {
         assert_eq!(cert_secret_name("yah.dev"), "tls/yah.dev/cert");
@@ -819,32 +927,63 @@ mod tests {
 
         // First observation always logs: a freshly restarted unit must say where
         // it landed rather than sitting silent, which is the original bug.
-        assert!(logged(&mut last, IssuerPresence::NotLeader));
+        assert!(logged(&mut last, IssuerPresence::LockHeldElsewhere));
         // Steady state is silent, however many ticks pass.
-        assert!(!logged(&mut last, IssuerPresence::NotLeader));
-        assert!(!logged(&mut last, IssuerPresence::NotLeader));
+        assert!(!logged(&mut last, IssuerPresence::LockHeldElsewhere));
+        assert!(!logged(&mut last, IssuerPresence::LockHeldElsewhere));
         // Every real transition speaks, in both directions.
         assert!(logged(&mut last, IssuerPresence::Active));
+        assert!(logged(&mut last, IssuerPresence::LockUnavailable));
         assert!(logged(&mut last, IssuerPresence::LockHeldElsewhere));
-        assert!(logged(&mut last, IssuerPresence::NotLeader));
-        assert_eq!(last, Some(IssuerPresence::NotLeader));
+        assert_eq!(last, Some(IssuerPresence::LockHeldElsewhere));
     }
 
-    /// The two standby reasons are different conditions, so a move between them
-    /// is a transition that must log — collapsing them into one "standby" state
-    /// would hide a leader change from the operator.
+    /// The whole point of dropping the leadership gate is that a node which is
+    /// NOT the raft leader can still be the issuer — so winning the lock must
+    /// read as ACTIVE with no reference to leadership, and a failed ask must
+    /// never be reported as the benign "someone else has it".
     #[test]
-    fn the_two_standby_reasons_are_distinct_states() {
-        assert_ne!(IssuerPresence::NotLeader, IssuerPresence::LockHeldElsewhere);
+    fn a_failed_lock_write_is_not_reported_as_standby() {
+        assert_eq!(presence_for(Some(true)), IssuerPresence::Active);
+        assert_eq!(presence_for(Some(false)), IssuerPresence::LockHeldElsewhere);
+        assert_eq!(presence_for(None), IssuerPresence::LockUnavailable);
+        // The failure mode this guards: `unwrap_or(false)` on the way to the
+        // presence would silently turn "nobody is issuing" into "somebody is".
+        assert_ne!(presence_for(None), presence_for(Some(false)));
+    }
 
-        let mut last = Some(IssuerPresence::NotLeader);
+    /// A tick that could not place the lock request must not act as though it
+    /// holds the lock — the `Option` collapses to `false` for the ACTION even
+    /// though it stays distinct for the REPORT.
+    #[test]
+    fn an_unlanded_lock_write_never_issues() {
+        let lock_won: Option<bool> = None;
+        assert_eq!(
+            decide_issuer_action(lock_won.unwrap_or(false), true),
+            IssuerAction::Standby
+        );
+    }
+
+    /// "Another node holds the lock" and "the lock write did not land" are
+    /// different conditions with different operator responses — the first is the
+    /// normal state of every voter but one, the second means NOBODY is issuing.
+    /// Collapsing them into one "standby" is precisely the R600-F10 failure in a
+    /// new costume.
+    #[test]
+    fn losing_the_lock_and_failing_to_ask_are_distinct_states() {
+        assert_ne!(
+            IssuerPresence::LockUnavailable,
+            IssuerPresence::LockHeldElsewhere
+        );
+
+        let mut last = Some(IssuerPresence::LockHeldElsewhere);
         report_presence(
             &mut last,
-            IssuerPresence::LockHeldElsewhere,
+            IssuerPresence::LockUnavailable,
             None,
             "acme-issuer/yah.dev",
         );
-        assert_eq!(last, Some(IssuerPresence::LockHeldElsewhere));
+        assert_eq!(last, Some(IssuerPresence::LockUnavailable));
     }
 
     #[test]
@@ -890,36 +1029,35 @@ mod tests {
         ]
     }
 
+    /// R870-B20: the store and the issuer are independent config. A door with a
+    /// bucket and no `YUBABA_ACME_DOMAIN` used to get NO store at all, because
+    /// the only way to reach one was through `IssuerConfig`.
     #[test]
-    fn cert_store_mirror_is_off_unless_a_bucket_is_named() {
-        let cfg = parse_issuer_config(env(&issuer_env_pairs())).unwrap().unwrap();
-        assert_eq!(cfg.cert_store, None);
-    }
-
-    #[test]
-    fn cert_store_mirror_parses_from_the_issuer_env() {
-        let mut pairs = issuer_env_pairs();
-        pairs.push((crate::cert_store::BUCKET_ENV, "yah-certs"));
-        pairs.push((crate::cert_store::ACCOUNT_ID_ENV, "acct123"));
-        let cfg = parse_issuer_config(env(&pairs)).unwrap().unwrap();
-        assert_eq!(
-            cfg.cert_store,
-            Some(crate::cert_store::CertStoreConfig {
-                account_id: "acct123".into(),
-                bucket: "yah-certs".into(),
-                endpoint: None,
-            })
+    fn a_cert_store_parses_with_no_acme_issuer_configured() {
+        let store_env = [
+            (crate::cert_store::BUCKET_ENV, "yah-certs"),
+            (crate::cert_store::ACCOUNT_ID_ENV, "acct123"),
+        ];
+        assert!(
+            crate::cert_store::CertStoreConfig::parse(env(&store_env))
+                .unwrap()
+                .is_some(),
+            "the cert store must not need an ACME issuer to exist"
+        );
+        assert!(
+            parse_issuer_config(env(&store_env)).unwrap().is_none(),
+            "no YUBABA_ACME_DOMAIN still means no issuer — that is the point"
         );
     }
 
+    /// And the reverse coupling is gone too: cert-store env is no longer read
+    /// here, so a half-configured bucket cannot take the issuer down with it.
+    /// `main` parses and reports the store itself.
     #[test]
-    fn a_bucket_without_an_account_id_is_a_config_error() {
-        // Half-configured means an operator meant to turn this on; a silent skip
-        // surfaces weeks later as a missing cert.
+    fn issuer_config_no_longer_reads_the_cert_store_env() {
         let mut pairs = issuer_env_pairs();
         pairs.push((crate::cert_store::BUCKET_ENV, "yah-certs"));
-        let err = parse_issuer_config(env(&pairs)).unwrap_err();
-        assert!(err.contains(crate::cert_store::ACCOUNT_ID_ENV), "got {err}");
+        assert!(parse_issuer_config(env(&pairs)).unwrap().is_some());
     }
 
     #[test]
@@ -975,7 +1113,37 @@ mod tests {
             access: Default::default(),
             digest: None,
             sans: sans.map(|s| s.iter().map(|n| n.to_string()).collect()),
+            ari: None,
         }
+    }
+
+    /// R853-F10: the order must name the cert it is replacing, taken off the
+    /// record we are holding. This is the whole plumbing F10 adds — before it,
+    /// `issue_and_store` passed a hard-coded `None` — and it is what makes a
+    /// *widened* order a renewal rather than a brand-new certificate. Exact-set
+    /// detection cannot recognise a widened order by construction: adding a
+    /// name makes the identifier set new.
+    #[test]
+    fn a_renewal_names_the_cert_it_replaces() {
+        let mut rec = stored(Some(&["*.yah.dev", "yah.dev"]), 1);
+        rec.ari = Some("aki.serial".into());
+        assert_eq!(replaces_id(Some(&rec)), Some("aki.serial"));
+    }
+
+    /// The three `None` paths, which must all be *safe* rather than merely
+    /// tolerated: each falls back to the CA's exact-identifier-set detection,
+    /// i.e. to exactly what every order did before F10. A cold start has no
+    /// previous cert to name; a pre-F10 record predates the field; an
+    /// unparseable chain stamps `None` at issuance. None of them can turn an
+    /// order that would have worked into one that does not.
+    #[test]
+    fn a_cold_start_or_a_legacy_record_declares_no_replacement() {
+        assert_eq!(replaces_id(None), None, "cold start: nothing to replace");
+        assert_eq!(
+            replaces_id(Some(&stored(Some(&["yah.dev"]), 1))),
+            None,
+            "a pre-F10 record carries no id and must not invent one"
+        );
     }
 
     /// THE B9 REGRESSION. Widening `YUBABA_ACME_EXTRA_DOMAINS` and restarting

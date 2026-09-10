@@ -829,6 +829,7 @@ mod tests {
             front_doors: front_doors.iter().map(|m| m.to_string()).collect(),
             tunnel_id: None,
             edge_provider_id: None,
+            image: None,
         }
     }
 

@@ -297,6 +297,14 @@ struct ClusterNode {
     /// process, and a restarted node pointed at a fresh dir would prove the
     /// opposite of what it was written to prove.
     headscale_dir: Option<PathBuf>,
+    /// Whether this node is currently cut off by [`Cluster::partition_node`]
+    /// (R118-F7).
+    ///
+    /// Not derivable from `raft.is_none()`: a smoke-tier node and a killed node
+    /// also have no raft handle, and neither of those is a partition. The whole
+    /// distinction this primitive exists to draw is *running but unreachable*,
+    /// so it is recorded rather than inferred.
+    partitioned: bool,
 }
 
 // ── Cluster ───────────────────────────────────────────────────────────────────
@@ -313,22 +321,30 @@ struct ClusterNode {
 /// [`Cluster::wait_for_leader`] and [`Cluster::current_leader_idx`] expose the
 /// raft election state.
 ///
-/// **There is no partition primitive here, and there never was one.** The
-/// `NetworkDegrade` type this struct used to carry described a `tc qdisc` spec,
-/// but nothing read the field: it was set by a builder method and dropped. The
-/// real `tc` knob (`YAH_LOCAL_NETWORK_DEGRADE`) belongs to
-/// `cloud::provider::local_docker::LocalDockerProvider`, which puts machines in
-/// *containers* — a different tier from these in-process loopback servers,
-/// which share one network namespace and cannot be impaired with `tc` at all.
-/// The dead type is removed (R118-T1) so that gap reads as a gap.
+/// ## Partition
 ///
-/// This matters because `kill_node` and a partition are **not**
-/// interchangeable, and the difference is the whole safety argument for the
-/// membership ratchet (W138 / R118-F7): a powered-off node emits nothing on any
-/// channel, while an IP-partitioned node stays alive and answers a
-/// corroborating one. `kill_node` models the first. Modelling the second needs
-/// a way to cut a node's raft links while leaving it running, which is
-/// R118-F7's to build alongside the detector that consumes it.
+/// [`Cluster::partition_node`] cuts one node's raft links in **both**
+/// directions while leaving the machine running and answering `/health` and
+/// `GET /cluster/singletons`; [`Cluster::heal_node`] puts it back.
+/// [`Cluster::is_partitioned`] reports the state.
+///
+/// **`kill_node` and `partition_node` are not interchangeable**, and the
+/// difference is the whole safety argument for the membership ratchet (W138 /
+/// R118-F7): a powered-off node emits nothing on any channel, while an
+/// IP-partitioned node stays alive and answers a corroborating one. The ratchet
+/// must shrink on the first and must **not** shrink on the second, so a test
+/// that reaches for `kill_node` when it means a partition is asserting the
+/// wrong half.
+///
+/// It is **not** built on `tc`, and a reader coming from W138 should know why.
+/// The `NetworkDegrade` type this struct used to carry described a `tc qdisc`
+/// spec, but nothing read the field: it was set by a builder method and dropped
+/// (removed in R118-T1). The real `tc` knob (`YAH_LOCAL_NETWORK_DEGRADE`)
+/// belongs to `cloud::provider::local_docker::LocalDockerProvider`, which puts
+/// machines in *containers* — a different tier from these in-process loopback
+/// servers, which share one network namespace and cannot be impaired with `tc`
+/// at all. `partition_node` cuts the links at the raft layer instead; see its
+/// own doc for both halves and for the fidelity gap.
 pub struct Cluster {
     nodes: Vec<ClusterNode>,
     /// Smoke tier teardown: destroy Hetzner machines + buckets. `None` for
@@ -501,6 +517,129 @@ impl Cluster {
         self.nodes[idx].task.is_some()
     }
 
+    /// Cut node `idx`'s raft links **in both directions** while leaving the
+    /// machine running and answering on every other channel (R118-F7).
+    ///
+    /// This is the partition primitive the harness did not have. It is not
+    /// [`Self::kill_node`] and the two are not interchangeable: `kill_node`
+    /// models a power cut, where the node emits nothing on any channel, and
+    /// this models a network fault, where the node is alive and a corroborating
+    /// channel can still hear it. The membership ratchet (`W138` / `R118-F7`)
+    /// must shrink on the first and must **not** shrink on the second, and
+    /// until now there was no way to write the second half of that test.
+    ///
+    /// # Both directions, because inbound-only is not a partition
+    ///
+    /// Every harness node lives in one process on one loopback namespace, so
+    /// gating a node's inbound `/raft/*` routes is **not sufficient**: its
+    /// outbound `AppendEntries` still reach peers and the replies ride back on
+    /// connections it opened, so an "isolated" leader keeps its lease and goes
+    /// on leading. That is the opposite of a partition. So:
+    ///
+    /// - **Outbound** is cut by `Raft::shutdown()` — the raft actor stops, so
+    ///   it issues no `AppendEntries`, no vote requests, and holds no lease.
+    /// - **Inbound** is cut by rebinding the router on the same port from a
+    ///   `ServerState` **with no raft attached**, so every `/raft/*` route
+    ///   answers `503` via `require_raft!` and a peer's `RaftNetworkV2` client
+    ///   sees an undecodable reply, i.e. an unreachable node.
+    ///
+    /// No yubaba production code is needed for either half, which is why this
+    /// route was taken: `ServerState`'s `raft` is already an `Option` and the
+    /// handlers already refuse without it.
+    ///
+    /// **The `shutdown()` is load-bearing, and the way it would fail is subtle
+    /// enough to write down.** `Raft` is a handle over a shared actor, so
+    /// *dropping the last clone* stops the actor too; since the rebind below
+    /// replaces the only other holder (the old `ServerState`), deleting the
+    /// explicit shutdown still happens to cut outbound *today*. It would stop
+    /// doing so the moment anything else stashed a clone, and the result would
+    /// be an inbound-only gate that looks like a partition and is not.
+    /// Measured, by keeping the actor deliberately alive: the two survivors
+    /// still reported the "partitioned" leader as leader ten seconds later
+    /// (`current_leader = [Some(1), Some(1)]`), which is the trap exactly. Cut
+    /// it explicitly, and await it.
+    ///
+    /// # What stays up — deliberately, and it is the point
+    ///
+    /// `/health` keeps answering, and so does `GET /cluster/singletons`,
+    /// because the partitioned state keeps its `cluster_state` handle and only
+    /// drops `raft`. **That is the corroborating-channel signal this whole
+    /// design turns on** (`R118-F7`): a partitioned plinth is one that a
+    /// non-raft channel can still hear, and a harness that darkened every
+    /// channel at once would only be able to model a power cut again. It also
+    /// means a test can watch the isolated node's `applied_index` stop
+    /// advancing while it still answers — `R118-T3`'s staleness signal.
+    ///
+    /// # Fidelity gap — one line, so `R118-F8` knows what its chaos test proves
+    ///
+    /// **A shut-down node stops campaigning, where a really-partitioned one
+    /// keeps raising terms.** So this models the *majority* side's view of a
+    /// partition faithfully (the minority node is unreachable and commits
+    /// nothing), but it does not reproduce a returning node that comes back
+    /// with a higher term — which is exactly the case `W158` §5's epoch fence
+    /// exists for. A ratchet test built on this proves "does not shrink a peer
+    /// it can still hear"; it does not prove the fence. A second gap, smaller:
+    /// peers see a `503` rather than a connection timeout. Both are RPC
+    /// failures to openraft, but the timing differs from a real drop.
+    pub async fn partition_node(&mut self, idx: usize) -> Result<()> {
+        let node = self
+            .nodes
+            .get_mut(idx)
+            .ok_or_else(|| anyhow::anyhow!("partition_node: no node at index {idx}"))?;
+
+        if node.task.is_none() {
+            anyhow::bail!(
+                "partition_node: node {idx} is not running — partitioning a dead node is \
+                 kill_node twice, not a network fault"
+            );
+        }
+
+        // Outbound first, for kill_node's reason: a raft actor that outlives
+        // the listener it answers on is the half-dead state that makes an
+        // isolated leader keep leading.
+        if let Some(raft) = node.raft.take() {
+            raft.shutdown()
+                .await
+                .map_err(|e| anyhow::anyhow!("partition_node: raft shutdown for node {idx}: {e}"))?;
+        }
+
+        // The listener is dropped by `bind_node`, which owns that step for both
+        // of its callers. Unlike kill_node, `state_machine` is deliberately
+        // KEPT: the machine is still powered on, and what it already applied is
+        // still what it believes.
+        self.bind_node(idx, false).await.with_context(|| {
+            format!("partition_node: rebind node {idx} without raft")
+        })?;
+        self.nodes[idx].partitioned = true;
+        Ok(())
+    }
+
+    /// Whether node `idx` is currently partitioned by [`Self::partition_node`].
+    ///
+    /// Distinct from `!`[`Self::is_running`]: a partitioned node **is**
+    /// running, which is the entire difference this primitive exists to
+    /// express.
+    pub fn is_partitioned(&self, idx: usize) -> bool {
+        self.nodes[idx].partitioned
+    }
+
+    /// Heal a partition: re-attach raft and rebind the full router.
+    ///
+    /// The mirror of [`Self::partition_node`]. Mechanically identical to
+    /// [`Self::restart_node`] — the raft log and vote are on disk either way —
+    /// but named separately because the two model different events and a test
+    /// that says `heal_node` is stating which one it staged.
+    pub async fn heal_node(&mut self, idx: usize) -> Result<()> {
+        if !self.nodes[idx].partitioned {
+            anyhow::bail!("heal_node: node {idx} is not partitioned");
+        }
+        self.bind_node(idx, true)
+            .await
+            .with_context(|| format!("heal_node: rebind node {idx} with raft"))?;
+        self.nodes[idx].partitioned = false;
+        Ok(())
+    }
+
     /// Restart a previously killed node at `idx`.
     ///
     /// Re-opens the raft node from its persisted state (vote + log files in the
@@ -510,38 +649,76 @@ impl Cluster {
     ///
     /// Waits for the restarted node's `/health` endpoint to respond.
     pub async fn restart_node(&mut self, idx: usize) -> Result<()> {
+        self.bind_node(idx, true).await
+    }
+
+    /// Bind (or rebind) node `idx`'s server on its own port.
+    ///
+    /// `attach_raft` is the whole difference between a restart and a partition:
+    /// with it the node re-opens its raft from disk and rejoins the cluster;
+    /// without it the node comes back serving every route **except** `/raft/*`,
+    /// which is what a peer sees when the network between them is cut.
+    ///
+    /// **Releasing the old listener is this function's job, not its callers'.**
+    /// `partition_node` and `heal_node` both rebind a port that is currently
+    /// *bound and serving* — a partitioned node is running, which is the whole
+    /// point of it — so a caller that forgot the abort would get
+    /// `EADDRINUSE`, and only on the second of the two transitions. Doing it
+    /// here makes the step impossible to forget; it is a no-op after
+    /// `kill_node`, which has already dropped the task.
+    async fn bind_node(&mut self, idx: usize, attach_raft: bool) -> Result<()> {
         let node = self
             .nodes
             .get_mut(idx)
-            .ok_or_else(|| anyhow::anyhow!("restart_node: no node at index {idx}"))?;
+            .ok_or_else(|| anyhow::anyhow!("bind_node: no node at index {idx}"))?;
+
+        if let Some(task) = node.task.take() {
+            task.abort();
+            // Give the OS time to release the port before rebinding it.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
 
         let port = node
             .port
-            .ok_or_else(|| anyhow::anyhow!("restart_node: node {idx} has no port (smoke tier?)"))?;
+            .ok_or_else(|| anyhow::anyhow!("bind_node: node {idx} has no port (smoke tier?)"))?;
         let raft_dir = node
             .raft_dir
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("restart_node: node {idx} has no raft_dir"))?;
+            .ok_or_else(|| anyhow::anyhow!("bind_node: node {idx} has no raft_dir"))?;
         let node_id = node
             .node_id
-            .ok_or_else(|| anyhow::anyhow!("restart_node: node {idx} has no node_id"))?;
+            .ok_or_else(|| anyhow::anyhow!("bind_node: node {idx} has no node_id"))?;
         let state_path = node
             .state_path
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("restart_node: node {idx} has no state_path"))?;
+            .ok_or_else(|| anyhow::anyhow!("bind_node: node {idx} has no state_path"))?;
         let runtime = node
             .runtime
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("restart_node: node {idx} has no runtime"))?;
+            .ok_or_else(|| anyhow::anyhow!("bind_node: node {idx} has no runtime"))?;
         let policy = node.policy;
+        // A partitioned node keeps the applied state it already had — the
+        // machine is on, and what it committed before the cut is still what it
+        // believes. Only a rejoining node re-opens it from disk.
+        let carried_state_machine = node.state_machine.clone();
 
         // Re-open the raft node from persisted state, under the same policy the
         // cluster was founded with — a restarting node that changed its raft
         // timings would campaign against peers that had not.
-        let (raft, state_machine) =
-            yubaba::raft::open_with_state_machine(node_id, raft_dir, &policy)
-                .await
-                .with_context(|| format!("restart_node: re-open raft for node {idx}"))?;
+        //
+        // Skipped entirely when `attach_raft` is false: that is the inbound
+        // half of the partition, and it works precisely because every
+        // `/raft/*` handler goes through `require_raft!` and refuses with a
+        // 503 when `ServerState::raft` is `None`.
+        let reopened = if attach_raft {
+            Some(
+                yubaba::raft::open_with_state_machine(node_id, raft_dir, &policy)
+                    .await
+                    .with_context(|| format!("bind_node: re-open raft for node {idx}"))?,
+            )
+        } else {
+            None
+        };
 
         // A restarted node gets a *fresh* lease registry, not the old one: the
         // registry is this node's view of who has renewed to it, and it is
@@ -561,44 +738,57 @@ impl Cluster {
         let headscale_dir = node.headscale_dir.clone();
 
         let mut builder = yubaba::ServerState::load(state_path)
-            .with_context(|| format!("restart_node: load state for node {idx}"))?
+            .with_context(|| format!("bind_node: load state for node {idx}"))?
             .with_runtime(runtime);
         if let Some(dir) = headscale_dir {
             builder = builder.with_headscale_dir(dir);
         }
-        let state = Arc::new(
-            builder
-                .with_cluster_policy(policy)
-                .with_raft(raft.clone())
-                .with_node_id(node_id)
-                .with_cluster_state(state_machine.clone())
-                .with_failure_detector(Arc::new(RaftHeartbeatDetector::new(
-                    raft.clone(),
-                    policy.liveness_thresholds(),
-                )))
-                .with_lease_detector(Arc::clone(&leases))
-                .with_rpo_registry(Arc::clone(&rpo_registry)),
-        );
+        builder = builder
+            .with_cluster_policy(policy)
+            .with_node_id(node_id)
+            .with_lease_detector(Arc::clone(&leases))
+            .with_rpo_registry(Arc::clone(&rpo_registry));
 
-        // Rebind on the same port. The killed task dropped the listener, so
-        // this should succeed after the 200ms sleep in kill_node.
+        // `state_machine` is attached in BOTH shapes and `raft` in only one.
+        // That asymmetry is the partition: a node whose network is cut still
+        // serves `GET /cluster/singletons` out of the state it had already
+        // applied — the corroborating channel `R118-F7` turns on — while every
+        // `/raft/*` route refuses through `require_raft!`.
+        let state_machine = match &reopened {
+            Some((_, sm)) => Some(sm.clone()),
+            None => carried_state_machine,
+        };
+        if let Some(sm) = &state_machine {
+            builder = builder.with_cluster_state(sm.clone());
+        }
+        if let Some((raft, _)) = &reopened {
+            builder = builder.with_raft(raft.clone()).with_failure_detector(Arc::new(
+                RaftHeartbeatDetector::new(raft.clone(), policy.liveness_thresholds()),
+            ));
+        }
+        let state = Arc::new(builder);
+
+        // Rebind on the same port. The previous task dropped the listener, so
+        // this should succeed after the 200ms sleep its caller took.
         let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
             .await
-            .with_context(|| format!("restart_node: bind 127.0.0.1:{port} for node {idx}"))?;
+            .with_context(|| format!("bind_node: bind 127.0.0.1:{port} for node {idx}"))?;
 
         let router = yubaba::build_router(Arc::clone(&state));
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
 
-        // Wait for the restarted server to respond.
+        // Wait for the server to respond. `/health` answers in both shapes,
+        // which is what makes it usable as the partition's liveness probe.
         wait_for_yubaba_health(&format!("http://127.0.0.1:{port}"))
             .await
-            .with_context(|| format!("restart_node: health check for node {idx}"))?;
+            .with_context(|| format!("bind_node: health check for node {idx}"))?;
 
+        let node = &mut self.nodes[idx];
         node.task = Some(task);
-        node.raft = Some(raft);
-        node.state_machine = Some(state_machine);
+        node.raft = reopened.map(|(raft, _)| raft);
+        node.state_machine = state_machine;
         node.lease_detector = Some(leases);
         node.rpo_registry = Some(rpo_registry);
         // The old handle belongs to a process that no longer exists; a test
@@ -1031,6 +1221,7 @@ async fn test_cluster_local(
             policy,
             state: Some(state),
             headscale_dir: Some(headscale_dir),
+            partitioned: false,
         });
     }
 
@@ -1189,6 +1380,7 @@ where
             // — same reasoning as `runtime` and `state_path` above.
             state: None,
             headscale_dir: None,
+            partitioned: false,
         });
     }
 

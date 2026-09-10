@@ -84,11 +84,19 @@
 //! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib = 766 passed / 0 failed (was 745 at this tree; +21 covering the :80 render and the two-tier sweep). cargo test --manifest-path oss/yah-base/crates/workload-spec/Cargo.toml --lib control_plane_install = 11 passed, including the new gate that the :80 tier rides its own conditional. cargo test -p yah --test main camp_systemd_unit_emit = 9 passed, including the new template test. rustfmt --check on the four Rust files edited outside the new crate: every hunk in code I authored hand-applied; the remainder is PRE-EXISTING drift in cert_store.rs (26 sites), demux_routes.rs (2) and control_plane_install.rs (4), left alone rather than reformatting files this ticket does not own. bash -n on both scripts.")
 //! @yah:gotcha("THE CUT-OVER IS NOT FREE AND NOTHING LIVE WAS TOUCHED. Both origins hold :80 from INSIDE a passway today — /etc/passway.env (south) and /etc/passway-test.env (east) set PASSWAY_HTTP_REDIRECT_BIND=0.0.0.0:80, added by R853-T2. Two processes cannot bind one port, so this router CANNOT START until that line is gone and that passway has restarted, and a passway restart drops in-flight :443 connections (passway cannot hot-swap — tls.rs 'The reload gap'). Order per door: remove the line -> restart that passway (take the blip, OR wait for R870-T3's PASSWAY_UPGRADE handoff, which is exactly what makes that restart free) -> systemctl enable --now passway-http-router -> prove `curl -sI http://<host>/install.sh` is 308 for every enrolled name. The full sequence is written into app/yah/cli/resources/passway-http-router.env.")
 //! @yah:gotcha("TWO THINGS I CHOSE THAT A REVIEWER SHOULD AGREE WITH RATHER THAN DISCOVER. (1) A CONNECTION IS ROUTED BY ITS FIRST REQUEST and never re-examined — HTTP/1.1 lets a client reuse a socket for a different Host, so a pipelined follow-up can reach the first request's backend. Every response this process writes itself carries `Connection: close`, so the redirect leg (every enrolled domain by default) never invites a second request; the proxy leg's backend is an http-01 responder that 404s everything but one challenge path, so a misdirected follow-up gets a wrong answer, not another tenant's data. Re-parsing every request means buffering and re-emitting bodies on the shared plaintext tier — a much larger surface than the one it closes. Same trade haproxy makes in mode tcp. Documented at router.rs 'One connection, one host'. (2) redirect.rs DUPLICATES passway::redirect's Host validation rather than sharing it, because passway links pingora/rustls/an ACME client and this tier links tokio; sharing would either drag pingora onto :80 or put a third crate between passway and crates.io. Both sides carry the same tests and a cross-reference note.")
+//! @yah:next("READY FOR TENANT #2, and this is now the whole remaining list for a second apex. Nothing is code. (1) Point the new apex's A records at BOTH 45.32.194.254 and 51.81.85.145 — as of 2026-09-08 `dig +short noisetable.com A` is still empty and every downstream step is blocked on it. (2) One passway per origin on a free loopback port with its own cert and its own DNS-01 zone credential (the R777 one-listener-one-cert tenant boundary), plus its own PASSWAY_UPGRADE_SOCK — both nodes already run three passway processes and an unpinned sock would hand a reload's listeners to the wrong one. (3) One line in /etc/passway-demux.routes (`<apex>=127.0.0.1:<port>`) and one in /etc/passway-http-router.routes (`<apex>=redirect`), on BOTH nodes. Both files hot-reload at 10s, so neither tier takes a restart or a :443/:80 gap. Test the TLS half before DNS with `curl --resolve <apex>:443:<ip>` — today that returns tlsv1 unrecognized_name on both origins, which is the demux correctly refusing an unenrolled SNI.")
+//! @yah:verify("LIVE ON BOTH PUBLIC DOORS 2026-09-08 by @Ashguard:dragon — the :80 tier is no longer single-tenant. Cut-over ran exactly as passway-http-router.env's header prescribes, per door: remove PASSWAY_HTTP_REDIRECT_BIND from the door's env file (backed up to /etc/passway-test.env.rollback-20260908-r870 on east, /etc/passway.env.rollback-20260908-r870 on south), restart that passway to release :80, then `systemctl enable --now passway-http-router`. Both routers report \"listening on 0.0.0.0:80, 3 routes\" and reload /etc/passway-http-router.routes every 10s. Route table mirrors the demux's host set (yah.dev=redirect, *.yah.dev=redirect, cloud.mesh.yah.dev=redirect — the three-label mesh name needs its own line for the same one-label-wildcard reason the demux table documents). Verified against BOTH origin IPs: http://yah.dev/install.sh -> 308 https://yah.dev/install.sh (path preserved), http://cloud.mesh.yah.dev/ -> 308, and Host: nope.example -> 404 rather than a redirect, so the table is the allowlist as designed. DynamicUser start needed no intervention; /etc/passway-http-router.routes installed 0644 as the unit requires.")
+//! @yah:verify("STEP 1 OF THE SECOND-APEX LIST IS DONE — noisetable.com apex now resolves to the fleet, 2026-09-08, operator-authorised. Two GREY (proxied=false, ttl=auto) A records created in Cloudflare zone 21fadafc03c976486e0d7b5941dd89be -> 45.32.194.254 and 51.81.85.145. Grey is load-bearing, not a default: the door terminates its own TLS and validates by DNS-01, so an orange-cloud record would put Cloudflare in front of the sovereign front door and break both. CREDENTIAL GOTCHA worth knowing before the next zone: the `cloudflare-api-token` slot is ACCOUNT-scoped and sees ONLY yah.dev — `zones?name=noisetable.com` returns success with an EMPTY result, which reads like a missing zone rather than a missing grant. `cloudflare-legacy-yah` (the user-owned bootstrap root) sees all four zones and is what this used. Nothing else in the zone was touched; the live MX/SPF/DKIM mail set and the proxied cdn.noisetable.com -> public.r2.dev CNAME are intact. BOTH TIERS CORRECTLY FAIL CLOSED for the not-yet-enrolled name, which is the proof the allowlists work: https://noisetable.com -> tlsv1 unrecognized_name from the demux, http://noisetable.com -> 404 from the http-router. Steps 2 and 3 (per-origin passway + the two route lines) are unchanged and are now the only remaining work.")
+//! @yah:verify("us-west-001 PROMOTED TO APEX ORIGIN 3, live and in DNS 2026-09-08, operator-authorised. It was previously a mesh-name-only door: passway-demux on :443 with a ONE-LINE route table (cloud.mesh.yah.dev), passway-mesh on 127.0.0.1:8444, nothing on :80, no apex passway and no yah.dev cert — so adding its IP to the apex before this would have black-holed a third of requests on an unenrolled SNI. What was added: /etc/passway.env + passway.service (origin 3, loopback 8443, per-instance /run/passway-apex-upgrade.sock because this box runs two passways), the R870-T3 drop-in, two demux route lines, and the http-router tier. Binaries needed no roll — west already carried passway-http-router and passway-graceful-upgrade from a fuller Sep 8 roll than east or south got. Demux picked up the new routes by HOT RELOAD (journal: \"reloaded, 3 routes\"), no restart, no :443 gap. VERIFIED PER-ORIGIN with --resolve before the A record was written, then again after: all three of 15.204.89.240 / 45.32.194.254 / 51.81.85.145 now return apex 200/43488, www 200, /releases 200/41629, mesh key 200, unenrolled Host on :80 -> 404. Both apexes (yah.dev and noisetable.com) now carry all three grey A records.")
+//! @yah:gotcha("THE THIRD ORIGIN'S CERT NAME COULD NOT BE THE OBVIOUS ONE, twice over. (1) A bare {*.yah.dev, yah.dev} on west would have been byte-identical to us-east-001's identifier set, and LE keys its 5-per-week duplicate-certificate limit on the EXACT set — that is the collision R777/W273 split the SAN sets to avoid, so west needed a disambiguating name like south's. (2) The obvious name west.origin.yah.dev WAS ALREADY TAKEN BY THIS SAME BOX: passway-mesh.service's /etc/passway-mesh.env carries PASSWAY_ACME_DOMAIN=cloud.mesh.yah.dev,west.origin.yah.dev, added by R858-T1. So the apex door took apex.west.origin.yah.dev instead. Check /etc/passway-mesh.env before picking a disambiguator on any node that already runs a mesh door. Issued first try in 78s with PASSWAY_ACME_DNS01_PROPAGATION_SECS=75 (the default 10 would have NXDOMAINed on a never-before-used name — the R853-T2 gotcha, confirmed again). Three distinct SAN sets are now live with full wildcard parity: east {*.yah.dev, yah.dev} notAfter Dec 3, south {*.yah.dev, south.origin.yah.dev, yah.dev} Dec 4, west {*.yah.dev, apex.west.origin.yah.dev, yah.dev} Dec 7. ALSO CHECKED, and it is why the wildcard is safe here: issues.yah.dev and passway-test.yah.dev are A-pinned to east ALONE, so they never arrive at west and west needs none of east's static upstream pins — only www.yah.dev (a CNAME to the apex) actually rides the wildcard on three origins.")
+//! @yah:verify("TENANT 2 IS ENROLLED AND LIVE ON ALL THREE ORIGINS, 2026-09-08 — steps 2 and 3 of this ticket's second-apex list are done. Per origin: passway-noisetable.service on loopback 8445 (8443 apex, 8444 mesh were taken), own cert dir /var/lib/passway-noisetable, own ACME account, own per-instance /run/passway-noisetable-upgrade.sock, and the R870-T3 drop-in. Three DISTINCT SAN sets, wildcard from day one so a new service on this domain is a DNS record and a route line rather than a cert order: {*.noisetable.com, noisetable.com, <east|south|west>.origin.noisetable.com}. Both route tiers took the two new lines by HOT RELOAD on all three nodes — \"reloaded, 5 routes\" on demux and http-router alike, no restart, no :443 or :80 gap, which is the whole design claim of R853-T2 and R870-F1 demonstrated on a real second tenant. VERIFIED per-origin and through real DNS: https://noisetable.com and https://app.noisetable.com return 503 with ssl_verify_result=0 (browser-trusted, no backend yet), http://noisetable.com/install.sh -> 308 https path-preserved, an unenrolled Host still 404s, and yah.dev is untouched at 200/43488 on all three with cloud.mesh.yah.dev 200. The bare 503 is filed as R870-F5.")
+//! @yah:gotcha("THE APEX DOORS' ACME CREDENTIAL IS ACCOUNT-SCOPED, WHICH MAKES THE TENANT BOUNDARY FICTIONAL IF YOU REUSE IT. Measured 2026-09-08: /var/lib/passway/cf-token on us-east-001 lists FOUR zones (noisetable.com, scrabcake.com, scrabcake.net, yah.dev), so the token every yah.dev door holds for its DNS-01 challenge can edit DNS for every domain in the account. Tenant 2 was therefore given a purpose-minted token instead — CF token id 79bebdb4c1d2b994963357d209e4201f, DNS:Read + DNS:Write on zone 21fadafc03c976486e0d7b5941dd89be ONLY, verified to list exactly one zone, stored in keys slot `passway-acme-noisetable-dns`. Do the same for tenant 3, and treat re-scoping the apex doors' own token as outstanding: `yah cloud cf token create` does NOT mint this shape — it builds MESOFACT_STATIC_GRANTS (Workers Scripts:Write, R2:Write, Cache Purge), which is far more than a door needs and should not sit on three public boxes.")
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use acme_engine::AcmeDirectory;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yah_object_store::{Error as ObjectError, ObjectStore, Precondition};
@@ -162,6 +170,31 @@ pub enum CertStoreError {
     /// `PASSWAY_DEMUX_ROUTES`.
     #[error("cert store: {domain} is already enrolled to {existing} (unenroll it first)")]
     AlreadyEnrolled { domain: String, existing: String },
+
+    /// A holding-page name that could not survive the trip to a door — see
+    /// [`is_safe_holding_name`]. Refused at the API, because the name is
+    /// rendered into a map file every door parses and becomes a filename on
+    /// every door's disk.
+    #[error(
+        "cert store: {name:?} is not a usable holding-page name (lowercase a-z, 0-9, '-' and '_', \
+         starting with a letter or digit, at most {MAX_HOLDING_NAME} characters)"
+    )]
+    InvalidHoldingName { name: String },
+
+    /// [`ObjectCertStore::set_holding`] on a domain that is not in the
+    /// enrollment set. Refused rather than creating a record: an enrollment is
+    /// what makes a domain routable, and inventing one from a request to change
+    /// its holding page would route a hostname nobody enrolled.
+    #[error("cert store: {domain} is not enrolled")]
+    NotEnrolled { domain: String },
+
+    /// A holding page past [`MAX_HOLDING_PAGE_BYTES`]. Refused at the upload
+    /// rather than at the door, where it would be a silent non-appearance.
+    #[error(
+        "cert store: holding page {name:?} is {bytes} bytes, over the {MAX_HOLDING_PAGE_BYTES}-byte \
+         ceiling every door enforces"
+    )]
+    HoldingPageTooLarge { name: String, bytes: usize },
 }
 
 /// Whether `domain` can be used as one object-key segment.
@@ -265,6 +298,30 @@ pub const ACCOUNT_ID_ENV: &str = "YUBABA_CERT_STORE_ACCOUNT_ID";
 /// Env key overriding the S3 endpoint.
 pub const ENDPOINT_ENV: &str = "YUBABA_CERT_STORE_ENDPOINT";
 
+/// Env key naming the ACME directory, shared by every reader and writer of this
+/// store.
+///
+/// It lives here, with exactly one owner, because the directory URL is what
+/// [`issuer_key`] turns into the store's issuer path segment: a consumer that
+/// resolved a *different* default from the writer would address an empty prefix
+/// and report a fleet of enrolled domains as having no certificates.
+pub const DIRECTORY_ENV: &str = "YUBABA_ACME_DIRECTORY";
+
+/// The default when [`DIRECTORY_ENV`] is unset — **staging**. Deliberately the
+/// same for the daemon, both issuers and the admin commands; see
+/// [`DIRECTORY_ENV`].
+pub const DEFAULT_DIRECTORY: &str = "staging";
+
+/// Resolve the ACME directory from a `key -> value` lookup — pure, so it is
+/// unit-testable without `std::env`.
+///
+/// Every caller that needs an issuer segment goes through this rather than
+/// reading [`DIRECTORY_ENV`] itself, so the default cannot drift between the
+/// node that writes a cert and the node that reads it.
+pub fn acme_directory(get: impl Fn(&str) -> Option<String>) -> AcmeDirectory {
+    AcmeDirectory::parse(&get(DIRECTORY_ENV).unwrap_or_else(|| DEFAULT_DIRECTORY.to_string()))
+}
+
 impl CertStoreConfig {
     /// `Ok(None)` when [`BUCKET_ENV`] is unset — the cert store is opt-in, and a
     /// node without it behaves exactly as it did before R779.
@@ -299,11 +356,22 @@ impl CertStoreConfig {
     /// adds no new credential surface beyond the one every other R2 consumer in
     /// the tree already uses.
     pub fn connect(&self, directory_url: &str) -> Result<ObjectCertStore, CertStoreError> {
-        let mut store = yah_object_store::R2ObjectStore::from_vault(&self.account_id, &self.bucket)?;
+        Ok(ObjectCertStore::new(self.connect_objects()?, directory_url))
+    }
+
+    /// The bare bucket, for a consumer that is not cert material.
+    ///
+    /// R869's off-fleet state copy shares this bucket and these credentials —
+    /// see [`ObjectCertStore::objects`] for why — but has no issuer segment and
+    /// no directory URL to derive one from, so it takes the store directly
+    /// rather than being handed a cert store it would only unwrap.
+    pub fn connect_objects(&self) -> Result<Arc<dyn ObjectStore>, CertStoreError> {
+        let mut store =
+            yah_object_store::R2ObjectStore::from_vault(&self.account_id, &self.bucket)?;
         if let Some(endpoint) = &self.endpoint {
             store = store.with_endpoint(endpoint.clone());
         }
-        Ok(ObjectCertStore::new(Arc::new(store), directory_url))
+        Ok(Arc::new(store))
     }
 }
 
@@ -352,6 +420,26 @@ pub const ENROLLED_PREFIX: &str = "enrolled/";
 /// hostname with no enrollment object has no route, so it never reaches a
 /// passway and can never provoke an ACME order; registering a domain *is*
 /// writing this object.
+///
+/// @yah:ticket(R870-F8, "Per-domain holding-page override on the enrollment record, so yah.dev-family doors can show the camp art")
+/// @yah:status(review)
+/// @yah:at(2026-09-09T04:03:33Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R870)
+/// @yah:next("THE SPLIT THE OPERATOR ASKED FOR (2026-09-08): the passway default (R870-F7's inline-CSS graphic) is what an unbranded tenant like noisetable.com gets; the `solid-parked` camp illustration is OVERRIDE content for the yah.dev family of sites. So this ticket builds the override rail, and the camp art is its first consumer — not something compiled into passway.")
+/// @yah:gotcha("DO NOT INLINE PAGE BYTES INTO Enrollment — it is swept whole, per domain, every 300s. yubaba::demux_routes (oss/yubaba/crates/yubaba/src/demux_routes.rs) sweeps the enrollment set on YUBABA_DEMUX_ROUTES_SWEEP_SECS (default 300) as one list_prefix plus ONE GET PER DOMAIN, purely to render `host=addr` lines. A holding page embedded in the record would be pulled on every domain on every sweep to produce a routes file that does not use it — invisible at one tenant, and exactly the cost that makes the free tier's 10k-custom-domain target unaffordable. Store a reference, or a separate object the serving process fetches only when it is about to render a 503.")
+/// @yah:handoff("RAIL BUILT END TO END, and the camp art is in-tree as its first consumer. Enrollment gains `holding: Option<String>` — A NAME, NEVER BYTES (the gotcha's demand): the page is one object at `holding/<name>` shared by every domain naming it, so 10k tenants on one brand cost ONE extra object read per sweep instead of 10k. Chain: `.yah/assets/holding/yah-camp.html` -> `yubaba holding put` -> `holding/yah-camp` -> `yubaba domain holding yah.dev --page yah-camp` -> enrollment record -> yubaba's existing 300s sweep materializes `<YUBABA_HOLDING_DIR>/{hosts,pages/<name>.html}` -> passway reads `PASSWAY_HOLDING_DIR` (re-read every 30s) -> branded 503 body.")
+/// @yah:handoff("DELIVERY IS A FILE, NOT A FETCH, and that was the load-bearing shape call. passway does NOT get an object-store client: it is the most exposed process in the fleet, and `sni_demux::routes_file` already refuses one for the same reason (a compromise of the shared public process would yield the whole fleet's routing plus a credential). yubaba already holds the credentials and already sweeps the enrollment set, so it materializes the bodies onto local disk exactly as it does the tenant cert pairs — one-way pipe, tmp-plus-rename, passway reads bytes it did not write. `publish_holding` runs off the SAME single listing as the :443 and :80 tables, so the added cost is one GET per DISTINCT page per sweep.")
+/// @yah:handoff("FILES. yubaba: cert_store.rs (`holding` field + `with_holding`, HOLDING_PREFIX, MAX_HOLDING_PAGE_BYTES=256KiB, `is_safe_holding_name`, `holding_entries`, and store verbs `set_holding` / `holding_page` / `write_holding_page` / `delete_holding_page` / `holding_pages`), demux_routes.rs (HOLDING_DIR_ENV=YUBABA_HOLDING_DIR, HOLDING_MAP_FILE=\"hosts\", HOLDING_PAGES_DIR=\"pages\", `publish_holding` + `materialize_page` + `prune_pages`, `Sweep.holding`, `log_holding`), main.rs (`yubaba holding put|list|remove` + `yubaba domain holding <d> --page|--clear`, `holding` in `domain list --json`). passway: holding.rs (HoldingPages/load/page_for, SharedHoldingPages, HoldingWatcher BackgroundService, MAX_OVERRIDE_PAGE_BYTES, DEFAULT_RELOAD_SECS=30), proxy.rs (`with_holding_pages` + `holding_page_for`, both 503 sites), main.rs (PASSWAY_HOLDING_DIR / PASSWAY_HOLDING_RELOAD_SECS), lib.rs + README. Docs: W267 gained '### The holding tier — built'; new `.yah/assets/holding/` (README, build.sh, template, the two recovered webps, generated yah-camp.html at 93,020 bytes).")
+/// @yah:handoff("TWO DELIBERATE DIVERGENCES FROM THE ROUTE-TABLE RULES, both documented at the code: (1) AN EMPTY HOLDING MAP IS WRITTEN, where an empty route table is skipped. An empty route table is every tenant going dark; an empty holding map is 'nobody here has an override', which is the steady state on a fresh install and the only way to un-brand a domain without a restart. An empty ENROLLMENT LISTING still skips everything, as it does for every tier. (2) Fail-stale is per-page: a store 404 prunes the page and drops its domains from the map (a real delete), while a fetch FAILURE keeps the copy on disk and keeps its domains mapped (a bucket blip must not un-brand a live door). The map never names a page absent from disk, so passway never has to decide what a dangling reference means — though it tolerates one anyway.")
+/// @yah:handoff("DISCOVERED WORK, done in-pass: `ObjectCertStore::enroll`'s idempotence check compared only tls_backend + http_backend, so once `holding` existed an `enroll` differing ONLY in the page would have returned Ok having written nothing — a silent no-op on the exact command an operator would reach for. It now compares `holding` too (cert_store.rs, and `re_enrolling_with_a_different_page_is_refused_rather_than_silently_ignored` pins it); changing the page is the separate `set_holding` verb, which refuses an unenrolled domain rather than inventing a route. Also: `write_table` rendered an empty entry list as a bare newline; it now renders an empty file, which only the holding tier can reach.")
+/// @yah:verify("GREEN, run by me on the settled tree. `cargo test -p passway` = 166 lib + 43 bin + 29 integration = 238, 0 failed (baseline 228; +9 lib, +1 integration). `cargo test -p yubaba --lib` = 845, 0 failed, with cert_store 37 and demux_routes 30 (+6 and +8). rustfmt --edition 2021 --check clean on EVERY line I wrote — note cert_store.rs, yubaba/main.rs and passway/main.rs are NOT rustfmt-clean at baseline (30+ pre-existing hunks), so I fixed only my own and left theirs alone rather than reformatting a shared-tree file. `cargo clippy -p passway --all-targets` and `-p yubaba --lib --bins`: zero warnings on any file I touched (passway's 3 and yubaba's are all pre-existing, in auth.rs/path.rs/tenant_passway.rs/cluster_*/pond).")
+/// @yah:verify("WHAT THE TESTS ACTUALLY PIN, not just the count. passway integration (`a_branded_authority_gets_its_own_holding_page`) drives a real proxy over the wire: Host: branded.test + Accept: text/html gets the override body, Host: unbranded.test on the SAME door gets HOLDING_PAGE byte-for-byte, and the machine leg on the branded host still gets application/json {\"error\":\"no ready upstreams\"} — so the override cannot regress either the default or the JSON contract. Unit side: two hosts naming one page are asserted `Arc::ptr_eq` (the memory argument the whole indirection exists for), every broken map line costs only its own host (dangling name, traversal, absolute path, dotted name, empty host, nonsense line), an oversized page falls back, and the watcher swaps on a body edit, installs an EMPTIED map, and refuses a VANISHED one. yubaba side: 5 domains on one page materialize ONE file, a missing object keeps its domains out of the map, un-naming prunes, an unchanged sweep writes nothing, an empty enrollment set touches nothing.")
+/// @yah:verify("THE CROSS-WORKSPACE JOIN IS PINNED BY CONSTANTS, NOT BY ONE EXECUTING TEST — stated plainly because it is the weakest link. yubaba writes the directory and passway reads it, and they share no crate, so the layout (\"hosts\", \"pages\", \"<name>.html\") and the 256 KiB ceiling are duplicated with a test at each end asserting the literal (`the_layout_matches_what_passway_reads`, `the_ceiling_and_the_layout_match_the_publishers_constants`) — the same device HTTP_REDIRECT_TOKEN already uses for the :80 tier. NOT run: one process publishing and another serving the same directory. That is the fleet enable (see the gotcha), and it is the only step that would catch a mismatch the two constant-tests do not.")
+/// @yah:gotcha("NOTHING IS DEPLOYED AND NOTHING CHANGES ON THE FLEET UNTIL TWO ENV VARS ARE SET. No node sets YUBABA_HOLDING_DIR and no door sets PASSWAY_HOLDING_DIR, so today every domain — yah.dev included — still shows passway's own page, and rolling these binaries changes no served byte. Enabling it is: `yubaba holding put yah-camp .yah/assets/holding/yah-camp.html` against the live bucket, `yubaba domain holding <each yah.dev-family domain> --page yah-camp`, YUBABA_HOLDING_DIR in /etc/yubaba.env, PASSWAY_HOLDING_DIR (same path) in each door's passway env, restart both. Filed as its own ticket because it is an outward-facing live-fleet action plus an R2 write.")
+/// @yah:gotcha("PRE-EXISTING RED, verified not mine: `cargo test -p yubaba --test main` = 58 passed / 10 failed, EVERY failure a raft_* test (raft_member_registration, raft_membership_loop). Identical to the flake R852-F2's own gotcha already records on this crate (load-sensitive, varies between runs on a box running concurrent agent builds). My change touches no raft code and no integration test in that binary. Also unchanged and still true: R870-F5's gotcha that HEAD (09e3f35d) carries the VETOED raster inside passway's own holding.rs plus the deleted-from-worktree `oss/passway/crates/passway/assets/` — I recovered those two webps into `.yah/assets/holding/` (the override's home) rather than restoring them under oss/passway, so a build from HEAD is still the wrong binary and the operator's commit list on F5 still applies.")
+/// @yah:cleanup("The per-tenant passway tier (`yubaba::tenant_passway::declare`) renders `env: BTreeMap::new()` for each forked door and so cannot brand a cold tenant — that tier is not deployed, and the shape when it is: TenantPasswayConfig gains a holding dir and `declare` sets PASSWAY_HOLDING_DIR, since the dir form works unchanged for a one-domain map. Deliberately not built here: wiring an undeployed tier for a feature that is itself not yet enabled is two hypotheticals stacked.")
+/// @yah:next("RESOLVED, retiring the filing-time shape call so nobody reads it as open: the reference form won (a NAME in the record, one shared object per page), and the delivery is yubaba materializing onto local disk rather than passway fetching — passway gets no bucket client. The art recovery is done: both webps now live at `.yah/assets/holding/`. Remaining work is the fleet enable, which is R870-T10, not this ticket.")
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Enrollment {
     /// Where the demux splices this domain's TLS bytes — the per-tenant
@@ -377,6 +465,22 @@ pub struct Enrollment {
     /// Unix seconds the enrollment was written. For an operator reading the
     /// bucket; nothing keys off it.
     pub enrolled_at: u64,
+    /// R870-F8: which holding page this domain shows on a fail-ready 503 —
+    /// **a name, never bytes**.
+    ///
+    /// The page itself is one object at `holding/<name>` ([`HOLDING_PREFIX`]),
+    /// shared by every domain that names it. That indirection is the whole
+    /// design: this record is read once per domain on every route sweep
+    /// (`crate::demux_routes`, default 300s), so page bytes carried here would
+    /// be pulled 10k times per sweep to render a routes file that does not use
+    /// them, while a name costs a handful of bytes and the pages are fetched
+    /// once each per sweep regardless of how many domains point at them.
+    ///
+    /// `None` — the overwhelming majority, and the default — means the tenant
+    /// gets passway's own unbranded holding page. An override is for a domain
+    /// whose *brand* the operator owns; see `passway::holding`.
+    #[serde(default)]
+    pub holding: Option<String>,
 }
 
 impl Enrollment {
@@ -386,12 +490,19 @@ impl Enrollment {
             tls_backend,
             http_backend: None,
             enrolled_at: unix_secs(now),
+            holding: None,
         }
     }
 
     /// The same, also routing port 80 to `http_backend`.
     pub fn with_http_backend(mut self, http_backend: SocketAddr) -> Self {
         self.http_backend = Some(http_backend);
+        self
+    }
+
+    /// The same, showing the holding page named `holding` on a 503 (R870-F8).
+    pub fn with_holding(mut self, holding: impl Into<String>) -> Self {
+        self.holding = Some(holding.into());
         self
     }
 }
@@ -478,6 +589,100 @@ pub fn http_route_entries<'a>(
     entries
 }
 
+// ── Holding pages ────────────────────────────────────────────────────────────
+
+/// Top-level key prefix for holding-page bodies (R870-F8).
+///
+/// One object per *page*, not per domain: `holding/<name>` is the whole HTML
+/// document a door serves on a fail-ready 503 for every domain whose
+/// [`Enrollment::holding`] names it. Sibling of [`ENROLLED_PREFIX`] and outside
+/// [`CERT_PREFIX`] for the same reason enrolment is — a page belongs to a brand,
+/// not to a CA and not to one tenant.
+pub const HOLDING_PREFIX: &str = "holding/";
+
+/// The longest a holding-page name may be.
+///
+/// Not a storage limit — a limit on how bad a mistake can look. The name is
+/// rendered into a map file and becomes a filename on every door in the fleet,
+/// so a runaway string is caught where it is written rather than by the
+/// filesystem of whichever node happens to have the shortest `NAME_MAX`.
+pub const MAX_HOLDING_NAME: usize = 64;
+
+/// The largest holding page this store will accept, and the largest a door will
+/// serve.
+///
+/// **The number is duplicated in `passway::holding::MAX_OVERRIDE_PAGE_BYTES`**,
+/// which is in a different Cargo workspace with no shared crate — same
+/// arrangement as [`HTTP_REDIRECT_TOKEN`], and a test at each end pins the
+/// value with a comment naming the other. A page over the door's ceiling is
+/// silently ignored *there*, so the useful place to refuse it is here, at the
+/// upload, where a human is watching.
+///
+/// 256 KiB is deliberately generous next to passway's own 16 KiB default page:
+/// an override is a branded document that may carry inlined artwork, and the
+/// thing the ceiling exists to prevent is an accident (a whole photo library, a
+/// wrong file) rather than a large-but-intended page.
+pub const MAX_HOLDING_PAGE_BYTES: usize = 256 * 1024;
+
+/// Whether `name` may be a holding-page name.
+///
+/// Stricter than [`is_safe_domain`], deliberately. A domain is only ever an
+/// object key here; a holding-page name additionally travels to every door,
+/// becomes `<holding dir>/pages/<name>.html` on their disks, and is parsed back
+/// out of a `host=name` map file. So the alphabet is the intersection of what
+/// all three accept: ASCII lowercase alphanumerics plus `-` and `_`, starting
+/// with an alphanumeric. No dots (no `..`, and no extension games), no `/`, no
+/// `=` (which would split a map line in the wrong place), no whitespace.
+pub fn is_safe_holding_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_HOLDING_NAME
+        && name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// The `host=<page name>` entries a door's holding-page map is built from
+/// (R870-F8), sorted and deduped.
+///
+/// Third render off the same single listing of the enrollment set, in the same
+/// `host=` grammar as [`route_entries`] and [`http_route_entries`], for the same
+/// reason: one sweep, N tiers, and one place that decides what an entry is.
+///
+/// Two differences from its siblings, both load-bearing:
+///
+/// - **A domain with no override is omitted, not rendered as a token.** There is
+///   no `holding=default` line, because passway's built-in page *is* the answer
+///   for an absent entry and a door with an empty map is the correct steady
+///   state, not an outage. (The `:80` tier renders `=redirect` precisely because
+///   omission there is a refused connection.)
+/// - **An unusable name is dropped, loudly**, rather than propagated. A name
+///   that fails [`is_safe_holding_name`] cannot have been written by
+///   [`ObjectCertStore::set_holding`], so it arrived by a hand-edited object;
+///   rendering it would push a bad filename onto every door in the fleet.
+pub fn holding_entries<'a>(
+    enrolled: impl IntoIterator<Item = (&'a str, &'a Enrollment)>,
+) -> Vec<String> {
+    let mut entries: Vec<String> = enrolled
+        .into_iter()
+        .filter_map(|(domain, e)| {
+            let name = e.holding.as_deref()?;
+            if !is_safe_holding_name(name) {
+                tracing::warn!(
+                    domain = %domain,
+                    holding = %name,
+                    "cert store: unusable holding-page name — this domain keeps the default page"
+                );
+                return None;
+            }
+            Some(format!("{domain}={name}"))
+        })
+        .collect();
+    entries.sort();
+    entries.dedup();
+    entries
+}
+
 /// Object-store-backed store for per-domain sealed TLS material.
 ///
 /// Cheap to clone in the sense that matters — the backing store is behind an
@@ -511,6 +716,17 @@ impl ObjectCertStore {
     /// The path segment this store writes under.
     pub fn issuer(&self) -> &str {
         &self.issuer
+    }
+
+    /// The bucket underneath, for a consumer that keys off it differently.
+    ///
+    /// R869: the off-fleet state copy lives in this same bucket under
+    /// `cluster-state/` rather than behind a second set of credentials — a
+    /// disaster-recovery mechanism that needs config the fleet does not already
+    /// carry is one that is not there when the disaster happens. It is not
+    /// *cert* material, so it is not routed through this type's own verbs.
+    pub fn objects(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.objects)
     }
 
     /// Read and deserialise the [`SecretRecord`] at `name`, or `None` if the
@@ -785,8 +1001,14 @@ impl ObjectCertStore {
     pub fn enroll(&self, domain: &str, enrollment: &Enrollment) -> Result<(), CertStoreError> {
         let key = Self::enrolled_key(domain)?;
         if let Some(existing) = self.enrollment(domain)? {
+            // Every field but the timestamp: a record differing only in
+            // `holding` is a *different* enrollment, and treating it as a no-op
+            // would make `enroll --holding` silently do nothing on a domain that
+            // is already registered. Changing the page is
+            // [`Self::set_holding`], which does not touch routing.
             if existing.tls_backend == enrollment.tls_backend
                 && existing.http_backend == enrollment.http_backend
+                && existing.holding == enrollment.holding
             {
                 return Ok(()); // same enrollment, different timestamp — a no-op
             }
@@ -869,6 +1091,107 @@ impl ObjectCertStore {
             }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    // ── Holding pages (R870-F8) ─────────────────────────────────────────────
+
+    /// `holding/<name>`, refused for a name no door could put on disk.
+    fn holding_key(name: &str) -> Result<String, CertStoreError> {
+        if !is_safe_holding_name(name) {
+            return Err(CertStoreError::InvalidHoldingName {
+                name: name.to_string(),
+            });
+        }
+        Ok(format!("{HOLDING_PREFIX}{name}"))
+    }
+
+    /// Point `domain` at a holding page, or (with `None`) back at passway's own.
+    ///
+    /// Deliberately **not** part of [`Self::enroll`]'s conflict rule: which page
+    /// a parked domain shows is cosmetic and freely re-decided, whereas
+    /// re-pointing `tls_backend` is a routing change that must go through
+    /// unenroll + enroll so it cannot happen by a stale config replay. So this
+    /// is a read-modify-write of an *existing* record and refuses an unenrolled
+    /// domain rather than creating one — there is no domain to brand until it is
+    /// routable.
+    ///
+    /// The page object need not exist yet: a door that cannot find the page
+    /// falls back to its built-in one, so the two writes can happen in either
+    /// order and neither leaves a tenant with a blank door.
+    pub fn set_holding(&self, domain: &str, name: Option<&str>) -> Result<(), CertStoreError> {
+        if let Some(name) = name {
+            // Validate before the read, so a typo costs no round trip and the
+            // error names the name rather than the domain.
+            Self::holding_key(name)?;
+        }
+        let key = Self::enrolled_key(domain)?;
+        let Some(mut record) = self.enrollment(domain)? else {
+            return Err(CertStoreError::NotEnrolled {
+                domain: domain.to_string(),
+            });
+        };
+        if record.holding.as_deref() == name {
+            return Ok(());
+        }
+        record.holding = name.map(str::to_owned);
+        let body = serde_json::to_vec(&record).map_err(|source| CertStoreError::Malformed {
+            key: key.clone(),
+            source,
+        })?;
+        self.objects.put(&key, body)?;
+        Ok(())
+    }
+
+    /// Read one holding page's bytes, or `None` if nothing is stored under it.
+    pub fn holding_page(&self, name: &str) -> Result<Option<Vec<u8>>, CertStoreError> {
+        Ok(self.objects.get(&Self::holding_key(name)?)?)
+    }
+
+    /// Store a holding page under `name`, replacing any previous body.
+    ///
+    /// Last-writer-wins, unlike [`Self::enroll`]: a page is one operator's
+    /// content being revised, not two tenants racing for one hostname.
+    ///
+    /// Refuses a body past [`MAX_HOLDING_PAGE_BYTES`] — the doors would decline
+    /// to serve it anyway, and a refusal here is the only one a human sees.
+    pub fn write_holding_page(&self, name: &str, body: Vec<u8>) -> Result<(), CertStoreError> {
+        let key = Self::holding_key(name)?;
+        if body.len() > MAX_HOLDING_PAGE_BYTES {
+            return Err(CertStoreError::HoldingPageTooLarge {
+                name: name.to_string(),
+                bytes: body.len(),
+            });
+        }
+        self.objects.put(&key, body)?;
+        Ok(())
+    }
+
+    /// Remove a holding page. Idempotent.
+    ///
+    /// Leaves every [`Enrollment::holding`] that names it alone — those domains
+    /// fall back to passway's built-in page on the next sweep, which is the
+    /// behaviour an operator deleting a page is asking for. Re-uploading the
+    /// name restores them with no re-enrollment.
+    pub fn delete_holding_page(&self, name: &str) -> Result<(), CertStoreError> {
+        self.objects.delete(&Self::holding_key(name)?)?;
+        Ok(())
+    }
+
+    /// Every stored holding-page name, sorted.
+    ///
+    /// Keys only — the bodies are whole HTML documents and an operator listing
+    /// what exists does not want them.
+    pub fn holding_pages(&self) -> Result<Vec<String>, CertStoreError> {
+        let mut out: Vec<String> = self
+            .objects
+            .list_prefix(HOLDING_PREFIX)?
+            .into_iter()
+            .filter_map(|key| key.strip_prefix(HOLDING_PREFIX).map(str::to_owned))
+            .filter(|name| is_safe_holding_name(name))
+            .collect();
+        out.sort();
+        out.dedup();
         Ok(out)
     }
 }
@@ -970,6 +1293,7 @@ mod tests {
             access: SecretAccess::AllowAny,
             digest: None,
             sans: None,
+            ari: None,
         }
     }
 
@@ -1154,6 +1478,30 @@ mod tests {
         assert_eq!(cfg.bucket, "yah-certs");
         assert_eq!(cfg.account_id, "acct123");
         assert_eq!(cfg.endpoint.as_deref(), Some("http://127.0.0.1:9000"));
+    }
+
+    /// Half-configured is a hard error, not a silent skip — an operator who set
+    /// the bucket meant to turn the store on. Lived on `parse_issuer_config`
+    /// until R870-B20 hoisted the store out of the issuer config.
+    #[test]
+    fn a_bucket_without_an_account_id_is_rejected() {
+        let err = CertStoreConfig::parse(|k| match k {
+            BUCKET_ENV => Some("yah-certs".to_string()),
+            _ => None,
+        })
+        .unwrap_err();
+        assert!(err.contains(ACCOUNT_ID_ENV), "got {err}");
+    }
+
+    /// R870-B20: one owner for the issuer segment. A door reading a different
+    /// default from the issuer that wrote the cert would address an empty prefix.
+    #[test]
+    fn the_acme_directory_defaults_to_staging_and_is_overridable() {
+        assert_eq!(acme_directory(|_: &str| None), AcmeDirectory::Staging);
+        assert_eq!(
+            acme_directory(|k: &str| (k == DIRECTORY_ENV).then(|| "production".to_string())),
+            AcmeDirectory::Production
+        );
     }
 
     #[test]
@@ -1476,5 +1824,164 @@ mod tests {
             }
         }
         assert_eq!(render_http_routes(std::iter::empty()), "");
+    }
+
+    // ── Holding pages (R870-F8) ──────────────────────────────────────────────
+
+    #[test]
+    fn a_holding_name_must_survive_being_a_filename_and_a_map_line() {
+        for good in ["camp", "yah-camp", "camp_2", "a", "9lives"] {
+            assert!(is_safe_holding_name(good), "{good:?} should be usable");
+        }
+        for bad in [
+            "",
+            "-leading",  // a leading dash reads as a flag to half the tools that see it
+            "camp.html", // dots invite extension games and `..`
+            "../etc/passwd", // the traversal the alphabet exists to exclude
+            "camp/dark",
+            "camp=dark", // would split a `host=name` line in the wrong place
+            "camp dark",
+            "Camp", // case-folding filesystems make two names one file
+            &"x".repeat(MAX_HOLDING_NAME + 1),
+        ] {
+            assert!(!is_safe_holding_name(bad), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn only_domains_with_an_override_reach_the_map_and_a_bad_name_never_does() {
+        let set = [
+            ("b.example.com".to_string(), enrollment(8444)),
+            (
+                "a.example.com".to_string(),
+                enrollment(8443).with_holding("camp"),
+            ),
+            (
+                "evil.example.com".to_string(),
+                // Only reachable by hand-editing the object — `set_holding`
+                // refuses it — so the render must refuse it too rather than
+                // pushing the name onto every door's disk.
+                enrollment(8445).with_holding("../../etc/passwd"),
+            ),
+        ];
+        assert_eq!(
+            holding_entries(set.iter().map(|(d, e)| (d.as_str(), e))),
+            vec!["a.example.com=camp".to_string()]
+        );
+        assert!(holding_entries(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn an_enrollment_written_before_this_field_existed_still_loads() {
+        // The `#[serde(default)]` contract, against the exact bytes already in
+        // the live bucket rather than against a round-trip of today's struct.
+        let (mem, certs) = store();
+        mem.put(
+            "enrolled/old.example.com",
+            br#"{"tls_backend":"127.0.0.1:8443","enrolled_at":1700000000}"#.to_vec(),
+        )
+        .unwrap();
+        let rec = certs.enrollment("old.example.com").unwrap().unwrap();
+        assert_eq!(rec.tls_backend, backend(8443));
+        assert_eq!(rec.holding, None);
+    }
+
+    #[test]
+    fn setting_a_holding_page_is_a_mutation_and_re_enrolling_is_not() {
+        let (_mem, certs) = store();
+        certs.enroll("a.example.com", &enrollment(8443)).unwrap();
+
+        certs.set_holding("a.example.com", Some("camp")).unwrap();
+        assert_eq!(
+            certs.enrollment("a.example.com").unwrap().unwrap().holding,
+            Some("camp".to_string())
+        );
+        certs.set_holding("a.example.com", Some("camp")).unwrap(); // idempotent
+        certs.set_holding("a.example.com", None).unwrap();
+        assert_eq!(
+            certs.enrollment("a.example.com").unwrap().unwrap().holding,
+            None
+        );
+
+        // Routing is untouched by any of it.
+        assert_eq!(
+            certs
+                .enrollment("a.example.com")
+                .unwrap()
+                .unwrap()
+                .tls_backend,
+            backend(8443)
+        );
+
+        // An unusable name never reaches the bucket, and an unenrolled domain
+        // is not created by asking to brand it.
+        assert!(matches!(
+            certs.set_holding("a.example.com", Some("../x")),
+            Err(CertStoreError::InvalidHoldingName { .. })
+        ));
+        assert!(matches!(
+            certs.set_holding("nope.example.com", Some("camp")),
+            Err(CertStoreError::NotEnrolled { .. })
+        ));
+    }
+
+    #[test]
+    fn re_enrolling_with_a_different_page_is_refused_rather_than_silently_ignored() {
+        // The trap the idempotence check has to avoid: `enroll --holding camp`
+        // on an already-enrolled domain must not report success having changed
+        // nothing. Changing the page is `set_holding`.
+        let (_mem, certs) = store();
+        certs.enroll("a.example.com", &enrollment(8443)).unwrap();
+        let err = certs
+            .enroll("a.example.com", &enrollment(8443).with_holding("camp"))
+            .unwrap_err();
+        assert!(
+            matches!(err, CertStoreError::AlreadyEnrolled { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            certs.enrollment("a.example.com").unwrap().unwrap().holding,
+            None
+        );
+    }
+
+    #[test]
+    fn holding_pages_round_trip_and_refuse_an_oversized_body() {
+        let (mem, certs) = store();
+        certs
+            .write_holding_page("camp", b"<p>camp</p>".to_vec())
+            .unwrap();
+        assert_eq!(
+            certs.holding_page("camp").unwrap().as_deref(),
+            Some(&b"<p>camp</p>"[..])
+        );
+        assert_eq!(certs.holding_pages().unwrap(), vec!["camp".to_string()]);
+        assert_eq!(mem.keys(), vec!["holding/camp".to_string()]);
+
+        // Refused at the upload, where a human sees it — the doors would only
+        // ever decline to serve it, silently.
+        let err = certs
+            .write_holding_page("camp", vec![b'x'; MAX_HOLDING_PAGE_BYTES + 1])
+            .unwrap_err();
+        assert!(
+            matches!(err, CertStoreError::HoldingPageTooLarge { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            certs.holding_page("camp").unwrap().as_deref(),
+            Some(&b"<p>camp</p>"[..]),
+            "a refused write must not have replaced the live page"
+        );
+
+        // Deleting a page leaves the domains naming it alone: they fall back to
+        // passway's own page, and re-uploading restores them.
+        certs.delete_holding_page("camp").unwrap();
+        assert!(certs.holding_page("camp").unwrap().is_none());
+        assert!(certs.holding_pages().unwrap().is_empty());
+        certs.delete_holding_page("camp").unwrap(); // idempotent
+        assert!(matches!(
+            certs.holding_page("../../secrets"),
+            Err(CertStoreError::InvalidHoldingName { .. })
+        ));
     }
 }

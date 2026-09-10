@@ -1886,6 +1886,7 @@ pub(crate) fn lower_recipe_step_to_forge_spec(
             shift: format!("derive-{}", recipe.name),
         },
         mesh_access: MeshAccess::default(),
+        cache_key: None,
     }
 }
 

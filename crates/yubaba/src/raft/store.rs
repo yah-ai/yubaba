@@ -67,8 +67,8 @@
 //! @yah:tier(Wizard)
 //!
 //! @yah:relay(R869, "Raft state has no off-fleet copy: total node loss is unrecoverable, and rebuilding resets tenant fencing epochs")
-//! @yah:phase(P1)
-//! @yah:at(2026-09-06T17:35:34Z)
+//! @yah:phase(P4)
+//! @yah:at(2026-09-09T04:40:29Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @arch:see(.yah/docs/working/W267-sovereign-public-ingress.md)
 //! @arch:see(.yah/docs/working/W339-rebuilding-a-cluster-from-nothing.md)
@@ -81,11 +81,7 @@
 //! @yah:gotcha("THE CORRECTNESS HALF IS GATED ON R736-F6 AND MUST NOT BE ROUTED AROUND. Only the off-fleet yah_tenant_pointer generation can fence a resurrected node, because it is minted by CAS on an object the dead cluster cannot reach — exactly the case W250 built it for (\"two cells are independent raft groups that share no epoch counter\"; a rebuilt cluster is that case against its own predecessor). It is INERT today: tenant-streamer passes pointer_generation: 0 at streamer.rs:144 and :441. Carrying the real value is R736-F6's RATIFIED design call — the generation enters the target cell's raft at commit_target_ownership and is served beside the epoch from GET /tenants/{id}, and F6 explicitly rejects the alternative (\"the streamer reads the pointer itself\") as worse. Do not implement that wiring under R869. A @yah:notify_on(R736-F6) is already on this ticket.")
 //! @yah:gotcha("DO NOT RE-PROPOSE `ClaimTenant { min_epoch }`. It was built, measured against the epoch gate, and REVERTED in this pass — the reasoning is in cluster-epochs.json surface_rerecords[2026-09-06] and W339. It would be #[serde(default)] and therefore TOLERATED in both directions, which is the R706 hazard and not the R720-F1/R737-F1 `capacity` precedent: a node on an older binary drops the field and applies current+1 while an upgraded node applies max(current,min_epoch)+1 — one log entry, two applied epochs, state machines diverged. That costs cluster_protocol 5->6 AND state_epoch 4->5, and a disaster-recovery mechanism gated on a fleet-wide upgrade cannot be used in the disaster it exists for. The shipped recovery lifts the epoch with repeated PLAIN ClaimTenant writes over the POST /raft/write that R732-T4 already deployed (raft/mod.rs:98) — one committed entry per epoch of gap, usable against the binaries on the fleet today.")
 //! @yah:gotcha("ORDERING IS LOAD-BEARING IN THE REBUILD, AND STEP 3 MAY NEED ONE RETRY. Bump the pointer generation FIRST, then read the epoch floor, then write. A generation bump does not stop a survivor immediately — the sidecar carries the old generation until somebody stamps a new one, so a survivor writing in that window is accepted and raises the sink's epoch above the floor just read, bouncing the rebuild. It TERMINATES because a dead raft group cannot mint an epoch: the survivor's number is frozen at its last applied ClaimTenant, so re-reading the fence after a bounce yields a floor already above it and attempt two wins for good. No backoff policy and no bound beyond re-read-and-retry. Pinned by raft_rebuild_fencing::the_rebuild_wins_in_one_retry.")
-//! @yah:next("R736-F6 FIRST — it is the gate on the correctness half and a @yah:notify_on already watches it. Until the pointer generation reaches the streamer, a rebuild performed today is AVAILABLE but not SAFE against a deliberately-resurrected node, and no amount of work on this ticket changes that.")
-//! @yah:next("BUILD THE REBUILD COMMAND. All four steps of W339's procedure are expressible against surfaces that exist today: (1) yah_tenant_pointer::compare_and_swap to the SAME cell — note commit_cell will NOT do it, it reports AlreadyCommitted; the raw CAS explicitly permits a same-cell generation bump. (2) turso_backup::stream::read_fence_state(&target) -> Option<FenceState{epoch, pointer_generation}>, landed by this pass. (3) repeated ClaimTenant via POST /raft/write until GET /tenants/{id} reports an epoch above the floor. (4) start streaming. Nothing drives these yet. The tenant roster for the sweep can come from R2 itself — the pointer objects live at tenants/&lt;t&gt;/cell.toml (yah_tenant_pointer::pointer_key), so it is off-fleet too.")
 //! @yah:next("RE-SEED CLUSTER SECRETS FROM DECLARATIONS — a candidate deliverable on its own, and independent of R736-F6 so it can run in parallel. YubabaState::secrets dies with the raft dir. The plaintexts survive off-fleet (fob vault, 4 slots, declarations in .yah/infra/secrets/*.toml) and the cluster KEK survives (fob vault slot cluster-kek), so this is recoverable — but by hand for N secrets, which is exactly the 'losing track of state required for cluster health' the operator ruled out on 2026-09-05.")
-//! @yah:next("OFF-FLEET SNAPSHOT OF THE APPLIED YubabaState — also independent of R736-F6. State is KB-scale and persist() already rewrites the whole file on every mutation (raft/store.rs:5), so the copy is small and cheap, and yubaba ALREADY has yah-object-store as a RUNTIME dependency (crates/yubaba/Cargo.toml:106, used by cert_store.rs for R2 with YUBABA_CERT_STORE_BUCKET / _ACCOUNT_ID / _ENDPOINT and R2ObjectStore::from_vault) — so this needs no new dep politics, unlike turso-backup which is dev-only there by W253 tenet 1. It buys back service_placement and secrets directly instead of re-deriving them. Do NOT reach for litestream: that replicates a sqlite DB and this is four JSON files.")
-//! @yah:next("SIGN-OFF IS THE CHAOS DRILL, unchanged from filing and now with a concrete pass/fail. Destroy every voter, rebuild from camp + R2, and prove (a) the cluster serves and (b) a deliberately-resurrected node holding a stale-high epoch is REFUSED. (b) is the one a happy-path rebuild test silently skips, and it CANNOT pass before R736-F6 — raft_rebuild_fencing::an_epoch_floor_alone_loses_to_a_survivor_that_outranks_it is the executable statement of why. Running the drill before F6 lands would produce a green (a) and a false sense that the ticket is done.")
 //! @yah:handoff("P1 DELIVERED: the recovery semantics are established, evidenced against production code, and written into .yah/docs/working/W339-rebuilding-a-cluster-from-nothing.md (new). That was next(1)'s literal ask — 'establish the recovery semantics FIRST, before any replicator code' — and no replicator was written, correctly: the finding is that this ticket does not need one.")
 //! @yah:handoff("THE FINDING, in one line: the acceptance property splits in two because tail_frames fences on an OR, and the halves need different mechanisms — an epoch floor read from the sink closes (a) 'the rebuilt cluster serves', and ONLY the off-fleet pointer generation can close (b) 'a resurrected node is refused'. The raft epoch fundamentally cannot fence across a raft-group rebuild, because raft is the authority that just died.")
 //! @yah:handoff("NEW: oss/yubaba/crates/yubaba/tests/raft_rebuild_fencing.rs — four proofs driving turso-backup's REAL tail_frames over an in-memory object store, so epoch comparison, watermark CAS, frame keys and manifests are all production code. (1) a_rebuilt_cluster_is_locked_out_of_its_own_tenants_sink — the availability failure, and it is SILENT: tenant-streamer treats Fenced as authoritative and calls drop_tenant (streamer.rs:153), so the tenant just stops being backed up with nothing to page on. (2) an_epoch_floor_alone_loses_to_a_survivor_that_outranks_it — the falsification of this ticket's own next(2). (3) a_generation_bump_fences_a_survivor_the_epoch_floor_cannot — the fix; note the survivor is fenced while holding a HIGHER epoch than the rebuilt cluster. (4) the_rebuild_wins_in_one_retry — the ordering race and its termination argument.")
@@ -100,6 +96,49 @@
 //! @yah:handoff("Tree anchor at handoff: 3c2c9461e1d348d2e232548a6f24042a3588ea93 — the shared tree as I left it, uncommitted. Files I touched, and only these: oss/turso-backup/src/stream.rs (read_fence_state + FenceState + 2 tests), oss/yubaba/crates/yubaba/src/raft/mod.rs (comments + 2 tests only), oss/yubaba/crates/yubaba/src/raft/store.rs (this annotation), oss/yubaba/crates/yubaba/tests/main.rs (one mod line), oss/yubaba/crates/yubaba/cluster-epochs.json, plus NEW oss/yubaba/crates/yubaba/tests/raft_rebuild_fencing.rs and .yah/docs/working/W339-rebuilding-a-cluster-from-nothing.md. Everything else dirty in the tree belongs to live peers (crates/yah/hub/, packages/yah/ui/, app/yah/cli/src/cli.rs, .yah/AGENTS.md) — do not sweep them into a commit with these.")
 //! @yah:handoff("Tree anchor at handoff: 3c2c9461e1d348d2e232548a6f24042a3588ea93 — the shared tree as I left it. Diff against it (`git diff 3c2c9461e1d348d2e232548a6f24042a3588ea93..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
 //! @yah:handoff("Tree anchor at handoff: 3c2c9461e1d348d2e232548a6f24042a3588ea93 — the shared tree as I left it. Diff against it (`git diff 3c2c9461e1d348d2e232548a6f24042a3588ea93..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:handoff("P2 DELIVERED — the off-fleet copy this ticket's title says does not exist now does. NEW oss/yubaba/crates/yubaba/src/state_backup.rs: a leader-side loop PUTs the applied YubabaState to cluster-state/<cluster>/latest.json every 60s, into the SAME R2 bucket and credentials the cert store already uses. That reuse is a decision, not laziness: a disaster-recovery mechanism that needs config the fleet does not already carry is one that is not there when the disaster happens. Opt-in on YUBABA_STATE_BACKUP_CLUSTER and fully inert without it. `secrets` rides along as AES-256-GCM ciphertext (SecretRecord is ciphertext-only by construction, raft/mod.rs) and the KEK survives in the fob vault — so the copy carries no plaintext AND restoring it needs no re-sealing, which largely retires the separate 're-seed secrets from declarations' deliverable.")
+//! @yah:handoff("THE GUARD IS THE POINT, NOT THE PUT — and it is measured, not predicted. An unguarded backup would have been WORTHLESS in the exact incident this ticket cites: on 2026-08-31 the raft dirs were wiped on all three voters, and a task that simply PUT whatever the local state machine held would have overwritten the only good copy with the empty state within one tick of the first node coming back. StateBackup::store REFUSES any snapshot whose applied_index is below the stored one, logs once per transition (not once per tick), and parks on the last good copy. Probed by deleting that arm: state_backup::a_wiped_raft_dir_cannot_overwrite_the_good_copy then fails with `Wrote { lineage: 1, applied_index: 1 }` and the object is left holding the empty state — the incident reproduced in a unit test.")
+//! @yah:handoff("THE WAY OUT OF THAT REFUSAL is `yubaba state adopt`, an operator saying the low index is legitimate. It archives the current object to lineage/<n>.json FIRST — the one moment that copy would otherwise become unreachable — then bumps `lineage` and resets the applied_index floor to 0 so the rebuilt cluster's next tick wins. No node stores a lineage locally; each carries forward whatever latest.json says, so the object is the sole authority and a node joining a rebuilt cluster needs no state of its own to participate.")
+//! @yah:handoff("RESTORE: `yubaba state restore --dir <raft dir>` -> raft::store::seed_state_machine, which writes raft_state.json with `last_applied: null` so openraft still believes nothing has been applied and the founding `init` lands its membership at index 1 on top of the seeded maps. It refuses a dir holding ANY of the four raft files, not just raft_state.json, because open() reads them as one unit (R841-B1) and a dir holding any one of them has a history of its own. `locks` and `rollouts` are DROPPED on the way in, deliberately: on a rebuild every lock holder is dead by construction, and R600-F10 spent a day blocked on a squatted acme-issuer/yah.dev lease with an 86400s TTL and no renewer on a LIVE cluster — carrying one into a disaster is strictly worse. Rollouts are in-flight state a rebuild may legitimately abandon (W339 says so).")
+//! @yah:handoff("FINDING THAT MOVES W339's SCOPE, and the next agent should read it before re-planning: restoring `tenants` restores the FENCING EPOCHS, so a rebuilt cluster no longer restarts at 1. A survivor's epoch is fixed at its last applied ClaimTenant, hence at most the snapshot's, and the rebuilt cluster's next claim grants snapshot+1 and out-fences it BY THE EPOCH COMPARAND ALONE — without the pointer generation. That is MOST of W339 half (b), not all of it: epochs granted between the last copy and the loss are not in the object and no number readable from R2 bounds them. The residual is now a BOUNDED-STALENESS problem instead of an unbounded one, which is materially different to hold open, but it is still open and still only closable by R736-F6.")
+//! @yah:handoff("BUG IN MY OWN CAS, found by re-reading the method rather than by a test, then pinned by one. store() read the object bytes and then its ETag; a copy landing between those two reads is decided against the STALE bytes and CAS'd under the FRESH ETag, so a stale write succeeds and the monotonicity guard — the entire point of the method — is bypassed by a race rather than by a missing check. Fixed to etag-then-get, where a write in the gap can only make the CAS fail (reported as Stored::Raced). FALSIFIED: swapping the two lines back makes a_copy_landing_between_the_two_reads_cannot_be_overwritten_by_a_stale_one fail with `Wrote { lineage: 1, applied_index: 6 }`, the copy walking backwards from applied index 9.")
+//! @yah:handoff("AND A PROBE THAT DID NOT PROBE, recorded because it is the more expensive mistake. My first version of that test's ObjectStore double injected the racing write on `get` specifically — so it fired at whichever point `get` happened and PASSED UNDER BOTH READ ORDERS, pinning nothing. Only rewriting it to key on read COUNT (inject after read #1, whichever method that is) made it fail against the bad order. The lesson is in the test's doc comment: a race double must be anchored to sequence position, not to a method name.")
+//! @yah:handoff("W339 (.yah/docs/working/W339-rebuilding-a-cluster-from-nothing.md) updated with a new '#the-copy' section covering the guard, adopt/lineage, restore's two deliberate drops, and the epoch finding above; its Open-work list is re-scoped accordingly.")
+//! @yah:handoff("DISCOVERED WORK, done in this pass: cert_store::CertStoreConfig::connect was split so `connect_objects()` yields the bare Arc<dyn ObjectStore> and connect() calls it — no duplicated from_vault, and a non-cert consumer takes the bucket without being handed a cert store it would only unwrap. ObjectCertStore::objects() added for the same reason on the daemon side.")
+//! @yah:handoff("Tree anchor at handoff: e336e7278f7f40780323d40a8ceb6e438bead0b1 — the shared tree as I left it. Diff against it (`git diff e336e7278f7f40780323d40a8ceb6e438bead0b1..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:next("TURN IT ON — nothing on the fleet sets YUBABA_STATE_BACKUP_CLUSTER, so today this code exists and does nothing. It is also not in any published binary (0.8.35 predates it, and only us-east-001 runs that). Sequence, and it is an operator call at step 1: cut a release -> roll the three voters -> add a drop-in with YUBABA_STATE_BACKUP_CLUSTER=<name> beside the existing YUBABA_CERT_STORE_* -> confirm with `yubaba state show` that latest.json exists and its applied index tracks /cluster/singletons. Until that lands the ticket has built the copy but the cluster still has none.")
+//! @yah:next("R736-F6 IS STILL THE GATE for the ABSOLUTE form of half (b) — but read the P2 handoff first, because the shape of what it buys has changed. With the state copy in place a rebuild already out-fences any survivor whose epoch predates the last copy; F6 closes the remaining window of epochs granted after it. A @yah:notify_on(R736-F6) already watches this ticket.")
+//! @yah:next("SIGN-OFF IS STILL THE CHAOS DRILL. Destroy every voter, rebuild from camp + R2 (now: `yubaba state restore` on each, then `raft init`), and prove (a) the cluster serves and (b) a deliberately-resurrected node holding a stale-high epoch is REFUSED. (b) now has TWO passing conditions worth measuring separately: refused because the restored epoch out-ranks it (available today), and refused because the pointer generation moved (needs R736-F6). A drill that only shows (a) proves the least interesting half.")
+//! @yah:next("A NEW LINEAGE IS NEVER PRUNED. lineage/<n>.json accumulates one object per adopt, forever, by design — they are KB-scale and they are precisely the pre-accident record. If that ever needs bounding it is a policy decision, not an oversight; `StateBackup::lineages()` already lists them.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib = 828 passed / 0 failed (14 in state_backup::tests, 3 new in raft::store::tests). cargo test ... -p yubaba --test main -- --test-threads=4 = 68 passed / 0 failed. Both on a tree that also carries @Ashguard:eclipse's live R859-F2 work, so the totals include their tests too.")
+//! @yah:verify("cargo clippy -p yubaba --all-targets: zero hits naming state_backup.rs, cert_store.rs, main.rs or my raft/store.rs hunks. The three store.rs hits (clone_on_copy at :397/:419, derivable_impls at :491) are pre-existing and untouched.")
+//! @yah:verify("rustfmt --edition 2021 --check: state_backup.rs fully clean (it is mine alone, so it was formatted outright). On the shared files only MY hunks were checked and hand-corrected (main.rs println!, cert_store.rs connect_objects); raft/store.rs carries 1 pre-existing drift site at tenants(), cert_store.rs 25, lib.rs 150 crate-wide — all deliberately NOT reformatted, since a blanket fmt on a shared tree is how this camp lost 827 uncommitted lines on 2026-08-28.")
+//! @yah:verify("CLI exercised: `yubaba state --help`, `state restore --help` render, and `yubaba state show` with no env fails with the intended message. NOT EXERCISED END TO END: the R2 path itself — connect_from_env needs live cloudflare-r2-* credentials, so show/restore/adopt against a real bucket is unrun. Everything beneath it is unit-tested against InMemoryObjectStore, including put_if/etag CAS semantics, so the untested span is the credential fetch and the R2 transport, not the logic.")
+//! @yah:handoff("P3 DELIVERED — W339's four-step procedure is a command. `yubaba-tenant-streamer rebuild` (NEW oss/yubaba/crates/tenant-streamer/src/rebuild.rs) drives step 1 (bump the global pointer generation), step 2 (read the sink's epoch floor via read_fence_state, landed P1) and step 3 (lift this cluster's epoch over it with plain ClaimTenant writes) over every tenant in the node's streamer config. `--dry-run` reads both and writes nothing — no pointer bump, no raft entry — which is what an operator should run first. `--tenant` scopes it and REFUSES an id the config does not know, because a typo'd tenant that silently rebuilt nothing would read as a green run. The full total-loss order is now: `yubaba state restore --dir …` on each new voter -> `yubaba raft init --member …` once -> `yubaba-tenant-streamer rebuild` -> start the streamers.")
+//! @yah:handoff("WHERE IT LIVES, since the P2 handoff flagged the dep politics as undecided: yubaba-tenant-streamer, because it is the ONLY crate already holding both halves of the fence — turso-backup (a real dep there, not the dev-only one W253 tenet 1 forces on the yubaba crate) and the node-local yubaba HTTP client. It gained two deps: `yah-tenant-pointer` as a raw path (publish=false, owns no crates.io name, so nothing for [patch.crates-io] to redirect — the same shape and the same reason as the existing turso-backup path dep three lines above it) and `yah-object-store` as the house version+patch shape. R736-F6's gotcha says a yubaba crate cannot take the tenant-pointer dep 'as-is'; that is true of the version+patch shape it was describing and not of the path shape this manifest already used.")
+//! @yah:handoff("THREE THINGS THE FOUR-STEP LIST DOES NOT SPELL OUT, each because getting it wrong is silent. (1) It RE-READS the fence after lifting and takes another round if it moved (max_rounds, default 4) — that is W339's survivor race. (2) A fence that never stops moving is an ERROR naming a live predecessor, not a longer retry: a dead raft group cannot mint an epoch, so exhausting max_rounds means the premise is false. (3) The distance is checked BEFORE the first claim (max_claims, default 10000) and the refusal names `yubaba state restore` — each claim is one committed raft entry, so a floor in the millions is a reason to restore the copy, not to count up to it.")
+//! @yah:handoff("FALSIFIED, NOT ASSUMED. Deleting the re-read (returning Cleared straight after the claim loop) makes rebuild::tests::the_rebuild_overtakes_a_survivor_that_wrote_into_the_window fail with `Cleared { floor: 5, epoch: 6, claims: 6, rounds: 1 }` against a sink standing at 9 — a rebuild that believes it won and is then silently dropped by tail_frames, which is this relay's whole failure mode. a_fence_that_never_stops_moving_is_reported_as_a_live_predecessor fails with it too; the other seven stay green, so nothing else in the setup is quietly doing the work. Probe reverted and recorded in that test's doc comment.")
+//! @yah:handoff("STEP 1 IS BUILT BUT REPORTS PointerStep::Absent FOR EVERY TENANT TODAY, and that is correct rather than broken — nothing mints pointers until R736-F6. It is unit-tested against InMemoryObjectStore (the same-cell bump advances 1->2->3 without moving the tenant), uses the RAW compare_and_swap because commit_cell reports AlreadyCommitted and writes nothing in exactly this case, and treats a lost CAS as an error rather than a retry. So F6 landing needs no change here.")
+//! @yah:handoff("DISCOVERED WORK, done in this pass. (1) The @yah:notify_on(R859-F2) P2 left is SATISFIED and removed: `cargo run -p xtask -- cluster-epochs` is GREEN (cluster_protocol d4b539bd…, state_epoch 5b11870a…) and surface_rerecords[0] is a 2026-09-08 entry by @Ashguard:eclipse that names R869's half explicitly and keeps cluster_protocol 5 / state_epoch 4. The 'THE CLUSTER-EPOCHS GATE IS RED' gotcha was false and is retired. (2) `yubaba state restore`'s next-step message stopped at `raft init` — an operator following it would have left the fence up, silently. It now names `yubaba-tenant-streamer rebuild` and says why skipping it is silent (yubaba/src/main.rs, one string; that file also carries @Ashguard:eclipse's live R859-F2 hunks, mine is a distinct one in the StateCmd::Restore arm). (3) build_store and build_pointer_store both read the sink credential pair; factored to one `sink_credentials` so two stores on one bucket cannot read from different variables. (4) ownership.rs gained `parse_tenant_outcome` + `TenantOutcome`, shared by the renewal path and the new claim, and `raft_write` so both POSTs go through one place. LeaseRenewal deliberately KEPT as a separate type — its contract is 'a renewal never advances the epoch' and a claim's is the exact opposite. (5) Deleted my own `rebuild_tenant`/`TenantRebuild` before handing over: main.rs composes the steps itself for logging granularity, so they were unused public API.")
+//! @yah:handoff("Tree anchor at handoff: 24d24042d537b453e01d330ac185445398ec74a9 — quote this SHA, not 'HEAD', in any revert instruction. Files I touched and only these: NEW oss/yubaba/crates/tenant-streamer/src/rebuild.rs, plus tenant-streamer/{Cargo.toml, src/lib.rs, src/main.rs, src/ownership.rs}, oss/yubaba/crates/yubaba/src/main.rs (one string in StateCmd::Restore), oss/yubaba/crates/yubaba/src/raft/store.rs (this annotation), .yah/docs/working/W339-rebuilding-a-cluster-from-nothing.md. oss/yubaba/Cargo.lock is gitignored, so the new deps leave no lockfile diff. Everything else dirty in the tree is peers' — most of it @Ashguard:eclipse's R859-F2 floating-ip carve-out (oss/yubaba/crates/{cloud,floating-ip}/, yubaba/Cargo.toml) — do not sweep it into a commit with these.")
+//! @yah:handoff("W339 gained a '#the-command' section (the command, the three guards, where it lives and why, the pointer-store reuse and its \"auto\"-region refusal) and its Open-work list is re-scoped: 'A rebuild command' is retired, 'nothing has run it against a real bucket' replaces it.")
+//! @yah:handoff("Tree anchor at handoff: 24d24042d537b453e01d330ac185445398ec74a9 — the shared tree as I left it. Diff against it (`git diff 24d24042d537b453e01d330ac185445398ec74a9..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:next("NOTHING HAS RUN `rebuild` AGAINST A REAL BUCKET. Every branch is unit-tested against in-memory doubles, so the untested span is the credential read and the R2/S3 transport, not the logic — the same shape as P2's state CLI. `rebuild --dry-run` against the live sink is the cheapest way to close it and writes nothing; it needs S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY and a streamer config, and no fleet node runs a streamer today.")
+//! @yah:next("THE POINTER STORE'S BUCKET IS AN ASSUMPTION worth checking before the drill, and it is stated rather than hidden: `rebuild` reads tenants/<id>/cell.toml from the SAME bucket, endpoint and credentials as the sink, at the bucket ROOT (sink.prefix is deliberately NOT applied — yah_tenant_pointer::pointer_key takes a tenant and nothing else). Nothing writes pointers yet, so no deployed convention contradicts it, but R736-F6 is the ticket that will establish one — if F6 puts pointers in a different bucket, build_pointer_store (tenant-streamer/src/lib.rs) is the one place to change.")
+//! @yah:next("IT SIGNS WITH R2's \"auto\" REGION AND REFUSES ANYTHING ELSE. R2ObjectStore hardcodes \"auto\" and offers no override, so build_pointer_store rejects a sink.region that is neither \"auto\" nor empty rather than failing later as a SigV4 signature error. If a cell is ever pointed at real AWS S3, that refusal is the ticket: the pointer bump then needs a store this crate does not have.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba-tenant-streamer = 35 passed / 0 failed (baseline 24; +9 in rebuild::tests, +2 in lib's new tests::). cargo build -p yubaba --bin yubaba = Finished. cargo run -p xtask -- cluster-epochs = 'protocol surfaces match their recorded hashes' — my change touches no input to either axis (tenant-streamer is not one) and the gate is green after it.")
+//! @yah:verify("cargo clippy --manifest-path oss/yubaba/Cargo.toml -p yubaba-tenant-streamer --all-targets: ZERO warnings on any tenant-streamer file. The one warning in the run is pre-existing dead code in yah-object-store (`parse_list_v2`, r2.rs:606), a file I did not touch.")
+//! @yah:verify("rustfmt --edition 2021 --check, per file: rebuild.rs 0 sites (mine alone, so formatted outright); ownership.rs 9 = 9 at baseline; main.rs 11 = 11 at baseline; lib.rs 2, DOWN from 4 (the credential dedup removed two). So every hunk I authored is clean and no shared file was blanket-reformatted — that is how this camp lost 827 uncommitted lines on 2026-08-28.")
+//! @yah:verify("CLI exercised: `yubaba-tenant-streamer --help` shows the rebuild subcommand and the streaming default is unchanged (no subcommand still streams, --check still checks); `rebuild --help` renders every flag; `rebuild --dry-run` with no credentials fails with 'S3_ACCESS_KEY_ID must be set…' and `rebuild --tenant nope` fails with '--tenant nope is not in the config; configured tenants are: acme, globex'.")
+//! @yah:handoff("P4 — THE PROCEDURE IS NOW FINDABLE IN AN EMERGENCY, which P3 left as a gap: the run order existed only in a chat message and in `yubaba state restore`'s stdout. NEW `.yah/docs/guides/yubaba-total-loss-recovery.md`, in the house runbook shape (preconditions -> numbered steps -> verify -> what this does not cover). It covers all six steps including two P3's summary omitted — `yubaba state show` FIRST to see how stale the copy is, and `yubaba state adopt` LAST, without which the rebuilt cluster cannot back itself up at all (the monotonicity guard reads its low applied_index exactly like a wiped node). It also carries a three-row table mapping `rebuild`'s three refusals to what each one means and what to do, with the strings verified against rebuild.rs rather than paraphrased.")
+//! @yah:handoff("NO NEW SURFACE WAS NEEDED — the answer to 'runbook or QED pipeline or trait stanza' is that this camp already routes exactly this: `.yah/docs/guides/` holds steps, the `fleet` skill holds judgment and says 'Judgment here, steps there', and the `cloud-ops` trait (always-on for the Yubaba job) carries the runbook index. The new guide is now in all three. A QED pipeline would be wrong — the steps are operator actions against live hardware, not a build.")
+//! @yah:handoff("THE REAL FIND, and it is why this pass was worth more than a doc: `fleet.md` §'Raft — what's safe and what is a flag-day' told the operator that an openraft minor-version upgrade's safe procedure is to 'delete raft_{log,state,vote}.json on every node, start, then run raft init once' — a bare wipe, with no mention of the off-fleet copy or the sink fence. That is a ROUTINE PLANNED EVENT documented as a procedure that destroys precisely what R869 exists to protect, and the tenant half of the damage is silent (tail_frames refuses, tenant-streamer drops the tenant, nothing pages). Rewritten into two bullets: the flag-day mechanics, then 'a raft wipe is a total loss, so treat it as one' pointing at the runbook. This is the same defect the 2026-08-31 crash-loop recovery hit by accident; the difference is that the flag-day version is something we would have done ON PURPOSE.")
+//! @yah:handoff("THE CEILING GUARD CAUGHT ME AND IT WAS RIGHT. My first cloud-ops entry (232 B, index + full rationale) put the yubaba job's resident prompt at 21010 B against a 20900 B ceiling — `prelude::tests::resident_prompt_stays_under_its_ceiling`. I did NOT raise the ceiling: the resident index only has to make the runbook FINDABLE, and the rationale belongs in fleet.md and the guide, which both now carry it in full. Trimmed to 91 B ('raft state gone; a bare wipe silently fences every tenant'), which is the better edit on its own terms and not merely the cheaper one. yubaba now sits at 20867 B — 33 B of headroom, so the next addition to cloud-ops WILL trip it. That is a real constraint on this surface and the operator should know it: growth belongs in the on-demand `fleet` skill or the guides, not in the always-on trait.")
+//! @yah:handoff("Tree anchor at handoff: 24d24042d537b453e01d330ac185445398ec74a9 — quote this SHA, not 'HEAD'. P4 files, on top of P3's: NEW .yah/docs/guides/yubaba-total-loss-recovery.md, crates/yah/party/src/skill_procedures/fleet.md (two hunks: the flag-day bullet, the runbook list), crates/yah/party/preroll/traits/cloud-ops.json (ONE line — the JSON was already indent=2 so the rewrite is not a reformat, checked with git diff --stat), .yah/docs/working/W339-rebuilding-a-cluster-from-nothing.md (names the runbook as its operational counterpart).")
+//! @yah:handoff("Tree anchor at handoff: 24d24042d537b453e01d330ac185445398ec74a9 — the shared tree as I left it. Diff against it (`git diff 24d24042d537b453e01d330ac185445398ec74a9..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:verify("cargo test -p yah-party --lib = 507 passed / 0 failed, including resident_prompt_stays_under_its_ceiling, which FAILED first at 'yubaba: 21010 B of 20900 B — OVER by 110 B' and passes at 20867 B after the trim. The failure is recorded because it is the measurement: the yubaba resident budget has 33 B left.")
+//! @yah:verify("Every command, flag and error string in the runbook is read from source, not recalled: `yubaba state show|restore|adopt` and their --lineage/--dry-run/--dir flags from main.rs's StateCmd, `yubaba raft init --member id=host:port@region` and the @region requirement from RaftCmd::Init's own help, /etc/yah/tenant-streamer.toml from the streamer's clap default, YUBABA_STATE_BACKUP_CLUSTER + YUBABA_CERT_STORE_{BUCKET,ACCOUNT_ID,ENDPOINT} from state_backup::StateBackupConfig::parse and cert_store's consts, and the three refusal strings grepped out of rebuild.rs.")
+//! @yah:verify("NOT EXERCISED: the runbook end to end. It is a procedure against live hardware and no fleet node runs a tenant streamer today, so it is verified by construction (every step's command and message read from source) and not by execution. The chaos drill is still what closes it.")
 
 use std::collections::BTreeMap;
 use std::fmt::Display;
@@ -654,6 +693,97 @@ impl YubabaStateMachine {
         self.inner.read().unwrap().data.state.locks.clone()
     }
 
+    /// R118-T5 (W138): every rollout in this node's applied state.
+    ///
+    /// The rollout supervisor's per-tick read. It carries no rollout state of
+    /// its own across ticks — this map *is* its memory, which is precisely why
+    /// a node that has never seen a rollout before can pick one up the moment
+    /// it becomes leader.
+    pub fn rollouts(&self) -> BTreeMap<String, super::RolloutRaftRecord> {
+        self.inner.read().unwrap().data.state.rollouts.clone()
+    }
+
+    /// R118-F8: what this node's applied state believes about `subject`, folded
+    /// across every observer whose report is fresher than `ttl` seconds at
+    /// `now`.
+    ///
+    /// The ratchet's per-tick read, and locally applied like every accessor in
+    /// this block — a leader that has lost quorum still answers, with the
+    /// evidence it had. That is not a hazard here: without quorum it cannot
+    /// commit a membership change either, so a stale read cannot produce a
+    /// stale *action*.
+    pub fn corroborated_liveness(
+        &self,
+        subject: super::YubabaNodeId,
+        now: u64,
+        ttl: u64,
+    ) -> super::PeerLivenessVerdict {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .state
+            .corroborated_liveness(subject, now, ttl)
+    }
+
+    /// R118-F8: every peer-liveness report in this node's applied state, keyed
+    /// `observer -> subject`. The operator/diagnostic view; the ratchet itself
+    /// asks [`Self::corroborated_liveness`].
+    pub fn peer_liveness(
+        &self,
+    ) -> BTreeMap<super::YubabaNodeId, BTreeMap<super::YubabaNodeId, super::PeerLivenessRecord>>
+    {
+        self.inner.read().unwrap().data.state.peer_liveness.clone()
+    }
+
+    /// R118-F8: the last membership change the ratchet made, or `None` if it has
+    /// never fired on this cluster.
+    pub fn last_membership_ratchet(&self) -> Option<super::MembershipRatchetRecord> {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .state
+            .last_membership_ratchet
+            .clone()
+    }
+
+    /// R118-T5: one rollout's record in this node's applied state, or `None` if
+    /// there is none. Serves `GET /v1/rollouts/{id}` and the running engine's
+    /// per-step re-read (which is how an operator override reaches an engine
+    /// that is already mid-flight).
+    pub fn rollout(&self, rollout_id: &str) -> Option<super::RolloutRaftRecord> {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .state
+            .rollouts
+            .get(rollout_id)
+            .cloned()
+    }
+
+    /// R118-T5 (W138): every boot-health report filed against one rollout,
+    /// keyed by node.
+    ///
+    /// An **empty map is the honest answer for a rollout nobody has reported
+    /// on**, and it is indistinguishable from one for a rollout that does not
+    /// exist — deliberately. The only consumer is the engine's step gate, which
+    /// is fail-closed: no evidence and some evidence-but-not-enough take the
+    /// same branch, so there is nothing for a caller to get wrong by conflating
+    /// them, and no way to spell "assume healthy".
+    pub fn rollout_health(&self, rollout_id: &str) -> BTreeMap<String, super::NodeHealthRecord> {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .state
+            .rollout_health
+            .get(rollout_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// R732-T4 (W245): the fencing token `node` may stream `tenant` under, per
     /// this node's applied state. Delegates to
     /// [`YubabaState::tenant_fencing_token`](super::YubabaState::tenant_fencing_token)
@@ -842,10 +972,98 @@ impl YubabaStateMachine {
             .unwrap()
             .data
             .state
+            .node_for_machine(machine)
+    }
+
+    /// Read several parts of applied state **at one applied index**.
+    ///
+    /// The accessors above each take and release the lock, which is right for a
+    /// reader asking one question. It is wrong for a reader whose answer is a
+    /// *join* across maps: the membership ratchet (R118-F8) folds peer-liveness
+    /// verdicts against the singleton-owner lock and the member rows, and three
+    /// separate reads could straddle an apply and produce a decision that was
+    /// never true of any single state. Nothing is cloned — `f` borrows.
+    ///
+    /// Hold it briefly. The lock is the one raft applies into.
+    pub fn with_state<T>(&self, f: impl FnOnce(&super::YubabaState) -> T) -> T {
+        f(&self.inner.read().unwrap().data.state)
+    }
+
+    /// R859-F2 phase A: the whole cluster's declared machines, in the shape the
+    /// ingress-failover planner takes.
+    ///
+    /// This is the fleet-side answer to a question the leader previously could
+    /// not ask. `floating_ip::plan_ingress_owner_effect` needs a *fleet* of
+    /// declarations to resolve an `ingress_owner` string against, and its other
+    /// consumer (`yah cloud apply`) gets that by reading
+    /// `.yah/infra/machines/*.toml` — a tree no fleet node has. Each node
+    /// publishing its own five declared facts into its member row
+    /// ([`member_registration`](crate::member_registration)) reassembles the
+    /// same list from the inside.
+    ///
+    /// # Rows with no machine name are skipped, deliberately
+    ///
+    /// [`MemberInfo::machine`](super::MemberInfo::machine) is `None` for a node
+    /// that pre-dates the field or could not read `/etc/hostname`. A
+    /// [`FloatingIpMachine`](floating_ip::FloatingIpMachine) with an empty
+    /// `name` would not merely be useless — `resolve_ingress_owner` matches on
+    /// `name`, so an empty one is a row that matches nothing, and *several*
+    /// empty ones look like a duplicate declaration. Omitting them means an
+    /// unresolvable owner refuses loudly (the whole point of that function)
+    /// instead of resolving onto a nameless placeholder.
+    ///
+    /// # This list is comparable to `ingress_owner` by construction
+    ///
+    /// The gotcha that shadows the `cloud` side of this path — `ingress_owner`
+    /// carries `/etc/hostname`, which is not reliably the
+    /// `.yah/infra/machines/<name>.toml` name — **does not apply here**, and
+    /// that is phase A's quiet win. Both strings come from one function
+    /// ([`derive_machine_name`](crate::leader::derive_machine_name)) on one
+    /// box, so on the fleet path `resolve_ingress_owner` matches by
+    /// construction rather than by luck.
+    pub fn floating_ip_machines(&self) -> Vec<floating_ip::FloatingIpMachine> {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .state
             .members
-            .iter()
-            .find(|(_, m)| m.machine.as_deref() == Some(machine))
-            .map(|(id, _)| *id)
+            .values()
+            .filter_map(|m| {
+                Some(floating_ip::FloatingIpMachine {
+                    name: m.machine.clone()?,
+                    provider: m.provider.clone().unwrap_or_default(),
+                    location: m.location.clone(),
+                    region: m.region.clone(),
+                    ingress_floating_ip: m.ingress_floating_ip.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// R859-F2 phase A: the public address `machine` answers on, per its
+    /// replicated member row.
+    ///
+    /// The one fact a withdrawal cannot be performed without.
+    /// `IngressOwnerEffect::Withdraw` names a machine, and a Cloudflare record
+    /// delete is content-matched (a round-robin apex holds several A records
+    /// under one name, so deleting *by name* would take the live origins with
+    /// it) — so the effector has to turn the name back into an address before
+    /// it can subtract exactly one.
+    ///
+    /// `None` covers "no such machine", "that node never declared an address",
+    /// and "no member row", all of which mean *cannot withdraw*, never *nothing
+    /// to withdraw*.
+    pub fn public_address_for_machine(&self, machine: &str) -> Option<String> {
+        self.inner
+            .read()
+            .unwrap()
+            .data
+            .state
+            .members
+            .values()
+            .find(|m| m.machine.as_deref() == Some(machine))
+            .and_then(|m| m.public_address.clone())
     }
 
     /// The raft log index this replica has applied up to, or `None` before the
@@ -864,6 +1082,65 @@ impl YubabaStateMachine {
             .last_applied
             .map(|id| id.index)
     }
+
+    /// The whole applied state, and the index it is true as of — the pair
+    /// [`crate::state_backup`] ships off-fleet (R869 / W339).
+    ///
+    /// One read under one lock, deliberately: the accessors above each take the
+    /// lock separately, so assembling a copy from them could interleave an
+    /// apply and produce a snapshot that was never a state this cluster was in.
+    /// The index is `None` when nothing has been applied, which is a cluster
+    /// with nothing to back up rather than an empty backup.
+    pub fn applied_state(&self) -> (super::YubabaState, Option<u64>) {
+        let inner = self.inner.read().unwrap();
+        (
+            inner.data.state.clone(),
+            inner.data.last_applied.map(|id| id.index),
+        )
+    }
+}
+
+/// Seed a **fresh** raft dir with `state` — the restore half of R869 / W339.
+///
+/// Writes `raft_state.json` with `last_applied: None` and a default membership,
+/// so the state machine carries the restored maps while openraft still believes
+/// nothing has been applied. That is the truth on a rebuild: the log genuinely
+/// is empty, and the founding `init` applies its membership entry at index 1 on
+/// top of the seeded state rather than replaying anything.
+///
+/// Refuses when **any** of the four raft files already exists. A restore is
+/// only ever correct against a dir that has no history of its own, and the
+/// alternative — merging into a live replica — is the split-brain this whole
+/// relay exists to prevent. `raft_state.json` alone would be the tempting
+/// check; `open()` reads all four as one unit (R841-B1), so all four are the
+/// guard.
+pub fn seed_state_machine(dir: &Path, state: &super::YubabaState) -> Result<(), io::Error> {
+    std::fs::create_dir_all(dir)?;
+    for name in [
+        "raft_state.json",
+        "raft_log.json",
+        "raft_vote.json",
+        "raft_meta.json",
+    ] {
+        if dir.join(name).exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} already holds {name}: a state restore only applies to an empty raft dir. \
+                     Stop yubaba and remove raft_state.json / raft_log.json / raft_vote.json / \
+                     raft_meta.json together, or point --dir at a fresh one.",
+                    dir.display()
+                ),
+            ));
+        }
+    }
+    let data = StateMachineData {
+        last_applied: None,
+        last_membership: StoredMembership::default(),
+        state: state.clone(),
+    };
+    let json = serde_json::to_string(&data).map_err(io_other)?;
+    write_atomic(&dir.join("raft_state.json"), json.as_bytes())
 }
 
 /// Lower-case hex encoding. No `hex` crate dep in this crate; a digest is
@@ -1040,6 +1317,7 @@ mod tests {
                     access: workload_spec::secrets::SecretAccess::AllowAny,
                     digest: None,
                     sans: None,
+                    ari: None,
                 },
             ),
         )
@@ -1340,6 +1618,186 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    // ── R869 / W339: the off-fleet copy's two ends ───────────────────────────
+
+    fn placed(service: &str, machine: &str) -> super::super::YubabaState {
+        super::super::YubabaState {
+            service_placement: BTreeMap::from([(service.to_string(), machine.to_string())]),
+            ..Default::default()
+        }
+    }
+
+    /// A seeded dir opens as a state machine holding the restored maps while
+    /// still reporting nothing applied — which is the truth on a rebuild, and
+    /// what lets the founding `init` land its membership at index 1 on top.
+    #[tokio::test]
+    async fn a_seeded_dir_opens_with_the_state_and_no_applied_index() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        seed_state_machine(&dir, &placed("web", "us-west-001")).unwrap();
+
+        let sm = YubabaStateMachine::open(dir.clone()).await.unwrap();
+        let (state, applied) = sm.applied_state();
+        assert_eq!(state.service_placement["web"], "us-west-001");
+        assert_eq!(applied, None);
+
+        // And the log half of the same dir is startable: an empty log with a
+        // seeded state machine reconstructs no purge marker (the case
+        // `reconstruct_last_purged` closes with `Ok(None)`), so a founding
+        // voter boots instead of refusing.
+        let log = YubabaLogStore::open(dir).await.unwrap();
+        assert!(log.inner.read().unwrap().last_purged_log_id.is_none());
+    }
+
+    /// A restore is only ever correct against a dir with no history of its own.
+    /// All four files guard it, not just `raft_state.json` — `open()` reads them
+    /// as one unit (R841-B1), so a dir holding any one of them has a history.
+    #[tokio::test]
+    async fn seeding_refuses_every_raft_file_that_already_exists() {
+        for name in [
+            "raft_state.json",
+            "raft_log.json",
+            "raft_vote.json",
+            "raft_meta.json",
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let dir = tmp.path().to_path_buf();
+            std::fs::write(dir.join(name), b"{}").unwrap();
+
+            let err = seed_state_machine(&dir, &placed("web", "us-west-001")).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{name}");
+            assert!(err.to_string().contains(name), "{name}: {err}");
+            // Refusing means refusing: nothing was written alongside it.
+            assert!(
+                !dir.join("raft_state.json").exists() || name == "raft_state.json",
+                "{name}: seeded anyway"
+            );
+        }
+    }
+
+    /// `applied_state` reads the state and its index under one lock, so the
+    /// pair the backup ships is a state this cluster was actually in.
+    #[tokio::test]
+    async fn applied_state_reports_the_index_the_state_is_true_as_of() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut sm = YubabaStateMachine::open(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        apply_one(
+            &mut sm,
+            normal_entry(
+                4,
+                YubabaRequest::SetServicePlacement {
+                    service: "web".into(),
+                    machine: "us-west-001".into(),
+                },
+            ),
+        )
+        .await;
+
+        let (state, applied) = sm.applied_state();
+        assert_eq!(applied, Some(4));
+        assert_eq!(state.service_placement["web"], "us-west-001");
+    }
+
+    /// R859-F2 phase A: the member map reassembles the fleet's declarations
+    /// into the shape `floating_ip::plan_ingress_owner_effect` takes — the list
+    /// `yah cloud apply` reads out of `.yah/infra/machines/*.toml` and a fleet
+    /// node cannot.
+    ///
+    /// Two properties, and the second is the load-bearing one: a row with no
+    /// machine name is **omitted**, not included with an empty `name`. An empty
+    /// name matches no `ingress_owner`, so including it would turn a clean
+    /// "cannot resolve — refusing" into a list whose entries silently cannot be
+    /// looked up, and two such rows would look like a duplicate declaration.
+    #[tokio::test]
+    async fn the_member_map_reassembles_the_fleets_declarations() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut sm = YubabaStateMachine::open(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let rows = [
+            (
+                1u64,
+                Some("us-west-001"),
+                Some("hetzner"),
+                Some("hil"),
+                Some("fip-42"),
+                Some("15.204.89.240"),
+            ),
+            (
+                2,
+                Some("us-east-001"),
+                Some("static"),
+                None,
+                None,
+                Some("51.81.85.145"),
+            ),
+            // A node that pre-dates `MemberInfo::machine`, or could not read
+            // its own hostname. Unresolvable by name, so it must not appear.
+            (3, None, Some("static"), None, None, Some("45.32.194.254")),
+        ];
+        for (index, (node_id, machine, provider, location, ip, public)) in
+            rows.into_iter().enumerate()
+        {
+            apply_one(
+                &mut sm,
+                normal_entry(
+                    index as u64 + 1,
+                    YubabaRequest::SetMember {
+                        node_id,
+                        addr: format!("100.64.0.{node_id}:7443"),
+                        region: Some("us-west".into()),
+                        capacity: None,
+                        machine: machine.map(str::to_string),
+                        provider: provider.map(str::to_string),
+                        location: location.map(str::to_string),
+                        ingress_floating_ip: ip.map(str::to_string),
+                        public_address: public.map(str::to_string),
+                    },
+                ),
+            )
+            .await;
+        }
+
+        let machines = sm.floating_ip_machines();
+        assert_eq!(
+            machines.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["us-west-001", "us-east-001"],
+            "a member row with no machine name has no name to resolve against and must be \
+             omitted, not carried as an empty-named entry"
+        );
+        // The five-field contract, end to end: what a node declared on its
+        // flags is what the planner reads.
+        let west = &machines[0];
+        assert_eq!(west.provider, "hetzner");
+        assert_eq!(west.location.as_deref(), Some("hil"));
+        assert_eq!(west.region.as_deref(), Some("us-west"));
+        assert_eq!(west.ingress_floating_ip.as_deref(), Some("fip-42"));
+        // `resolve_ingress_owner` matches on exactly this, so the round trip
+        // through the member map has to preserve it byte for byte.
+        assert!(floating_ip::resolve_ingress_owner("us-west-001", &machines).is_ok());
+        assert!(
+            floating_ip::resolve_ingress_owner("vps-4c1efa56", &machines).is_err(),
+            "an owner naming no declared machine must refuse, not resolve onto the nameless row"
+        );
+
+        assert_eq!(
+            sm.public_address_for_machine("us-west-001").as_deref(),
+            Some("15.204.89.240")
+        );
+        assert_eq!(
+            sm.public_address_for_machine("us-east-001").as_deref(),
+            Some("51.81.85.145")
+        );
+        assert_eq!(
+            sm.public_address_for_machine("us-south-001"),
+            None,
+            "an unknown machine has no address to withdraw — never a fallback one"
         );
     }
 }

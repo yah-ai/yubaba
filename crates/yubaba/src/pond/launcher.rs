@@ -44,7 +44,12 @@ use kamaji::Kamaji as ContainerRuntime;
 /// the wire contract; [`annotation_keys_match_kamaji`] pins them.
 ///
 /// [`annotation_keys_match_kamaji`]: tests::annotation_keys_match_kamaji
-const PUBLISH_ANNOTATION: &str = "yah.docker.publish";
+///
+/// `PUBLISH_ANNOTATION` is `pub(crate)` because it is also the one spec fact
+/// that makes a *namespaced* container reachable at the node's own address —
+/// see [`crate::service_records::binds_node_ports`] (R881-B1). Both readers
+/// share this constant so the pin test above covers both.
+pub(crate) const PUBLISH_ANNOTATION: &str = "yah.docker.publish";
 const NETWORK_ANNOTATION: &str = "yah.docker.network";
 const NETWORK_ALIAS_ANNOTATION: &str = "yah.docker.network_alias";
 

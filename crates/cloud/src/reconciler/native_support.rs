@@ -123,6 +123,154 @@ pub(crate) fn capture_paths(state_dir: &std::path::Path, ident: &str) -> (PathBu
     (dir.join("stdout.log"), dir.join("stderr.log"))
 }
 
+/// Tail-only supervisor for an **adopted** native workload — one this process
+/// did not spawn and therefore holds no [`NativeRuntime`] handle for.
+///
+/// The distinction matters and is the whole reason this exists next to
+/// [`spawn_native_log_supervisor`] rather than being folded into it. That one
+/// owns the workload: it can ask the runtime whether the child is still alive
+/// and tear it down. An adopter has neither — after a desktop restart the
+/// original supervisor is gone and the child has reparented to init — so all it
+/// can do is keep reading the capture files, which NativeRuntime left behind at
+/// a deterministic path and the orphan is still appending to.
+///
+/// Teardown for an adopted workload is therefore NOT this task's job; it rides
+/// on `RunningWorkload::with_teardown` (see
+/// [`stop_process_listening_on`]).
+pub(crate) fn spawn_capture_tail(
+    log_buf: LogBuffer,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        // From the end, not from 0 — see [`FileTail::from_end`].
+        let mut out_tail = FileTail::from_end(stdout_path).await;
+        let mut err_tail = FileTail::from_end(stderr_path).await;
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    out_tail.drain_into(&log_buf).await;
+                    err_tail.drain_into(&log_buf).await;
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                    out_tail.drain_into(&log_buf).await;
+                    err_tail.drain_into(&log_buf).await;
+                }
+            }
+        }
+    })
+}
+
+/// Stop whatever process is currently listening on `addr`: SIGTERM, wait up to
+/// `grace` for the port to go quiet, then SIGKILL. Errors if the port is still
+/// bound afterwards.
+///
+/// **Why the port and not a recorded pid.** The case this exists for is an
+/// orphan — a native workload whose supervisor died and which reparented to
+/// init (observed on this camp 2026-09-08: three `mesofact-dev` processes,
+/// PPID 1, one of them holding 4321 across a desktop *and* camp-daemon
+/// restart). A pid written to disk at spawn time is only ever stale in exactly
+/// that case, and a stale pid on a machine that has since wrapped its pid space
+/// names an innocent process. Asking the OS who holds the socket *right now*
+/// has no staleness window at all.
+///
+/// The caller is expected to have already confirmed the listener's identity
+/// (mesofact-dev's `/__mesofact/info`) — this function only knows how to kill
+/// what answers on a port, not whether killing it is correct.
+///
+/// Verification is by effect: the port stops accepting connections. A pid that
+/// exits while something else keeps the socket open is a failed stop and is
+/// reported as one, which is the property the Stop button was missing.
+pub(crate) async fn stop_process_listening_on(
+    addr: std::net::SocketAddr,
+    grace: Duration,
+) -> Result<()> {
+    let pid = pid_listening_on(addr.port())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("nothing is listening on {addr}"))?;
+
+    #[cfg(unix)]
+    {
+        // SAFETY: kill(2) with a pid `lsof` just reported as the owner of this
+        // listening socket. ESRCH (already exited) is the benign race and is
+        // ignored — the port check below is what decides success.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+        if wait_for_port_free(addr, grace).await {
+            return Ok(());
+        }
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        if wait_for_port_free(addr, Duration::from_secs(2)).await {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "sent SIGTERM then SIGKILL to pid {pid}, but {addr} is still accepting \
+             connections — the process did not exit, or another one took the socket"
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, grace);
+        anyhow::bail!("stopping an adopted host process is only implemented on unix")
+    }
+}
+
+/// Ask the OS which process holds the listening socket on `port`.
+///
+/// `lsof` rather than a platform API because this runs on an operator's own
+/// machine at the dev tier, where `lsof` is present on macOS by default and is
+/// the one spelling that works the same on both unixes we care about. An
+/// ambiguous answer (two distinct pids) is an error, not a coin flip.
+async fn pid_listening_on(port: u16) -> Result<Option<u32>> {
+    let out = tokio::process::Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+        .output()
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot resolve the owner of port {port}: running `lsof` failed ({e}). \
+                 Stopping an adopted dev server needs it; install lsof or stop the \
+                 process by hand."
+            )
+        })?;
+    // lsof exits 1 with no output when nothing matches — not an error here.
+    let mut pids: Vec<u32> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    match pids.len() {
+        0 => Ok(None),
+        1 => Ok(Some(pids[0])),
+        _ => anyhow::bail!(
+            "port {port} reports {} distinct listening pids ({pids:?}) — refusing to \
+             guess which one to stop",
+            pids.len()
+        ),
+    }
+}
+
+/// Poll until nothing accepts on `addr`, or `timeout` elapses. The inverse of
+/// [`super::wait_for_port`].
+async fn wait_for_port_free(addr: std::net::SocketAddr, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if tokio::net::TcpStream::connect(addr).await.is_err() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Supervisor task for a kamaji-native workload.
 ///
 /// NativeRuntime captures stdout/stderr to files with no follow, but the
@@ -189,6 +337,29 @@ impl FileTail {
         }
     }
 
+    /// A tail that starts at the file's current end, so the first drain emits
+    /// only lines written from now on.
+    ///
+    /// This is the right start for an **adopted** workload and the wrong one
+    /// for a spawned one. A spawned workload's capture file was just truncated
+    /// for it, so offset 0 is its own first line. An adopted one inherits
+    /// whatever the last run left at that path — and the two are not reliably
+    /// the same process: the mesofact-dev holding 4321 on this camp on
+    /// 2026-09-08 started at 17:43 while the capture file it would have written
+    /// had not been touched since 17:39. Replaying that from offset 0 would
+    /// present a dead run's output as the live server's, which is a worse
+    /// answer than an empty pane.
+    ///
+    /// A file that does not exist yet starts at 0 — nothing to skip.
+    pub(crate) async fn from_end(path: PathBuf) -> Self {
+        let offset = tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0);
+        Self {
+            path,
+            offset,
+            partial: String::new(),
+        }
+    }
+
     pub(crate) async fn drain_into(&mut self, log_buf: &LogBuffer) {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let Ok(mut file) = tokio::fs::File::open(&self.path).await else {
@@ -243,6 +414,52 @@ mod tests {
         // Never: the caller owns readiness, so a non-starting binary must
         // surface as a failed reconcile rather than a silent re-exec loop.
         assert!(matches!(spec.restart_policy, RestartPolicy::Never));
+    }
+
+    /// R875-B1. An adopted workload inherits whatever the last run left in the
+    /// capture file, and the two are not reliably the same process — so the
+    /// adopt tail must skip what is already there rather than replay a dead
+    /// run's output as the live server's.
+    #[tokio::test]
+    async fn from_end_skips_what_is_already_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout.log");
+        tokio::fs::write(&path, b"stale line from a previous run\n")
+            .await
+            .unwrap();
+
+        let buf = LogBuffer::new();
+        let mut tail = FileTail::from_end(path.clone()).await;
+        tail.drain_into(&buf).await;
+        assert!(
+            buf.since(0).await.0.is_empty(),
+            "history predating the adopt must not surface as this run's output"
+        );
+
+        use tokio::io::AsyncWriteExt;
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await
+            .unwrap()
+            .write_all(b"live line\n")
+            .await
+            .unwrap();
+        tail.drain_into(&buf).await;
+        assert_eq!(buf.since(0).await.0, vec!["live line".to_string()]);
+    }
+
+    /// The spawn path keeps offset 0: NativeRuntime truncated the file for this
+    /// child, so byte 0 really is its first line.
+    #[tokio::test]
+    async fn new_starts_at_zero_and_reads_existing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout.log");
+        tokio::fs::write(&path, b"first line\n").await.unwrap();
+
+        let buf = LogBuffer::new();
+        FileTail::new(path).drain_into(&buf).await;
+        assert_eq!(buf.since(0).await.0, vec!["first line".to_string()]);
     }
 
     #[test]

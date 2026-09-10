@@ -150,6 +150,8 @@
 //! @yah:gotcha("WHAT THIS DOES *NOT* YET GIVE YOU, stated so nobody reads `review` as \"the rehearsal will pass\". A leadership move off us-west-001 today still does not produce a serving coordinator, and R858-T8 must not be attempted yet. The appliance needs four things on the node that takes it: the kamaji native backend (DONE on all three), the binary (DONE on all three), its identity (DONE — R858-T2's carriage is live and self-materialized a 72-byte noise_private.key on us-south-001 at 08:47Z with no human action, which is the first observation that T2 works end to end on a node that never ran the appliance), and its config + DB (NOT done — config.yaml is R858-T16, the DB is the litestream leg R858-T5 has never proven against the real bucket). The capability probe refuses on the missing config, so the failure is loud and early rather than a crash loop — but a refusal is not a failover. Also unchanged and still true: the R858-B13/B14 gotcha about NOT rolling us-west-001 to published 0.8.33. Nothing in this pass rolled any yubaba or kamaji binary; only a systemd drop-in and a headscale binary were placed.")
 //! @yah:gotcha("TREE ANCHOR AT REVIEW: fc754ce6. Quote that SHA rather than 'HEAD' in any revert instruction — the camp shares one working tree and peers committed during this pass. Files this pass touched: oss/yubaba/crates/yubaba/src/leader.rs, oss/yubaba/crates/yubaba/src/headscale_appliance.rs, oss/kamaji/crates/kamaji-bin/src/server.rs, app/yah/cli/resources/kamaji.service. Note that headscale_appliance.rs was edited by a peer mid-pass (R858-B9's step-4 port reconciliation landed HEADSCALE_LISTEN_PORT under me); my two hunks there are additive helpers and survived, but diff before assuming which change is whose. NODE-SIDE ROLLBACK, if the drop-in rewrite ever needs reversing: `20-bundle.conf.rollback-20260906-coffee` sits beside the live file on both us-east-001 and us-south-001 — restoring it re-introduces the exact bug this ticket fixed, so it is provenance, not a safe state.")
 //! @yah:handoff("CAPABILITY PROBE — THE T3 SEAM, FILLED (consolidated; this entry replaces three byte-near-identical copies a retry wrote). R858-T3 defined `NativeExecCapability::{Unknown,Present,Absent}` in appliance_ownership.rs, named it \"R858-T4's seam\", and passed the permissive `Unknown` placeholder from its one live call site. That placeholder is now a real probe and `judge_appliance_candidate` is unchanged, which is what T3 asked for. THE WIRE: `YubabaToKamaji::Capabilities { request_id }` and `KamajiToYubaba::CapabilitiesReport { request_id, capabilities: NodeCapabilities { native_exec, native_exec_dir } }`, both APPENDED LAST so every pre-existing postcard variant index is untouched and no ProtocolVersion bump is needed — the treatment `GracefulUpgrade` and `DeployStatus` already had. version.rs's V2/V4/V5/V6 bumps do not apply: those added a field to an EXISTING variant, which is positional and therefore breaking, and V6's note records that the `#[serde(default)]` theory cost a debugging cycle. The variant is also registered in `reply_request_id()` — R746-B11's doc comment on that function is explicit that an unclassified reply variant falls into the push arm, is dropped as an unconsumed push, and parks its caller on a oneshot forever, which is exactly what happened to `DeployStatusResult`. The hand-written correlation test covers `CapabilitiesReport`. KAMAJI ANSWERS FROM `ctx.native`, the same `Option<Arc<NativeRuntime>>` that `deploy_native_exec` dispatches on, so the capability a scheduler reads and the one a deploy exercises cannot disagree; deriving it from build features or CLI args would be a second source of truth that drifts exactly when it matters. `NativeRuntime::exec_dir()` was added to expose the staging dir. EVERY FAILURE TO *LEARN* IS `Unknown`, NEVER `Absent` — no sibling client, an older kamaji that does not know the variant, a transient socket error. Reading \"I could not ask\" as \"cannot run it\" would make every not-yet-rolled node ineligible the moment this shipped: the 2026-09-03 outage reproduced from the other side, and mid-roll that is most of the fleet. The old-kamaji case logs at `debug!` not `warn!` for the same reason — during a normal roll it is the expected answer on every tick, and a warning that fires constantly trains operators to ignore the channel T3 just made loud.")
+//! @yah:gotcha("THIS PROBE DEADLOCKED WITH R858-T16 AND NO NODE COULD EVER GO Present — FOUND AND FIXED 2026-09-08 by @Ashguard:libra (session:6eed47dc) while running R858-T5's live exercise. probe_native_exec requires every argv path to exist, INCLUDING headscale_appliance::config_path (leader.rs:1130). T16 writes that config.yaml inside start_headscale, which is downstream of this candidacy judgement. So a node that had never hosted the appliance could never become eligible to run the hydration that would have made it eligible. MEASURED on us-west-011 with a musl yubaba cross-built from the tree carrying BOTH children (sha afd360dd3d9ce891edeac4bf9bbfa593ba3f254ffaff1edab133f221bd5a70f9), kamaji reporting native_exec true, headscale binary and noise key both on disk: `missing=/var/lib/yah-cloud/headscale/config.yaml` -> `APPLIANCE UNHEALTHY ... refusal: missing-native-exec`, on a 10s cadence, forever. THAT IS EXACTLY R858'S STATED ACCEPTANCE CHECK (\"probe_native_exec returning Present on us-south-001, which today returns Absent naming config.yaml\") — so as the tree stood it could not have passed on ANY node, and a roll of east+south would have left both refusing for the same reason west's dev twin did. THE FIX (leader.rs, new hydrate_config_before_probe): hydration runs immediately before the candidates map is built, and ONLY when config.yaml is absent — the early return is what keeps us-west-001's hand-edited config safe from a render on every 10s tick. FALSIFIED ON HARDWARE, single variable: same node, same config, same kamaji, only the binary swapped — the pre-fix binary loops the refusal, the post-fix binary logs `hydrated headscale config.yaml ahead of the appliance candidacy probe` outcome=Rendered and the appliance deploys 18ms later. Reproduced independently on us-west-013 (a node that had never hosted it) at 19:09:48Z.")
+//! @yah:gotcha("THIS TICKET'S ACCEPTANCE CHECK IS NOT OBSERVABLE ON A FOLLOWER, AND R858's WORDING OF IT IS THEREFORE UNMEETABLE AS WRITTEN — measured 2026-09-08 by @Ashguard:libra (session:6eed47dc) on us-east-001 immediately after it was rolled to published 0.8.35, which is the first prod binary carrying leader.rs::hydrate_config_before_probe. R858 says the post-roll acceptance check is \"leader::probe_native_exec returning Present on us-south-001\". It cannot be, on any node that is not currently acting. `reconcile_appliance_ownership` returns early at `if !may_act { return; }`, where may_act = is_leader || recorded_owner == self, and that early return sits AHEAD of both the hydration and the probe. MEASURED: east is neither the raft leader (node 2 = us-west-001 leads, term 21) nor the recorded owner (us-south-001), and in 20 minutes on 0.8.35 it logged ZERO hydrate lines, ZERO probe lines, and its /var/lib/yah-cloud/headscale/ still holds ONLY the headscale binary — no config.yaml, no noise_private.key. THIS IS NOT A FAULT IN THE FIX and does not warrant a rollback: the fix is correctly placed for the node that ACTS, which is the only node whose eligibility is ever consulted (the candidates map is built from self alone, plus an expired owner). A follower does not need to be pre-hydrated so long as it hydrates when it becomes leader or recorded owner, which it now does — that is exactly the path us-south-001 took at 19:29:27Z. WHAT IT MEANS FOR SIGN-OFF: \"Present on a candidate\" is only ever observable at the moment of an actual ownership move, so this acceptance check does not stand alone — it collapses into R858-T8's rehearsal and should be signed off there rather than looked for on an idle follower. Anyone who greps a follower's journal for `Present` and finds nothing has measured the early return, not the fix.")
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -157,6 +159,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::cluster_policy::RaftTiming;
+use crate::ingress_effector::EffectOutcome;
 use crate::lease_detector::{
     judge_readiness, Confirmed, HysteresisPolicy, LeaseFailureDetector, NotReady,
     ReadinessInputs, TransitionTracker,
@@ -336,42 +339,57 @@ pub fn decide_transfer(
     }
 }
 
+/// The optional collaborators the tick reads — every one of which a
+/// deployment, or a test, may legitimately not have.
+///
+/// A struct rather than four positional `Option`s: they are all
+/// `Option<Arc<…>>` of different traits, so at a call site any two could be
+/// swapped with no type error on three of the four, and the failure would be
+/// silent (a scheduler that quietly stopped gating, not one that failed to
+/// compile). R859-F2 phase B's `ingress` is what took the count past readable.
+///
+/// [`Default`] is all-`None`, which is exactly "behaves as it did before any of
+/// these gates existed" — see each field.
+#[derive(Default)]
+pub struct SchedulerDeps {
+    /// R737-F2's node-lease channel — the evidence `decide_transfer` acts on.
+    /// `None` means nothing is ever confirmed up or down, so nothing moves.
+    pub lease_detector: Option<std::sync::Arc<LeaseFailureDetector>>,
+    /// The `raft_peer_healthy` gate, and **only as a veto** — `None` leaves
+    /// that gate open rather than freezing placement, so a deployment (or a
+    /// harness) without one behaves exactly as it did before the gate existed.
+    /// See the module doc.
+    pub raft_detector: Option<std::sync::Arc<dyn crate::failure_detector::FailureDetector>>,
+    /// R782: `streamer_watermark_age` per candidate. `None` has the same
+    /// "behaves like before the gate existed" property — but only for tenants
+    /// with no `rpo_bound` declared; a tenant that *does* declare one and gets
+    /// `None` here fails every candidate closed, per `judge_readiness`'s
+    /// absence-of-evidence rule.
+    pub rpo_registry: Option<std::sync::Arc<crate::lease_detector::RpoWatermarkRegistry>>,
+    /// R859-F2 phase B: the public-ingress effector. It rides this loop rather
+    /// than one of its own because this is the one place per tick that already
+    /// holds every input the decision needs — the leader check, the
+    /// [`TransitionTracker`] that says whether a machine is confirmed down, and
+    /// the quorum verdict. A second loop would have to duplicate all three and
+    /// could disagree with this one about any of them. `None` — every camp that
+    /// has not set `YUBABA_INGRESS_APEX` — skips the ingress plan entirely.
+    pub ingress: Option<crate::ingress_effector::IngressEffector>,
+}
+
 /// Spawn the scheduler loop.
 ///
 /// Safe to run on every node, like [`crate::leader_pin::spawn`]: a follower's
 /// tick finds `current_leader != Some(node_id)` and does nothing but advance
 /// its own (unused) [`TransitionTracker`].
-///
-/// `raft_detector` supplies the `raft_peer_healthy` gate only, and only as a
-/// veto — passing `None` leaves that gate open rather than freezing placement,
-/// so a deployment (or a test harness) without one behaves exactly as it did
-/// before the gate existed. See the module doc.
-///
-/// `rpo_registry` (R782) supplies `streamer_watermark_age` per candidate.
-/// `None` here has the same "behaves like before the gate existed" property —
-/// but only for tenants with no `rpo_bound` declared; a tenant that *does*
-/// declare one and gets `None` here fails every candidate closed, per
-/// `judge_readiness`'s absence-of-evidence rule. See the module doc.
 pub fn spawn(
     node_id: YubabaNodeId,
     raft: YubabaRaft,
     state_machine: YubabaStateMachine,
-    lease_detector: Option<std::sync::Arc<LeaseFailureDetector>>,
-    raft_detector: Option<std::sync::Arc<dyn crate::failure_detector::FailureDetector>>,
-    rpo_registry: Option<std::sync::Arc<crate::lease_detector::RpoWatermarkRegistry>>,
+    deps: SchedulerDeps,
     config: SchedulerConfig,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        run(
-            node_id,
-            raft,
-            state_machine,
-            lease_detector,
-            raft_detector,
-            rpo_registry,
-            config,
-        )
-        .await;
+        run(node_id, raft, state_machine, deps, config).await;
     })
 }
 
@@ -379,11 +397,15 @@ async fn run(
     node_id: YubabaNodeId,
     raft: YubabaRaft,
     state_machine: YubabaStateMachine,
-    lease_detector: Option<std::sync::Arc<LeaseFailureDetector>>,
-    raft_detector: Option<std::sync::Arc<dyn crate::failure_detector::FailureDetector>>,
-    rpo_registry: Option<std::sync::Arc<crate::lease_detector::RpoWatermarkRegistry>>,
+    deps: SchedulerDeps,
     config: SchedulerConfig,
 ) {
+    let SchedulerDeps {
+        lease_detector,
+        raft_detector,
+        rpo_registry,
+        ingress,
+    } = deps;
     use crate::failure_detector::{FailureDetector, LivenessReport};
     use openraft::async_runtime::watch::WatchReceiver;
 
@@ -394,6 +416,14 @@ async fn run(
     );
     let watch = raft.metrics();
     let mut tracker = TransitionTracker::new();
+    // R859-F2 phase B. `plan_ingress_owner_effect` is stateless, so "the owner
+    // changed" has to mean "changed since the last tick THIS process saw" —
+    // there is nowhere else to hold it. Starting at `None` on a freshly elected
+    // leader is correct rather than a gap: the first tick reads an existing
+    // owner as a change and converges the IP onto it (idempotently — see
+    // `a_first_observation_of_an_existing_owner_converges_the_ip`), and the
+    // withdrawal path, which needs an *unchanged* owner, arms on the tick after.
+    let mut previous_ingress_owner: Option<String> = None;
 
     loop {
         tokio::time::sleep(config.evaluate_every).await;
@@ -461,6 +491,87 @@ async fn run(
         );
         if !quorum.permits_withdrawal() {
             debug!(node_id, verdict = %quorum.reason(), "quorum not healthy this tick");
+        }
+
+        // R859-F2 phase B: public ingress follows placement. Everything this
+        // needs is already in hand — the leader check above, the tracker, the
+        // quorum verdict — which is why it lives in this tick and not a loop of
+        // its own.
+        if let Some(effector) = &ingress {
+            let current_owner = state_machine.ingress_owner();
+            // Liveness may only ever VETO here (see
+            // `plan_ingress_owner_effect`'s doc): an owner we cannot resolve to
+            // a node id, or one the hysteresis has not committed either way, is
+            // `Unconfirmed` — never `ConfirmedDown`. Reading "no mapping" as
+            // "dead" would withdraw a live origin on the strength of a missing
+            // member row.
+            let liveness = crate::ingress_effector::owner_liveness(
+                current_owner
+                    .as_deref()
+                    .and_then(|machine| state_machine.node_for_machine(machine)),
+                |id| tracker.committed(id),
+            );
+            // One snapshot of the declarations, used by both halves: the
+            // planner decides against it, and the effector re-resolves the
+            // named machine out of it to learn which vendor hosts the box.
+            // Taking it twice would let the two halves disagree within one tick.
+            let machines = state_machine.floating_ip_machines();
+            let effect = floating_ip::plan_ingress_owner_effect(
+                previous_ingress_owner.as_deref(),
+                current_owner.as_deref(),
+                liveness,
+                &quorum.as_ingress_health(),
+                &machines,
+            );
+            let outcome = effector
+                .apply(&effect, &machines, |machine| {
+                    state_machine.public_address_for_machine(machine)
+                })
+                .await;
+            match &outcome {
+                EffectOutcome::Withdrew {
+                    machine,
+                    address,
+                    records_deleted,
+                } if *records_deleted > 0 => info!(
+                    node_id,
+                    machine = %machine,
+                    address = %address,
+                    records_deleted,
+                    apex = effector.apex().unwrap_or_default(),
+                    "withdrew a dead origin from the public apex"
+                ),
+                // Already withdrawn on an earlier tick — the ordinary steady
+                // state while a node stays down, and not worth an info line
+                // once per tick for the duration of an outage.
+                EffectOutcome::Withdrew { .. } => {}
+                EffectOutcome::Reassigned {
+                    machine,
+                    ip_id,
+                    moved: true,
+                } => info!(
+                    node_id,
+                    machine = %machine,
+                    ip_id = %ip_id,
+                    "moved the ingress floating IP onto the new owner"
+                ),
+                // Already pointed at the right box — same non-news as an
+                // already-withdrawn record above.
+                EffectOutcome::Reassigned { .. } => {}
+                EffectOutcome::Failed { reason } => {
+                    warn!(node_id, "ingress withdrawal failed, will retry: {reason}")
+                }
+                EffectOutcome::NotApplied { reason } => {
+                    debug!(node_id, "no ingress effect: {reason}")
+                }
+            }
+            // Do not advance the owner marker past a FAILED apply. The planner
+            // is stateless, so this marker is the only thing that would stop
+            // the next tick from re-deciding — and a withdrawal that did not
+            // land must be re-decided, not recorded as done.
+            if !matches!(outcome, EffectOutcome::Failed { .. }) {
+                previous_ingress_owner = current_owner;
+            }
         }
 
         for (tenant, ownership) in &tenants {

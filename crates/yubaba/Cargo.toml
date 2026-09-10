@@ -69,6 +69,20 @@ base64 = "0.22"
 # to every camp (R591-T3).
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# R859-F2: the ingress-failover planner + the floating-IP seam. A RUNTIME dep,
+# not a dev one: `scheduler` drives `plan_ingress_owner_effect` on every leader
+# tick. This crate exists precisely so that edge does not have to be
+# `yubaba -> cloud` — see its header and cloud's `yah-local-driver` comment
+# (R374-F3). Its dep list is anyhow + async-trait, so it costs the fleet daemon
+# nothing. Short extern name `floating_ip`.
+floating_ip = { package = "yah-floating-ip", path = "../floating-ip", version = "0.8.36" }
+# R859-F3: the Hetzner/OVH/Vultr clients the planner's `Reassign` arm needs to
+# be more than a decision. Deliberately a SEPARATE crate from the seam above:
+# this one pulls reqwest + serde, which is exactly the weight `yah-floating-ip`
+# refuses to carry, and it is only linked because a fleet node genuinely has to
+# make an outbound vendor API call to move an IP. Nothing else came with it —
+# the envoy verb catalog and the `fob` vault lookup stayed in `cloud`.
+floating_ip_adapters = { package = "yah-floating-ip-adapters", path = "../floating-ip-adapters", version = "0.8.36" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 futures-core = "0.3"
 openraft = { version = "=0.10.0-alpha.30", features = ["serde"] }
@@ -92,28 +106,28 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # `seal` (R706/W293): the shared AES-256-GCM seal the ACME issuer writes with.
-workload-spec = { package = "yah-workload-spec", version = "0.8.34", features = ["seal", "admission-verify"] }
+workload-spec = { package = "yah-workload-spec", version = "0.8.36", features = ["seal", "admission-verify"] }
 # R600-F3 (W273): the elected ACME issuer reuses passway's extracted issuance
 # engine (RFC-8555 order flow + DNS-01-via-Cloudflare, returns cert+key PEM in
 # memory) instead of copy-pasting acme.rs. Version dep + [patch.crates-io]
 # redirect to the sibling passway workspace, same shape as the yah-base deps.
 # R635: registry name is `passway-acme`; the alias keeps `use acme_engine::…`.
-acme-engine = { package = "passway-acme", version = "0.8.34" }
+acme-engine = { package = "passway-acme", version = "0.8.36" }
 # R779 (W267): `cert_store` puts per-domain TLS material in R2 instead of raft —
 # 10k certs would rewrite the whole KB-scale raft state on every PutSecret on
 # every node (raft/store.rs:5). Same version-dep-redirected-to-path shape as the
 # other yah-base deps; `crates/cloud` already consumes this crate.
-yah-object-store = { version = "0.8.34" }
+yah-object-store = { version = "0.8.36" }
 # R484-T2: shared Kamaji trait + runtime backend impls (containerd, docker,
 # fake). Pre-W199 these lived in `yubaba::runtime::*`; now they live in
 # kamaji-core and yubaba re-exports the surface through this crate.
-kamaji = { version = "0.8.34", features = ["sibling"] }
+kamaji = { version = "0.8.36", features = ["sibling"] }
 # R406-T8: Yubaba ↔ Kamaji UDS wire protocol — postcard-framed messages
 # shared with the kamaji binary in app/yah/kamaji/.
-kamaji-proto = { version = "0.8.34" }
+kamaji-proto = { version = "0.8.36" }
 # Shared docker-CLI driver + S3 SigV4 helpers — yubaba owns the pond MinIO
 # slot lifecycle from R374-F3 onward. cloud depends on the same crate.
-local-driver = { package = "yah-local-driver", version = "0.8.34" }
+local-driver = { package = "yah-local-driver", version = "0.8.36" }
 
 # R593-T2: mshr is the machine-identity primary (promoted from xlb-net,
 # R593-T1) — yubaba's hostkey loader now sources its Ed25519 keypair from
@@ -123,12 +137,12 @@ local-driver = { package = "yah-local-driver", version = "0.8.34" }
 # today (identity/keypair loading, the QUIC Endpoint, and discovery all
 # compile together as one crate) so there is no smaller feature surface to
 # opt into here — identity.rs only calls Keypair::load_or_create_at.
-mshr = { path = "../../../mshr/crates/mshr", version = "0.8.34" }
+mshr = { path = "../../../mshr/crates/mshr", version = "0.8.36" }
 
 # Thin pond wire-type surface (PondDeployReq/PondStateRecord/…). Carved out of
 # this lib (R483-T5) so clients link the types without yubaba's server closure;
 # the server side here re-exports them via `pub use warden_client::*` in pond.rs.
-yubaba-client = { path = "../yubaba-client", version = "0.8.34" }
+yubaba-client = { path = "../yubaba-client", version = "0.8.36" }
 
 # containerd gRPC client (optional — only with containerd-integration feature)
 containerd-client = { version = "0.9", optional = true }
@@ -143,7 +157,7 @@ tempfile = "3"
 # streamer is a separate kamaji-managed data-plane service, so the yubaba
 # server links neither it nor turso-backup at runtime — W253 tenet 1.
 object_store = "0.13"
-turso-backup = { path = "../../../turso-backup", version = "0.8.34" }
+turso-backup = { path = "../../../turso-backup", version = "0.8.36" }
 yubaba-tenant-streamer = { path = "../tenant-streamer" }
 futures-util = "0.3"
 tower = { version = "0.5", default-features = false, features = ["util"] }
@@ -154,7 +168,7 @@ yubaba-test-macros = { path = "../yubaba-test-macros" }
 yubaba-test-harness = { path = "../yubaba-test-harness" }
 # R406-T8: spawn a real kamaji::serve_with_shutdown inside the
 # yubaba↔kamaji integration test (tests/integration_constable_client.rs).
-kamaji-bin = { version = "0.8.34" }
+kamaji-bin = { version = "0.8.36" }
 
 
 # ---------------------------------------------------------------------------

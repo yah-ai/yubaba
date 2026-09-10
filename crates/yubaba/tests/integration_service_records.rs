@@ -53,7 +53,27 @@ fn named_ports(pairs: &[(&str, u16)]) -> std::collections::BTreeMap<String, u16>
     pairs.iter().map(|(n, p)| ((*n).to_string(), *p)).collect()
 }
 
+/// A serving workload that is also a **reachable** one — host-networked, the
+/// shape `.yah/infra/workloads/yah-cloud-admin.toml` declares.
+///
+/// R881-B1: a record is only `Ready` if the workload binds its ports in the
+/// node's netns, so the tests below — which are about wiring, the ledger and
+/// restart survival — declare that shape rather than leaning on a bare spec
+/// whose meaning changed. [`isolated_spec`] is the unreachable counterpart, and
+/// only the R881-B1 test uses it.
 fn serving_spec(name: &str, ports: Vec<u16>) -> WorkloadSpec {
+    let mut spec = isolated_spec(name, ports);
+    spec.annotations.insert(
+        workload_spec::HOST_NETWORK_ANNOTATION.to_string(),
+        workload_spec::HOST_NETWORK_VALUE.to_string(),
+    );
+    spec
+}
+
+/// The tenant shape: no networking annotation, so runc unshares a fresh netns
+/// and the declared ports are bound where nothing on the node — and nothing on
+/// the mesh — can reach them.
+fn isolated_spec(name: &str, ports: Vec<u16>) -> WorkloadSpec {
     WorkloadSpec {
         schema_version: SchemaVersion::V1,
         name: name.to_string(),
@@ -475,4 +495,96 @@ async fn discovery_records_are_sorted_by_ident() {
         .map(|r| r["ident"].as_str().unwrap())
         .collect();
     assert_eq!(idents, vec!["alpha", "zeta"]);
+}
+
+/// **R881-B1's acceptance test**, end to end across the seam the incident
+/// crossed: yubaba's deploy handler → `GET /service-records?ready=true` →
+/// `yah cloud apply`'s upstream resolution.
+///
+/// The setup is the measured live shape and nothing else: `noisetable-account`,
+/// tenant tier, its own netns, `[expose.mesh] ports = [4332]`, deployed onto
+/// the mesh node `100.64.0.3` — and a fronted rule for `api.noisetable.com`.
+/// What shipped was `PASSWAY_UPSTREAMS=api.noisetable.com=100.64.0.3:4332`,
+/// pointing at a port nothing on that host was listening on, so the front door
+/// 503'd while looking perfectly healthy to every consumer.
+///
+/// The apply must now *fail*, and the assertion is written both ways round —
+/// that it errors, and that the address never appears — because "errored" alone
+/// would also pass if the plan had rendered the dead upstream and then tripped
+/// over something unrelated.
+///
+/// `ingress.rs`'s guard ("a rule left unresolved is an error here rather than a
+/// dead upstream later") needed no change: it was always correct and was being
+/// fed a fabricated record. This test is the proof that feeding it an honest
+/// one is what switches it on.
+#[tokio::test]
+async fn an_unroutable_tenant_workload_makes_the_ingress_apply_refuse() {
+    use cloud::config::IngressProvider;
+    use cloud::reconciler::ingress::{IngressPlan, IngressRule};
+    use cloud::reconciler::service_discovery::{DiscoveredRecord, ServiceRecordFanout};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = boot_on_mesh(tmp.path(), Arc::new(FakeRuntime::new()), "100.64.0.3:7443");
+
+    let status = deploy(&state, &isolated_spec("noisetable-account", vec![4332])).await;
+    assert!(
+        status.is_success(),
+        "the deploy itself must still succeed — R881-B1 is about the record \
+         being honest, not about refusing to run the workload: {status}"
+    );
+
+    // What `yah cloud apply` reads off the node.
+    let (_, ready) = fetch_records(&state, "?ready=true").await;
+    let discovered: Vec<DiscoveredRecord> = ready["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| DiscoveredRecord {
+            ident: r["ident"].as_str().unwrap().to_string(),
+            mesh_ip: r["mesh_ip"].as_str().unwrap().to_string(),
+            ports: r["ports"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_u64().unwrap() as u16)
+                .collect(),
+            named_ports: Default::default(),
+        })
+        .collect();
+    assert!(
+        discovered.is_empty(),
+        "the front door was offered an upstream for a workload in its own \
+         netns: {discovered:?}"
+    );
+
+    let mut plan = IngressPlan {
+        provider: IngressProvider::Passway,
+        rules: vec![IngressRule {
+            hostname: "api.noisetable.com".into(),
+            port: Some(4332),
+            slot: "compute".into(),
+            provider_id: None,
+            machines: vec!["us-east-001".into()],
+            upstream_hosts: Vec::new(),
+        }],
+        front_doors: Vec::new(),
+        tunnel_id: None,
+        edge_provider_id: None,
+        image: None,
+    };
+    let mut fanout = ServiceRecordFanout::default();
+    fanout.push_answer("us-east-001", discovered);
+
+    let err = plan.resolve_upstreams_from(&fanout).unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("api.noisetable.com"),
+        "the refusal must name the rule an operator has to act on, got: {msg}"
+    );
+
+    let rendered = plan.passway_upstreams().unwrap_or_default().join(",");
+    assert!(
+        !rendered.contains("100.64.0.3:4332"),
+        "the dead upstream from the live incident was rendered anyway: {rendered}"
+    );
 }

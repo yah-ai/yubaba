@@ -254,12 +254,14 @@ mod tests {
     use crate::raft::NodeCapacity;
 
     fn member(region: Option<&str>, capacity: Option<NodeCapacity>) -> MemberInfo {
-        MemberInfo {
-            addr: "100.64.0.1:7443".into(),
-            region: region.map(str::to_string),
-            capacity,
-            machine: None,
-        }
+        MemberInfo::from_declaration(
+            "100.64.0.1:7443",
+            &crate::raft::NodeDeclaration {
+                region: region.map(str::to_string),
+                capacity,
+                ..Default::default()
+            },
+        )
     }
 
     const BOX: NodeCapacity = NodeCapacity { memory_mb: 1024, cpu_millis: 1000 };

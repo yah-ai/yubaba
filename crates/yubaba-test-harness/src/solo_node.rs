@@ -300,13 +300,21 @@ async fn build(
             node_id,
             raft.clone(),
             state_machine.clone(),
-            region.clone(),
-            Some(HARNESS_CAPACITY),
-            // R859-F2: the harness runs several nodes in one process, so
-            // `/etc/hostname` would give every one of them the same answer and
-            // make `node_for_machine` ambiguous. Publish a per-node stand-in
-            // instead — the production derivation is `leader::derive_machine_name`.
-            Some(format!("harness-node-{node_id}")),
+            yubaba::raft::NodeDeclaration {
+                region: region.clone(),
+                capacity: Some(HARNESS_CAPACITY),
+                // R859-F2: the harness runs several nodes in one process, so
+                // `/etc/hostname` would give every one of them the same answer
+                // and make `node_for_machine` ambiguous. Publish a per-node
+                // stand-in instead — the production derivation is
+                // `leader::derive_machine_name`.
+                machine: Some(format!("harness-node-{node_id}")),
+                // R859-F2 phase A: a harness node declares no public ingress.
+                // Deliberate — an in-process node has no provider and no public
+                // address, and inventing one would let a test assert a
+                // withdrawal that could never happen on a real box.
+                ..Default::default()
+            },
         )
     } else {
         tokio::spawn(async {})

@@ -113,8 +113,8 @@ pub use derive_cache_prune::{
 };
 pub use domain::{
     deploy_domain_passway, diff_apex_records, ensure_passway_apex, ensure_r2_custom_domain,
-    plan_domain_passway, public_origins, ApexRecordDiff, DomainPasswayPlan, LiveApexRecord,
-    PasswayApexOutcome, PasswayOrigin,
+    list_live_apex_records, plan_domain_passway, plan_passway_apex, public_origins, ApexRecordDiff,
+    DomainPasswayPlan, LiveApexRecord, PasswayApexOutcome, PasswayOrigin,
 };
 pub use headscale::{
     DeclaredHeadscale, DeclaredPolicy, DeclaredPreauthKey, HeadscaleReconciler,
@@ -122,8 +122,8 @@ pub use headscale::{
 };
 pub use ingress::{
     collate_front_doors, declared as ingress_declared, ensure_tunnel_ingress, machine_mesh_addrs,
-    plan_ingress, publish_tunnel_ingress, resolve_ingress_placements, Collation, IngressPlan,
-    IngressRule, NodeFrontDoor, PlannedEdge, TunnelIngressOutcome,
+    plan_ingress, publish_tunnel_ingress, resolve_ingress_candidates, resolve_ingress_placements,
+    Collation, IngressPlan, IngressRule, NodeFrontDoor, PlannedEdge, TunnelIngressOutcome,
 };
 pub use ingress_verify::{
     apply_public_path, resolve_upstreams_reporting, verify_collation, BeaconFetch, DialOutcome,
@@ -521,6 +521,21 @@ impl RunningWorkload {
     {
         self.teardown = Some(Teardown(Box::new(move || Box::pin(teardown()))));
         self
+    }
+
+    /// Whether this handle carries a real teardown — i.e. whether a failed
+    /// [`Self::shutdown`] means the workload is **still running**.
+    ///
+    /// The stop path needs this to decide between an operator-facing error and
+    /// a log line, and R875-B1 is why it is a property of the handle rather
+    /// than a list of kinds at the call site. That list started as
+    /// `kind == "container"` when R714-B1 gave containers a teardown, and was
+    /// silently wrong the moment a second kind grew one: an adopted
+    /// mesofact-dev whose teardown failed reported a successful stop with the
+    /// server still serving. A handle knows whether it owns the workload; a
+    /// string comparison at the call site only knows what it was last taught.
+    pub fn owns_teardown(&self) -> bool {
+        self.teardown.is_some()
     }
 
     /// Attach per-run operator-facing lines (R546-B12). See [`Self::notes`].
@@ -1023,6 +1038,26 @@ mod teardown_tests {
         // `workload.stop`; their no-op shutdown is correct and must stay.
         let w = RunningWorkload::adopted("mesofact-static", "static", None);
         w.shutdown().await.unwrap();
+    }
+
+    /// R875-B1. The stop path decides "still running, tell the operator" vs
+    /// "untidy supervisor, log it" from this, so it has to answer for the
+    /// handle in front of it rather than for the kind string it carries — the
+    /// two disagreed for every adopted mesofact-dev.
+    #[test]
+    fn owns_teardown_tracks_the_hook_not_the_kind() {
+        let (owned, _) = counting();
+        assert!(owned.owns_teardown());
+        assert!(
+            !RunningWorkload::adopted("container", "compute", None).owns_teardown(),
+            "a bare adopted handle owns nothing, whatever its kind says"
+        );
+        assert!(
+            RunningWorkload::adopted("mesofact-static", "static", None)
+                .with_teardown(|| async { Ok(()) })
+                .owns_teardown(),
+            "a non-container kind with a teardown owns its workload"
+        );
     }
 
     #[tokio::test]

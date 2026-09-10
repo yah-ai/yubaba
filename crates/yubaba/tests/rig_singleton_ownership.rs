@@ -39,9 +39,14 @@
 //! deliberately **not** a network partition — a partitioned plinth stays alive
 //! and keeps answering a corroborating channel (BLE, in W138's design), and
 //! telling those two apart is the whole safety argument for the membership
-//! ratchet. The harness has no partition primitive; building one belongs with
-//! the detector that consumes it (R118-F7), and the harness doc comment records
-//! why the `NetworkDegrade` type that looked like one never was.
+//! ratchet.
+//!
+//! The other half now exists: `Cluster::partition_node` (R118-F7) cuts a node's
+//! raft links in both directions while leaving it running and answering
+//! `/health` and `/cluster/singletons`, and `tests/raft_partition.rs` is its
+//! consumer. **These tests still mean `kill_node`** — every assertion below is
+//! about a power cut, which is the rig's dominant failure. A test that wants
+//! the partition case belongs in that file, not here.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

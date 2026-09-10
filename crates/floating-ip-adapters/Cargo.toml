@@ -1,0 +1,48 @@
+[package]
+# R859-F3: the three vendor HTTP adapters, carved out of `yah-cloud` so the
+# fleet daemon can actually MOVE a floating IP. `yah-floating-ip` holds the
+# seam and the planner on two dependencies and must keep holding exactly those
+# two (its header says why); `yah-cloud` holds the envoy verb layer and the
+# `fob` credential lookup, and the fleet daemon must not link it. Everything
+# left over — a reqwest client per vendor and the wire types it decodes — is
+# this crate. Neither consumer owns it, which is what lets both link it.
+name = "yah-floating-ip-adapters"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hetzner / OVH / Vultr floating-reserved-IP HTTP adapters implementing yah-floating-ip's FloatingIpProvider seam."
+keywords = ["floating-ip", "hetzner", "vultr", "ovh", "failover"]
+categories = ["network-programming"]
+
+[lib]
+# Short extern name, matching `floating_ip`'s own aliasing.
+name = "floating_ip_adapters"
+path = "src/lib.rs"
+
+[dependencies]
+# The seam these three implement. Note the direction: adapters depend on the
+# seam, never the reverse — adding reqwest to `yah-floating-ip` to save this
+# crate would ship a TLS stack to every fleet node.
+floating_ip = { package = "yah-floating-ip", path = "../floating-ip", version = "0.8.36" }
+anyhow = "1.0"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Same knobs `yah-cloud` pins, minus `stream` — nothing here streams a body.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+
+[dev-dependencies]
+# The three mock suites bind 127.0.0.1:0 and serve canned/stateful vendor JSON,
+# the same convention `cloud`'s reconciler tests use. Dev-only: an axum server
+# does not reach the fleet daemon.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net"] }

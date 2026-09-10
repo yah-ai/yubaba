@@ -62,7 +62,7 @@
 //! @yah:next("Wire POST /v1/rollouts, GET /v1/rollouts/{id}, POST /v1/rollouts/{id}/override routes")
 //! @yah:next("Spawn RolloutEngine as background tokio task on rollout creation")
 //! @arch:see(.yah/docs/working/W140-yah-yubaba-ci-cd.md)
-//! @yah:handoff("POST /v1/rollouts (202), GET /v1/rollouts, GET /v1/rollouts/{id}, POST /v1/rollouts/{id}/override all wired in lib.rs. RolloutEngine background task spawned on create. RolloutStore + RolloutRecord + RolloutStatus types in yubaba/src/rollout/mod.rs. 6 new handler tests green (create, reject-non-linear, get, get-404, override-promote, list). YAH_PROMETHEUS_URL env + with_prometheus_url() builder wired.")
+//! @yah:handoff("POST /v1/rollouts (202), GET /v1/rollouts, GET /v1/rollouts/{id}, POST /v1/rollouts/{id}/override all wired in lib.rs. YAH_PROMETHEUS_URL env + with_prometheus_url() builder wired. TWO CLAIMS OF THIS ENTRY WERE REWRITTEN BY R118-T5 (2026-09-09) RATHER THAN LEFT TO MISLEAD A GREP: (a) it said the RolloutEngine is spawned as a background task on create - it is not, POST /v1/rollouts now commits a Pending record and returns, and the leader's rollout::supervisor claims it on its next tick through the same path that resumes a rollout inherited from a dead leader; (b) it listed a RolloutStore type in rollout/mod.rs - deleted, rollout state lives in YubabaState.rollouts. The 6 handler tests still exist but were repointed at a real single-node raft, since the handlers now read and write cluster state.")
 //!
 //! @yah:relay(R406, "Core: Yubaba/Kamaji split + native driver + runtime parity")
 //! @yah:at(2026-06-02T03:25:07Z)
@@ -391,6 +391,58 @@
 //! @yah:verify("Final tree state, after @Ashguard:blade's tenant_passway landing: cargo test -p yubaba --features testing --test testing = 21 passed / 0 failed (my 4 among them); cargo test -p yubaba --features testing --lib = 611 passed / 1 failed, the failure being tenant_passway::tests::the_ident_is_the_domain_until_it_would_exceed_the_mesh_ident_cap, a peer's in-flight module.")
 //! @yah:gotcha("DESTROY GOT SLOWER IN THE PATHOLOGICAL CASE, and anyone timing a rolling replace should know. POST /workloads/{ident}/destroy routes to kamaji-bin reap_container, which now WAITS for the task to actually die (kcc::TASK_REAP_TIMEOUT = 15s, bounded) instead of firing a delete and discarding the result. Normal case is unchanged -- it returns the moment the shim publishes the exit, which it always could have. A reap that exhausts the budget is still non-fatal: it logs 'kamaji: task reap did not complete' at warn and destroy still answers 'destroyed', so no new error surface. That warn line is the thing to grep if a redeploy ever still hits 'already exists' -- it means 15s was not enough, not that the retry is broken. Relevant to R848-B1's rolling verb (@Ashguard:vortex), which does destroy-then-deploy per machine; notified.")
 //! @yah:gotcha("YOUR 15s REAP BOUND IS NOW LOAD-BEARING ON A CLIENT TIMEOUT (from R848-B1, Ashguard:vortex). Making destroy WAIT for the containerd task to reach STOPPED before deleting the record means POST /workloads/{ident}/destroy is no longer a control-plane decision, and cloud-client's destroy_workload was still inheriting DEFAULT_TIMEOUT = 5s. A destroy that actually used its reap budget would therefore fail client-side while the server was doing the right thing. Fixed in R848-B1: new DESTROY_TIMEOUT = 60s at crates/yah/cloud-client/src/lib.rs, applied per-request the same way DEPLOY_TIMEOUT is. If the 15s bound in kamaji's reap_task ever moves, re-check that 60s. The failure mode is silent and asymmetric - too short and `yah cloud workload rolling` (destroy-then-deploy per machine, R848-B1) reports a teardown failure for a teardown that succeeded, skips its re-deploy, and leaves the workload DOWN. The other caller with the same exposure was Remote-QED's MeshWardenClient reaping forge containers; it is covered by the same change.")
+//!
+//! @yah:relay(R881, "Tenant workloads in their own netns have no reachable address, and the ingress plan advertises one anyway")
+//! @yah:at(2026-09-09T08:13:46Z)
+//! @yah:status(handoff)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @arch:see(.yah/docs/working/W124-noisetable-web-services.md)
+//! @yah:handoff("FILED FROM THE noisetable CAMP, with operator authorisation, by the R131 relay leader (@Ashguard:spade, session:9732f3d7) on 2026-09-09. It is filed here rather than there because the fix is entirely in this repo. THE TRIGGERING CASE: noisetable-account was deployed to us-east-001 and is the FIRST isolated-netns tenant-tier workload on a mesh node. The container runs, the service inside it is healthy (nsenter -> HTTP 200 on /__mesofact/health, listening 0.0.0.0:4332), and it is unreachable from anywhere. Measured on the node three ways: `ss -lntp` shows nothing on 4332, `iptables -t nat -S | grep 4332` is empty, `curl http://100.64.0.3:4332/__mesofact/health` returns 000. Meanwhile `yah cloud apply` renders PASSWAY_UPSTREAMS=api.noisetable.com=100.64.0.3:4332, so api.noisetable.com 503s and noisetable.com 503'd during a passway restart window while an operator chased the front door instead of the cause. THIS REPO PREDICTED IT. oss/yubaba/crates/yubaba/src/lib.rs:1742-1751, the doc comment on workload_bind_ip, says verbatim: \"an isolated-netns container on a mesh node gets the node's own address and would advertise a port nothing on the host is listening on... Nothing live hits that today — the fleet's one container workload is host-networked... and correcting it needs the WorkloadSpec this function is deliberately not given.\" Something live hits it now.")
+//! @yah:gotcha("THREE SEAMS, IN DEPLOY ORDER, ALL READ RATHER THAN INFERRED. (1) oss/kamaji/crates/kamaji-containerd-core/src/lib.rs:1101 — when a spec does not want host networking and has no join_netns, the OCI spec gets bare `{\"type\":\"network\"}` with no path, so runc unshares a fresh netns, brings up lo, and stops. No veth, no bridge, no address, no NAT rule. That is the loopback-only symptom exactly. (join_netns is NOT a mesh join — its doc at lib.rs:796-803 scopes it to the passway graceful-upgrade fd handoff, i.e. sharing a sibling container's netns.) (2) oss/kamaji/crates/kamaji-bin/src/containerd.rs:1159 — the only reachable shape, `yah.network = \"host\"`, is gated to `tier == \"infra\"` and returns InvalidSpec otherwise. A tenant workload therefore has NO reachable networking option at all. (3) oss/yubaba/crates/yubaba/src/lib.rs:1752 — `workload_bind_ip()` returns `self.node_mesh_ip.unwrap_or(LOCALHOST)`, the NODE's address, keyed on whether the node has a mesh plane and never on the workload's netns shape. That feeds the ServiceRecord behind GET /service-records?ready=true, which IngressPlan::resolve_upstreams (oss/yubaba/crates/cloud/src/reconciler/ingress.rs:397) consumes to render PASSWAY_UPSTREAMS (ingress.rs:316-322). The plan is READY-GATED BUT NOT REACHABILITY-GATED: ingress.rs:389-392 explicitly treats an unresolved rule as an error \"rather than a dead upstream later\", but the record it trusts is fabricated at seam 3, so a dead upstream ships anyway wearing a healthy record. The mesh IP reaches the container only as an env var / label, never as an interface address (kamaji/src/containerd.rs:1345, oci_spec_injects_mesh_ip_after_literal_env).")
+//! @yah:gotcha("THE CONSUMER CANNOT WORK AROUND THIS, which is why it is filed here. noisetable-account.toml already declares everything the schema offers — [expose.mesh] identity/ports=[4332]/allow_from=[] and [expose.public] hostname/port=4332/tls. The only difference from this repo's own working yah-cloud-admin.toml is tier=\"infra\" (:63) and [annotations] \"yah.network\"=\"host\" (:132-133), and adding that annotation to a tenant workload makes the deploy FAIL at seam 2 rather than work. yah-cloud-admin.toml's own comment at :112-117 concedes the whole thing: \"yubaba's per-workload mesh addressing is still a stub... with no CNI or bridge plumbing behind it, so a container in its own netns has no address anyone can reach. Until that is real, an infra workload that must actually be reachable binds a host port.\" The consumer's remaining option was to flip its tier to \"infra\" to dodge the privilege gate, which its own CLAUDE.md forbids as a hack around a framework shortcoming. Hence this ticket instead.")
+//! @yah:assumes("The negative claims — no CNI, no port-publish, no portmap anywhere in the cloud deploy path — came from a recon session that had NEITHER Bash NOR Grep, and rest on kg symbol-index misses for publish_port/cni/port_map. They are corroborated by read, affirmative evidence (the workload_bind_ip doc comment, yah-cloud-admin.toml:112-117, and the read tier gate at containerd.rs:1159), which is why the diagnosis stands — but whoever takes this should run the free-text grep for `veth` / `iptables` / `CNI` under oss/yubaba and oss/kamaji as their FIRST action, since it is cheap here and was impossible there. One unread hit is flagged rather than dismissed: setup_veth_for_pid / VethNetns at app/yah/cli/src/camp.rs:6849-6923, believed to be the CLI's local camp sandbox rather than the cloud deploy path, NOT opened and NOT verified — if that is reusable plumbing it may shorten seam 1 considerably.")
+//! @yah:gotcha("DIAGNOSIS CONFIRMED BY GREP, WITH ONE CORRECTION THAT MATTERS TO R881-S2. R881-B1's courier ran the free-text searches the diagnosing session could not: there is NO CNI, portmap, publish_port or port_map anywhere in oss/yubaba or oss/kamaji, and the only iptables hits are kamaji/src/microvm.rs:1261-1283 (Firecracker guest MASQUERADE, not the containerd workload path). Independently corroborated by kamaji-containerd-core/src/lib.rs:48, which records a live 2026-07-11 probe finding only 127.0.0.1/::1 inside a deployed workload. THE CORRECTION: host networking is NOT the only reachable shape — the DOCKER backend publishes host ports via the `yah.docker.publish` annotation (docker.rs:150, used by pond/launcher.rs). So the seam-2 framing \"a tenant workload has no reachable option at all\" is true of the CONTAINERD path specifically, not of every backend. The new predicate service_records::binds_node_ports covers both shapes and treats everything else as unroutable; join_netns is excluded because both containerd deploy paths hard-code it to None.")
+//!
+//! @yah:ticket(R881-B1, "workload_bind_ip advertises the node address for a workload it cannot confirm is bound there, so a dead upstream ships as healthy")
+//! @yah:status(review)
+//! @yah:at(2026-09-09T08:36:44Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R881)
+//! @yah:next("THE SEPARABLE HALF OF R881, and deliberately scoped to NOT fix reachability. Reachability is an architecture choice (R881-S2); this ticket is only about the failure being SILENT. Today `workload_bind_ip()` at oss/yubaba/crates/yubaba/src/lib.rs:1752 returns `self.node_mesh_ip.unwrap_or(LOCALHOST)` — keyed on whether THIS NODE has a mesh plane, never on the workload's netns shape — so an isolated-netns container is advertised at the node's mesh address, a port nothing on the host is listening on. Its own doc comment at :1742-1751 already says this and names the reason it was not fixed: \"correcting it needs the WorkloadSpec this function is deliberately not given.\" So the fix is to give it that, or to move the decision to a caller that has it.")
+//! @yah:next("ACCEPTANCE — the property that matters is that an unreachable workload FAILS LOUDLY AT APPLY TIME instead of becoming a 503 nobody can trace. oss/yubaba/crates/cloud/src/reconciler/ingress.rs:389-392 already states this intent for the rule it can see (\"rather than a dead upstream later\") and is defeated by the fabricated record; making the record honest is what makes that existing guard work. A workload with an isolated netns and no host binding should either not produce a ready ServiceRecord at all, or produce one the ingress plan refuses to render an upstream from — either is fine, and which one is a design call for whoever takes it. What is NOT acceptable is rendering PASSWAY_UPSTREAMS pointing at an address the reconciler never confirmed anything is listening on. A test that pins the noisetable-account shape (tenant tier, isolated netns, [expose.mesh] ports=[4332], mesh node) and asserts apply refuses rather than rendering 100.64.0.3:4332 is the regression this needs.")
+//! @yah:handoff("LANDED by @Ashguard:coffee (courier, session:0c8cd807) 2026-09-09, commissioned from the noisetable camp with operator authorisation. ACCEPTANCE SHAPE CHOSEN — publish the record but never mark it Ready, rather than withholding the record. `workload_bind_ip` becomes `workload_bind_ip(&spec) -> Option<Ipv4Addr>` and returns None for an isolated netns; `ServiceRecord` gains a persisted `routable` flag whose false value pins health to `NotReady { reason: \"unroutable\" }` through every write path via a single `health_for` funnel. The funnel is load-bearing: without it the sweep re-promotes the record off `WorkloadStatus::Running`, and a restart re-promotes it off the ledger — hence `routable` is a ledger field, defaulting true for pre-R881 files. Publishing-but-not-Ready was chosen over withholding because the wire ALREADY carries health + reason, so `?ready=false` shows an operator exactly why while `?ready=true` goes empty and ingress.rs:389-392 refuses unchanged. The deploy itself still succeeds, so the container stays nsenter-debuggable — the failure is loud without being destructive.")
+//! @yah:verify("Baselines measured before any edit, not taken from the ticket. `cargo test -p yubaba --lib` 865/0 -> 878/0 (that range includes a peer's concurrent demux_routes tests, so it is not all mine). `cargo test -p yubaba --features testing --test testing` = 30 passed / 0 failed / 1 ignored, the +1 being the acceptance test: it deploys the real triggering shape (tenant tier, isolated netns, [expose.mesh] ports=[4332], mesh node 100.64.0.3) through the real handler, feeds `?ready=true` into cloud's ServiceRecordFanout, and asserts `resolve_upstreams_from` ERRORS naming api.noisetable.com and never renders 100.64.0.3:4332 — i.e. it pins the exact production failure that triggered R881. `--test main -- integration_deploy_through_kamaji pond_kamaji` 4/0. `cargo check --workspace --all-targets` in oss/yubaba clean. Peer check ran before editing: camp.roster showed no session on yubaba or kamaji.")
+//! @yah:gotcha("DELIBERATE SECOND-ORDER BEHAVIOUR CHANGE, now pinned by a test — read this before it surprises you. Deploy dependency gating and FromMesh env rendering both read `is_ready`, so an unroutable dependency now REFUSES a consumer's deploy with 424 instead of starting that consumer against an unreachable service. That is the correct direction (it is the same loud-failure principle one level up) but it means the first deploy after this lands can fail where it previously appeared to succeed. The failure names the reason.")
+
+/// The version this binary reports to the fleet.
+///
+/// `CARGO_PKG_VERSION` unless `YAH_HOTSHIP_VERSION` was set at compile time, in
+/// which case that wins. Both are compile-time; nothing is read at runtime.
+///
+/// WHY THIS EXISTS. A hot ship (`yah qed run hotship`) builds from the working
+/// tree and installs over SSH, bypassing the CDN entirely — so the bytes on a
+/// node are, by construction, not the bytes any published manifest describes.
+/// Before this, such a binary reported the workspace version and was therefore
+/// indistinguishable from the release it was NOT: us-east-001 once reported
+/// `kamaji 0.8.22` while carrying none of the 0.8.22 tree (R746-T3), and on
+/// 2026-09-08 all three prod voters reported `0.8.35` while carrying a build
+/// made ~100 minutes after the published 0.8.35 artifacts.
+///
+/// The stamp is a PRERELEASE OF THE NEXT PATCH (`0.8.36-h1`), never build
+/// metadata (`0.8.35+h1`) and never a prerelease of the current one
+/// (`0.8.35-h1`). Only the first orders correctly: semver ignores `+` metadata
+/// for precedence, so `0.8.35+h1` compares EQUAL to the release it differs
+/// from, and `-` on the current version sorts BEFORE it — which would let a
+/// rollout "upgrade" a hot-shipped node backwards into the bytes it replaced.
+/// `0.8.35 < 0.8.36-h1 < 0.8.36` is the only true statement of the three.
+///
+/// Overriding it does not mutate Cargo.toml, deliberately: this camp runs many
+/// concurrent sessions against one working tree, and a version bump written to
+/// disk to stamp one build would be picked up by every peer's build too.
+pub const VERSION: &str = match option_env!("YAH_HOTSHIP_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
 
 pub mod acme_issuer;
 /// R858-T3: who owns the pinned-singleton appliance, elected from an
@@ -447,6 +499,11 @@ pub mod deploy;
 /// The "is that node still there?" port and its default raft-heartbeat impl
 /// (R118-T9). Deployments with a second evidence channel supply their own.
 pub mod failure_detector;
+/// R859-F2 phase B: the fleet's half of public-ingress failover — a targeted,
+/// content-matched withdrawal of a dead origin's A record from the apex, driven
+/// by `floating_ip::plan_ingress_owner_effect` off the scheduler's leader tick.
+/// Subtract-only by design; `yah cloud apply` owns every addition.
+pub mod ingress_effector;
 /// N+1 (N+2 across regions) warm-spare headroom accounting, and the
 /// leader-only background loop that watches it (R737-T4, W253 §8).
 pub mod headroom;
@@ -474,6 +531,10 @@ pub mod litestream;
 /// Each node's own raft member row — the `region` tag the quorum-geography rule
 /// is judged on, kept live rather than only checked at founding (R734-F5).
 pub mod member_registration;
+/// The membership ratchet (R118-F8, W138/W158): demote voters a physically
+/// independent channel proves are *off*, while the cluster still holds the
+/// quorum to commit that decision, and rest at a single voter rather than wedge.
+pub mod membership_ratchet;
 pub mod mesh;
 pub mod node;
 pub mod pond;
@@ -492,6 +553,9 @@ pub mod secrets;
 pub mod service_records;
 /// R742-F1 (W305): the sovereign-group gate on `POST /raft/add-learner`.
 pub mod sovereign_group;
+/// R869 (W339): the off-fleet copy of the applied raft state, and the guard
+/// that stops a wiped raft dir from overwriting it.
+pub mod state_backup;
 
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -1055,11 +1119,6 @@ pub struct ServerState {
     /// global env var on every request.
     pub operator_bridge_mode: OperatorBridgeMode,
 
-    /// R278-F1/F3: in-process rollout registry (degenerate-raft v1).
-    ///
-    /// Migrates to raft-replicated state once R277 cluster-mesh-1 is live.
-    pub rollout_store: Arc<std::sync::Mutex<rollout::RolloutStore>>,
-
     /// R278-F2: Prometheus-compatible base URL for gate evaluation.
     ///
     /// When `None`, gate evaluation runs in stub mode (all gates auto-pass).
@@ -1320,7 +1379,6 @@ impl ServerState {
             bootstrap_tokens: identity::bootstrap::BootstrapTokenRegistry::new(),
             headscale_url: None,
             operator_bridge_mode: OperatorBridgeMode::from_env(),
-            rollout_store: Arc::new(std::sync::Mutex::new(rollout::RolloutStore::new())),
             prometheus_url: std::env::var("YAH_PROMETHEUS_URL").ok(),
             pond_local_runtime: None,
             pond_registry: Arc::new(pond::PondRegistry::new()),
@@ -1697,14 +1755,39 @@ impl ServerState {
     /// its native fork, and the same as `ServiceRecords::admit_bundle`.
     ///
     /// Loopback when this node has no mesh plane (`--bind 0.0.0.0` on a dev
-    /// host), matching the bundle path's fallback. It is the honest answer for
-    /// the isolated-netns shape too: such a container gets a fresh empty
-    /// namespace with nothing but `lo` in it, so there is no address another
-    /// node could dial. A record carrying `127.0.0.1` is visibly unreachable;
-    /// one carrying a neighbour's address is not, and that is the failure this
-    /// replaces.
-    pub fn workload_bind_ip(&self) -> std::net::Ipv4Addr {
-        self.node_mesh_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST)
+    /// host), matching the bundle path's fallback. A record carrying
+    /// `127.0.0.1` is visibly unreachable; one carrying a neighbour's address
+    /// is not, and that is the failure this replaces.
+    ///
+    /// R881-B1 — **`None` is the answer for a workload this node cannot place
+    /// itself at**, and that is why the spec is a parameter now. Until this
+    /// ticket the body was `self.node_mesh_ip.unwrap_or(LOCALHOST)`, keyed on
+    /// whether *this node* has a mesh plane and never on the shape of the
+    /// workload — so an isolated-netns container on a mesh node got the node's
+    /// own address and advertised a port nothing on the host was listening on.
+    /// The previous text said exactly that and deferred the fix because
+    /// "correcting it needs the `WorkloadSpec` this function is deliberately
+    /// not given"; giving it the spec *is* the correction. Live case:
+    /// `noisetable-account`, the first isolated-netns tenant-tier workload on a
+    /// mesh node, ran healthy inside its namespace while `100.64.0.3:4332`
+    /// answered nothing and `PASSWAY_UPSTREAMS` pointed at it anyway.
+    ///
+    /// [`service_records::binds_node_ports`] is the predicate — one place, so
+    /// the address and the record's routability cannot disagree. `None` does
+    /// **not** stop the deploy: the workload still runs (an operator can still
+    /// `nsenter` into it), it is published as a `NotReady { reason:
+    /// "unroutable" }` record instead of a `Ready` one, and the front door
+    /// therefore fails to resolve an upstream at apply time rather than
+    /// shipping a 503. Making a tenant workload genuinely reachable is a
+    /// separate architecture decision (R881-S2).
+    pub fn workload_bind_ip(
+        &self,
+        spec: &workload_spec::WorkloadSpec,
+    ) -> Option<std::net::Ipv4Addr> {
+        if !crate::service_records::binds_node_ports(spec) {
+            return None;
+        }
+        Some(self.node_mesh_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST))
     }
 
     /// Attach an already-opened raft node to the server state.
@@ -2046,6 +2129,16 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/v1/rollouts", get(list_rollouts))
         .route("/v1/rollouts/{id}", get(get_rollout))
         .route("/v1/rollouts/{id}/override", post(override_rollout))
+        // R118-T5 (W138): a node's own post-update boot verdict, filed against
+        // whichever in-flight rollout is waiting on it.
+        .route("/v1/nodes/{node}/boot-health", post(report_boot_health))
+        // R118-F8 (W138): one node's corroborated liveness verdict about a
+        // peer — the evidence the membership ratchet shrinks on. Same loopback
+        // seam as boot-health, and for the same reason.
+        .route(
+            "/v1/nodes/{node}/peer-liveness",
+            post(report_peer_liveness),
+        )
         // R040-F20: raft RPC (peer-to-peer, Tailscale mesh only)
         .route("/raft/append-entries", post(raft_append_entries))
         .route("/raft/vote", post(raft_vote))
@@ -2320,7 +2413,7 @@ async fn health(State(s): State<Arc<ServerState>>) -> Json<HealthBody> {
     Json(HealthBody {
         status: "ok",
         name: env!("CARGO_PKG_NAME"),
-        version: env!("CARGO_PKG_VERSION"),
+        version: VERSION,
         cluster_protocol: cluster_epoch::CLUSTER_PROTOCOL,
         state_epoch: cluster_epoch::STATE_EPOCH,
         mode: if s.raft.is_some() {
@@ -3731,7 +3824,20 @@ async fn deploy_workload_spec(
         // the endpoint passway dials. It was an `alloc_mesh_ip()` counter draw,
         // which made the third container deploy of any yubaba process advertise
         // `100.64.0.3` — us-east-001. See `ServerState::workload_bind_ip`.
-        let mesh = crate::mesh::MeshAssignment::stub(s.workload_bind_ip());
+        //
+        // R881-B1: `None` means the workload does not bind in this node's
+        // network namespace, so the node's address is not where it answers.
+        // The backend still needs *some* address for the `yah.mesh_ip` label
+        // and the container's own environment, and loopback is the honest one
+        // for a container alone in its netns — it is what the container
+        // actually has, and it is visibly undialable from another node rather
+        // than plausibly dialable like a node address. `upsert_deployed` reads
+        // the same predicate and publishes the record `NotReady`, so nothing
+        // downstream treats this value as an upstream.
+        let mesh = crate::mesh::MeshAssignment::stub(
+            s.workload_bind_ip(&spec)
+                .unwrap_or(std::net::Ipv4Addr::LOCALHOST),
+        );
         let mesh_ident = workload_spec::MeshIdent(ident.clone());
 
         // R600-F4 (W273): capture the workload's original cluster `File` secret
@@ -3789,6 +3895,10 @@ async fn deploy_workload_spec(
         // consumer never came back) don't accumulate unbounded.
         ensure_forge_state_dirs(&spec).await;
         sweep_stale_produced_dirs().await;
+        // R876-F4: same moment, same reason, for the build-cache root. A cache
+        // dir has no reap-on-destroy leg by design — surviving the run IS the
+        // feature — so this sweep is the only thing bounding it.
+        sweep_build_cache_dirs().await;
 
         // R600-F6 (W273): materialize File-target secret mounts into per-workload
         // tmpfs files and rewrite them as read-only Bind volumes BEFORE the spec
@@ -4757,6 +4867,83 @@ async fn sweep_stale_produced_dirs() {
             }
         }
     }
+}
+
+/// R876-F4 — bound the host-persistent build-cache root the same way, and at
+/// the same moment, the produced root is bounded.
+///
+/// A build cache is *supposed* to survive its run, so it has no reap-on-destroy
+/// leg that could hold it in check; without this it is a monotonically growing
+/// cargo target dir on a worker's `/var` (60 GB on us-west-003, where the
+/// mesofact target dir alone is multiple GB). That is R702's subject, and
+/// shipping an unbounded mount was explicitly ruled out.
+///
+/// The policy is `forge_cache::evict_plan` — shared verbatim with the runner's
+/// camp-local sweep, so the worker and the Mac cannot disagree about what a
+/// stale cache is. Two rules: idle past `RETENTION` goes; and while the
+/// filesystem is under `FREE_FLOOR_BYTES`, the least-recently-used survivor
+/// goes too. Under sustained pressure each deploy drops one more dir, so the
+/// worst case is a cold build, never a full disk.
+async fn sweep_build_cache_dirs() {
+    let root = std::path::Path::new(workload_spec::forge_cache::HOST_ROOT);
+    let mut entries = match tokio::fs::read_dir(root).await {
+        Ok(e) => e,
+        Err(_) => return, // root not created yet → nothing to sweep
+    };
+    let mut dirs = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Ok(mtime) = meta.modified() else { continue };
+        dirs.push((entry.path(), mtime));
+    }
+    let plan = workload_spec::forge_cache::evict_plan(
+        &dirs,
+        std::time::SystemTime::now(),
+        workload_spec::forge_cache::RETENTION,
+        cache_root_free_bytes(root).await.unwrap_or(u64::MAX),
+        workload_spec::forge_cache::FREE_FLOOR_BYTES,
+    );
+    for path in plan {
+        match tokio::fs::remove_dir_all(&path).await {
+            Ok(()) => tracing::info!(
+                dir = %path.display(),
+                "evicted build cache dir (idle, or reclaiming space under the free floor)"
+            ),
+            Err(e) => tracing::warn!(
+                dir = %path.display(),
+                error = %e,
+                "failed to evict build cache dir"
+            ),
+        }
+    }
+}
+
+/// Free bytes on the filesystem holding the cache root, via POSIX `df -Pk` —
+/// `df` rather than `statvfs` for the reason `node::read_filesystem` states.
+/// `None` on any read failure, which the caller treats as "no pressure": a bad
+/// `df` must not become a reason to delete a build cache.
+async fn cache_root_free_bytes(root: &std::path::Path) -> Option<u64> {
+    let out = tokio::process::Command::new("df")
+        .arg("-Pk")
+        .arg(root)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Filesystem  1024-blocks  Used  Available  Capacity  Mounted-on
+    let fields: Vec<&str> = text.lines().nth(1)?.split_whitespace().collect();
+    if fields.len() < 4 {
+        return None;
+    }
+    fields[3].parse::<u64>().ok()?.checked_mul(1024)
 }
 
 // ── Diagnostics (R092-F3) ─────────────────────────────────────────────────────
@@ -6588,6 +6775,66 @@ async fn raft_add_learner(
         cell::Gate::NotInForce => None,
     };
 
+    // R118-F8 part 2: rehydration and RE-ADMISSION are different paths, and
+    // this is the fork (`W158` §7.2(2)). A voter the ratchet demoted with
+    // `retain = true` never arrives here at all — it is still in membership and
+    // rejoins by ordinary replication plus promotion. A node that arrives here
+    // carrying a term this cluster has never reached is from an incarnation that
+    // was recovered or refounded elsewhere, and adding it as a learner grafts
+    // that history onto this one. Refused, permanently, with the remedy named.
+    //
+    // Runs after the group/cell gates and before `add_learner` for the same
+    // reason they do: it also fires on a follower, so an operator is not sent to
+    // retarget a join that is going to be refused at the leader anyway.
+    //
+    // Whether a declaration is REQUIRED is the cluster policy's call, not this
+    // handler's: a cluster that rehydrates automatically hands a vote to a
+    // learner later with no operator present, so an undeclared joiner there
+    // becomes an unvetted voter. A `Frozen` cluster promotes nobody without a
+    // human, so it still admits one — see
+    // `MembershipRatchet::vets_joiner_lineage`.
+    // Whether the lineage is checked at all is the cluster policy's call, not
+    // this handler's: a cluster that rehydrates hands a vote to a learner later
+    // with no operator present, so an unvetted joiner there becomes an unvetted
+    // VOTER. A `Frozen` cluster promotes nobody without a human, so it skips the
+    // dial entirely and behaves byte-for-byte as it did — see
+    // `MembershipRatchet::vets_joiner_lineage`.
+    //
+    // The joiner is ASKED, not believed, exactly as the sovereign-group gate
+    // above asks it: see `membership_ratchet::ask_origin` for why this is not a
+    // request-body field.
+    let origin_judged = if s.cluster_policy.membership_ratchet.vets_joiner_lineage() {
+        let local = membership_ratchet::LocalLineage {
+            cluster_protocol: cluster_epoch::CLUSTER_PROTOCOL,
+            state_epoch: cluster_epoch::STATE_EPOCH,
+            current_term: raft.metrics().borrow_watched().current_term,
+        };
+        // 502, not 409, and the distinction is the same one the sovereign gate
+        // draws: "the box did not answer" and "the box answered, from the wrong
+        // cluster" call for different operator actions. Unreachable is
+        // retryable; a foreign incarnation is not.
+        let asked = membership_ratchet::ask_origin(&body.addr).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "join refused: could not ask {joiner_label} which cluster it has been \
+                     in, and this cluster rehydrates its voter set automatically — a node \
+                     that joins it is handed a vote later with no operator present, so \
+                     growing it with a node nothing could check is the join this gate exists \
+                     to stop. Underlying error: {e}"
+                ),
+            )
+        })?;
+        match membership_ratchet::judge_origin(&asked, &local) {
+            membership_ratchet::OriginVerdict::Refuse(reason) => {
+                return Err((StatusCode::CONFLICT, reason))
+            }
+            membership_ratchet::OriginVerdict::Adopt => true,
+        }
+    } else {
+        false
+    };
+
     let node = openraft::BasicNode {
         addr: body.addr.clone(),
     };
@@ -6608,6 +6855,11 @@ async fn raft_add_learner(
             // rather than checked and found equal.
             "cell_judged": judged_jurisdiction.is_some(),
             "jurisdiction": judged_jurisdiction,
+            // R118-F8: `false` means this cluster does not rehydrate, so the
+            // joiner's lineage was not checked rather than checked and found to
+            // be ours. Same contract as the two gates above, for the same
+            // reason.
+            "origin_judged": origin_judged,
         }))),
         // Not the leader: hand back the redirect hint (leader id + node) so the
         // operator/orchestrator can retarget the call at the actual leader,
@@ -7300,12 +7552,84 @@ async fn self_update(
     }
 }
 
+/// The rollout API's read handle on this node's applied state, or the 503 a
+/// node outside a raft cluster must answer with (R118-T5).
+///
+/// Rollout state is raft-replicated and has no node-local fallback: answering
+/// "no rollouts" from a node that simply cannot see the cluster would tell an
+/// operator the fleet is idle in exactly the situation where it is not. Same
+/// posture, and the same wording, as `GET /cluster/singletons` and
+/// `GET /tenants/{id}`.
+fn rollout_state(s: &ServerState) -> Result<&raft::YubabaStateMachine, axum::response::Response> {
+    use axum::response::IntoResponse;
+    s.cluster_state.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "this node is not part of a raft cluster (no cluster state)",
+            })),
+        )
+            .into_response()
+    })
+}
+
+/// Commit a rollout write through consensus under the record's
+/// compare-and-swap, forwarding to the leader when this node is not it.
+///
+/// The *handlers* forward (an operator may POST to any node); the engine
+/// deliberately does not — see [`rollout::engine`] for why a demoted driver
+/// must fail rather than reach the leader by proxy.
+///
+/// `intent` is re-run against freshly read state on every retry, so a handler
+/// that loses a race to the driving engine re-derives its change from what the
+/// engine actually committed instead of replaying a stale record over it.
+async fn commit_rollout(
+    s: &ServerState,
+    rollout_id: &str,
+    intent: impl FnMut(Option<&rollout::RolloutRecord>) -> Option<rollout::RolloutRecord>,
+) -> Result<rollout::Written, axum::response::Response> {
+    use axum::response::IntoResponse;
+    let (Some(raft), Some(sm)) = (s.raft.as_ref(), s.cluster_state.as_ref()) else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "this node has no raft instance; rollout state cannot be committed",
+            })),
+        )
+            .into_response());
+    };
+    let client = reqwest::Client::builder()
+        .timeout(raft::FORWARD_TIMEOUT)
+        .build()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("building HTTP client: {e}") })),
+            )
+                .into_response()
+        })?;
+    rollout::commit_guarded(raft, sm, rollout_id, Some(&client), intent)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": format!("committing rollout state through raft: {e}"),
+                })),
+            )
+                .into_response()
+        })
+}
+
 /// `POST /v1/rollouts` — accept a new rollout request.
 ///
-/// Validates the policy (linear-only for v1), creates a `RolloutRecord`,
-/// spawns the engine as a background task, and returns 202 immediately.
+/// Validates the policy (linear-only for v1), commits a `Pending` record
+/// through raft, and returns 202. It does **not** spawn an engine: the leader's
+/// [`rollout::supervisor`] claims the record on its next tick, through the same
+/// code path that resumes a rollout inherited from a leader that lost power.
+/// That is the point — see that module's doc.
 ///
-/// Gate evaluation uses the Prometheus URL configured on the server
+/// Gate evaluation uses the Prometheus URL configured on the *driving* node
 /// (`YAH_PROMETHEUS_URL` or `with_prometheus_url`). When no URL is set the
 /// engine runs in stub mode and all gates auto-pass.
 async fn create_rollout(
@@ -7315,6 +7639,8 @@ async fn create_rollout(
     use axum::response::IntoResponse;
     use workload_spec::rollout::RolloutStrategy;
 
+    // Checked before the cluster is consulted: a policy v1 can never drive is a
+    // bad request whatever the state of raft, and saying so needs no quorum.
     if req.policy.strategy != RolloutStrategy::Linear {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -7326,54 +7652,93 @@ async fn create_rollout(
             .into_response();
     }
 
-    let rollout_id = {
-        let mut store = s.rollout_store.lock().unwrap();
-        store.create(req.artifact.clone(), req.policy.clone(), req.trigger)
-    };
+    let record = rollout::RolloutRecord::new(req.artifact, req.policy, req.trigger);
+    // A create expects revision 0 — no record. If one somehow exists under this
+    // freshly minted id, abandon rather than overwrite it: two rollouts sharing
+    // an id is not a state this API should be able to reach.
+    let outcome = commit_rollout(&s, &record.rollout_id, |current| {
+        current.is_none().then(|| record.clone())
+    })
+    .await;
+    match outcome {
+        Ok(rollout::Written::Committed(_)) => {}
+        Ok(rollout::Written::Abandoned) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!("rollout '{}' already exists", record.rollout_id),
+                })),
+            )
+                .into_response();
+        }
+        Err(resp) => return resp,
+    }
 
-    // Spawn the rollout engine as a background task.
-    let engine = rollout::engine::RolloutEngine::new(
-        rollout_id.clone(),
-        req.artifact,
-        req.policy,
-        Arc::clone(&s.rollout_store),
-        s.prometheus_url.clone(),
-    );
-    tokio::spawn(engine.run());
-
-    tracing::info!(rollout_id = %rollout_id, "rollout accepted");
+    tracing::info!(rollout_id = %record.rollout_id, "rollout accepted");
 
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
-            "rollout_id": rollout_id,
+            "rollout_id": record.rollout_id,
             "status": "pending",
         })),
     )
         .into_response()
 }
 
-/// `GET /v1/rollouts` — list all rollouts on this yubaba node, newest first.
-async fn list_rollouts(State(s): State<Arc<ServerState>>) -> Json<serde_json::Value> {
-    let store = s.rollout_store.lock().unwrap();
-    let records: Vec<serde_json::Value> = store
-        .list()
-        .into_iter()
+/// `GET /v1/rollouts` — every rollout the cluster knows about, newest first.
+///
+/// A local read of this node's applied state — no leader round-trip. It can be
+/// stale by the replication lag, which is why each record is rendered from the
+/// committed log rather than from anything this process did.
+async fn list_rollouts(State(s): State<Arc<ServerState>>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let sm = match rollout_state(&s) {
+        Ok(sm) => sm,
+        Err(resp) => return resp,
+    };
+    let mut records: Vec<rollout::RolloutRecord> = sm
+        .rollouts()
+        .values()
+        .map(rollout::RolloutRecord::from_raft)
+        .collect();
+    records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let records: Vec<serde_json::Value> = records
+        .iter()
         .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
         .collect();
-    Json(serde_json::json!({ "rollouts": records }))
+    Json(serde_json::json!({ "rollouts": records })).into_response()
 }
 
-/// `GET /v1/rollouts/{id}` — fetch a single rollout by ID.
+/// `GET /v1/rollouts/{id}` — fetch a single rollout by ID from applied state.
 async fn get_rollout(
     State(s): State<Arc<ServerState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    match rollout::snapshot_record(&s.rollout_store, &id) {
-        Some(r) => {
-            Json(serde_json::to_value(&r).unwrap_or(serde_json::Value::Null)).into_response()
+    let sm = match rollout_state(&s) {
+        Ok(sm) => sm,
+        Err(resp) => return resp,
+    };
+    match sm.rollout(&id) {
+        Some(raw) => {
+            let record = rollout::RolloutRecord::from_raft(&raw);
+            let mut body = serde_json::to_value(&record).unwrap_or(serde_json::Value::Null);
+            // R118-T5: the evidence beside the decision. Attached here rather
+            // than carried on `RolloutRecord`, because that type is also the
+            // *write* payload (`set_request`) and health is not a field any
+            // rollout writer may set — it has its own request and its own
+            // stickiness rule.
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "health".to_string(),
+                    serde_json::to_value(sm.rollout_health(&id))
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+            Json(body).into_response()
         }
         None => (
             StatusCode::NOT_FOUND,
@@ -7398,9 +7763,15 @@ fn unknown_operator() -> String {
 
 /// `POST /v1/rollouts/{id}/override` — force-promote or force-rollback.
 ///
-/// Overrides are logged with the operator ID. The engine continues running
-/// after a promote; after a rollback the engine's next gate check will see
-/// the `Overridden` status and can exit gracefully.
+/// Overrides are recorded with the operator ID and committed through raft, so
+/// they reach the engine wherever it is running: the driving leader re-reads
+/// the record before each step and inside every gate window (see
+/// [`rollout::engine`]), which is what makes an override arrive during the wait
+/// it is meant to cut short rather than after it.
+///
+/// A **promote** advances `current_step` and leaves the rollout `Running` — it
+/// is a statement about one step. A **rollback** is terminal: the record goes
+/// `Overridden` and the engine stands down.
 async fn override_rollout(
     State(s): State<Arc<ServerState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -7408,27 +7779,31 @@ async fn override_rollout(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let action_str = match req.action {
-        rollout::OverrideAction::Promote => "promote",
-        rollout::OverrideAction::Rollback => "rollback",
-    };
+    let action_str = req.action.as_str();
 
-    {
-        let mut store = s.rollout_store.lock().unwrap();
-        if store.get(&id).is_none() {
+    // The override is applied to whatever the record says at write time, not to
+    // a copy read once at the top of the handler: the engine driving this
+    // rollout is committing step advances the whole while, and re-deriving is
+    // what stops this write reverting one.
+    let action = req.action.clone();
+    let by = req.by.clone();
+    let outcome = commit_rollout(&s, &id, move |current| {
+        let mut record = current?.clone();
+        action.apply(&mut record, &by);
+        Some(record)
+    })
+    .await;
+    match outcome {
+        Ok(rollout::Written::Committed(_)) => {}
+        // `intent` only declines when there is no record at all.
+        Ok(rollout::Written::Abandoned) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": format!("rollout '{id}' not found") })),
             )
                 .into_response();
         }
-        store.update_status(
-            &id,
-            rollout::RolloutStatus::Overridden {
-                action: action_str.to_string(),
-                by: req.by.clone(),
-            },
-        );
+        Err(resp) => return resp,
     }
 
     tracing::info!(rollout_id = %id, action = action_str, by = %req.by, "rollout overridden by operator");
@@ -7442,6 +7817,281 @@ async fn override_rollout(
         })),
     )
         .into_response()
+}
+
+/// `POST /v1/nodes/{node}/boot-health` request body.
+#[derive(Deserialize, Debug)]
+struct BootHealthBody {
+    verdict: raft::NodeHealthVerdict,
+    /// Free text for the operator — which slot, which bundle version, why.
+    #[serde(default)]
+    detail: String,
+}
+
+/// `POST /v1/nodes/{node}/boot-health` — a node reports how its own boot went
+/// (R118-T5, W138).
+///
+/// # Who calls this, and from where
+///
+/// The node itself, over **loopback**, against the yubaba running beside it.
+/// On the appliance that is `overlay/usr/share/noise/rauc-health.sh`, in the
+/// same two arms that already decide the verdict for RAUC's own A/B contract
+/// (`good` after `rauc status mark-good`, `failed` immediately before the
+/// reboot that lets U-Boot fall back). There is deliberately no second place
+/// where health is decided: the cluster is a new *observer* of R101-F1's seam,
+/// not a competing authority, and a later kamaji adoption changes only who
+/// calls those two verbs.
+///
+/// The write is forwarded to the leader from here rather than by the reporter,
+/// which is what keeps the plinth's side of the conversation loopback-only —
+/// it never has to know where the leader is or be able to reach it.
+///
+/// # Why `{node}` is in the path and the rollout id is not
+///
+/// A booting plinth knows its own name and nothing about fleet state. The
+/// mapping to rollouts is resolved here from replicated state
+/// ([`rollout::health::rollouts_awaiting`]).
+///
+/// **A node no rollout is waiting on gets 200 with an empty list, not an
+/// error.** That is the ordinary case — every everyday reboot of every board —
+/// and a shell script that has to distinguish "nothing to report" from "the
+/// report failed" is a shell script that will get it wrong.
+async fn report_boot_health(
+    State(s): State<Arc<ServerState>>,
+    axum::extract::Path(node): axum::extract::Path<String>,
+    Json(req): Json<BootHealthBody>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let sm = match rollout_state(&s) {
+        Ok(sm) => sm,
+        Err(resp) => return resp,
+    };
+    let awaiting = rollout::health::rollouts_awaiting(&node, &sm.rollouts());
+    if awaiting.is_empty() {
+        tracing::debug!(%node, verdict = ?req.verdict, "boot health filed against no rollout");
+        return Json(serde_json::json!({
+            "node": node,
+            "verdict": req.verdict,
+            "reports": [],
+        }))
+        .into_response();
+    }
+
+    let Some(raft) = s.raft.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "this node has no raft instance; boot health cannot be committed",
+            })),
+        )
+            .into_response();
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(raft::FORWARD_TIMEOUT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("building HTTP client: {e}") })),
+            )
+                .into_response()
+        }
+    };
+
+    let reported_at = rollout::now_unix_secs();
+    let mut reports = Vec::new();
+    for rollout_id in awaiting {
+        let request = raft::YubabaRequest::ReportNodeHealth {
+            rollout_id: rollout_id.clone(),
+            node: node.clone(),
+            verdict: req.verdict,
+            detail: req.detail.clone(),
+            reported_at,
+        };
+        match raft::client_write_forwarded(raft, &client, request).await {
+            Ok(raft::YubabaResponse::NodeHealth(outcome)) => {
+                tracing::info!(%node, %rollout_id, verdict = ?req.verdict, ?outcome, "boot health filed");
+                reports.push(serde_json::json!({
+                    "rollout_id": rollout_id,
+                    "outcome": outcome,
+                }));
+            }
+            // Anything else means `apply` stopped answering this request with a
+            // NodeHealth outcome, which is a bug and not a race. Say so rather
+            // than reporting a write that may not have meant what we think.
+            Ok(other) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("unexpected raft response to a boot-health write: {other:?}"),
+                    })),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": format!("committing boot health through raft: {e}"),
+                    })),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "node": node,
+        "verdict": req.verdict,
+        "reports": reports,
+    }))
+    .into_response()
+}
+
+/// One peer's entry in a [`PeerLivenessBody`].
+#[derive(Deserialize, Debug)]
+struct PeerLivenessEntry {
+    /// The subject's raft node id.
+    node_id: raft::YubabaNodeId,
+    verdict: raft::PeerLivenessVerdict,
+    /// The observer's operator-readable sentence — `"no raft heartbeat 4m, no
+    /// BLE advert 4m"`. `R118-F7`'s `PeerVerdict::describe_channels` produces
+    /// exactly this, and `W158` §7.1(4) is the reason it is carried: *"`Dark`
+    /// alone is not a UI"*.
+    #[serde(default)]
+    detail: String,
+}
+
+/// `POST /v1/nodes/{node}/peer-liveness` request body.
+///
+/// A batch, because a detector holds a *view* — every peer at one evaluation
+/// instant — and splitting it across requests would let a partial view reach
+/// the ratchet as if it were whole.
+#[derive(Deserialize, Debug)]
+struct PeerLivenessBody {
+    peers: Vec<PeerLivenessEntry>,
+}
+
+/// `POST /v1/nodes/{node}/peer-liveness` — a node reports what it can see of its
+/// peers (R118-F8, W138).
+///
+/// # Who calls this, and from where
+///
+/// The node itself, over **loopback**, against the yubaba running beside it —
+/// the same seam `POST /v1/nodes/{node}/boot-health` opened, and deliberately
+/// not a second shape. Here the caller is noisetable's
+/// `society_facility::liveness` reporter (`R118-F7`), which corroborates an IP
+/// path against BLE. That detector links no yubaba crate and cannot implement
+/// the in-process [`failure_detector::FailureDetector`] trait, so HTTP is not a
+/// convenience here, it is the only seam that exists across the process
+/// boundary.
+///
+/// The write is forwarded to the leader from here rather than by the reporter,
+/// which is what keeps the plinth's side loopback-only: it never has to know
+/// where the leader is, or be able to reach it.
+///
+/// # `{node}` is the **observer's raft node id**, not a machine name
+///
+/// Unlike boot-health, whose `{node}` is a machine name because a rollout policy
+/// names its mirrors that way. Liveness is consumed by consensus — membership,
+/// quorum, the ratchet — and that layer speaks [`raft::YubabaNodeId`]
+/// throughout. `R118-F7`'s own `PeerKey` doc says the caller owes the
+/// correlation between a BLE endpoint and a raft node; this is where it is owed.
+///
+/// # Transitions, not renewals
+///
+/// Every entry becomes a replicated log entry, so a reporter that POSTs its
+/// whole view every tick writes a raft entry per peer per tick forever. The
+/// response says `outcome: "unchanged"` for an entry that restated what was
+/// already on file — a run of those is the signal that a reporter is renewing
+/// where it should be reporting a change. The state machine does not enforce it
+/// (it cannot know the caller's cadence), and the record's timestamp *does*
+/// advance on a restatement, which is what keeps evidence fresh across the
+/// policy's TTL.
+///
+/// Status codes: `200` with per-peer outcomes; `503` when this node has no raft
+/// or the forward failed (both transient, both the caller's retry).
+async fn report_peer_liveness(
+    State(s): State<Arc<ServerState>>,
+    axum::extract::Path(observer): axum::extract::Path<raft::YubabaNodeId>,
+    Json(req): Json<PeerLivenessBody>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let Some(raft) = s.raft.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "this node has no raft instance; peer liveness cannot be committed",
+            })),
+        )
+            .into_response();
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(raft::FORWARD_TIMEOUT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("building HTTP client: {e}") })),
+            )
+                .into_response()
+        }
+    };
+
+    let observed_at = rollout::now_unix_secs();
+    let mut reports = Vec::new();
+    for peer in &req.peers {
+        let request = raft::YubabaRequest::ReportPeerLiveness {
+            observer,
+            subject: peer.node_id,
+            verdict: peer.verdict,
+            detail: peer.detail.clone(),
+            observed_at,
+        };
+        match raft::client_write_forwarded(raft, &client, request).await {
+            Ok(raft::YubabaResponse::PeerLiveness(outcome)) => {
+                reports.push(serde_json::json!({
+                    "node_id": peer.node_id,
+                    "verdict": peer.verdict,
+                    "outcome": outcome,
+                }));
+            }
+            // `apply` stopped answering this request with a PeerLiveness
+            // outcome — a bug, not a race. Say so rather than reporting a write
+            // that may not have meant what we think.
+            Ok(other) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": format!("unexpected raft response to a peer-liveness write: {other:?}"),
+                    })),
+                )
+                    .into_response()
+            }
+            Err(e) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": format!("committing peer liveness through raft: {e}"),
+                    })),
+                )
+                    .into_response()
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "observer": observer,
+        "observed_at": observed_at,
+        "reports": reports,
+    }))
+    .into_response()
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -8884,7 +9534,7 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["status"], "ok");
-        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["version"], VERSION);
         // Absent (not null) when no kamaji UDS is attached — skip_serializing_if.
         assert!(
             body.get("kamaji_version").is_none(),
@@ -9181,9 +9831,78 @@ mod tests {
         })
     }
 
+    /// A node that is its own one-voter raft cluster, elected and able to
+    /// commit.
+    ///
+    /// The rollout API's state is replicated as of R118-T5, so its handlers
+    /// cannot be exercised against a raft-less `fresh_state()` any more — and
+    /// that is the behaviour, not an inconvenience: a rollout whose record
+    /// lives only in the accepting process is the failure the ticket exists to
+    /// remove. `bootstrap_single_node` is the same call the daemon makes for a
+    /// BYO-VPS node, so these tests drive the production write path.
+    async fn state_with_single_node_raft() -> (tempfile::TempDir, Arc<ServerState>) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let policy = cluster_policy::ClusterPolicy::rig();
+        let (raft, sm) = raft::open_with_state_machine(1, tmp.path().join("raft"), &policy)
+            .await
+            .expect("open a single-node raft");
+        raft::bootstrap_single_node(&raft, 1, "127.0.0.1:0")
+            .await
+            .expect("found a cluster of one");
+
+        // Self-election takes an election timeout; the rig preset's is 450–900
+        // ms, so this is several elections of headroom on a loaded machine.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while raft.metrics().borrow_watched().current_leader != Some(1) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a cluster of one never elected itself"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let state = ServerState::load(tmp.path().join("identity.json"))
+            .unwrap()
+            .with_node_id(1)
+            .with_raft(raft)
+            .with_cluster_state(sm);
+        (tmp, Arc::new(state))
+    }
+
+    /// Rollout state is cluster state. A node that cannot see the cluster must
+    /// say so rather than answer "no rollouts" — those mean opposite things to
+    /// an operator asking whether the fleet is mid-update.
+    #[tokio::test]
+    async fn the_rollout_api_is_unavailable_without_a_raft_cluster() {
+        let (_tmp, state) = fresh_state();
+        let app = build_router(state);
+
+        for request in [
+            Request::get("/v1/rollouts").body(Body::empty()).unwrap(),
+            Request::get("/v1/rollouts/rt-anything")
+                .body(Body::empty())
+                .unwrap(),
+            Request::post("/v1/rollouts")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&minimal_rollout_body()).unwrap(),
+                ))
+                .unwrap(),
+        ] {
+            let uri = request.uri().clone();
+            let resp = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{uri} must refuse rather than invent an answer"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn create_rollout_returns_202_with_id() {
-        let (_tmp, state) = fresh_state();
+        let (_tmp, state) = state_with_single_node_raft().await;
         let app = build_router(state);
 
         let body = minimal_rollout_body();
@@ -9260,6 +9979,9 @@ mod tests {
 
     #[tokio::test]
     async fn create_rollout_rejects_non_linear_strategy() {
+        // Deliberately raft-less: a policy v1 can never drive is a bad request
+        // whatever the cluster is doing, and the handler must say so without
+        // consulting it.
         let (_tmp, state) = fresh_state();
         let app = build_router(state);
 
@@ -9288,7 +10010,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_rollout_returns_record() {
-        let (_tmp, state) = fresh_state();
+        let (_tmp, state) = state_with_single_node_raft().await;
         let app = build_router(Arc::clone(&state));
 
         // Create via the handler.
@@ -9319,11 +10041,16 @@ mod tests {
         let get_body = body_json(get_resp).await;
         assert_eq!(get_body["rollout_id"], id);
         assert_eq!(get_body["artifact"], "release:yah-marketing@v1.0.0");
+        // The widened record, read back out of raft: the two steps a resuming
+        // leader would need, and a decoded status object rather than a string.
+        assert_eq!(get_body["policy"]["steps"].as_array().unwrap().len(), 2);
+        assert_eq!(get_body["status"]["kind"], "pending");
+        assert_eq!(get_body["trigger"]["source"], "test");
     }
 
     #[tokio::test]
     async fn get_rollout_404_for_unknown_id() {
-        let (_tmp, state) = fresh_state();
+        let (_tmp, state) = state_with_single_node_raft().await;
         let app = build_router(state);
 
         let resp = app
@@ -9337,26 +10064,32 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// An override is a *committed* fact, not a note to a local task: the
+    /// assertion is on what the cluster's applied state says afterwards, since
+    /// that is the only channel a driving engine — possibly on another node —
+    /// reads.
     #[tokio::test]
-    async fn override_rollout_promote_ok() {
-        let (_tmp, state) = fresh_state();
+    async fn override_rollout_promote_advances_the_committed_step() {
+        let (_tmp, state) = state_with_single_node_raft().await;
+        let app = build_router(Arc::clone(&state));
 
-        // Create a rollout directly in the store.
-        let id = {
-            let mut store = state.rollout_store.lock().unwrap();
-            store.create(
-                "release:test@v1".into(),
-                serde_json::from_value(serde_json::json!({
-                    "strategy": "linear",
-                    "window_seconds": 60,
-                    "steps": [{ "mirrors": ["staging"], "gate_window_seconds": 0 }]
-                }))
-                .unwrap(),
-                serde_json::Value::Null,
+        let create = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/rollouts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&minimal_rollout_body()).unwrap(),
+                    ))
+                    .unwrap(),
             )
-        };
+            .await
+            .unwrap();
+        let id = body_json(create).await["rollout_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
-        let app = build_router(state);
         let resp = app
             .oneshot(
                 Request::post(format!("/v1/rollouts/{id}/override"))
@@ -9377,20 +10110,113 @@ mod tests {
         let b = body_json(resp).await;
         assert_eq!(b["action"], "promote");
         assert_eq!(b["by"], "test-operator");
+
+        let committed = state
+            .cluster_state
+            .as_ref()
+            .unwrap()
+            .rollout(&id)
+            .expect("the override is committed to cluster state");
+        let committed = rollout::RolloutRecord::from_raft(&committed);
+        assert_eq!(committed.current_step, 1, "a promote advances the step");
+        assert_eq!(
+            committed.status,
+            rollout::RolloutStatus::Running,
+            "a promote is about one step, so the rollout stays in flight"
+        );
     }
 
     #[tokio::test]
-    async fn list_rollouts_returns_array() {
-        let (_tmp, state) = fresh_state();
-        let app = build_router(state);
+    async fn override_rollout_rollback_is_terminal() {
+        let (_tmp, state) = state_with_single_node_raft().await;
+        let app = build_router(Arc::clone(&state));
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/rollouts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&minimal_rollout_body()).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = body_json(create).await["rollout_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let resp = app
-            .oneshot(Request::get("/v1/rollouts").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::post(format!("/v1/rollouts/{id}/override"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "action": "rollback",
+                            "by": "test-operator"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let b = body_json(resp).await;
-        assert!(b["rollouts"].is_array());
+
+        let committed = rollout::RolloutRecord::from_raft(
+            &state
+                .cluster_state
+                .as_ref()
+                .unwrap()
+                .rollout(&id)
+                .expect("record still present"),
+        );
+        assert!(
+            !committed.status.is_in_flight(),
+            "a rollback must stop the supervisor claiming this rollout again, \
+             got {:?}",
+            committed.status
+        );
+    }
+
+    #[tokio::test]
+    async fn list_rollouts_returns_what_the_cluster_committed() {
+        let (_tmp, state) = state_with_single_node_raft().await;
+        let app = build_router(state);
+
+        let empty = app
+            .clone()
+            .oneshot(Request::get("/v1/rollouts").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::OK);
+        assert!(body_json(empty).await["rollouts"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        app.clone()
+            .oneshot(
+                Request::post("/v1/rollouts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&minimal_rollout_body()).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let listed = app
+            .oneshot(Request::get("/v1/rollouts").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let b = body_json(listed).await;
+        let rollouts = b["rollouts"].as_array().unwrap();
+        assert_eq!(rollouts.len(), 1);
+        assert_eq!(rollouts[0]["artifact"], "release:yah-marketing@v1.0.0");
     }
 
     // ── R427-F1: destroy endpoint + ownership revoke ────────────────────────
@@ -10408,8 +11234,32 @@ mod tests {
     }
 
     /// A container spec the deploy handler will accept, with one anonymous
-    /// mesh port so it is a serving workload.
+    /// mesh port so it is a serving workload — and **host-networked**, so it is
+    /// a *reachable* one.
+    ///
+    /// R881-B1 made the second half matter. Dependency gating and `FromMesh`
+    /// rendering both read `ServiceRecord::is_ready`, and since that ticket a
+    /// workload alone in its netns is never ready — correctly, because a
+    /// consumer cannot dial a service nothing can reach. The tests using this
+    /// helper are about the gate and the rendering, so the fixture declares the
+    /// shape whose address is real instead of leaning on a default that has
+    /// since changed meaning. The consequence for the *unreachable* shape is
+    /// pinned by
+    /// [`a_dependency_on_an_unroutable_workload_does_not_satisfy_the_gate`].
+    ///
+    /// [`a_dependency_on_an_unroutable_workload_does_not_satisfy_the_gate`]: tests::a_dependency_on_an_unroutable_workload_does_not_satisfy_the_gate
     fn mesh_spec(ident: &str, port: u16) -> workload_spec::WorkloadSpec {
+        let mut spec = isolated_mesh_spec(ident, port);
+        spec.annotations.insert(
+            workload_spec::HOST_NETWORK_ANNOTATION.to_string(),
+            workload_spec::HOST_NETWORK_VALUE.to_string(),
+        );
+        spec
+    }
+
+    /// [`mesh_spec`] without the host-network annotation: its own netns, so
+    /// nothing on the node answers on `port` (R881-B1).
+    fn isolated_mesh_spec(ident: &str, port: u16) -> workload_spec::WorkloadSpec {
         use workload_spec::{ImageRef, MeshIdent, TierTag, WorkloadSpec};
         let mut spec = WorkloadSpec::for_forge(
             "fixture",
@@ -10722,6 +11572,44 @@ mod tests {
             1,
             "a satisfied dependency must not block the deploy (status was {})",
             resp.status()
+        );
+    }
+
+    /// R881-B1's consequence one layer up, pinned deliberately rather than
+    /// discovered later: the gate reads `ServiceRecord::is_ready`, and an
+    /// isolated-netns dependency is never ready. Its record exists and its
+    /// container runs — but nothing can dial it, so a consumer that declares
+    /// `depends_on` is refused instead of being started against a service it
+    /// will never reach.
+    ///
+    /// The dependency's record is deliberately *present* here. That is what
+    /// makes this distinct from
+    /// `a_deploy_whose_dependency_never_appears_is_refused_before_the_backend_is_called`
+    /// above: before R881-B1 this exact setup satisfied the gate.
+    #[tokio::test(start_paused = true)]
+    async fn a_dependency_on_an_unroutable_workload_does_not_satisfy_the_gate() {
+        let (_tmp, state, rt) = state_with_recording_runtime();
+        let dep = isolated_mesh_spec("db", 5432);
+        state
+            .service_records
+            .upsert_deployed(&dep, std::net::Ipv4Addr::new(100, 64, 0, 7), "dep-container");
+        assert!(
+            state
+                .service_records
+                .get(&workload_spec::MeshIdent("db".into()))
+                .is_some(),
+            "the dependency IS tracked — this test is about reachability, not absence"
+        );
+
+        let mut spec = mesh_spec("consumer", 8080);
+        spec.depends_on = vec![workload_spec::MeshIdent("db".into())];
+
+        let resp = post_deploy(state, &spec).await;
+
+        assert_eq!(resp.status(), StatusCode::FAILED_DEPENDENCY);
+        assert!(
+            rt.specs().is_empty(),
+            "a consumer was started against a dependency nothing can reach"
         );
     }
 
@@ -11346,6 +12234,7 @@ mod bundle_deploy_tests {
                 lifecycle: workload_spec::BundleLifecycle::KeepAlive,
                 port: None,
                 env: Default::default(),
+                origin: None,
             }),
             revalidate_receiver: None,
         })
@@ -11469,10 +12358,18 @@ mod bundle_deploy_tests {
     /// workspace anyway). The live per-node form of the same check is in the
     /// ticket's verify: every record's `mesh_ip` must equal the answering
     /// node's `tailscale ip -4`.
+    /// R881-B1 note: the spec parameter is what the question is asked *about*
+    /// now, so this test asks it of a host-networked workload — the shape whose
+    /// answer the node's address genuinely is, and the shape the fleet's one
+    /// container workload has. The isolated-netns answer is
+    /// [`an_isolated_netns_workload_has_no_address_this_node_can_advertise`].
+    ///
+    /// [`an_isolated_netns_workload_has_no_address_this_node_can_advertise`]: tests::an_isolated_netns_workload_has_no_address_this_node_can_advertise
     #[test]
     fn a_deployed_workloads_address_is_this_nodes_own_however_many_came_before() {
         use std::net::Ipv4Addr;
 
+        let spec = host_networked_spec();
         let (_tmp, s) = state();
         let s = Arc::try_unwrap(s)
             .map(|s| s.with_bind_addr("100.64.0.3:7443"))
@@ -11480,8 +12377,8 @@ mod bundle_deploy_tests {
 
         for nth in 1..=8 {
             assert_eq!(
-                s.workload_bind_ip(),
-                Ipv4Addr::new(100, 64, 0, 3),
+                s.workload_bind_ip(&spec),
+                Some(Ipv4Addr::new(100, 64, 0, 3)),
                 "deploy #{nth} advertised an address that is not this node's — \
                  a per-workload counter drawn from 100.64.0.0/10 walks onto \
                  real node addresses (R844-B11)"
@@ -11496,7 +12393,68 @@ mod bundle_deploy_tests {
             .map(|s| s.with_bind_addr("0.0.0.0:7443"))
             .unwrap_or_else(|_| unreachable!("sole owner"));
         assert_eq!(dev.node_mesh_ip(), None);
-        assert_eq!(dev.workload_bind_ip(), Ipv4Addr::LOCALHOST);
+        assert_eq!(dev.workload_bind_ip(&spec), Some(Ipv4Addr::LOCALHOST));
+    }
+
+    /// A serving spec with `yah.network = "host"` — reachable at the node's own
+    /// address, because it binds the node's ports.
+    fn host_networked_spec() -> workload_spec::WorkloadSpec {
+        let mut spec = isolated_netns_spec();
+        spec.annotations.insert(
+            workload_spec::HOST_NETWORK_ANNOTATION.to_string(),
+            workload_spec::HOST_NETWORK_VALUE.to_string(),
+        );
+        spec
+    }
+
+    /// The same spec with no networking annotation: runc unshares a fresh netns
+    /// and brings up `lo`, and nothing else on the node is listening.
+    fn isolated_netns_spec() -> workload_spec::WorkloadSpec {
+        use workload_spec::{ImageRef, TierTag, WorkloadSpec};
+        WorkloadSpec::for_forge(
+            "fixture",
+            ImageRef {
+                registry: "localhost".into(),
+                repository: "test".into(),
+                tag: "latest".into(),
+                digest: workload_spec::testing::test_digest(),
+            },
+            TierTag("tenant".into()),
+            vec![4332],
+        )
+    }
+
+    /// R881-B1 — the noisetable-account shape. A tenant-tier workload in its
+    /// own netns on a **mesh** node: the node has an address, the workload does
+    /// not answer on it, and the old `node_mesh_ip.unwrap_or(LOCALHOST)` handed
+    /// out `100.64.0.3` anyway because it only ever asked about the node.
+    ///
+    /// `None` on a mesh node is the whole fix — that is the value that keeps a
+    /// dead upstream out of `PASSWAY_UPSTREAMS`. The dev-host half is asserted
+    /// beside it so the answer is visibly keyed on the *workload*: a function
+    /// that had merely been made stricter about mesh planes would return
+    /// `Some(LOCALHOST)` there.
+    #[test]
+    fn an_isolated_netns_workload_has_no_address_this_node_can_advertise() {
+        let spec = isolated_netns_spec();
+
+        let (_tmp, s) = state();
+        let s = Arc::try_unwrap(s)
+            .map(|s| s.with_bind_addr("100.64.0.3:7443"))
+            .unwrap_or_else(|_| unreachable!("sole owner"));
+        assert_eq!(
+            s.workload_bind_ip(&spec),
+            None,
+            "a container alone in its netns was advertised at the NODE's mesh \
+             address — the R881 defect: nothing on the host is listening on \
+             its port, so the ingress plan renders an upstream that 503s"
+        );
+
+        let (_t, dev) = state();
+        let dev = Arc::try_unwrap(dev)
+            .map(|s| s.with_bind_addr("0.0.0.0:7443"))
+            .unwrap_or_else(|_| unreachable!("sole owner"));
+        assert_eq!(dev.workload_bind_ip(&spec), None);
     }
 
     /// A bare `WorkloadSpec` must still parse as `Container`: every deployed

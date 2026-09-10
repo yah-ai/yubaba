@@ -43,6 +43,16 @@
 //!
 //! @arch:see(.yah/docs/architecture/A053-yah-yubaba-integration-testing.md)
 //! @arch:see(.yah/docs/architecture/A032-yah-cluster-mesh.md)
+//!
+//! @yah:ticket(R732-T6, "R732-T5's split-brain fencing tests never run by default — extract from integration_mesh.rs like R737-T5 did")
+//! @yah:at(2026-09-08T08:00:22Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R732)
+//! @yah:next("Extract the split_brain module out of integration_mesh.rs into its own gate-free test file (mirror raft_tenant_placement.rs's approach for R737-T5), register it in tests/main.rs, and confirm it still passes with zero cargo features. Leave multi_node_mesh and the other containerd-integration-gated tests in integration_mesh.rs untouched.")
+//! @yah:verify("cargo test -p yubaba --test main -- split_brain:: passes with no feature flags; cargo test -p yubaba --features containerd-integration --test containerd -- integration_mesh:: still passes for the tests that remain there.")
+//! @yah:gotcha("The split_brain module (4 tests, R732-T5) drives two in-process YubabaState instances through real raft::apply and a real turso-backup BackupTarget over an in-memory object store — it never touches containerd or the Cluster/FakeRuntime harness. It is gated behind --features containerd-integration only because it lives in integration_mesh.rs alongside multi_node_mesh, which DOES need that feature. Default `cargo test -p yubaba` therefore never runs W253 §9's canonical proof — the exact 'passes vacuously' trap raft_tenant_placement.rs:22 documents R737-T5 hitting and fixing for the same reason.")
+//! @arch:see(oss/yubaba/crates/yubaba/tests/raft_tenant_placement.rs)
 
 use std::time::Duration;
 
