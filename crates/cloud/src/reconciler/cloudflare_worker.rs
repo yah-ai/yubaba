@@ -482,6 +482,7 @@ account_id = "test-account"
                 publishes: None,
                 wave: 0,
                 git: None,
+                deploy: Default::default(),
             };
             Self {
                 _workspace: workspace,

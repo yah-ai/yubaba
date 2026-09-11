@@ -78,6 +78,24 @@ runcmd:
   # The tarball contains: yubaba, kamaji, yubaba.service, kamaji.service,
   # yubaba.slice. cloud-init lays the binaries under /usr/local/bin and the units
   # under /etc/systemd/system/ before systemctl daemon-reload.
+  #
+  # R858-F17: turso-backup-hydrate and turso-backup-tail ship in the SAME
+  # tarball rather than a separate download — they are yah's own co-developed
+  # oss/turso-backup, not a third-party release like litestream/headscale
+  # below, so they version-lockstep with kamaji the same way kamaji itself
+  # does with yubaba. scripts/publish-yubaba-release.sh builds + packages +
+  # version-gates them the same way it already does kamaji (-p turso-backup,
+  # oss/turso-backup, one invocation per --bin since both live in one
+  # package), so every tarball this template fetches carries them from here
+  # on. SEQUENCING HAZARD, still live: the moment ANY workload spec declares
+  # a `yah.durability.tier`, kamaji REFUSES to deploy it on a node whose
+  # kamaji has neither helper configured (kamaji-bin/src/hydrate.rs:170-178,
+  # src/tail.rs). A release carrying these binaries + the env vars below MUST
+  # reach every candidate node BEFORE the release that adds the declaration
+  # to headscale's WorkloadSpec, or the first roll of the second refuses to
+  # deploy the coordinator. The cp/chmod steps below stay present-checked and
+  # non-fatal regardless — an OLDER tarball (cut before this landed) must
+  # still provision cleanly, just without the helpers.
   - curl -fsSL -o /tmp/yah-yubaba.tar.gz {{YAH_YUBABA_URL}}
   # cosign verify-blob — primary trust gate when yubaba_cosign_identity_regexp is
   # set (R330-F19/F20). sha256 line below stays as a redundant integrity check.
@@ -86,7 +104,23 @@ runcmd:
   - tar -xzf /tmp/yah-yubaba.tar.gz -C /tmp
   - sh -c 'cp /tmp/yubaba-*/yubaba /usr/local/bin/yubaba'
   - sh -c 'cp /tmp/yubaba-*/kamaji /usr/local/bin/kamaji'
+  # Double-quoted, not bare: these two carry a `: ` inside their echo, and a
+  # colon-space in a BARE YAML scalar makes the whole runcmd entry parse as a
+  # mapping — cloud-init then skips it silently and the helpers never land.
+  # `rendered_runcmd_entries_are_all_strings` (cloud_init.rs) is the gate;
+  # it went red when these were added.
+  - "sh -c '[ -f /tmp/yubaba-*/turso-backup-hydrate ] && cp /tmp/yubaba-*/turso-backup-hydrate /usr/local/bin/turso-backup-hydrate || echo \"turso-backup-hydrate: absent from this tarball, durability-declaring workloads will refuse to deploy (R858-F17)\" >&2'"
+  - "sh -c '[ -f /tmp/yubaba-*/turso-backup-tail ] && cp /tmp/yubaba-*/turso-backup-tail /usr/local/bin/turso-backup-tail || echo \"turso-backup-tail: absent from this tarball, durability-declaring workloads will refuse to deploy (R858-F17)\" >&2'"
   - chmod +x /usr/local/bin/yubaba /usr/local/bin/kamaji
+  - sh -c '[ -f /usr/local/bin/turso-backup-hydrate ] && chmod +x /usr/local/bin/turso-backup-hydrate; [ -f /usr/local/bin/turso-backup-tail ] && chmod +x /usr/local/bin/turso-backup-tail; true'
+  # KAMAJI_HYDRATE_HELPER / KAMAJI_TAIL_HELPER, as Environment= in a drop-in,
+  # never as ExecStart= flags — see kamaji.service's own warning: a drop-in
+  # that redeclares ExecStart= silently drops every flag added after it
+  # (measured on us-south-001, half of the 2026-09-03 outage). Both are
+  # no-ops until a workload actually declares a durability tier, so this is
+  # safe to lay down on every node before headscale's declaration ships.
+  - mkdir -p /etc/systemd/system/kamaji.service.d
+  - sh -c '[ -f /usr/local/bin/turso-backup-hydrate ] && [ -f /usr/local/bin/turso-backup-tail ] && printf "[Service]\nEnvironment=KAMAJI_HYDRATE_HELPER=/usr/local/bin/turso-backup-hydrate\nEnvironment=KAMAJI_TAIL_HELPER=/usr/local/bin/turso-backup-tail\n" > /etc/systemd/system/kamaji.service.d/50-durability-helpers.conf || true'
   - sh -c 'cp /tmp/yubaba-*/yubaba.slice /etc/systemd/system/yubaba.slice'
   - sh -c 'cp /tmp/yubaba-*/kamaji.service /etc/systemd/system/kamaji.service'
   - sh -c 'cp /tmp/yubaba-*/yubaba.service /etc/systemd/system/yubaba.service'

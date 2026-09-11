@@ -383,6 +383,17 @@ pub const REASON_UNROUTABLE: &str = "unroutable";
 /// - **`yah.docker.publish`** — the docker backend maps host ports onto the
 ///   container's (`docker run -p`). Only that backend publishes host ports at
 ///   all; the annotation is the operator's explicit request for it.
+/// - **`yah.exec = native`** ([`WorkloadSpec::wants_native_exec`]) — kamaji
+///   fork+execs the binary on the node's own userland. It has no namespace of
+///   any kind, so it binds the node's ports by construction; this is the most
+///   node-bound shape there is, not an exception to it. **Added by R881-T4 as a
+///   fix, not an extension** — see the note below.
+///
+/// `yah.exec = microvm` is deliberately NOT here. A guest gets a TAP with a
+/// link-local `/30` and a MASQUERADE for egress (`kamaji::microvm::net`), which
+/// is outbound only: there is no DNAT and nothing on the node's address routes
+/// to the guest. A microVM workload publishing a node-address record would be
+/// the same lie in a different backend.
 ///
 /// Anything else gets a fresh, empty netns with nothing but `lo`
 /// (`kamaji-containerd-core`'s OCI builder emits a bare `{"type":"network"}`
@@ -398,8 +409,45 @@ pub const REASON_UNROUTABLE: &str = "unroutable";
 /// that does not run. If it ever becomes live, a container joining a
 /// *host-networked* sibling's netns belongs on the `true` side of this
 /// predicate and one joining an isolated sibling does not.
+///
+/// **R881-T4 fixed a live regression here rather than merely widening the
+/// predicate.** R881-B1 wrote this reasoning against the CONTAINER backends and
+/// applied the answer to every workload, so the native fork+exec tier fell
+/// through to `false` — and the headscale appliance is native
+/// (`headscale_appliance::appliance_spec` sets only `NATIVE_EXEC_ANNOTATION`)
+/// and is upserted straight from `leader.rs`. Between B1 landing and this fix,
+/// every yubaba published the mesh coordinator's own service record as
+/// `NotReady { reason: "unroutable" }`, which is exactly backwards: a forked
+/// host process binds the node's address and nothing else. The class of mistake
+/// is worth more than the instance — "isolated netns" was inferred from the
+/// containerd path and then asserted about a tier that has no netns at all.
+///
+/// This predicate answers only "does it bind in the NODE's namespace". A
+/// workload with its own allocated container address is routable too and is
+/// **not** covered here — that is the second branch of
+/// `ServerState::workload_bind_ip`, and the two are kept apart on purpose,
+/// because one is a property of the spec and the other is a property of the
+/// node's configuration.
+///
+/// @yah:ticket(R881-T4, "yubaba: allocate a per-workload container address instead of handing every workload the node's own, and widen the routable predicate to match")
+/// @yah:phase(P1)
+/// @yah:status(review)
+/// @yah:at(2026-09-10T03:11:45Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R881)
+/// @yah:next("READ W343 FIRST. Steps 4-5 of its \"What changes, in deploy order\" are this ticket.")
+/// @arch:see(.yah/docs/working/W343-per-workload-mesh-addressing.md)
+/// @yah:depends_on(R881-T3)
+/// @yah:handoff("LANDED. A tenant workload now gets an address of its own instead of none. `ServerState::workload_bind_ip` gains a second branch: a spec that does not bind the node's ports gets the lowest free index in this node's /24, derived from the node's mesh address by the one shared function R881-T3 put in `kamaji::container_net`. New `--container-net CIDR` on yubaba, matching kamaji's; a malformed range fails startup rather than degrading to \"no container networking\", because an operator who passed the flag asked for reachable workloads.")
+/// @yah:handoff("THERE IS NO ALLOCATOR, AND THAT IS THE DESIGN. The taken set and a workload's existing address are read straight off the live `ServiceRecords` (`addresses()` / `address_of()`, both new). That buys three properties for free rather than by machinery: a redeploy keeps its address (the record already holds it), a yubaba restart keeps it (the ledger already persists `mesh_ip`), and there is no second source of truth to drift — which is precisely what R844-B11 was, and the lesson this relay keeps re-learning. Lowest free index wins, so a node that churns workloads reuses addresses rather than walking to .254 and refusing to place anything. Exhaustion returns None (unroutable, visibly) rather than wrapping onto an address a live neighbour holds. One subtlety the tests caught: `retract` does not remove a record, it marks it `Retracted`, so \"taken\" had to mean LIVE records — the same line `save_ledger` already drew — and BOTH `addresses()` and `address_of()` had to draw it, or a workload redeployed after retraction would reclaim an index already handed out.")
+/// @yah:handoff("TWO LIVE DEFECTS FOUND WHILE BUILDING THIS, BOTH FIXED HERE, BOTH OUTSIDE THE TICKET TITLE. (1) THE HEADSCALE APPLIANCE'S SERVICE RECORD HAS BEEN PUBLISHED UNROUTABLE SINCE R881-B1 LANDED. `binds_node_ports` was `wants_host_network() || yah.docker.publish`, reasoned about the CONTAINER backends (\"anything else gets a fresh, empty netns\") and applied to every workload — but `headscale_appliance::appliance_spec` sets only NATIVE_EXEC_ANNOTATION, needs no host-network annotation because a forked host process has no namespace at all, and `leader.rs` upserts its record directly. So the mesh coordinator, the single most node-bound workload in the fleet, was reading `NotReady { reason: \"unroutable\" }`. Fixed by adding `wants_native_exec()` to the predicate; pinned by `a_native_fork_exec_workload_is_routable_because_it_has_no_namespace`. `yah.exec = microvm` is deliberately NOT added — a guest gets a link-local /30 and MASQUERADE, which is egress only, and `a_microvm_workload_is_not_routable_at_the_nodes_address` pins that judgement so the fix is not later read as \"every non-container backend is routable\". (2) THE 15s SWEEP WOULD HAVE TAKEN EVERY ALLOCATED ADDRESS BACK. `authoritative_mesh_ip` re-asserts the NODE's address on every refresh (R844-B11 / R876-B3), so an allocated 10.128.x.y survived the deploy and was overwritten seconds later, with a warn! blaming a stale container label — allocation works, then silently stops, and the log points at the wrong thing. New `refreshed_mesh_ip` preserves any address OUTSIDE headscale's node pool and defers to the old behaviour for anything inside it, which keeps R876-B3 intact (a stale label still cannot move a record onto a neighbour) and keeps records correct across a node being re-addressed, which has happened in this fleet. Both halves pinned, the second by an explicit non-vacuity anchor.")
+/// @yah:handoff("SIGNATURE CHANGE, pre-1.0 house style rather than a shim. `ServiceRecords::upsert_deployed` now takes `mesh_ip: Option<Ipv4Addr>` and `routable` IS `mesh_ip.is_some()`. R881-B1 computed `binds_node_ports(spec)` inside that function, independently of the address its caller had already derived from the same predicate — two readings of one fact, correct only while they agreed. A workload with its own allocated address broke that: the caller had an address and the callee said \"not routable\". Passing the Option the caller already holds removes the second reading instead of teaching it the new case. Three production call sites updated (lib.rs container deploy, two in leader.rs); 43 test call sites route through a new `#[cfg(test)] upsert_deployed_at` helper that applies the production predicate, so a test asserting `routable` asserts the PREDICATE rather than a boolean someone typed next to a spec. W343 §\"What changes, in deploy order\" step 5 was rewritten to describe what shipped — the doc had predicted the predicate would be renamed, and it was not: `binds_node_ports` keeps its narrow, still-correct question and the third routable case lives in `workload_bind_ip`.")
+/// @yah:verify("FULL RADIUS, every exit code echoed rather than inferred. `cargo test -p yubaba --lib` = 952 passed / 0 failed, exit 0 (baseline 949 before this ticket's tests; +6 new here, and the run that caught both discovered defects). `cargo test -p yubaba --features testing --test testing` = 30 passed / 0 failed / 1 ignored, exit 0. `cargo test -p yah-cloud --lib` = 1137 passed / 0 failed / 4 ignored, exit 0 — the consumer of the records this changes. `cargo test --workspace --all-features` in oss/kamaji = exit 0, 19 test-result lines all ok, zero failures (kamaji lib 303, kamaji-bin lib 205). `cargo check --workspace --all-targets` from the REPO ROOT = ROOT_CHECK_EXIT 0, the run that sees past the oss/ workspace boundaries a [patch.crates-io] bridge hides.")
+/// @yah:gotcha("THE TWO --container-net FLAGS MUST MATCH AND NOTHING CHECKS THAT. yubaba allocates out of its range; kamaji recovers the /24 from the address it is handed and wires a namespace. They never exchange the value. A mismatch does not error anywhere — kamaji simply declines to wire an address outside its own range, and every tenant workload on that node is quietly unreachable again, which is R881 restored. Set both from ONE systemd drop-in when R881-T5 rolls this. A node given neither flag is unchanged and correct: isolated workloads get no address and their records say `unroutable`, exactly as R881-B1 left them.")
+/// @yah:assumes("NOTHING RAN AGAINST A LIVE NODE, and the headscale finding is a READ of the code path, not an observation of the fleet. I did not curl a live yubaba's GET /service-records to confirm the appliance's record currently reads `unroutable` — the chain is established by reading `appliance_spec` (only NATIVE_EXEC_ANNOTATION), `binds_node_ports` (false for that spec), and `upsert_deployed` (pins health on it), plus the two `leader.rs` call sites. Worth ONE curl against us-west-001 before the roll, because if the live record does read unroutable then something downstream has been quietly degraded since R881-B1 shipped, and knowing for how long is worth more than the curl costs. It also tells you whether R881-B1 has actually reached a node yet, which I did not establish either way.")
 pub fn binds_node_ports(spec: &WorkloadSpec) -> bool {
     spec.wants_host_network()
+        || spec.wants_native_exec()
         || spec
             .annotations
             .contains_key(crate::pond::launcher::PUBLISH_ANNOTATION)
@@ -855,6 +903,73 @@ impl ServiceRecords {
         self.tx.borrow().get(ident.0.as_str()).cloned()
     }
 
+    /// Test shorthand for [`Self::upsert_deployed`] with the address the
+    /// production deploy path would have derived (R881-T4).
+    ///
+    /// `ServerState::workload_bind_ip` returns `Some` exactly when the spec
+    /// binds in the node's own namespace, so routing every test call site
+    /// through the same predicate means a test asserting `routable` is
+    /// asserting the *predicate*, not a boolean someone typed beside a spec —
+    /// and a change to the predicate moves the tests with it instead of leaving
+    /// them agreeing with a stale hand-written answer.
+    ///
+    /// A test that wants the unroutable path deliberately calls
+    /// `upsert_deployed(spec, None, …)` directly.
+    #[cfg(test)]
+    pub(crate) fn upsert_deployed_at(
+        &self,
+        spec: &WorkloadSpec,
+        mesh_ip: Ipv4Addr,
+        container_id: impl Into<String>,
+    ) {
+        self.upsert_deployed(spec, binds_node_ports(spec).then_some(mesh_ip), container_id)
+    }
+
+    /// The address one workload currently holds, if it holds one (R881-T4).
+    ///
+    /// This is what makes a container's address survive a redeploy without a
+    /// separate allocator: `ServerState::allocate_container_address` asks here
+    /// first, so an ident that already has a record keeps its address, and the
+    /// records are already persisted through the ledger.
+    ///
+    /// A [`Health::Retracted`] record holds nothing — see [`Self::addresses`].
+    /// The two must agree on that, or a workload redeployed after a retraction
+    /// would reclaim an index [`Self::addresses`] had already handed out.
+    pub fn address_of(&self, ident: &MeshIdent) -> Option<Ipv4Addr> {
+        self.tx
+            .borrow()
+            .get(ident.0.as_str())
+            .filter(|r| r.health != Health::Retracted)
+            .map(|r| r.mesh_ip)
+    }
+
+    /// Every address currently held by a live record — the "taken" set an
+    /// allocation must avoid (R881-T4).
+    ///
+    /// Retracted records are excluded, on exactly the reasoning [`save_ledger`]
+    /// drops them for: the workload is gone, and `retract` also drops its
+    /// cold-admission eligibility, so no sweep resurrects it
+    /// (`retraction_also_drops_cold_admission_eligibility`). Holding its address
+    /// would mean a node that churns workloads walks to `.254` and then refuses
+    /// to place anything, with 253 addresses spoken for by workloads that do
+    /// not exist.
+    ///
+    /// Deliberately unfiltered by subnet or by routability, though. A record
+    /// pinned to loopback or carrying the node's own address contributes an
+    /// address the caller's candidate range will never contain anyway, and
+    /// filtering on that here would give this method an opinion about which
+    /// addresses matter — the caller's question, not this type's.
+    ///
+    /// [`save_ledger`]: Self::save_ledger
+    pub fn addresses(&self) -> std::collections::BTreeSet<Ipv4Addr> {
+        self.tx
+            .borrow()
+            .values()
+            .filter(|r| r.health != Health::Retracted)
+            .map(|r| r.mesh_ip)
+            .collect()
+    }
+
     /// All currently-ready records — the shape an ingress proxy's
     /// upstream-selection loop actually wants.
     pub fn ready(&self) -> Vec<ServiceRecord> {
@@ -932,16 +1047,28 @@ impl ServiceRecords {
     pub fn upsert_deployed(
         &self,
         spec: &WorkloadSpec,
-        mesh_ip: Ipv4Addr,
+        mesh_ip: Option<Ipv4Addr>,
         container_id: impl Into<String>,
     ) {
         let ident = spec.expose.mesh.identity.clone();
         // R844-F2: the caller only reaches here for a spec with non-empty
         // `expose.mesh.ports`, so arriving at all IS the serving declaration.
         self.declare_serving(&ident);
-        // R881-B1: this is the one moment the spec is in hand, so it is the
-        // one moment the netns shape can be read. See `binds_node_ports`.
-        let routable = binds_node_ports(spec);
+        // R881-T4: routability IS the address, so the two cannot disagree.
+        //
+        // R881-B1 computed `binds_node_ports(spec)` here, independently of the
+        // `mesh_ip` its caller had already derived from the same predicate —
+        // two readings of one fact, correct only while they stayed in step. The
+        // moment a third routable shape appeared (a workload with its own
+        // allocated container address, this ticket) they stopped agreeing: the
+        // caller had an address and this said "not routable". Passing the
+        // `Option` the caller already holds removes the second reading rather
+        // than teaching it the new case.
+        let routable = mesh_ip.is_some();
+        // Loopback for the unroutable case: it is what a container alone in its
+        // namespace actually has, and it is visibly undialable from another
+        // node rather than plausibly dialable like a node address.
+        let mesh_ip = mesh_ip.unwrap_or(Ipv4Addr::LOCALHOST);
         if !routable {
             tracing::warn!(
                 ident = %ident.0,
@@ -955,8 +1082,10 @@ impl ServiceRecords {
                  '{REASON_UNROUTABLE}'): it stays visible on GET \
                  /service-records for diagnosis and is withheld from \
                  ?ready=true, so an ingress apply fails to resolve an upstream \
-                 instead of rendering one nothing answers on (R881-B1). Giving \
-                 a tenant-tier workload a reachable address is R881-S2."
+                 instead of rendering one nothing answers on (R881-B1). To give \
+                 this workload an address of its own, start yubaba AND its \
+                 kamaji with the same --container-net range (R881-T4 / W343); \
+                 it is off on a node that was given none."
             );
         }
         let record = ServiceRecord {
@@ -1155,7 +1284,7 @@ impl ServiceRecords {
                 {
                     let record = next.get_mut(key).expect("checked above");
                     seen.insert(key.to_string());
-                    if let Some(ip) = authoritative_mesh_ip(state, node_mesh_ip) {
+                    if let Some(ip) = refreshed_mesh_ip(record, state, node_mesh_ip) {
                         record.mesh_ip = ip;
                     }
                     // Only overwrite from a supervisor that actually reported
@@ -1318,6 +1447,47 @@ fn health_for(routable: bool, observed: Health) -> Health {
 /// yubaba keeps reporting that process's deleted `alloc_mesh_ip()` counter
 /// draw until it is redeployed — which is exactly the live record above. This
 /// check is what repairs those in place, with no redeploy.
+/// The address a **refresh** sweep should leave on an existing record
+/// (R881-T4).
+///
+/// [`authoritative_mesh_ip`] re-asserts the node's own address on every sweep,
+/// which was right while the node's address was the only honest one a record
+/// could carry. It is not right for a workload holding its own container
+/// address (W343): that address would be overwritten roughly 15 seconds after
+/// the deploy that allocated it, with a `warn!` blaming a stale container
+/// label — the allocation would work and then silently stop working, which is
+/// the hardest possible shape of this bug to find.
+///
+/// The split is on the address the record already carries, not on a
+/// configuration this type would then have to be told about:
+///
+/// - **Inside headscale's node pool** ([`MESH_NODE_POOL`]) — a node address, so
+///   `authoritative_mesh_ip` re-asserts it exactly as before. This keeps
+///   R876-B3 intact (a stale `yah.mesh_ip` label cannot move a record onto a
+///   neighbour) *and* keeps a record correct across a node being re-addressed,
+///   which has happened in this fleet.
+/// - **Anywhere else** — yubaba allocated it deliberately at admission, the one
+///   moment the `WorkloadSpec` was in hand. A supervisor's label does not get
+///   to overrule that, and neither does the node's own address.
+///
+/// The cold-admit arm deliberately does not use this: there is no prior record,
+/// so there is no deliberate allocation to preserve, and the node's address is
+/// the right answer for the bundle/native tier that arm exists for.
+///
+/// [`MESH_NODE_POOL`]: kamaji::container_net::MESH_NODE_POOL
+fn refreshed_mesh_ip(
+    record: &ServiceRecord,
+    state: &WorkloadState,
+    node_mesh_ip: Option<Ipv4Addr>,
+) -> Option<Ipv4Addr> {
+    let node_pool = kamaji::container_net::Ipv4Cidr::parse(kamaji::container_net::MESH_NODE_POOL)
+        .expect("MESH_NODE_POOL is a valid CIDR");
+    if !node_pool.contains(record.mesh_ip) && record.mesh_ip != Ipv4Addr::LOCALHOST {
+        return Some(record.mesh_ip);
+    }
+    authoritative_mesh_ip(state, node_mesh_ip)
+}
+
 fn authoritative_mesh_ip(
     state: &WorkloadState,
     node_mesh_ip: Option<Ipv4Addr>,
@@ -1749,6 +1919,7 @@ mod tests {
             },
             labels: Default::default(),
             annotations: Default::default(),
+            files: Vec::new(),
         }
     }
 
@@ -1856,7 +2027,7 @@ mod tests {
         let spec = test_spec("api", vec![8080]);
         let ip = Ipv4Addr::new(100, 64, 0, 5);
 
-        records.upsert_deployed(&spec, ip, "container-abc");
+        records.upsert_deployed_at(&spec, ip, "container-abc");
 
         let record = records
             .get(&MeshIdent("api".into()))
@@ -1879,7 +2050,7 @@ mod tests {
         let spec = test_spec("multi", vec![8080, 9090]);
         let ip = Ipv4Addr::new(100, 64, 0, 6);
 
-        records.upsert_deployed(&spec, ip, "container-multi");
+        records.upsert_deployed_at(&spec, ip, "container-multi");
 
         let record = records.get(&MeshIdent("multi".into())).unwrap();
         assert_eq!(
@@ -2288,7 +2459,7 @@ mod tests {
         let records = ServiceRecords::new();
         let node_ip = Ipv4Addr::new(100, 64, 0, 3);
 
-        records.upsert_deployed(&test_spec("api", vec![9090]), Ipv4Addr::new(100, 64, 0, 7), "c1");
+        records.upsert_deployed_at(&test_spec("api", vec![9090]), Ipv4Addr::new(100, 64, 0, 7), "c1");
         records.admit_bundle(&MeshIdent("yah-marketing".into()), Some(node_ip), Some(8080));
 
         let mut idents: Vec<String> = records.ready().into_iter().map(|r| r.ident.0).collect();
@@ -2301,7 +2472,7 @@ mod tests {
         let records = ServiceRecords::new();
         let spec = test_spec("gone", vec![8080]);
         let ip = Ipv4Addr::new(100, 64, 0, 7);
-        records.upsert_deployed(&spec, ip, "container-gone");
+        records.upsert_deployed_at(&spec, ip, "container-gone");
         assert!(records.get(&MeshIdent("gone".into())).unwrap().is_ready());
 
         // Torn down: the runtime's own list_workloads() no longer includes
@@ -2322,7 +2493,7 @@ mod tests {
         let records = ServiceRecords::new();
         let spec = test_spec("stopping", vec![8080]);
         let ip = Ipv4Addr::new(100, 64, 0, 8);
-        records.upsert_deployed(&spec, ip, "container-stopping");
+        records.upsert_deployed_at(&spec, ip, "container-stopping");
 
         let stopped = WorkloadState {
             ident: MeshIdent("stopping".into()),
@@ -2352,7 +2523,7 @@ mod tests {
         let records = ServiceRecords::new();
         let spec = test_spec("moved", vec![443]);
         let node = sweep_node_ip().expect("the sweep supplies a node address");
-        records.upsert_deployed(&spec, node, "container-moved");
+        records.upsert_deployed_at(&spec, node, "container-moved");
 
         let state = running_state("moved", Some(node));
         records.reconcile(std::slice::from_ref(&state), sweep_node_ip());
@@ -2376,7 +2547,7 @@ mod tests {
     fn reconcile_leaves_an_agreeing_mesh_ip_alone_and_says_nothing() {
         let records = ServiceRecords::new();
         let node = Ipv4Addr::new(100, 64, 0, 1);
-        records.upsert_deployed(&test_spec("yah-cloud-admin", vec![4325]), node, "c-admin");
+        records.upsert_deployed_at(&test_spec("yah-cloud-admin", vec![4325]), node, "c-admin");
 
         let logs = capture_warnings(|| {
             records.reconcile(&[running_state("yah-cloud-admin", Some(node))], Some(node));
@@ -2413,7 +2584,7 @@ mod tests {
         let records = ServiceRecords::new();
         let node = Ipv4Addr::new(100, 64, 0, 1);
         let neighbour = Ipv4Addr::new(100, 64, 0, 3);
-        records.upsert_deployed(&test_spec("yah-cloud-admin", vec![4325]), node, "c-admin");
+        records.upsert_deployed_at(&test_spec("yah-cloud-admin", vec![4325]), node, "c-admin");
 
         let logs = capture_warnings(|| {
             records.reconcile(
@@ -2493,7 +2664,7 @@ mod tests {
     fn explicit_retract_marks_not_ready_idempotently() {
         let records = ServiceRecords::new();
         let spec = test_spec("explicit", vec![8080]);
-        records.upsert_deployed(&spec, Ipv4Addr::new(100, 64, 0, 12), "c1");
+        records.upsert_deployed_at(&spec, Ipv4Addr::new(100, 64, 0, 12), "c1");
 
         let ident = MeshIdent("explicit".into());
         records.retract(&ident);
@@ -2512,7 +2683,7 @@ mod tests {
         let mut rx = records.subscribe();
 
         let spec = test_spec("pushed", vec![8080]);
-        records.upsert_deployed(&spec, Ipv4Addr::new(100, 64, 0, 13), "c-pushed");
+        records.upsert_deployed_at(&spec, Ipv4Addr::new(100, 64, 0, 13), "c-pushed");
 
         rx.changed().await.expect("sender still alive");
         let snap = rx.borrow_and_update();
@@ -2526,7 +2697,7 @@ mod tests {
     async fn subscriber_is_notified_on_retraction() {
         let records = ServiceRecords::new();
         let spec = test_spec("watched", vec![8080]);
-        records.upsert_deployed(&spec, Ipv4Addr::new(100, 64, 0, 14), "c-watched");
+        records.upsert_deployed_at(&spec, Ipv4Addr::new(100, 64, 0, 14), "c-watched");
 
         let mut rx = records.subscribe();
         // Baseline: mark the current value seen so the next `changed()`
@@ -2543,12 +2714,12 @@ mod tests {
     #[test]
     fn ready_filters_to_only_ready_records() {
         let records = ServiceRecords::new();
-        records.upsert_deployed(
+        records.upsert_deployed_at(
             &test_spec("healthy", vec![80]),
             Ipv4Addr::new(100, 64, 0, 15),
             "c-healthy",
         );
-        records.upsert_deployed(
+        records.upsert_deployed_at(
             &test_spec("sick", vec![80]),
             Ipv4Addr::new(100, 64, 0, 16),
             "c-sick",
@@ -2566,7 +2737,7 @@ mod tests {
     fn wire_projection_carries_everything_needed_to_dial() {
         let records = ServiceRecords::new();
         let ip = Ipv4Addr::new(100, 64, 0, 20);
-        records.upsert_deployed(&test_spec("api", vec![8080, 9090]), ip, "c-api");
+        records.upsert_deployed_at(&test_spec("api", vec![8080, 9090]), ip, "c-api");
 
         let body = discovery_body(&records.snapshot(), false);
         assert_eq!(body.version, WIRE_VERSION);
@@ -2733,7 +2904,7 @@ mod tests {
     fn an_anonymous_declaration_is_named_the_same_way_every_tier_names_it() {
         let records = ServiceRecords::new();
         let ip = Ipv4Addr::new(100, 64, 0, 5);
-        records.upsert_deployed(&test_spec("api", vec![8080, 9090]), ip, "c-api");
+        records.upsert_deployed_at(&test_spec("api", vec![8080, 9090]), ip, "c-api");
 
         let record = records.get(&MeshIdent("api".into())).unwrap();
         assert_eq!(record.ports, name_anonymous_ports(&[8080, 9090]));
@@ -2753,7 +2924,7 @@ mod tests {
         // The single-port case has nothing to be ambiguous about, so it does
         // get the name — that is the whole asymmetry.
         let solo = ServiceRecords::new();
-        solo.upsert_deployed(&test_spec("solo", vec![8080]), ip, "c-solo");
+        solo.upsert_deployed_at(&test_spec("solo", vec![8080]), ip, "c-solo");
         assert_eq!(
             solo.get(&MeshIdent("solo".into())).unwrap().port("http"),
             Some(8080)
@@ -2792,12 +2963,12 @@ mod tests {
     #[test]
     fn wire_ready_filter_matches_the_registrys_own_ready_view() {
         let records = ServiceRecords::new();
-        records.upsert_deployed(
+        records.upsert_deployed_at(
             &test_spec("healthy", vec![80]),
             Ipv4Addr::new(100, 64, 0, 21),
             "c-healthy",
         );
-        records.upsert_deployed(
+        records.upsert_deployed_at(
             &test_spec("sick", vec![80]),
             Ipv4Addr::new(100, 64, 0, 22),
             "c-sick",
@@ -2819,7 +2990,7 @@ mod tests {
     #[test]
     fn wire_not_ready_carries_the_machine_stable_reason() {
         let records = ServiceRecords::new();
-        records.upsert_deployed(
+        records.upsert_deployed_at(
             &test_spec("api", vec![80]),
             Ipv4Addr::new(100, 64, 0, 23),
             "c-api",
@@ -2843,7 +3014,7 @@ mod tests {
     #[test]
     fn wire_body_round_trips_through_json() {
         let records = ServiceRecords::new();
-        records.upsert_deployed(
+        records.upsert_deployed_at(
             &test_spec("api", vec![8080]),
             Ipv4Addr::new(100, 64, 0, 24),
             "c-api",
@@ -2865,7 +3036,7 @@ mod tests {
     fn wire_body_is_sorted_by_ident() {
         let records = ServiceRecords::new();
         for (i, name) in ["zeta", "alpha", "mid"].iter().enumerate() {
-            records.upsert_deployed(
+            records.upsert_deployed_at(
                 &test_spec(name, vec![80]),
                 Ipv4Addr::new(100, 64, 0, 30 + i as u8),
                 "c",
@@ -2892,7 +3063,7 @@ mod tests {
 
         {
             let records = ServiceRecords::with_ledger(ledger.clone());
-            records.upsert_deployed(&test_spec("api", vec![8080, 9090]), ip, "container-api");
+            records.upsert_deployed_at(&test_spec("api", vec![8080, 9090]), ip, "container-api");
         }
 
         // This is the whole point of the ticket: the port — which
@@ -2916,7 +3087,7 @@ mod tests {
         let ledger = tmp.path().join(LEDGER_FILE_NAME);
         {
             let records = ServiceRecords::with_ledger(ledger.clone());
-            records.upsert_deployed(
+            records.upsert_deployed_at(
                 &test_spec("api", vec![8080]),
                 Ipv4Addr::new(100, 64, 0, 21),
                 "c-api",
@@ -2950,7 +3121,7 @@ mod tests {
         let ip = sweep_node_ip().expect("the sweep supplies a node address");
         {
             let records = ServiceRecords::with_ledger(ledger.clone());
-            records.upsert_deployed(&test_spec("api", vec![8080]), ip, "c-api");
+            records.upsert_deployed_at(&test_spec("api", vec![8080]), ip, "c-api");
         }
 
         // The workload rode out the restart — the runtime still lists it.
@@ -2969,7 +3140,7 @@ mod tests {
         let ledger = tmp.path().join(LEDGER_FILE_NAME);
         {
             let records = ServiceRecords::with_ledger(ledger.clone());
-            records.upsert_deployed(
+            records.upsert_deployed_at(
                 &test_spec("ghost", vec![8080]),
                 Ipv4Addr::new(100, 64, 0, 23),
                 "c-ghost",
@@ -2995,12 +3166,12 @@ mod tests {
         let ledger = tmp.path().join(LEDGER_FILE_NAME);
         {
             let records = ServiceRecords::with_ledger(ledger.clone());
-            records.upsert_deployed(
+            records.upsert_deployed_at(
                 &test_spec("keep", vec![80]),
                 Ipv4Addr::new(100, 64, 0, 24),
                 "c-keep",
             );
-            records.upsert_deployed(
+            records.upsert_deployed_at(
                 &test_spec("destroyed", vec![80]),
                 Ipv4Addr::new(100, 64, 0, 25),
                 "c-destroyed",
@@ -3026,7 +3197,7 @@ mod tests {
         assert!(records.snapshot().is_empty());
         assert!(!ledger.exists(), "nothing to write yet");
 
-        records.upsert_deployed(
+        records.upsert_deployed_at(
             &test_spec("api", vec![8080]),
             Ipv4Addr::new(100, 64, 0, 26),
             "c-api",
@@ -3125,7 +3296,7 @@ mod tests {
         let records = ServiceRecords::new();
         assert!(records.ledger_path().is_none());
         // Must not panic or try to write anywhere.
-        records.upsert_deployed(
+        records.upsert_deployed_at(
             &test_spec("ephemeral", vec![80]),
             Ipv4Addr::new(100, 64, 0, 27),
             "c-eph",
@@ -3154,7 +3325,7 @@ mod tests {
         let ident = MeshIdent("noisetable-account".into());
 
         let warnings = capture_warnings(|| {
-            records.upsert_deployed(&isolated_spec("noisetable-account", vec![4332]), node, "c-nt")
+            records.upsert_deployed_at(&isolated_spec("noisetable-account", vec![4332]), node, "c-nt")
         });
 
         let record = records.get(&ident).expect(
@@ -3205,7 +3376,7 @@ mod tests {
         let ident = MeshIdent("noisetable-account".into());
 
         let warnings = capture_warnings(|| {
-            records.upsert_deployed(&test_spec("noisetable-account", vec![4332]), node, "c-nt")
+            records.upsert_deployed_at(&test_spec("noisetable-account", vec![4332]), node, "c-nt")
         });
 
         let record = records.get(&ident).expect("published");
@@ -3238,10 +3409,144 @@ mod tests {
         assert!(binds_node_ports(&spec));
 
         let records = ServiceRecords::new();
-        records.upsert_deployed(&spec, Ipv4Addr::new(100, 64, 0, 3), "c-minio");
+        records.upsert_deployed_at(&spec, Ipv4Addr::new(100, 64, 0, 3), "c-minio");
         assert_eq!(
             records.get(&MeshIdent("minio".into())).unwrap().health,
             Health::Ready
+        );
+    }
+
+    /// THE REGRESSION R881-T4 FOUND AND FIXED, and it was live: between
+    /// R881-B1 landing and this test existing, every yubaba published the
+    /// **headscale appliance's** record as `NotReady { reason: "unroutable" }`.
+    ///
+    /// `headscale_appliance::appliance_spec` sets only `NATIVE_EXEC_ANNOTATION`
+    /// — no host-network annotation, because a forked host process needs none —
+    /// and `leader.rs` upserts the record directly. B1's predicate reasoned
+    /// about the CONTAINER backends ("anything else gets a fresh, empty netns")
+    /// and applied the answer to a tier that has no netns at all. The mesh
+    /// coordinator is the single most node-bound workload in the fleet.
+    #[test]
+    fn a_native_fork_exec_workload_is_routable_because_it_has_no_namespace() {
+        let mut spec = isolated_spec("headscale", vec![8080]);
+        spec.annotations.insert(
+            workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+            workload_spec::NATIVE_EXEC_VALUE.to_string(),
+        );
+        assert!(
+            !spec.wants_host_network(),
+            "the whole trap: a native workload needs no host-network annotation"
+        );
+        assert!(binds_node_ports(&spec));
+
+        let node = Ipv4Addr::new(100, 64, 0, 1);
+        let records = ServiceRecords::new();
+        let warnings = capture_warnings(|| records.upsert_deployed_at(&spec, node, "headscale"));
+        let record = records.get(&MeshIdent("headscale".into())).expect("published");
+        assert!(record.routable);
+        assert_eq!(record.health, Health::Ready);
+        assert_eq!(record.endpoints(), vec![SocketAddrV4::new(node, 8080)]);
+        assert!(warnings.is_empty(), "nothing to warn about; got: {warnings}");
+    }
+
+    /// The other half of the same judgement, asserted so the fix above is not
+    /// mistaken for "every non-container backend is routable". A microVM guest
+    /// gets a link-local `/30` and a MASQUERADE — egress only. Nothing on the
+    /// node's address routes inbound to the guest, so a node-address record
+    /// would be the same lie in a different backend.
+    #[test]
+    fn a_microvm_workload_is_not_routable_at_the_nodes_address() {
+        let mut spec = isolated_spec("build-guest", vec![8080]);
+        spec.annotations.insert(
+            workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+            workload_spec::MICROVM_EXEC_VALUE.to_string(),
+        );
+        assert!(spec.wants_microvm());
+        assert!(!spec.wants_native_exec());
+        assert!(!binds_node_ports(&spec));
+    }
+
+    /// R881-T4 moved routability off the spec and onto the address the caller
+    /// derived, so a workload with its OWN allocated container address is
+    /// `Ready` at that address — even though `binds_node_ports` is false for it
+    /// and always will be. That is the whole shape of W343: the third routable
+    /// case is a property of the node's configuration, not of the spec.
+    #[test]
+    fn a_workload_with_its_own_container_address_is_ready_at_it() {
+        let spec = isolated_spec("noisetable-account", vec![4332]);
+        assert!(!binds_node_ports(&spec));
+
+        let own = Ipv4Addr::new(10, 128, 3, 7);
+        let records = ServiceRecords::new();
+        let warnings = capture_warnings(|| records.upsert_deployed(&spec, Some(own), "c-nt"));
+
+        let record = records
+            .get(&MeshIdent("noisetable-account".into()))
+            .expect("published");
+        assert!(record.routable);
+        assert_eq!(record.health, Health::Ready);
+        assert_eq!(record.endpoints(), vec![SocketAddrV4::new(own, 4332)]);
+        assert_eq!(records.ready().len(), 1);
+        assert!(warnings.is_empty(), "nothing to warn about; got: {warnings}");
+    }
+
+    /// THE SECOND LIVE HAZARD R881-T4 FOUND, and the one that would have made
+    /// the whole relay look like it worked. `authoritative_mesh_ip` re-asserts
+    /// the NODE's address on every 15s sweep (R844-B11 / R876-B3), so an
+    /// allocated container address survived the deploy and was overwritten
+    /// about fifteen seconds later — with a `warn!` blaming a stale container
+    /// label. Allocation works, then silently stops working, and the log points
+    /// at the wrong thing.
+    #[test]
+    fn a_sweep_does_not_overwrite_an_allocated_container_address() {
+        let spec = isolated_spec("noisetable-account", vec![4332]);
+        let own = Ipv4Addr::new(10, 128, 3, 7);
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+
+        let records = ServiceRecords::new();
+        records.upsert_deployed(&spec, Some(own), "c-nt");
+
+        // The container backend echoes back the address it was handed; the
+        // node's own address is what the sweep would otherwise impose.
+        records.reconcile(&[running_state("noisetable-account", Some(own))], Some(node));
+        let record = records.get(&MeshIdent("noisetable-account".into())).unwrap();
+        assert_eq!(record.mesh_ip, own, "the sweep took the address back");
+        assert_eq!(record.health, Health::Ready);
+        assert_eq!(record.endpoints(), vec![SocketAddrV4::new(own, 4332)]);
+
+        // Even when the backend reports nothing at all, which is what a
+        // container backend that lost its label does.
+        records.reconcile(&[running_state("noisetable-account", None)], Some(node));
+        assert_eq!(
+            records
+                .get(&MeshIdent("noisetable-account".into()))
+                .unwrap()
+                .mesh_ip,
+            own
+        );
+    }
+
+    /// Non-vacuity anchor for the test above, and R876-B3's own invariant
+    /// restated: a record on a NODE address still gets that address re-asserted
+    /// every sweep, so a stale `yah.mesh_ip` label naming a neighbour cannot
+    /// move it — and a node that gets re-addressed still corrects its records.
+    #[test]
+    fn a_sweep_still_re_asserts_the_node_address_on_a_node_addressed_record() {
+        let spec = isolated_spec("headscale", vec![8080]);
+        let old_node = Ipv4Addr::new(100, 64, 0, 6);
+        let new_node = Ipv4Addr::new(100, 64, 0, 8);
+
+        let records = ServiceRecords::new();
+        records.upsert_deployed(&spec, Some(old_node), "headscale");
+
+        // A neighbour's address arriving on a stale label loses to the node's.
+        records.reconcile(
+            &[running_state("headscale", Some(Ipv4Addr::new(100, 64, 0, 3)))],
+            Some(new_node),
+        );
+        assert_eq!(
+            records.get(&MeshIdent("headscale".into())).unwrap().mesh_ip,
+            new_node
         );
     }
 
@@ -3257,7 +3562,7 @@ mod tests {
         let ident = MeshIdent("noisetable-account".into());
 
         let before = ServiceRecords::with_ledger(path.clone());
-        before.upsert_deployed(&isolated_spec("noisetable-account", vec![4332]), node, "c-nt");
+        before.upsert_deployed_at(&isolated_spec("noisetable-account", vec![4332]), node, "c-nt");
 
         // A new process reading the ledger the old one wrote.
         let after = ServiceRecords::with_ledger(path);

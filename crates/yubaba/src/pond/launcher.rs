@@ -211,6 +211,7 @@ pub fn lower_run_spec(spec: &ContainerRunSpec) -> Result<WorkloadSpec> {
         },
         labels,
         annotations,
+        files: Vec::new(),
     })
 }
 

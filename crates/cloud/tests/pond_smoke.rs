@@ -170,6 +170,7 @@ async fn pond_spinup_budget() {
             git: None,
             publishes: None,
             wave: 0,
+            deploy: Default::default(),
         });
 
     let reconciler = MesofactStaticReconciler::new();

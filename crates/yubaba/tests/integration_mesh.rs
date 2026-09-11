@@ -53,6 +53,7 @@
 //! @yah:verify("cargo test -p yubaba --test main -- split_brain:: passes with no feature flags; cargo test -p yubaba --features containerd-integration --test containerd -- integration_mesh:: still passes for the tests that remain there.")
 //! @yah:gotcha("The split_brain module (4 tests, R732-T5) drives two in-process YubabaState instances through real raft::apply and a real turso-backup BackupTarget over an in-memory object store — it never touches containerd or the Cluster/FakeRuntime harness. It is gated behind --features containerd-integration only because it lives in integration_mesh.rs alongside multi_node_mesh, which DOES need that feature. Default `cargo test -p yubaba` therefore never runs W253 §9's canonical proof — the exact 'passes vacuously' trap raft_tenant_placement.rs:22 documents R737-T5 hitting and fixing for the same reason.")
 //! @arch:see(oss/yubaba/crates/yubaba/tests/raft_tenant_placement.rs)
+//! @yah:gotcha("COUNT CORRECTION from R869 P5 recon (@Ashguard:libra, 2026-09-09): this ticket's earlier gotcha says \"4 tests\" — the real number is 8, and all 8 are default-excluded, not 4. integration_mesh.rs carries `multi_node_mesh` at :137 (a `#[test_with_provider(local, smoke)]` that expands to TWO — `multi_node_mesh__local` and `multi_node_mesh__smoke`) plus SIX in `mod split_brain` (:359-952): the_old_master_is_fenced_after_the_partition_heals (:480), a_graceful_transfer_loses_no_acked_writes (:674), a_fenced_node_cannot_renew_its_lease (:725), the_streamer_only_tails_tenants_this_node_owns (:783), the_streamer_lease_renewal_body_deserializes_into_a_raft_request (:873), the_raft_write_reply_matches_what_the_streamer_parses (:906). The last two are plain `#[test]` wire-contract checks added after this ticket was filed — they need no containerd at all, so they are the cheapest ones to re-home first. `integration_mesh` is declared ONLY at tests/containerd.rs:10 (required-features = containerd-integration, Cargo.toml:213); tests/main.rs has no required-features and is where a default `cargo test -p yubaba` reaches. Sibling default-excluded roots worth folding into the same sweep: tests/integration_single_node.rs (same containerd root), tests/testing.rs (5 mods, required-features = testing) and tests/integration_smoke_filter.rs. R869 deliberately did NOT re-home these — its own proofs went into tests/raft_rebuild_fencing.rs and tests/rebuild_drill.rs under tests/main.rs instead — because re-homing another ticket's tests is T6's call, not R869's.")
 
 use std::time::Duration;
 
@@ -113,6 +114,7 @@ fn test_workload_spec(name: &str) -> WorkloadSpec {
         },
         labels: Default::default(),
         annotations: Default::default(),
+        files: Vec::new(),
     }
 }
 

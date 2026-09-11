@@ -197,7 +197,7 @@
 //! @yah:handoff("DETERMINISM VERIFIED (not assumed): two independent builds an hour apart produced byte-identical tars, sha256 e856a18d14146fd199040c2557881c38e7275a911e3f6c2076587e5acbb42d01. That validated pasting the recorded hashes into .yah/services/yah-cloud/components/rusty-v8-musl/workload.toml, closing R546-T3's code side.")
 //! @yah:handoff("TEST GAP (deliberate, not done): the reap guard is NOT unit-tested -- workload_spec::forge_produced::HOST_ROOT is a hardcoded absolute /var/lib path, so a test would touch the real host fs. Making HOST_ROOT injectable is the prerequisite; I did not refactor that unprompted.")
 //! @yah:handoff("FLEET NOT YET PROTECTED: us-west-002 still runs the hand-patched unit + a yubaba binary WITHOUT the reap guard. The repo fixes only reach it on the next cross-build+redeploy. Fine for now (the timeout fix removes the trigger; the guard is defense-in-depth), but a fresh node provisioned before that redeploy would still hit the EROFS mkdir failure.")
-//! @yah:next("DESTROY SEMANTICS BUG — ROOT-CAUSED under R823-B4 (2026-09-03), read that ticket before acting on the bullet above. The incoherence that note describes (\"reaps the produced dir but leaves the container running\") is not a semantics choice; it is a key mismatch. yubaba's Stop carries the workload's MESH ident (forge.&lt;uuid&gt;) while kamaji-bin's containerd backend NAMES the container from spec.name (forge-&lt;uuid&gt;, R590-B9), so teardown probed a container that never existed and returned Ok — destroy answered \"destroyed\" over a live container. Fixed in oss/kamaji/crates/kamaji-bin/src/containerd.rs by resolving the Stop key through the yah.mesh-ident label. Retire this bullet once R823-B4's live roll proves it on a node.")
+//! @yah:next("DESTROY SEMANTICS BUG — RETIRED 2026-09-10, PROVEN ON A NODE, AND THE PREVIOUS ROOT-CAUSE BULLET WAS WRONG. Your original note (\"a destroy that reaps the produced dir but leaves the container running is incoherent\") was a correct observation of a real bug, and it is now fixed and verified on us-west-003. But it was NOT the kamaji-bin key mismatch the 2026-09-03 bullet above claimed. That bullet's fix (resolve_container_key_with, resolving the Stop key via the yah.mesh-ident label) is correct code that destroy never reached: measured on PUBLISHED 0.8.36, which contains it, the destroy RPC still answered {\"status\":\"destroyed\"} over a RUNNING task and emitted no kamaji journal line at all. ACTUAL CAUSE: yubaba's destroy_workload was the last lifecycle verb still reaching for s.runtime directly instead of ServerState::active_backend(), so deploy ran in kamaji-bin (container named forge-<uuid> from spec.name) while destroy ran in yubaba's in-process containerd runtime (id derived from the mesh ident, forge.<uuid>) — a ROUTING split across two processes, not a naming bug inside one backend. Fixed in oss/yubaba/crates/yubaba/src/lib.rs; full evidence on R823-B4. Nothing further is owed on this bullet.")
 //!
 //! @yah:ticket(R624-T2, "yubaba serve(): retry the mesh-IP bind with backoff instead of hard-exiting into the systemd restart budget")
 //! @yah:status(review)
@@ -402,6 +402,7 @@
 //! @yah:gotcha("THE CONSUMER CANNOT WORK AROUND THIS, which is why it is filed here. noisetable-account.toml already declares everything the schema offers — [expose.mesh] identity/ports=[4332]/allow_from=[] and [expose.public] hostname/port=4332/tls. The only difference from this repo's own working yah-cloud-admin.toml is tier=\"infra\" (:63) and [annotations] \"yah.network\"=\"host\" (:132-133), and adding that annotation to a tenant workload makes the deploy FAIL at seam 2 rather than work. yah-cloud-admin.toml's own comment at :112-117 concedes the whole thing: \"yubaba's per-workload mesh addressing is still a stub... with no CNI or bridge plumbing behind it, so a container in its own netns has no address anyone can reach. Until that is real, an infra workload that must actually be reachable binds a host port.\" The consumer's remaining option was to flip its tier to \"infra\" to dodge the privilege gate, which its own CLAUDE.md forbids as a hack around a framework shortcoming. Hence this ticket instead.")
 //! @yah:assumes("The negative claims — no CNI, no port-publish, no portmap anywhere in the cloud deploy path — came from a recon session that had NEITHER Bash NOR Grep, and rest on kg symbol-index misses for publish_port/cni/port_map. They are corroborated by read, affirmative evidence (the workload_bind_ip doc comment, yah-cloud-admin.toml:112-117, and the read tier gate at containerd.rs:1159), which is why the diagnosis stands — but whoever takes this should run the free-text grep for `veth` / `iptables` / `CNI` under oss/yubaba and oss/kamaji as their FIRST action, since it is cheap here and was impossible there. One unread hit is flagged rather than dismissed: setup_veth_for_pid / VethNetns at app/yah/cli/src/camp.rs:6849-6923, believed to be the CLI's local camp sandbox rather than the cloud deploy path, NOT opened and NOT verified — if that is reusable plumbing it may shorten seam 1 considerably.")
 //! @yah:gotcha("DIAGNOSIS CONFIRMED BY GREP, WITH ONE CORRECTION THAT MATTERS TO R881-S2. R881-B1's courier ran the free-text searches the diagnosing session could not: there is NO CNI, portmap, publish_port or port_map anywhere in oss/yubaba or oss/kamaji, and the only iptables hits are kamaji/src/microvm.rs:1261-1283 (Firecracker guest MASQUERADE, not the containerd workload path). Independently corroborated by kamaji-containerd-core/src/lib.rs:48, which records a live 2026-07-11 probe finding only 127.0.0.1/::1 inside a deployed workload. THE CORRECTION: host networking is NOT the only reachable shape — the DOCKER backend publishes host ports via the `yah.docker.publish` annotation (docker.rs:150, used by pond/launcher.rs). So the seam-2 framing \"a tenant workload has no reachable option at all\" is true of the CONTAINERD path specifically, not of every backend. The new predicate service_records::binds_node_ports covers both shapes and treats everything else as unroutable; join_netns is excluded because both containerd deploy paths hard-code it to None.")
+//! @yah:gotcha("THE WORD \"TENANT\" IN THIS RELAY'S TITLE MISLABELS THE TRIGGERING CASE — operator correction, 2026-09-09, relayed from the noisetable camp by @Ashguard:hydra (session:66d5c145). noisetable is TRUSTED code, not a third-party tenant. What it actually wants is a NAMESPACE, so it is isolated from yah — and that is a DIFFERENT AXIS from trust. This matters beyond the label because yah's `tier` currently carries both axes at once: it is a trust classification, yet it also gates isolation-shaped capabilities — host networking at oss/kamaji/crates/kamaji-bin/src/containerd.rs:1159, and bind mounts (noisetable-account.toml's own volume note cites tier = \"infra\" as the requirement). So there is no vocabulary today for \"trusted, but namespaced\", and a workload in that position has to pick the closest wrong label. noisetable-account.toml keeps tier = \"tenant\" as the closest available fit rather than because it is right. THIS DOES NOT WEAKEN THE (A) DECISION — it strengthens it. Under (A) reachability does not key on tier at all: every workload gets its own address, so the trust label stops gating whether a service can be reached, which is exactly the conflation that made this a blocker. Option (B) would have deepened the conflation by making the trust label the thing you edit to get a network capability. THE GENERAL FIX the operator expects eventually is cgroups plus namespace isolation for most workloads, and they have explicitly called it LOW PRIORITY short-term — so this is recorded as vocabulary drift to fix when someone is next in `tier`'s neighbourhood, NOT as work to start off the back of this note.")
 //!
 //! @yah:ticket(R881-B1, "workload_bind_ip advertises the node address for a workload it cannot confirm is bound there, so a dead upstream ships as healthy")
 //! @yah:status(review)
@@ -1187,6 +1188,19 @@ pub struct ServerState {
     /// Both the counter and `alloc_mesh_ip` are gone; see
     /// [`Self::workload_bind_ip`] for what replaced them.
     node_mesh_ip: Option<std::net::Ipv4Addr>,
+    /// Container range this node's kamaji wires workloads into (R881-T4 /
+    /// W343), from `--container-net`. `Some` is what lets an isolated-netns
+    /// workload get an address of its own instead of no address at all.
+    ///
+    /// **Must match the `--container-net` its kamaji was started with.** The
+    /// two processes never exchange it: yubaba allocates an address out of this
+    /// range and kamaji recovers the `/24` from the address it is handed
+    /// ([`kamaji::container_net::ContainerNet::node_subnet`] is the one shared
+    /// derivation). A disagreement therefore does not error — kamaji simply
+    /// declines to wire an address outside its own range, and every tenant
+    /// workload on the node goes quietly back to being unreachable. Set both
+    /// from the same drop-in.
+    container_net: Option<kamaji::container_net::ContainerNet>,
 }
 
 /// Extract this node's own mesh address from a `--bind` argument (R599-F12).
@@ -1386,6 +1400,7 @@ impl ServerState {
             control_plane_planes: control_plane::Planes::default(),
             // Start at 100.64.0.1 (first usable in the CGNAT /10 pool).
             node_mesh_ip: None,
+            container_net: None,
         })
     }
 
@@ -1398,6 +1413,14 @@ impl ServerState {
     /// stored as `None` so kamaji keeps the pre-R599-F12 loopback bind.
     pub fn with_bind_addr(mut self, bind: &str) -> Self {
         self.node_mesh_ip = parse_node_mesh_ip(bind);
+        self
+    }
+
+    /// Give this node a container range to allocate workload addresses from
+    /// (R881-T4 / W343). Must be the same range its kamaji was started with —
+    /// see [`ServerState::container_net`].
+    pub fn with_container_net(mut self, net: kamaji::container_net::ContainerNet) -> Self {
+        self.container_net = Some(net);
         self
     }
 
@@ -1778,16 +1801,62 @@ impl ServerState {
     /// `nsenter` into it), it is published as a `NotReady { reason:
     /// "unroutable" }` record instead of a `Ready` one, and the front door
     /// therefore fails to resolve an upstream at apply time rather than
-    /// shipping a 503. Making a tenant workload genuinely reachable is a
-    /// separate architecture decision (R881-S2).
+    /// shipping a 503.
+    ///
+    /// R881-T4 — **an isolated-netns workload now has a third answer**, and it
+    /// is the one this whole relay was for: an address of its own, allocated
+    /// out of this node's container `/24` (W343). It is reached only when the
+    /// node was given a `--container-net`; without one there is no bridge to
+    /// hang a veth off and the honest answer is still `None`. The order of the
+    /// two branches matters and is not arbitrary — a host-networked workload
+    /// binds the *node's* ports whatever else is configured, so it must not be
+    /// handed a container address it would fail to bind.
     pub fn workload_bind_ip(
         &self,
         spec: &workload_spec::WorkloadSpec,
     ) -> Option<std::net::Ipv4Addr> {
-        if !crate::service_records::binds_node_ports(spec) {
-            return None;
+        if crate::service_records::binds_node_ports(spec) {
+            return Some(self.node_mesh_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST));
         }
-        Some(self.node_mesh_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST))
+        self.allocate_container_address(spec)
+    }
+
+    /// This workload's own address in the node's container `/24` (R881-T4).
+    ///
+    /// Stable across a redeploy **because it is read back off the live record
+    /// rather than remembered separately**. A workload that redeploys onto a
+    /// fresh address would leave every consumer that had resolved the old one
+    /// dialing a dead veth until the next sweep, and the record set is already
+    /// persisted (`ServiceRecords`' ledger carries `mesh_ip`), so it survives a
+    /// yubaba restart with no second thing to keep in sync. That is the whole
+    /// reason there is no allocator struct here: an allocator would be a
+    /// second source of truth for a fact the records already hold, and R844-B11
+    /// is the standing lesson about what a second source does.
+    ///
+    /// Lowest free index wins, so a node that churns workloads reuses addresses
+    /// rather than walking to `.254` and stopping. `None` when the node has no
+    /// container range, no mesh address of its own to derive the `/24` from, or
+    /// no free index left — all three of which leave the workload unroutable
+    /// and visibly so, rather than sharing an address with a live neighbour.
+    fn allocate_container_address(
+        &self,
+        spec: &workload_spec::WorkloadSpec,
+    ) -> Option<std::net::Ipv4Addr> {
+        let net = self.container_net.as_ref()?;
+        let node = self.node_mesh_ip?;
+        let subnet = net.node_subnet(node)?;
+
+        let ident = &spec.expose.mesh.identity;
+        if let Some(held) = self.service_records.address_of(ident) {
+            if subnet.contains(held) {
+                return Some(held);
+            }
+        }
+
+        let taken = self.service_records.addresses();
+        (2u8..=254)
+            .filter_map(|n| net.workload_address(node, n))
+            .find(|candidate| !taken.contains(candidate))
     }
 
     /// Attach an already-opened raft node to the server state.
@@ -2060,6 +2129,7 @@ impl ServerState {
 pub fn build_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/capabilities", get(get_capabilities))
         .route("/identity", get(get_identity))
         .route("/node", get(get_node))
         .route("/node/usage", get(get_node_usage))
@@ -2432,6 +2502,33 @@ async fn health(State(s): State<Arc<ServerState>>) -> Json<HealthBody> {
             .and_then(KamajiSibling::current)
             .map(|c| c.info().kamaji_version.clone()),
     })
+}
+
+/// `GET /capabilities` — this node's Kamaji backend capabilities (R605-T27):
+/// whether the microVM backend is attached and, if not, why; whether native
+/// fork+exec is available; and where. Deliberately its own route rather than
+/// a `/health` field — `/health` is meant to stay a fixed, cheap, always-fast
+/// body (see its own doc comment), and this reads live per-backend state that
+/// is neither of those (the microVM half is an un-cached `/dev/kvm` probe on
+/// every call, by design — see [`kamaji_proto::MicroVmHealth::kvm_ok`]).
+///
+/// [`kamaji_proto::NodeCapabilities`] already existed as the sibling-wire
+/// answer to this question (R858-T4's `native_exec`), but was reachable only
+/// in-process by the scheduler via [`kamaji::sibling::KamajiClient::capabilities`].
+/// This is the first HTTP route for it, so the same question is answerable
+/// remotely without shell access to the node — which is this ticket's whole
+/// point: today the only honest remote check that a node attached the
+/// microVM backend is the kamaji startup journal line.
+///
+/// `200` with `capabilities: null` when there's no sibling kamaji attached at
+/// all (in-process runtime fallback / single-node) or the request to it
+/// failed — there's nothing to report, not an error on this node's own part.
+async fn get_capabilities(State(s): State<Arc<ServerState>>) -> Json<serde_json::Value> {
+    let capabilities = match s.constable_client.as_ref().and_then(KamajiSibling::current) {
+        Some(client) => client.capabilities().await.ok(),
+        None => None,
+    };
+    Json(serde_json::json!({ "capabilities": capabilities }))
 }
 
 /// `GET /node` — this node's hardware specs, measured.
@@ -3825,18 +3922,23 @@ async fn deploy_workload_spec(
         // which made the third container deploy of any yubaba process advertise
         // `100.64.0.3` — us-east-001. See `ServerState::workload_bind_ip`.
         //
-        // R881-B1: `None` means the workload does not bind in this node's
-        // network namespace, so the node's address is not where it answers.
+        // R881-B1: `None` means there is no address that reaches this workload.
         // The backend still needs *some* address for the `yah.mesh_ip` label
         // and the container's own environment, and loopback is the honest one
         // for a container alone in its netns — it is what the container
         // actually has, and it is visibly undialable from another node rather
-        // than plausibly dialable like a node address. `upsert_deployed` reads
-        // the same predicate and publishes the record `NotReady`, so nothing
-        // downstream treats this value as an upstream.
+        // than plausibly dialable like a node address.
+        //
+        // R881-T4: this `Option` is now carried all the way to
+        // `upsert_deployed` instead of being re-derived there. On a node with
+        // `--container-net` the `Some` is the workload's OWN allocated address,
+        // and kamaji wires a namespace around exactly this value (R881-T3) — so
+        // it is no longer a label but the address on the container's `eth0`,
+        // and re-deriving routability from the spec alone downstream would now
+        // get it wrong.
+        let bind_ip = s.workload_bind_ip(&spec);
         let mesh = crate::mesh::MeshAssignment::stub(
-            s.workload_bind_ip(&spec)
-                .unwrap_or(std::net::Ipv4Addr::LOCALHOST),
+            bind_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST),
         );
         let mesh_ident = workload_spec::MeshIdent(ident.clone());
 
@@ -4430,8 +4532,14 @@ async fn deploy_workload_spec(
                 // without it the previous generation's record would linger and
                 // advertise a port this generation no longer serves.
                 if !spec.expose.mesh.ports.is_empty() {
+                    // R881-T4: `bind_ip`, not `result.mesh_ip`. The two agree in
+                    // value — the backend echoes back what it was handed — but
+                    // only `bind_ip` still carries whether the address means
+                    // anything, and `result.mesh_ip` is a bare `Ipv4Addr` that
+                    // has laundered the loopback fallback into something
+                    // indistinguishable from a real answer.
                     s.service_records
-                        .upsert_deployed(&spec, result.mesh_ip, &result.container_id);
+                        .upsert_deployed(&spec, bind_ip, &result.container_id);
                 } else {
                     s.service_records.retract(&mesh_ident);
                 }
@@ -4520,7 +4628,35 @@ async fn destroy_workload(
     let mut teardown_status = "destroyed";
     let mut teardown_error: Option<String> = None;
 
-    if let Some(rt) = &s.runtime {
+    // R823-B4: destroy resolves its backend through `active_backend()` — the
+    // same selector the deploy handler uses — instead of reaching for
+    // `s.runtime` directly. Destroy was the LAST lifecycle verb still on the
+    // legacy field: deploy routes through `active_backend()` (:3914),
+    // `GET /workloads`, `/state` and `/drain` each check `constable_client`
+    // first, and this handler alone did not.
+    //
+    // That is the whole defect behind "destroy answers destroyed and leaves the
+    // container running", and it is a ROUTING bug, not a naming one. Deploy ran
+    // in kamaji-bin, which names a container from `spec.name` — `forge-<uuid>`
+    // for a forge run, DNS-label safe, no dots. Destroy ran here, in yubaba's
+    // in-process containerd runtime, which derives the id from the MESH IDENT:
+    // `kcc::PodSlot::A.container_id(&ident.0)` is the bare ident and a forge
+    // workload's mesh identity is `forge.<uuid>` (R590-B9). Dot versus hyphen,
+    // across two processes. Teardown therefore probed a container that had
+    // never existed; every leg of that runtime's `teardown_container` treats
+    // `NotFound` as benign, so it returned `Ok(())` and this handler reported
+    // `"destroyed"` over a live task still holding its port.
+    //
+    // Measured on us-west-003 on published 0.8.36 — the release that already
+    // carries the earlier kamaji-bin fix (`resolve_container_key_with`). The
+    // destroy RPC emitted NO kamaji journal line at all, which is what gave the
+    // routing away: that fix sits on a Stop path destroy was never taking.
+    // Going through the sibling is what makes it load-bearing, because
+    // `KamajiSibling::teardown_workload` sends the mesh ident as the Stop id and
+    // kamaji-bin resolves it to the real container by its `yah.mesh-ident`
+    // label. Deploy and destroy now enter the same process and agree about
+    // which container backs an ident, instead of being two halves that didn't.
+    if let Some(rt) = &s.active_backend() {
         match rt.teardown_workload(&mesh_ident).await {
             Ok(()) => {}
             Err(e) => {
@@ -11560,7 +11696,7 @@ mod tests {
         let dep = mesh_spec("db", 5432);
         state
             .service_records
-            .upsert_deployed(&dep, std::net::Ipv4Addr::new(100, 64, 0, 7), "dep-container");
+            .upsert_deployed_at(&dep, std::net::Ipv4Addr::new(100, 64, 0, 7), "dep-container");
 
         let mut spec = mesh_spec("consumer", 8080);
         spec.depends_on = vec![workload_spec::MeshIdent("db".into())];
@@ -11592,7 +11728,7 @@ mod tests {
         let dep = isolated_mesh_spec("db", 5432);
         state
             .service_records
-            .upsert_deployed(&dep, std::net::Ipv4Addr::new(100, 64, 0, 7), "dep-container");
+            .upsert_deployed_at(&dep, std::net::Ipv4Addr::new(100, 64, 0, 7), "dep-container");
         assert!(
             state
                 .service_records
@@ -11656,7 +11792,7 @@ mod tests {
         // so a record carrying .9 is a provider on node .9 — not on us.
         state
             .service_records
-            .upsert_deployed(&dep, std::net::Ipv4Addr::new(100, 64, 0, 9), "dep-container");
+            .upsert_deployed_at(&dep, std::net::Ipv4Addr::new(100, 64, 0, 9), "dep-container");
 
         let mut spec = mesh_spec("consumer", 8080);
         spec.requires = vec![local_requirement("replicator")];
@@ -11681,7 +11817,7 @@ mod tests {
         let dep = mesh_spec("replicator", 5432);
         state
             .service_records
-            .upsert_deployed(&dep, std::net::Ipv4Addr::new(100, 64, 0, 7), "dep-container");
+            .upsert_deployed_at(&dep, std::net::Ipv4Addr::new(100, 64, 0, 7), "dep-container");
 
         let mut spec = mesh_spec("consumer", 8080);
         spec.requires = vec![local_requirement("replicator")];
@@ -11707,7 +11843,7 @@ mod tests {
         let dep = mesh_spec("db", 5432);
         state
             .service_records
-            .upsert_deployed(&dep, std::net::Ipv4Addr::new(100, 64, 0, 7), "dep-container");
+            .upsert_deployed_at(&dep, std::net::Ipv4Addr::new(100, 64, 0, 7), "dep-container");
         state
             .service_records
             .retract(&workload_spec::MeshIdent("db".into()));
@@ -11742,7 +11878,7 @@ mod tests {
         let dep = mesh_spec("db", 5432);
         state
             .service_records
-            .upsert_deployed(&dep, std::net::Ipv4Addr::new(100, 64, 0, 7), "dep-container");
+            .upsert_deployed_at(&dep, std::net::Ipv4Addr::new(100, 64, 0, 7), "dep-container");
 
         let mut spec = mesh_spec("consumer", 8080);
         spec.depends_on = vec![workload_spec::MeshIdent("db".into())];
@@ -11816,6 +11952,126 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    // ── R823-B4: destroy must dispatch to the kamaji sibling ────────────────
+    //
+    // The shipped defect these two pin: `destroy_workload` was the ONE
+    // lifecycle verb that never consulted `constable_client`. `GET /workloads`,
+    // `GET /workloads/{id}/state` and `POST /workloads/drain` all prefer the
+    // sibling and fall back to the in-process runtime; destroy went straight to
+    // the fallback. That split deploy from destroy across two processes, which
+    // is what made the container id disagree with itself: kamaji-bin names a
+    // container from `spec.name` — `forge-<uuid>` for a forge run — while the
+    // in-process containerd runtime derives it from the MESH IDENT,
+    // `kcc::PodSlot::A.container_id(&ident.0)` = `forge.<uuid>` (R590-B9). Dot
+    // versus hyphen. Every leg of that runtime's `teardown_container` treats
+    // `NotFound` as benign, so it returned `Ok(())` and this handler answered
+    // `"destroyed"` over a task that kept running and kept holding its port.
+    //
+    // Measured on us-west-003 against PUBLISHED 0.8.36 — which already carries
+    // the earlier kamaji-bin fix (`resolve_container_key_with`). The destroy
+    // RPC emitted no kamaji journal line at all, which is what gave the routing
+    // away: that fix sits on a Stop path destroy was never taking.
+
+    /// Spawn a real kamaji on `socket` for the two tests below and wait for the
+    /// listener to bind. Same shape as `tests/integration_deploy_through_kamaji`'s
+    /// helper — a REAL sibling, because the thing under test is which of two
+    /// runtimes the handler picks, and a fake sibling would let the wrong pick
+    /// pass.
+    async fn spawn_kamaji_sibling(
+        socket: std::path::PathBuf,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_path = socket.clone();
+        let handle = tokio::spawn(async move {
+            let _ = kamaji_bin::serve_with_shutdown(&server_path, async move {
+                let _ = stop_rx.await;
+            })
+            .await;
+        });
+        for _ in 0..50 {
+            if tokio::net::UnixStream::connect(&socket).await.is_ok() {
+                return (handle, stop_tx);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("kamaji never bound the UDS at {}", socket.display());
+    }
+
+    /// With a sibling attached, destroy goes to KAMAJI and the in-process
+    /// runtime is never asked.
+    ///
+    /// The assertion is on the recording runtime seeing NOTHING, deliberately,
+    /// and not on the response body. A bare kamaji has no containerd, native or
+    /// docker backend configured, so `stop_workload` falls through every arm
+    /// and Acks — an assertion on the 200 would pass just as happily against
+    /// the bug, since the bug's whole signature is answering success.
+    #[tokio::test]
+    async fn destroy_with_a_kamaji_attached_never_falls_back_to_the_in_process_runtime() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sock = tmp.path().join("kamaji.sock");
+        let (server, stop) = spawn_kamaji_sibling(sock.clone()).await;
+
+        let client = kamaji::sibling::KamajiClient::connect(sock.clone())
+            .await
+            .expect("kamaji handshake");
+        let sibling =
+            kamaji::sibling::KamajiSibling::new(client, sock, std::time::Duration::from_secs(5));
+
+        let rt = Arc::new(RecordingRuntime::default());
+        let state = Arc::new(
+            ServerState::load(tmp.path().join("identity.json"))
+                .unwrap()
+                .with_runtime(rt.clone())
+                .with_constable_client(sibling),
+        );
+
+        // A forge-shaped mesh ident: the one workload kind whose name and mesh
+        // identity actually differ, and so the only shape that ever exposed
+        // this. `forge.<uuid>` dotted, against a `forge-<uuid>` container.
+        let resp = post_destroy(
+            Arc::clone(&state),
+            "forge.eb595755-810c-40ba-a9ae-37515abe4333",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(
+            rt.teardown_order().is_empty(),
+            "destroy must dispatch to the kamaji sibling, but the in-process \
+             runtime was handed {:?} — that is the R823-B4 routing bug",
+            rt.teardown_order()
+        );
+
+        let _ = stop.send(());
+        server.abort();
+    }
+
+    /// The other half of the same change: a node with NO kamaji attached still
+    /// tears down through the in-process runtime. Without this, "prefer the
+    /// sibling" could have been written as "require the sibling" and silently
+    /// turned destroy into a no-op on every single-node box — the same class of
+    /// silent success the fix exists to remove.
+    #[tokio::test]
+    async fn destroy_without_a_kamaji_still_uses_the_in_process_runtime() {
+        let (_tmp, state, rt) = state_with_recording_runtime();
+
+        let resp = post_destroy(
+            Arc::clone(&state),
+            "forge.eb595755-810c-40ba-a9ae-37515abe4333",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert_eq!(
+            rt.teardown_order(),
+            vec!["forge.eb595755-810c-40ba-a9ae-37515abe4333".to_string()],
+            "with no sibling attached the in-process runtime is still the backend"
+        );
     }
 
     fn self_supplied(ident: &str, provider: workload_spec::WorkloadSpec) -> workload_spec::Requirement {
@@ -11920,7 +12176,7 @@ mod tests {
     async fn a_wait_provider_is_never_deployed_by_its_requirer() {
         let (_tmp, state, rt) = state_with_recording_runtime();
         let dep = mesh_spec("headscale-db", 5432);
-        state.service_records.upsert_deployed(
+        state.service_records.upsert_deployed_at(
             &dep,
             std::net::Ipv4Addr::new(100, 64, 0, 7),
             "db-container",
@@ -11971,7 +12227,7 @@ mod tests {
         // Somebody else's workload: present on the mesh and live in the
         // registry, but declared and owned elsewhere.
         let waited = mesh_spec("headscale-db", 5432);
-        state.service_records.upsert_deployed(
+        state.service_records.upsert_deployed_at(
             &waited,
             std::net::Ipv4Addr::new(100, 64, 0, 7),
             "db-container",
@@ -12455,6 +12711,155 @@ mod bundle_deploy_tests {
             .map(|s| s.with_bind_addr("0.0.0.0:7443"))
             .unwrap_or_else(|_| unreachable!("sole owner"));
         assert_eq!(dev.workload_bind_ip(&spec), None);
+    }
+
+    // ── R881-T4: per-workload container addressing (W343) ────────────────────
+
+    /// The same isolated shape under an arbitrary identity, so a test can put
+    /// two of them on one node.
+    fn isolated_netns_spec_named(name: &str) -> workload_spec::WorkloadSpec {
+        use workload_spec::{ImageRef, TierTag, WorkloadSpec};
+        WorkloadSpec::for_forge(
+            name,
+            ImageRef {
+                registry: "localhost".into(),
+                repository: "test".into(),
+                tag: "latest".into(),
+                digest: workload_spec::testing::test_digest(),
+            },
+            TierTag("tenant".into()),
+            vec![4332],
+        )
+    }
+
+    /// A node with a container range, addressed as us-east-001 is.
+    fn container_net_node() -> (tempfile::TempDir, ServerState) {
+        let (tmp, s) = state();
+        let s = Arc::try_unwrap(s)
+            .map(|s| {
+                s.with_bind_addr("100.64.0.3:7443")
+                    .with_container_net(kamaji::container_net::ContainerNet::defaults())
+            })
+            .unwrap_or_else(|_| unreachable!("sole owner"));
+        (tmp, s)
+    }
+
+    /// THE POINT OF R881. The noisetable-account shape — tenant tier, own
+    /// netns, no annotations — now has an address of its own rather than none,
+    /// and it is in this node's `/24`, not the node's own address (which was
+    /// the original defect) and not loopback (which was R881-B1's honest
+    /// refusal).
+    #[test]
+    fn a_tenant_workload_on_a_configured_node_gets_an_address_of_its_own() {
+        use std::net::Ipv4Addr;
+
+        let (_tmp, s) = container_net_node();
+        let got = s.workload_bind_ip(&isolated_netns_spec());
+        assert_eq!(got, Some(Ipv4Addr::new(10, 128, 3, 2)));
+        assert_ne!(got, Some(Ipv4Addr::new(100, 64, 0, 3)), "the node's own address");
+        assert_ne!(got, Some(Ipv4Addr::LOCALHOST));
+    }
+
+    /// The address must survive a redeploy, and it does so by being read back
+    /// off the live record rather than remembered anywhere else. A workload
+    /// that redeployed onto a fresh address would leave every consumer that had
+    /// resolved the old one dialing a dead veth until the next sweep.
+    #[test]
+    fn a_redeploy_keeps_the_address_the_record_already_holds() {
+        use std::net::Ipv4Addr;
+
+        let (_tmp, s) = container_net_node();
+        let first = isolated_netns_spec_named("first");
+        let second = isolated_netns_spec_named("second");
+
+        // `first` deploys, then `second` takes the next free index.
+        let a = s.workload_bind_ip(&first).unwrap();
+        s.service_records.upsert_deployed(&first, Some(a), "c-first");
+        let b = s.workload_bind_ip(&second).unwrap();
+        s.service_records.upsert_deployed(&second, Some(b), "c-second");
+        assert_eq!((a, b), (Ipv4Addr::new(10, 128, 3, 2), Ipv4Addr::new(10, 128, 3, 3)));
+
+        // `first` redeploys. Without the read-back it would be handed `.4`,
+        // because `.2` and `.3` are both taken.
+        assert_eq!(s.workload_bind_ip(&first), Some(a));
+        assert_eq!(s.workload_bind_ip(&second), Some(b));
+    }
+
+    /// Lowest free index wins, so a node that churns workloads reuses addresses
+    /// rather than walking to `.254` and then refusing to place anything.
+    ///
+    /// The subtlety this caught when it first failed: `retract` does not remove
+    /// the record, it marks it `Retracted`, so "taken" had to be defined as
+    /// *live* records — the same line `save_ledger` already drew. Both
+    /// `addresses()` and `address_of()` had to draw it, or a workload
+    /// redeployed after retraction would reclaim an index already handed out.
+    #[test]
+    fn a_freed_address_is_reused_rather_than_walked_past() {
+        use std::net::Ipv4Addr;
+
+        let (_tmp, s) = container_net_node();
+        let first = isolated_netns_spec_named("first");
+        let second = isolated_netns_spec_named("second");
+        s.service_records
+            .upsert_deployed(&first, s.workload_bind_ip(&first), "c-first");
+        s.service_records
+            .upsert_deployed(&second, s.workload_bind_ip(&second), "c-second");
+
+        s.service_records
+            .retract(&first.expose.mesh.identity);
+        let third = isolated_netns_spec_named("third");
+        assert_eq!(
+            s.workload_bind_ip(&third),
+            Some(Ipv4Addr::new(10, 128, 3, 2)),
+            "the retracted workload's index should be free again"
+        );
+    }
+
+    /// Branch order is not arbitrary: a host-networked workload binds the
+    /// NODE's ports whatever else is configured, so handing it a container
+    /// address would hand it one it cannot bind.
+    #[test]
+    fn a_host_networked_workload_still_gets_the_node_address() {
+        use std::net::Ipv4Addr;
+
+        let (_tmp, s) = container_net_node();
+        assert_eq!(
+            s.workload_bind_ip(&host_networked_spec()),
+            Some(Ipv4Addr::new(100, 64, 0, 3))
+        );
+    }
+
+    /// A dev host binding `0.0.0.0` has no mesh address, so there is no `/24`
+    /// to derive — and inventing one would put addresses in service records
+    /// that nothing on any node routes.
+    #[test]
+    fn a_node_with_no_mesh_address_allocates_nothing() {
+        let (_tmp, s) = state();
+        let s = Arc::try_unwrap(s)
+            .map(|s| {
+                s.with_bind_addr("0.0.0.0:7443")
+                    .with_container_net(kamaji::container_net::ContainerNet::defaults())
+            })
+            .unwrap_or_else(|_| unreachable!("sole owner"));
+        assert_eq!(s.workload_bind_ip(&isolated_netns_spec()), None);
+    }
+
+    /// A full `/24` refuses rather than wrapping onto an address a live
+    /// neighbour holds. Two workloads sharing an address is a worse failure
+    /// than one workload being unroutable, because the second is visible in
+    /// the record and the first is not visible anywhere.
+    #[test]
+    fn an_exhausted_subnet_refuses_rather_than_colliding() {
+        let (_tmp, s) = container_net_node();
+        for n in 2..=254u8 {
+            let spec = isolated_netns_spec_named(&format!("w{n}"));
+            let ip = s.workload_bind_ip(&spec).expect("a free index");
+            s.service_records.upsert_deployed(&spec, Some(ip), "c");
+        }
+        assert_eq!(
+            s.workload_bind_ip(&isolated_netns_spec_named("one-too-many")),
+            None
+        );
     }
 
     /// A bare `WorkloadSpec` must still parse as `Container`: every deployed

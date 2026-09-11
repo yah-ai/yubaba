@@ -203,10 +203,20 @@ async fn run_rebuild(
 ) -> Result<()> {
     let selected = select_tenants(config, only)?;
     let store = build_store(&config.sink)?;
+    // CONSTRUCTED off the runtime, not just used off it. `pointer_step` already
+    // spawn_blocking's the pointer *calls*; building the store is the same
+    // hazard one step earlier and was missed — `R2ObjectStore::new` builds a
+    // `reqwest::blocking::Client`, whose constructor drops a temporary tokio
+    // runtime, and `reqwest::blocking` asserts against that inside an async
+    // context. Debug-only assert, so it never showed up in a release binary or
+    // in a test that used an in-memory store — it showed up the first time
+    // anyone ran `rebuild` from a `cargo build` checkout (R869-T2).
     let pointers: Option<Arc<dyn yah_object_store::ObjectStore>> = if skip_pointer {
         None
     } else {
-        Some(Arc::from(build_pointer_store(&config.sink)?))
+        let sink = config.sink.clone();
+        let store = tokio::task::spawn_blocking(move || build_pointer_store(&sink)).await??;
+        Some(Arc::from(store))
     };
     let claims = HttpOwnership::new(config.yubaba_url.clone(), config.node_id);
 

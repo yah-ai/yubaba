@@ -414,6 +414,36 @@ impl IngressPlan {
         Ok(())
     }
 
+    /// Repoint every rule at this node's **inner door** (R870-F23 step 5).
+    ///
+    /// A service whose components deploy independently has no single workload a
+    /// hostname can front: the outer door's job becomes "reach the thing that
+    /// splits the paths", and that thing is a passway on loopback. So every
+    /// rule's upstream becomes `127.0.0.1:<port>` and the inner door owns the
+    /// fan-out from there.
+    ///
+    /// **This OVERRIDES, where [`resolve_upstreams`](Self::resolve_upstreams)
+    /// and [`resolve_ports`](Self::resolve_ports) fill in.** Those two leave an
+    /// operator's `upstream_host` / `port` pin alone, because a pin is an
+    /// explicit statement about the same backend discovery would have found.
+    /// An inner door is not that: a pin names ONE unit, and fronting a
+    /// two-unit service from one of its units serves half the site and 503s the
+    /// other half. So the halves are cleared first and then re-resolved through
+    /// the same two methods — which keeps this the only place in the crate that
+    /// writes those fields, rather than a third one that could drift from their
+    /// error handling.
+    ///
+    /// Idempotent, and byte-identical across two applies: the port is derived
+    /// from the service name (`inner_door::listen_port`), not allocated.
+    pub fn point_at_inner_door(&mut self, port: u16) -> Result<()> {
+        for rule in &mut self.rules {
+            rule.port = None;
+            rule.upstream_hosts.clear();
+        }
+        self.resolve_ports(|_| Ok(Some(port)))?;
+        self.resolve_upstreams(|_| Ok(vec![crate::inner_door::INNER_DOOR_HOST.to_string()]))
+    }
+
     /// Fill in the node-local port each rule's front door dials.
     ///
     /// The port half of [`resolve_upstreams`](Self::resolve_upstreams), and the
@@ -2274,6 +2304,64 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("pasway"), "got: {err}");
+    }
+
+    // ── point_at_inner_door (R870-F23 step 5) ──
+
+    /// The override, and the thing that makes it not a `resolve_*` call: an
+    /// operator's pinned `port` / `upstream_host` names ONE unit, and fronting
+    /// a two-unit service from one of its units serves half the site and 503s
+    /// the other half. So the pin has to lose here, unlike everywhere else.
+    #[test]
+    fn an_inner_door_overrides_a_pinned_upstream_rather_than_deferring_to_it() {
+        let mut p = plan(IngressProvider::Passway, &["us-east-001"], "noisetable.com", 8080);
+        // The pin every mirror on disk carries.
+        assert_eq!(p.rules[0].upstream_hosts, vec!["100.64.0.5".to_string()]);
+
+        p.point_at_inner_door(14210).unwrap();
+
+        assert_eq!(p.rules[0].upstream_hosts, vec!["127.0.0.1".to_string()]);
+        assert_eq!(p.rules[0].port, Some(14210));
+        assert_eq!(
+            p.passway_upstreams().unwrap(),
+            vec!["noisetable.com=127.0.0.1:14210".to_string()]
+        );
+    }
+
+    /// Every rule of a multi-hostname edge is repointed — an apex and its `www`
+    /// go through the same door, and leaving one behind would front half the
+    /// hostnames from the bundle and half from the inner door.
+    #[test]
+    fn every_rule_of_an_edge_is_repointed_not_just_the_first() {
+        let mut p = plan(IngressProvider::Passway, &["us-east-001"], "noisetable.com", 8080);
+        p.rules.push(IngressRule {
+            hostname: "www.noisetable.com".into(),
+            port: None,
+            slot: "compute".into(),
+            provider_id: None,
+            machines: Vec::new(),
+            upstream_hosts: Vec::new(),
+        });
+        p.point_at_inner_door(14210).unwrap();
+        assert_eq!(
+            p.passway_upstreams().unwrap(),
+            vec![
+                "noisetable.com=127.0.0.1:14210".to_string(),
+                "www.noisetable.com=127.0.0.1:14210".to_string(),
+            ]
+        );
+    }
+
+    /// Idempotent, because the number is derived rather than allocated: two
+    /// applies of an unchanged tree render byte-identical config, which is the
+    /// property every other resolver in this file also holds.
+    #[test]
+    fn repointing_twice_renders_the_same_config() {
+        let mut once = plan(IngressProvider::Passway, &["us-east-001"], "noisetable.com", 8080);
+        once.point_at_inner_door(14210).unwrap();
+        let mut twice = once.clone();
+        twice.point_at_inner_door(14210).unwrap();
+        assert_eq!(once, twice);
     }
 
     // ── collation: what each NODE runs (W305 F2) ──

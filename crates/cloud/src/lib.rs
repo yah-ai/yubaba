@@ -252,6 +252,7 @@ pub mod compose;
 pub mod config;
 pub mod envoy;
 pub mod identities;
+pub mod inner_door;
 // R374-F3: `local_runtime` + `provider::s3_sign` moved to the `local-driver`
 // crate so yubaba can own MinIO lifecycle without a reverse yubaba→cloud dep.
 // `local_driver_glue` carries the cloud-config adapter that used to live as

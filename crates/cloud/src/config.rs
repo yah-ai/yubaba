@@ -143,9 +143,10 @@
 //! @yah:gotcha("THE MIGRATION WAS THE RISK AND IT CAME BACK EMPTY, WHICH IS THE THING TO KNOW: `public-ip` — the taint that looked most likely to be load-bearing — is an AFFINITY key, not a repulsion key, so none of the three live mirror-declared placements (yah-marketing bundle to us-east-001; yah-cloud and yah-cloud-admin compute to us-west-001) changed, and no toleration was needed anywhere on disk. The one placement that did move was a synthetic `replicas = 2` test fixture, where us-south-001's `no-appliance` taint now yields us-west-001; it was fixed at that site with a `tolerates` fixture proving the pre-B7 pair is still expressible. Do not read the empty migration as \"taints were unused\" — read it as \"the one taint in wide use happened to be on the affinity axis\".")
 //!
 //! @yah:ticket(R870-F23, "Render and supervise the inner door: the service.toml + domain-manifest join that feeds passway's PathRouter config")
-//! @yah:at(2026-09-09T08:23:48Z)
-//! @yah:status(open)
-//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:status(review)
+//! @yah:phase(P2)
+//! @yah:at(2026-09-11T00:25:14Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R870)
 //! @yah:next("THE CONSUMER SIDE IS DONE AND ITS FORMAT IS FIXED (R870-T18, in review). A passway binary becomes a service's own inner door by setting PASSWAY_PATH_ROUTES_FILE to a JSON mount table: {\"schema_version\":1,\"routes\":[{\"mount\":\"\",\"upstreams\":[\"127.0.0.1:8081\"]},{\"mount\":\"/app\",\"upstreams\":[\"127.0.0.1:8082\"],\"headers\":{\"cross-origin-opener-policy\":\"same-origin\"}}]}. Parser + validation: oss/passway/crates/passway/src/path_routes_file.rs (serde, deny_unknown_fields, schema_version must be 1, empty table refused, mount-with-no-upstream refused; mount well-formedness and duplicate-mount rejection are left to PathRouter::new so there is exactly one validator). Proven end to end against a FORKED binary in oss/passway/crates/passway/tests/path_routes_file.rs. This ticket is the producer: write that file.")
 //! @yah:next("WHY THIS IS A SEPARATE TICKET AND NOT HALF OF R870-T18. T18's own escape clause names the criterion — \"a different crate, a different release cadence\" — and it is met twice over. (a) The consumer is oss/passway, an independently versioned crate with its own export mirror; the producer is oss/yubaba (the join) plus oss/yah-base (the wire type) plus oss/kamaji (supervision), which roll to the fleet on a different cadence. (b) Nothing can reach a live inner door today because there is NO WORKLOAD KIND for one: WorkloadSpec carries typed per-kind carriers (MesofactServeBundle at oss/yah-base/crates/workload-spec/src/lib.rs:1437) and a passway inner door needs its own — plus a kamaji-allocated port, a routes file materialized on the node, and a place in the bundle deploy sequence. Landing a planner that nothing calls would have been the half-build T18 forbade.")
@@ -155,6 +156,42 @@
 //! @yah:verify("A two-component service whose components deploy INDEPENDENTLY gets an inner door: one yah cloud apply leaves both https://<host>/ and https://<host>/app/ at 200, and curl -sI on /app/ carries cross-origin-opener-policy: same-origin AND cross-origin-embedder-policy: require-corp from the /app/* route in the domain manifest, while / carries neither.")
 //! @yah:verify("THE NEGATIVE, asserted on absence rather than on uptime: a single-component service (yah-marketing) produces NO inner-door config and NO inner-door process — no routes file materialized on the node, no extra supervised workload in kamaji's table, and a byte-identical workload spec to today. A unit test on the planner returning None is the cheap half; the node-side absence check is the half that matters.")
 //! @yah:gotcha("OPERATOR CALL ASKED AND NOT ANSWERED (R870 relay leader, session:abde2cbb, 2026-09-09). The TLS question in this ticket first gotcha was put to the operator as a three-way choice and the prompt timed out unanswered after 30 minutes, so it remains genuinely open — it was not skipped and not decided by default. The three options as framed, so whoever picks this up does not have to re-derive them: (A) add a plaintext listener mode gated so it is structurally impossible to combine with a public bind — refuse at config load unless the bind is loopback, keep it mutually exclusive with ACME/cert paths; this was the leader recommendation, on the grounds that it makes the inner tier actually cheap as R870-F15 design claimed while keeping the risk a bounded testable invariant rather than an operator remembering not to misconfigure it. (B) keep TLS everywhere and have F23 carry a cert-issuance plus renewal story for every inner door, which is safest by construction and already proven working in R870-T18 binary-level test with an rcgen self-signed leaf, but makes every service with 2+ independently-deployed components pay a cert, a renewal and a loopback handshake per request. (C) park the tier — nothing regresses, because config 1 (bundle staging, R870-B11, in review) already covers the deploy-together case, which is the one noisetable actually needs. THIS IS THE ONLY THING BLOCKING F23 DESIGN; the join itself, both admission rules and the workload-kind vocabulary are all specified in this ticket next entries and need no further decisions.")
+//! @yah:handoff("OPERATOR CALL ANSWERED 2026-09-09: option (A), the loopback-only plaintext listener. It was re-put with ONE fact the earlier framing did not have, and that fact inverts the safety argument the three options were weighed on: option (B) was never \"already proven working\". pingora defaults verify_cert: true (pingora-core-0.8.1/src/upstreams/peer.rs:479, read not assumed) and passway NEVER overrides it — there is no verify_cert anywhere in oss/passway/crates/passway/src. R870-T18's test drove the door from an HTTP client with danger_accept_invalid_certs, not from an outer passway, so the outer-to-inner leg was untested. Since no CA issues for 127.0.0.1, \"keep TLS everywhere\" required a SECOND unbuilt change — a way to disable or pin upstream certificate verification on a public-facing door — traded for encrypting a hop that never leaves the loopback interface. (A) is strictly the smaller security surface, not merely the cheaper one.")
+//! @yah:handoff("PASSWAY: TlsMode::Plaintext, selected by PASSWAY_TLS_MODE=plaintext (a third value on the EXISTING discriminator, not a new bool env var — one variable owns the listener's TLS mode). All guards live in ONE function, tls.rs parse_listener_tls_mode, and each is a boot failure naming what to change: the bind must parse as a LITERAL loopback SocketAddr (0.0.0.0:443 — the default — is refused, and so is a hostname this process cannot prove); PASSWAY_TLS_CERT/KEY must be unset, so a configured public door cannot go cleartext by ADDING a variable rather than removing two; LISTEN_FDS is refused outright because under socket activation PASSWAY_LISTEN is only the key pingora looks the socket up by and proves nothing about the bind. An unrecognized PASSWAY_TLS_MODE is now also a boot failure instead of a silent fall-through to manual. main() reads the mode BEFORE the cert paths (plaintext has none), branches to proxy_service.add_tcp(&listen), and build_tls_settings returns Err rather than panicking on the variant it can no longer be handed.")
+//! @yah:handoff("THE VOCABULARY, and admission rule 2 made UNREPRESENTABLE rather than refused. ServiceComponent gains deploy: DeployTier { Bundle (default), Workload } — oss/yubaba/crates/cloud/src/config.rs. That is the per-component slot [providers.bundle] could not express, and because it is ONE field with two values, \"both bundle-staged and its own workload\" has no spelling at all; there is no rule to enforce. What remained checkable — two components claiming one mount — went into R870-B11's EXISTING cross_ref_validate loop rather than a parallel one. That loop previously filtered on kind and so skipped the workload tier entirely; it now covers both tiers, and only the explanation branches (bundle/bundle = one storage prefix in one bundle; workload/workload = one prefix in the inner-door table; mixed = the mount names two things serving one prefix). skip_serializing_if on the default keeps every existing service.toml byte-identical.")
+//! @yah:handoff("THE JOIN: new module oss/yubaba/crates/cloud/src/inner_door.rs. plan(&ServiceConfig, &domains) -> Result<Option<InnerDoorPlan>>. Rule 1 is by construction — None below two DEPLOYED UNITS, so the negative is assertable on the absence of a plan. Grouping is per unit but mounts are per COMPONENT: N bundle components collapse to one DeployedUnit::Bundle yet keep N mounts, because a bundle sub-mount can carry route headers the root does not and the collapse-to-root shape would silently drop them. Headers come from the DomainRoute whose route_path_prefix equals the component's normalize_mount — cross_ref_validate already PROVES those agree, so the lookup cannot mismatch. Err is reserved for one case: two-plus units with no root mount, which would 503 every unclaimed path. routes_file() refuses an unresolved upstream instead of skipping the mount — a dropped mount does not 503, it falls through to the root and serves the WRONG component with a 200. passway_mount() composes with normalize_mount rather than trimming slashes a second time.")
+//! @yah:handoff("SUPERVISION: WorkloadSpec gains files: Vec<InlineFile { path, content, mode }> (oss/yah-base/crates/workload-spec/src/lib.rs, appended last, serde(default), no skip_serializing_if — postcard is positional, so every pre-existing spec decodes to an empty vec). kamaji's NATIVE backend writes them in spawn_child BEFORE exec and on every respawn (materialize_files, oss/kamaji/crates/kamaji/src/native.rs); containerd/docker/microvm call the new kamaji::reject_unmaterializable_files and REFUSE such a spec by name rather than starting a door against a file that is not there — a silently-skipped route table comes up healthy and routes wrongly, which is worse than not starting. InnerDoorPlan::workload(listen_port, address) renders Workload::Container: argv /usr/local/bin/passway, env PASSWAY_TLS_MODE=plaintext + PASSWAY_LISTEN=127.0.0.1:<port> (the 127.0.0.1 is literal, NOT a parameter, so a wrong port cannot make the door reachable) + PASSWAY_PATH_ROUTES_FILE, and the table itself as the one InlineFile. Not a new Workload variant: TenantPasswayWorkload earns one by carrying config kamaji acts on; an inner door's whole config is an argv, three env vars and a file, so a variant would buy only exhaustive-match churn in peer-owned kamaji-proto (the R572-F1 trade).")
+//! @yah:verify("cargo test -p passway (oss/passway) = 205 lib + 43 + 35 integration, 283 passed / 0 failed, up from the 275 baseline @Ashguard:abde2cbb recorded on R870-T21. 8 new lib tests in tls::tests and 2 new integration tests in tests/path_routes_file.rs. THE END-TO-END ONE IS THE POINT: a_cleartext_inner_door_serves_the_same_mount_table_with_no_certificate forks a REAL passway binary with no PASSWAY_TLS_CERT set at all and asserts the same two-mount split and the same per-mount COOP header over plain http:// — i.e. the tier the operator authorized actually costs a process and nothing else. Its negative, a_cleartext_door_on_a_reachable_bind_refuses_to_start, spawns the binary on 0.0.0.0:0 (the DEFAULT bind, so it is the exact misconfiguration that would make an inner door a public cleartext one) and asserts a non-zero exit whose message names the bind.")
+//! @yah:verify("cargo test -p yah-cloud --lib = 1150 passed / 0 failed (11 new in inner_door::tests, 2 new in config::tests). The cheap half of this ticket's own negative is a_single_unit_service_gets_no_inner_door plus several_bundle_components_are_one_unit_and_still_get_no_door — three components sharing one bundle are still ONE unit and still get no door, which is the case that would be easy to get wrong by counting components. cargo test -p yubaba --lib = 952/0. cargo test -p kamaji --lib --all-features = 208/0 (2 new; the materialization test asserts ORDERING by having the child cat the file into a second path, not merely that the file exists). cargo test -p yah-workload-spec --all-features = 205 + 101, 0 failed. cargo test --workspace --all-features in oss/kamaji = 18+208+5+303, all green in-package.")
+//! @yah:gotcha("ONE PRE-EXISTING FLAKE, DIAGNOSED NOT WAVED THROUGH. kamaji-bin's server::tests::tenant_passway::the_list_reports_the_digest_of_the_spec_it_was_deployed_with FAILS under `cargo test --workspace --all-features` in oss/kamaji, reproducibly, and PASSES 303/303 under `cargo test -p kamaji-bin --lib --all-features` both parallel AND --test-threads=1. So it is cross-PACKAGE contention, not in-package parallelism and not this change: the failing assertion is the second deploy failing to Ack after `free_port()` (server.rs ~:8667) handed back a port another package's test binary had taken between the probe and the bind — a TOCTOU in the helper. Nothing in this ticket adds a port or touches that path; WorkloadSpec::files cannot reach it, since Workload::TenantPassway carries a TenantPasswayWorkload and no WorkloadSpec at all. Worth a real fix (bind-and-hold instead of probe-and-release) but it is not this relay's.")
+//! @yah:gotcha("ROLL ORDER MATTERS AND IS NOT THE USUAL \"JSON IGNORES UNKNOWN KEYS\" ANSWER — flagged by @Ashguard:eclipse (session:e188ccc2, R881-T6) mid-session. All three prod voters now run kamaji+yubaba 0.8.37-h5 (us-south-001 and us-west-001 rolled 2026-09-09; us-east-001 on 0.8.37-h1/h2), all built BEFORE WorkloadSpec::files existed. WorkloadSpec has no deny_unknown_fields, so on the JSON leg an un-rolled node ignores the field exactly as R870-B6's `origin` did. The postcard leg is the one that does NOT forgive: it is positional and non-self-describing, so a new yubaba encoding a spec with a trailing `files` to an old kamaji decoder is a DESYNC, not an ignored key. Before deploying any inner door, confirm which codec that node's kamaji link uses (kamaji-proto/src/codec.rs) and roll kamaji first if it is postcard. Nothing regresses until something actually SETS files — every existing spec encodes an empty vec — but the ordering is a real constraint, not a formality.")
+//! @yah:handoff("WIDER THAN THE TITLE, all mechanical and all compiler-verified. Adding two fields to types this many call sites construct exhaustively meant ~45 initializer repairs across FOUR workspaces: oss/yah-base (workload-spec + local-driver), oss/kamaji (incl. peer-owned kamaji-proto/src/codec.rs and kamaji-containerd-core), oss/yubaba, and the root (crates/yah/hub, app/yah/cli). Each is one line — `files: Vec::new(),` or `deploy: Default::default(),` — with no semantic content; they were driven off E0063 spans, not grep, so none was guessed. NOTE the sweep needs --all-features AND `cargo test --no-run`: `cargo check --all-targets` alone missed sites behind feature gates and in examples/. ALSO REGENERATED (both are pure functions of the tree, so this is not authorship): .yah/schema/{workload,service}.toml.schema.json via `cargo run -p xtask -- emit-schemas` and packages/yah/workload-spec/index.ts via the export-ts bin. Both drift gates still report red because they compare against GIT, and this camp defers commits — they go green with the commit, and the regenerated content is correct.")
+//! @yah:handoff("PHASE 1 DONE — the tier EXISTS and every piece of it is proven in isolation: the cleartext listener (proven through a forked binary), the vocabulary, the join with both admission rules, the wire carrier, and node-side materialization + restart. What is NOT done is the last hop: nothing CALLS plan() yet, so `yah cloud apply` still produces no inner door. That is deliberate rather than abandoned — it is placement work with a live-fleet verify attached, and it is the whole of phase 2.")
+//! @yah:handoff("Tree anchor at handoff: 6f984b53a9dd1a291d29fe7d4cb544b47d4f65e6 — the shared tree as I left it. Diff against it (`git diff 6f984b53a9dd1a291d29fe7d4cb544b47d4f65e6..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:next("ONE DESIGN QUESTION PHASE 1 LEFT OPEN, stated so it is not rediscovered as a bug. A bundle-tier component at a non-root mount now gets its own entry in the inner-door table pointing at the SAME bundle upstream, purely so the domain manifest's per-path response headers can be applied (see a_bundle_components_sub_mount_keeps_its_headers_and_the_bundle_upstream). That is correct for headers and harmless for routing, but it means the inner door re-states routing the bundle already does internally. If the outer door or the Worker is ALREADY applying those headers for a config-1 service, the inner door would apply them twice — check which tier owns route headers for a passway front door before wiring step 4, because R746 put ROUTE_HEADERS into the Cloudflare Worker and I did not confirm the passway-front-door equivalent.")
+//! @yah:verify("THE LIVE HALF, unrun and needing a fleet: a two-component service whose components deploy independently gets one inner door from one `yah cloud apply`, with https://&lt;host&gt;/ and https://&lt;host&gt;/app/ both 200 and `curl -sI` on /app/ carrying cross-origin-opener-policy: same-origin AND cross-origin-embedder-policy: require-corp while / carries neither. The config-side half of exactly that assertion is already green as inner_door::tests::each_mount_carries_only_its_own_routes_headers, and the transport-side half as the forked-binary cleartext test — what remains unproven is only that apply joins them. THE NEGATIVE'S node-side half is also unrun: for a single-component service (yah-marketing), assert NO routes file is materialized on the node and NO extra workload appears in kamaji's table.")
+//! @yah:next("PHASE 2 IS FIVE STEPS AND EVERY INPUT ALREADY EXISTS. (1) Call inner_door::plan(&svc.service, &cfg.domains) once per service in the apply path; Ok(None) is the common answer and means do nothing at all. (2) Allocate the loopback port. It is deliberately a PARAMETER of InnerDoorPlan::workload rather than config — which port is free is a property of the node — so this is the only genuinely new decision: either take it from kamaji's ledger (oss/kamaji/crates/kamaji/src/ports.rs) or pin one per service. (3) Resolve each DeployedUnit to an address for the `address` closure: DeployedUnit::Bundle is the service's one bundle workload (R870-B11), DeployedUnit::Component(id) is that component's own workload. (4) Deploy the rendered workload in the bundle deploy sequence — BEFORE the outer door is repointed, since the door 503s until its upstream is up. (5) Repoint the outer door's PASSWAY_UPSTREAMS at 127.0.0.1:&lt;port&gt; instead of at the bundle, via IngressPlan::resolve_upstreams (oss/yubaba/crates/cloud/src/reconciler/ingress.rs:397).")
+//! @yah:next("CHECK THE BACKEND BEFORE STEP 4, because getting it wrong is a refused deploy rather than a silent one and you should know which it is. Only kamaji's NATIVE backend materializes WorkloadSpec::files; containerd/docker/microvm call reject_unmaterializable_files and refuse the spec by name. So an inner door must land on a node whose kamaji routes it to Backend::Native. If the fleet's containerd path is where this has to run, the honest fix is to implement the write there (a pre-exec write or a mount), NOT to relax the guard — the guard exists because a door started against an absent route table reports healthy and routes wrongly.")
+//! @yah:handoff("DEFECT IN THIS TICKET'S OWN CHANGE, CAUGHT IN REVIEW BY @Ashguard:eclipse (session:e188ccc2) AND FIXED BEFORE IT LEFT THE TREE. WorkloadSpec rides the postcard `Deploy` frame (kamaji-proto/src/messages.rs:373, and V7's own stanza names `Workload::Container(WorkloadSpec)` as what that frame carries), and kamaji-proto/src/version.rs states the rule twice: every field on a postcard message is mandatory and always encoded, and the only compatibility mechanism is a ProtocolVersion bump. V2/V4/V5/V6 were each exactly \"a field appended to a struct\" and each got one. `files` is that shape and I had not bumped. The reasoning that made me miss it is the one V6's stanza already refutes: `#[serde(default)]` makes an OLD spec decode fine, so the JSON leg really is unaffected — but `default` only affects DEserialization, so a new yubaba still ENCODES a length varint an old kamaji reads as the next field and misparses from there. Now V8, CURRENT = V8, with a stanza naming the wrong reasoning rather than only the rule. cargo test -p kamaji-proto --all-features = 33/0; oss/kamaji workspace = 18+208+5+303+2+2+2+1, 0 failed.")
+//! @yah:gotcha("CORRECTION TO THE FLAKE GOTCHA ABOVE — my characterization was too narrow and would mislead the next reader, so read this one instead. I wrote that the tenant_passway digest test is \"green 303/303 in-package, fails only workspace-wide\". @Ashguard:eclipse measured the counter-example on the same tree: `cargo test -p kamaji -p kamaji-bin --lib --all-features`, in-package and parallel, failed a DIFFERENT test in the same module — deploy_arms_the_declared_socket_and_stop_releases_it (server.rs:8590) — and it failed identically before my sweep. On my own later run the workspace-wide invocation came back 303/0. So the truth is: at least two tests in server::tests::tenant_passway are intermittently flaky in BOTH configurations, the cause is `free_port()` probe-and-release losing the port between the probe and the bind (server.rs ~:8667), and it predates R870-F23. Do NOT read an in-package red there as a regression, and do not read a single green run as proof either. The fix is bind-and-hold; it belongs to neither R870 nor R881 and is unfiled — @Ashguard:eclipse tried and board.open refused for want of a parent relay.")
+//! @yah:gotcha("CONSEQUENCE OF THE V8 BUMP FOR ANY FLEET OPERATION, not just for this relay — relayed by @Ashguard:eclipse (session:e188ccc2) who is holding the fleet on R881-T6, and worth acting on before the next roll. The tree is now ProtocolVersion::V8; EVERY node runs a pre-V8 pair (us-east-001 on 0.8.37-h1/h2, us-south-001 and us-west-001 on 0.8.37-h5, the other six on 0.8.28-0.8.34). Nothing is broken, because each node is internally matched and the protocol is a node-local UDS. What changed is that `hotship --binaries yubaba` ALONE — or `kamaji` alone — is now a footgun on every node: it puts a V8 binary against a V7 sibling, and per version.rs:71 that does not fail cleanly, it misreads every field after the desync, \"which is how a wrong image or a wrong volume mount gets deployed instead of an error\". Ship the PAIR. That was harmless before this ticket and is not now.")
+//! @yah:handoff("PHASE 2 LANDED — `yah cloud apply` now produces an inner door. All five steps, with the call sites. (1) PLAN: `service_inner_door` (app/yah/cli/src/cloud.rs:9212) calls `inner_door::plan` once per service; `Ok(None)` is the answer for every service on disk today and returns before anything else runs. (2) PORT: derived, not allocated — `inner_door::listen_port(service)` (oss/yubaba/crates/cloud/src/inner_door.rs:346). (3) RESOLVE: `InnerDoorPlan::resolve_addresses` (inner_door.rs:418) maps each unit to a mesh ident via `unit_ident` (:398) and looks it up with the new `ServiceRecordFanout::address_for_ident` (reconciler/service_discovery.rs:426). (4) DEPLOY: `deploy_inner_door` (cloud.rs:9274), called at the END of the deploy-phase closure in BOTH apply paths — `reconcile_root` (cloud.rs:11877) and `handle_mirror_up` (cloud.rs:7100) — so it is after every unit registered a record and before the front-door phase repoints anything. (5) REPOINT: `IngressPlan::point_at_inner_door` (reconciler/ingress.rs:438), called from `reconcile_ingress_edge` (cloud.rs:7726).")
+//! @yah:handoff("STEP 2 ANSWERED — the port is DERIVED from the service name, not taken from kamaji's ledger, and the three facts that decided it were read rather than assumed. (a) `LedgerPorts` is node-local (a JSON file beside the supervisor's state dir) and yubaba's HTTP surface exposes no allocation verb at all — yubaba/src/lib.rs routes /workloads/*, /services, /node/*, and nothing for ports — so an apply has no way to ask. (b) A stated number is HONOURED, not rejected, on the path this workload takes: R844-F14's pin rule bites inside `LedgerPorts::resolve_set`, and `NativeRuntime::resolve_declared_ports` (oss/kamaji/crates/kamaji/src/native.rs:280) filters `pin.is_none()` BEFORE calling it. That matters because `PASSWAY_LISTEN` must carry the number, and a number the node picks after the spec is rendered cannot be in it. (c) A collision is not representable: the ledger allocates on the workload's MESH ip, an inner door binds loopback, so 100.64.0.3:14210 and 127.0.0.1:14210 are different sockets. The window is 10000-19999, deliberately below Linux's default ephemeral floor (32768) where `pick_free_port`'s bind(:0) draws from. FNV-1a written out inline rather than `DefaultHasher`, whose stability std does not promise — this number goes into a deployed door's env AND the outer door's upstream list, and a toolchain bump silently moving it would repoint one tier and not the other.")
+//! @yah:handoff("THE OPEN HEADER QUESTION IS ANSWERED, AND THE ANSWER IS NO CHANGE — grounded by reading, not assumed. The question was whether the passway FRONT door also applies per-route response headers. It does not: `PassProxy::response_filter` (oss/passway/crates/passway/src/proxy.rs:700) iterates `ctx.route_headers`, and its own doc at :694 states that vector is empty for `RoutingStrategy::ByHost` — which is what every outer door is. So the outer tier owns no headers and there is no double-apply to resolve there. A THIRD tier the question did not name does apply them, and is worth recording: the mesofact bundle ORIGIN, via `MESOFACT_ROUTE_HEADERS` set by `add_declared_route_headers` (app/yah/cli/src/cloud.rs:8612). For a mount served by `DeployedUnit::Bundle` both that origin and the inner door apply the route's headers — but CONVERGENTLY, not duplicatively: both read the same `.yah/domains` route map, `PathRouter` does not strip the mount prefix (oss/passway/crates/passway/src/path_route.rs has no strip/rewrite), so both match the same request path, and both use insert-semantics (`HeaderMap::insert` in mesofact's `RouteHeaderTable::apply`, `insert_header` in passway) — one header, one value. Do NOT collapse it to one owner. The bundle origin's coverage is strictly WIDER: it applies headers for a declared route that has no component mount (a `/docs/*` route served out of the root bundle's dist), which the inner door has no entry for. And the inner door is the ONLY owner for a `DeployTier::Workload` mount, since nothing hands such a component a header table. The two are complementary; removing either loses headers somewhere.")
+//! @yah:handoff("PLUMBING BUILT BECAUSE STEPS 3 AND 5 NEEDED IT, all three of which did not exist. (1) `inner_door::component_workload_ident(service, component_id)` (inner_door.rs:371) — the mesh identity a workload-tier component registers under. It is a NAMING RULE stated here because nothing else states it: a bundle's ident is a mirror fact (`BundleSlot::workload_name`, renameable with `name = \"...\"`), but a workload-tier component has no slot of its own, since `[providers.*]` is per-kind-per-mirror — the exact gap `DeployTier` was added to close. Folded through `reconciler::native_support::sanitize_ident`, which I widened from private to `pub(crate) mod` (reconciler/mod.rs) rather than writing a second normalizer. Getting the ident wrong fails LOUDLY: `routes_file` refuses a mount whose unit resolved to nothing, naming the unit. (2) `ServiceRecordFanout::address_for_ident` — deliberately SINGULAR where `upstreams_for` is plural. An inner door proxies over loopback to a unit on its own node; handed a fleet-wide set it would dial across the mesh, which is not what the cleartext-listener safety argument assumed. Two nodes, two addresses is ambiguity (None), not load balancing. Port selection follows `port_for`'s discipline exactly (`kamaji::DEFAULT_PORT_NAME` first, then the sole anonymous port) so a unit resolves the same way at both tiers or neither. (3) `IngressPlan::point_at_inner_door` OVERRIDES where `resolve_upstreams`/`resolve_ports` fill in — it clears both halves and then goes through those same two methods, so this stays the only place in the crate writing those fields. The ticket's step 5 named `resolve_upstreams`; used alone it is WRONG, because it skips a rule that already has an `upstream_host` and every mirror on disk pins one. A pin names ONE unit, and fronting a two-unit service from one unit serves half the site and 503s the other half, so the pin has to lose here and nowhere else.")
+//! @yah:handoff("TWO PLACEMENT DECISIONS PHASE 2 HAD TO MAKE, both recorded at the site. (a) The inner door lands on the FRONT DOORS, not the workload nodes — the outer door dials 127.0.0.1, so a door anywhere else is a door the outer tier cannot reach. `ingress_topology` (cloud.rs:9230) recomputes `resolve_ingress_placements` + `plan_ingress` in the deploy phase to learn that set; both are pure, so this costs no network and cannot disagree with the front-door phase's own answer. (b) SELF-DISCOVERY IS TURNED OFF for an inner-door service. `PASSWAY_UPSTREAM_SOURCE=yubaba` makes the door poll for the fronted workload's records and use those INSTEAD of its static set — which would route straight past the inner door to whichever unit registered under the mirror's ident, silently undoing step 5. The rendered note says so in its own words rather than reusing R844-F20's \"NOT self-discoverable ... MANUAL step\" wording, because this is not a degradation: the address is derived and byte-identical on every apply. (c) A mirror with two units and NO declared front door SKIPS with a note rather than failing — `reconcile_mirror_ingress` already returns early on `plans.is_empty()`, so there would be no outer door to repoint and nothing that can 503. Every `shape = \"local\"` dev mirror is in that state; bailing there would have broken `yah mirror up`.")
+//! @yah:handoff("DISCOVERED WORK, FIXED IN THIS PASS, NOT FILED AS A FOLLOWUP. `cargo test -p yah-cloud --lib` was 1161/2 on arrival, and the two reds were NOT mine and NOT a flake: `cloud_init::tests::{rendered_runcmd_entries_are_all_strings, coordinator_prestage_only_for_standalone}`. Cause: oss/yubaba/crates/cloud/templates/mirror.yml:107-108, the two R858-F17 turso-backup-helper runcmd entries, were written as BARE YAML scalars containing a `: ` — which makes the whole entry parse as a Mapping, so cloud-init skips it and the helpers never land on a provisioned node. The file is committed and clean (last touched by a8f0d501, i.e. it regressed AFTER phase 1's 1150/0 measurement), no live peer owns it, and the fix is two lines: double-quote the entries and escape the inner quotes. Both tests are green and the comment at the site names the gate. This is a real provisioning defect, not just a red test — a node provisioned since a8f0d501 has no turso-backup-hydrate / turso-backup-tail, and R858-F17's own design makes durability-declaring workloads refuse to deploy without them. Worth a look at whether any node was provisioned in that window.")
+//! @yah:verify("PHASE 2 MEASURED, every number run by me and read. `cargo test -p yah-cloud --lib` = 1163 passed / 0 failed (baseline 1150; +13 — 6 in inner_door::tests, 4 in service_discovery::tests, 3 in ingress::tests). `cargo test -p yah --lib` = 1549 / 0 (+3 new in a new `inner_door_apply_tests` module). `cargo test -p xtask --test main mirror_ingress` = 13 / 0 (baseline 11; +2). `cargo test -p yubaba --lib` = 952 / 0, exactly the baseline. `cargo test -p passway` in oss/passway = 205 + 43 + 37 = 285 / 0 against the 283 baseline, and `cargo test -p kamaji --lib --all-features` = 217 / 0 against 208 — BOTH deltas are peers', not mine: I touched neither crate. Sweeps: `cargo test --workspace --all-features --no-run` clean, and the same in oss/yubaba clean (only the two pre-existing unused-import warnings in a peer's in-flight mesofact_static.rs). NO SCHEMA REGEN NEEDED — this pass added functions, constants and one module-visibility widening, and no serde-visible field on any generator input, so .yah/schema/*.json and packages/yah/workload-spec/index.ts are untouched by construction.")
+//! @yah:verify("THE NEGATIVE IS ASSERTED IN THREE PLACES, at three different altitudes, because it is the claim the live fleet rests on. (1) `xtask/tests/mirror_ingress.rs::no_service_on_disk_gets_an_inner_door` walks the REAL `.yah/services/` tree and asserts every service plans `None`. That is the strongest form available without a fleet: the only way to be wrong about it is for a service to acquire `deploy = \"workload\"`, at which point the test names the service. Sibling `every_services_derived_inner_door_port_is_distinct` pins the port derivation against the real service list. (2) `cloud::inner_door_apply_tests::a_single_unit_service_leaves_the_outer_door_exactly_as_it_was` builds a two-component fixture that is BYTE-FOR-BYTE the positive test's, with one word changed (`workload` -> `bundle`), and asserts the rendered `PASSWAY_UPSTREAMS` is still the mirror's pinned `noisetable.com=100.64.0.3:8080`. So the difference between the two outcomes is provably that one field. (3) `inner_door::tests::{a_single_unit_service_gets_no_inner_door, several_bundle_components_are_one_unit_and_still_get_no_door}` from phase 1, still green. THE POSITIVE: `a_two_unit_service_repoints_the_outer_door_at_its_inner_door` (outer door renders `noisetable.com=127.0.0.1:<derived>`, and the port is asserted equal to what the door itself binds — two call sites in two phases that must not be able to disagree) and `the_rendered_table_splits_the_mounts_and_carries_only_their_own_headers` (both units addressed, COOP+COEP on /app and ABSENT on the root).")
+//! @yah:gotcha("TRANSIENT BUILD FAILURE SEEN AND DISPROVEN, recorded so the next reader does not re-chase it. The first `cargo test --workspace --all-features --no-run` came back with `can't find crate for 'runner'` / `'agent_tools'` / `'camp_service'` and a linker failing on a dozen absent `.rlib`s (libgif, libzune_jpeg, libimagesize...) in crates this ticket never touched — the exact shape CLAUDE.md's orphan-gc warning describes. Followed that procedure rather than cleaning: `cargo orphan-gc log -n 300` names NONE of the missing artifacts (every entry in the window reads `deleted 0 artifacts`), so orphan-gc is NOT confirmed here. The likelier cause is plain target-dir contention: a `yah-release-check` QED pipeline was holding the same `/Users/leif/ss/yah/target` for 29 minutes alongside this build. Re-ran with nothing else on the key: CLEAN, zero errors. Not reproducible, orphan-gc log does not name it, and the artifacts were never deleted per its own record.")
+//! @yah:next("WHAT REMAINS IS THE LIVE HALF ONLY, and it is an operator call the R870 leader is holding — phase 2 deliberately landed code + tests and touched no node. The two assertions: (a) POSITIVE — a two-component service whose components deploy independently gets one inner door from one `yah cloud apply`, with https://&lt;host&gt;/ and https://&lt;host&gt;/app/ both 200 and `curl -sI` on /app/ carrying cross-origin-opener-policy: same-origin AND cross-origin-embedder-policy: require-corp while / carries neither. (b) NEGATIVE, node-side — for a single-component service (yah-marketing), NO routes file materialized under /var/lib/passway/routes and NO extra workload in kamaji's table. Note that (b) is now also asserted statically against the real tree by `xtask/tests/mirror_ingress.rs::no_service_on_disk_gets_an_inner_door`, so the node-side check is confirmation rather than discovery. BEFORE RUNNING (a): there is no service with `deploy = \"workload\"` on disk, so one has to be declared first — and the R870-B6/V8 roll-order gotcha on this ticket applies the moment anything actually SETS `WorkloadSpec::files`. Confirm the target node's kamaji link codec (kamaji-proto/src/codec.rs) and roll the kamaji+yubaba PAIR first if it is postcard.")
+//! @yah:next("ONE THING PHASE 2 DID NOT BUILD, named so it is not mistaken for done: there is still no FLEET deploy path for a `DeployTier::Workload` component. `reconcile_component` (app/yah/cli/src/cloud.rs:8264) dispatches on `component.kind`, and the only non-bundle arms are `container` — which `ContainerReconciler::up` guards on `MirrorShape::Local`, and `LocalProcessReconciler`, which is the camp/dev tier and registers as `local-process-&lt;service&gt;-&lt;env&gt;-&lt;component&gt;`. So on a real mirror such a component is deployed by hand today (`yah cloud workload deploy`). That is exactly why `inner_door::component_workload_ident` had to STATE the ident rather than look it up. The failure mode is loud rather than silent — a component registered under any other ident leaves its unit unresolved and `routes_file` refuses the whole table, naming the unit — but whoever wires that deploy path must make it register under `component_workload_ident(service, id)`, or change both sides together. Related and already filed: R523-F1 (a component kind that deploys a stateful binary to a fleet node) is the same missing arm seen from the other direction.")
+//! @yah:handoff("PHASE 2 COMPLETE — `yah cloud apply` produces an inner door. Everything above this entry is the detail: the five call sites, the derived-port argument, the header-ownership answer (no change — the outer passway door owns no route headers, proven at proxy.rs:694/700, and the bundle origin's overlap is convergent and strictly wider), the three pieces of plumbing built because steps 3 and 5 needed them, the two placement decisions, and the one mirror.yml provisioning defect fixed on the way through. Nothing was deployed and no node was touched, per the dispatch. Green: yah-cloud 1163/0, yah 1549/0, yubaba 952/0, xtask mirror_ingress 13/0, passway 285/0, kamaji 217/0, both --all-features --no-run sweeps clean. Git policy is `defer`, so nothing is committed — the diff is 6 files: oss/yubaba/crates/cloud/src/{inner_door.rs, reconciler/mod.rs, reconciler/ingress.rs, reconciler/service_discovery.rs}, oss/yubaba/crates/cloud/templates/mirror.yml, app/yah/cli/src/cloud.rs, plus xtask/tests/mirror_ingress.rs.")
+//! @yah:handoff("Tree anchor at handoff: 88533e01f7f578b1520b633d05846973fa47f608 — the shared tree as I left it. Diff against it (`git diff 88533e01f7f578b1520b633d05846973fa47f608..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:handoff("PHASE 2 ACCEPTED BY THE RELAY LEADER (@Ashguard:hydra, session:39386823). `yah cloud apply` now produces an inner door: all five steps wired, plus three pieces of plumbing that did not exist (`component_workload_ident`, `ServiceRecordFanout::address_for_ident`, `IngressPlan::point_at_inner_door`), the derived-port decision argued from three read facts, and the open header question answered NO CHANGE with the proof at proxy.rs:694/700. Implemented by @Ashguard:blade (session:54a6be05). The detail is in the handoff entries above this one; this entry records only that it was accepted and on what evidence.")
+//! @yah:verify("WHAT IS DELIBERATELY NOT VERIFIED, and it is the operator's call rather than an oversight: the LIVE half. No node was touched, nothing was deployed, nothing committed (git policy is `defer`). Running it needs a service with `deploy = \"workload\"` declared — none exists on disk — and the moment anything actually SETS `WorkloadSpec::files`, this ticket's own V8 roll-order gotcha binds: confirm the target node's kamaji link codec (kamaji-proto/src/codec.rs) and roll the kamaji+yubaba PAIR, never one alone.")
+//! @yah:verify("INDEPENDENTLY RE-RUN BY A SECOND COURIER (@Ashguard:dove, session:60d4f41f) who did not implement it, because a courier's self-report is the inner gate and not the outer one. All six commands reproduced the claimed counts EXACTLY: yah-cloud 1163/0 (4 ignored), yubaba 952/0, passway 285/0 (205+43+37), kamaji --lib --all-features 217/0, yah --lib 1549/0 (1 ignored), workspace --all-features --no-run clean. Every content check held: `point_at_inner_door` at ingress.rs:438; `inner_door::plan` reached from the apply path via `service_inner_door` (cloud.rs:9219) through `deploy_inner_door` (cloud.rs:9274, invoked at 7100 and 11877) and the ingress repoint at 7726; the port confirmed a deterministic per-service pin (FNV-1a into 10000-19999, inner_door.rs:346) and NOT kamaji's ledger, with the native.rs:282 `pin.is_none()` justification verified at the site. The negative is asserted three times, not once. CAVEAT ON THE MEASUREMENT ITSELF: the camp skew detector flagged 4 of 6 runs SUSPECT — peers edited kamaji/src/microvm.rs, kamaji-bin/src/main.rs and cloud/reconciler/mesofact_bundle.rs mid-run — so these are shared-tree numbers, not a frozen-tree measurement.")
+//! @yah:verify("ONE CLAIM CORRECTED AND ONE DEFECT FOUND BY THAT RE-RUN, both recorded rather than smoothed over. (1) CORRECTION: `cargo test -p yah-cloud --lib` does NOT run from the repo root — yah-cloud is not a root workspace member and needs dev-dependencies; it only works from `oss/yubaba`. Anyone reproducing the 1163/0 above must cd there first. (2) DEFECT, pre-existing and NOT caused by this ticket: `embedded_template_matches_workspace_canonical` is green VACUOUSLY — it resolves the workspace root via CARGO_MANIFEST_DIR.ancestors() to oss/yubaba, whose .yah/ holds only a .gitignore, so it takes the bootstrap branch and asserts nothing, while the repo-root twin at .yah/infra/cloud-init/mirror.yml is 128 diff-lines stale and missing the whole R858-F17 turso-backup block. FILED AS R870-B25, not left here. Note `rendered_runcmd_entries_are_all_strings` is a DIFFERENT test, is genuinely green, and is the gate that really catches the colon-space footgun this ticket fixed.")
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -1664,10 +1701,22 @@ impl CloudConfig {
         // *workload*; here it would be two components silently overwriting
         // the same *path inside* the workload). A mount is owned by exactly
         // one component; refuse the config before the clobber happens.
+        //
+        // R870-F23 widens the same loop to the workload tier rather than
+        // adding a parallel one. A mount is owned by exactly one component
+        // whichever tier serves it: two workload-tier components at one mount
+        // would hand the inner door two upstream sets for one prefix, and two
+        // components in *different* tiers at one mount is the same clobber
+        // read from the routing side — the request reaches whichever of the
+        // bundle and the workload the mount table happened to name. So the
+        // rule is now "one component per mount, service-wide", and only the
+        // explanation branches on tier.
         for (svc_name, svc) in services {
-            let mut owner_by_mount: BTreeMap<String, &str> = BTreeMap::new();
+            let mut owner_by_mount: BTreeMap<String, (&str, DeployTier)> = BTreeMap::new();
             for component in &svc.service.components {
-                if component.kind != "mesofact-static" && component.kind != "mesofact-spa" {
+                let bundle_tier =
+                    component.kind == "mesofact-static" || component.kind == "mesofact-spa";
+                if !bundle_tier && component.deploy != DeployTier::Workload {
                     continue;
                 }
                 let mount = component
@@ -1675,19 +1724,38 @@ impl CloudConfig {
                     .as_deref()
                     .map(normalize_mount)
                     .unwrap_or_default();
-                if let Some(existing) = owner_by_mount.insert(mount.clone(), &component.id) {
+                if let Some((existing, existing_tier)) =
+                    owner_by_mount.insert(mount.clone(), (&component.id, component.deploy))
+                {
                     let where_ = if mount.is_empty() {
                         "the service root (no `mount`)".to_string()
                     } else {
                         format!("mount = \"/{mount}\"")
                     };
+                    let why = if existing_tier == component.deploy {
+                        match component.deploy {
+                            DeployTier::Bundle => {
+                                "a bundle-tier component's mount is a storage prefix inside the \
+                                 service's single assembled bundle (app/dist/<mount>/), so two \
+                                 components at the same mount would stage into the same path and \
+                                 silently overwrite each other"
+                            }
+                            DeployTier::Workload => {
+                                "a workload-tier component's mount is its prefix in the service's \
+                                 inner-door route table, so two components at the same mount would \
+                                 claim one prefix and requests would reach whichever the table \
+                                 named"
+                            }
+                        }
+                    } else {
+                        "one is staged into the service bundle and the other deploys as its own \
+                         workload, so the mount names two different things that serve one prefix \
+                         — the inner door can only route it to one of them"
+                    };
                     anyhow::bail!(
                         "services/{svc_name}/service.toml: components \"{existing}\" and \
-                         \"{}\" both declare {where_} — a bundle-tier component's mount is a \
-                         storage prefix inside the service's single assembled bundle \
-                         (app/dist/<mount>/), so two components at the same mount would stage \
-                         into the same path and silently overwrite each other. Give one of \
-                         them a distinct `mount`.",
+                         \"{}\" both declare {where_} — {why}. Give one of them a distinct \
+                         `mount`.",
                         component.id,
                     );
                 }
@@ -3525,6 +3593,47 @@ pub struct ServiceComponent {
     /// before starting wave N+1. Defaults to 0 (all components in one wave).
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub wave: u32,
+
+    /// Whether this component ships inside the service's one assembled bundle
+    /// or as a deployed unit of its own (R870-F23).
+    ///
+    /// This is the vocabulary R870-F15's design needed and the config did not
+    /// have. `[providers.bundle]` is a per-**mirror** slot, so before this
+    /// there was no way to say "give this one component its own workload" at
+    /// all — the whole service was one bundle or it was nothing, and a service
+    /// whose components genuinely release on different cadences had no shape
+    /// to declare.
+    ///
+    /// It is one field rather than a pair of flags on purpose: a component
+    /// being both bundle-staged and its own workload is the second admission
+    /// rule R870-F23 was asked to enforce, and an enum makes it unrepresentable
+    /// instead of merely refused.
+    #[serde(default, skip_serializing_if = "DeployTier::is_default")]
+    pub deploy: DeployTier,
+}
+
+/// How one [`ServiceComponent`] reaches a node — see
+/// [`ServiceComponent::deploy`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum DeployTier {
+    /// Staged into the service's single assembled W272 bundle under
+    /// `app/dist/<mount>/` and served by the one bundle workload (R870-B11).
+    /// The default, and what every component in the tree means today.
+    #[default]
+    Bundle,
+    /// Deployed as its own workload, with its own release cadence, its own
+    /// address, and its own place in the inner door's mount table.
+    Workload,
+}
+
+impl DeployTier {
+    /// Skip serializing the default so existing `service.toml` files
+    /// round-trip byte-identically.
+    fn is_default(&self) -> bool {
+        matches!(self, DeployTier::Bundle)
+    }
 }
 
 #[inline]
@@ -6476,6 +6585,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             namespace: NamespaceId::singleton(),
             labels: Default::default(),
             annotations: Default::default(),
+            files: Vec::new(),
         };
 
         let toml_str = toml::to_string_pretty(&spec).unwrap();
@@ -6541,6 +6651,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             namespace: NamespaceId::singleton(),
             labels: Default::default(),
             annotations: Default::default(),
+            files: Vec::new(),
         }
     }
 
@@ -6678,6 +6789,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             namespace: NamespaceId::singleton(),
             labels: Default::default(),
             annotations: Default::default(),
+            files: Vec::new(),
         };
 
         let toml_str = toml::to_string_pretty(&spec).unwrap();
@@ -6755,6 +6867,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             namespace: NamespaceId::singleton(),
             labels: Default::default(),
             annotations: Default::default(),
+            files: Vec::new(),
         };
 
         let wc = WorkloadConfig { spec };
@@ -7893,6 +8006,7 @@ out_dir = "dist"
                 publishes: Some("static".into()),
                 wave: 0,
                 git: None,
+                deploy: Default::default(),
             }],
         };
         svc.save(root).unwrap();
@@ -8112,6 +8226,7 @@ out_dir = "dist"
                 publishes: None,
                 wave: 0,
                 git: None,
+                deploy: Default::default(),
             }],
         };
         svc.save(root).unwrap();
@@ -8346,6 +8461,7 @@ worker_bundle_path = ".yah/workers/cdn-yah-dev/"
                     publishes: None,
                     wave: 0,
                     git: None,
+                    deploy: Default::default(),
                 },
                 ServiceComponent {
                     mount: Some("/app".into()),
@@ -8356,6 +8472,7 @@ worker_bundle_path = ".yah/workers/cdn-yah-dev/"
                     publishes: None,
                     wave: 0,
                     git: None,
+                    deploy: Default::default(),
                 },
             ],
         };
@@ -8648,6 +8765,7 @@ component = "yah-marketing/site"
                     publishes: None,
                     wave: 0,
                     git: None,
+                    deploy: Default::default(),
                 },
                 ServiceComponent {
                     mount: Some("app/".into()),
@@ -8658,6 +8776,7 @@ component = "yah-marketing/site"
                     publishes: None,
                     wave: 0,
                     git: None,
+                    deploy: Default::default(),
                 },
             ],
         };
@@ -8691,6 +8810,7 @@ component = "yah-marketing/site"
                     publishes: None,
                     wave: 0,
                     git: None,
+                    deploy: Default::default(),
                 },
                 ServiceComponent {
                     mount: None,
@@ -8701,6 +8821,7 @@ component = "yah-marketing/site"
                     publishes: None,
                     wave: 0,
                     git: None,
+                    deploy: Default::default(),
                 },
             ],
         };
@@ -8708,6 +8829,95 @@ component = "yah-marketing/site"
         let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
         assert!(err.contains("\"site\""), "{err}");
         assert!(err.contains("\"app\""), "{err}");
+        assert!(err.contains("the service root"), "{err}");
+    }
+
+    /// R870-F23 widened the same loop to the workload tier. Two components in
+    /// DIFFERENT tiers at one mount is the same clobber read from the routing
+    /// side: the inner door's table names one upstream for that prefix, so a
+    /// request reaches either the bundle or the workload and nothing says
+    /// which.
+    #[test]
+    fn a_bundle_component_and_a_workload_component_at_one_mount_are_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let svc = ServiceConfig {
+            schema_version: 1,
+            name: "noisetable".into(),
+            domain: "noisetable.com".into(),
+            db: DbCatalog::default(),
+            components: vec![
+                ServiceComponent {
+                    mount: Some("app".into()),
+                    id: "app-bundle".into(),
+                    kind: "mesofact-spa".into(),
+                    path: "app/browser".into(),
+                    role: "static".into(),
+                    publishes: None,
+                    wave: 0,
+                    git: None,
+                    deploy: DeployTier::Bundle,
+                },
+                ServiceComponent {
+                    mount: Some("/app/".into()),
+                    id: "app-service".into(),
+                    kind: "container".into(),
+                    path: "app/server".into(),
+                    role: "compute".into(),
+                    publishes: None,
+                    wave: 0,
+                    git: None,
+                    deploy: DeployTier::Workload,
+                },
+            ],
+        };
+        svc.save(root).unwrap();
+        let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
+        assert!(err.contains("\"app-bundle\""), "{err}");
+        assert!(err.contains("\"app-service\""), "{err}");
+        assert!(err.contains("deploys as its own workload"), "{err}");
+    }
+
+    /// And two WORKLOAD-tier components at one mount, which the pre-R870-F23
+    /// loop skipped entirely (it filtered on `kind`, and a workload-tier
+    /// component need not be a mesofact kind at all).
+    #[test]
+    fn two_workload_components_at_one_mount_are_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let svc = ServiceConfig {
+            schema_version: 1,
+            name: "noisetable".into(),
+            domain: "noisetable.com".into(),
+            db: DbCatalog::default(),
+            components: vec![
+                ServiceComponent {
+                    mount: None,
+                    id: "api".into(),
+                    kind: "container".into(),
+                    path: "svc/api".into(),
+                    role: "compute".into(),
+                    publishes: None,
+                    wave: 0,
+                    git: None,
+                    deploy: DeployTier::Workload,
+                },
+                ServiceComponent {
+                    mount: Some("/".into()),
+                    id: "api2".into(),
+                    kind: "container".into(),
+                    path: "svc/api2".into(),
+                    role: "compute".into(),
+                    publishes: None,
+                    wave: 0,
+                    git: None,
+                    deploy: DeployTier::Workload,
+                },
+            ],
+        };
+        svc.save(root).unwrap();
+        let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
+        assert!(err.contains("inner-door route table"), "{err}");
         assert!(err.contains("the service root"), "{err}");
     }
 

@@ -112,6 +112,7 @@ fn secret_spec(name: &str) -> WorkloadSpec {
         },
         labels: Default::default(),
         annotations: Default::default(),
+        files: Vec::new(),
     }
 }
 

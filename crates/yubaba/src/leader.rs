@@ -988,9 +988,14 @@ async fn reconcile_appliance_ownership(
                     .mesh_ip
                     .or_else(|| state.node_mesh_ip())
                     .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+                // R881-T4: `Some` because a native fork+exec IS bound on this
+                // address — `workload_bind_ip` agrees for exactly this spec
+                // (`binds_node_ports` covers `yah.exec = native`), and passing
+                // it here would only re-derive an address this branch already
+                // resolved with more information than that function has.
                 state
                     .service_records
-                    .upsert_deployed(&spec, mesh_ip, &observed.container_id);
+                    .upsert_deployed(&spec, Some(mesh_ip), &observed.container_id);
             }
             election.record_success(node_id);
             info!(
@@ -1464,34 +1469,33 @@ async fn on_became_leader(
 ) -> Result<(), ApplianceStartError> {
     let headscale_db = state.headscale_dir.join("headscale.db");
 
-    // 1. Restore from S3 (no-op if no snapshot exists yet).
+    // 1. Write the litestream config the replicate unit started in step 3
+    //    reads (`litestream -config /etc/yah-cloud/litestream.yml`). R591-T3:
+    //    `install` MUST come first — until that ticket nothing called it at
+    //    all, so on every node the sidecar start failed against a unit that
+    //    had never been written, into a discarded exit status. Installing
+    //    here rather than at provision time also means a node that becomes
+    //    the ingress owner years after it was provisioned still gets a config
+    //    matching the S3 URL this yubaba was actually started with.
     //
-    // R591-T3: `install` MUST come first, and until that ticket nothing called
-    // it at all. Both the restore below and the replicate unit started in
-    // step 3 run `litestream -config /etc/yah-cloud/litestream.yml`, and
-    // nothing else on the node writes that file — so on every node the restore
-    // failed at "no such file" into a `warn!` and the sidecar start failed
-    // against a unit that had never been written, into a discarded exit status.
-    // Installing here rather than at provision time also means a node that
-    // becomes the ingress owner years after it was provisioned still gets a
-    // config matching the S3 URL this yubaba was actually started with.
+    //    R858-F17: the restore leg that used to run here is gone. Hydrating
+    //    `headscale.db` before start is now kamaji's job, driven by the
+    //    `yah.durability.*` declaration on the appliance's `WorkloadSpec`
+    //    (`headscale_appliance::appliance_spec`) — see `start_headscale`
+    //    below, which is where kamaji's hydrate-on-place actually runs.
     if let Some(s3_url) = &state.litestream_s3_url {
         if let Err(e) = litestream::install(&headscale_db, s3_url) {
             warn!(
-                "litestream install failed ({e:#}) — restore and replication will not run on \
-                 this node; the headscale DB is unbacked until this is fixed"
+                "litestream install failed ({e:#}) — replication will not run on this node"
             );
-        }
-        match litestream::restore(&headscale_db, s3_url).await {
-            Ok(()) => info!("litestream restore complete"),
-            Err(e) => warn!(
-                "litestream restore failed (continuing — headscale may start from local DB): {e}"
-            ),
         }
     }
 
     // 2. Start headscale as a kamaji-supervised appliance. Everything below is
-    //    conditional on this, which is the R858-T3 change.
+    //    conditional on this, which is the R858-T3 change. Kamaji hydrates
+    //    `headscale.db` from turso-backup before forking the appliance
+    //    (R858-F17) — see the `yah.durability.*` declaration this spec
+    //    carries.
     start_headscale(state).await?;
 
     // 3. Start litestream sidecar. After the start, not before: replicating a
@@ -1742,9 +1746,11 @@ async fn start_headscale(state: &Arc<ServerState>) -> Result<(), ApplianceStartE
                 // record the HTTP handler would have — without this the
                 // appliance runs but `GET /service-records` never mentions it,
                 // and an ingress proxy has nothing to follow.
+                // R881-T4: `Some` — the appliance is `yah.exec = native`, a
+                // forked host process bound on the address it just reported.
                 state
                     .service_records
-                    .upsert_deployed(&spec, result.mesh_ip, &result.container_id);
+                    .upsert_deployed(&spec, Some(result.mesh_ip), &result.container_id);
                 return Ok(());
             }
             Err(e) => {
@@ -2028,6 +2034,11 @@ mod tests {
         NodeCapabilities {
             native_exec,
             native_exec_dir: Some("/var/lib/yah/kamaji/native".into()),
+            microvm: kamaji_proto::MicroVmHealth {
+                attached: false,
+                kvm_ok: None,
+                detail: None,
+            },
         }
     }
 

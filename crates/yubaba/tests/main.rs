@@ -44,5 +44,6 @@ mod raft_rebuild_fencing;
 mod raft_sovereign_group;
 mod raft_tenant_placement;
 mod raft_transfer_leader;
+mod rebuild_drill;
 mod rig_singleton_ownership;
 mod rollout_resume;

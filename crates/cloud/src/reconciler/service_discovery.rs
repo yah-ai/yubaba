@@ -400,6 +400,54 @@ impl ServiceRecordFanout {
         }
     }
 
+    /// The one `host:port` a workload registered as `ident` is dialable at, or
+    /// `None` when the read cannot say unambiguously.
+    ///
+    /// The ident-keyed counterpart of [`upstreams_for`](Self::upstreams_for) +
+    /// [`port_for`](Self::port_for), for a consumer that has an identity and no
+    /// number: an inner-door mount (R870-F23) names a *unit*, and which port
+    /// that unit took is precisely what the record answers. An `IngressRule`
+    /// can select by port because a hostname rule carries one; a mount cannot.
+    ///
+    /// **Singular, where `upstreams_for` is plural, and that is a real limit
+    /// rather than an oversight.** passway's route-table format carries an
+    /// `upstreams` array per mount, so N backends are expressible — but an
+    /// inner door proxies over loopback to a unit on *its own node*, and a unit
+    /// at horizontal scale > 1 has one address per node. Handing this door the
+    /// whole fleet's set would make it dial across the mesh, which is neither
+    /// what the cleartext listener's safety argument assumed nor what the
+    /// operator asked for. Two nodes answering with two addresses is therefore
+    /// ambiguity, not load balancing, and ambiguity is `None`.
+    ///
+    /// Port selection follows [`port_for`](Self::port_for)'s discipline exactly
+    /// — the port named [`kamaji::DEFAULT_PORT_NAME`] first, then the record's
+    /// sole anonymous port — so a multi-listener unit resolves the same way at
+    /// both tiers or at neither.
+    pub fn address_for_ident(&self, ident: &str) -> Option<String> {
+        let mut found: Vec<String> = Vec::new();
+        for (_, visibility) in self.nodes.iter() {
+            for record in visibility.records().iter().filter(|r| r.ident == ident) {
+                let port = record
+                    .named_ports
+                    .get(kamaji::DEFAULT_PORT_NAME)
+                    .copied()
+                    .or(match record.ports.as_slice() {
+                        [one] => Some(*one),
+                        _ => None,
+                    });
+                let Some(port) = port else { continue };
+                let addr = format!("{}:{port}", record.mesh_ip);
+                if !found.contains(&addr) {
+                    found.push(addr);
+                }
+            }
+        }
+        match found.as_slice() {
+            [one] => Some(one.clone()),
+            _ => None,
+        }
+    }
+
     /// Whether `machine`'s records may answer for `rule` — true for every node
     /// when the rule declares no placement.
     fn in_scope(&self, rule: &IngressRule, machine: &str) -> bool {
@@ -1105,5 +1153,80 @@ mod tests {
         let mut portless = rule("yah.dev", 0, &["us-east-001"]);
         portless.port = None;
         assert!(fanout.upstreams_for(&portless).is_empty());
+    }
+
+    // ── address_for_ident (R870-F23 step 3) ─────────────────────────────────
+
+    /// The whole point of the ident-keyed read: a node running three workloads
+    /// answers for the one asked about, with the port IT took — which is the
+    /// fact an inner-door mount has no other way to learn.
+    #[test]
+    fn an_ident_resolves_to_the_address_that_workload_registered() {
+        let mut fanout = ServiceRecordFanout::default();
+        fanout.push_answer(
+            "us-east-001",
+            vec![
+                named_record("noisetable", "100.64.0.3", &[8080]),
+                named_record("noisetable-account", "100.64.0.3", &[43117]),
+                named_record("something-else", "100.64.0.3", &[9999]),
+            ],
+        );
+        assert_eq!(
+            fanout.address_for_ident("noisetable-account").as_deref(),
+            Some("100.64.0.3:43117")
+        );
+        assert_eq!(fanout.address_for_ident("noisetable").as_deref(), Some("100.64.0.3:8080"));
+        assert_eq!(fanout.address_for_ident("not-deployed"), None);
+    }
+
+    /// Two nodes answering with two addresses is ambiguity, not load
+    /// balancing. An inner door proxies over loopback to a unit on its OWN
+    /// node; handed the fleet's set it would dial across the mesh, which is
+    /// neither what was asked for nor what the cleartext listener assumed.
+    #[test]
+    fn a_unit_on_two_nodes_is_ambiguous_rather_than_load_balanced() {
+        let mut fanout = ServiceRecordFanout::default();
+        fanout.push_answer("us-east-001", vec![named_record("acct", "100.64.0.3", &[43117])]);
+        fanout.push_answer("us-south-001", vec![named_record("acct", "100.64.0.4", &[43117])]);
+        assert_eq!(fanout.address_for_ident("acct"), None);
+    }
+
+    /// The same workload reported by two nodes at ONE address — a duplicate
+    /// read, not a second backend — still resolves. Deduplication is on the
+    /// address, so re-asking a node cannot manufacture ambiguity.
+    #[test]
+    fn one_address_reported_twice_is_still_one_address() {
+        let mut fanout = ServiceRecordFanout::default();
+        fanout.push_answer("us-east-001", vec![named_record("acct", "100.64.0.3", &[43117])]);
+        fanout.push_answer("us-east-001-again", vec![named_record("acct", "100.64.0.3", &[43117])]);
+        assert_eq!(fanout.address_for_ident("acct").as_deref(), Some("100.64.0.3:43117"));
+    }
+
+    /// A multi-listener workload resolves on its `http` name, exactly as
+    /// `port_for` does — so a unit resolves the same way at both tiers or at
+    /// neither. `name_anonymous_ports` refuses to name an unnamed pair, which
+    /// is what makes the unnamed case ambiguous rather than a coin flip.
+    #[test]
+    fn a_multi_listener_unit_resolves_on_its_serving_port_name() {
+        let mut named = ServiceRecordFanout::default();
+        named.push_answer(
+            "us-east-001",
+            vec![DiscoveredRecord {
+                ident: "acct".into(),
+                mesh_ip: "100.64.0.3".into(),
+                ports: vec![43117, 9100],
+                named_ports: [("http".to_string(), 43117), ("metrics".to_string(), 9100)]
+                    .into_iter()
+                    .collect(),
+            }],
+        );
+        assert_eq!(named.address_for_ident("acct").as_deref(), Some("100.64.0.3:43117"));
+
+        let mut anonymous = ServiceRecordFanout::default();
+        anonymous.push_answer(
+            "us-east-001",
+            vec![named_record("acct", "100.64.0.3", &[43117, 9100])],
+        );
+        assert_eq!(anonymous.address_for_ident("acct"), None);
     }
 }

@@ -1732,6 +1732,7 @@ mod tests {
             publishes: None,
             wave: 0,
             git: None,
+            deploy: Default::default(),
         };
         let mirror = crate::MirrorConfig {
             schema_version: 1,
@@ -1803,6 +1804,7 @@ mod tests {
             publishes: None,
             wave: 0,
             git: None,
+            deploy: Default::default(),
         };
         let mirror = crate::MirrorConfig {
             schema_version: 1,
@@ -1886,6 +1888,7 @@ mod tests {
             publishes: None,
             wave: 0,
             git: None,
+            deploy: Default::default(),
         };
         let mirror = crate::MirrorConfig {
             schema_version: 1,
@@ -1967,6 +1970,7 @@ mod tests {
             publishes: None,
             wave: 0,
             git: None,
+            deploy: Default::default(),
         };
         let mirror = crate::MirrorConfig {
             schema_version: 1,
@@ -2042,6 +2046,7 @@ mod tests {
             publishes: None,
             wave: 0,
             git: None,
+            deploy: Default::default(),
         };
         let mirror = crate::MirrorConfig {
             schema_version: 1,

@@ -63,6 +63,18 @@
 //! @yah:verify("cargo check --workspace --locked  # clean")
 //! @yah:verify("./target/debug/yah cloud apply --env cloud --service yah-desktop  # domain summary shows cdn-yah-dev=ok, yah-dev/app-yah-dev=skipped (routed)")
 //! @yah:verify("curl -sI https://cdn.yah.dev/yah-desktop/whisper/distil-large-v3-q5_1.bin  # HTTP/2 200, content-length 584567555")
+//!
+//! @yah:ticket(R870-B25, "The cloud-init template drift guard is vacuously green, and the canonical mirror.yml it should guard is 128 lines stale")
+//! @yah:at(2026-09-11T00:24:58Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R870)
+//! @yah:severity(high)
+//! @yah:next("OPERATIONAL QUESTION THIS RAISES, worth answering separately from the code fix: which is the provisioning path actually used, the embedded template or the repo-root canonical one? If any node was provisioned from the canonical copy since R858-F17 landed, it has no turso-backup helpers and its durability-declaring workloads will refuse to deploy. `rendered_runcmd_entries_are_all_strings` is the gate that genuinely catches the colon-space footgun and IS green — this ticket is about the twin-file guard beside it, not that one.")
+//! @yah:verify("The drift guard must FAIL on today's tree (proving it now compares something real), then pass once the canonical `.yah/infra/cloud-init/mirror.yml` is brought level with the embedded template. Asserting only the post-fix green is the weak form — it passes for the same vacuous reason it does today.")
+//! @yah:gotcha("Found by independent verification of R870-F23 phase 2 (@Ashguard:dove, session:60d4f41f), confirming a claim from @Ashguard:blade's implementation pass. NOT caused by R870-F23 — pre-existing, and F23's own change is green and unaffected. Do not read this as a phase-2 regression.")
+//! @yah:next("THE DEFECT, read not inferred. `embedded_template_matches_workspace_canonical` exists to prove the mirror.yml compiled into the binary matches the canonical copy on disk. It resolves the workspace root by walking `CARGO_MANIFEST_DIR.ancestors()`, which lands on `oss/yubaba` — an independent Cargo workspace whose `.yah/` holds only a `.gitignore`. The canonical path therefore does not exist, the test takes its `canonical_path.exists()` bootstrap branch, and asserts NOTHING. It has been green for that reason, not because the files agree.")
+//! @yah:next("WHAT THE GUARD IS MISSING, measured: the repo-root `.yah/infra/cloud-init/mirror.yml` is 128 diff-lines behind `oss/yubaba/crates/cloud/templates/mirror.yml`. It is missing the ENTIRE R858-F17 turso-backup block, and the YAML-quoting fix R870-F23 landed in the embedded copy (the two runcmd entries whose bare `: ` made cloud-init parse them as a Mapping and skip them). THE FIX IS TWO PARTS AND THE ORDER MATTERS: first make the guard non-vacuous — resolve the canonical path against the REPO root rather than the enclosing cargo workspace, or fail loudly when it cannot be found, so the bootstrap branch can no longer swallow a real absence. Then reconcile the two files. Doing only the second leaves the guard still asleep for the next drift.")
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -89,7 +101,11 @@ pub mod ingress_verify;
 pub mod local_process;
 pub mod mesofact_bundle;
 pub mod mesofact_static;
-mod native_support;
+// `pub(crate)` rather than private: `sanitize_ident` is the crate's ONE mesh-ident
+// normalizer, and R870-F23's `inner_door::component_workload_ident` has to fold
+// its derived ident the same way `local_process` folds its own. A second copy
+// would be a second normalizer that can drift.
+pub(crate) mod native_support;
 pub mod pg_driver;
 pub mod pond;
 pub mod pond_door;
@@ -851,6 +867,7 @@ mod source_seam_tests {
             publishes: None,
             wave: 0,
             git,
+            deploy: Default::default(),
         }
     }
 

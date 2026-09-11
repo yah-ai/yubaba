@@ -103,6 +103,7 @@ fn operator_workload_spec(name: &str, tag: &str, port: u16) -> WorkloadSpec {
         },
         labels: Default::default(),
         annotations: Default::default(),
+        files: Vec::new(),
     }
 }
 

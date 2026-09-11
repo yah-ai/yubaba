@@ -27,10 +27,10 @@ path = "src/main.rs"
 # turso-backup is `publish = false` and owns no such name, so there is nothing
 # to patch. Same relative-path shape as yubaba's own `mshr` dep. Verified
 # 2026-08-10 against oss/turso-backup/Cargo.toml.
-turso-backup = { path = "../../../turso-backup", version = "0.8.36" }
+turso-backup = { path = "../../../turso-backup", version = "0.8.37" }
 # TenantId only — the one tenant identifier in the system (R732-F1 deliberately
 # minted no second one).
-workload-spec = { package = "yah-workload-spec", version = "0.8.36" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.37" }
 # R869 / W339 step 1. The global tenant->cell pointer's GENERATION is the only
 # fence a cluster rebuilt from nothing can raise against a node resurrected from
 # the dead, because it is minted by CAS on an object the dead raft group cannot
@@ -42,7 +42,7 @@ yah-tenant-pointer = { path = "../../../yah-base/crates/tenant-pointer" }
 # The `ObjectStore` trait that pointer CAS runs over (plus its in-memory double
 # in tests). This one IS on crates.io, so it takes the house `version` +
 # [patch.crates-io] shape rather than a path.
-yah-object-store = "0.8.36"
+yah-object-store = "0.8.37"
 
 anyhow = "1.0"
 async-trait = "0.1"

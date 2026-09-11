@@ -165,6 +165,29 @@ enum Cmd {
         /// `/workloads/deploy` stays in stub mode.
         #[arg(long, default_value = DEFAULT_CONTAINERD_SOCKET)]
         containerd_socket: String,
+        /// R881-T4 (W343): container range this node addresses isolated-netns
+        /// workloads out of, e.g. `10.128.0.0/9`. Unset, such a workload gets
+        /// no address at all and its service record is published
+        /// `NotReady { reason: "unroutable" }` — reachable only by `nsenter`.
+        ///
+        /// **Must match the `--container-net` this node's kamaji was started
+        /// with.** The two never exchange it: yubaba allocates out of the range
+        /// and kamaji recovers the `/24` from the address it is handed. A
+        /// mismatch does not error — kamaji declines to wire an address outside
+        /// its own range and every tenant workload on the node is quietly
+        /// unreachable again. Set both from one drop-in.
+        ///
+        /// R881-T5: readable from `$YUBABA_CONTAINER_NET` so that "set both
+        /// from one drop-in" is actually possible. kamaji takes its half from
+        /// `$KAMAJI_CONTAINER_NET` (kamaji-bin/src/main.rs), and yubaba's own
+        /// unit on a fleet node already has its `ExecStart=` re-declared by a
+        /// raft drop-in — so a flag-only knob here would have meant editing
+        /// that re-declaration, which is exactly the footgun kamaji.service's
+        /// header warns about (a later drop-in resetting `ExecStart=` silently
+        /// drops flags, and half of the 2026-09-03 mesh outage was that).
+        /// `Environment=` composes; a second `ExecStart=` does not.
+        #[arg(long, env = "YUBABA_CONTAINER_NET")]
+        container_net: Option<String>,
         /// R406-T8: UDS path for the Kamaji sibling process. When set,
         /// yubaba dispatches workload list/state/drain through Kamaji
         /// over postcard-framed messages. If the connection fails at
@@ -189,9 +212,19 @@ enum Cmd {
         /// advertises no scryer, which is correct for an opted-out box
         /// (the mesh tolerates absence, A049 §"What scryer is not"). The
         /// value names THIS node's own mesh IP so it is per-node config:
-        /// production sets it via a yubaba.service drop-in, the same shape
-        /// as the 20-mesh-bind drop-in.
-        #[arg(long)]
+        /// production sets it via a yubaba.service drop-in.
+        ///
+        /// `env =` FOR THE SAME REASON `--container-net` HAS ONE (R881-T5,
+        /// above): on a raft voter, `30-raft.conf` already re-declares this
+        /// unit's whole `ExecStart=` line, so a flag-only knob forces a THIRD
+        /// copy of that line into a later drop-in — and a copy is exactly how
+        /// a flag gets silently dropped when someone edits one of the other
+        /// two. `Environment=YUBABA_SCRYER_ENDPOINT=http://<mesh-ip>:6543`
+        /// composes instead. Added 2026-09-10 while wiring us-east-001
+        /// (R556-F6 gate (b)); that node runs 0.8.37-h1, which predates this,
+        /// so it carries the ExecStart re-declaration as a stated interim and
+        /// its drop-in names the `Environment=` line that replaces it.
+        #[arg(long, env = "YUBABA_SCRYER_ENDPOINT")]
         scryer_endpoint: Option<String>,
         /// Phase 2: this node's raft node ID (u64, unique per yubaba instance).
         /// When set, the raft coordination layer is started and `/raft/*`
@@ -777,6 +810,7 @@ fn default_serve() -> Cmd {
         state: PathBuf::from(DEFAULT_STATE_PATH),
         channel: "stable".to_string(),
         containerd_socket: DEFAULT_CONTAINERD_SOCKET.to_string(),
+        container_net: None,
         kamaji_socket: None,
         scryer_endpoint: None,
         raft_node_id: None,
@@ -819,6 +853,7 @@ async fn main() -> Result<()> {
             state,
             channel,
             containerd_socket,
+            container_net,
             kamaji_socket,
             scryer_endpoint,
             raft_node_id,
@@ -897,6 +932,26 @@ async fn main() -> Result<()> {
             let mut server_state = ServerState::load(state)?
                 .with_cluster_policy(policy)
                 .with_bind_addr(&bind);
+
+            // R881-T4 (W343). A malformed range fails startup rather than
+            // degrading to "no container networking": an operator who passed
+            // --container-net asked for reachable workloads, and quietly
+            // serving unreachable ones is the failure R881 exists to remove.
+            if let Some(range) = &container_net {
+                let range = kamaji::container_net::Ipv4Cidr::parse(range)
+                    .map_err(|e| anyhow::anyhow!("--container-net: {e:#}"))?;
+                tracing::info!(
+                    %range,
+                    node_mesh_ip = ?server_state.node_mesh_ip(),
+                    "allocating per-workload container addresses (W343)"
+                );
+                server_state = server_state.with_container_net(
+                    kamaji::container_net::ContainerNet::new(
+                        range,
+                        kamaji::container_net::DEFAULT_BRIDGE,
+                    ),
+                );
+            }
 
             // R556-F6 gate (b): make the /services scryer advertisement
             // reachable from the daemon. `with_scryer_endpoint` existed since
@@ -1733,14 +1788,32 @@ async fn main() -> Result<()> {
         },
         Cmd::Domain { cmd } => run_domain_cmd(cmd),
         Cmd::Holding { cmd } => run_holding_cmd(cmd),
-        Cmd::State { cmd } => run_state_cmd(cmd),
+        // Off the runtime, unlike its two siblings above — see `run_state_cmd`.
+        Cmd::State { cmd } => tokio::task::spawn_blocking(move || run_state_cmd(cmd)).await?,
     }
 }
 
 /// R869 (W339) — the `state` verbs, against the object store directly.
 ///
-/// Synchronous inside an async `main` for the same reason [`run_domain_cmd`]
-/// is: the object-store API is blocking and these are one-shot commands.
+/// Synchronous, like [`run_domain_cmd`] and [`run_holding_cmd`]: the
+/// object-store API is blocking and these are one-shot commands.
+///
+/// **Called through `spawn_blocking`, unlike those two, and that is not
+/// stylistic.** `R2ObjectStore::new` builds a `reqwest::blocking::Client`,
+/// whose constructor drops a temporary tokio runtime; `reqwest::blocking`
+/// asserts against that happening inside an async context, so calling this
+/// directly from the async `main` panics with "Cannot drop a runtime in a
+/// context where blocking is not allowed" before it reads a single byte.
+///
+/// The assert is `#[cfg(debug_assertions)]`, so a **release** binary — which is
+/// what `/usr/local/bin/yubaba` is — never trips it. That asymmetry is exactly
+/// why this is worth fixing rather than documenting: these are the
+/// disaster-recovery verbs, the one family somebody may well run from a
+/// `cargo build` of a checkout on a machine that has nothing installed on it,
+/// and discovering they panic is a terrible thing to discover during a
+/// recovery. `yubaba domain` and `yubaba holding` still have the un-wrapped
+/// shape and still panic from a debug build; that is their tickets' call, not
+/// R869's.
 fn run_state_cmd(cmd: StateCmd) -> Result<()> {
     use yubaba::state_backup;
 

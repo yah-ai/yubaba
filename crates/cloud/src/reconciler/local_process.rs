@@ -1347,6 +1347,7 @@ socket = "/tmp/mine.sock"
                 publishes: None,
                 wave: 0,
                 git: None,
+                deploy: Default::default(),
             }],
             db: crate::DbCatalog::default(),
         }

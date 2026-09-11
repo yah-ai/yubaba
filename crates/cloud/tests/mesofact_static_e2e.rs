@@ -104,6 +104,7 @@ async fn local_static_reconciler_brings_up_app_yah_web() {
         publishes: None,
         git: None,
         wave: 0,
+        deploy: Default::default(),
     };
 
     let reconciler = MesofactStaticReconciler::new().with_local_static(LocalStaticOptions {

@@ -624,6 +624,7 @@ mod mesh {
                 },
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
+                files: Vec::new(),
             }
         }
 

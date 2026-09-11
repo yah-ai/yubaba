@@ -113,6 +113,7 @@ pub(crate) fn native_spec(ident: &str, argv: Vec<String>, env: Vec<EnvVar>) -> W
         namespace: NamespaceId::singleton(),
         labels: Default::default(),
         annotations: Default::default(),
+        files: Vec::new(),
     }
 }
 

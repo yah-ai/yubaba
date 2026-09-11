@@ -237,6 +237,7 @@ impl TestWorkspace {
                 publishes: None,
                 git: None,
                 wave: 0,
+                deploy: Default::default(),
             },
             mirror: MirrorConfig {
                 schema_version: 1,

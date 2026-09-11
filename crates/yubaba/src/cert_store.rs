@@ -855,9 +855,12 @@ impl ObjectCertStore {
             source,
         })?;
 
+        // None throughout this file: ACME issuance claims are a private
+        // inter-node lock read over the S3 API, never served to a browser, so
+        // there is no cache to direct (R330-B51).
         match self
             .objects
-            .put_if(&key, body.clone(), Precondition::IfAbsent)
+            .put_if(&key, body.clone(), Precondition::IfAbsent, None)
         {
             Ok(_) => return Ok(claim),
             Err(ObjectError::PreconditionFailed(_)) => {}
@@ -874,7 +877,7 @@ impl ObjectCertStore {
             // finished and released. Retry the create; a second racer that got
             // here at the same moment loses that IfAbsent, and losing is
             // `Claimed`, not a backend fault.
-            return match self.objects.put_if(&key, body, Precondition::IfAbsent) {
+            return match self.objects.put_if(&key, body, Precondition::IfAbsent, None) {
                 Ok(_) => Ok(claim),
                 Err(ObjectError::PreconditionFailed(_)) => Err(CertStoreError::Claimed {
                     domain: domain.to_string(),
@@ -897,7 +900,7 @@ impl ObjectCertStore {
                 remaining_secs,
             });
         }
-        match self.objects.put_if(&key, body, Precondition::IfMatch(etag)) {
+        match self.objects.put_if(&key, body, Precondition::IfMatch(etag), None) {
             Ok(_) => Ok(claim),
             // Lost the steal to another node that noticed the same expiry.
             Err(ObjectError::PreconditionFailed(_)) => Err(CertStoreError::Claimed {

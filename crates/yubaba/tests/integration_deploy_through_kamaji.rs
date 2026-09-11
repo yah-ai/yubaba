@@ -77,6 +77,10 @@ fn container_spec(name: &str) -> WorkloadSpec {
         user: None,
         env: vec![],
         secrets: vec![],
+        // Call-site repair only: `WorkloadSpec::files` was added while this
+        // test tree was shared, and empty is what "no inline files" means for
+        // a spec whose whole point is to be minimal.
+        files: vec![],
         volumes: vec![],
         resources: ResourceLimits {
             memory_mb: 64,
