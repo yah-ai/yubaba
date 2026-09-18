@@ -31,7 +31,7 @@ use anyhow::{Context, Result};
 use local_driver::{ContainerLauncher, ContainerRunSpec};
 use workload_spec::{
     EnvValue, EnvVar, ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, NamespaceId,
-    ResourceLimits, RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, VolumeMount,
+    ResourceLimits, RestartPolicy, StopPolicy, TenantId, TierTag, VolumeMount,
     VolumeSource, WorkloadSpec,
 };
 
@@ -45,11 +45,15 @@ use kamaji::Kamaji as ContainerRuntime;
 ///
 /// [`annotation_keys_match_kamaji`]: tests::annotation_keys_match_kamaji
 ///
-/// `PUBLISH_ANNOTATION` is `pub(crate)` because it is also the one spec fact
-/// that makes a *namespaced* container reachable at the node's own address —
-/// see [`crate::service_records::binds_node_ports`] (R881-B1). Both readers
-/// share this constant so the pin test above covers both.
-pub(crate) const PUBLISH_ANNOTATION: &str = "yah.docker.publish";
+/// `PUBLISH_ANNOTATION` is the one spec fact that makes a *namespaced*
+/// container reachable at the node's own address — see
+/// [`crate::service_records::binds_node_ports`] (R881-B1). Both readers share
+/// one constant so the pin test above covers both.
+///
+/// noisetable R118-T11: it is now DEFINED in `service_records`, because that
+/// reader is not pond code and must compile with the `pond` feature off. Same
+/// single constant, re-homed to the module whose need is unconditional.
+pub(crate) use crate::service_records::PUBLISH_ANNOTATION;
 const NETWORK_ANNOTATION: &str = "yah.docker.network";
 const NETWORK_ALIAS_ANNOTATION: &str = "yah.docker.network_alias";
 
@@ -138,7 +142,6 @@ pub fn lower_run_spec(spec: &ContainerRunSpec) -> Result<WorkloadSpec> {
     labels.insert(POND_LABEL_KEY.to_string(), spec.label.clone());
 
     Ok(WorkloadSpec {
-        schema_version: SchemaVersion::V1,
         name: spec.name.clone(),
         image: parse_image(&spec.image)?,
         tier: TierTag("infra".into()),
@@ -173,6 +176,7 @@ pub fn lower_run_spec(spec: &ContainerRunSpec) -> Result<WorkloadSpec> {
                 },
                 target: container.into(),
                 read_only: false,
+                from_secret_mount: false,
             })
             .collect(),
         // Pond slots run uncapped, as they did under `LocalRuntime::run` —
@@ -182,7 +186,10 @@ pub fn lower_run_spec(spec: &ContainerRunSpec) -> Result<WorkloadSpec> {
         resources: ResourceLimits {
             memory_mb: 0,
             cpu_millis: 0,
-            ephemeral_storage_mb: 0,
+            memory_request_mb: None,
+            cpu_limit_millis: None,
+            pids_max: None,
+            scratch_floor_mb: None,
         },
         depends_on: vec![],
         requires: vec![],
@@ -210,6 +217,7 @@ pub fn lower_run_spec(spec: &ContainerRunSpec) -> Result<WorkloadSpec> {
             operator: None,
         },
         labels,
+        durability: None,
         annotations,
         files: Vec::new(),
     })

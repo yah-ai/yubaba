@@ -21,13 +21,11 @@
 
 use std::path::{Path, PathBuf};
 
-use aes_gcm::aead::Aead;
-use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use workload_spec::secrets::{SecretAccess, SecretConsumer, SecretError, SecretResolver};
 use workload_spec::{SecretMount, SecretRef, SecretTarget};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::raft::{SecretRecord, YubabaStateMachine};
+use crate::raft::SecretRecord;
 
 /// Default per-machine yubaba secret store root.
 pub const SECRET_STORE_ROOT: &str = "/var/lib/yah/yubaba/secrets";
@@ -102,27 +100,99 @@ impl SecretResolver for LocalFileResolver {
 /// replicated cluster secret ciphertext.
 pub const CLUSTER_KEK_PATH: &str = "/var/lib/yah/yubaba/cluster.kek";
 
-/// Read-only view over the local raft replica's cluster-secret map (R600-F1).
+/// Logical cluster-secret key for the issued TLS cert **chain** PEM of
+/// `domain`. e.g. `cert_secret_name("yah.dev") == "tls/yah.dev/cert"`.
 ///
-/// Abstracted as a trait so [`ClusterResolver`] is unit-testable without a live
-/// raft node. The production impl is on [`YubabaStateMachine`].
-pub trait ClusterSecretStore {
-    /// The ciphertext record stored under `name`, or `None` if absent from the
-    /// local replica.
-    fn get_secret(&self, name: &str) -> Option<SecretRecord>;
+/// noisetable R118-T11: these two lived in `acme_issuer`, which is now behind
+/// the `acme` feature — but they name a **cluster secret**, and the modules
+/// that read that secret back (`cert_materialize`, `tenant_passway`) are not
+/// ACME code and must still compile on a node that issues nothing. So the
+/// naming moved down here, to the module that owns the cluster-secret store,
+/// rather than being duplicated on the far side of a `#[cfg]`. One definition,
+/// as before; only the owner changed.
+pub fn cert_secret_name(domain: &str) -> String {
+    format!("tls/{domain}/cert")
 }
 
-impl ClusterSecretStore for YubabaStateMachine {
-    fn get_secret(&self, name: &str) -> Option<SecretRecord> {
-        self.cluster_secret(name)
-    }
+/// Logical cluster-secret key for the issued private **key** PEM of `domain`.
+/// e.g. `key_secret_name("yah.dev") == "tls/yah.dev/key"`. See
+/// [`cert_secret_name`] for why this lives here.
+pub fn key_secret_name(domain: &str) -> String {
+    format!("tls/{domain}/key")
 }
+
+/// Why a [`ClusterSecretStore`] could not answer — as opposed to answering
+/// "absent" (R911-F1).
+///
+/// The store used to return a bare `Option`, so an object-store outage and a
+/// record that was never written read identically. That is survivable for a
+/// deploy, which fails closed either way, and fatal for a caller that acts on
+/// absence (`headscale_state::materialize_noise_key` mints a fresh identity).
+/// Every variant here maps to [`SecretError::ClusterUnavailable`] at the
+/// resolver, never to `ClusterNotFound`.
+#[derive(Debug, thiserror::Error)]
+pub enum SecretStoreError {
+    /// This node has no fleet object store configured (`YUBABA_CERT_STORE_*`
+    /// unset), so it has no cluster-secret rail at all.
+    #[error(
+        "this node has no cluster secret store configured (set YUBABA_CERT_STORE_*); cluster \
+         secrets cannot be read here"
+    )]
+    Unconfigured,
+
+    /// This node declares no sovereign group (`--sovereign-group`). Cluster
+    /// secrets are keyed per group and there is deliberately no default group
+    /// (see [`crate::fleet_secrets`]), so this node has no cluster-secret rail.
+    #[error(
+        "this node declares no sovereign group (--sovereign-group); cluster secrets are keyed \
+         per group and cannot be read here"
+    )]
+    NoSovereignGroup,
+
+    /// `name` cannot be a store key: empty, absolute, or holding an empty,
+    /// `.` or `..` segment — or a `tls/` name that is not `tls/<domain>/cert`
+    /// or `tls/<domain>/key`.
+    #[error("{name:?} is not a valid cluster secret name")]
+    InvalidName { name: String },
+
+    /// The node's sovereign group cannot be one object-key segment.
+    #[error("sovereign group {group:?} cannot be a cluster secret store key segment")]
+    InvalidGroup { group: String },
+
+    /// The backing object store failed (network, auth, protocol).
+    #[error("cluster secret store backend: {0}")]
+    Backend(#[from] yah_object_store::Error),
+
+    /// An object exists at the key but is not a sealed record. A hard error,
+    /// never a miss.
+    #[error("cluster secret store: malformed record at {key}: {source}")]
+    Malformed {
+        key: String,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+/// Read-only view over the fleet's cluster-secret store (R600-F1, R911-F1).
+///
+/// Abstracted as a trait so [`ClusterResolver`] is unit-testable without a
+/// bucket. The production impl is
+/// [`FleetSecretStore`](crate::fleet_secrets::FleetSecretStore) — the one store
+/// every cluster secret resolves from.
+pub trait ClusterSecretStore {
+    /// The ciphertext record stored under `name`: `Ok(None)` only when the
+    /// store answered and holds nothing, `Err` when it could not answer.
+    fn get_secret(&self, name: &str) -> Result<Option<SecretRecord>, SecretStoreError>;
+}
+
 
 /// Resolves both secret arms on a fleet node:
 ///
 /// - `SecretRef::LocalFile` → delegated to an inner [`LocalFileResolver`].
-/// - `SecretRef::Cluster` → read the AES-256-GCM ciphertext from the local raft
-///   replica ([`ClusterSecretStore`]) and decrypt it with the node-local KEK.
+/// - `SecretRef::Cluster` → read the AES-256-GCM ciphertext from the fleet
+///   secret store ([`ClusterSecretStore`], in production
+///   [`FleetSecretStore`](crate::fleet_secrets::FleetSecretStore)) and decrypt
+///   it with the node-local KEK.
 ///
 /// The KEK is held for the resolver's lifetime as [`Zeroizing`] key material
 /// (scrubbed on drop), is never logged, and never leaves the node. Every
@@ -137,6 +207,37 @@ impl ClusterSecretStore for YubabaStateMachine {
 /// build a cluster resolver that skips the check, so a future call site cannot
 /// accidentally reintroduce the bearer-reference behaviour by forgetting to
 /// opt in.
+///
+/// @yah:ticket(R911-F1, "FleetSecretStore: one object-store read path for every cluster secret; trait returns Result")
+/// @yah:status(review)
+/// @yah:at(2026-09-15T04:14:50Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R911)
+/// @yah:next("Tier: Warrior — cross-module trait change with a fail-closed security invariant and a headscale identity hazard.")
+/// @yah:next("Change ClusterSecretStore::get_secret to return Result<Option<SecretRecord>, _>. The Option-only trait reads an R2 outage as absent (see the warn at cert_store.rs impl ClusterSecretStore for ObjectCertStore). Fix every impl and caller.")
+/// @yah:next("Add FleetSecretStore { objects: Arc<dyn ObjectStore>, issuer, group }: tls/<domain>/{cert,key} keeps cert_store::object_key's certs/<issuer>/<domain>/*.sealed; every other name maps to secrets/<group>/<name>.sealed (reject `..`, empty, or absolute segments). group = the node's sovereign_group (main.rs:1545 with_sovereign_group), else the literal `default`. Give it read/write/delete/index verbs; index yields (name, updated_at, access summary, digest).")
+/// @yah:next("Delete impl ClusterSecretStore for YubabaStateMachine, for ObjectCertStore, and LayeredSecretStore (plus its tests). Rebuild every resolver site on FleetSecretStore: lib.rs:4703 and the container call site it references, secret_reload.rs:269, cert_materialize.rs:290, leader.rs noise_key_resolver. A node with no cert-store config has no cluster-secret rail and fails closed with a named error.")
+/// @yah:next("headscale_state::materialize_noise_key: a store ERROR must never mint a fresh noise identity. Refuse or retry, and log which.")
+/// @yah:verify("cargo test -p yubaba --lib (from oss/yubaba) green vs baseline; new tests cover the key mapping, traversal rejection, Err-is-not-absent, and headscale not minting on Err.")
+/// @yah:verify("Code-only grep for LayeredSecretStore finds nothing.")
+/// @yah:files(oss/yubaba/crates/yubaba/src/secrets.rs)
+/// @yah:files(oss/yubaba/crates/yubaba/src/cert_store.rs)
+/// @yah:files(oss/yubaba/crates/yubaba/src/lib.rs)
+/// @yah:files(oss/yubaba/crates/yubaba/src/leader.rs)
+/// @yah:files(oss/yubaba/crates/yubaba/src/headscale_state.rs)
+/// @yah:handoff("LANDED (read side only). New module oss/yubaba/crates/yubaba/src/fleet_secrets.rs: FleetSecretStore { objects, issuer, group } with object_key, read_secret, write_secret, delete_secret, index() -> Vec<SecretIndexRow { name, updated_at, access (SecretAccess::summary), digest: Option<hex> }>, for_node(&ServerState) -> Option<Self> (group = sovereign_group or DEFAULT_GROUP \"default\"), and impl ClusterSecretStore. tls/<domain>/{cert,key} go through cert_store::object_key (certs/<issuer>/<domain>/*.sealed); every other name goes to secrets/<group>/<name>.sealed. A test_support::UnreachableObjectStore (cfg(test)) simulates an outage.")
+/// @yah:handoff("TRAIT: secrets.rs ClusterSecretStore::get_secret now returns Result<Option<SecretRecord>, SecretStoreError> (new enum: Unconfigured, InvalidName, InvalidGroup, Backend, Malformed). ClusterResolver maps Ok(None) to ClusterNotFound and any Err to the NEW workload_spec SecretError::ClusterUnavailable { name }, logging the store detail on the node. That variant lives in oss/yah-base/crates/workload-spec/src/secrets.rs, which is outside the ticket's file list but necessary: a distinct, name-only, fail-closed error. It is not an existence oracle, since an outage answers the same for every name.")
+/// @yah:handoff("DELETED: impl ClusterSecretStore for YubabaStateMachine, impl for ObjectCertStore, LayeredSecretStore, the Arc blanket impl, and their tests (FakeRaft, layered_prefers_raft..., raft_shadows...). The Option<S> blanket impl moved to secrets.rs, and its semantics CHANGED: None now answers Err(Unconfigured) instead of 'holds nothing'. That makes a node with no YUBABA_CERT_STORE_* fail closed by name at resolve time.")
+/// @yah:handoff("RESOLVER SITES rebuilt on FleetSecretStore::for_node(state): lib.rs build_secret_resolver (the raft cluster_state precondition is removed; the 'container call site' comment referred to this same shared function, which is the only one); secret_reload::run/reload_once (now take &Option<FleetSecretStore>); cert_materialize::run/materialize_once (adds a warn-level ClusterUnavailable arm, plus an error log at startup when there is no store); leader.rs noise_key_resolver (returns None only when there is no KEK). raft PutSecret, subscribe_secrets (still the wake signal in reload/materialize), acme_issuer writes and list_secrets were NOT touched.")
+/// @yah:handoff("HEADSCALE HAZARD: headscale_state::materialize_noise_key maps ClusterUnavailable to the new NoiseKeyError::StoreUnavailable. It REFUSES to start (start_headscale logs it and returns NoiseIdentity error) whether or not a key is on disk, and never reaches the Fresh/mint verdict. A KEK plus no cert-store config also refuses.")
+/// @yah:handoff("DESIGN CALLS: (a) the whole tls/ namespace is reserved. A tls/ name that is not tls/<domain>/{cert,key} is InvalidName rather than falling through to secrets/<group>/, so one name never has two candidate keys. (b) Names reject empty, '.', '..', a leading '/', backslash and control chars. cert_store::is_safe_domain now also rejects a bare '.'. (c) The group is validated lazily (InvalidGroup at first use) so construction stays infallible. (d) index() skips claim objects, other groups and non-roundtripping keys; a malformed record is an Err, not a skipped row. (e) The module lives in its own file rather than in cert_store.rs (already ~1900 lines).")
+/// @yah:verify("BASELINE before edits: cargo test -p yubaba --lib (oss/yubaba) = 946 passed / 0 failed, EXIT=0.")
+/// @yah:verify("AFTER: cargo test -p yubaba --lib = 961 passed / 0 failed, EXIT=0 (+15: 14 in fleet_secrets, secrets::a_store_error_is_unavailable_not_absent, headscale_state::a_store_outage_refuses_to_start_and_never_mints and ::the_real_resolver_over_a_down_or_missing_store_refuses_to_start, minus the 2 deleted layered tests).")
+/// @yah:verify("cargo check -p yubaba --all-targets EXIT=0, no new yubaba warnings. cargo check -p yubaba --features testing --lib --tests EXIT=0. cargo test -p yubaba --features testing --lib secret_reload = 2 passed (the feature-gated rotation tests, now seeded through FleetSecretStore over InMemoryObjectStore).")
+/// @yah:verify("Code-only grep for LayeredSecretStore across oss/app/crates (doc/annotation lines stripped) = 0.")
+/// @yah:gotcha("ROLL HAZARD: this build reads cluster secrets ONLY from R2. Deploying it before the migration ticket has copied each group's raft secret map to secrets/<group>/ (and the tls/yah.dev pair to certs/<issuer>/) makes every cluster-secret deploy fail ClusterNotFound, and makes headscale fall to LocalOnly/Fresh when the record is genuinely absent. It also makes any node without YUBABA_CERT_STORE_* refuse to start headscale and refuse cluster-secret deploys. Do not roll F1 alone: migration first, per R911's ROLL note.")
+/// @yah:gotcha("BLOCKING I/O: FleetSecretStore reads go through reqwest::blocking on the calling thread. They are now used in async contexts (deploy handler, secret_reload, cert_materialize via its async run, start_headscale). The deploy path already did this for the R779 TLS fallback, but it now happens for every cluster secret. Consider spawn_blocking if a tokio worker stall shows up.")
+/// @yah:gotcha("yah build run could not start the camp daemon's TaskRun store (turso short read on page 24050), so builds ran locally outside the camp queue. That is a camp-daemon problem, not this ticket's.")
 pub struct ClusterResolver<S: ClusterSecretStore> {
     store: S,
     kek: Zeroizing<[u8; 32]>,
@@ -191,12 +292,27 @@ impl<S: ClusterSecretStore> ClusterResolver<S> {
     /// on success; every failure is a fail-closed `SecretError` naming only the
     /// logical secret.
     fn resolve_cluster(&self, name: &str) -> Result<Vec<u8>, SecretError> {
-        let rec = self
-            .store
-            .get_secret(name)
-            .ok_or_else(|| SecretError::ClusterNotFound {
-                name: name.to_string(),
-            })?;
+        let rec = match self.store.get_secret(name) {
+            Ok(Some(rec)) => rec,
+            Ok(None) => {
+                return Err(SecretError::ClusterNotFound {
+                    name: name.to_string(),
+                })
+            }
+            // R911-F1: an unanswerable store is NOT an absent record. The detail
+            // (backend error, malformed key) stays in the node's log; the
+            // returned error carries only the logical name.
+            Err(e) => {
+                tracing::warn!(
+                    secret = %name,
+                    error = %e,
+                    "cluster secret store could not be read; failing closed as unavailable"
+                );
+                return Err(SecretError::ClusterUnavailable {
+                    name: name.to_string(),
+                });
+            }
+        };
         open_cluster_secret(&self.kek, name, &rec, &self.consumer)
     }
 }
@@ -205,12 +321,11 @@ impl<S: ClusterSecretStore> ClusterResolver<S> {
 /// [`seal_cluster_secret`], and **the only place a sealed record is opened**.
 ///
 /// Extracted from [`ClusterResolver::resolve_cluster`] by R852-F3, which needs
-/// the same operation against a record that did not come from raft: a per-domain
-/// tenant cert lives in the object store (see [`crate::cert_store`]), read with
+/// the same operation against a record read outside the resolver: a per-domain
+/// tenant cert read with
 /// [`ObjectCertStore::read_secret`](crate::cert_store::ObjectCertStore::read_secret)
-/// rather than through [`ClusterSecretStore`] because that trait's `Option`
-/// return cannot distinguish "no cert issued yet" from "the bucket is
-/// unreachable", and one of those must not be reported as the other.
+/// by a caller that must tell "no cert issued yet" from "the bucket is
+/// unreachable" itself.
 ///
 /// A second decryption path is exactly the kind of code that drifts — the
 /// authorize-before-KEK ordering, the nonce-length guard and the deliberately
@@ -242,23 +357,21 @@ pub fn open_cluster_secret(
         });
     }
 
-    // GCM nonces are 12 bytes. A record with any other nonce length is
-    // treated as a decrypt failure rather than panicking in `from_slice`.
-    if rec.nonce.len() != 12 {
-        return Err(SecretError::ClusterDecrypt {
-            name: name.to_string(),
-        });
-    }
-
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(kek));
-    let nonce = Nonce::from_slice(&rec.nonce);
-    // A wrong KEK or tampered ciphertext fails the GCM tag check here; the
-    // error is opaque on purpose — no key, nonce, or ciphertext is logged.
-    cipher
-        .decrypt(nonce, rec.ciphertext.as_ref())
-        .map_err(|_| SecretError::ClusterDecrypt {
-            name: name.to_string(),
-        })
+    // R911-F4: open under the name being resolved and the rule ON THE RECORD.
+    // The check above trusted that rule; this is where it is authenticated. A
+    // widened rule, or a ciphertext copied here from another name, passed the
+    // check and now fails the tag. A wrong KEK, tampered bytes, or a malformed
+    // nonce fail the same way. The error is opaque on purpose — no key, nonce,
+    // or ciphertext is logged — and carries only the name.
+    workload_spec::secrets::open(
+        kek,
+        &rec.nonce,
+        &rec.ciphertext,
+        &workload_spec::secrets::secret_aad(name, &rec.access),
+    )
+    .map_err(|_| SecretError::ClusterDecrypt {
+        name: name.to_string(),
+    })
 }
 
 impl<S: ClusterSecretStore> SecretResolver for ClusterResolver<S> {
@@ -336,13 +449,23 @@ pub fn load_cluster_kek(path: &Path) -> Result<Zeroizing<[u8; 32]>, SecretError>
 /// cert is never declared by a camp — it is minted here, on the node, and has
 /// nothing to drift against. `None` is `yah cloud secret status`'s
 /// `unknown(pre-digest)` bucket, which exists for exactly this case.
+///
+/// R911-F4: `name` is the logical name the record will be resolved under. It
+/// and `access` are bound into the seal as associated data
+/// ([`workload_spec::secrets::secret_aad`]), so the record opens only under
+/// that name with that exact rule.
 pub fn seal_cluster_secret(
     kek: &[u8; 32],
+    name: &str,
     plaintext: &[u8],
     updated_at: u64,
     access: SecretAccess,
 ) -> SecretRecord {
-    let sealed = workload_spec::secrets::seal(kek, plaintext);
+    let sealed = workload_spec::secrets::seal(
+        kek,
+        plaintext,
+        &workload_spec::secrets::secret_aad(name, &access),
+    );
     SecretRecord {
         ciphertext: sealed.ciphertext,
         nonce: sealed.nonce,
@@ -681,10 +804,16 @@ mod tests {
     }
 
     // ── Cluster resolver (R600-F2) ──────────────────────────────────────────
-    // `Aes256Gcm`, `Key`, `KeyInit`, `Nonce`, and the `Aead` trait are already
-    // in scope via `use super::*`; only `HashMap` is new here.
+    // The raw cipher is test-only here since R911-F4: production opens through
+    // `workload_spec::secrets::open`. These fixtures seal with a FIXED nonce so
+    // a test can reason about exact bytes, which the production seal never does.
 
+    use aes_gcm::aead::{Aead, Payload};
+    use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
     use std::collections::HashMap;
+
+    /// The logical name the fixed-nonce fixtures are sealed under (R911-F4).
+    const TEST_SECRET: &str = "tls/yah.dev";
 
     const TEST_KEK: [u8; 32] = [7u8; 32];
     const TEST_NONCE: [u8; 12] = [3u8; 12];
@@ -717,9 +846,28 @@ mod tests {
         plaintext: &[u8],
         access: SecretAccess,
     ) -> SecretRecord {
+        seal_named(kek, nonce, TEST_SECRET, plaintext, access)
+    }
+
+    /// A fixed-nonce fixture sealed under `name` (R911-F4), for a test that
+    /// resolves some name other than [`TEST_SECRET`].
+    fn seal_named(
+        kek: &[u8; 32],
+        nonce: &[u8; 12],
+        name: &str,
+        plaintext: &[u8],
+        access: SecretAccess,
+    ) -> SecretRecord {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(kek));
+        let aad = workload_spec::secrets::secret_aad(name, &access);
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(nonce), plaintext)
+            .encrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &aad,
+                },
+            )
             .expect("seal");
         SecretRecord {
             ciphertext,
@@ -750,9 +898,51 @@ mod tests {
     }
 
     impl ClusterSecretStore for FakeClusterStore {
-        fn get_secret(&self, name: &str) -> Option<SecretRecord> {
-            self.secrets.get(name).cloned()
+        fn get_secret(&self, name: &str) -> Result<Option<SecretRecord>, SecretStoreError> {
+            Ok(self.secrets.get(name).cloned())
         }
+    }
+
+    /// A store that cannot answer at all.
+    struct BrokenClusterStore;
+
+    impl ClusterSecretStore for BrokenClusterStore {
+        fn get_secret(&self, _name: &str) -> Result<Option<SecretRecord>, SecretStoreError> {
+            Err(SecretStoreError::Backend(yah_object_store::Error::Backend(
+                "connection reset".into(),
+            )))
+        }
+    }
+
+    /// R911-F1: an unanswerable store must surface as `ClusterUnavailable`,
+    /// never `ClusterNotFound` — a caller that acts on absence (headscale's
+    /// noise identity) would otherwise act on an outage.
+    #[test]
+    fn a_store_error_is_unavailable_not_absent() {
+        let root = tempfile::TempDir::new().unwrap();
+        let resolver = ClusterResolver::new(
+            BrokenClusterStore,
+            TEST_KEK,
+            LocalFileResolver::new(root.path()),
+            test_consumer(),
+        );
+        let err = resolver
+            .resolve(&SecretRef::Cluster {
+                name: "tls/yah.dev".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, SecretError::ClusterUnavailable { ref name } if name == "tls/yah.dev"),
+            "got {err}"
+        );
+        assert!(!err.to_string().contains("connection reset"), "{err}");
+        assert_ne!(
+            err.to_string(),
+            SecretError::ClusterNotFound {
+                name: "tls/yah.dev".into()
+            }
+            .to_string()
+        );
     }
 
     fn cluster_resolver(
@@ -931,7 +1121,7 @@ mod tests {
     fn seal_then_resolver_open_round_trips() {
         // The issuer seals; a consumer node opens with the same KEK — the exact
         // fleet path (F3 write → raft → F2 read).
-        let rec = seal_cluster_secret(&TEST_KEK, TLS_PEM, 1234, test_access());
+        let rec = seal_cluster_secret(&TEST_KEK, TEST_SECRET, TLS_PEM, 1234, test_access());
         assert_eq!(rec.nonce.len(), 12, "GCM nonce is 12 bytes");
         assert_eq!(rec.updated_at, 1234);
         assert_ne!(
@@ -953,8 +1143,8 @@ mod tests {
     #[test]
     fn seal_draws_a_fresh_nonce_each_call() {
         // Re-sealing identical plaintext (a renewal) must never reuse a nonce.
-        let a = seal_cluster_secret(&TEST_KEK, TLS_PEM, 0, test_access());
-        let b = seal_cluster_secret(&TEST_KEK, TLS_PEM, 0, test_access());
+        let a = seal_cluster_secret(&TEST_KEK, TEST_SECRET, TLS_PEM, 0, test_access());
+        let b = seal_cluster_secret(&TEST_KEK, TEST_SECRET, TLS_PEM, 0, test_access());
         assert_ne!(a.nonce, b.nonce, "nonce must be random per seal");
         assert_ne!(
             a.ciphertext, b.ciphertext,
@@ -965,7 +1155,7 @@ mod tests {
     #[test]
     fn seal_under_one_kek_does_not_open_under_another() {
         // A record sealed with KEK-A must fail closed against KEK-B.
-        let rec = seal_cluster_secret(&TEST_KEK, TLS_PEM, 0, test_access());
+        let rec = seal_cluster_secret(&TEST_KEK, TEST_SECRET, TLS_PEM, 0, test_access());
         let store = FakeClusterStore::new().with("tls/yah.dev", rec);
         let resolver = cluster_resolver(store, [0x11u8; 32]);
         let err = resolver
@@ -1097,9 +1287,10 @@ mod tests {
         let consumer = crate::deploy::secret_mount::consumer_for(&spec, Some(&grant));
         let store = FakeClusterStore::new().with(
             "r2/write",
-            seal_with(
+            seal_named(
                 &TEST_KEK,
                 &TEST_NONCE,
+                "r2/write",
                 b"r2-secret-bytes",
                 SecretAccess::recipes([("rusty-v8-musl", public.as_str())]),
             ),
@@ -1300,6 +1491,67 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, SecretError::Forbidden { .. }), "got {err}");
+    }
+
+    /// R911-F4: a bucket writer widens a record's rule to admit an impostor.
+    /// The access check trusts the rule on the record, so it passes — and then
+    /// the AEAD tag fails, because the rule was bound into the seal. The
+    /// refusal is `ClusterDecrypt`, fail-closed, and names only the secret.
+    #[test]
+    fn a_widened_access_rule_passes_the_check_and_fails_the_tag() {
+        let mut rec = seal(&TEST_KEK, &TEST_NONCE, TLS_PEM); // admits "ingress" only
+        rec.access = SecretAccess::AllowAny;
+        let store = FakeClusterStore::new().with(TEST_SECRET, rec);
+        let err = resolver_for(store, "impostor")
+            .resolve(&SecretRef::Cluster {
+                name: TEST_SECRET.into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, SecretError::ClusterDecrypt { ref name } if name == TEST_SECRET),
+            "a widened rule must fail the tag, got {err}"
+        );
+        assert!(!err.to_string().contains("impostor"), "{err}");
+    }
+
+    /// R911-F4: a ciphertext copied under another name — even one the consumer
+    /// is admitted to — does not open there.
+    #[test]
+    fn a_record_copied_under_another_name_fails_the_tag() {
+        let rec = seal(&TEST_KEK, &TEST_NONCE, TLS_PEM);
+        let store = FakeClusterStore::new().with("tls/other.dev", rec);
+        let err = cluster_resolver(store, TEST_KEK)
+            .resolve(&SecretRef::Cluster {
+                name: "tls/other.dev".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, SecretError::ClusterDecrypt { .. }),
+            "a moved ciphertext must fail the tag, got {err}"
+        );
+    }
+
+    /// R911-F4: a record sealed the pre-F4 way (no associated data) no longer
+    /// opens through the resolver. R911-F5 migrates those records.
+    #[test]
+    fn a_pre_r911_f4_unbound_record_does_not_open() {
+        let legacy = workload_spec::secrets::seal(&TEST_KEK, TLS_PEM, &[]);
+        let rec = SecretRecord {
+            ciphertext: legacy.ciphertext,
+            nonce: legacy.nonce,
+            updated_at: 0,
+            access: test_access(),
+            digest: None,
+            sans: None,
+            ari: None,
+        };
+        let store = FakeClusterStore::new().with(TEST_SECRET, rec);
+        let err = cluster_resolver(store, TEST_KEK)
+            .resolve(&SecretRef::Cluster {
+                name: TEST_SECRET.into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, SecretError::ClusterDecrypt { .. }), "got {err}");
     }
 
     #[test]

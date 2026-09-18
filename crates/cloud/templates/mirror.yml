@@ -227,9 +227,11 @@ runcmd:
   # Bring up the supervision tree (W154 ordering): slice → kamaji → yubaba.
   # kamaji.service has After=yubaba.slice + PartOf=yubaba.slice; yubaba.service
   # has After=kamaji.service + Wants=kamaji.service, so enabling yubaba
-  # transitively starts the other two — but enabling each explicitly here makes
-  # the bring-up order deterministic and surfaces failure on the right unit.
+  # transitively starts the other two — but bringing each one up explicitly
+  # here makes the order deterministic and surfaces failure on the right unit.
+  # yubaba.slice has no [Install] section (slices aren't meant to be enabled —
+  # see yubaba.slice's own comment), so it gets `start`, not `enable --now`.
   - systemctl daemon-reload
-  - systemctl enable --now yubaba.slice
+  - systemctl start yubaba.slice
   - systemctl enable --now kamaji.service
   - systemctl enable --now yubaba.service

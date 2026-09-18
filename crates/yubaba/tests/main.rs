@@ -20,9 +20,23 @@
 //!
 //! Note on concurrency: cargo runs test *binaries* sequentially but the tests
 //! inside one binary in parallel, so these modules' tests now run concurrently
-//! with each other. That is safe here — every test allocates its own
-//! `tempfile::TempDir` for state and binds `127.0.0.1:0` for listeners; there
-//! is no shared fixed port, fixed path, or process-global initialization.
+//! with each other. That is safe for STATE — every test allocates its own
+//! `tempfile::TempDir` and binds `127.0.0.1:0`, so there is no shared fixed
+//! port, fixed path, or process-global initialization.
+//!
+//! It is also safe at libtest's default `--test-threads`, and that is worth
+//! stating because R903 briefly believed otherwise. With every module's raft
+//! clusters running concurrently, 32–35 rig-timed tests used to time out with
+//! `current_leader [None, None, None]`. The first explanation — CPU
+//! oversubscription from stacked multi-thread runtimes — was wrong: the failing
+//! runs used 1.3 of 15 cores, and a ctor capping `RUST_TEST_THREADS` at 4 left
+//! a failure behind. The measured cause was building a `reqwest::Client` per
+//! request (per vote round inside openraft, per poll in these helpers): each
+//! build walks the macOS trust store through one serialized `trustd`, at 393 ms
+//! a call under that load. See `YubabaNetworkFactory` in yubaba-consensus for
+//! the numbers. So: share clients (`yubaba_test_harness::http()`), and do not
+//! reach for a concurrency cap — it hides this class of stall instead of
+//! removing it.
 
 mod bootstrap_single_node;
 mod domain_onboarding_endpoint;

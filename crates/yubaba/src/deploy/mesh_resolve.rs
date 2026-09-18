@@ -266,6 +266,13 @@ impl MeshState for InMemoryMeshState {
 pub struct ServiceRecordMeshState<'a> {
     records: &'a crate::service_records::ServiceRecords,
     node_mesh_ip: Option<Ipv4Addr>,
+    /// R330-F17: the fleet-wide directory, when one is running. `None` in
+    /// single-node/dev mode (no raft membership, so nothing to poll) —
+    /// [`Self::lookup`] degrades to the pre-R330-F17 local-only behaviour
+    /// exactly in that case, never to an empty result.
+    directory: Option<&'a crate::mesh_directory::MeshDirectory>,
+    tables: &'a crate::route_score::RouteTables,
+    weights: crate::route_score::RouteWeights,
 }
 
 impl<'a> ServiceRecordMeshState<'a> {
@@ -275,16 +282,22 @@ impl<'a> ServiceRecordMeshState<'a> {
     pub fn new(
         records: &'a crate::service_records::ServiceRecords,
         node_mesh_ip: Option<Ipv4Addr>,
+        directory: Option<&'a crate::mesh_directory::MeshDirectory>,
+        tables: &'a crate::route_score::RouteTables,
+        weights: crate::route_score::RouteWeights,
     ) -> Self {
         Self {
             records,
             node_mesh_ip,
+            directory,
+            tables,
+            weights,
         }
     }
-}
 
-impl MeshState for ServiceRecordMeshState<'_> {
-    fn lookup(&self, ident: &MeshIdent) -> Option<MeshAddress> {
+    /// Local-only lookup — the entire pre-R330-F17 behaviour, kept verbatim
+    /// as the fallback for [`Self::directory`] being `None`.
+    fn lookup_local(&self, ident: &MeshIdent) -> Option<MeshAddress> {
         let record = self.records.get(ident)?;
         Some(MeshAddress {
             ident: record.ident.clone(),
@@ -299,6 +312,58 @@ impl MeshState for ServiceRecordMeshState<'_> {
             // Resolved (measured) ports when the supervisor reported any,
             // declared ports otherwise — see `ServiceRecord::dialable_ports`.
             ports: record.dialable_ports().clone(),
+            dependency_wait_deadline: None,
+        })
+    }
+}
+
+impl MeshState for ServiceRecordMeshState<'_> {
+    /// R330-F17: nearest-first across the fleet, not just this node.
+    ///
+    /// **A same-node instance always wins, by construction, and that is not
+    /// a special case.** A local candidate's region/provider are identical to
+    /// the caller's own (it IS the caller's node), so it scores exactly `0`
+    /// — the floor no other candidate can tie or beat — which is exactly the
+    /// [`Locality::Local`] answer this seam gave before R330-F17. Nearest-
+    /// first is a strict superset: `local`/`prefer-local` requirements are
+    /// unaffected when a local instance exists, and an `anywhere` requirement
+    /// that used to resolve to `Absent` whenever its provider was deployed on
+    /// a DIFFERENT node (the documented pre-existing gap — this registry only
+    /// ever saw its own node) now actually finds it.
+    ///
+    /// Ready candidates are preferred; if none is Ready, the nearest PRESENT
+    /// one is still returned (never `None` while at least one candidate
+    /// exists) — [`MeshState::lookup`]'s contract is presence, not readiness,
+    /// and [`await_dependencies`] is what applies the Ready gate.
+    fn lookup(&self, ident: &MeshIdent) -> Option<MeshAddress> {
+        let Some(directory) = self.directory else {
+            return self.lookup_local(ident);
+        };
+
+        let caller = directory.self_locality();
+        let candidates = directory.candidates(&ident.0);
+        if candidates.is_empty() {
+            return None;
+        }
+        let ready: Vec<_> = candidates.iter().filter(|c| c.ready).cloned().collect();
+        let pool = if ready.is_empty() { &candidates } else { &ready };
+
+        let winner_key = crate::route_score::pick_nearest(
+            &caller,
+            pool.iter()
+                .map(|c| (c.node_addr.clone(), c.locality.clone())),
+            self.tables,
+            &self.weights,
+        )?
+        .key;
+        let winner = pool.iter().find(|c| c.node_addr == winner_key)?;
+
+        Some(MeshAddress {
+            ident: ident.clone(),
+            dial_host: Some(winner.mesh_ip.to_string()),
+            provider_mesh_ip: Some(winner.mesh_ip),
+            ready: winner.ready,
+            ports: winner.ports.clone(),
             dependency_wait_deadline: None,
         })
     }
@@ -580,7 +645,6 @@ mod mesh {
 
         fn spec_with_depends_on(deps: Vec<MeshIdent>) -> WorkloadSpec {
             WorkloadSpec {
-                schema_version: SchemaVersion::V1,
                 name: "consumer".into(),
                 image: ImageRef {
                     registry: "ghcr.io".into(),
@@ -602,7 +666,10 @@ mod mesh {
                 resources: ResourceLimits {
                     memory_mb: 64,
                     cpu_millis: 256,
-                    ephemeral_storage_mb: 64,
+                    memory_request_mb: None,
+                    cpu_limit_millis: None,
+                    pids_max: None,
+                    scratch_floor_mb: None,
                 },
                 depends_on: deps,
                 requires: vec![],
@@ -623,6 +690,7 @@ mod mesh {
                     operator: None,
                 },
                 labels: HashMap::new(),
+                durability: None,
                 annotations: HashMap::new(),
                 files: Vec::new(),
             }
@@ -1162,6 +1230,220 @@ mod mesh {
             let spec = spec_with_depends_on(vec![MeshIdent("a".into())]);
             let deadline = compute_dependency_deadline(&spec, &state, Duration::from_secs(7));
             assert_eq!(deadline, Duration::from_secs(7));
+        }
+    }
+
+    /// R330-F17: `ServiceRecordMeshState::lookup`'s nearest-first path, wired
+    /// through a real [`crate::mesh_directory::MeshDirectory`] rather than
+    /// `InMemoryMeshState` — the fake used everywhere above answers for
+    /// `MeshState` in general and knows nothing about scoring.
+    mod nearest_first {
+        use std::collections::{BTreeMap, HashMap};
+
+        use workload_spec::MeshIdent;
+
+        use crate::deploy::mesh_resolve::{MeshState, ServiceRecordMeshState};
+        use crate::mesh_directory::{MeshDirectory, PeerCandidate};
+        use crate::route_score::{NodeLocality, RouteTables, RouteWeights};
+        use crate::service_records::ServiceRecords;
+
+        fn loc(region: &str, provider: &str) -> NodeLocality {
+            NodeLocality::new(Some(region.to_string()), Some(provider.to_string()))
+        }
+
+        fn candidate(node_addr: &str, region: &str, provider: &str, ip: &str) -> PeerCandidate {
+            PeerCandidate {
+                node_addr: node_addr.to_string(),
+                locality: loc(region, provider),
+                mesh_ip: ip.parse().unwrap(),
+                ports: BTreeMap::from([("http".to_string(), 8080)]),
+                ready: true,
+            }
+        }
+
+        /// Verify bullets 1/2: two same-provider instances, different
+        /// regions — resolves to the caller's own region, deterministically.
+        #[test]
+        fn resolves_to_the_callers_own_region_when_providers_tie() {
+            let records = ServiceRecords::new();
+            let directory = MeshDirectory::new();
+            directory.set_self_locality(loc("us-west", "hetzner"));
+            directory.ingest(
+                "self".to_string(),
+                HashMap::from([(
+                    "svc".to_string(),
+                    vec![candidate("self", "us-west", "hetzner", "100.64.0.1")],
+                )]),
+            );
+            directory.ingest(
+                "100.64.0.2:7443".to_string(),
+                HashMap::from([(
+                    "svc".to_string(),
+                    vec![candidate(
+                        "100.64.0.2:7443",
+                        "eu-west",
+                        "hetzner",
+                        "100.64.0.2",
+                    )],
+                )]),
+            );
+            let tables = RouteTables::defaults();
+            let state = ServiceRecordMeshState::new(
+                &records,
+                Some("100.64.0.1".parse().unwrap()),
+                Some(&directory),
+                &tables,
+                RouteWeights::DEFAULT,
+            );
+
+            let addr = state.lookup(&MeshIdent("svc".into())).unwrap();
+            assert_eq!(addr.dial_host, Some("100.64.0.1".to_string()));
+        }
+
+        /// Verify bullet 4: cross-region-same-provider beats
+        /// same-region-cross-provider under the default weights — the
+        /// scoring claim, now exercised through the real resolver instead of
+        /// only `route_score`'s own unit tests.
+        #[test]
+        fn prefers_cross_region_same_provider_over_same_region_cross_provider() {
+            let records = ServiceRecords::new();
+            let directory = MeshDirectory::new();
+            directory.set_self_locality(loc("us-west", "hetzner"));
+            directory.ingest(
+                "100.64.0.2:7443".to_string(),
+                HashMap::from([(
+                    "svc".to_string(),
+                    vec![candidate(
+                        "100.64.0.2:7443",
+                        "us-east",
+                        "hetzner",
+                        "100.64.0.2",
+                    )],
+                )]),
+            );
+            directory.ingest(
+                "100.64.0.3:7443".to_string(),
+                HashMap::from([(
+                    "svc".to_string(),
+                    vec![candidate("100.64.0.3:7443", "us-west", "aws", "100.64.0.3")],
+                )]),
+            );
+            let tables = RouteTables::defaults();
+            let state = ServiceRecordMeshState::new(
+                &records,
+                Some("100.64.0.1".parse().unwrap()),
+                Some(&directory),
+                &tables,
+                RouteWeights::DEFAULT,
+            );
+
+            let addr = state.lookup(&MeshIdent("svc".into())).unwrap();
+            assert_eq!(addr.dial_host, Some("100.64.0.2".to_string()));
+        }
+
+        /// Verify bullet 5: removing the nearest instance and re-resolving
+        /// falls back to the next-nearest survivor — degraded, not failed.
+        #[test]
+        fn removing_the_nearest_instance_degrades_to_the_next_nearest() {
+            let records = ServiceRecords::new();
+            let directory = MeshDirectory::new();
+            directory.set_self_locality(loc("us-west", "hetzner"));
+            directory.ingest(
+                "100.64.0.2:7443".to_string(),
+                HashMap::from([(
+                    "svc".to_string(),
+                    vec![candidate(
+                        "100.64.0.2:7443",
+                        "us-west",
+                        "hetzner",
+                        "100.64.0.2",
+                    )],
+                )]),
+            );
+            directory.ingest(
+                "100.64.0.3:7443".to_string(),
+                HashMap::from([(
+                    "svc".to_string(),
+                    vec![candidate(
+                        "100.64.0.3:7443",
+                        "eu-west",
+                        "hetzner",
+                        "100.64.0.3",
+                    )],
+                )]),
+            );
+            let tables = RouteTables::defaults();
+            let state = ServiceRecordMeshState::new(
+                &records,
+                Some("100.64.0.1".parse().unwrap()),
+                Some(&directory),
+                &tables,
+                RouteWeights::DEFAULT,
+            );
+            assert_eq!(
+                state.lookup(&MeshIdent("svc".into())).unwrap().dial_host,
+                Some("100.64.0.2".to_string())
+            );
+
+            // The us-west instance is undeployed: the next successful poll
+            // (simulated here by a fresh `ingest` with no entry for `svc`)
+            // wholesale-replaces that peer's contribution.
+            directory.ingest("100.64.0.2:7443".to_string(), HashMap::new());
+            assert_eq!(
+                state.lookup(&MeshIdent("svc".into())).unwrap().dial_host,
+                Some("100.64.0.3".to_string())
+            );
+        }
+
+        /// Health ejection precondition: a not-ready remote candidate is
+        /// never the resolved winner while a ready one exists, even if the
+        /// not-ready one would otherwise score better (closer region).
+        #[test]
+        fn a_not_ready_candidate_never_wins_over_a_ready_one() {
+            let records = ServiceRecords::new();
+            let directory = MeshDirectory::new();
+            directory.set_self_locality(loc("us-west", "hetzner"));
+            let mut close_but_dead = candidate("100.64.0.2:7443", "us-west", "hetzner", "100.64.0.2");
+            close_but_dead.ready = false;
+            directory.ingest(
+                "100.64.0.2:7443".to_string(),
+                HashMap::from([("svc".to_string(), vec![close_but_dead])]),
+            );
+            directory.ingest(
+                "100.64.0.3:7443".to_string(),
+                HashMap::from([(
+                    "svc".to_string(),
+                    vec![candidate(
+                        "100.64.0.3:7443",
+                        "eu-west",
+                        "hetzner",
+                        "100.64.0.3",
+                    )],
+                )]),
+            );
+            let tables = RouteTables::defaults();
+            let state = ServiceRecordMeshState::new(
+                &records,
+                Some("100.64.0.1".parse().unwrap()),
+                Some(&directory),
+                &tables,
+                RouteWeights::DEFAULT,
+            );
+
+            let addr = state.lookup(&MeshIdent("svc".into())).unwrap();
+            assert_eq!(addr.dial_host, Some("100.64.0.3".to_string()));
+            assert!(addr.ready);
+        }
+
+        /// `directory: None` (single-node/dev mode, no raft membership) must
+        /// reproduce the pre-R330-F17 local-only behaviour exactly, not
+        /// resolve to nothing.
+        #[test]
+        fn with_no_directory_falls_back_to_local_only_lookup() {
+            let records = ServiceRecords::new();
+            let tables = RouteTables::defaults();
+            let state = ServiceRecordMeshState::new(&records, None, None, &tables, RouteWeights::DEFAULT);
+            assert!(state.lookup(&MeshIdent("svc".into())).is_none());
         }
     }
 }

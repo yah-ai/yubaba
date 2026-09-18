@@ -309,7 +309,7 @@ kind = "local-pg-dev"
 schema_version = 1
 shape = "local"
 [providers.static]
-kind = "local-static"
+kind = "miniflare-native"
 port = 4324
 "#;
 
@@ -342,7 +342,7 @@ port = 4324
         assert!(declared_pg_databases(&svcs).is_empty());
     }
 
-    /// A `pond`/`cloud` mirror binding pg must not conscript the *dev* driver —
+    /// A `pond`/`prod` mirror binding pg must not conscript the *dev* driver —
     /// the whole point of the model is that each tier binds its own.
     #[test]
     fn a_non_dev_mirror_binding_pg_is_ignored() {

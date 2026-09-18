@@ -5,7 +5,7 @@
 //!
 //! A component's `kind` says what the service *is*; the mirror's provider slot
 //! says how *this tier* runs it. That split already exists for storage —
-//! `mesofact-static` runs off `local-static` (files on disk) at dev and
+//! `mesofact-static` runs off `miniflare-native` (a Worker over the dev S3 driver) at dev and
 //! `miniflare-container` (containers) at pond, one component kind, two
 //! runtimes — and this is the same split for compute. A `kind = "container"`
 //! component now runs natively at dev and in docker at pond without the
@@ -124,7 +124,7 @@
 //! it loads and `running` when it is up, and an agent can ask what it is
 //! doing instead of parsing sentences out of stdout. A component that already
 //! serves HTTP declares `http_path` instead and shares one endpoint with the
-//! cloud tier's `Healthcheck`. The channel is optional — a process that
+//! prod tier's `Healthcheck`. The channel is optional — a process that
 //! declines it still runs, on liveness alone.
 //!
 //! @yah:relay(R715, "local-process compute provider: a dev tier that runs the binary, not a container")
@@ -358,7 +358,7 @@ struct ProcessSpec {
 ///
 /// Both fields optional and mutually exclusive in practice: give `http_path`
 /// for a process that already serves HTTP (it then shares an endpoint with
-/// the cloud tier's healthcheck), otherwise the channel is a unix socket
+/// the prod tier's healthcheck), otherwise the channel is a unix socket
 /// whose path this reconciler chooses and passes down as `$YAH_CONTROL_SOCK`.
 #[derive(Debug, Default, Deserialize)]
 struct ControlSpec {
@@ -392,7 +392,7 @@ impl Reconciler for LocalProcessReconciler {
         if !matches!(ctx.mirror.shape, MirrorShape::Local) {
             bail!(
                 "component {}: `local-process` is a dev-tier compute slot — mirror shape is \
-                 {:?}, not `local`. Deploy the cloud tier via `yah cloud workload deploy`.",
+                 {:?}, not `local`. Deploy the prod tier via `yah cloud workload deploy`.",
                 ctx.component.id,
                 ctx.mirror.shape,
             );
@@ -1338,6 +1338,7 @@ socket = "/tmp/mine.sock"
             schema_version: 1,
             name: "noisy".into(),
             domain: "noisy.example".into(),
+            health_path: None,
             components: vec![crate::ServiceComponent {
                 mount: None,
                 id: "gui".into(),
@@ -1370,6 +1371,7 @@ socket = "/tmp/mine.sock"
             ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: Default::default(),
+            build: Default::default(),
         }
     }
 
@@ -1623,6 +1625,7 @@ socket = "/tmp/mine.sock"
             providers: Default::default(),
             drivers: Default::default(),
             asset_aliases: Default::default(),
+            build: Default::default(),
         };
         assert!(!slot_declared(&m));
         m.providers.insert(

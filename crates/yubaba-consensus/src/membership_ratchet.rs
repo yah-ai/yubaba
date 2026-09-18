@@ -37,7 +37,7 @@
 //! deliberately links no yubaba crate (`cargo test -p society_facility
 //! --features control-plane --test lan_path_is_yubaba_free` enforces that), so
 //! it cannot implement the in-process
-//! [`FailureDetector`](crate::failure_detector::FailureDetector) trait. It
+//! `yubaba::failure_detector::FailureDetector` trait. It
 //! reports over loopback to the yubaba beside it, that report is replicated as
 //! [`YubabaRequest::ReportPeerLiveness`], and this module reads it back out of
 //! locally-applied state. The seam is exactly the one `R118-T5` opened for
@@ -55,6 +55,43 @@
 //! rather than a full rejoin. There is no case in this module for `false` — the
 //! symmetric operator verb `POST /raft/remove-member` uses `false` because
 //! *decommissioning* is what it means, and that is a different act.
+//!
+//! # And never a follow-up eviction either (`W158` §7.2(5))
+//!
+//! `retain = true` leaves the demoted node *in the membership*, so evicting it
+//! fully would take a second change — `ChangeMembers::RemoveNodes` — aimed at it
+//! as a learner. `W158` §7.2(5) asks this module to decide explicitly whether it
+//! ever wants that follow-up. **It never does, at any darkness duration.** There
+//! is no timeout after which a long-dark learner is garbage-collected, and that
+//! is a decision rather than an omission:
+//!
+//! - A demoted plinth is precisely the plinth you want to re-promote. Eviction
+//!   would turn every rehydration back into the full rejoin `retain = true` was
+//!   chosen to avoid.
+//! - Worse, it would route the return through `POST /raft/add-learner`, which
+//!   under a ratcheting policy interrogates the joiner ([`OriginSource::ask_origin`]) and
+//!   refuses `502` when it cannot be reached. So evicting a flaky plinth is
+//!   exactly the act that makes its return hardest *while it is still flaky*.
+//! - The cost accepted is real but bounded and never touches safety: the leader
+//!   keeps a replication stream open to a node that may never come back, and
+//!   [`plan_rehydrate`] carries it as a candidate it will keep refusing.
+//!   Learners do not vote, so neither the quorum window nor the odd-count
+//!   descent can be moved by a ghost.
+//! - A plinth that is *genuinely* gone — sold, destroyed — is an **operator**
+//!   fact this module cannot observe, and the verb for it already exists:
+//!   `POST /raft/remove-member`, which sends `RemoveVoters` then `RemoveNodes`
+//!   with `retain: false` (`lib.rs`). Automatic demotion and deliberate
+//!   decommissioning stay different acts with different instruments.
+//!
+//! The decision is load-bearing enough to be unrepresentable rather than merely
+//! documented: [`RatchetPlan`] has exactly two variants, `Hold` and `Shrink`,
+//! and neither can express a removal — adding eviction means adding a variant,
+//! which is a review point rather than an edit inside a function. Empirically it
+//! is pinned by `five_voters_losing_two_then_one_more_ratchet_down_to_a_single_voter`,
+//! which asserts all five ids are still in `membership.nodes()` after *two*
+//! successive shrinks. No new test is added for it here: a test asserting that
+//! this module does not do a thing it has no way to express, over the code path
+//! that assertion already walks, could not fail.
 //!
 //! ```bash
 //! cargo test -p yubaba --lib membership_ratchet
@@ -420,7 +457,8 @@ impl RehydratePlan {
 ///    re-stamps on every verdict CHANGE — so a plinth that flaps resets it every
 ///    cycle and can never accumulate a full hold-down, however fast it reports.
 /// 4. **Caught up.** Openraft's replication metrics, not a guess.
-/// 5. **[`VoterAdmission::judge`], per candidate.** The same rule
+/// 5. **[`VoterAdmission::judge`](crate::cluster_policy::VoterAdmission::judge),
+///    per candidate.** The same rule
 ///    `POST /raft/promote-voter` applies, called rather than re-derived, so
 ///    `max_voters` and the fleet's learner-only rule cannot diverge between the
 ///    operator verb and the automatic one.
@@ -554,14 +592,14 @@ pub fn plan_rehydrate(
 
 /// Where a node joining a cluster has been (`W158` §7.2(2)).
 ///
-/// **Read off the joiner by [`ask_origin`], never sent in a request body.** See
+/// **Read off the joiner by [`OriginSource::ask_origin`], never sent in a request body.** See
 /// that function for why the first cut had this as an optional request field and
 /// why moving it was the fix rather than making the field required.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NodeOrigin {
-    /// The joiner's [`cluster_epoch::CLUSTER_PROTOCOL`](crate::cluster_epoch::CLUSTER_PROTOCOL).
+    /// The joiner's `yubaba::cluster_epoch::CLUSTER_PROTOCOL`.
     pub cluster_protocol: u32,
-    /// The joiner's [`cluster_epoch::STATE_EPOCH`](crate::cluster_epoch::STATE_EPOCH).
+    /// The joiner's `yubaba::cluster_epoch::STATE_EPOCH`.
     pub state_epoch: u32,
     /// The highest raft **term** the joiner's own log has ever held.
     ///
@@ -579,6 +617,42 @@ pub struct LocalLineage {
     pub current_term: u64,
 }
 
+/// The two cluster-compatibility integers of the build that is *writing* — the
+/// provenance stamped onto a [`MembershipRatchetRecord`].
+///
+/// # Why this is injected rather than read (noisetable R118-T11)
+///
+/// These are constants of a build, `include_str!`d at compile time out of
+/// `crates/yubaba/cluster-epochs.json` by `yubaba::cluster_epoch`. That file is
+/// also read by the xtask drift gate and by the release manifest builder, both
+/// by path, so it stays where those two consumers already look for it and the
+/// values reach consensus as data instead.
+///
+/// It deliberately repeats two of [`LocalLineage`]'s fields rather than reusing
+/// it: the third field there is the leader's `current_term`, a runtime value
+/// that changes on every election. Pairing a build constant with a runtime
+/// reading in one type invites a caller to cache the wrong half. [`Self::lineage`]
+/// is the one place they are combined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildEpochs {
+    /// Wire compatibility — may this node talk to that one at all.
+    pub cluster_protocol: u32,
+    /// On-disk compatibility — can this binary read that one's raft log.
+    pub state_epoch: u32,
+}
+
+impl BuildEpochs {
+    /// Pair these build constants with the leader's current term to get the
+    /// side of the comparison [`judge_origin`] takes.
+    pub fn lineage(&self, current_term: u64) -> LocalLineage {
+        LocalLineage {
+            cluster_protocol: self.cluster_protocol,
+            state_epoch: self.state_epoch,
+            current_term,
+        }
+    }
+}
+
 /// Whether a declared origin may be handed to `add_learner` at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OriginVerdict {
@@ -589,13 +663,16 @@ pub enum OriginVerdict {
     Refuse(String),
 }
 
-/// How long the leader waits for a joiner to answer [`ask_origin`]. Sized like
-/// [`sovereign_group`](crate::sovereign_group)'s: one loopback-or-mesh round
-/// trip, at join time, not on any hot path.
-const ASK_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long the leader should wait for a joiner to answer
+/// [`OriginSource::ask_origin`]. Sized like `yubaba::sovereign_group`'s: one
+/// loopback-or-mesh round trip, at join time, not on any hot path.
+///
+/// Part of the port's contract rather than an implementation detail of one
+/// impl: a caller that waits a minute for a joiner to answer has changed the
+/// behaviour of the join gate, not merely its plumbing.
+pub const ASK_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// **Ask the joiner where it has been.** Two GETs at the address the leader is
-/// about to start replicating to.
+/// **Ask the joiner where it has been.** The I/O half of the lineage gate.
 ///
 /// # The joiner is asked, not believed — and that is a rule this handler already
 /// keeps
@@ -608,7 +685,7 @@ const ASK_TIMEOUT: Duration = Duration::from_secs(3);
 /// from **"a caller that will not say"**. Both look like an absent field.
 ///
 /// So the field is gone and the fact is fetched. That is exactly what
-/// [`sovereign_group::ask_peer`](crate::sovereign_group::ask_peer) does eleven
+/// `yubaba::sovereign_group::ask_peer` does eleven
 /// lines earlier in the same handler, for the reason its own doc gives: *"A
 /// request body cannot be the source of a fact whose whole purpose is to catch a
 /// mis-aimed request."* The same sentence is true here and more sharply, because
@@ -622,51 +699,43 @@ const ASK_TIMEOUT: Duration = Duration::from_secs(3);
 /// - the residual *"the joiner declares this itself"*, which the first cut
 ///   documented as inherent, **is no longer inherent and no longer present**.
 ///
+/// # Why this is a port and not a free function (noisetable R118-T11)
+///
+/// The R118-F8 implementation was `async fn ask_origin(addr)` doing two GETs:
+/// `/raft/status` for `current_term`, `/health` for the two build epochs. Both
+/// facts are consensus facts — but only ONE of those routes is a consensus
+/// route. `/health` is defined, shaped and versioned by the fleet daemon, and it
+/// carries the epochs because `yubaba::cluster_epoch` `include_str!`s them out
+/// of `crates/yubaba/cluster-epochs.json`. A consensus crate holding a literal
+/// `"cluster_protocol"` JSON key read off another crate's health route is
+/// coupled to that crate's surface exactly as tightly as a direct dependency
+/// would make it, and far less visibly.
+///
+/// So the *judgement* stayed here, pure and unit-tested ([`judge_origin`]), and
+/// the *fetch* became this trait. `yubaba` implements it as
+/// `yubaba::origin_source::HttpOriginSource` over the same reqwest client and
+/// the same two routes, so the wire behaviour is byte-for-byte R118-F8's; what
+/// changed is which crate names the routes. A deployment with a different
+/// control surface — a plinth answering over the mesh rather than over HTTP —
+/// supplies its own impl and reuses the gate unchanged.
+///
+/// This did NOT buy a smaller dependency list, and saying so matters: `reqwest`
+/// is a non-negotiable dependency of this crate regardless, because
+/// [`raft::network`](crate::raft::network) IS a `RaftNetworkV2` over HTTP. The
+/// win is layering, not weight.
+///
 /// `/raft/status` carries `current_term`; `/health` carries the two build
 /// epochs. Two small requests rather than one because no single route serves
 /// both, and this runs once per join.
-pub async fn ask_origin(addr: &str) -> Result<NodeOrigin, String> {
-    let client = reqwest::Client::builder()
-        .timeout(ASK_TIMEOUT)
-        .build()
-        .map_err(|e| format!("build http client: {e}"))?;
-
-    let get_json = async |url: String| -> Result<serde_json::Value, String> {
-        let resp = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("GET {url}: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("GET {url}: HTTP {}", resp.status()));
-        }
-        resp.json::<serde_json::Value>()
-            .await
-            .map_err(|e| format!("GET {url}: decoding body: {e}"))
-    };
-
-    let status = get_json(format!("http://{addr}/raft/status")).await?;
-    // A node that has never been in a cluster reports term 0, which is the
-    // ordinary "brand new plinth" case and passes every clause below.
-    let last_seen_term = status
-        .get("current_term")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| format!("{addr}/raft/status carries no current_term"))?;
-
-    let health = get_json(format!("http://{addr}/health")).await?;
-    let epoch = |key: &str| -> Result<u32, String> {
-        health
-            .get(key)
-            .and_then(serde_json::Value::as_u64)
-            .map(|v| v as u32)
-            .ok_or_else(|| format!("{addr}/health carries no {key}"))
-    };
-
-    Ok(NodeOrigin {
-        cluster_protocol: epoch("cluster_protocol")?,
-        state_epoch: epoch("state_epoch")?,
-        last_seen_term,
-    })
+#[async_trait::async_trait]
+pub trait OriginSource: Send + Sync {
+    /// Read the joiner's lineage off the joiner itself, at the address the
+    /// leader is about to start replicating to.
+    ///
+    /// The `Err` string reaches an operator verbatim, so it must say which
+    /// address failed and how. Implementations should give up at
+    /// [`ASK_TIMEOUT`].
+    async fn ask_origin(&self, addr: &str) -> Result<NodeOrigin, String>;
 }
 
 /// **Rehydration and re-admission are different paths, and this is the fork.**
@@ -793,6 +862,7 @@ pub async fn run_once(
     policy: &ClusterPolicy,
     http: &reqwest::Client,
     now: u64,
+    epochs: BuildEpochs,
 ) -> RatchetOutcome {
     use openraft::async_runtime::watch::WatchReceiver;
 
@@ -908,8 +978,8 @@ pub async fn run_once(
         before: evidence.keys().copied().collect(),
         after: committed.iter().copied().collect(),
         demoted: demote.iter().copied().collect(),
-        cluster_protocol: crate::cluster_epoch::CLUSTER_PROTOCOL,
-        state_epoch: crate::cluster_epoch::STATE_EPOCH,
+        cluster_protocol: epochs.cluster_protocol,
+        state_epoch: epochs.state_epoch,
         reason,
     };
     if let Err(e) =
@@ -979,7 +1049,7 @@ async fn promote_voters(
 
 /// Spawn the ratchet loop.
 ///
-/// Safe to run on every node, like [`crate::scheduler::spawn`]: a follower's
+/// Safe to run on every node, like `yubaba::scheduler::spawn`: a follower's
 /// tick returns [`RatchetOutcome::NotLeader`] and does nothing. Under
 /// [`MembershipRatchet::Frozen`] the loop is not spawned at all — see
 /// `main.rs` — so a fleet node does not even carry the task.
@@ -989,6 +1059,7 @@ pub fn spawn(
     state_machine: YubabaStateMachine,
     policy: ClusterPolicy,
     config: RatchetConfig,
+    epochs: BuildEpochs,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let http = match reqwest::Client::builder()
@@ -1009,8 +1080,8 @@ pub fn spawn(
         );
         loop {
             tokio::time::sleep(config.evaluate_every).await;
-            let now = crate::rollout::now_unix_secs();
-            match run_once(node_id, &raft, &state_machine, &policy, &http, now).await {
+            let now = crate::now_unix_secs();
+            match run_once(node_id, &raft, &state_machine, &policy, &http, now, epochs).await {
                 RatchetOutcome::Shrank { demoted, after } => {
                     info!(node_id, ?demoted, ?after, "membership ratchet: voter set shrank");
                 }
@@ -1446,18 +1517,25 @@ mod tests {
 
     // ── Re-admission after a recovery ───────────────────────────────────────
 
+    /// noisetable R118-T11: these used to read `yubaba::cluster_epoch`'s real constants.
+    /// Fixed values are strictly better here and not merely a consequence of the
+    /// crate split — what [`judge_origin`] is asked is whether two declarations
+    /// AGREE, so a test that sources both sides from the same live constant
+    /// cannot fail when the comparison breaks, only when the build's own numbers
+    /// move. The mismatch case below perturbs one side by hand.
+    const TEST_EPOCHS: BuildEpochs = BuildEpochs {
+        cluster_protocol: 7,
+        state_epoch: 6,
+    };
+
     fn local() -> LocalLineage {
-        LocalLineage {
-            cluster_protocol: crate::cluster_epoch::CLUSTER_PROTOCOL,
-            state_epoch: crate::cluster_epoch::STATE_EPOCH,
-            current_term: 7,
-        }
+        TEST_EPOCHS.lineage(7)
     }
 
     fn origin(term: u64) -> NodeOrigin {
         NodeOrigin {
-            cluster_protocol: crate::cluster_epoch::CLUSTER_PROTOCOL,
-            state_epoch: crate::cluster_epoch::STATE_EPOCH,
+            cluster_protocol: TEST_EPOCHS.cluster_protocol,
+            state_epoch: TEST_EPOCHS.state_epoch,
             last_seen_term: term,
         }
     }
@@ -1511,7 +1589,7 @@ mod tests {
     #[test]
     fn a_build_epoch_mismatch_is_refused_before_the_term_is_even_looked_at() {
         let mut o = origin(3);
-        o.state_epoch = crate::cluster_epoch::STATE_EPOCH + 1;
+        o.state_epoch = TEST_EPOCHS.state_epoch + 1;
         let OriginVerdict::Refuse(reason) = judge_origin(&o, &local()) else {
             panic!("two builds at different state epochs cannot share a cluster");
         };

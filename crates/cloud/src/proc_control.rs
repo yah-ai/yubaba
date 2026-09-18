@@ -12,7 +12,7 @@
 //! an agent was grepping the log tail for a line somebody hopefully logged.
 //!
 //! So: **any process built to run under a yah camp SHOULD expose a control
-//! channel**, dev tier or cloud tier, port or no port. It is the difference
+//! channel**, dev tier or prod tier, port or no port. It is the difference
 //! between an agent reading `state = "starting", detail = "migrating 3/7"`
 //! and an agent tailing stdout hoping for a sentence.
 //!
@@ -42,7 +42,7 @@
 //! | Unix socket | dev tier, portless or not | newline-delimited JSON: write `{"cmd":"status"}\n`, read one JSON line back |
 //! | HTTP | any tier that already serves HTTP | `GET <base><path>` (conventionally `/_yah/status`) returning the same document |
 //!
-//! The cloud tier gets this for free: a `Healthcheck { probe: Http { path } }`
+//! The prod tier gets this for free: a `Healthcheck { probe: Http { path } }`
 //! in `workload-spec` pointed at the status path is the *same* endpoint the
 //! dev tier reads over a socket. One document, two transports, no per-tier
 //! fork — which is the same rule W265 applies to everything else here.
@@ -93,11 +93,35 @@
 //! @yah:gotcha("MACOS SANDBOX BUG FOUND AND FIXED, and it would have made the whole injection useless on macOS. run.spawn puts the control socket at <workload_dir>/.yah-control.sock because that is the only writable path both sandbox facilities agree on (Seatbelt allows file-write* under WORKLOAD; bwrap binds workload_dir and nothing else - .yah/jit/ is not even present inside the bwrap namespace). But file-write* is NOT sufficient: Seatbelt gates AF_UNIX bind under network-bind, so a child got EPERM binding a path it could otherwise create any file at. MACOS_SANDBOX_PROFILE now carries (allow network-bind (local unix-socket (subpath (param WORKLOAD)))). Reproduced by hand with sandbox-exec before and after. plugin_host.rs shares the same profile constant and passes the same -D WORKLOAD, so it inherits the rule.")
 //! @yah:gotcha("DISCOVERED, NOT FIXED (deliberately): kamaji never registers a ProbeTarget from a spec's own healthcheck on any path except the mesofact-bundle deploy. insert_probe has exactly three call sites (server.rs registry decl, the bundle deploy, and now the native control-channel registration), so a container workload declaring a healthcheck is probed as Ready unconditionally. Fixing it means live fleet workloads that report Ready today would start reporting real probe status - a behaviour change on running infra, not a drive-by. The control registration added here cannot regress that: it only fires when the spec declares YAH_CONTROL_SOCK, so a spec without it registers nothing and behaves exactly as before.")
 //! @yah:cleanup("kamaji-procctl is not on crates.io. In-tree consumers resolve it by path so nothing is blocked, but kamaji-bin now depends on it and cargo publish --workspace publishes in topological order - the name must be reserved (scripts/reserve-crate-names.sh, entry added) before the next kamaji release, or that release fails on an unpublished dep. The external consumers this crate exists for (noisetable, entambi repo) need it published anyway.")
+//!
+//! @yah:ticket(R918-F5, "Windows leg wall 3: yubaba cloud's local-process reconciler is Unix process semantics, not a gatable module")
+//! @yah:status(review)
+//! @yah:at(2026-09-17T08:57:18Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R918)
+//! @arch:see(.yah/docs/working/W352-windows-and-macos-build-targets.md)
+//! @yah:gotcha("MEASURED, not predicted — this is exactly where `cargo check --target x86_64-pc-windows-gnu -p yah` stops once R918-T1's kamaji and mesofact-core fixes are in. 5 errors, all in yah-cloud (oss/yubaba/crates/cloud): proc_control.rs:278 `tokio::net::UnixStream` in `fetch_status_uds`; reconciler/local_process.rs:935 `libc::SIGKILL`, :949 and :957 `libc::kill` (`pid_alive` / `signal_pid`); reconciler/pond_door.rs:536 `libc::geteuid` (`is_root`). Reproduce with the R918-T1 verify line (windres shim + isolated CARGO_TARGET_DIR) — it is in that ticket's verify.")
+//! @yah:next("DO NOT REACH FOR `#[cfg(unix)]` ON THE MODULE — that is what worked for walls 1 and 2 and it is the wrong tool here, which is the whole reason this is a separate ticket rather than folded into R918-T1. kamaji and mesofact-core each had a cleanly separable Unix DAEMON half sitting beside a neutral half; gating the daemon half cost four one-line attributes and changed no behaviour. Here the Unix primitives are load-bearing inside the live fleet reconciler's semantics, so each one is a DECISION about what it means on Windows, not a cfg: (a) `pid_alive`/`signal_pid` are `kill(pid,0)` liveness plus SIGTERM-then-SIGKILL escalation — Windows needs a real OpenProcess/TerminateProcess implementation or the local-process reconciler must be declared Unix-only; (b) `is_root()` is documented as \"running under sudo, the only way to bind --port 443 on macOS\" and has NO Windows equivalent — elevation is a different concept, not a renamed one; (c) `fetch_status_uds` is the ProcStatus poll — Windows 10+ has AF_UNIX but tokio does not expose `UnixStream` there, so this is a transport choice (named pipe vs loopback TCP) that changes a wire contract.")
+//! @yah:next("SETTLE THE SCOPE QUESTION FIRST, because it may delete most of the work: does a Windows yah CLI need the local-process reconciler AT ALL? These paths supervise workloads on a fleet node. If the Windows target is a CLIENT CLI (talk to a camp, submit builds) rather than a fleet node, the honest answer is that yubaba's reconciler is Unix-only by design and the fix is to stop the CLI linking it — the same graph problem W352 named for kamaji, one layer out. That is a cheaper and more truthful change than three Windows syscall implementations nobody will exercise. Read W352's goals before picking.")
+//! @yah:gotcha("LIVE-FLEET BLAST RADIUS — oss/yubaba/crates/cloud operates the real nodes in .yah/infra/machines/. The root CLAUDE.md's pre-1.0 \"break it, don't tape it\" rule explicitly does NOT extend to breaking a running fleet carelessly: design the code as if one version exists, sequence the roll as if two do. A change to pid reaping or SIGKILL escalation is exactly the kind that looks inert in a diff and strands processes on a node. Whatever shape is chosen, the Unix behaviour must be byte-identical afterwards.")
+//! @yah:handoff("SHAPE CHOSEN: option 1 (gate the Unix-only surfaces inside yah-cloud), NOT option 2 (cut the CLI's edge to yah-cloud). Evidence for rejecting option 2, measured before editing: the CLI is not incidentally linked to yah-cloud — `app/yah/cli/src/camp.rs` and `cloud.rs` reach `cloud::` at 60+ sites for CloudConfig/ServiceConfig/ServiceComponent/MirrorConfig/Provider/LocalRuntime/ReconcileCtx and the whole `reconciler::pond` surface. There is no thin neutral-types edge to cut. The failing surface, by contrast, was three isolated things with almost no internal fan-in: `is_root` had ONE caller in the whole repo (pond_door.rs's own `ensure_pond_cert`); `LocalProcessReconciler`/`local_process::` had exactly two outside the crate (app/yah/cli/src/cloud.rs:11138 and app/yah/desktop/src/mirror_run.rs:1008); `proc_control` is consumed by camp.rs only for CONTROL_SOCK_ENV + ControlEndpoint + fetch_status. So the Unix-only part was cleanly separable after all — the ticket's warning that a cfg was the wrong tool was written against a scope question that had not yet been answered.")
+//! @yah:handoff("WHAT LANDED, three gates in yah-cloud plus their downstream. (1) reconciler/local_process.rs — the module is `#[cfg(unix)]` WHOLE, not half-ported, with the reasoning written at the gate: its contract is \"replace the predecessor\" (kill(pid,0) liveness + SIGTERM-grace-SIGKILL), and a build with that ladder stripped would still spawn and would silently double-spawn instead of reaping, which is precisely the stranded-process failure this ticket's own gotcha warns about. Re-exports gated in reconciler/mod.rs:179 and lib.rs. (2) reconciler/pond_door.rs — `is_root` (geteuid) and `ensure_pond_cert` (its only caller) are `#[cfg(unix)]`; deliberately NO non-unix counterpart, because Windows elevation is an integrity level plus a token privilege, not a renamed euid, so answering `false` there would be a guess dressed as a fact. `ensure_pond_cert_as` — the version with the privilege injected — stays portable and ungated, and is the portable half of that API. (3) proc_control.rs — `fetch_status_uds` is `#[cfg(unix)]` and `fetch_status`'s `Socket` arm gets a `#[cfg(not(unix))]` arm returning a precise error. The ENUM VARIANT was deliberately kept on all platforms: gating it would have forced surgery on app/yah/cli/src/camp.rs (run.spawn/run.status), a 38k-line file three peers were editing during this session, for no gain — a PathBuf variant is perfectly representable and `fetch_status` already documents \"errors mean unreachable\" as its vocabulary, so a platform with no such transport is inside that contract rather than beside it. Four UDS-backed tests + the `serve_once` helper gated to match.")
+//! @yah:handoff("DOWNSTREAM, four sites, all outside camp.rs: app/yah/cli/src/cloud.rs — `LocalProcessReconciler` moved out of the big `use cloud::{...}` list into its own `#[cfg(unix)] use`, and the `\"container\" if local_process::slot_declared(..)` match arm carries `#[cfg(unix)]` (an attribute on a match arm is legal and is the smallest correct edit); `handle_pond` split into a `#[cfg(unix)]` original plus a `#[cfg(not(unix))]` counterpart that bails naming mkcert and passway, with `handle_pond_door` gated alongside its only caller. app/yah/desktop/src/mirror_run.rs — same two edits (import + match arm). `cargo check -p desktop` EXIT=0 confirms the desktop half.")
+//! @yah:handoff("DISCOVERED WORK FIXED IN THIS PASS, not filed as a followup. (a) WALL 4 was one line: crates/yah/agent-tools/src/daemon_client.rs:228 `SCRATCH_ACQUIRE_TIMEOUT` was the ONLY one of four `const …: Duration` in that file missing the `#[cfg(unix)]` its three siblings carry (RPC_TIMEOUT :197, MID_TIMEOUT :217, WORKLOAD_ACTUATE_TIMEOUT :243), and `Duration` is imported under that gate — so a non-unix build failed there with `cannot find type Duration`. Attributed, not guessed: `git diff --stat` on that file was EMPTY, so it is committed state and not a peer's in-flight edit. (b) Three items went dead-on-Windows once local_process was gated and are now gated to match, so the Windows leg does not accumulate dead-code noise: reconciler/native_support.rs `spawn_native_log_supervisor` and `FileTail` (the latter `#[cfg(any(unix, test))]` — its other callers are in that file's own test module), and reconciler/mod.rs `wait_for_port`. (c) proc_control.rs's `use tokio::io::{…}` is `#[cfg(unix)]`, since only the UDS transport reads or writes a stream (the HTTP arm goes through reqwest); `use std::path::{Path, PathBuf}` narrowed to `PathBuf` with `fetch_status_uds` spelling `std::path::Path` inline.")
+//! @yah:verify("WINDOWS PROBE — baseline re-measured by me on this tree before editing (NOT taken on the dispatch's word): EXIT=101, 6 error lines, 5 of them the yah-cloud errors named in this ticket's gotcha at their current line numbers (proc_control.rs:288, local_process.rs:935/:949/:957, pond_door.rs:536 — the gotcha's :278 is one tree-state stale), 0 in kamaji. AFTER: EXIT=101, 22 error lines, 21 real errors and ZERO of them in yah-cloud or yah-agent-tools — every one is in app/yah/cli/src/ (venue.rs 8, qed_worktrees.rs 3, camp_control_plane.rs 3, cli.rs 2, qed.rs/plugin_host.rs/plugin_grants.rs/plugin_broker.rs/lan_tunnel.rs 1 each). That is wall 5, filed as R918-F7 with the same measurement. Attribution method for the file counts: `awk '/^error/{e=$0; getline; print $0}' probe.log` pairs each error with ITS location — a bare grep for the crate path also matches warning lines and this ticket's own annotation prose and reports 8 phantom yah-cloud hits.")
+//! @yah:verify("UNIX DID NOT REGRESS — all measured on this tree after the edits: `cargo check -p yah` EXIT=0; `cargo check -p desktop` EXIT=0; `cargo check --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --all-targets` EXIT=0; `cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib` = 1253 passed / 0 failed / 4 ignored, EXIT=0. BASELINE CAVEAT, stated rather than papered over: my pre-edit `cargo test -p yah-cloud` baseline never ran — from the repo root cargo answers \"package `yah-cloud` cannot be tested because it requires dev-dependencies and is not a member of the workspace\" (the --manifest-path form is the only one that works; config.rs's R918-era annotation says the same). So the yah-cloud test number is an after-only measurement. It is still load-bearing evidence: every Unix-side edit here is a `#[cfg(unix)]` that evaluates TRUE on the test host, plus re-export relocations, so the Unix path is byte-identical by construction and 0 failures is the expected result rather than a lucky one. The pre-edit `cargo check -p yah` baseline DID run and was EXIT=0.")
+//! @yah:gotcha("SCOPE ANSWER USED, recorded so it is not re-litigated: the relay leader ruled the Windows yah CLI is a CLIENT (talks to a camp, submits builds, is not a fleet node and will not supervise workloads), so yubaba's local-process reconciler is Unix-only BY DESIGN and the fix is to stop linking it on Windows rather than to implement OpenProcess/TerminateProcess, a Windows elevation check and a named-pipe transport. Reversing that costs exactly one ticket implementing those three, at the point someone actually wants a Windows fleet node; it costs nothing now. NOTE FOR THE NEXT READER: this ticket's own `@yah:next` says \"DO NOT REACH FOR #[cfg(unix)] ON THE MODULE\" — that instruction was written BEFORE the scope question it also asks was answered, and the answer inverts it. With the reconciler declared unix-only, a module gate is not a half-port dodging a decision; it IS the decision, written where the compiler enforces it.")
+//! @yah:gotcha("BEHAVIOUR CHANGE ON WINDOWS ONLY, listed so nobody discovers it at runtime: `yah cloud pond door` and `yah cloud pond cert` fail with a message naming mkcert and passway; a mirror binding its compute slot to `local-process` no longer matches the local-process arm and falls through to the container reconciler, failing there with that reconciler's own diagnostic rather than silently double-spawning an unreaped process; `cloud::proc_control::fetch_status` on a `Socket` endpoint returns an error naming the transport. All three are non-unix-only. Unix is untouched — no `pid_alive`, `signal_pid` or `is_root` BEHAVIOUR was modified, which was this ticket's stated live-fleet constraint.")
+//! @yah:handoff("Wall 3 cleared and verified; wall 4 (agent-tools, one line) absorbed; wall 5 measured and filed as R918-F7 rather than absorbed. Wall 5 is genuinely separable, not a fourth cfg attribute: it is 21 errors across 9 files of the CLI's OWN Unix surfaces (plugin sandbox, venue flock, lan-tunnel signals, camp control plane, qed worktree reaping), its eight candidate modules carry 125 intra-CLI reference sites, and it turns on an operator call this relay has NOT made — W352 frames Windows as a build TARGET and R919 calls us-west-002 a build WORKER, but `yah qed run --in-process` is the local-build path and it reaches `libc::kill` and `crate::camp`. Declaring that unix-only is the precedent-matching default and may defeat the point of the Windows leg. Full measurement and the question are on R918-F7.")
+//! @yah:handoff("LEADER SIGN-OFF (R918 relay). The scope call I made at dispatch — Windows yah CLI is a CLIENT, so stop it linking yubaba's reconciler rather than implement Windows syscall equivalents — was executed as Shape 1 (gate the Unix-only surfaces inside yah-cloud): local_process gated whole, is_root/ensure_pond_cert gated, fetch_status_uds gated with an explicit non-unix error arm, plus four downstream sites in app/yah/cli/src/cloud.rs and app/yah/desktop/src/mirror_run.rs. Shape 2 (cut the CLI's edge to yah-cloud) was rejected on measured evidence rather than taste — the CLI reaches `cloud::` at 60+ sites, so there is no thin edge to cut. That is the right call and the evidence is the reason it is the right call.</handoff>\n<parameter name=\"verify\">RE-VERIFIED BY THE LEADER, both halves, independently of the courier's return. WINDOWS: the ticket's probe gives EXIT=101 with 22 error lines, and bucketing every error's `-->` location by directory gives **21 in app/yah/cli/src and ZERO anywhere else** — no yah-cloud, no yah-agent-tools, no kamaji, no mesofact-core. The 6→21 error count is progress, not regression: three crates went clean and a previously-unreachable surface became visible, and the distribution matches R918-F7's independently-filed per-file breakdown. UNIX DID NOT REGRESS, which is the half that actually carried risk given this crate operates the live fleet: `cargo check --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --all-targets` CHECK_EXIT=0 with 0 errors, and `cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib` TEST_EXIT=0, **1253 passed / 0 failed / 4 ignored**. The ticket's own gotcha demanded Unix behaviour be byte-identical afterwards; a full green test suite on the reconciler is the evidence for that.</verify>\n<parameter name=\"gotcha\">WALL 4 WAS ABSORBED HERE RATHER THAN FILED, correctly — app/yah/cli/src/daemon_client.rs:228 had one of four `Duration` consts missing the `#[cfg(unix)]` its three siblings carry. That is committed state, not a peer's in-flight edit, and it is a one-line fix standing directly in this ticket's path; filing it would have cost a ticket, a dispatch and a cold agent re-deriving context. WALL 5 was correctly NOT absorbed and is filed as R918-F7: it is 21 errors across eight CLI modules with 125 intra-CLI reference sites, and it turns on an operator scope question this ticket's ruling does not settle.</gotcha>\n<parameter name=\"assumes\">EVIDENCE CAVEAT on the Windows probe above, stated rather than left for a reader to find: the camp daemon attached a deferred skew verdict reporting 2 build inputs changed mid-run (app/yah/cli/src/camp.rs and crates/yah/camp-service/src/bite/mod.rs), so that run describes a tree that had already moved. The conclusion survives it — the error-location histogram is a directory-level fact, R918-F7's per-file breakdown lists no camp.rs error site, and the Unix half above ran clean and skew-free — but the exact count of 21 should be re-measured rather than quoted as gospel by whoever picks up F7.</assumes>\n</invoke>\n")
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+// R918-F5 — only the unix-socket transport (and the tests that exercise it)
+// reads or writes a stream here; the HTTP arm goes through reqwest.
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Environment variable naming the control socket a supervised process should
@@ -254,7 +278,22 @@ impl std::fmt::Display for ControlEndpoint {
 /// [`wait_ready`] rather than treating one error as a verdict.
 pub async fn fetch_status(endpoint: &ControlEndpoint) -> anyhow::Result<ProcStatus> {
     match endpoint {
+        #[cfg(unix)]
         ControlEndpoint::Socket(path) => fetch_status_uds(path).await,
+        // R918-F5 — the dev-tier transport is a unix domain socket, and tokio
+        // exposes `UnixStream` on unix only (Windows 10+ has AF_UNIX; tokio
+        // does not surface it). A non-unix `yah` is a *client* — it talks to a
+        // camp and submits builds rather than supervising workloads — so no
+        // producer it can reach binds one of these. Reporting the endpoint as
+        // unreachable is this function's documented vocabulary for exactly
+        // that; inventing a named-pipe transport here would change a wire
+        // contract no producer speaks.
+        #[cfg(not(unix))]
+        ControlEndpoint::Socket(path) => anyhow::bail!(
+            "control socket {} is unreachable: the newline-JSON unix-socket transport is \
+             unix-only and this is a non-unix build",
+            path.display()
+        ),
         ControlEndpoint::Http(url) => {
             let body = reqwest::Client::new()
                 .get(url)
@@ -274,7 +313,8 @@ pub async fn fetch_status(endpoint: &ControlEndpoint) -> anyhow::Result<ProcStat
 /// The connection is not reused. A status poll happens every few seconds at
 /// most, and a per-call connection means a wedged reader on the producer side
 /// cannot poison later polls — worth far more here than the syscalls saved.
-async fn fetch_status_uds(path: &Path) -> anyhow::Result<ProcStatus> {
+#[cfg(unix)]
+async fn fetch_status_uds(path: &std::path::Path) -> anyhow::Result<ProcStatus> {
     let mut stream = tokio::net::UnixStream::connect(path).await?;
     stream.write_all(b"{\"cmd\":\"status\"}\n").await?;
     stream.flush().await?;
@@ -340,6 +380,9 @@ mod tests {
 
     /// Minimal conforming producer: accept, read a line, answer one document.
     /// This is also the reference for how little a workload has to implement.
+    ///
+    /// R918-F5 — unix-only alongside the transport it exercises.
+    #[cfg(unix)]
     fn serve_once(path: PathBuf, docs: Vec<String>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let listener = tokio::net::UnixListener::bind(&path).unwrap();
@@ -416,6 +459,7 @@ mod tests {
         assert!(!s.is_ready(), "but state decides");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn fetch_status_reads_a_document_over_a_unix_socket() {
         let tmp = tempfile::tempdir().unwrap();
@@ -433,6 +477,7 @@ mod tests {
         server.abort();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn wait_ready_polls_through_starting_to_running() {
         let tmp = tempfile::tempdir().unwrap();
@@ -458,6 +503,7 @@ mod tests {
     /// `failed` must short-circuit. Burning the full readiness timeout on a
     /// process that has already said it is not coming up is the slow-edit-loop
     /// failure this outcome exists to prevent.
+    #[cfg(unix)]
     #[tokio::test]
     async fn wait_ready_fails_fast_on_a_terminal_state() {
         let tmp = tempfile::tempdir().unwrap();
@@ -481,6 +527,7 @@ mod tests {
         server.abort();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn wait_ready_times_out_when_nothing_is_listening() {
         let tmp = tempfile::tempdir().unwrap();

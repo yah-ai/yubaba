@@ -130,9 +130,9 @@
 //! @yah:next("Second consumer (cross-camp, noisetable): the egress peer publishes with POST /node/metrics on its own cadence, ttl_ms set to a small multiple of that cadence, one source per plinth. Keys are producer-owned in full — use a noisetable. prefix; system./host./os./yah. are refused. A report REPLACES that source's previous set, so a metric it stops sending disappears rather than pinning its last value, and an empty metrics map is a legal heartbeat.")
 //!
 //! @yah:ticket(R885-B7, "/node/usage reports workloads.count 0 after every restart: workload_resources is in-memory and nothing rehydrates it at boot")
-//! @yah:at(2026-09-10T22:33:21Z)
-//! @yah:status(open)
-//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:status(review)
+//! @yah:at(2026-09-11T09:02:32Z)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
 //! @yah:parent(R885)
 //! @yah:severity(high)
 //! @yah:gotcha("THIS IS NOT STALENESS, IT IS STRUCTURAL ZERO — and that distinction is the whole ticket. Measured 2026-09-10 on us-west-003 by @Ashguard:eclipse. yubaba serves GET /node/usage at oss/yubaba/crates/yubaba/src/lib.rs:2581, which calls node::committed_totals(&s.workload_resources) (node.rs:512). `workload_resources` is an in-memory Mutex<BTreeMap> (node.rs:509), constructed Default::default() at lib.rs:1390, inserted on deploy success (lib.rs:4512) and removed on destroy (lib.rs:4680). NOTHING REHYDRATES IT AT STARTUP. So after any yubaba/kamaji restart it reports `yah.workloads.count` = 0 permanently, no matter what the node is actually holding — it does not drift toward wrong, it starts wrong and stays wrong. A scheduler trusting /node/usage will therefore overcommit a rebooted node indefinitely. CONTRAST THE SIBLING ENDPOINT, which is correct: GET /workloads (lib.rs:3073) goes through the kamaji UDS `client.list()` to containerd, which SURVIVES a restart. The two endpoints disagreeing is the visible symptom; the durability asymmetry is the cause. OBSERVED CONCRETELY: on us-west-003 after its restart, /workloads listed 16 Pending forge-* entries while /node/usage read workloads.count 0 — and when those 16 containerd records were removed, /workloads went to [] while /node/usage read 0 both before AND after, i.e. it was never tracking them at all.")
@@ -140,11 +140,19 @@
 //! @yah:gotcha("RELATED BUT DELIBERATELY SEPARATE — do not fold these together. (1) kamaji HAS NO STARTUP RECONCILIATION AT ALL: its boot is build_ctx + resume_bundle_workloads() only (crates/kamaji-bin/src/main.rs:510-516), which replays persisted BUNDLE deploy records and never looks at containerd's namespace. The labels that would support reconciliation already exist and document the intent — crates/kamaji-bin/src/containerd.rs:1115-1118 literally says 'how reconciliation recovers the workload id after a Kamaji restart' — but nothing consumes them at boot. Confirmed by tree-wide grep for reconcile/sweep/orphan/gc/prune. This ticket's rehydration is the yubaba-side half; a kamaji-side reconcile is a larger, separable piece. (2) R823-B4 owns the LEAK that made this visible: teardown_workload sends the MeshIdent `forge.<uuid>` where the container is named `forge-<uuid>`, so every reap silently no-ops while reporting success. That is a different bug with a different fix and it is already diagnosed and code-complete but unrolled. Fixing B7 does not fix the leak, and rolling the leak fix does not fix B7. (3) The rest of R885 is per-workload cgroup limits at ADMISSION — complementary; nothing there reclaims a record or corrects an accounting surface.")
 //! @yah:verify("Restart yubaba on a node holding at least one live workload and assert GET /node/usage `yah.workloads.count` matches GET /workloads immediately after boot, without a deploy having happened in between. That last clause is the real test: the count is currently repopulated ONLY by a subsequent deploy (lib.rs:4512), so any verification that deploys first will pass against the unfixed code. us-west-003 is a usable target — it is reachable on LAN (yah@192.168.10.32) and mesh (100.64.0.9), running yubaba/kamaji 0.8.28, single-node, epoch 4.")
 //! @yah:gotcha("Tier: Cleric — a single well-understood seam with the required call already in the codebase; it needs care about restart ordering and source-of-truth choice, not novel design.")
+//! @yah:handoff("FIXED: node.rs's ResourceRegistry changed from Mutex<BTreeMap<String, WorkloadResources>> to Mutex<BTreeMap<String, Option<WorkloadResources>>>. None means 'this workload exists (recovered from the runtime backend) but its original resource request is unrecoverable' -- distinct from a fabricated zero, which preserves enrich_workloads' pre-existing documented 'absent means unknown, not zero' contract for GET /workloads. New node::record_seen_with_unknown_resources(registry, ident) inserts None without clobbering an already-known entry. committed_totals now counts ALL entries (known+unknown) toward yah.workloads.count but sums only known ones into the memory/cpu totals.")
+//! @yah:handoff("WIRED AT BOOT: lib.rs gained rehydrate_workload_resources(state) + live_workload_idents[_with_retry], called from both real entry points serve() and serve_on_listener() right after the listener binds, before axum::serve starts routing. It mirrors list_workloads' own backend selection (kamaji sibling client.list() first, legacy in-process runtime.list_workloads() second) and reuses the existing mesh_ident.unwrap_or(id) key-resolution idiom already used at lib.rs:3574 for drain_workloads, so /node/usage and /workloads can never disagree about which backend is authoritative for 'what does this node hold'.")
+//! @yah:handoff("RESTART-ORDERING CALL: retries up to REHYDRATE_ATTEMPTS=3 with short backoff (~3.5s total) instead of blocking forever -- attach_constable_client (main.rs) already rides out the kamaji-socket-not-ready boot race with its own multi-second budget before serve() is ever called, so a failure at this point is unexpected, not routine. On exhausting retries it does NOT leave the registry silently empty (that would reproduce this exact bug under a different trigger): it logs tracing::error! naming the concrete consequence for an operator. Did NOT add an explicit 'unknown' wire state to NodeUsage.workloads_count (plain u32, additive-only schema per NODE_SCHEMA_VERSION) -- that would be a breaking change to every GET /node/usage consumer, disproportionate to this ticket's single-seam scope; the loud log is the honest signal available at this tier.")
+//! @yah:handoff("KNOWN, DOCUMENTED LIMITATION (stated up front, not discovered late): memory_mb/cpu_millis for a workload that survived a restart without redeploy stay genuinely unrecoverable -- they were never persisted anywhere but this in-memory map -- so they read absent (not zero) until that workload is redeployed or destroyed. yah.committed.memory_mb/.cpu_millis therefore still undercounts restart survivors; only yah.workloads.count (the ticket's actual measured bug) is fixed. Persisting requested resources to disk so they'd survive a restart is out of scope for this ticket.")
+//! @yah:verify("cargo check --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib --tests: zero errors attributed to node.rs or lib.rs across 3 consecutive runs on 2026-09-11. The one remaining error (E0599 in push_dispatch.rs) is an unrelated, actively-in-flight peer file for R726 (sessions 0f1af411/422b4ffc, Ashguard/Glimmerstone) that this ticket never touched -- could not obtain a full green `cargo test -p yubaba --lib` while that blocks the crate build; operator should re-run once R726 lands.")
+//! @yah:verify("New/changed tests, not yet executed against a green build but reviewed line-by-line against the type signatures they exercise: node.rs::committed_totals_counts_unknown_entries_but_excludes_them_from_sums, node.rs::record_seen_with_unknown_resources_does_not_clobber_a_known_entry, node.rs::enrich_leaves_rehydrated_unknown_entries_without_resource_fields, lib.rs::node_usage_workload_count_matches_workloads_after_boot_rehydration_no_deploy (the ticket's own trap-avoiding regression test: builds a ServerState with a FixedListRuntime pre-seeded with 2 workloads, calls rehydrate_workload_resources directly, then asserts yah.workloads.count == GET /workloads array length -- with NO deploy anywhere in the test, which is what the ticket's verify note calls out as the case that would pass against the unfixed code).")
+//! @yah:verify("LIVE VERIFICATION NOT PERFORMED (courier mandate: no live fleet writes). For the operator on us-west-003 once this ships and cargo test is confirmed green: restart yubaba+kamaji (systemctl restart kamaji && systemctl restart yubaba, or the fleet roll equivalent), then diff `curl -s http://100.64.0.9:7443/node/usage | jq '.\"yah.workloads.count\"'` against `curl -s http://100.64.0.9:7443/workloads | jq '.workloads | length'` -- they must match immediately, with NO deploy in between. That last clause is the actual test; deploying first would pass even against the unfixed code.")
+//! @yah:verify("RETRY CONFIRMED GREEN 2026-09-11: the R726 peer's push_dispatch.rs E0599 landed fixed. `cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib` = 979 passed, 0 failed (full crate, baseline: same command on the pre-edit tree was unrunnable due to the then-in-flight peer file, so this is the first available baseline). All 4 new/changed tests confirmed passing by name: node::tests::committed_totals_counts_unknown_entries_but_excludes_them_from_sums, node::tests::record_seen_with_unknown_resources_does_not_clobber_a_known_entry, node::tests::enrich_leaves_rehydrated_unknown_entries_without_resource_fields, tests::node_usage_workload_count_matches_workloads_after_boot_rehydration_no_deploy (the ticket's own trap-avoiding regression test).")
 //!
 //! @yah:ticket(R885-B8, "/node/usage system.filesystem.* measures the wrong filesystem: it reports / while containerd fills /var")
-//! @yah:at(2026-09-10T22:34:26Z)
-//! @yah:status(open)
-//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:status(review)
+//! @yah:at(2026-09-11T09:09:18Z)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
 //! @yah:parent(R885)
 //! @yah:severity(high)
 //! @yah:gotcha("CAUGHT BY A CONTROLLED EXPERIMENT, not by reading the code — measured 2026-09-10 on us-west-003 by @Ashguard:eclipse. 16 inert containerd records were removed and 10G of disk was genuinely reclaimed (/var went from 23G avail to 33G avail, stable across two minutes of 20-second polls). Across that reclaim, GET /node/usage's `system.filesystem.*` reported 54505013248 / 422566010880 BYTE-IDENTICAL BEFORE AND AFTER. The reason: 422566010880 = 393.6 GiB = `/`, which on that box is 394G with 343G free. containerd writes to `/var`, which is a SEPARATE LV of only 60G. So the endpoint reports the roomy filesystem and is structurally blind to the one that actually fills. THE CONSEQUENCE IS THE OPPOSITE OF A COSMETIC BUG: this is the surface a scheduler or an operator would consult to decide whether a node has room for a build, and on this node it would have answered '343G free, plenty' at the exact moment /var had 23G left and a pending ~1h49m rusty-v8-musl build needed headroom there. A disk-pressure incident on this hardware is therefore invisible to the metric designed to catch it.")
@@ -152,6 +160,17 @@
 //! @yah:gotcha("WHY THIS NODE IS LAID OUT THIS WAY, so the fix is not built against a wrong mental model: a 2026-08-29 layout change on us-west-003 removed the docker LV and gave `/` 394 GB with no containment — that machine file's own 'WHAT THIS COSTS' note flags the absence of containment as a known cost. `/var` remained a separate 60G LV, and that is where containerd's snapshotter lives (measured: /var/lib/containerd 30G total, snapshotter 29G, before the cleanup). So the two filesystems genuinely differ in SIZE BY A FACTOR OF SIX on this hardware, which is what makes the misreport so consequential here — on a node where containerd sits on / the bug would be invisible. Do not assume other nodes share this layout; that is exactly why the fix must resolve the path at runtime. RELATED, SAME INCIDENT, SEPARATE TICKETS: R885-B7 covers /node/usage's workloads.count reading a never-rehydrated in-memory map, and R823-B4 owns the reap-key mismatch that leaked the records in the first place. All three surfaced together on 2026-09-10; none of them fixes another.")
 //! @yah:verify("Reproduce the original catch rather than only asserting the new number looks right: consume a measurable amount of space under the containerd root, then confirm GET /node/usage's system.filesystem.* MOVES by roughly that amount. The unfixed code passes any check that merely reads the endpoint once and sees a plausible figure — it was reporting a perfectly plausible 54505013248 / 422566010880 throughout. A delta test is what distinguishes the fix; a snapshot test does not.")
 //! @yah:gotcha("Tier: Cleric — small, contained change to one metric path, but it needs runtime path resolution and a delta-based test rather than a snapshot assertion, which is where a careless fix would go wrong.")
+//! @yah:handoff("FIXED: node.rs's read_filesystem() no longer unconditionally probes `/`. It now calls read_filesystem_at(workload_root_candidates()), where workload_root_candidates() returns [\"/var/lib/containerd\", \"/\"] on Linux and [\"/var/lib/containerd\", \"/System/Volumes/Data\", \"/\"] on macOS (preserving the existing darwin sealed-system-volume workaround, now second priority behind containerd's own root). read_filesystem_at picks the first candidate that exists and runs df -Pk against THAT PATH -- the OS's live mount table then resolves whichever filesystem actually backs it today, so a node that colocates containerd with / and a node that gives it a separate LV (like us-west-003) both report truthfully with zero per-node configuration. /var/lib/containerd is containerd's own well-known default data directory, not a partition-layout guess like hardcoding /var would have been.")
+//! @yah:handoff("Both call sites of read_filesystem() (collect_specs for GET /node, usage() for GET /node/usage) get the fix automatically since they share the one function -- no separate change needed per endpoint.")
+//! @yah:handoff("SCOPING CALL: did NOT add a second field reporting the root filesystem alongside the containerd-backed one, though the ticket's next-steps text raised it as something to 'consider'. The blast radius for a new wire field is real (NodeUsage/NodeSpecs schema, their serialization tests, and per the R646 precedent in this file's own history, cloud-client's mirrored NodeUsage/NodeSpecs types and yah-fleet-metrics' re-export) and it was framed as optional, not required; the ticket's hard acceptance bar (the delta test) doesn't need it. Left as a followup if an operator later wants the root FS visible too.")
+//! @yah:verify("cargo check --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib --tests: clean, zero errors, 2026-09-11.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib: 983 passed, 0 failed (baseline: 979 passed/0 failed established on this same tree for R885-B7 moments earlier, so this run's +4 is exactly the 4 new tests below -- no regressions elsewhere).")
+//! @yah:verify("New tests, all confirmed passing by name in `-- node::` run: node::tests::read_filesystem_at_moves_when_the_probed_path_fills_up (THE delta test the ticket demanded -- writes 8 MiB under a tempdir standing in for the containerd root and asserts df's reported used-bytes grows by roughly that amount, total unchanged; this is what a snapshot assertion cannot catch, since the unfixed code also returns a plausible-looking number), node::tests::read_filesystem_at_skips_a_missing_candidate_and_falls_through, node::tests::read_filesystem_at_falls_back_to_root_when_no_candidate_exists, node::tests::workload_root_candidates_lead_with_the_containerd_root.")
+//! @yah:verify("LIVE VERIFICATION NOT PERFORMED (courier mandate: no live fleet writes). For the operator on us-west-003 to reproduce the ORIGINAL catch against the fixed binary: before/after values of `curl -s http://100.64.0.9:7443/node/usage | jq '.\"system.filesystem.usage\", .\"system.filesystem.limit\"'`. First confirm `.\"system.filesystem.limit\"` is no longer 422566010880 (that was `/`'s 393.6 GiB) -- it should now read ~60G (the /var/lib/containerd LV's own size). Then reproduce the delta: `df -h /var/lib/containerd` before, pull or run something that writes a known amount under containerd's root (or remove a known-size image/container the way the original catch removed 16 inert records), `df -h /var/lib/containerd` after, and confirm system.filesystem.usage moved by roughly the same amount both in `df` and in the endpoint -- a single before/after snapshot is not sufficient, matching this ticket's own stated acceptance bar.")
+//! @yah:handoff("GAP CLOSED per leader review: /var/lib/containerd was still a hardcoded path, same class of mistake as hardcoding / one directory deeper. INVESTIGATED WHETHER CONTAINERD'S ROOT IS CONFIGURABLE IN THIS CODEBASE, not assumed: kamaji-bin's full CLI flag set (oss/kamaji/crates/kamaji-bin/src/main.rs, every \"--...\" arm) has --containerd-socket (the UDS kamaji dials) but no --containerd-root/--containerd-state; every provisioning path in this repo (.yah/infra/cloud-init/stand-up-yubaba.sh:67-69, apt-get install containerd + systemctl enable --now containerd) installs the stock package and stages no config.toml override. So this codebase genuinely has ZERO configuration surface for containerd's root -- it is containerd's own upstream compiled-in default everywhere this camp provisions a node, not a guess. Documented this finding (with the file:line citations) directly in read_filesystem's doc comment so the next reader sees it was checked, not assumed -- including the honest caveat that containerd's own Go source defining that default was not itself read in this pass (not vendored here), and naming the real next step if a node ever DOES need a custom root: containerd's own Introspection.Plugins RPC exposes a configured snapshotter path via Plugin.exports, but surfacing that to yubaba means a new kamaji-proto message + server handler + client call across the sibling UDS -- correctly out of this ticket's single-seam scope, noted as the natural follow-up ticket rather than attempted here.")
+//! @yah:handoff("LABELLED, NOT SILENT FALLBACK: added yah.filesystem.source (String, paired 1:1 with system.filesystem.usage/limit's Option-ness) to both NodeSpecs and NodeUsage, carrying the exact path read_filesystem_at actually measured -- /var/lib/containerd, /System/Volumes/Data, or a labelled / when every candidate is missing. read_filesystem/read_filesystem_at now return (used, total, source_path) instead of just the two numbers, threaded through both collect_specs() and usage() into the new field. A fleet node silently falling back to / is now a visible, attributable JSON key instead of a plausible-looking number with no way to tell what it measured -- closing the exact failure shape this whole ticket exists to kill.")
+//! @yah:verify("cargo check --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib --tests: clean, 2026-09-11, after the filesystem_source field addition.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib: 984 passed, 0 failed (prior verified baseline was 983/0; the +1 is the new usage_omits_filesystem_fields_together_when_unmeasured test, zero regressions). New/strengthened tests confirmed passing by name: read_filesystem_at_skips_a_missing_candidate_and_falls_through and read_filesystem_at_falls_back_to_root_when_no_candidate_exists now assert the SOURCE string names the real candidate, not just that a value came back; specs_collect_on_this_platform and usage_collects_on_this_platform gained the pairing invariant (a filesystem number and its source are always both-present or both-absent); specs_serialize_with_otel_semconv_keys and usage_serializes_with_otel_semconv_keys assert the new yah.filesystem.source wire key round-trips; usage_omits_filesystem_fields_together_when_unmeasured is new.")
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -311,13 +330,29 @@ pub struct NodeSpecs {
     )]
     pub memory_limit_bytes: Option<u64>,
 
-    /// Total size of the root filesystem in bytes.
+    /// Total size of the filesystem workloads actually consume, in bytes —
+    /// see [`Self::filesystem_source`] for which path that was resolved to.
     #[serde(
         rename = "system.filesystem.limit",
         skip_serializing_if = "Option::is_none",
         default
     )]
     pub filesystem_limit_bytes: Option<u64>,
+
+    /// The path [`Self::filesystem_limit_bytes`] was actually measured
+    /// against (R885-B8) — e.g. `/var/lib/containerd`, or a labelled `/`
+    /// fallback on a node with no containerd at its default root. Absent
+    /// exactly when `filesystem_limit_bytes` is, and present whenever it
+    /// isn't: a number with no named source is the failure mode this field
+    /// exists to rule out. Not an OTel semconv key (no standard field for
+    /// "which path was probed"), hence the `yah.` prefix like
+    /// [`NodeUsage::cpu_source`].
+    #[serde(
+        rename = "yah.filesystem.source",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub filesystem_source: Option<String>,
 
     /// What this node's `[allocatable] memory_mb` *would* be if derived from
     /// measurement — total RAM in MiB.
@@ -434,6 +469,17 @@ pub struct NodeUsage {
     )]
     pub filesystem_utilization: Option<f64>,
 
+    /// The path the three `system.filesystem.*` fields above were actually
+    /// measured against (R885-B8) — see [`NodeSpecs::filesystem_source`] for
+    /// the full rationale, which applies identically here. Absent exactly
+    /// when `filesystem_usage_bytes` is.
+    #[serde(
+        rename = "yah.filesystem.source",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub filesystem_source: Option<String>,
+
     #[serde(
         rename = "yah.load.1m",
         skip_serializing_if = "Option::is_none",
@@ -524,15 +570,40 @@ pub struct WorkloadResources {
 }
 
 /// Registry of `ident -> requested resources` for workloads this yubaba
-/// admitted.
+/// knows about.
 ///
 /// Deliberately the same shape and lifecycle as `ServerState`'s
 /// `archetype_registry`: written by the deploy handler on success, removed by
 /// destroy. In-memory only — see [`NodeUsage::committed_memory_mb`] for what
 /// that costs a consumer.
-pub type ResourceRegistry = Mutex<BTreeMap<String, WorkloadResources>>;
+///
+/// A value of `None` means "this workload exists, but its requested resources
+/// were not recorded" — R885-B7's boot-time rehydration case: a workload that
+/// survived a restart is real (the runtime backend still lists it) but the
+/// `memory_mb`/`cpu_millis` it originally asked for was never persisted
+/// anywhere, so it cannot be recovered. `None` still counts toward
+/// [`committed_totals`]'s workload count (the node genuinely holds it) but is
+/// excluded from the memory/cpu sums (fabricating a number would be worse
+/// than omitting one), and [`enrich_workloads`] leaves its per-row
+/// `memory_mb`/`cpu_millis` absent rather than `0` — the same "absent means
+/// unknown, not zero" contract a fresh, never-registered ident already got.
+pub type ResourceRegistry = Mutex<BTreeMap<String, Option<WorkloadResources>>>;
 
-/// Sum of all recorded requests, and how many workloads contributed.
+/// Record that a workload exists without a known resource request — the
+/// boot-time rehydration case (see [`ResourceRegistry`]). Never overwrites an
+/// existing entry: if the workload's real request is already known (a deploy
+/// landed before this ran, or raced it), it must not be clobbered with
+/// `None`.
+pub fn record_seen_with_unknown_resources(registry: &ResourceRegistry, ident: String) {
+    let mut guard = match registry.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.entry(ident).or_insert(None);
+}
+
+/// Sum of all recorded requests, and how many workloads contributed (known or
+/// not — see [`ResourceRegistry`]).
 pub fn committed_totals(registry: &ResourceRegistry) -> (u32, u32, u32) {
     let guard = match registry.lock() {
         Ok(g) => g,
@@ -541,8 +612,8 @@ pub fn committed_totals(registry: &ResourceRegistry) -> (u32, u32, u32) {
         // exactly what an operator reaches for while diagnosing that panic.
         Err(poisoned) => poisoned.into_inner(),
     };
-    let mem = guard.values().map(|r| r.memory_mb).sum();
-    let cpu = guard.values().map(|r| r.cpu_millis).sum();
+    let mem = guard.values().filter_map(|r| r.as_ref()).map(|r| r.memory_mb).sum();
+    let cpu = guard.values().filter_map(|r| r.as_ref()).map(|r| r.cpu_millis).sum();
     (guard.len() as u32, mem, cpu)
 }
 
@@ -586,7 +657,7 @@ pub fn enrich_workloads(registry: &ResourceRegistry, workloads: &mut serde_json:
             .or_else(|| obj.get("id"))
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        let Some(res) = key.and_then(|k| guard.get(&k).copied()) else {
+        let Some(res) = key.and_then(|k| guard.get(&k).copied()).flatten() else {
             continue;
         };
         obj.insert("memory_mb".into(), res.memory_mb.into());
@@ -1033,6 +1104,10 @@ impl NodeProbe {
         let (cpu_utilization, cpu_source, sample_window_ms) = self.sample_cpu(window_ms).await;
         let mem = read_memory();
         let fs = read_filesystem();
+        let filesystem_usage_bytes = fs.as_ref().map(|(used, _, _)| *used);
+        let filesystem_limit_bytes = fs.as_ref().map(|(_, total, _)| *total);
+        let filesystem_utilization = fs.as_ref().and_then(|(used, total, _)| ratio(*used, *total));
+        let filesystem_source = fs.map(|(_, _, source)| source);
         let load = read_loadavg();
 
         NodeUsage {
@@ -1042,9 +1117,10 @@ impl NodeProbe {
             memory_usage_bytes: mem.map(|(used, _)| used),
             memory_limit_bytes: mem.map(|(_, total)| total),
             memory_utilization: mem.and_then(|(used, total)| ratio(used, total)),
-            filesystem_usage_bytes: fs.map(|(used, _)| used),
-            filesystem_limit_bytes: fs.map(|(_, total)| total),
-            filesystem_utilization: fs.and_then(|(used, total)| ratio(used, total)),
+            filesystem_usage_bytes,
+            filesystem_limit_bytes,
+            filesystem_utilization,
+            filesystem_source,
             load_1m: load.map(|l| l.0),
             load_5m: load.map(|l| l.1),
             load_15m: load.map(|l| l.2),
@@ -1186,7 +1262,9 @@ fn collect_specs() -> NodeSpecs {
     let rust_arch = std::env::consts::ARCH;
     let cpu_logical_count = read_cpu_count();
     let memory_limit_bytes = read_memory().map(|(_, total)| total);
-    let filesystem_limit_bytes = read_filesystem().map(|(_, total)| total);
+    let fs = read_filesystem();
+    let filesystem_limit_bytes = fs.as_ref().map(|(_, total, _)| *total);
+    let filesystem_source = fs.map(|(_, _, source)| source);
 
     NodeSpecs {
         schema_version: NODE_SCHEMA_VERSION,
@@ -1204,6 +1282,7 @@ fn collect_specs() -> NodeSpecs {
         cpu_logical_count,
         memory_limit_bytes,
         filesystem_limit_bytes,
+        filesystem_source,
         // MiB, matching the `[allocatable]` TOML unit.
         allocatable_memory_mb: memory_limit_bytes.map(|b| (b / (1024 * 1024)) as u32),
         allocatable_cpu_millis: cpu_logical_count.map(|c| c.saturating_mul(1000)),
@@ -1376,38 +1455,114 @@ fn parse_vm_stat_used(text: &str) -> Option<u64> {
     (pages > 0).then(|| pages.saturating_mul(page_size))
 }
 
-/// `(used_bytes, total_bytes)` for the filesystem that actually holds
-/// workload data, via POSIX `df -Pk`.
+/// `(used_bytes, total_bytes, source_path)` for the filesystem that actually
+/// holds workload data, via POSIX `df -Pk`. `source_path` is the exact path
+/// that was probed — see the "labelled, not silent" point below for why the
+/// caller always gets it, not just the two numbers.
 ///
 /// `df` rather than `statvfs` keeps this dep-free and identical on both
 /// platforms. `-P` forces single-line records — without it a long device name
 /// wraps onto its own line and every field offset shifts.
 ///
-/// # Two things that look like nitpicks and are not
+/// # Four things that look like nitpicks and are not
 ///
-/// **The mount point.** On macOS, `/` is the *sealed system volume*, not where
-/// anything writes. Measured on a live camp Mac: `df /` reported 4% used while
-/// `df /System/Volumes/Data` reported 64% on the same APFS container. Reading
-/// `/` would have made a nearly-full build worker report as almost empty —
-/// exactly backwards for the signal this endpoint exists to give. So darwin
-/// probes the Data volume and falls back to `/` only if it is absent.
+/// **The mount point is resolved, never assumed.** R885-B8, measured
+/// 2026-09-10 on us-west-003: this used to unconditionally probe `/`, which
+/// on that box is a roomy, uncontained 394G volume, while containerd's
+/// snapshotter — the thing that actually fills up — lives on a separate 60G
+/// LV mounted under `/var/lib/containerd`. Reclaiming 10G under containerd's
+/// root moved the *real* free space by 10G and moved this endpoint's number
+/// by exactly zero: it was reporting the wrong filesystem's capacity, not a
+/// stale figure. Handing containerd's data directory PATH to `df` lets the
+/// OS's live mount table resolve whichever filesystem actually backs it
+/// today — a node that colocates containerd with `/` and a node that gives
+/// it its own LV both report truthfully with no per-node configuration.
+///
+/// **`/var/lib/containerd` is containerd's own default, not a guess dressed
+/// up as one.** The first version of this fix was checked against exactly
+/// the failure it fixes: is the PATH itself hardcoded the same way `/` was?
+/// Checked, not assumed — this codebase has no configuration surface for
+/// containerd's root at all. `kamaji-bin`'s flag set
+/// (`oss/kamaji/crates/kamaji-bin/src/main.rs`, the `"--containerd-socket"`
+/// arm and its neighbours) only names the UDS *socket* kamaji dials, never a
+/// `--containerd-root`/`--containerd-state`; and every provisioning path in
+/// this repo (`.yah/infra/cloud-init/stand-up-yubaba.sh`: `apt-get install
+/// containerd` then `systemctl enable --now containerd`, no config.toml ever
+/// staged) runs the stock package with no root/state override. So
+/// `/var/lib/containerd` is containerd's own upstream compiled-in default
+/// (not re-verified against containerd's own Go source in this pass — that
+/// source isn't vendored here — but nothing in this repo ever overrides it),
+/// the same well-known constant on every node this camp provisions. If a
+/// future node's containerd IS reconfigured with a custom root, this probes
+/// the wrong path again — but resolving that would mean yubaba asking
+/// kamaji, over the sibling UDS, a question the wire protocol doesn't carry
+/// today (kamaji itself has a direct gRPC channel to containerd and could
+/// answer via containerd's own `Introspection.Plugins` RPC, whose
+/// `Plugin.exports` map is documented for exactly this — "exposing the
+/// configured path of a snapshotter plugin" — but wiring that through means
+/// a new kamaji-proto message, a server-side handler and a client-side call,
+/// which is a materially bigger change than this ticket's single-seam scope
+/// and is a natural next ticket if a node ever needs it).
+///
+/// **A missing containerd root falls back to `/` labelled, not silently.**
+/// [`workload_root_candidates`] lists `/var/lib/containerd` first; when it
+/// doesn't exist — a dev machine, CI, or a node that hasn't started
+/// containerd yet — falling through to `/` (or, on macOS, the Data volume
+/// below) is the correct degrade, but the unfixed code's whole failure mode
+/// was a plausible-looking number with no way to tell what it actually
+/// measured. So every caller gets `source_path` back alongside the two
+/// numbers, threaded all the way out to the wire as `yah.filesystem.source`
+/// (see [`NodeUsage::filesystem_source`]) — a `/` in that field on a fleet
+/// node is now a visible, attributable fact instead of a hidden substitution.
+///
+/// **The mount point, darwin edition.** On macOS, `/` is the *sealed system
+/// volume*, not where anything writes. Measured on a live camp Mac: `df /`
+/// reported 4% used while `df /System/Volumes/Data` reported 64% on the same
+/// APFS container. Reading `/` would have made a nearly-full build worker
+/// report as almost empty — exactly backwards for the signal this endpoint
+/// exists to give. So darwin probes the Data volume (after containerd's root,
+/// which won't exist on these boxes) and falls back to `/` only if both are
+/// absent.
 ///
 /// **Used = total − available, not the `Used` column.** They differ, and the
 /// subtraction is the one a scheduler wants: on APFS the `Used` column excludes
 /// other volumes sharing the container, and on Linux it excludes the
 /// root-reserved blocks. Both are space a workload cannot have. `total −
 /// available` is the honest "how much can still be written" figure on both.
-fn read_filesystem() -> Option<(u64, u64)> {
+fn read_filesystem() -> Option<(u64, u64, String)> {
     if matches!(Collector::detect(), Collector::Unsupported) {
         return None;
     }
-    let mount =
-        if cfg!(target_os = "macos") && std::path::Path::new("/System/Volumes/Data").exists() {
-            "/System/Volumes/Data"
-        } else {
-            "/"
-        };
-    parse_df(&run("df", &["-Pk", mount])?)
+    read_filesystem_at(&workload_root_candidates())
+}
+
+/// Paths to probe for "the filesystem workloads actually consume", in
+/// priority order — the first one that exists wins. See [`read_filesystem`]
+/// for why `/var/lib/containerd` leads rather than `/`.
+fn workload_root_candidates() -> Vec<&'static str> {
+    if cfg!(target_os = "macos") {
+        vec!["/var/lib/containerd", "/System/Volumes/Data", "/"]
+    } else {
+        vec!["/var/lib/containerd", "/"]
+    }
+}
+
+/// Core of [`read_filesystem`], split out so a test can point it at a
+/// tempdir instead of the real containerd root or `/` — the acceptance bar
+/// for R885-B8 is a delta (does the number move when the probed path's disk
+/// usage changes), which the real production paths can't safely exercise in
+/// a unit test. Runs `df -Pk` against the first candidate that exists,
+/// falling back to `/` — which always exists — if none do, and always
+/// returns which path won so a fallback is a labelled fact, not a silent
+/// substitution.
+fn read_filesystem_at(candidates: &[&str]) -> Option<(u64, u64, String)> {
+    let mount = candidates
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .copied()
+        .unwrap_or("/");
+    let (used, total) = parse_df(&run("df", &["-Pk", mount])?)?;
+    Some((used, total, mount.to_string()))
 }
 
 /// Parse `df -Pk` output into `(used_bytes, total_bytes)`.
@@ -1971,24 +2126,128 @@ mod tests {
         assert!(parse_df("Filesystem Blocks\n/dev/disk1 100\n").is_none());
     }
 
+    /// R885-B8's acceptance bar: a delta, not a snapshot. The unfixed code
+    /// passed any check that merely read a plausible-looking number once — it
+    /// was reporting a perfectly plausible figure throughout, just for the
+    /// wrong filesystem. Points `read_filesystem_at` at a tempdir (standing in
+    /// for the containerd root, since a unit test can't safely write real
+    /// gigabytes under `/var/lib/containerd`) and asserts the reported `used`
+    /// bytes actually MOVE when disk under that exact path fills up.
+    #[test]
+    fn read_filesystem_at_moves_when_the_probed_path_fills_up() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let candidates = vec![tmp.path().to_str().unwrap()];
+        let (used_before, total_before, source_before) =
+            read_filesystem_at(&candidates).expect("df must succeed against a real tempdir");
+        assert_eq!(source_before, tmp.path().to_str().unwrap());
+
+        let payload = vec![0u8; 8 * 1024 * 1024]; // 8 MiB
+        std::fs::write(tmp.path().join("filler.bin"), &payload).unwrap();
+
+        let (used_after, total_after, source_after) =
+            read_filesystem_at(&candidates).expect("df must still succeed after the write");
+
+        assert_eq!(
+            total_before, total_after,
+            "writing a file must not change the filesystem's own capacity"
+        );
+        assert_eq!(source_before, source_after);
+        let delta = used_after.saturating_sub(used_before);
+        // Block-size rounding and filesystem overhead mean the delta will
+        // not be exact; assert it lands in the right ballpark rather than
+        // pinning a byte count that would make this test flaky.
+        assert!(
+            delta >= payload.len() as u64 / 2,
+            "expected used bytes to grow by roughly {}, only grew by {delta}",
+            payload.len()
+        );
+        assert!(
+            delta <= payload.len() as u64 * 4,
+            "used bytes grew suspiciously more than what was written: {delta}"
+        );
+    }
+
+    /// The "labelled, not silent" half of R885-B8: skipping a missing
+    /// candidate must not just succeed, it must report the REAL candidate it
+    /// fell through to — not the one that was skipped.
+    #[test]
+    fn read_filesystem_at_skips_a_missing_candidate_and_falls_through() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let real = tmp.path().to_str().unwrap();
+        let candidates = vec![missing.to_str().unwrap(), real];
+        let (_, _, source) = read_filesystem_at(&candidates)
+            .expect("must fall through a nonexistent first candidate to the real second one");
+        assert_eq!(source, real, "must name the candidate that actually answered, not the one skipped");
+    }
+
+    /// The other half: when EVERY candidate is missing, the `/` fallback
+    /// must come back labelled as `/` — a caller reading `yah.filesystem.source`
+    /// can tell this happened instead of silently trusting a number that
+    /// (as this ticket's own root cause was) measured the wrong filesystem.
+    #[test]
+    fn read_filesystem_at_falls_back_to_root_when_no_candidate_exists() {
+        let candidates = vec!["/this/path/should/not/exist/on/any/test/box"];
+        let (_, _, source) = read_filesystem_at(&candidates)
+            .expect("falling back to / (which always exists) must still succeed");
+        assert_eq!(source, "/", "a missing candidate must fall back to / and SAY SO, not silently substitute it");
+    }
+
+    #[test]
+    fn workload_root_candidates_lead_with_the_containerd_root() {
+        assert_eq!(workload_root_candidates().first(), Some(&"/var/lib/containerd"));
+        assert!(workload_root_candidates().contains(&"/"));
+    }
+
     #[test]
     fn committed_totals_sums_the_registry() {
         let reg: ResourceRegistry = Mutex::new(BTreeMap::new());
         reg.lock().unwrap().insert(
             "a.pdx".into(),
-            WorkloadResources {
+            Some(WorkloadResources {
                 memory_mb: 512,
                 cpu_millis: 250,
-            },
+            }),
         );
         reg.lock().unwrap().insert(
             "b.pdx".into(),
-            WorkloadResources {
+            Some(WorkloadResources {
                 memory_mb: 1024,
                 cpu_millis: 500,
-            },
+            }),
         );
         assert_eq!(committed_totals(&reg), (2, 1536, 750));
+    }
+
+    /// R885-B7: a rehydrated-but-unknown entry still counts toward the
+    /// workload count but is excluded from the memory/cpu sums — the whole
+    /// point of `None` over a fabricated zero.
+    #[test]
+    fn committed_totals_counts_unknown_entries_but_excludes_them_from_sums() {
+        let reg: ResourceRegistry = Mutex::new(BTreeMap::new());
+        reg.lock().unwrap().insert(
+            "known.pdx".into(),
+            Some(WorkloadResources {
+                memory_mb: 512,
+                cpu_millis: 250,
+            }),
+        );
+        reg.lock().unwrap().insert("rehydrated.pdx".into(), None);
+        assert_eq!(committed_totals(&reg), (2, 512, 250));
+    }
+
+    #[test]
+    fn record_seen_with_unknown_resources_does_not_clobber_a_known_entry() {
+        let reg: ResourceRegistry = Mutex::new(BTreeMap::new());
+        reg.lock().unwrap().insert(
+            "known.pdx".into(),
+            Some(WorkloadResources {
+                memory_mb: 512,
+                cpu_millis: 250,
+            }),
+        );
+        record_seen_with_unknown_resources(&reg, "known.pdx".into());
+        assert_eq!(committed_totals(&reg), (1, 512, 250));
     }
 
     fn registry_with(entries: &[(&str, u32, u32)]) -> ResourceRegistry {
@@ -1996,10 +2255,10 @@ mod tests {
         for (k, memory_mb, cpu_millis) in entries {
             reg.lock().unwrap().insert(
                 (*k).into(),
-                WorkloadResources {
+                Some(WorkloadResources {
                     memory_mb: *memory_mb,
                     cpu_millis: *cpu_millis,
-                },
+                }),
             );
         }
         reg
@@ -2046,6 +2305,22 @@ mod tests {
         assert!(rows[1].get("cpu_millis").is_none());
     }
 
+    /// R885-B7: a *registered-but-unknown* entry (`None`, from boot-time
+    /// rehydration) must read the same as a never-registered one — absent
+    /// fields, not `0`. This is distinct from
+    /// [`enrich_leaves_unknown_workloads_without_resource_fields`], which
+    /// covers an ident with no registry entry at all; this one covers an
+    /// ident the registry explicitly knows exists.
+    #[test]
+    fn enrich_leaves_rehydrated_unknown_entries_without_resource_fields() {
+        let reg: ResourceRegistry = Mutex::new(BTreeMap::new());
+        record_seen_with_unknown_resources(&reg, "rehydrated.pdx".into());
+        let mut rows = serde_json::json!([{ "ident": "rehydrated.pdx" }]);
+        enrich_workloads(&reg, &mut rows);
+        assert!(rows[0].get("memory_mb").is_none());
+        assert!(rows[0].get("cpu_millis").is_none());
+    }
+
     #[test]
     fn enrich_is_a_noop_on_an_empty_registry_or_non_array() {
         let empty: ResourceRegistry = Mutex::new(BTreeMap::new());
@@ -2082,6 +2357,7 @@ mod tests {
             cpu_logical_count: Some(8),
             memory_limit_bytes: Some(17_179_869_184),
             filesystem_limit_bytes: Some(494_384_795_648),
+            filesystem_source: Some("/var/lib/containerd".into()),
             allocatable_memory_mb: Some(16384),
             allocatable_cpu_millis: Some(8000),
             collector: "sysctl".into(),
@@ -2095,6 +2371,8 @@ mod tests {
         assert_eq!(v["os.type"], "darwin");
         assert_eq!(v["system.cpu.logical.count"], 8);
         assert_eq!(v["system.memory.limit"], 17_179_869_184u64);
+        assert_eq!(v["system.filesystem.limit"], 494_384_795_648u64);
+        assert_eq!(v["yah.filesystem.source"], "/var/lib/containerd");
         assert_eq!(v["yah.allocatable.memory_mb"], 16384);
         assert_eq!(v["yah.collector"], "sysctl");
 
@@ -2112,6 +2390,9 @@ mod tests {
             memory_usage_bytes: Some(1024),
             memory_limit_bytes: Some(4096),
             memory_utilization: Some(0.25),
+            filesystem_usage_bytes: Some(28_000_000_000),
+            filesystem_limit_bytes: Some(60_000_000_000),
+            filesystem_source: Some("/var/lib/containerd".into()),
             committed_memory_mb: 512,
             committed_cpu_millis: 250,
             workloads_count: 1,
@@ -2124,15 +2405,34 @@ mod tests {
         assert_eq!(v["system.cpu.utilization"], 0.25);
         assert_eq!(v["system.memory.usage"], 1024);
         assert_eq!(v["system.memory.utilization"], 0.25);
+        assert_eq!(v["system.filesystem.usage"], 28_000_000_000u64);
+        assert_eq!(v["system.filesystem.limit"], 60_000_000_000u64);
+        assert_eq!(v["yah.filesystem.source"], "/var/lib/containerd");
         assert_eq!(v["yah.committed.memory_mb"], 512);
         assert_eq!(v["yah.cpu.source"], "procstat");
         assert_eq!(v["yah.sample.window_ms"], 200);
-        // Unmeasured fields are omitted entirely rather than sent as 0 —
-        // "unknown" and "zero" are different states for a capacity floor.
-        assert!(v.get("system.filesystem.usage").is_none());
 
         let back: NodeUsage = serde_json::from_value(v).unwrap();
         assert_eq!(back, usage);
+    }
+
+    /// Unmeasured filesystem fields are omitted entirely rather than sent as
+    /// 0 or a fake source — "unknown" and "zero" are different states for a
+    /// capacity floor, and a number's source must never be reported without
+    /// the number itself (see `read_filesystem`'s "labelled, not silent").
+    #[test]
+    fn usage_omits_filesystem_fields_together_when_unmeasured() {
+        let usage = NodeUsage {
+            schema_version: NODE_SCHEMA_VERSION,
+            cpu_source: "procstat".into(),
+            collector: "procfs".into(),
+            collected_at_unix_ms: 1,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&usage).unwrap();
+        assert!(v.get("system.filesystem.usage").is_none());
+        assert!(v.get("system.filesystem.limit").is_none());
+        assert!(v.get("yah.filesystem.source").is_none());
     }
 
     /// Whatever the host platform is, `/node` must answer with a coherent
@@ -2161,6 +2461,15 @@ mod tests {
             probe.specs().collected_at_unix_ms,
             specs.collected_at_unix_ms
         );
+
+        // R885-B8: a filesystem number with no named source is exactly the
+        // failure mode this field exists to rule out — the two must always
+        // travel together, on every platform.
+        assert_eq!(
+            specs.filesystem_limit_bytes.is_some(),
+            specs.filesystem_source.is_some(),
+            "{specs:?}"
+        );
     }
 
     #[tokio::test]
@@ -2171,6 +2480,18 @@ mod tests {
         assert_eq!(usage.workloads_count, 2);
         assert_eq!(usage.committed_memory_mb, 1536);
         assert_eq!(usage.committed_cpu_millis, 750);
+
+        // R885-B8: same pairing invariant as `specs_collect_on_this_platform`.
+        assert_eq!(
+            usage.filesystem_usage_bytes.is_some(),
+            usage.filesystem_source.is_some(),
+            "{usage:?}"
+        );
+        assert_eq!(
+            usage.filesystem_limit_bytes.is_some(),
+            usage.filesystem_source.is_some(),
+            "{usage:?}"
+        );
 
         if !matches!(Collector::detect(), Collector::Unsupported) {
             let mem = usage.memory_utilization.expect("memory is measurable");

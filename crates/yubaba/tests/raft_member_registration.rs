@@ -28,7 +28,7 @@ use yubaba::cluster_policy::ClusterPolicy;
 use yubaba_test_harness::{solo_node, solo_node_in_region, solo_node_unregistered, SoloNode};
 
 async fn post_json(base_url: &str, path: &str, body: serde_json::Value) -> (u16, String) {
-    let resp = reqwest::Client::new()
+    let resp = yubaba_test_harness::http()
         .post(format!("{base_url}{path}"))
         .json(&body)
         .send()
@@ -39,7 +39,7 @@ async fn post_json(base_url: &str, path: &str, body: serde_json::Value) -> (u16,
 }
 
 async fn raft_status(base_url: &str) -> serde_json::Value {
-    reqwest::Client::new()
+    yubaba_test_harness::http()
         .get(format!("{base_url}/raft/status"))
         .send()
         .await

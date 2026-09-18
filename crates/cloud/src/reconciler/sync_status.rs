@@ -21,9 +21,9 @@
 //! This module computes status from (a) the declared [`MirrorConfig`] and
 //! (b) a caller-supplied [`MirrorObservation`]. It never reaches out to a
 //! runtime itself — the desktop fills observations from its in-memory
-//! running-mirror registry; a future yubaba probe will fill them for cloud
+//! running-mirror registry; a future yubaba probe will fill them for prod
 //! tiers. Tiers with **no observation** (`None`) resolve to `unknown` sync /
-//! `missing` health, which is the honest state today for `cloud`/`ha`
+//! `missing` health, which is the honest state today for `prod`/`ha`
 //! (read-only, declared status only — see the Area-A arch doc).
 //!
 //! @yah:ticket(R323-F10, "Service sync-history store (recent-syncs timeline backend)")
@@ -53,7 +53,7 @@ pub enum SyncState {
     /// actionable signal that drives the matrix cell's border/fill.
     OutOfSync,
     /// No live observation available, so agreement can't be determined
-    /// (e.g. cloud/ha today — declared only).
+    /// (e.g. prod/ha today — declared only).
     Unknown,
 }
 
@@ -70,7 +70,7 @@ pub enum HealthState {
     /// Running with errors, or the last bring-up/sync failed.
     Degraded,
     /// Declared but absent where it is expected to be continuously live
-    /// (cloud/ha tiers), or unobserved.
+    /// (prod/ha tiers), or unobserved.
     Missing,
     /// Declared + in sync but intentionally not running. The resting state
     /// of an on-demand local mirror (`shape = "local"`) you haven't brought
@@ -98,7 +98,7 @@ pub enum WireContainerStatus {
 }
 
 /// The substrate a mirror runs on. `dev` is the odd one out (a bare
-/// process); `sim`/`cloud`/`ha` share the container substrate. Derived from
+/// process); `sim`/`prod`/`ha` share the container substrate. Derived from
 /// the mirror's provider slots, not from the env name (env names are
 /// arbitrary file stems). See the RuntimeAxis grouping in the Area-A design.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +113,7 @@ pub enum Runtime {
 impl Runtime {
     /// Derive the runtime from a mirror's provider slots: any container or
     /// remote-substrate slot makes the whole mirror `containers`; a mirror
-    /// whose only slots are bare-process inline kinds (`local-static`) is
+    /// whose only slots are bare-process inline kinds (`miniflare-native`) is
     /// `process`. Empty/unknown defaults to `process` (the dev case).
     pub fn from_mirror(mirror: &MirrorConfig) -> Self {
         let any_container = mirror.providers.values().any(|slot| match slot {
@@ -123,7 +123,7 @@ impl Runtime {
                 Provider::MiniflareContainer | Provider::MinioContainer | Provider::LocalContainer
             ),
             // A referenced provider (cloudflare / hetzner / local-container)
-            // is always a container/cloud substrate.
+            // is always a container/prod substrate.
             MirrorProviderSlot::Reference { .. } => true,
         });
         if any_container {
@@ -182,7 +182,7 @@ pub struct CellStatus {
     pub shape: MirrorShape,
     /// Best-effort declared revision (an `image`/`version`/`tag` field on a
     /// provider slot). `None` when the manifest carries no version-bearing
-    /// field (e.g. a bare `local-static` slot).
+    /// field (e.g. a bare `miniflare-native` slot).
     pub declared_revision: Option<String>,
     /// Live revision, echoed from the observation when known.
     pub live_revision: Option<String>,
@@ -214,7 +214,7 @@ pub struct ServiceStatus {
     pub domain: String,
     /// One cell per declared mirror, keyed by env. Tiers with no
     /// `mirrors/<env>.toml` are simply absent — the UI renders those as
-    /// "undeclared" against its canonical tier list (dev/sim/cloud/ha).
+    /// "undeclared" against its canonical tier list (dev/sim/prod/ha).
     pub cells: BTreeMap<String, CellStatus>,
 }
 
@@ -236,7 +236,7 @@ pub struct StatusSummary {
 ///
 /// Policy:
 /// - **No observation** → `unknown` sync, `missing` health. Honest default
-///   for tiers with no live source (cloud/ha today).
+///   for tiers with no live source (prod/ha today).
 /// - **Sync**: drift present, or a known live revision that differs from the
 ///   declared revision → `out-of-sync`; otherwise `synced`. (A `None` live
 ///   revision never forces out-of-sync — absence of info is not divergence.)
@@ -428,12 +428,14 @@ fn provider_kind_label(kind: Provider) -> String {
         Provider::Hetzner => "hetzner",
         Provider::Vultr => "vultr",
         Provider::Static => "static",
-        Provider::LocalStatic => "local-static",
+        Provider::MiniflareNative => "miniflare-native",
         Provider::LocalContainer => "local-container",
         Provider::LocalProcess => "local-process",
         Provider::MiniflareContainer => "miniflare-container",
         Provider::MinioContainer => "minio-container",
         Provider::LocalPgDev => "local-pg-dev",
+        Provider::LocalMailcrab => "local-mailcrab",
+        Provider::LocalS3Fs => "local-s3-fs",
     }
     .to_string()
 }
@@ -491,7 +493,7 @@ mod tests {
 
     fn local_static_mirror() -> MirrorConfig {
         mirror(
-            "schema_version = 1\nshape = \"local\"\n\n[providers.static]\nkind = \"local-static\"\nport = 4321\n",
+            "schema_version = 1\nshape = \"local\"\n\n[providers.static]\nkind = \"miniflare-native\"\nport = 4321\n",
         )
     }
 
@@ -574,7 +576,7 @@ mod tests {
             running: false,
             ..Default::default()
         };
-        let cell = compute_cell("cloud", &cloudflare_mirror(), Some(&obs));
+        let cell = compute_cell("prod", &cloudflare_mirror(), Some(&obs));
         assert_eq!(cell.health, HealthState::Missing);
     }
 
@@ -585,7 +587,7 @@ mod tests {
             ready: false,
             ..Default::default()
         };
-        let cell = compute_cell("cloud", &cloudflare_mirror(), Some(&obs));
+        let cell = compute_cell("prod", &cloudflare_mirror(), Some(&obs));
         assert_eq!(cell.health, HealthState::Progressing);
     }
 
@@ -597,7 +599,7 @@ mod tests {
             errored: true,
             ..Default::default()
         };
-        let cell = compute_cell("cloud", &cloudflare_mirror(), Some(&obs));
+        let cell = compute_cell("prod", &cloudflare_mirror(), Some(&obs));
         assert_eq!(cell.health, HealthState::Degraded);
     }
 
@@ -609,7 +611,7 @@ mod tests {
             live_revision: Some("caddy:2.7.6".into()),
             ..Default::default()
         };
-        let cell = compute_cell("cloud", &cloudflare_mirror(), Some(&obs));
+        let cell = compute_cell("prod", &cloudflare_mirror(), Some(&obs));
         assert_eq!(cell.declared_revision.as_deref(), Some("caddy:2.8.1"));
         assert_eq!(cell.live_revision.as_deref(), Some("caddy:2.7.6"));
         assert_eq!(cell.sync, SyncState::OutOfSync);
@@ -623,7 +625,7 @@ mod tests {
             live_revision: Some("caddy:2.8.1".into()),
             ..Default::default()
         };
-        let cell = compute_cell("cloud", &cloudflare_mirror(), Some(&obs));
+        let cell = compute_cell("prod", &cloudflare_mirror(), Some(&obs));
         assert_eq!(cell.sync, SyncState::Synced);
     }
 
@@ -637,7 +639,7 @@ mod tests {
             live_revision: None,
             ..Default::default()
         };
-        let cell = compute_cell("cloud", &cloudflare_mirror(), Some(&obs));
+        let cell = compute_cell("prod", &cloudflare_mirror(), Some(&obs));
         assert_eq!(cell.sync, SyncState::Synced);
     }
 
@@ -686,12 +688,13 @@ mod tests {
                 schema_version: 1,
                 name: "yah-dev".into(),
                 domain: "yah.dev".into(),
+                health_path: None,
                 components: vec![],
                 db: crate::DbCatalog::default(),
             },
             mirrors: BTreeMap::from([
                 ("dev".to_string(), local_static_mirror()),
-                ("cloud".to_string(), cloudflare_mirror()),
+                ("prod".to_string(), cloudflare_mirror()),
             ]),
             component_transform_recipes: BTreeMap::new(),
             passway_machines: BTreeMap::new(),
@@ -706,15 +709,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        // No observation for "cloud" → unknown/missing.
+        // No observation for "prod" → unknown/missing.
 
         let status = compute_service(&svc, &obs);
         assert_eq!(status.name, "yah-dev");
         assert_eq!(status.cells.len(), 2);
         assert_eq!(status.cells["dev"].sync, SyncState::Synced);
         assert_eq!(status.cells["dev"].health, HealthState::Healthy);
-        assert_eq!(status.cells["cloud"].sync, SyncState::Unknown);
-        assert_eq!(status.cells["cloud"].health, HealthState::Missing);
+        assert_eq!(status.cells["prod"].sync, SyncState::Unknown);
+        assert_eq!(status.cells["prod"].health, HealthState::Missing);
 
         let summary = summarize(&[status]);
         assert_eq!(summary.synced, 1);

@@ -1,12 +1,25 @@
-//! End-to-end smoke for [`MesofactStaticReconciler`] against the real
-//! `mesofact-dev` binary and the real `app/yah/web/marketing` workload.
+//! End-to-end smoke for the dev-tier static path: a real `yah-s3-fs` driver,
+//! the real `app/yah/web/marketing` build output, and the same publish step
+//! the pond and cloud tiers run.
 //!
-//! Skipped unless `YAH_RECONCILER_E2E_BIN` points at a built `mesofact-dev`
-//! binary. Build it first with `cargo build -p mesofact-dev`, then run:
+//! What it pins is the behavioural half of W265 / R584-F4 — that a dev-tier
+//! `mesofact-static` component's assets are reachable **through the S3
+//! driver's endpoint**, unsigned, with the `Content-Type` a browser needs. The
+//! miniflare door in front of that endpoint is deliberately out of scope here:
+//! it needs bun plus a workerd download, and what it adds is route rewriting
+//! that `mesofact_static::tests::worker_script_*` already covers against the
+//! same bundle every tier serves.
+//!
+//! Before R584-F4 this file drove `mesofact-dev` instead, because the dev tier
+//! served `dist/` off the filesystem and had no bucket to publish into.
+//!
+//! Skipped unless `YAH_RECONCILER_E2E_BIN` points at a built `yah-s3-fs`
+//! binary:
 //!
 //! ```bash
-//! YAH_RECONCILER_E2E_BIN=$(pwd)/target/debug/mesofact-dev \
-//!   cargo test -p cloud --test main -- mesofact_static_e2e:: --nocapture
+//! cargo build -p yah-s3-fs
+//! YAH_RECONCILER_E2E_BIN=$(pwd)/target/debug/yah-s3-fs \
+//!   cargo test -p yah-cloud --test main -- mesofact_static_e2e:: --nocapture
 //! ```
 //!
 //! @yah:ticket(R441-B2, "mesofact_static_e2e: MirrorConfig missing asset_aliases field")
@@ -18,165 +31,113 @@
 //! @yah:next("Add `asset_aliases: BTreeMap::new()` (or whatever empty value the type wants) to the fixture; the e2e test predates the alias mechanism and just needs the field to be a no-op for its scenario.")
 //! @yah:verify("cargo test -p cloud --test mesofact_static_e2e passes")
 //! @yah:handoff("Added asset_aliases: Default::default() to MirrorConfig fixture in mesofact_static_e2e.rs:83. cargo test -p cloud --test mesofact_static_e2e passes.")
+//! @yah:handoff("R584-F4 rewrote this file: the fixture it exercised (Provider::LocalStatic + LocalStaticOptions + the mesofact-dev binary) no longer exists, so the asset_aliases field this ticket was about is now supplied by the dev-tier fixture below instead. The annotation block stays here because the ticket is anchored to this file.")
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use cloud::{
-    LocalStaticOptions, MesofactStaticReconciler, MirrorConfig, MirrorProviderSlot, MirrorShape,
-    Provider, ProviderScope, ReconcileCtx, Reconciler, ServiceComponent, ServiceConfig,
+use cloud::reconciler::pond_publish::publish_to_pond;
+use cloud::reconciler::s3_driver::{
+    up_s3_driver, S3DriverOptions, DEV_ACCESS_KEY, DEV_SECRET_KEY,
 };
 
+/// The monorepo root, found by walking up for `.yah/services` rather than by
+/// counting path segments.
+///
+/// Counting is what the pre-R584-F4 version did (`.nth(3)`, with a comment
+/// claiming `crates/yah/cloud`) and it had been wrong since this crate moved
+/// under `oss/yubaba/` — it resolved to `<repo>/oss`. Nothing noticed, because
+/// the whole test is env-gated. A marker beats an offset here: the crate is
+/// also exported standalone, where no such root exists at any depth.
 fn workspace_root() -> PathBuf {
-    // CARGO_MANIFEST_DIR = crates/yah/cloud → ../../.. = workspace root
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
-        .nth(3)
-        .expect("workspace root from manifest dir")
+        .find(|d| d.join(".yah/services").is_dir())
+        .expect("monorepo root (an ancestor containing .yah/services)")
         .to_path_buf()
 }
 
-fn pick_port() -> u16 {
-    // Bind to 127.0.0.1:0, read assigned port, drop. Tiny race window
-    // between drop and the spawned mesofact-dev re-binding the port; fine
-    // for a smoke test.
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let p = l.local_addr().unwrap().port();
-    drop(l);
-    p
-}
-
 #[tokio::test]
-async fn local_static_reconciler_brings_up_app_yah_web() {
-    let Ok(bin) = std::env::var("YAH_RECONCILER_E2E_BIN") else {
-        eprintln!("skipping: set YAH_RECONCILER_E2E_BIN=<path/to/mesofact-dev> to run");
+async fn dev_assets_are_served_through_the_s3_driver_endpoint() {
+    let Some(bin) = std::env::var_os("YAH_RECONCILER_E2E_BIN").map(PathBuf::from) else {
+        eprintln!("skipping: set YAH_RECONCILER_E2E_BIN to a built yah-s3-fs binary");
         return;
     };
-    let bin = PathBuf::from(bin);
+    assert!(bin.exists(), "YAH_RECONCILER_E2E_BIN={} not found", bin.display());
+
+    let repo = workspace_root();
+    let dist = repo.join("app/yah/web/marketing/dist");
     assert!(
-        bin.exists(),
-        "YAH_RECONCILER_E2E_BIN points at missing file: {}",
-        bin.display(),
+        dist.join("html/index.html").exists(),
+        "expected a built marketing dist under {} — run its build first",
+        dist.display(),
     );
 
-    let workspace = workspace_root();
-    let workload_path = workspace.join("app/yah/web/marketing");
-    assert!(
-        workload_path.join("workload.toml").exists(),
-        "expected app/yah/web/marketing/workload.toml under {}",
-        workspace.display(),
+    // The driver publishes coords under the workspace it is given, so point it
+    // at a scratch root rather than the live camp's `.yah/infra/state/dev/s3`.
+    // A test that retracted the running camp's coords.json would take
+    // `S3_ENDPOINT` away from every dev service on this machine.
+    let scratch = tempfile::tempdir().expect("scratch workspace");
+    let bucket = "yah-marketing";
+    let driver = up_s3_driver(
+        scratch.path(),
+        vec![bucket.to_string()],
+        &S3DriverOptions {
+            binary: Some(bin),
+            ready_timeout: Some(Duration::from_secs(30)),
+        },
+    )
+    .await
+    .expect("yah-s3-fs comes up");
+
+    let result = publish_and_probe(&driver.endpoint, bucket, &dist).await;
+    driver.teardown().await;
+    result.expect("dev publish + unsigned GET");
+}
+
+/// The assertion body, split out so a failure still tears the driver down.
+async fn publish_and_probe(
+    endpoint: &str,
+    bucket: &str,
+    dist: &std::path::Path,
+) -> anyhow::Result<()> {
+    local_driver::pond_minio::ensure_bucket_public(
+        endpoint,
+        bucket,
+        DEV_ACCESS_KEY,
+        DEV_SECRET_KEY,
+    )
+    .await?;
+
+    let report =
+        publish_to_pond(dist, endpoint, bucket, DEV_ACCESS_KEY, DEV_SECRET_KEY, None).await?;
+    anyhow::ensure!(
+        report.uploaded.iter().any(|k| k == "index.html"),
+        "publish did not produce an index.html key: {:?}",
+        report.uploaded,
     );
 
-    let port = pick_port();
-    let mut fields = BTreeMap::new();
-    fields.insert("port".to_string(), toml::Value::Integer(port as i64));
-    let static_slot = MirrorProviderSlot::Inline {
-        kind: Provider::LocalStatic,
-        fields,
-    };
-
-    let mut providers = BTreeMap::new();
-    providers.insert("static".to_string(), static_slot);
-    let mirror = MirrorConfig {
-        schema_version: 1,
-        shape: MirrorShape::Local,
-        providers,
-        ingress: Default::default(),
-        ingress_machines: Vec::new(),
-        drivers: Default::default(),
-        asset_aliases: Default::default(),
-    };
-
-    let service = ServiceConfig {
-        schema_version: 1,
-        name: "dev-yah".to_string(),
-        domain: "yah.dev".to_string(),
-        components: vec![],
-        db: cloud::DbCatalog::default(),
-    };
-    let component = ServiceComponent {
-        mount: None,
-        id: "site".to_string(),
-        kind: "mesofact-static".to_string(),
-        path: "app/yah/web/marketing".to_string(),
-        role: "static".to_string(),
-        publishes: None,
-        git: None,
-        wave: 0,
-        deploy: Default::default(),
-    };
-
-    let reconciler = MesofactStaticReconciler::new().with_local_static(LocalStaticOptions {
-        binary: Some(bin),
-        // Default watch mode — mesofact-dev runs the initial build,
-        // snapshots into .mesofact-dev/gen-0/, and starts serving. Adds
-        // ~100 ms to the e2e but exercises the watcher path the operator
-        // will hit.
-        extra_args: vec![],
-        // The initial bun build can take a few seconds on a cold cache.
-        ready_timeout: Some(Duration::from_secs(30)),
-        ..LocalStaticOptions::default()
-    });
-
-    let ctx = ReconcileCtx {
-        workspace_root: &workspace,
-        service: &service,
-        component: &component,
-        mirror: &mirror,
-        env: "local",
-        scope: ProviderScope::singleton(),
-    };
-
-    let running = reconciler
-        .up(ctx)
-        .await
-        .expect("reconciler.up succeeds against real workload");
-    let dev_url = running
-        .dev_url
-        .clone()
-        .expect("local-static path sets dev_url");
-    eprintln!("reconciler reported dev_url={dev_url}");
-    assert!(dev_url.starts_with(&format!("http://127.0.0.1:{port}")));
-    assert_eq!(running.kind, "mesofact-static");
-    assert_eq!(running.slot, "static");
-
-    // Curl through reqwest. The reconciler returns as soon as the port
-    // binds, but with watch mode the initial bun build still has to
-    // populate dist/html before / serves the real page. Poll until 200
-    // (or timeout).
-    let client = reqwest::Client::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let body = loop {
-        let response = client
-            .get(&dev_url)
-            .send()
-            .await
-            .expect("GET / against reconciled dev_url");
-        if response.status() == 200 {
-            break response.text().await.expect("read body");
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "GET / never returned 200 (last status {}); initial build may have failed",
-                response.status(),
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
-    assert!(
-        body.contains("<!doctype html>") || body.contains("<!DOCTYPE html>"),
-        "expected the served body to be HTML, got: {}",
-        &body[..body.len().min(120)],
+    // Unsigned, the way the door fetches: the bucket policy is what makes this
+    // work, and it is the exact contract R554 found an alternative store
+    // storing and then ignoring.
+    let url = format!("{}/{}/index.html", endpoint.trim_end_matches('/'), bucket);
+    let resp = reqwest::Client::new().get(&url).send().await?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "unsigned GET {url} → {}",
+        resp.status(),
     );
-
-    running.shutdown().await.expect("shutdown succeeds");
-
-    // After shutdown the port should free up; give it a beat.
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let connect = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await;
-    assert!(
-        connect.is_err(),
-        "port {port} still accepting connections after shutdown"
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    anyhow::ensure!(
+        content_type.starts_with("text/html"),
+        "served index.html as {content_type:?} — a browser downloads that instead of rendering it",
     );
+    let body = resp.text().await?;
+    anyhow::ensure!(body.contains("<html"), "served body is not the built page");
+    Ok(())
 }

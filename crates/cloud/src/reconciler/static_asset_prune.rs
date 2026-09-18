@@ -68,7 +68,7 @@ pub struct PruneCandidate {
 pub struct PruneReport {
     /// Service the report was computed for.
     pub service: String,
-    /// Mirror environment (e.g. `"pond"`, `"cloud"`).
+    /// Mirror environment (e.g. `"pond"`, `"prod"`).
     pub env: String,
     /// Bucket the report was computed against.
     pub bucket: String,
@@ -543,6 +543,7 @@ mod tests {
             schema_version: 1,
             name: name.into(),
             domain: "releases.example".into(),
+            health_path: None,
             components,
             db: crate::DbCatalog::default(),
         }

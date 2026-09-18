@@ -298,7 +298,7 @@ async fn warden_reconciler_restarts_minio_and_miniflare() {
         ssr_runtime: None,
     };
 
-    let client = reqwest::Client::new();
+    let client = yubaba_test_harness::http();
     let deploy_resp = client
         .post(format!("http://127.0.0.1:{port}/pond/deploy"))
         .json(&req)

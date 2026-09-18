@@ -24,7 +24,7 @@
 //! | Field | Source |
 //! |---|---|
 //! | `mount` | [`ServiceComponent::mount`], normalized by [`normalize_mount`] |
-//! | `headers` | the [`DomainRoute`] whose [`route_path_prefix`] equals that mount |
+//! | `headers` | the route the domain's table gives that mount's path ([`DomainConfig::route_for_path`]) |
 //! | tier | [`ServiceComponent::deploy`] — the one thing R870-F23 added |
 //! | `upstreams` | placement-time, so it is [`InnerDoorPlan::routes_file`]'s argument, not a config field |
 //!
@@ -32,6 +32,29 @@
 //! already *proves* a component's mount and its route's path prefix are the
 //! same string, so the lookup below cannot silently mismatch — a config where
 //! it would have does not load.
+//!
+//! ## Headers come from the ONE route table (R898-F2)
+//!
+//! The header column is not this module's to derive. R898-F1 compiled a
+//! domain's declared routes into one ordered [`RouteTable`], and every tier —
+//! the Worker, mesofact, the outer door's `ROUTE_HEADERS` — answers "what
+//! governs this path" by that table's rule. [`headers_for`] therefore asks the
+//! table's rule too, rather than re-deriving the join; two producers of one
+//! fact is precisely what the R898 relay exists to delete.
+//!
+//! **And this tier is the only one that applies those headers.** Operator call,
+//! 2026-09-12: the outer passway door stays a pure HOST router (path routing and
+//! host routing are mutually exclusive at its boot — `HOST_ROUTING_ENV` in
+//! passway's `main.rs`), so it applies no per-path headers and cannot
+//! double-apply these. That settles R870-F23's open ownership question, and it
+//! is what makes a bundle-tier component at a non-root mount keeping its own
+//! entry here CORRECT rather than redundant: the entry points at the same bundle
+//! upstream as the root and exists purely to carry that mount's headers.
+//! Deleting it as a duplicate would silently strip them.
+//!
+//! [`RouteTable`]: crate::route_table::RouteTable
+//! [`ServiceComponent::mount`]: crate::config::ServiceComponent::mount
+//! [`ServiceComponent::deploy`]: crate::config::ServiceComponent::deploy
 //!
 //! ## The two admission rules
 //!
@@ -68,12 +91,11 @@ use serde::Serialize;
 use workload_spec::{
     EnvValue, EnvVar, ExposeSpec, HealthProbe, Healthcheck, ImageRef, InlineFile,
     LifecycleArchetype, MeshExpose, MeshIdent, Millis, NamespaceId, ResourceLimits, RestartPolicy,
-    SchemaVersion, StopPolicy, TenantId, TierTag, Workload, WorkloadSpec,
+    StopPolicy, TenantId, TierTag, Workload, WorkloadSpec,
 };
 
 use crate::config::{
-    domain_serving_service, normalize_mount, route_path_prefix, DeployTier, DomainConfig,
-    DomainRoute, ServiceComponent, ServiceConfig,
+    domain_serving_service, normalize_mount, DeployTier, DomainConfig, ServiceConfig,
 };
 
 /// `schema_version` of the route table this module writes. Must match
@@ -104,8 +126,14 @@ pub struct InnerDoorMount {
     pub mount: String,
     /// What serves it.
     pub unit: DeployedUnit,
-    /// Response headers the domain manifest gives this path (R746). Empty when
-    /// no route declares any.
+    /// Response headers the domain manifest gives this path (R746) — the
+    /// answer of the domain's one route table, not a second join. Empty when
+    /// the route governing this mount declares none, or when no route governs
+    /// it at all.
+    ///
+    /// This tier is their sole owner; see the module doc for why the outer door
+    /// cannot double-apply them, and why a bundle sub-mount's entry is not
+    /// redundant.
     pub headers: BTreeMap<String, String>,
 }
 
@@ -155,7 +183,7 @@ pub fn plan(
     service: &ServiceConfig,
     domains: &BTreeMap<String, DomainConfig>,
 ) -> Result<Option<InnerDoorPlan>> {
-    let routes = domain_serving_service(domains, &service.name).map(|d| d.routes.as_slice());
+    let domain = domain_serving_service(domains, &service.name);
 
     let mut mounts: Vec<InnerDoorMount> = Vec::new();
     for component in &service.components {
@@ -163,9 +191,10 @@ pub fn plan(
             DeployTier::Bundle => DeployedUnit::Bundle,
             DeployTier::Workload => DeployedUnit::Component(component.id.clone()),
         };
+        let mount = passway_mount(component.mount.as_deref());
         mounts.push(InnerDoorMount {
-            mount: passway_mount(component.mount.as_deref()),
-            headers: headers_for(routes, component),
+            headers: headers_for(domain, &mount),
+            mount,
             unit,
         });
     }
@@ -196,25 +225,55 @@ pub fn plan(
     }))
 }
 
-/// The response headers the domain manifest gives `component`'s mount.
+/// The response headers `domain`'s route table gives `mount` (passway spelling:
+/// `""` or `/app`).
 ///
-/// Matched on the mount rather than on the route's `component` reference, so a
-/// path declared as a bare prefix still contributes: `cross_ref_validate` has
-/// already proved the two agree for every route that names a component, and
-/// matching on the prefix is what makes the lookup total.
-fn headers_for(
-    routes: Option<&[DomainRoute]>,
-    component: &ServiceComponent,
-) -> BTreeMap<String, String> {
-    let wanted = component
-        .mount
-        .as_deref()
-        .map(normalize_mount)
-        .unwrap_or_default();
-    routes
-        .unwrap_or(&[])
-        .iter()
-        .find(|r| route_path_prefix(&r.path) == wanted && !r.headers.is_empty())
+/// ## One join, not two
+///
+/// This used to be its own walk — the [`DomainRoute`] whose `route_path_prefix`
+/// equalled the component's [`normalize_mount`], skipping headerless routes.
+/// R898-F1 made a domain's routes a compiled [`RouteTable`] with ONE matching
+/// rule, and the Worker, mesofact and the outer door's `ROUTE_HEADERS` all
+/// answer by that rule. An inner door answering by a *different* one would serve
+/// different headers on the same path than the table says are served there — two
+/// producers of one fact. So the lookup goes through
+/// [`DomainConfig::route_for_path`], which is [`RouteTable::match_path`]'s walk
+/// over the declared routes.
+///
+/// Matched on the mount's PATH rather than on the route's `component`
+/// reference, so a route declared as a bare prefix still contributes:
+/// `cross_ref_validate` has already proved the two agree for every route that
+/// names a component, and matching on the path is what makes the lookup total.
+///
+/// ## The consequence: the answer is order-dependent now
+///
+/// First-match-wins is, and the old prefix-equality join was not. A manifest
+/// that puts `/*` above `/app/*` gives the ROOT's headers to `/app` — at every
+/// tier, now including this one. That is the table being right rather than this
+/// being wrong: `/app` is what such a manifest actually serves through the
+/// outer tier, and `yah-dev.toml:108` states the contract ("routes above this
+/// catch-all … Vec order = match order"). A headerless route that matches is
+/// likewise an answer of "no headers", not a reason to keep looking — no
+/// merging across rules (R746).
+///
+/// ## Why this takes a `DomainConfig` and not a compiled `RouteTable`
+///
+/// It would be circular. `CdnPlacement::backend_origin` resolves a route's
+/// origin out of [`InnerDoorPlan::resolve_addresses`]' output (R898-F1), so no
+/// table can be compiled until the plan this function is helping build exists.
+/// [`DomainConfig::route_for_path`] is the placement-free half of that same
+/// table, in exactly the relationship `route_headers_json` already has to
+/// [`RouteTable::headers_json`].
+///
+/// [`DomainRoute`]: crate::config::DomainRoute
+/// [`RouteTable`]: crate::route_table::RouteTable
+/// [`RouteTable::match_path`]: crate::route_table::RouteTable::match_path
+/// [`RouteTable::headers_json`]: crate::route_table::RouteTable::headers_json
+fn headers_for(domain: Option<&DomainConfig>, mount: &str) -> BTreeMap<String, String> {
+    // passway spells the root mount `""`; a request for it is `/`.
+    let path = if mount.is_empty() { "/" } else { mount };
+    domain
+        .and_then(|d| d.route_for_path(path))
         .map(|r| r.headers.clone())
         .unwrap_or_default()
 }
@@ -489,7 +548,6 @@ impl InnerDoorPlan {
         ];
 
         let spec = WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: name.clone(),
             // Identity metadata only — the native backend pulls nothing.
             image: ImageRef {
@@ -512,7 +570,10 @@ impl InnerDoorPlan {
             resources: ResourceLimits {
                 memory_mb: 128,
                 cpu_millis: 256,
-                ephemeral_storage_mb: 64,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -548,6 +609,7 @@ impl InnerDoorPlan {
                 operator: None,
             },
             labels: HashMap::new(),
+            durability: None,
             annotations: HashMap::new(),
             files: vec![InlineFile {
                 path: routes_path,
@@ -570,7 +632,8 @@ fn literal_env(name: &str, value: String) -> EnvVar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{FrontDoor, RouteMode};
+    use crate::config::{DomainRoute, FrontDoor, RouteMode, ServiceComponent};
+    use crate::route_table::{CdnPlacement, RouteTable};
 
     fn component(id: &str, mount: Option<&str>, deploy: DeployTier) -> ServiceComponent {
         ServiceComponent {
@@ -591,6 +654,7 @@ mod tests {
             schema_version: 1,
             name: name.to_string(),
             domain: format!("{name}.test"),
+            health_path: None,
             components,
             db: Default::default(),
         }
@@ -680,6 +744,14 @@ mod tests {
     /// own route declares, and the root picks up none when its route declares
     /// none. This is the config-side half of the ticket's live assertion that
     /// `/app/` carries COOP/COEP while `/` carries neither.
+    ///
+    /// R898-F2 REORDERED THIS FIXTURE and changed nothing else. The assertions
+    /// and the property they pin are untouched; the route list now declares
+    /// `/app/*` ABOVE `/*`, which is what a legal manifest looks like under the
+    /// route table's first-match-wins contract (`yah-dev.toml:108`,
+    /// `noisetable-com.toml`). The old fixture declared the catch-all first,
+    /// which the previous prefix-equality join was blind to and the shared
+    /// matching rule is not — see [`headers_for`].
     #[test]
     fn each_mount_carries_only_its_own_routes_headers() {
         let svc = service(
@@ -692,7 +764,6 @@ mod tests {
         let domains = domains(
             "noisetable",
             &[
-                ("/*", &[]),
                 (
                     "/app/*",
                     &[
@@ -700,6 +771,7 @@ mod tests {
                         ("cross-origin-embedder-policy", "require-corp"),
                     ],
                 ),
+                ("/*", &[]),
             ],
         );
         let plan = plan(&svc, &domains).unwrap().expect("two units");
@@ -1034,5 +1106,171 @@ mod tests {
         assert!(plan
             .workload(plan.listen_port(), |unit| addresses.get(unit).cloned())
             .is_err());
+    }
+
+    // ── R898-F2: the inner door and the compiled table are one join ──────────
+
+    /// A placement that resolves the fixture's `static` routes. Nothing here
+    /// asserts on origins — the point is that the HEADER answer the door plans
+    /// and the header answer the compiled table carries come from one walk.
+    fn placement() -> CdnPlacement {
+        CdnPlacement {
+            cdn_base: "https://cdn.test".to_string(),
+            env: "prod".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn compiled(domains: &BTreeMap<String, DomainConfig>) -> RouteTable {
+        domains["test"]
+            .route_table(&placement())
+            .expect("the fixture's routes all resolve")
+    }
+
+    /// passway spells the root mount `""`; the request that reaches it is `/`.
+    fn mount_path(mount: &str) -> &str {
+        if mount.is_empty() {
+            "/"
+        } else {
+            mount
+        }
+    }
+
+    /// A two-unit service whose domain declares a headered `/app/*` above a
+    /// headerless catch-all — a legal manifest under first-match-wins.
+    fn seam_fixture() -> (ServiceConfig, BTreeMap<String, DomainConfig>) {
+        let svc = service(
+            "noisetable",
+            vec![
+                component("site", None, DeployTier::Bundle),
+                component("account", Some("app"), DeployTier::Workload),
+            ],
+        );
+        let domains = domains(
+            "noisetable",
+            &[
+                (
+                    "/app/*",
+                    &[("cross-origin-opener-policy", "same-origin")],
+                ),
+                ("/*", &[("x-frame-options", "DENY")]),
+            ],
+        );
+        (svc, domains)
+    }
+
+    /// **THE SEAM (R898-F2).** Every mount's headers are the compiled route
+    /// table's answer for that mount's path — not a second join that happens to
+    /// agree. If the two ever diverge, the inner door serves headers the table
+    /// says are served somewhere else.
+    #[test]
+    fn every_mounts_headers_are_the_compiled_route_tables_answer() {
+        let (svc, domains) = seam_fixture();
+        let table = compiled(&domains);
+        let plan = plan(&svc, &domains).unwrap().expect("two units");
+
+        for m in &plan.mounts {
+            let expected = table
+                .match_path(mount_path(&m.mount))
+                .map(|e| e.headers.clone())
+                .unwrap_or_default();
+            assert_eq!(m.headers, expected, "mount {:?}", m.mount);
+        }
+
+        // Non-trivially: the fixture gives both mounts headers, and DIFFERENT
+        // ones, so an implementation that returned `Default::default()` for
+        // everything could not pass the loop above.
+        assert_eq!(
+            plan.mounts
+                .iter()
+                .map(|m| m.headers.keys().cloned().collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![
+                vec!["x-frame-options".to_string()],
+                vec!["cross-origin-opener-policy".to_string()],
+            ]
+        );
+    }
+
+    /// The property the seam exists for: a header edited in the domain manifest
+    /// reaches the inner door's table without a second join being touched, and
+    /// both tiers move together.
+    #[test]
+    fn a_header_changed_in_the_manifest_moves_both_tiers_at_once() {
+        let (svc, mut domains) = seam_fixture();
+        let before = plan(&svc, &domains).unwrap().unwrap();
+        assert_eq!(
+            before.mounts[1]
+                .headers
+                .get("cross-origin-opener-policy")
+                .map(String::as_str),
+            Some("same-origin")
+        );
+
+        // One edit, in the manifest, to the route that governs `/app`.
+        let route = domains
+            .get_mut("test")
+            .unwrap()
+            .routes
+            .iter_mut()
+            .find(|r| r.path == "/app/*")
+            .unwrap();
+        route.headers.insert(
+            "cross-origin-embedder-policy".to_string(),
+            "require-corp".to_string(),
+        );
+
+        let after = plan(&svc, &domains).unwrap().unwrap();
+        let table = compiled(&domains);
+        assert_eq!(
+            after.mounts[1].headers,
+            table.match_path("/app").unwrap().headers,
+            "the door's mount and the compiled entry must move together"
+        );
+        assert_eq!(
+            after.mounts[1]
+                .headers
+                .get("cross-origin-embedder-policy")
+                .map(String::as_str),
+            Some("require-corp")
+        );
+        // And only that mount moved — no merging across rules.
+        assert_eq!(before.mounts[0].headers, after.mounts[0].headers);
+    }
+
+    /// The order-dependence the shared rule brings, stated as a test rather
+    /// than left to be discovered: a catch-all declared ABOVE `/app/*` claims
+    /// `/app` at every tier, and the inner door now agrees instead of quietly
+    /// disagreeing. This is the manifest being wrong, not the door.
+    #[test]
+    fn a_catch_all_declared_first_claims_every_mount_at_both_tiers() {
+        let svc = service(
+            "noisetable",
+            vec![
+                component("site", None, DeployTier::Bundle),
+                component("account", Some("app"), DeployTier::Workload),
+            ],
+        );
+        let domains = domains(
+            "noisetable",
+            &[
+                ("/*", &[("x-frame-options", "DENY")]),
+                ("/app/*", &[("cross-origin-opener-policy", "same-origin")]),
+            ],
+        );
+        let table = compiled(&domains);
+        let plan = plan(&svc, &domains).unwrap().unwrap();
+
+        assert_eq!(
+            table.match_path("/app").unwrap().path,
+            "/*",
+            "first match wins over the compiled table"
+        );
+        assert_eq!(plan.mounts[1].mount, "/app");
+        assert_eq!(
+            plan.mounts[1].headers.keys().cloned().collect::<Vec<_>>(),
+            vec!["x-frame-options".to_string()],
+            "and the inner door reports the same route's headers, not a second join's"
+        );
     }
 }

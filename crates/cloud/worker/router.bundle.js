@@ -19,9 +19,9 @@ function buildPageRoot(manifest) {
   const id = manifest?.build_id;
   return typeof id === "string" && id.length > 0 ? `${id}/html` : null;
 }
-async function loadManifest(assetOrigin) {
+async function loadManifest(get) {
   try {
-    const resp = await fetch(`${assetOrigin}/manifest.json`);
+    const resp = await get("manifest.json");
     if (!resp.ok) {
       return null;
     }
@@ -97,17 +97,17 @@ function validateKey(key) {
   }
   return null;
 }
-async function resolvePointer(pointerOrigin, key) {
+async function resolvePointer(read, key) {
   if (validateKey(key) !== null) {
     return { kind: "absent" };
   }
-  const url = `${pointerOrigin}/${POINTER_PREFIX}${key}`;
-  const resp = await fetch(url);
+  const pointerKey = `${POINTER_PREFIX}${key}`;
+  const resp = await read(pointerKey);
   if (resp.status === 404) {
     return { kind: "absent" };
   }
   if (!resp.ok) {
-    throw new PointerMalformed(`pointer read ${url} -> ${resp.status}`);
+    throw new PointerMalformed(`pointer read ${pointerKey} -> ${resp.status}`);
   }
   let record;
   try {
@@ -124,45 +124,76 @@ async function resolvePointer(pointerOrigin, key) {
 // src/router.ts
 var IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 var PAGE_CACHE_CONTROL = "no-cache";
+function httpGet(origin) {
+  return (key) => fetch(`${origin}/${key}`);
+}
+function r2Get(bucket) {
+  return async (key) => {
+    const obj = await bucket.get(key);
+    if (!obj)
+      return new Response(null, { status: 404 });
+    const headers = new Headers;
+    obj.writeHttpMetadata(headers);
+    headers.set("ETag", obj.httpEtag);
+    return new Response(obj.body, { headers });
+  };
+}
+function assetSource(env, entry) {
+  if (entry?.mode === "static" && entry.binding !== undefined) {
+    const bucket = env[entry.binding];
+    if (!bucket || typeof bucket.get !== "function") {
+      console.error(`mesofact: ROUTE_TABLE entry ${JSON.stringify(entry.path)} reads R2 binding ${JSON.stringify(entry.binding)}, which this Worker was not deployed with`);
+      return new Response("Bad Gateway", { status: 502 });
+    }
+    const get = r2Get(bucket);
+    return { get, pointers: get };
+  }
+  if (entry?.mode === "static" && entry.origin) {
+    const get = httpGet(entry.origin);
+    return { get, pointers: get };
+  }
+  if (!env.ASSET_ORIGIN) {
+    return new Response("Not Found", { status: 404 });
+  }
+  return {
+    get: httpGet(env.ASSET_ORIGIN),
+    pointers: httpGet(env.POINTER_ORIGIN || env.ASSET_ORIGIN)
+  };
+}
 var router_default = {
   async fetch(request, env) {
-    const resp = await route(request, env);
-    return applyRouteHeaders(resp, new URL(request.url).pathname, env.ROUTE_HEADERS);
+    const path = new URL(request.url).pathname;
+    let entry;
+    try {
+      entry = matchRoute(env.ROUTE_TABLE, path);
+    } catch (err) {
+      return routingUnavailable(path, err);
+    }
+    const resp = await route(request, env, entry);
+    return applyRouteHeaders(resp, entry);
   }
 };
-async function route(request, env) {
+async function route(request, env, entry) {
   const url = new URL(request.url);
   const path = url.pathname;
   const resilience = parseResilience(env.SSR_RESILIENCE);
-  if (env.ISSUES_ORIGIN && path.startsWith("/api/issues")) {
-    const target = env.ISSUES_ORIGIN + "/issues" + path.slice("/api/issues".length) + url.search;
+  if (entry?.mode === "redirect") {
+    return new Response(null, {
+      status: entry.status ?? 308,
+      headers: { Location: entry.target ?? "/" }
+    });
+  }
+  if (entry?.mode === "backend") {
+    if (!entry.origin) {
+      console.error(`mesofact: ROUTE_TABLE entry ${JSON.stringify(entry.path)} is mode=backend with no origin`);
+      return new Response("Bad Gateway", { status: 502 });
+    }
+    const target = entry.origin + rewritePath(entry, path) + url.search;
     return proxyWithResilience(request, target, policyFor(resilience, path));
   }
-  if (env.MESOFACT_BACKEND_ORIGIN && path.startsWith("/api/releases")) {
-    const target = env.MESOFACT_BACKEND_ORIGIN + "/releases" + path.slice("/api/releases".length) + url.search;
-    return proxyWithResilience(request, target, policyFor(resilience, path));
-  }
-  if (env.WORKER_MODE === "ssr" && env.SSR_ORIGIN) {
-    let prefixes = [];
-    try {
-      prefixes = JSON.parse(env.SSR_PREFIXES);
-    } catch {}
-    const matched = prefixes.find((p) => path === p || path.startsWith(p.endsWith("/") ? p : p + "/"));
-    if (matched) {
-      const target = env.SSR_ORIGIN + path + url.search;
-      return proxyWithResilience(request, target, policyFor(resilience, path));
-    }
-  }
-  if (path.startsWith("/uploads/")) {
-    if (!env.UPLOAD_ORIGIN) {
-      return new Response("Not Found", { status: 404 });
-    }
-    const uploadResp = await fetch(`${env.UPLOAD_ORIGIN}/${path.slice(1)}`);
-    if (uploadResp.ok) {
-      return uploadResp;
-    }
-    return new Response("Not Found", { status: 404 });
-  }
+  const source = assetSource(env, entry);
+  if (source instanceof Response)
+    return source;
   let key;
   if (path === "/" || path.endsWith("/")) {
     key = (path === "/" ? "" : path.slice(1)) + "index.html";
@@ -172,73 +203,72 @@ async function route(request, env) {
   let manifest = null;
   let manifestLoaded = false;
   if (isPageKey(key)) {
-    manifest = await loadManifest(env.ASSET_ORIGIN);
+    manifest = await loadManifest(source.get);
     manifestLoaded = true;
     const pageRoot = buildPageRoot(manifest);
     if (pageRoot) {
       for (const candidate of assetCandidates(key)) {
-        const resp = await fetch(`${env.ASSET_ORIGIN}/${pageRoot}/${candidate}`);
+        const resp = await source.get(`${pageRoot}/${candidate}`);
         if (resp.ok) {
           return routePage(resp, manifest, path);
         }
       }
     }
   }
-  const assetResp = await fetch(`${env.ASSET_ORIGIN}/${key}`);
+  const assetResp = await source.get(key);
   if (assetResp.ok) {
     return isPageKey(key) ? withDeclaredCache(assetResp, manifest, path) : assetResp;
   }
   if (!manifestLoaded) {
-    manifest = await loadManifest(env.ASSET_ORIGIN);
+    manifest = await loadManifest(source.get);
   }
   if (matchesDeferredRoute(manifest, path)) {
-    return serveInstance(env, path, manifest);
+    return serveInstance(source, path, manifest);
   }
   for (const candidate of assetCandidates(key).slice(1)) {
-    const cleanResp = await fetch(`${env.ASSET_ORIGIN}/${candidate}`);
+    const cleanResp = await source.get(candidate);
     if (cleanResp.ok) {
       return withDeclaredCache(cleanResp, manifest, path);
     }
   }
   if (env.WORKER_MODE === "static") {
-    return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
+    return errorResponse(404, source.get, manifest?.error_routes);
   }
-  const shellResp = await fetch(`${env.ASSET_ORIGIN}/index.html`);
+  const shellResp = await source.get("index.html");
   if (shellResp.ok) {
     return new Response(shellResp.body, {
       status: 200,
       headers: shellResp.headers
     });
   }
-  return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
+  return errorResponse(404, source.get, manifest?.error_routes);
 }
-async function serveInstance(env, path, manifest) {
-  const pointerOrigin = env.POINTER_ORIGIN || env.ASSET_ORIGIN;
+async function serveInstance(source, path, manifest) {
   const key = path.slice(1);
   let state;
   try {
-    state = await resolvePointer(pointerOrigin, key);
+    state = await resolvePointer(source.pointers, key);
   } catch (err) {
     if (err instanceof PointerMalformed) {
-      return errorResponse(500, env.ASSET_ORIGIN, manifest?.error_routes);
+      return errorResponse(500, source.get, manifest?.error_routes);
     }
     throw err;
   }
   if (state.kind === "present") {
-    const contentResp = await fetch(`${env.ASSET_ORIGIN}/${state.pointer.content_root}`);
+    const contentResp = await source.get(state.pointer.content_root);
     if (!contentResp.ok) {
-      return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
+      return errorResponse(404, source.get, manifest?.error_routes);
     }
     const headers = new Headers(contentResp.headers);
     stampPageCache(headers, manifest, path, IMMUTABLE_CACHE_CONTROL);
     return new Response(contentResp.body, { status: 200, headers });
   }
   if (state.kind === "deleted") {
-    return errorResponse(410, env.ASSET_ORIGIN, manifest?.error_routes, "410 Gone");
+    return errorResponse(410, source.get, manifest?.error_routes, "410 Gone");
   }
-  return errorResponse(404, env.ASSET_ORIGIN, manifest?.error_routes);
+  return errorResponse(404, source.get, manifest?.error_routes);
 }
-async function errorResponse(status, assetOrigin, errorRoutes, fallbackText) {
+async function errorResponse(status, get, errorRoutes, fallbackText) {
   const brandedRoute = status >= 500 ? errorRoutes?.["5xx"] : errorRoutes?.["404"];
   const keys = [];
   if (brandedRoute)
@@ -246,7 +276,7 @@ async function errorResponse(status, assetOrigin, errorRoutes, fallbackText) {
   if (status < 500)
     keys.push("404.html");
   for (const k of keys) {
-    const resp = await fetch(`${assetOrigin}/${k}`);
+    const resp = await get(k);
     if (resp.ok) {
       return new Response(resp.body, { status, headers: resp.headers });
     }
@@ -298,12 +328,25 @@ function defaultStatusText(status) {
   return "Not Found";
 }
 var NULL_BODY_STATUS = new Set([101, 103, 204, 205, 304]);
-var routeHeaderCache;
-function applyRouteHeaders(resp, path, raw) {
-  const matched = parseRouteHeaders(raw).find((r) => matchesRoutePattern(r.path, path));
-  if (!matched)
-    return resp;
-  const entries = Object.entries(matched.headers);
+var routeTableCache;
+function matchRoute(raw, path) {
+  return parseRouteTable(raw).find((e) => matchesRoutePattern(e.path, path));
+}
+function rewritePath(entry, path) {
+  const rw = entry.rewrite;
+  if (!rw)
+    return path;
+  return rw.to + path.slice(rw.from.length);
+}
+function routingUnavailable(path, err) {
+  console.error(`mesofact: ROUTE_TABLE binding is malformed — refusing to route ${path} rather than serving it from the catch-all — ${err instanceof Error ? err.message : String(err)}`);
+  return new Response("Service Unavailable: routing table is unreadable", {
+    status: 503,
+    headers: { "Content-Type": "text/plain" }
+  });
+}
+function applyRouteHeaders(resp, entry) {
+  const entries = Object.entries(entry?.headers ?? {});
   if (entries.length === 0)
     return resp;
   const headers = new Headers(resp.headers);
@@ -315,55 +358,70 @@ function applyRouteHeaders(resp, path, raw) {
     headers
   });
 }
-function parseRouteHeaders(raw) {
+function parseRouteTable(raw) {
   if (!raw)
     return [];
-  if (routeHeaderCache?.raw === raw)
-    return routeHeaderCache.rules;
-  let rules = [];
+  if (routeTableCache?.raw === raw)
+    return routeTableCache.entries;
+  let entries = validateRouteTable(raw);
   try {
-    rules = validateRouteHeaderTable(raw);
+    assertSettableHeaders(entries);
   } catch (err) {
-    console.error(`mesofact: ROUTE_HEADERS binding is malformed, serving with NO route headers — ${err instanceof Error ? err.message : String(err)}`);
-    rules = [];
+    console.error(`mesofact: ROUTE_TABLE carries a header that cannot be applied, serving with NO route headers — ${err instanceof Error ? err.message : String(err)}`);
+    entries = entries.map(({ headers: _drop, ...rest }) => rest);
   }
-  routeHeaderCache = { raw, rules };
-  return rules;
+  routeTableCache = { raw, entries };
+  return entries;
 }
-function validateRouteHeaderTable(raw) {
+function validateRouteTable(raw) {
   const v = JSON.parse(raw);
   if (!Array.isArray(v)) {
-    throw new Error("expected a JSON array of {path, headers} rules");
+    throw new Error("expected a JSON array of route entries");
   }
-  return v.map((rule, i) => {
-    if (!isRouteHeaderRule(rule)) {
-      throw new Error(`rule ${i} is not a {path: string, headers: object}`);
+  return v.map((entry, i) => {
+    if (!isRouteEntry(entry)) {
+      throw new Error(`entry ${i} is not a {path: string, mode: "static"|"backend"|"redirect", headers?: object}`);
     }
-    if (rule.path === "") {
-      throw new Error(`rule ${i} has an empty path — a rule that matches nothing (or everything, depending on who reads it) is not a policy`);
+    if (entry.path === "") {
+      throw new Error(`entry ${i} has an empty path — an entry that matches nothing (or everything, depending on who reads it) is not a route`);
     }
-    assertSettableHeaders(rule, i);
-    return rule;
+    return entry;
   });
 }
-function assertSettableHeaders(rule, i) {
+function assertSettableHeaders(entries) {
   const probe = new Headers;
-  for (const [name, value] of Object.entries(rule.headers)) {
-    if (typeof value !== "string") {
-      throw new Error(`rule ${i} declares ${JSON.stringify(name)} = ${JSON.stringify(value)}, which is not a string`);
+  entries.forEach((entry, i) => {
+    for (const [name, value] of Object.entries(entry.headers ?? {})) {
+      if (typeof value !== "string") {
+        throw new Error(`entry ${i} declares ${JSON.stringify(name)} = ${JSON.stringify(value)}, which is not a string`);
+      }
+      try {
+        probe.set(name, value);
+      } catch (err) {
+        throw new Error(`entry ${i} declares ${JSON.stringify(name)} = ${JSON.stringify(value)}, which cannot be set as a response header — ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
-    try {
-      probe.set(name, value);
-    } catch (err) {
-      throw new Error(`rule ${i} declares ${JSON.stringify(name)} = ${JSON.stringify(value)}, which cannot be set as a response header — ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
+  });
 }
-function isRouteHeaderRule(v) {
+function isRouteEntry(v) {
   if (!v || typeof v !== "object")
     return false;
-  const r = v;
-  return typeof r.path === "string" && !!r.headers && typeof r.headers === "object" && !Array.isArray(r.headers);
+  const e = v;
+  if (typeof e.path !== "string")
+    return false;
+  if (e.mode !== "static" && e.mode !== "backend" && e.mode !== "redirect") {
+    return false;
+  }
+  if (e.origin !== undefined && typeof e.origin !== "string")
+    return false;
+  if (e.binding !== undefined && typeof e.binding !== "string")
+    return false;
+  if (e.headers !== undefined) {
+    if (!e.headers || typeof e.headers !== "object" || Array.isArray(e.headers)) {
+      return false;
+    }
+  }
+  return true;
 }
 function matchesRoutePattern(pattern, path) {
   if (!pattern.endsWith("*"))
@@ -493,6 +551,6 @@ function emitTelemetry(target, attempts, outcome, latencyMs) {
   }));
 }
 export {
-  validateRouteHeaderTable,
+  validateRouteTable,
   router_default as default
 };

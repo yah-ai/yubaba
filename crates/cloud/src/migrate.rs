@@ -796,7 +796,6 @@ mod tests {
                      [image]\nregistry = \"cr.yah.dev\"\nrepository = \"{name}\"\n\
                      tag = \"v1\"\ndigest = \"sha256:abc\"\n\
                      [resources]\nmemory_mb = 128\ncpu_millis = 100\n\
-                     ephemeral_storage_mb = 64\n\
                      [stop_policy]\nsignal = 15\ngrace_period = 10000\n\
                      [expose.mesh]\nidentity = \"{name}\"\nports = [8080]\nallow_from = []\n"
                 ),

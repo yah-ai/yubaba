@@ -465,11 +465,13 @@ account_id = "test-account"
                 ingress_machines: Vec::new(),
                 drivers: Default::default(),
                 asset_aliases: Default::default(),
+                build: Default::default(),
             };
             let service = ServiceConfig {
                 schema_version: 1,
                 name: "yah-cr".to_string(),
                 domain: "cr.yah.dev".to_string(),
+                health_path: None,
                 components: vec![],
                 db: crate::DbCatalog::default(),
             };
@@ -490,7 +492,7 @@ account_id = "test-account"
                 service,
                 component,
                 mirror,
-                env: "cloud".to_string(),
+                env: "prod".to_string(),
             }
         }
 
@@ -545,7 +547,7 @@ account_id = "test-account"
             "error must name the offending slot role: {msg}"
         );
         assert!(msg.contains("yah-cr"), "error must name the service: {msg}");
-        assert!(msg.contains("cloud"), "error must name the env: {msg}");
+        assert!(msg.contains("prod"), "error must name the env: {msg}");
     }
 
     /// Case 2 of the F4 ticket: workload.toml [[bindings]] name does not match
@@ -578,7 +580,7 @@ account_id = "test-account"
             "error must mention the `binding` field: {msg}"
         );
         assert!(msg.contains("yah-cr"), "error must name the service: {msg}");
-        assert!(msg.contains("cloud"), "error must name the env: {msg}");
+        assert!(msg.contains("prod"), "error must name the env: {msg}");
     }
 
     /// Case 1 of the F4 ticket: providers.cache slot missing the `bucket` field.
@@ -612,6 +614,6 @@ account_id = "test-account"
             "error must name the binding it relates to: {msg}"
         );
         assert!(msg.contains("yah-cr"), "error must name the service: {msg}");
-        assert!(msg.contains("cloud"), "error must name the env: {msg}");
+        assert!(msg.contains("prod"), "error must name the env: {msg}");
     }
 }

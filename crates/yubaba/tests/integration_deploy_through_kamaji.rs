@@ -32,7 +32,7 @@ use tower::ServiceExt;
 use kamaji::sibling::{KamajiClient, KamajiSibling};
 use workload_spec::{
     ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, ResourceLimits, RestartPolicy,
-    SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
+    StopPolicy, TierTag, WorkloadSpec,
 };
 
 /// Spawn a real Kamaji on `socket` and wait for the listener to bind.
@@ -59,7 +59,6 @@ async fn spawn_kamaji(socket: PathBuf) -> (tokio::task::JoinHandle<()>, oneshot:
 /// deploy path runs straight to the backend dispatch.
 fn container_spec(name: &str) -> WorkloadSpec {
     WorkloadSpec {
-        schema_version: SchemaVersion::V1,
         name: name.to_string(),
         image: ImageRef {
             registry: "docker.io".into(),
@@ -85,7 +84,10 @@ fn container_spec(name: &str) -> WorkloadSpec {
         resources: ResourceLimits {
             memory_mb: 64,
             cpu_millis: 128,
-            ephemeral_storage_mb: 128,
+            memory_request_mb: None,
+            cpu_limit_millis: None,
+            pids_max: None,
+            scratch_floor_mb: None,
         },
         depends_on: vec![],
         requires: vec![],
@@ -106,6 +108,7 @@ fn container_spec(name: &str) -> WorkloadSpec {
             operator: None,
         },
         labels: Default::default(),
+        durability: None,
         annotations: Default::default(),
     }
 }
@@ -231,6 +234,69 @@ async fn deploy_status_dispatches_to_kamaji_over_the_real_wire() {
     server.await.unwrap();
 }
 
+/// R870-B24: `GET /workloads/{ident}/spec` reaches kamaji's `Describe` verb
+/// over the real wire.
+///
+/// Worth an end-to-end test rather than only the unit ones on either side,
+/// because the failure this verb exists to prevent is silent: the guard that
+/// consumes it refuses a push it cannot prove safe, so a route that answered
+/// wrongly — or a reply variant that was never classified as a reply and got
+/// dropped as a push, the R746-B11 trap — would show up as apply refusing
+/// everything, or as a parked connection, long after the change that caused it.
+///
+/// A bare kamaji has admitted nothing, so the honest answer is `spec: null`
+/// with a 200: kamaji answered, and it holds no record. That is deliberately
+/// not a 404 — the ident is a legitimate question, the answer is "nothing" —
+/// and `x-workload-source: kamaji` is the proof it came off the UDS rather
+/// than from axum's own not-found.
+#[tokio::test]
+async fn workload_spec_dispatches_to_kamaji_over_the_real_wire() {
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("kamaji.sock");
+    let (server, stop) = spawn_kamaji(sock.clone()).await;
+
+    let client = KamajiClient::connect(sock.clone())
+        .await
+        .expect("kamaji handshake");
+    let sibling = KamajiSibling::new(client, sock, Duration::from_secs(5));
+    let state = Arc::new(
+        yubaba::ServerState::load(dir.path().join("identity.json"))
+            .unwrap()
+            .with_constable_client(sibling),
+    );
+    let app = yubaba::build_router(state);
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(30),
+        app.oneshot(
+            Request::get("/workloads/never-deployed/spec")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("the spec read-back must answer, not park the caller")
+    .unwrap();
+
+    let status = resp.status();
+    let source = resp
+        .headers()
+        .get("x-workload-source")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = body_json(resp).await;
+
+    assert_eq!(status, StatusCode::OK, "got {status}: {body}");
+    assert_eq!(source.as_deref(), Some("kamaji"));
+    assert!(
+        body.get("spec").is_some_and(serde_json::Value::is_null),
+        "a kamaji holding no record answers `spec: null`: {body}"
+    );
+
+    let _ = stop.send(());
+    server.await.unwrap();
+}
+
 /// R746-B11, second and separable defect: a kamaji that completes the
 /// handshake and then never answers must degrade to a status code, not park
 /// the caller's connection forever.
@@ -333,7 +399,7 @@ async fn deploy_status_answers_a_status_code_when_kamaji_never_replies() {
 /// can catch, because at that level the refusal has already been discarded.
 ///
 /// The test is deliberately NON-VACUOUS: the node is given a real mesh IP via
-/// `with_bind_addr` and the bundle declares a port, so `admit_bundle` would
+/// `with_mesh_addr` and the bundle declares a port, so `admit_bundle` would
 /// admit this workload if it were reached. The empty registry therefore proves
 /// the refusal suppressed it, not that some other precondition was missing.
 ///
@@ -357,7 +423,7 @@ async fn a_refused_bundle_deploy_publishes_no_service_record() {
             .unwrap()
             // Both halves admit_bundle needs, so a passing assertion below can
             // only be explained by the refusal.
-            .with_bind_addr("100.64.0.3:7443")
+            .with_mesh_addr(None, "100.64.0.3:7443")
             .with_constable_client(sibling),
     );
     assert_eq!(
@@ -369,7 +435,6 @@ async fn a_refused_bundle_deploy_publishes_no_service_record() {
     let app = yubaba::build_router(state);
 
     let envelope = workload_spec::Workload::MesofactStatic(workload_spec::MesofactStaticWorkload {
-        schema_version: SchemaVersion::V1,
         build: workload_spec::BuildConfig {
             command: Some("bun run build".into()),
             out_dir: PathBuf::from("dist"),
@@ -423,4 +488,154 @@ async fn a_refused_bundle_deploy_publishes_no_service_record() {
 
     let _ = stop.send(());
     server.await.unwrap();
+}
+
+/// R876-B13: an unauthenticated `GET /workloads/{ident}/spec` must not serve a
+/// resolved secret VALUE.
+///
+/// The assertion is **value-shaped**, not field-shaped: it looks for the
+/// sentinel's bytes anywhere in the response body rather than at a named field,
+/// so reshaping `WorkloadSpec` — or adding a new value channel to it — cannot
+/// make this pass vacuously. The live defect was found on a `mesofact-static`
+/// workload whose `revalidate_receiver.env` held a Cloudflare API token and an
+/// S3 access-key pair as plain strings; this drives the same shape.
+///
+/// The kamaji here is a scripted one rather than the real `spawn_kamaji`,
+/// because `Describe` only answers with a record for a workload kamaji actually
+/// admitted, and a bare kamaji has no container backend to admit one with. The
+/// wire is real — a real `KamajiClient` handshake, a real postcard frame, the
+/// real router and the real handler — only the far side's registry is scripted.
+#[tokio::test]
+async fn a_served_spec_carries_env_names_but_never_resolved_secret_values() {
+    use kamaji_proto::{decode_frame, encode_frame, KamajiToYubaba, YubabaToKamaji};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const SENTINEL: &str = "SENTINEL-live-credential-4f1c9a";
+
+    let dir = TempDir::new().unwrap();
+    let sock = dir.path().join("kamaji.sock");
+    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+
+    // The envelope kamaji claims to be supervising: env VALUES are the
+    // sentinel, env KEYS are what the route exists to report.
+    let mut env = std::collections::BTreeMap::new();
+    env.insert("CLOUDFLARE_API_TOKEN".to_string(), SENTINEL.to_string());
+    env.insert(
+        "MESOFACT_S3_SECRET_ACCESS_KEY".to_string(),
+        SENTINEL.to_string(),
+    );
+    let supervised = workload_spec::Workload::MesofactStatic(workload_spec::MesofactStaticWorkload {
+        build: workload_spec::BuildConfig {
+            command: Some("bun run build".into()),
+            out_dir: PathBuf::from("dist"),
+            render_command: None,
+        },
+        routes: PathBuf::from("./mesofact.routes.ts"),
+        build_mode: workload_spec::BuildMode::default(),
+        ssr_runtime: None,
+        serve_bundle: None,
+        revalidate_receiver: Some(workload_spec::MesofactRevalidateReceiver {
+            routes: vec!["/".into()],
+            publish_config: "mesofact.config.toml".into(),
+            mirror_key_env: Some("MESOFACT_MIRROR_KEY".into()),
+            env,
+            feeds: vec![],
+            feed_runtime: None,
+            feed_interval_secs: 300,
+            feed_project_prefix: None,
+            secrets: vec![],
+        }),
+    });
+
+    // Non-vacuity, PINNED rather than assumed. The absence assertion at the
+    // bottom passes just as happily against an envelope that never carried the
+    // sentinel, so without this line a future refactor of the fixture above can
+    // make the whole test vacuous and it still goes green — which is exactly
+    // the silent regression the ticket was filed to prevent.
+    assert!(
+        serde_json::to_string(&supervised)
+            .unwrap()
+            .contains(SENTINEL),
+        "test precondition: the supervised envelope must actually carry the \
+         sentinel, or the redaction assertion below proves nothing"
+    );
+
+    // A kamaji that answers the handshake, then answers every `Describe` with
+    // that envelope.
+    let scripted = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::with_capacity(8192);
+        let mut tmp = [0u8; 8192];
+        loop {
+            match decode_frame::<YubabaToKamaji>(&buf) {
+                Ok((msg, consumed)) => {
+                    buf.drain(..consumed);
+                    let reply = match msg {
+                        YubabaToKamaji::Hello { .. } => KamajiToYubaba::Welcome {
+                            version: kamaji_proto::ProtocolVersion::CURRENT,
+                            kamaji_version: "scripted-test".into(),
+                        },
+                        YubabaToKamaji::Describe { request_id, id } => {
+                            KamajiToYubaba::WorkloadDescription {
+                                request_id,
+                                id,
+                                spec: Some(supervised.clone()),
+                            }
+                        }
+                        // Nothing else is part of this test's contract.
+                        _ => continue,
+                    };
+                    stream.write_all(&encode_frame(&reply).unwrap()).await.unwrap();
+                }
+                Err(_) => {
+                    let n = stream.read(&mut tmp).await.unwrap();
+                    assert!(n > 0, "client closed mid-exchange");
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+            }
+        }
+    });
+
+    let client = KamajiClient::connect(sock.clone())
+        .await
+        .expect("kamaji handshake");
+    let sibling = KamajiSibling::new(client, sock, Duration::from_secs(5));
+    let state = Arc::new(
+        yubaba::ServerState::load(dir.path().join("identity.json"))
+            .unwrap()
+            .with_constable_client(sibling),
+    );
+    let app = yubaba::build_router(state);
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(30),
+        app.oneshot(
+            Request::get("/workloads/yah-marketing/spec")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("the spec read-back must answer, not park the caller")
+    .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let raw = serde_json::to_string(&body).unwrap();
+
+    // Deliberately never printed on the success path — a failure prints the
+    // sentinel, which is a test fixture, not a credential.
+    assert!(
+        !raw.contains(SENTINEL),
+        "an unauthenticated GET served a resolved secret value: {raw}"
+    );
+    // Non-vacuity: the route must still have answered with the workload, and
+    // with the env KEYS, or the assertion above passes because the body is
+    // empty rather than because it is redacted.
+    assert!(
+        raw.contains("CLOUDFLARE_API_TOKEN") && raw.contains("MESOFACT_S3_SECRET_ACCESS_KEY"),
+        "the env NAMES are this route's whole purpose and must survive: {raw}"
+    );
+
+    scripted.abort();
 }

@@ -215,7 +215,7 @@ pub struct PortSource {
 
 /// Two local-tier mirror slots that bind the same host port. Because local
 /// mirrors share the operator's localhost, both binding the same port collide
-/// when brought up together — and the local-static adopt probe (a bare TCP
+/// when brought up together — and the pond adopt probe (a bare TCP
 /// connect) may then silently adopt the *wrong* service (R602-B4: `scrabcake`
 /// dev and `yah-marketing` pond both on 4322).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,7 +227,7 @@ pub struct PortCollision {
 
 impl PortCollision {
     /// True when the two binders belong to different services — the dangerous
-    /// case, because the local-static adopt probe can then silently adopt the
+    /// case, because the pond adopt probe can then silently adopt the
     /// *other* service's server. Same-service reuse (e.g. one service's dev +
     /// cloud mirrors sharing a port) is only a can't-co-run bind conflict.
     pub fn is_cross_service(&self) -> bool {
@@ -239,7 +239,7 @@ impl PortCollision {
         format!(
             "host port {} is bound by both {}/{} (providers.{}.{}) and {}/{} (providers.{}.{})\n\
              \u{2192} give one a distinct port — local mirrors share the operator's localhost, so \
-             two slots on the same port collide, and the local-static adopt probe may silently \
+             two slots on the same port collide, and the pond adopt probe may silently \
              adopt the wrong service.",
             self.port,
             self.first.service,
@@ -263,13 +263,13 @@ const PORT_FIELDS: &[&str] = &["port", "api_port", "console_port"];
 fn slot_binds_localhost(slot: &MirrorProviderSlot) -> bool {
     matches!(
         slot.inline_kind(),
-        Some(Provider::LocalStatic | Provider::MiniflareContainer | Provider::MinioContainer)
+        Some(Provider::MiniflareNative | Provider::MiniflareContainer | Provider::MinioContainer)
     )
 }
 
 /// Walk every service mirror and flag host-port reuse across local-tier
 /// provider slots (R602-B4). Only slots that bind a port on the operator's
-/// localhost are considered (`local-static`, `miniflare-container`,
+/// localhost are considered (`miniflare-native`, `miniflare-container`,
 /// `minio-container`) — cloud/CF slots don't contend for localhost.
 ///
 /// Deterministic: services + mirror envs are walked in sorted order, slot
@@ -1087,7 +1087,7 @@ mod tests {
             .map(|(k, v)| format!("\"{k}\" = \"{v}\"\n"))
             .collect();
         let content = format!(
-            "kind = \"static-asset\"\nschema_version = \"V1\"\n\
+            "kind = \"static-asset\"\n\
              [aliases]\n{alias_lines}"
         );
         std::fs::write(dir.join("workload.toml"), content).unwrap();
@@ -1219,7 +1219,7 @@ mod tests {
         // (Writes a valid mesofact-static workload which has no aliases)
         std::fs::write(
             workload_dir.join("workload.toml"),
-            "schema_version = \"V1\"\nname = \"api\"\nkind = \"mesofact-static\"\n\
+            "name = \"api\"\nkind = \"mesofact-static\"\n\
              bundle_dir = \"dist\"\n",
         )
         .unwrap();
@@ -1239,7 +1239,7 @@ mod tests {
     fn local_static_mirror(port: u16) -> String {
         format!(
             "schema_version = 1\nshape = \"local\"\n\
-             [providers.static]\nkind = \"local-static\"\nport = {port}\n"
+             [providers.static]\nkind = \"miniflare-native\"\nport = {port}\n"
         )
     }
 
@@ -1289,13 +1289,13 @@ mod tests {
         let root = dir.path();
         write_service(root, "scrabcake", "scrabcake/site");
         write_mirror(root, "scrabcake", "dev", &local_static_mirror(4352));
-        write_mirror(root, "scrabcake", "cloud", &local_static_mirror(4352));
+        write_mirror(root, "scrabcake", "prod", &local_static_mirror(4352));
         let cols = check_port_collisions(root).unwrap();
         assert_eq!(cols.len(), 1, "{cols:?}");
         assert_eq!(cols[0].port, 4352);
-        // "cloud" sorts before "dev".
-        assert_eq!(cols[0].first.env, "cloud");
-        assert_eq!(cols[0].second.env, "dev");
+        // "dev" sorts before "prod".
+        assert_eq!(cols[0].first.env, "dev");
+        assert_eq!(cols[0].second.env, "prod");
         assert!(
             !cols[0].is_cross_service(),
             "same service across envs is NOT cross-service"
@@ -1311,9 +1311,9 @@ mod tests {
         let ref_slot = "schema_version = 1\nshape = \"local\"\n\
              [providers.static]\nuse = \"cloudflare\"\nport = 8080\n";
         write_service(root, "a", "a/site");
-        write_mirror(root, "a", "cloud", ref_slot);
+        write_mirror(root, "a", "prod", ref_slot);
         write_service(root, "b", "b/site");
-        write_mirror(root, "b", "cloud", ref_slot);
+        write_mirror(root, "b", "prod", ref_slot);
         assert!(check_port_collisions(root).unwrap().is_empty());
     }
 
@@ -1926,7 +1926,7 @@ mod tests {
         write_mirror(
             &borrower,
             "marketing",
-            "cloud",
+            "prod",
             &fronted_mirror("passway", &["us-east-001"], "api.example.com", 8080),
         );
         let report = collate_workspace_ingress(&borrower).unwrap();
@@ -1978,7 +1978,7 @@ mod tests {
         write_mirror(
             &borrower,
             "marketing",
-            "cloud",
+            "prod",
             "schema_version = 1\nshape = \"single-machine\"\n\
              ingress = \"passway\"\ningress_machines = [\"us-east-001\"]\n\
              [providers.compute]\nuse = \"hetzner\"\nzone = \"api.example.com\"\n\
@@ -2056,14 +2056,14 @@ mod tests {
         write_mirror(
             root,
             "yah-marketing",
-            "cloud",
+            "prod",
             &fronted_mirror("passway", &["us-east-001"], "yah.dev", 8080),
         );
         write_service(root, "yah-issues", "yah-issues/site");
         write_mirror(
             root,
             "yah-issues",
-            "cloud",
+            "prod",
             &fronted_mirror("passway", &["us-east-001"], "issues.yah.dev", 8731),
         );
 
@@ -2089,14 +2089,14 @@ mod tests {
         write_mirror(
             root,
             "svc-a",
-            "cloud",
+            "prod",
             &fronted_mirror("passway", &["us-east-001"], "yah.dev", 8080),
         );
         write_service(root, "svc-b", "svc-b/site");
         write_mirror(
             root,
             "svc-b",
-            "cloud",
+            "prod",
             &fronted_mirror("cloudflare-tunnel", &["us-west-001"], "yah.dev", 8080),
         );
 
@@ -2108,8 +2108,8 @@ mod tests {
             .map(|p| p.message())
             .collect();
         assert_eq!(fatal.len(), 1, "{fatal:?}");
-        assert!(fatal[0].contains("svc-a/cloud"), "{}", fatal[0]);
-        assert!(fatal[0].contains("svc-b/cloud"), "{}", fatal[0]);
+        assert!(fatal[0].contains("svc-a/prod"), "{}", fatal[0]);
+        assert!(fatal[0].contains("svc-b/prod"), "{}", fatal[0]);
     }
 
     #[test]
@@ -2123,7 +2123,7 @@ mod tests {
         write_mirror(
             root,
             "svc-broken",
-            "cloud",
+            "prod",
             "schema_version = 1\nshape = \"single-machine\"\n\
              ingress_machines = [\"us-east-001\"]\n\
              [providers.compute]\nuse = \"hetzner\"\nzone = \"a.yah.dev\"\nport = 8080\n",
@@ -2132,14 +2132,14 @@ mod tests {
         write_mirror(
             root,
             "svc-ok",
-            "cloud",
+            "prod",
             &fronted_mirror("passway", &["us-east-001"], "b.yah.dev", 8080),
         );
 
         let report = collate_workspace_ingress(root).unwrap();
         assert_eq!(report.problems.len(), 1);
         assert!(
-            report.problems[0].message().contains("svc-broken/cloud"),
+            report.problems[0].message().contains("svc-broken/prod"),
             "{}",
             report.problems[0].message()
         );

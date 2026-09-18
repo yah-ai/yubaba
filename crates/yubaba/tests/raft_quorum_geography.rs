@@ -29,7 +29,7 @@ async fn post_initialize(
     node: &SoloNode,
     members: serde_json::Value,
 ) -> (reqwest::StatusCode, String) {
-    let resp = reqwest::Client::new()
+    let resp = yubaba_test_harness::http()
         .post(format!("{}/raft/initialize", node.base_url))
         .json(&json!({ "members": members }))
         .send()
@@ -45,7 +45,7 @@ async fn post_initialize(
 /// gate that refuses *after* calling `raft.initialize` would return the same
 /// 400 while having already committed the membership it just rejected.
 async fn is_initialized(node: &SoloNode) -> bool {
-    let status: serde_json::Value = reqwest::Client::new()
+    let status: serde_json::Value = yubaba_test_harness::http()
         .get(format!("{}/raft/status", node.base_url))
         .send()
         .await

@@ -398,7 +398,7 @@ pub enum YubabaRequest {
     },
     ClearIngressOwner,
     // R278-F3 defined these; R118-T5 (W138) gave them their producer. Rollout
-    // state is now REPLICATED, not mirrored: `crate::rollout` reads and writes
+    // state is now REPLICATED, not mirrored: `yubaba::rollout` reads and writes
     // `YubabaState::rollouts` through these two variants and holds no store of
     // its own, so a leader that loses power mid-rollout leaves the next leader
     // everything it needs to pick the rollout up.
@@ -491,7 +491,7 @@ pub enum YubabaRequest {
     /// process**. It is noisetable's `society_facility::liveness` (`R118-F7`),
     /// which corroborates an IP path against BLE and deliberately links no
     /// yubaba crate, so it cannot implement the in-process
-    /// [`FailureDetector`](crate::failure_detector::FailureDetector) trait. It
+    /// `yubaba::failure_detector::FailureDetector` trait. It
     /// reports over loopback to the yubaba beside it — exactly the seam
     /// `POST /v1/nodes/{node}/boot-health` opened — and this variant is what
     /// carries that report to the node that acts on it.
@@ -534,13 +534,11 @@ pub enum YubabaRequest {
     /// asks for, so a returning node can tell "I was demoted" from "my cluster
     /// was replaced" without asking anyone.
     RecordMembershipRatchet { record: MembershipRatchetRecord },
-    // R600-F1 (W273): cluster secret store. Values are AES-256-GCM CIPHERTEXT
-    // ONLY — the raft layer never sees plaintext or the KEK. The issuer
-    // (R600-F3) encrypts with the node-local cluster KEK before PutSecret; the
-    // `SecretRef::Cluster` resolver (R600-F2) decrypts after reading. Homing
-    // cert material here gives every node the same bytes via ordinary raft
-    // replication (see `SecretRecord` for why plaintext must never appear).
-    /// Insert or overwrite a cluster secret.
+    // R911-T7: RETIRED. Cluster secrets live in the fleet object store and
+    // `/raft/write` refuses these two variants. They remain only because the
+    // raft logs and snapshots on live nodes still hold pre-R911 entries, which
+    // must keep deserializing; `apply` treats both as a no-op.
+    /// Formerly: insert or overwrite a raft cluster secret. Now a no-op.
     PutSecret {
         /// Logical key, e.g. `"tls/yah.dev"`.
         name: String,
@@ -587,9 +585,7 @@ pub enum YubabaRequest {
         #[serde(default)]
         ari: Option<String>,
     },
-    /// Remove a cluster secret. Hard delete, no tombstone: a secret that should
-    /// stop being served is removed and the consuming resolver (R600-F2) fails
-    /// closed on the miss — there is no 410-vs-404 distinction to preserve here.
+    /// Formerly: remove a raft cluster secret. Now a no-op (R911-T7).
     DeleteSecret {
         name: String,
     },
@@ -823,7 +819,7 @@ pub struct YubabaState {
     /// a rollout the old one was driving when it lost power.
     ///
     /// **This map is the authority.** The in-process `RolloutStore` this used
-    /// to shadow is gone (R118-T5): `crate::rollout` reads rollouts from a
+    /// to shadow is gone (R118-T5): `yubaba::rollout` reads rollouts from a
     /// node's applied state and writes them with `SetRolloutState` /
     /// `ClearRolloutState`, so there is one source of truth and it survives the
     /// death of the node that created it.
@@ -847,17 +843,15 @@ pub struct YubabaState {
     /// make an ordinary boot report able to lose to a step advance.
     #[serde(default)]
     pub rollout_health: BTreeMap<String, BTreeMap<String, NodeHealthRecord>>,
-    /// R600-F1 (W273): raft-replicated cluster secrets, keyed by logical name
-    /// (e.g. `"tls/yah.dev"`). Values are AES-256-GCM ciphertext — see
-    /// [`SecretRecord`]. This is the fleet-shared store backing
-    /// `SecretRef::Cluster` (R600-F2); `#[serde(default)]` so pre-F1 snapshots
-    /// load with an empty map (same forward-compat contract as `rollouts`).
-    #[serde(default)]
-    pub secrets: BTreeMap<String, SecretRecord>,
+    // R911-T7: the raft cluster-secret map (`secrets`) is gone; cluster secrets
+    // live in the fleet object store. A pre-T7 snapshot still carries the key:
+    // serde ignores it on load (this struct has no `deny_unknown_fields`) and it
+    // is never written again. Pinned by
+    // `a_pre_r911_t7_snapshot_with_a_secret_map_loads_and_drops_it`.
     /// R732-F1 (W245): who owns each tenant's write path, and under which
     /// fencing epoch. Keyed on the existing [`workload_spec::TenantId`] — the
-    /// same identity `secrets`' [`SecretAccess`] rules and the service records
-    /// use — so there is exactly one tenant identifier in the system.
+    /// same identity cluster-secret [`SecretAccess`] rules and the service
+    /// records use — so there is exactly one tenant identifier in the system.
     ///
     /// `#[serde(default)]` so pre-R732 snapshots load with an empty map (same
     /// forward-compat contract as `rollouts` and `secrets`). An empty map means
@@ -1226,7 +1220,7 @@ pub struct PeerLivenessRecord {
 /// `W158` asks for an epoch stamp so a returning node can distinguish *"I was
 /// demoted"* from *"my cluster was replaced"*. **yubaba has no cluster
 /// incarnation epoch today** — this was `W158` §8's first open question, and the
-/// answer is no: [`cluster_epoch`](crate::cluster_epoch) declares
+/// answer is no: `yubaba::cluster_epoch` declares
 /// `CLUSTER_PROTOCOL` and `STATE_EPOCH`, which are *build* compatibility
 /// integers ("may these two binaries share a cluster", "can this binary read
 /// that one's log"). Neither identifies an incarnation, so `W158` §5.2's
@@ -1260,10 +1254,10 @@ pub struct MembershipRatchetRecord {
     /// its own log contains, was demoted — it was not evicted and its cluster
     /// was not replaced.
     pub demoted: Vec<YubabaNodeId>,
-    /// [`cluster_epoch::CLUSTER_PROTOCOL`](crate::cluster_epoch::CLUSTER_PROTOCOL)
+    /// `yubaba::cluster_epoch::CLUSTER_PROTOCOL`
     /// of the build that made the change.
     pub cluster_protocol: u32,
-    /// [`cluster_epoch::STATE_EPOCH`](crate::cluster_epoch::STATE_EPOCH) of that
+    /// `yubaba::cluster_epoch::STATE_EPOCH` of that
     /// build.
     pub state_epoch: u32,
     /// Why — the folded verdicts that licensed it, as operator-readable text.
@@ -1364,10 +1358,10 @@ pub struct TenantPlacement {
     pub demand: TenantDemand,
     /// R782 (W253 §7): the bound a candidate's streamer must stay caught up
     /// within to be considered ready to own this tenant — the tenant-relative
-    /// half of [`crate::lease_detector::ReadinessInputs::streamer_rpo_bound`].
+    /// half of `yubaba::lease_detector::ReadinessInputs::streamer_rpo_bound`.
     ///
     /// `#[serde(default)]` lands an absent bound on `None`, which
-    /// [`crate::lease_detector::judge_readiness`] already documents as
+    /// `yubaba::lease_detector::judge_readiness` already documents as
     /// "no target configured, gate vacuously satisfied" — so an old log entry
     /// (or an old node that never wrote this field) means exactly what it
     /// meant before this field existed. A plain new `Option` field, not a new
@@ -1521,7 +1515,7 @@ pub struct NodeLoad {
 /// `status_json` stays JSON-encoded while `policy` is typed, and the asymmetry
 /// is deliberate rather than an oversight: `RolloutPolicy` is a
 /// [`workload_spec`] type this module already depends on, whereas
-/// `RolloutStatus` lives in [`crate::rollout`] and typing it here would point
+/// `RolloutStatus` lives in `yubaba::rollout` and typing it here would point
 /// the raft layer at a domain module that reads *from* it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RolloutRaftRecord {
@@ -1791,7 +1785,7 @@ impl std::fmt::Debug for SecretRecord {
 ///
 /// Raft membership remains the authority on *who is in the cluster*; this map
 /// says what the cluster knows *about* those nodes. Each node writes its own row
-/// ([`member_registration`](crate::member_registration), R734-F5), because a
+/// (`yubaba::member_registration`, R734-F5), because a
 /// node knows only its own region — nobody is in a position to write anyone
 /// else's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1845,7 +1839,7 @@ pub struct MemberInfo {
     /// and [`YubabaStateMachine::node_for_machine`][nfm].
     ///
     /// Written from the same `derive_machine_name()` the leader path uses to
-    /// write `ingress_owner` ([`crate::leader`]), deliberately: one derivation
+    /// write `ingress_owner` (`yubaba::leader`), deliberately: one derivation
     /// means the two strings are comparable by construction rather than by
     /// convention.
     ///
@@ -1902,7 +1896,7 @@ pub struct MemberInfo {
     /// dead origin's A record); the `.yah/` declaration may **add** (`yah cloud
     /// apply` re-renders the apex). Neither reads the other's writes, which is
     /// what makes two writers of one apex safe — see
-    /// [`crate::ingress_effector`].
+    /// `yubaba::ingress_effector`.
     ///
     /// `Option` + `#[serde(default)]` for snapshot compatibility, same contract
     /// as [`machine`](Self::machine). `None` is *unknown*, never `"static"`.
@@ -1955,7 +1949,7 @@ pub struct MemberInfo {
 /// except `addr`, which comes from raft membership rather than from the node.
 ///
 /// One value instead of six positional `Option<String>`s threaded through
-/// [`member_registration::spawn`](crate::member_registration::spawn) →
+/// `yubaba::member_registration::spawn` →
 /// `run` → `plan_registration` → `write_row`. R859-F2 phase A took that count
 /// from three to six, at which point the argument list stopped being readable
 /// and two adjacent `Option<String>`s could be swapped at a call site with no
@@ -2240,40 +2234,10 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
             state.last_membership_ratchet = Some(record.clone());
             YubabaResponse::Ok
         }
-        YubabaRequest::PutSecret {
-            name,
-            ciphertext,
-            nonce,
-            updated_at,
-            access,
-            digest,
-            sans,
-            ari,
-        } => {
-            // Opaque bytes in, opaque bytes stored — this layer never decrypts.
-            // The access rule and digest are stored verbatim alongside them;
-            // the raft layer does not evaluate the rule (that's
-            // `secrets::ClusterResolver`'s job, at mount time) and cannot
-            // itself compute the digest (that needs the KEK, which never
-            // reaches this layer).
-            state.secrets.insert(
-                name.clone(),
-                SecretRecord {
-                    ciphertext: ciphertext.clone(),
-                    nonce: nonce.clone(),
-                    updated_at: *updated_at,
-                    access: access.clone(),
-                    digest: digest.clone(),
-                    sans: sans.clone(),
-                    ari: ari.clone(),
-                },
-            );
-            YubabaResponse::Ok
-        }
-        YubabaRequest::DeleteSecret { name } => {
-            state.secrets.remove(name);
-            YubabaResponse::Ok
-        }
+        // R911-T7: retired. Live raft logs and snapshots still hold these
+        // entries, so they must parse and apply — as a no-op, because no node
+        // reads a raft secret map any more.
+        YubabaRequest::PutSecret { .. } | YubabaRequest::DeleteSecret { .. } => YubabaResponse::Ok,
 
         // ── R732-F1 (W245): tenant ownership + fencing epochs ──────────────
         YubabaRequest::ClaimTenant {
@@ -2446,7 +2410,7 @@ pub async fn open_with_state_machine(
 
     let log_store = YubabaLogStore::open(raft_dir.clone()).await?;
     let state_machine = YubabaStateMachine::open(raft_dir).await?;
-    let network = YubabaNetworkFactory;
+    let network = YubabaNetworkFactory::new()?;
 
     let raft = YubabaRaft::new(node_id, config, network, log_store, state_machine.clone()).await?;
     Ok((raft, state_machine))
@@ -2791,8 +2755,12 @@ mod tests {
             before: vec![1, 2, 3],
             after: vec![1],
             demoted: vec![2, 3],
-            cluster_protocol: crate::cluster_epoch::CLUSTER_PROTOCOL,
-            state_epoch: crate::cluster_epoch::STATE_EPOCH,
+            // noisetable R118-T11: literals, not `yubaba::cluster_epoch`'s live constants.
+            // What this test asserts is that the record round-trips through the
+            // state machine with its fields intact, which is a stronger check
+            // against a value the build cannot also produce by accident.
+            cluster_protocol: 7,
+            state_epoch: 6,
             reason: "two of three corroborated dark".into(),
         };
         apply(
@@ -3080,118 +3048,64 @@ mod tests {
         assert!(state.ingress_owner.is_none());
     }
 
+    // ── R911-T7: the raft secret map is gone; its log entries still replay ──
+
+    /// Live raft logs and snapshots still hold `PutSecret` / `DeleteSecret`
+    /// entries written before R911. They must still parse (a variant that failed
+    /// to deserialize would stall the state machine at that index) and apply as
+    /// a no-op that changes nothing.
     #[test]
-    fn apply_put_overwrite_and_delete_secret() {
-        let mut state = YubabaState::default();
-        apply(
-            &mut state,
-            &YubabaRequest::PutSecret {
-                name: "tls/yah.dev".into(),
-                ciphertext: vec![1, 2, 3, 4],
-                nonce: vec![9; 12],
-                updated_at: 1000,
-                access: SecretAccess::workloads(["ingress"]),
-                digest: Some(vec![0xaa; 32]),
-                sans: None,
-                ari: None,
-            },
-        );
-        let rec = state.secrets.get("tls/yah.dev").expect("secret stored");
-        assert_eq!(rec.ciphertext, vec![1, 2, 3, 4]);
-        assert_eq!(rec.nonce, vec![9; 12]);
-        assert_eq!(rec.updated_at, 1000);
-        assert_eq!(rec.digest, Some(vec![0xaa; 32]));
-
-        // A second PutSecret for the same name overwrites in place (rotation).
-        apply(
-            &mut state,
-            &YubabaRequest::PutSecret {
-                name: "tls/yah.dev".into(),
-                ciphertext: vec![5, 6],
-                nonce: vec![7; 12],
-                updated_at: 2000,
-                access: SecretAccess::workloads(["ingress"]),
-                digest: Some(vec![0xbb; 32]),
-                sans: None,
-                ari: None,
-            },
-        );
-        let rec = state.secrets.get("tls/yah.dev").unwrap();
-        assert_eq!(rec.ciphertext, vec![5, 6]);
-        assert_eq!(rec.updated_at, 2000);
-        assert_eq!(
-            rec.digest,
-            Some(vec![0xbb; 32]),
-            "overwrite replaces digest too"
-        );
-        assert_eq!(state.secrets.len(), 1, "overwrite, not append");
-
-        // Delete removes it; deleting a missing key is a no-op, never a panic.
-        apply(
-            &mut state,
-            &YubabaRequest::DeleteSecret {
-                name: "tls/yah.dev".into(),
-            },
-        );
-        assert!(!state.secrets.contains_key("tls/yah.dev"));
-        apply(
-            &mut state,
-            &YubabaRequest::DeleteSecret {
-                name: "tls/yah.dev".into(),
-            },
-        );
-        assert!(state.secrets.is_empty());
+    fn a_legacy_put_or_delete_secret_entry_replays_as_a_no_op() {
+        let before = serde_json::to_value(YubabaState::default()).unwrap();
+        for entry in [
+            serde_json::json!({
+                "PutSecret": {
+                    "name": "tls/yah.dev/cert",
+                    "ciphertext": [1, 2, 3],
+                    "nonce": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    "updated_at": 9,
+                    "access": "allow_any",
+                    "digest": [170],
+                    "sans": ["yah.dev"],
+                    "ari": "aki.serial"
+                }
+            }),
+            // The oldest shape on any live log: pre-R706, no rule and no digest.
+            serde_json::json!({
+                "PutSecret": {
+                    "name": "cheers/cloud-admin/verify-key",
+                    "ciphertext": [1],
+                    "nonce": [0],
+                    "updated_at": 1
+                }
+            }),
+            serde_json::json!({ "DeleteSecret": { "name": "tls/yah.dev/cert" } }),
+        ] {
+            let req: YubabaRequest = serde_json::from_value(entry.clone())
+                .unwrap_or_else(|e| panic!("{entry} must still parse: {e}"));
+            let mut state = YubabaState::default();
+            assert!(matches!(apply(&mut state, &req), YubabaResponse::Ok));
+            assert_eq!(
+                serde_json::to_value(&state).unwrap(),
+                before,
+                "a legacy secret entry must not change state"
+            );
+        }
     }
 
+    /// A snapshot written before R911-T7 carries a `secrets` map. It must still
+    /// load, keep every other field, and never write the map back out.
     #[test]
-    fn secrets_survive_snapshot_round_trip() {
-        // The snapshot path is serde_json over YubabaState (see store.rs) — the
-        // secrets map must serialise and restore byte-identically.
-        let mut state = YubabaState::default();
-        apply(
-            &mut state,
-            &YubabaRequest::PutSecret {
-                name: "tls/yah.dev".into(),
-                ciphertext: vec![0xde, 0xad, 0xbe, 0xef],
-                nonce: vec![1; 12],
-                updated_at: 42,
-                access: SecretAccess::workloads(["ingress"]),
-                digest: Some(vec![0xcc; 32]),
-                sans: None,
-                ari: None,
-            },
-        );
-        let json = serde_json::to_string(&state).unwrap();
-        let restored: YubabaState = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.secrets, state.secrets);
-    }
-
-    #[test]
-    fn digest_round_trips_through_the_state_machine() {
-        // R720-F1: a record with a digest survives apply + snapshot round-trip
-        // byte-identically — the drift check downstream depends on this.
-        let mut state = YubabaState::default();
-        apply(
-            &mut state,
-            &YubabaRequest::PutSecret {
-                name: "tls/yah.dev".into(),
-                ciphertext: vec![1, 2, 3],
-                nonce: vec![4; 12],
-                updated_at: 500,
-                access: SecretAccess::workloads(["ingress"]),
-                digest: Some(vec![0x42; 32]),
-                sans: None,
-                ari: None,
-            },
-        );
-        let rec = state.secrets.get("tls/yah.dev").unwrap();
-        assert_eq!(rec.digest, Some(vec![0x42; 32]));
-
-        let json = serde_json::to_string(&state).unwrap();
-        let restored: YubabaState = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            restored.secrets.get("tls/yah.dev").unwrap().digest,
-            Some(vec![0x42; 32])
+    fn a_pre_r911_t7_snapshot_with_a_secret_map_loads_and_drops_it() {
+        let legacy = r#"{"members":{"1":{"addr":"100.64.0.1:7443"}},"service_placement":{},"locks":{},"ingress_owner":"m1","rollouts":{},"secrets":{"tls/yah.dev/cert":{"ciphertext":[1,2,3],"nonce":[0,0,0,0,0,0,0,0,0,0,0,0],"updated_at":7,"access":"allow_any","digest":[170],"sans":["yah.dev"],"ari":"aki.serial"}}}"#;
+        let state: YubabaState =
+            serde_json::from_str(legacy).expect("a pre-T7 snapshot must still load");
+        assert!(state.members.contains_key(&1));
+        assert_eq!(state.ingress_owner.as_deref(), Some("m1"));
+        let written = serde_json::to_value(&state).unwrap();
+        assert!(
+            written.get("secrets").is_none(),
+            "the dropped map must not be written back: {written}"
         );
     }
 
@@ -3289,42 +3203,35 @@ mod tests {
         });
         let req: YubabaRequest =
             serde_json::from_value(legacy).expect("an ari-less PutSecret must still parse");
+        let YubabaRequest::PutSecret { ari, sans, .. } = &req else {
+            panic!("expected PutSecret");
+        };
+        assert_eq!(*ari, None);
+        assert_eq!(sans.as_deref(), Some(&["yah.dev".to_string()][..]));
+        // R911-T7: and it still applies, as the no-op every legacy secret entry now is.
         let mut state = YubabaState::default();
-        apply(&mut state, &req);
-        let rec = state.secrets.get("tls/yah.dev/cert").expect("secret stored");
-        assert_eq!(rec.ari, None);
-        assert_eq!(rec.sans.as_deref(), Some(&["yah.dev".to_string()][..]));
+        assert!(matches!(apply(&mut state, &req), YubabaResponse::Ok));
     }
 
-    /// And the ordinary path: an id written by the issuer survives apply and a
-    /// snapshot round-trip byte-identically. Without this the *next* renewal
-    /// has nothing to name and silently forfeits the RFC 9773 exemption — the
-    /// failure mode is a lost rate-limit exemption, which is invisible until
-    /// the account is already over the limit.
+    /// And the ordinary path: an id written by the issuer survives a record's
+    /// serde round trip byte-identically. Since R911 the record is JSON in the
+    /// fleet object store, so this is the round trip that matters. Without it
+    /// the *next* renewal has nothing to name and silently forfeits the RFC 9773
+    /// exemption, which is invisible until the account is over the limit.
     #[test]
-    fn ari_round_trips_through_the_state_machine() {
-        let mut state = YubabaState::default();
-        apply(
-            &mut state,
-            &YubabaRequest::PutSecret {
-                name: "tls/yah.dev/cert".into(),
-                ciphertext: vec![1, 2, 3],
-                nonce: vec![4; 12],
-                updated_at: 500,
-                access: SecretAccess::workloads(["ingress"]),
-                digest: None,
-                sans: Some(vec!["yah.dev".into()]),
-                ari: Some("aki.serial".into()),
-            },
-        );
-        assert_eq!(
-            state.secrets.get("tls/yah.dev/cert").unwrap().ari.as_deref(),
-            Some("aki.serial")
-        );
-
-        let json = serde_json::to_string(&state).unwrap();
-        let restored: YubabaState = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.secrets, state.secrets);
+    fn ari_and_digest_round_trip_through_a_secret_record() {
+        let rec = SecretRecord {
+            ciphertext: vec![1, 2, 3],
+            nonce: vec![4; 12],
+            updated_at: 500,
+            access: SecretAccess::workloads(["ingress"]),
+            digest: Some(vec![0x42; 32]),
+            sans: Some(vec!["yah.dev".into()]),
+            ari: Some("aki.serial".into()),
+        };
+        let restored: SecretRecord =
+            serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
+        assert_eq!(restored, rec);
     }
 
     // ── R732-F1: tenant ownership + fencing epochs ────────────────────────
@@ -4376,15 +4283,5 @@ mod tests {
         let old: PreF2MemberInfo = serde_json::from_str(tagged)
             .expect("a downgraded binary must still parse a region-tagged member row");
         assert_eq!(old.addr, "100.64.0.1:7443");
-    }
-
-    #[test]
-    fn pre_f1_snapshot_without_secrets_field_loads() {
-        // A snapshot serialised before R600-F1 has no `secrets` key;
-        // #[serde(default)] must let it deserialize to an empty map, not error
-        // (same forward-compat contract the `rollouts` field relies on).
-        let legacy = r#"{"members":{},"service_placement":{},"locks":{},"ingress_owner":null,"rollouts":{}}"#;
-        let state: YubabaState = serde_json::from_str(legacy).unwrap();
-        assert!(state.secrets.is_empty());
     }
 }

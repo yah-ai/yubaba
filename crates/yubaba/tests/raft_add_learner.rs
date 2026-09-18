@@ -44,7 +44,7 @@ const JOINER_ID: u64 = 4;
 
 /// GET `/raft/status` as JSON.
 async fn raft_status(base_url: &str) -> serde_json::Value {
-    reqwest::Client::new()
+    yubaba_test_harness::http()
         .get(format!("{base_url}/raft/status"))
         .send()
         .await
@@ -100,7 +100,7 @@ async fn spawn_joiner(id: u64) -> Joiner {
     // Wait for the joiner's /health to come up before returning.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if reqwest::Client::new()
+        if yubaba_test_harness::http()
             .get(format!("{base_url}/health"))
             .send()
             .await
@@ -176,7 +176,7 @@ async fn add_learner_joins_running_quorum_without_changing_voters() {
     let joiner = spawn_joiner(JOINER_ID).await;
 
     // (1) A *follower* must refuse — only the leader can change membership.
-    let status = reqwest::Client::new()
+    let status = yubaba_test_harness::http()
         .post(format!("{follower_url}/raft/add-learner"))
         .json(&serde_json::json!({ "node_id": JOINER_ID, "addr": joiner.addr }))
         .send()
@@ -190,7 +190,7 @@ async fn add_learner_joins_running_quorum_without_changing_voters() {
 
     // (2) Happy path against the leader. add_learner is blocking(true), so a 200
     // means the leader believes the learner is caught up.
-    let resp = reqwest::Client::new()
+    let resp = yubaba_test_harness::http()
         .post(format!("{leader_url}/raft/add-learner"))
         .json(&serde_json::json!({ "node_id": JOINER_ID, "addr": joiner.addr }))
         .send()

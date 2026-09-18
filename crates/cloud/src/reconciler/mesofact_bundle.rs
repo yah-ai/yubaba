@@ -88,6 +88,11 @@
 //! @yah:next("WHAT ALREADY LANDED IN THE TREE (uncommitted; camp git-policy is `defer`). (1) scripts/hotship.sh: registry gained `source` and `dest` columns + a `mesofact` entry `mesofact|mesofact||oss/mesofact|bundle-serve|artifact:mesofact|runtime:mesofact`; new `bundle-serve` activation; new `unpack_artifact` resolving the newest qed-produced tarball out of .yah/cache/artifacts/named/; runtime-asset install arm that overwrites only RUNNING versions and writes a `serve.hotship` stamp. (2) .yah/qed/hotship.toml: `binaries` param description updated. (3) oss/qed/crates/qed/src/runner.rs: execute_step_local_container now publishes/injects/discards `source_context` — that is the arm-leg fix, with two new tests.")
 //! @yah:verify("Measured, not assumed — `mesofact-musl` x86_64 leg took 9m56s / 9m57s / 11m10s across its three successful runs (qed run records 23ef24bb, 936d0be1, d62e9bdd). Its aarch64 leg failed in ~1.4s on all 13 recorded runs, so the pipeline never reached `[[pipeline.on_success]]` and its publish has NEVER fired.")
 //! @yah:gotcha("THE CACHE-HIT SHORT-CIRCUIT IS THE LOAD-BEARING FACT FOR BOTH CHILDREN. `ensure_runtime_asset` (oss/yah-base/crates/mesofact-bundle/src/runtime.rs:488) returns on a bare `dest.is_file()` — no re-hash, no manifest GET, deliberately and documented. Consequences, both real: (a) a node that has ever resolved `mesofact/<ver>` will NEVER re-fetch it, so the pre-hotship iteration loop required a new version + a bundle republish + an apply for every single change; (b) dropping bytes at that path IS a working hot ship needing no R2 write — which is what makes the arm fit hotship's never-writes-the-CDN charter — but it is also invisible afterwards unless something records it. That is why the arm writes a `serve.hotship` stamp beside each binary. R746-T3 (us-east-001 reporting `kamaji 0.8.22` while carrying none of it) is the same failure this prevents.")
+//! @yah:gotcha("RELAY-LEVEL BLOCKER FOUND 2026-09-11 AND IT GATES BOTH REMAINING CHILDREN: A PROTOCOL SKEW BETWEEN THE TREE AND THE FLEET. Three versions, measured: the TREE speaks ProtocolVersion::V11 (at 8aa2dc6a), the last RELEASE v0.8.37 speaks V9, and us-east-001 is a matched **V10** pair. The node's version is the one nothing reports directly — it was dated by `grep -c -a` on /usr/local/bin/{kamaji,yubaba} finding `ephemeral_storage_mb` PRESENT and `scratch-floor-mb` ABSENT, i.e. both binaries predate R885-T6 (the change V11 exists for) and postdate V9. `strings` is not installed on that node; use `grep -c -a`. Consequence: kamaji-bin/src/server.rs:1390 refuses any handshake whose version != CURRENT, so a tree-built yubaba or CLI does not degrade — every call fails at connect while the unit still reports active and yubaba silently falls back to its in-process containerd runtime, wiring no network namespace while service records still advertise addresses. That is what makes `--allow-proto-skew` look survivable when on the node serving noisetable.com it is a worse outage than the bugs being fixed. Note hotship.sh's own guard compares tree-vs-LAST-RELEASE and so assumes the node runs the release, which here it does not — the refusal is right, its stated reason is not the operative one.")
+//! @yah:next("THE RELAY'S REMAINING WORK IS ONE CONSOLIDATED PRODUCTION DRILL, SHARED BY R876-B11 AND R876-B12, AND IT IS DELIBERATELY ONE RESTART RATHER THAN TWO. Both children's code is landed and green in the tree; both carry `depends_on(R885)` as the machine-checkable form of the precondition. Sequence when R885's kamaji work quiesces: (1) ONE paired `scripts/hotship.sh --nodes us-east-001 --binaries yubaba,kamaji` — the pair is required because a V11 binary cannot go to that V10 node alone, and it must wait for R885 because `--binaries kamaji` builds kamaji from the working tree and would otherwise push unfinished native-exec work onto a production node whose kamaji restart kills and replays every supervised workload. (2) Execute R876-B11's RUNBOOK STEP 0/6-6/6 — the kamaji restart plus the service-record survival check IS B11's verification. (3) Execute R876-B12's runbook against the `noisetable` slot — the same restart supplies B12's \"reproduce B11, then recover with the new verb\" test. (4) Check the apex per-origin with `--resolve` (east 51.81.85.145, south 45.32.194.254, west 15.204.89.240), never through round-robin DNS. If it 503s, the recovery is `yah cloud mirror up noisetable-marketing --env cloud`, which rebuilds wasm — that is an operator call, not the drill runner's, and closing that gap is precisely what B12 exists for.")
+//! @yah:notify_on(R885, "R885's kamaji work has quiesced — R876's consolidated production drill is now unblocked. Both R876-B11 (yubaba serving-declaration fix) and R876-B12 (`yah cloud service rolling` no-build redeploy) are landed, green, and waiting on ONE paired `scripts/hotship.sh --nodes us-east-001 --binaries yubaba,kamaji` plus ONE kamaji restart. The reason it waited: the tree is ProtocolVersion V11 while us-east-001 is a matched V10 pair, so a tree-built binary cannot go alone, and `--binaries kamaji` builds kamaji FROM THE TREE — shipping it mid-R885 would have pushed unfinished native-exec work onto the node serving noisetable.com. Run R876-B11's RUNBOOK STEP 0/6-6/6, then R876-B12's runbook, then check the apex per-origin with --resolve. See R876's @yah:next for the full sequence.")
+//! @yah:gotcha("PROTOCOL-VERSION PROVENANCE — DO NOT CITE THE V10 IN THIS RELAY'S SKEW GOTCHA AS A MEASUREMENT. It is an INFERENCE: `grep -c -a` on us-east-001's binaries found `ephemeral_storage_mb` present and `scratch-floor-mb` absent, therefore predating R885-T6 and postdating the v0.8.37 release. @Glimmerstone:eclipse subsequently read the node DIRECTLY — `/health` reports `kamaji_version: 0.8.38-h5` — which is a hot-shipped build ahead of the release, and that direct read is the citable number. The two agree and the operational conclusion is unchanged (the tree is a bump ahead of the node, so the ship must be the pair), but they are not independent confirmations of each other and should not be quoted as such. SEPARATE AXIS, DO NOT CROSS THEM: `/health`'s `cluster_protocol: 7` is the raft/cluster protocol, NOT the kamaji wire ProtocolVersion this skew is about.")
+//! @yah:gotcha("Cross-relay note from @Ashguard:coffee (leading R584), 2026-09-12 — a red gate that traces to this ticket's files. `cargo test -p xtask` fails `cluster_epochs::tests::the_declaration_records_current_per_input_digests_for_every_axis` with \"recorded digest for `rust-lines oss/yubaba/crates/yubaba/src/lib.rs containing /raft/` is stale\" (xtask --lib 51 pass / 1 fail; xtask --test main 68 / 1). R876's session held ~182 uncommitted insertions / 10 writes in that file when this was observed, which is why it is recorded here. Two R584 couriers hit this gate and both deliberately declined to re-record the digest, on reasoning worth preserving: a cluster-protocol epoch declaration is NOT a derived artifact. Schemas and TS bindings are pure functions of the tree, so anyone may regenerate them (R584-F2/F3/F4 all did) — but an epoch digest is a semantic assertion that the raft protocol did not change, and only the author of those raft lines can truthfully make it. Re-recording it from outside would launder an unreviewed protocol change through a green gate. If R876's changes to the /raft/ lines are protocol-neutral, re-record and the gate clears; if they are not, the declaration itself needs updating. Either way it should not ship red.")
 //!
 //! @yah:ticket(R876-S2, "Failover drill: move the yah.dev mesofact load off us-east-001 and back, and find out what actually blocks it")
 //! @yah:status(review)
@@ -226,7 +231,7 @@ use workload_spec::{
 };
 
 use super::{ReconcileCtx, Reconciler, RunningWorkload};
-use crate::config::CloudConfig;
+use crate::config::{CloudConfig, RequiredSpec, BUNDLE_SERVING_MESH_TAG};
 use crate::MirrorConfig;
 
 /// Mirror provider role that opts a mesofact component into the bundle tier.
@@ -586,6 +591,7 @@ impl RevalidateSlot {
         env: BTreeMap<String, String>,
         feeds: Vec<workload_spec::AlmanacFeed>,
         feed_project_prefix: Option<String>,
+        secrets: Vec<workload_spec::SecretMount>,
     ) -> MesofactRevalidateReceiver {
         MesofactRevalidateReceiver {
             routes: self.routes.clone(),
@@ -602,6 +608,7 @@ impl RevalidateSlot {
                 .unwrap_or(DEFAULT_FEED_INTERVAL_SECS),
             feed_project_prefix,
             feed_runtime: self.feed_runtime.clone(),
+            secrets,
         }
     }
 }
@@ -1338,6 +1345,16 @@ fn parse_revalidate_slot(
 /// deployer and the discovery fanout cannot pick different subsets of a
 /// scale-N placement. The `machines = [...]` arm above needs no such
 /// guarantee — the planner reads that literal list off the slot directly.
+///
+/// **R885-T14: both arms require the node to declare
+/// [`BUNDLE_SERVING_MESH_TAG`].** Serving a bundle needs a kamaji built with
+/// the `bundle-serving` feature and started with `--bundle-cache-dir` —
+/// node-local startup facts a mirror author cannot see and should not have to
+/// restate. The constraint arm gets it through
+/// [`with_bundle_capability`], the literal arm through
+/// [`ensure_bundle_capable`]; the ingress planner applies the same tag for the
+/// same role (`reconciler::ingress::resolve_ingress_placements`), so the
+/// set-for-set agreement promised above survives the extra axis.
 pub fn resolve_bundle_machines<'a>(
     cfg: &'a CloudConfig,
     mirror: &MirrorConfig,
@@ -1350,12 +1367,14 @@ pub fn resolve_bundle_machines<'a>(
             .machines
             .iter()
             .map(|name| {
-                cfg.machine(name).with_context(|| {
+                let machine = cfg.machine(name).with_context(|| {
                     format!(
                         "providers.{SLOT_ROLE}.machines names {name:?}, which is not declared in \
                          .yah/infra/machines/ (service={service}, env={env})"
                     )
-                })
+                })?;
+                ensure_bundle_capable(machine, service, env)?;
+                Ok(machine)
             })
             .collect();
     }
@@ -1373,6 +1392,8 @@ pub fn resolve_bundle_machines<'a>(
             )
         })?;
 
+    let required = with_bundle_capability(&required);
+
     cfg.resolve_machines(&required).with_context(|| {
         format!(
             "F16 placement: cannot place providers.{SLOT_ROLE}.required ({}) onto {} machine(s) \
@@ -1381,6 +1402,58 @@ pub fn resolve_bundle_machines<'a>(
             required.replica_count(),
         )
     })
+}
+
+/// The slot's declared constraint plus the capability the backend actually
+/// needs — R885-T14.
+///
+/// The operator writes `required = { regions, mesh_tags, replicas }` in terms
+/// of *where they want the bundle*; whether a matching node's kamaji has a
+/// bundle backend at all is a fact about the node, not a preference, so it is
+/// added here rather than asked of every mirror author. Idempotent: a mirror
+/// that already spells [`BUNDLE_SERVING_MESH_TAG`] out by hand resolves
+/// identically.
+///
+/// `mesh_tags` is the right axis because it is already an AND-ed superset check
+/// against `MachineConfig::mesh_tags` and [`RequiredSpec::describe`] already
+/// renders it — so a refusal reads `mesh_tags=[…,cap:bundle-serving]` with no
+/// new field, no wire change and no schema drift. See
+/// [`BUNDLE_SERVING_MESH_TAG`] for why a positive capability and not a taint.
+pub fn with_bundle_capability(required: &RequiredSpec) -> RequiredSpec {
+    let mut out = required.clone();
+    if !out.mesh_tags.iter().any(|t| t == BUNDLE_SERVING_MESH_TAG) {
+        out.mesh_tags.push(BUNDLE_SERVING_MESH_TAG.to_string());
+    }
+    out
+}
+
+/// Refuse a hand-pinned `providers.bundle.machines` entry whose node does not
+/// declare [`BUNDLE_SERVING_MESH_TAG`] — R885-T14.
+///
+/// The constraint arm gets this for free (an incapable node simply stops
+/// matching); the literal arm has no matcher to fall out of, so the check is
+/// explicit. Refusing it is deliberate rather than warning: a pin is the shape
+/// in which the operator makes the strongest claim about a node, and the
+/// alternative is a green `yah cloud mirror up` whose deploy leg comes back
+/// `BackendRefused` after the build and the upload have already run.
+fn ensure_bundle_capable(machine: &crate::MachineConfig, service: &str, env: &str) -> Result<()> {
+    if machine
+        .mesh_tags
+        .iter()
+        .any(|t| t == BUNDLE_SERVING_MESH_TAG)
+    {
+        return Ok(());
+    }
+    let name = &machine.name;
+    bail!(
+        "providers.{SLOT_ROLE}.machines pins {name:?}, whose declaration does not carry \
+         `{BUNDLE_SERVING_MESH_TAG}` — that node is not declared able to serve a bundle, so \
+         kamaji would answer the deploy with BackendRefused after the build and upload had \
+         already run. Confirm its kamaji was built with the `bundle-serving` feature and is \
+         started with --bundle-cache-dir plus --bundle-origin, then add \
+         \"{BUNDLE_SERVING_MESH_TAG}\" to mesh_tags in .yah/infra/machines/{name}.toml \
+         (service={service}, env={env})"
+    )
 }
 
 /// Desktop-side (offline) half of the bundle tier: validate the mirror's
@@ -1458,6 +1531,7 @@ mod tests {
             ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: BTreeMap::new(),
+            build: Default::default(),
         }
     }
 
@@ -1469,7 +1543,23 @@ mod tests {
         mirror_from(providers)
     }
 
+    /// A node that CAN serve a bundle — i.e. one that carries
+    /// [`BUNDLE_SERVING_MESH_TAG`] (R885-T14).
+    ///
+    /// The tag is in the default fixture rather than opted into per test
+    /// because every placement test here is asking "where does this land",
+    /// which presupposes an eligible pool. Use
+    /// [`machine_without_bundle_backend`] when the *absence* is the subject.
     fn machine(name: &str, region: &str) -> MachineConfig {
+        MachineConfig {
+            mesh_tags: vec![BUNDLE_SERVING_MESH_TAG.to_string()],
+            ..machine_without_bundle_backend(name, region)
+        }
+    }
+
+    /// A node whose kamaji has no bundle backend: same in every other respect,
+    /// so a test using it isolates exactly the capability axis.
+    fn machine_without_bundle_backend(name: &str, region: &str) -> MachineConfig {
         MachineConfig {
             name: name.into(),
             provider: "static".into(),
@@ -1504,12 +1594,12 @@ mod tests {
             providers: vec![],
             machine_origins: BTreeMap::new(),
             provider_origins: BTreeMap::new(),
+            recovery_measurements: BTreeMap::new(),
             services: BTreeMap::new(),
             domains: BTreeMap::new(),
             legacy_mirrors: vec![],
             workloads: vec![],
             topology: TopologyConfig::default(),
-            legacy_services: vec![],
         }
     }
 
@@ -1540,7 +1630,7 @@ bucket = "yah-dev"
 x86_64-unknown-linux-musl = "target/x86_64-unknown-linux-musl/release/mesofact"
 "#,
         );
-        let slot = BundleSlot::parse(&mirror, "yah-marketing", "cloud").unwrap();
+        let slot = BundleSlot::parse(&mirror, "yah-marketing", "prod").unwrap();
 
         assert!(slot_declared(&mirror), "config declares the slot");
         assert!(
@@ -1572,7 +1662,7 @@ bucket = "yah-dev"
 x86_64-unknown-linux-musl = "target/x86_64-unknown-linux-musl/release/mesofact"
 "#,
         );
-        let slot = BundleSlot::parse(&mirror, "yah-marketing", "cloud").unwrap();
+        let slot = BundleSlot::parse(&mirror, "yah-marketing", "prod").unwrap();
         assert!(slot_ready(&slot, root.path()));
         assert!(missing_bins(&slot, root.path()).is_empty());
     }
@@ -1595,7 +1685,7 @@ binary = "mesofact"
 triples = ["x86_64-unknown-linux-musl"]
 "#,
         );
-        let slot = BundleSlot::parse(&mirror, "yah-marketing", "cloud").unwrap();
+        let slot = BundleSlot::parse(&mirror, "yah-marketing", "prod").unwrap();
 
         let build = slot.serve_build.as_ref().expect("serve_build parsed");
         assert_eq!(build.pipeline, "mesofact-musl");
@@ -1620,7 +1710,7 @@ bucket = "yah-dev"
 runtime_version = "0.8.22"
 "#,
         );
-        let slot = BundleSlot::parse(&mirror, "yah-marketing", "cloud").unwrap();
+        let slot = BundleSlot::parse(&mirror, "yah-marketing", "prod").unwrap();
         assert!(slot.serve_build.is_none());
         assert!(slot.serve_bins.is_empty());
         assert!(!slot.is_self_contained());
@@ -1647,7 +1737,7 @@ binary = "mesofact"
 triples = ["x86_64-unknown-linux-musl"]
 "#,
         );
-        let err = BundleSlot::parse(&mirror, "yah-marketing", "cloud").unwrap_err();
+        let err = BundleSlot::parse(&mirror, "yah-marketing", "prod").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("BOTH `serve_bins` and `serve_build`"), "{msg}");
     }
@@ -1687,7 +1777,7 @@ triples = []"#,
             let mirror = mirror_with(&format!(
                 "use = \"cloudflare\"\nbucket = \"yah-dev\"\n\n{fragment}\n"
             ));
-            let err = BundleSlot::parse(&mirror, "yah-marketing", "cloud").unwrap_err();
+            let err = BundleSlot::parse(&mirror, "yah-marketing", "prod").unwrap_err();
             let msg = format!("{err:#}");
             assert!(
                 msg.contains(expected),
@@ -1722,7 +1812,7 @@ feeds = ["releases"]
 x86_64-unknown-linux-musl = "target/musl/almanac-feed"
 "#,
         );
-        let slot = BundleSlot::parse(&mirror, "yah-marketing", "cloud").unwrap();
+        let slot = BundleSlot::parse(&mirror, "yah-marketing", "prod").unwrap();
         let missing = missing_bins(&slot, root.path());
         assert_eq!(missing.len(), 1, "only the feed binary is absent");
         assert!(missing[0].0.contains("revalidate.feed_bins"));
@@ -1892,7 +1982,7 @@ bucket = "noisetable-marketing"
 origin = "https://cdn.noisetable.com""#,
             ),
             "noisetable-marketing",
-            "cloud",
+            "prod",
         )
         .unwrap();
         assert_eq!(slot.origin.as_deref(), Some("https://cdn.noisetable.com"));
@@ -1916,7 +2006,7 @@ origin = "https://cdn.noisetable.com""#,
 bucket = "yah-dev""#,
             ),
             "yah-marketing",
-            "cloud",
+            "prod",
         )
         .unwrap();
         assert_eq!(slot.origin, None);
@@ -1982,7 +2072,7 @@ bucket = "b"
 prot = 8081"#,
             ),
             "yah-marketing",
-            "cloud",
+            "prod",
         )
         .unwrap_err()
         .to_string();
@@ -2018,7 +2108,7 @@ bucket = "b"
 ingress_tunnel_hostname = "analytics.yah.dev""#,
             ),
             "yah-analytics",
-            "cloud",
+            "prod",
         )
         .unwrap_err()
         .to_string();
@@ -2057,7 +2147,7 @@ feed_interval_secs = 5
 feed_runtime = "almanac-feed/0.8.22""#,
             ),
             "yah-marketing",
-            "cloud",
+            "prod",
         )
         .unwrap();
         assert_eq!(slot.bucket, "yah-dev");
@@ -2222,7 +2312,7 @@ ANALYTICS_R2_ACCESS_KEY = "vault:cloudflare-r2-access-key-id""#,
 bucket = "b""#,
             ),
             "yah-marketing",
-            "cloud",
+            "prod",
         )
         .unwrap();
         assert!(slot.verify_serving);
@@ -2239,7 +2329,7 @@ bucket = "b"
 zone = "staging.yah.dev""#,
             ),
             "yah-marketing",
-            "cloud",
+            "prod",
         )
         .unwrap();
         assert_eq!(slot.serving_zone("yah.dev"), "staging.yah.dev");
@@ -2271,7 +2361,7 @@ bucket = "b"
 verify_serving = "false""#,
             ),
             "yah-marketing",
-            "cloud",
+            "prod",
         )
         .unwrap_err()
         .to_string();
@@ -2460,7 +2550,7 @@ routes = ["/releases"]
 mirror_key_env = "YAH_MARKETING_MIRROR_KEY"
 "#,
         );
-        let slot = BundleSlot::parse(&mirror, "yah-marketing", "cloud").unwrap();
+        let slot = BundleSlot::parse(&mirror, "yah-marketing", "prod").unwrap();
         let rv = slot.revalidate.expect("revalidate slot should parse");
         assert_eq!(rv.routes, vec!["/releases"]);
         assert_eq!(
@@ -2529,7 +2619,7 @@ mirror_key_env = "BEARER"
         let mut env = BTreeMap::new();
         env.insert("MESOFACT_S3_ACCESS_KEY_ID".into(), "ak".into());
         env.insert("MESOFACT_MIRROR_KEY".into(), "bearer1".into());
-        let payload = slot.to_workload_payload(env.clone(), vec![], None);
+        let payload = slot.to_workload_payload(env.clone(), vec![], None, vec![]);
         assert_eq!(payload.routes, vec!["/releases"]);
         assert_eq!(payload.publish_config, "cfg.toml");
         assert_eq!(payload.mirror_key_env.as_deref(), Some("MY_KEY"));
@@ -2539,7 +2629,7 @@ mirror_key_env = "BEARER"
 
     #[test]
     fn to_workload_payload_defaults_publish_config() {
-        let payload = bare_revalidate_slot().to_workload_payload(BTreeMap::new(), vec![], None);
+        let payload = bare_revalidate_slot().to_workload_payload(BTreeMap::new(), vec![], None, vec![]);
         assert_eq!(payload.publish_config, "mesofact.config.toml");
         assert!(payload.mirror_key_env.is_none());
         assert!(payload.routes.is_empty());
@@ -2703,7 +2793,7 @@ feed_runtime = "almanac-feed"
     fn the_feed_runtime_ref_reaches_the_workload_payload() {
         let mut slot = bare_revalidate_slot();
         slot.feed_runtime = Some("almanac-feed/0.8.22".to_string());
-        let payload = slot.to_workload_payload(BTreeMap::new(), vec![], None);
+        let payload = slot.to_workload_payload(BTreeMap::new(), vec![], None, vec![]);
         assert_eq!(payload.feed_runtime.as_deref(), Some("almanac-feed/0.8.22"));
     }
 
@@ -2768,11 +2858,192 @@ feed_interval_secs = 0
     /// copies of one number; this pins them together.
     #[test]
     fn feed_interval_default_matches_the_workload_spec_default() {
-        let payload = bare_revalidate_slot().to_workload_payload(BTreeMap::new(), vec![], None);
+        let payload = bare_revalidate_slot().to_workload_payload(BTreeMap::new(), vec![], None, vec![]);
         assert_eq!(payload.feed_interval_secs, DEFAULT_FEED_INTERVAL_SECS);
 
         let from_spec: workload_spec::MesofactRevalidateReceiver =
             serde_json::from_str("{}").expect("all receiver fields have serde defaults");
         assert_eq!(from_spec.feed_interval_secs, DEFAULT_FEED_INTERVAL_SECS);
+    }
+
+    // ── R885-T14: cap:bundle-serving as a placement precondition ─────────────
+    //
+    // Every test below keeps a CAPABLE and an INCAPABLE node in the same
+    // `CloudConfig`, so a pass provably comes from the capability axis rather
+    // than from an empty pool or a region that happens to narrow to one.
+
+    /// The literal-pin arm. An operator naming a node by hand is making exactly
+    /// the claim this tag exists to check, and the refusal has to name the tag
+    /// and the file to edit — the whole value is that it arrives before the
+    /// build and the upload, not after them as `BackendRefused`.
+    #[test]
+    fn a_node_without_the_bundle_backend_cannot_be_pinned_to_serve_a_bundle() {
+        let cfg = cfg_with(vec![
+            machine("us-east-001", "us-east"),
+            machine_without_bundle_backend("us-south-001", "us-south"),
+        ]);
+
+        let pinned_incapable = mirror_with(
+            r#"use = "cloudflare"
+bucket = "b"
+machines = ["us-south-001"]"#,
+        );
+        let slot = BundleSlot::parse(&pinned_incapable, "s", "e").unwrap();
+        let err = resolve_bundle_machines(&cfg, &pinned_incapable, &slot, "s", "e")
+            .expect_err("a pin at a node with no bundle backend must be refused")
+            .to_string();
+        assert!(
+            err.contains(BUNDLE_SERVING_MESH_TAG),
+            "the refusal must name the tag the operator has to add; got {err}"
+        );
+        assert!(
+            err.contains(".yah/infra/machines/us-south-001.toml"),
+            "the refusal must name the file to edit; got {err}"
+        );
+
+        // Same resolver, same fleet, same shape of declaration — only the
+        // node's capability differs, so the refusal above cannot be coming from
+        // anything else.
+        let pinned_capable = mirror_with(
+            r#"use = "cloudflare"
+bucket = "b"
+machines = ["us-east-001"]"#,
+        );
+        let slot = BundleSlot::parse(&pinned_capable, "s", "e").unwrap();
+        let resolved = resolve_bundle_machines(&cfg, &pinned_capable, &slot, "s", "e")
+            .expect("a pin at a capable node still resolves");
+        assert_eq!(
+            resolved.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["us-east-001"],
+        );
+    }
+
+    /// The constraint arm. Two nodes satisfy everything the mirror declared;
+    /// only one can actually serve a bundle, and placement must pick that one
+    /// rather than the file-order first match.
+    ///
+    /// `us-south-001` sorts after `us-east-001` on purpose being no help here —
+    /// the incapable node is declared FIRST, so a resolver that ignored the
+    /// capability would return it and this test would fail.
+    #[test]
+    fn a_constraint_places_past_a_matching_node_that_cannot_serve_bundles() {
+        let mirror = mirror_with(
+            r#"use = "cloudflare"
+bucket = "b"
+required = { regions = ["us-east"] }"#,
+        );
+        let slot = BundleSlot::parse(&mirror, "s", "e").unwrap();
+
+        let cfg = cfg_with(vec![
+            machine_without_bundle_backend("us-east-000", "us-east"),
+            machine("us-east-001", "us-east"),
+        ]);
+        let resolved = resolve_bundle_machines(&cfg, &mirror, &slot, "s", "e")
+            .expect("the capable us-east node takes it");
+        assert_eq!(
+            resolved.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["us-east-001"],
+            "placement must skip the region-matching node with no bundle backend",
+        );
+
+        // Drop the capable node and the SAME declaration over the SAME region
+        // now refuses — so the selection above was the capability talking.
+        let cfg = cfg_with(vec![machine_without_bundle_backend(
+            "us-east-000",
+            "us-east",
+        )]);
+        let err = resolve_bundle_machines(&cfg, &mirror, &slot, "s", "e")
+            .expect_err("a region with no bundle-capable node has nowhere to place")
+            .to_string();
+        assert!(
+            err.contains(BUNDLE_SERVING_MESH_TAG),
+            "the refusal must render the derived axis, not just the declared one; got {err}"
+        );
+    }
+
+    /// The deployer and the ingress planner must stay set-for-set across the
+    /// new axis (`resolve_bundle_machines`'s own doc promises it). A capable
+    /// and an incapable node both match the constraint; both sides must land on
+    /// the capable one, and the door must not widen its poll set past it.
+    #[test]
+    fn the_ingress_planner_applies_the_same_capability_as_the_deployer() {
+        let mirror = mirror_with(
+            r#"use = "cloudflare"
+bucket = "b"
+zone = "yah.dev"
+required = { regions = ["us-east"] }"#,
+        );
+        let slot = BundleSlot::parse(&mirror, "s", "e").unwrap();
+        let machines = vec![
+            machine_without_bundle_backend("us-east-000", "us-east"),
+            machine("us-east-001", "us-east"),
+        ];
+        let cfg = cfg_with(machines.clone());
+
+        let deployed: Vec<String> = resolve_bundle_machines(&cfg, &mirror, &slot, "s", "e")
+            .expect("deployer places")
+            .iter()
+            .map(|m| m.name.clone())
+            .collect();
+        let planned = super::super::ingress::resolve_ingress_placements(&machines, &mirror)
+            .expect("ingress planner places");
+        assert_eq!(
+            planned.get(SLOT_ROLE),
+            Some(&deployed),
+            "the front door must be aimed at exactly the nodes the bundle is deployed to",
+        );
+
+        let candidates = super::super::ingress::resolve_ingress_candidates(&machines, &mirror);
+        assert_eq!(
+            candidates.get(SLOT_ROLE),
+            Some(&vec!["us-east-001".to_string()]),
+            "widening the poll set must not widen past the capability — polling a node that \
+             can never hold the bundle is a door aimed at nothing",
+        );
+    }
+
+    /// Idempotent: a mirror that already spells the tag out by hand resolves
+    /// identically and does not end up declaring it twice.
+    #[test]
+    fn a_mirror_that_declares_the_capability_itself_is_unchanged() {
+        let declared = RequiredSpec {
+            regions: vec!["us-east".into()],
+            mesh_tags: vec![BUNDLE_SERVING_MESH_TAG.to_string()],
+            ..Default::default()
+        };
+        let widened = with_bundle_capability(&declared);
+        assert_eq!(
+            widened.mesh_tags, declared.mesh_tags,
+            "the tag must not be pushed a second time",
+        );
+        assert_eq!(widened.regions, declared.regions, "nothing else moves");
+
+        let bare = RequiredSpec {
+            regions: vec!["us-east".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            with_bundle_capability(&bare).mesh_tags,
+            vec![BUNDLE_SERVING_MESH_TAG.to_string()],
+        );
+    }
+
+    /// Only `providers.bundle` implies a capability. A non-bundle slot's
+    /// placement must be byte-identical to what it was before R885-T14 — this
+    /// is the regression guard on the role mapping, and it is the reason that
+    /// mapping is one function rather than an `if` at each call site.
+    #[test]
+    fn a_non_bundle_slot_requires_no_capability() {
+        let machines = vec![machine_without_bundle_backend("us-east-000", "us-east")];
+        let mirror = mirror_from(BTreeMap::from([(
+            "static".to_string(),
+            toml::from_str::<MirrorProviderSlot>(
+                "use = \"cloudflare\"\nrequired = { regions = [\"us-east\"] }\n",
+            )
+            .expect("slot parses"),
+        )]));
+        let planned = super::super::ingress::resolve_ingress_placements(&machines, &mirror)
+            .expect("a static slot places on a node with no bundle backend");
+        assert_eq!(planned.get("static"), Some(&vec!["us-east-000".to_string()]));
     }
 }

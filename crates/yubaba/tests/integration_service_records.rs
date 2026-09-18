@@ -41,7 +41,7 @@ use serde_json::Value;
 use kamaji::fake::FakeRuntime;
 use workload_spec::{
     ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, ResourceLimits, RestartPolicy,
-    SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
+    StopPolicy, TierTag, WorkloadSpec,
 };
 use yubaba::service_records::{self, Health};
 use yubaba::ServerState;
@@ -75,7 +75,6 @@ fn serving_spec(name: &str, ports: Vec<u16>) -> WorkloadSpec {
 /// the mesh — can reach them.
 fn isolated_spec(name: &str, ports: Vec<u16>) -> WorkloadSpec {
     WorkloadSpec {
-        schema_version: SchemaVersion::V1,
         name: name.to_string(),
         image: ImageRef {
             registry: "docker.io".into(),
@@ -97,7 +96,10 @@ fn isolated_spec(name: &str, ports: Vec<u16>) -> WorkloadSpec {
         resources: ResourceLimits {
             memory_mb: 64,
             cpu_millis: 128,
-            ephemeral_storage_mb: 128,
+            memory_request_mb: None,
+            cpu_limit_millis: None,
+            pids_max: None,
+            scratch_floor_mb: None,
         },
         depends_on: vec![],
         requires: vec![],
@@ -118,6 +120,7 @@ fn isolated_spec(name: &str, ports: Vec<u16>) -> WorkloadSpec {
             operator: None,
         },
         labels: Default::default(),
+        durability: None,
         annotations: Default::default(),
         files: Vec::new(),
     }
@@ -146,7 +149,7 @@ fn boot_on_mesh(state_dir: &Path, rt: Arc<FakeRuntime>, bind: &str) -> Arc<Serve
         ServerState::load(state_dir.join("identity.json"))
             .unwrap()
             .with_runtime(rt)
-            .with_bind_addr(bind),
+            .with_mesh_addr(None, bind),
     )
 }
 
@@ -572,6 +575,10 @@ async fn an_unroutable_tenant_workload_makes_the_ingress_apply_refuse() {
         tunnel_id: None,
         edge_provider_id: None,
         image: None,
+        auth: None,
+        via: None,
+        behind_tunnel: false,
+        tunnel_door: None,
     };
     let mut fanout = ServiceRecordFanout::default();
     fanout.push_answer("us-east-001", discovered);
@@ -588,4 +595,318 @@ async fn an_unroutable_tenant_workload_makes_the_ingress_apply_refuse() {
         !rendered.contains("100.64.0.3:4332"),
         "the dead upstream from the live incident was rendered anyway: {rendered}"
     );
+}
+
+// ── R881-B8: the silent fallback to the in-process runtime ───────────────────
+
+/// [`boot_on_mesh`], plus the `--container-net` a fleet node carries (R881-T4).
+///
+/// With one, `workload_bind_ip` allocates an isolated workload an address of
+/// its own out of the node's `/24` — which is a promise that *something* wires
+/// a veth behind it. Only the kamaji sibling does. This helper attaches no
+/// sibling, which is precisely the state a fleet node falls into when
+/// `kamaji.service` is down or misframing.
+fn boot_on_mesh_with_container_net(
+    state_dir: &Path,
+    rt: Arc<FakeRuntime>,
+    bind: &str,
+) -> Arc<ServerState> {
+    Arc::new(
+        ServerState::load(state_dir.join("identity.json"))
+            .unwrap()
+            .with_runtime(rt)
+            .with_mesh_addr(None, bind)
+            .with_container_net(kamaji::container_net::ContainerNet::defaults()),
+    )
+}
+
+/// [`deploy`], keeping the body — the refusal has to be legible, not just 5xx.
+async fn deploy_response(
+    state: &Arc<ServerState>,
+    spec: &WorkloadSpec,
+) -> (axum::http::StatusCode, Value) {
+    let body = serde_json::json!({ "spec": spec });
+    let resp = yubaba::build_router(Arc::clone(state))
+        .oneshot(
+            Request::post("/workloads/deploy")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// **R881-B8's acceptance test.** Measured live on us-east-001 2026-09-11: a
+/// kamaji-proto version mismatch made the sibling unreachable, `active_backend`
+/// fell through to yubaba's in-process containerd runtime without a word in
+/// either journal, and two `noisetable-account` deploys came up holding only
+/// `lo` — while the record advertised `10.128.3.2`, an address the in-process
+/// runtime never wires (`join_netns: None`, no `container_net` call at all).
+///
+/// The fix is the refusal, not a second netns implementation: this is the same
+/// answer kamaji-bin already gives on its own path when it was told to do
+/// container networking and could not. `deploy_calls()` is the load-bearing
+/// half — a 503 emitted *after* the container was started would leave the same
+/// orphan behind, so the assertion is that the backend was never asked.
+#[tokio::test]
+async fn a_workload_needing_a_wired_netns_is_refused_when_the_sibling_is_gone() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let rt = Arc::new(FakeRuntime::new());
+    let state = boot_on_mesh_with_container_net(tmp.path(), Arc::clone(&rt), "100.64.0.3:7443");
+
+    let (status, body) =
+        deploy_response(&state, &isolated_spec("noisetable-account", vec![4332])).await;
+
+    assert_eq!(
+        status,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "an isolated-netns deploy went through the in-process runtime, which \
+         cannot give it the address yubaba just allocated: {body}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("network namespace")),
+        "the refusal must say what is missing, not just fail: {body}"
+    );
+    assert!(
+        rt.deploy_calls().is_empty(),
+        "the container was started anyway — a refusal after the fact leaves \
+         exactly the orphan namespace the incident left: {:?}",
+        rt.deploy_calls()
+    );
+
+    let (_, all) = fetch_records(&state, "").await;
+    assert!(
+        all["records"].as_array().unwrap().is_empty(),
+        "a refused deploy must publish no record at all: {all}"
+    );
+}
+
+/// The refusal is narrow, and both halves of "narrow" are load-bearing.
+///
+/// A workload that binds the node's own ports (`yah.network = "host"`) needs no
+/// namespace wired, so it must still deploy through the in-process runtime —
+/// that is desktop, CI and pond's only backend. And a node started *without*
+/// `--container-net` never promised an address in the first place: R881-B1
+/// already publishes that workload as `NotReady { reason: "unroutable" }`,
+/// which is honest, so refusing it here would break every dev node to fix a
+/// fleet bug.
+#[tokio::test]
+async fn the_refusal_spares_host_networked_workloads_and_nodes_with_no_range() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let rt = Arc::new(FakeRuntime::new());
+    let state = boot_on_mesh_with_container_net(tmp.path(), Arc::clone(&rt), "100.64.0.3:7443");
+
+    let (status, body) = deploy_response(&state, &serving_spec("yah-cloud-admin", vec![4325])).await;
+    assert!(
+        status.is_success(),
+        "a host-networked workload binds the node's ports and needs nothing \
+         wired: {status} {body}"
+    );
+
+    let dev_tmp = tempfile::TempDir::new().unwrap();
+    let dev_rt = Arc::new(FakeRuntime::new());
+    let dev = boot_on_mesh(dev_tmp.path(), Arc::clone(&dev_rt), "100.64.0.3:7443");
+    let (status, body) =
+        deploy_response(&dev, &isolated_spec("noisetable-account", vec![4332])).await;
+    assert!(
+        status.is_success(),
+        "a node with no container range makes no promise to break — R881-B1's \
+         unroutable record is the honest answer there: {status} {body}"
+    );
+    assert_eq!(dev_rt.deploy_calls(), vec!["noisetable-account".to_string()]);
+}
+
+/// Spawn a real kamaji on `socket` and wait for the listener to bind. Mirrors
+/// `integration_deploy_through_kamaji::spawn_kamaji`, which lives in the other
+/// test group root (`tests/main.rs`, no `testing` feature) and so cannot be
+/// shared with a test that needs `FakeRuntime` as the fallback backend.
+async fn spawn_kamaji(
+    socket: std::path::PathBuf,
+) -> (tokio::task::JoinHandle<()>, tokio::sync::oneshot::Sender<()>) {
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_path = socket.clone();
+    let handle = tokio::spawn(async move {
+        let _ = kamaji_bin::serve_with_shutdown(&server_path, async move {
+            let _ = stop_rx.await;
+        })
+        .await;
+    });
+    for _ in 0..100 {
+        if tokio::net::UnixStream::connect(&socket).await.is_ok() {
+            return (handle, stop_tx);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("kamaji never bound the UDS at {}", socket.display());
+}
+
+/// Both arms of the selector, on one fleet-shaped node: a **live** sibling wins
+/// over the in-process runtime, and a **configured-but-unreachable** one is the
+/// substituted state that R881-B8 exists for.
+///
+/// The second half is what happened on us-east-001 — a kamaji-proto V9/V10 skew
+/// made the two processes misframe each other, `KamajiSibling::current()` went
+/// `None`, and every deploy quietly went to a backend that wires no namespace.
+/// It is reached here with `KamajiSibling::disconnected` rather than by killing
+/// the kamaji from the first half, because that does not work:
+/// `kamaji_bin::serve_with_shutdown` spawns each connection handler detached
+/// (server.rs, the `tokio::spawn` inside its accept loop), so stopping the
+/// accept loop leaves the established client connected and `is_dead()` false
+/// forever. The first version of this test did exactly that and sat through its
+/// whole 15s window without the watchdog ever clearing.
+#[tokio::test]
+async fn a_configured_but_unreachable_sibling_refuses_the_deploy_and_skips_the_sweep() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sock = tmp.path().join("kamaji.sock");
+
+    // Arm one: a real kamaji on a real UDS must win over the in-process
+    // runtime. Without this the assertions below would also pass on a node
+    // whose sibling never worked at all.
+    {
+        let (server, stop) = spawn_kamaji(sock.clone()).await;
+        let client = kamaji::sibling::KamajiClient::connect(sock.clone())
+            .await
+            .expect("kamaji handshake");
+        let live = Arc::new(
+            ServerState::load(tmp.path().join("identity.json"))
+                .unwrap()
+                .with_runtime(Arc::new(FakeRuntime::new()) as Arc<dyn kamaji::Kamaji + Send + Sync>)
+                .with_constable_client(kamaji::sibling::KamajiSibling::new(
+                    client,
+                    sock.clone(),
+                    std::time::Duration::from_millis(200),
+                )),
+        );
+        let backend = live.workload_backend().expect("a backend");
+        assert!(backend.is_sibling(), "the live sibling must win");
+        assert!(!live.sibling_substituted(&backend));
+        let _ = stop.send(());
+        server.await.unwrap();
+    }
+
+    // Arm two: the same node, sibling unreachable.
+    let rt = Arc::new(FakeRuntime::new());
+    let state = Arc::new(
+        ServerState::load(tmp.path().join("identity.json"))
+            .unwrap()
+            .with_runtime(rt.clone())
+            .with_mesh_addr(None, "100.64.0.3:7443")
+            .with_container_net(kamaji::container_net::ContainerNet::defaults())
+            .with_constable_client(kamaji::sibling::KamajiSibling::disconnected(sock)),
+    );
+    let backend = state.workload_backend().expect("the inlined runtime remains");
+    assert!(!backend.is_sibling());
+    assert!(
+        state.sibling_substituted(&backend),
+        "a node that HAS a sibling and is not reaching it must read as \
+         substituted — a node that never had one must not"
+    );
+
+    // The deploy half: refused before the in-process runtime is asked.
+    let (status, body) =
+        deploy_response(&state, &isolated_spec("noisetable-account", vec![4332])).await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "the exact us-east-001 sequence deployed a workload into a bare \
+         namespace and advertised an address for it: {body}"
+    );
+    assert!(rt.deploy_calls().is_empty(), "{:?}", rt.deploy_calls());
+
+    // The read half. `sweep_once`'s `Err` arm already refuses to reconcile
+    // against a backend blip ("a failed list is NOT an empty list"), but a
+    // substituted in-process runtime answers `Ok` with a listing of containers
+    // it never deployed — a successful, wrong list that walks straight through
+    // that guard and retracts every record for a container kamaji is still
+    // running.
+    assert!(
+        !service_records::sweep_once(&state).await,
+        "the sweep reconciled the record set against the wrong process's \
+         view of containerd"
+    );
+}
+
+/// The probe cadence runs against a live kamaji, and **refuses to run** when
+/// it cannot reach one.
+///
+/// Both halves matter and the second is the load-bearing one. Before
+/// `workload_health` existed, kamaji's probe runner had no caller at all — the
+/// `[healthcheck]` in every `.yah/infra/workloads/*.toml` was declared and
+/// never executed. The obvious way to get that wrong a second time is a sweep
+/// that silently no-ops, which looks identical from the outside to one that
+/// runs and finds nothing. So the assertions are on `sweep_once`'s own return:
+/// `true` means kamaji answered and the registry was reconciled against its
+/// listing, `false` means this tick knew nothing and changed nothing.
+///
+/// The unreachable arm uses `KamajiSibling::disconnected` for the reason
+/// documented on the test above — killing a spawned kamaji leaves the
+/// established client connected and `is_dead()` false forever.
+#[tokio::test]
+async fn the_health_sweep_runs_against_a_live_kamaji_and_refuses_without_one() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sock = tmp.path().join("kamaji.sock");
+
+    {
+        let (server, stop) = spawn_kamaji(sock.clone()).await;
+        let client = kamaji::sibling::KamajiClient::connect(sock.clone())
+            .await
+            .expect("kamaji handshake");
+        let live = Arc::new(
+            ServerState::load(tmp.path().join("identity.json"))
+                .unwrap()
+                .with_constable_client(kamaji::sibling::KamajiSibling::new(
+                    client,
+                    sock.clone(),
+                    std::time::Duration::from_millis(200),
+                )),
+        );
+        assert!(
+            yubaba::workload_health::sweep_once(&live).await,
+            "a live sibling answered List, so the tick reconciled — a sweep \
+             that no-ops here is the un-driven probe runner all over again"
+        );
+        // An empty fleet is an empty registry, not a stale one.
+        assert!(live.workload_health.keys().is_empty());
+        let _ = stop.send(());
+        server.await.unwrap();
+    }
+
+    let unreachable = Arc::new(
+        ServerState::load(tmp.path().join("identity.json"))
+            .unwrap()
+            .with_constable_client(kamaji::sibling::KamajiSibling::disconnected(sock)),
+    );
+    assert!(
+        !yubaba::workload_health::sweep_once(&unreachable).await,
+        "a sibling we cannot reach is not evidence about any workload's \
+         health; every verdict must be left exactly as it was"
+    );
+}
+
+/// A node with no kamaji at all runs no health loop and publishes no verdicts.
+///
+/// This is every dev box and every stub-runtime test. The failure worth
+/// pinning is the opposite of a missing probe: a node that cannot probe
+/// anything reporting a confident empty health set, which downstream reads as
+/// "nothing is degraded here".
+#[tokio::test]
+async fn a_node_with_no_sibling_publishes_no_health_at_all() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state = Arc::new(
+        ServerState::load(tmp.path().join("identity.json"))
+            .unwrap()
+            .with_runtime(Arc::new(FakeRuntime::new()) as Arc<dyn kamaji::Kamaji + Send + Sync>),
+    );
+    assert!(
+        !yubaba::workload_health::sweep_once(&state).await,
+        "no sibling means no probe channel — the in-process runtime cannot \
+         answer a Probe, and must not be asked to guess"
+    );
+    assert!(state.workload_health.keys().is_empty());
 }

@@ -256,6 +256,8 @@ fn a_disaster_ready_fleet() -> YubabaState {
         YubabaResponse::Rollout(_)
     ));
 
+    // R911-T7: a legacy secret entry still applies — as a no-op, since the
+    // raft secret map is gone and cluster secrets live in the fleet object store.
     assert!(matches!(
         apply(
             &mut state,
@@ -326,7 +328,6 @@ async fn end_to_end_rebuild_restores_everything_but_locks_and_rollouts() {
         restored.rollouts.is_empty(),
         "in-flight rollout state must not survive a restore"
     );
-    assert_eq!(restored.secrets.len(), 1, "secrets must survive");
     assert_eq!(
         restored.members.len(),
         1,
@@ -353,7 +354,6 @@ async fn end_to_end_rebuild_restores_everything_but_locks_and_rollouts() {
          can still land membership at index 1"
     );
     assert_eq!(reopened.tenants.get(&tenant()).map(|t| t.epoch), Some(5));
-    assert_eq!(reopened.secrets.len(), 1);
     assert!(reopened.locks.is_empty());
     assert!(reopened.rollouts.is_empty());
 

@@ -148,6 +148,20 @@ pub enum NoiseKeyError {
     )]
     Unusable { name: String, source: SecretError },
 
+    /// The cluster secret store could not be read at all (R911-F1).
+    ///
+    /// Fatal, and deliberately not read as "the store lacks it": on the fleet
+    /// object store an outage and an absent record used to look the same, and
+    /// that reading would mint a fresh noise identity whenever the bucket
+    /// blipped — breaking every registered mesh client. Refusing is
+    /// recoverable; the next start retries the read.
+    #[error(
+        "cluster secret `{name}` could not be read ({source}); refusing to start headscale — \
+         the store may hold this coordinator's identity, and starting without it could run a \
+         DIFFERENT server identity. Starting again once the store is reachable retries the read"
+    )]
+    StoreUnavailable { name: String, source: SecretError },
+
     /// The store held the identity and it could not be written to disk.
     #[error(
         "writing {path}: {source}; refusing to start headscale — the cluster holds this \
@@ -194,9 +208,15 @@ pub fn write_state_file(dir: &Path, filename: &str, bytes: &[u8]) -> std::io::Re
 /// Place the coordinator's noise identity on disk from the cluster secret
 /// store, if the store has it. Call this **before** starting headscale.
 ///
-/// `resolver` is `None` on a node with no cluster-secret rail at all (no raft
-/// state, or no node-local KEK) — indistinguishable from an unprovisioned dev
-/// box, and treated the same as a store that simply lacks the record. That
+/// A store that could not be *read* — `SecretError::ClusterUnavailable`: the
+/// fleet object store is down, returned a malformed record, or this node has a
+/// KEK but no store or no sovereign group configured — is a refusal ([`NoiseKeyError::StoreUnavailable`]),
+/// never "the store lacks it" (R911-F1). Minting on an outage would replace the
+/// identity every registered node trusts.
+///
+/// `resolver` is `None` on a node with no node-local KEK — indistinguishable
+/// from an unprovisioned dev box, and treated the same as a store that simply
+/// lacks the record. That
 /// direction is deliberate: refusing to start every coordinator whose KEK is
 /// missing would take the mesh down over a provisioning detail, whereas the
 /// failure this guards against needs *evidence* that the cluster holds an
@@ -222,6 +242,16 @@ pub fn materialize_noise_key(
                 // The one non-fatal read failure: the record is genuinely not
                 // in the local replica, so there is no identity to contradict.
                 Err(SecretError::ClusterNotFound { .. }) => None,
+                // R911-F1: the store could not answer (bucket down, no store
+                // configured, malformed record). It may well hold this
+                // coordinator's identity, so this REFUSES — it never falls
+                // through to the fresh-identity verdict below.
+                Err(source @ SecretError::ClusterUnavailable { .. }) => {
+                    return Err(NoiseKeyError::StoreUnavailable {
+                        name: NOISE_KEY_SECRET.to_string(),
+                        source,
+                    })
+                }
                 Err(source) => {
                     return Err(NoiseKeyError::Unusable {
                         name: NOISE_KEY_SECRET.to_string(),
@@ -269,6 +299,25 @@ pub fn materialize_noise_key(
          will accept. Once it is up, seed the store before any failover: {SEED_COMMAND}"
     );
     Ok(NoiseIdentity::Fresh)
+}
+
+/// [`materialize_noise_key`] for an async caller: the same verdicts, with the
+/// store read (blocking HTTPS against the fleet object store) and the key write
+/// moved onto the blocking pool (R911-F2).
+pub async fn materialize_noise_key_off_runtime<R>(
+    resolver: Option<R>,
+    headscale_dir: PathBuf,
+) -> Result<NoiseIdentity, NoiseKeyError>
+where
+    R: SecretResolver + Send + 'static,
+{
+    crate::fleet_secrets::off_runtime(move || {
+        materialize_noise_key(
+            resolver.as_ref().map(|r| r as &dyn SecretResolver),
+            &headscale_dir,
+        )
+    })
+    .await
 }
 
 /// What happened to `config.yaml` before headscale was started (R858-T16).
@@ -407,6 +456,7 @@ mod tests {
         NotFound,
         Forbidden,
         Decrypt,
+        Unavailable,
     }
 
     struct FakeResolver(Answer);
@@ -423,6 +473,7 @@ mod tests {
                 Answer::NotFound => Err(SecretError::ClusterNotFound { name: name.clone() }),
                 Answer::Forbidden => Err(SecretError::Forbidden { name: name.clone() }),
                 Answer::Decrypt => Err(SecretError::ClusterDecrypt { name: name.clone() }),
+                Answer::Unavailable => Err(SecretError::ClusterUnavailable { name: name.clone() }),
             }
         }
     }
@@ -574,6 +625,115 @@ mod tests {
             );
         }
         assert!(!dir.path().join(NOISE_KEY_FILE).exists());
+    }
+
+    /// R911-F1: a store that cannot answer must never reach the fresh-identity
+    /// verdict — with or without a key on disk, the start is refused and the
+    /// disk is left exactly as it was.
+    #[test]
+    fn a_store_outage_refuses_to_start_and_never_mints() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = materialize_noise_key(Some(&FakeResolver(Answer::Unavailable)), dir.path())
+            .unwrap_err();
+        assert!(
+            matches!(err, NoiseKeyError::StoreUnavailable { .. }),
+            "expected a refusal, got {err:?}"
+        );
+        assert!(!dir.path().join(NOISE_KEY_FILE).exists());
+
+        std::fs::write(dir.path().join(NOISE_KEY_FILE), b"privkey:local").unwrap();
+        let err = materialize_noise_key(Some(&FakeResolver(Answer::Unavailable)), dir.path())
+            .unwrap_err();
+        assert!(matches!(err, NoiseKeyError::StoreUnavailable { .. }), "got {err:?}");
+        assert_eq!(
+            std::fs::read(dir.path().join(NOISE_KEY_FILE)).unwrap(),
+            b"privkey:local"
+        );
+    }
+
+    /// The same, end to end through the production resolver: a fleet object
+    /// store that is down, and a node with no store configured at all.
+    #[test]
+    fn the_real_resolver_over_a_down_or_missing_store_refuses_to_start() {
+        use crate::fleet_secrets::{
+            test_support::UnreachableObjectStore, FleetSecretStore, MissingRail, NodeSecretStore,
+        };
+        use crate::secrets::{ClusterResolver, LocalFileResolver};
+        use workload_spec::secrets::SecretConsumer;
+
+        let root = tempfile::tempdir().unwrap();
+        let resolver = |store: NodeSecretStore| {
+            ClusterResolver::new(
+                store,
+                [1u8; 32],
+                LocalFileResolver::new(root.path()),
+                SecretConsumer::workload("headscale"),
+            )
+        };
+        let down = Ok(FleetSecretStore::new(
+            std::sync::Arc::new(UnreachableObjectStore),
+            "le",
+            "prod",
+        ));
+
+        for store in [
+            down,
+            Err(MissingRail::NoObjectStore),
+            Err(MissingRail::NoSovereignGroup),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let r = resolver(store);
+            let err = materialize_noise_key(Some(&r), dir.path()).unwrap_err();
+            assert!(
+                matches!(err, NoiseKeyError::StoreUnavailable { .. }),
+                "expected a refusal, got {err:?}"
+            );
+            assert!(!dir.path().join(NOISE_KEY_FILE).exists(), "nothing minted or written");
+        }
+    }
+
+    /// R911-F2: the async entry point start_headscale uses reads a real fleet
+    /// store on a multi-thread runtime. The store's debug tripwire panics if
+    /// the read ever runs on a worker thread instead of the blocking pool.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_async_entry_point_reads_the_fleet_store_off_the_runtime() {
+        use crate::fleet_secrets::FleetSecretStore;
+        use crate::secrets::{seal_cluster_secret, ClusterResolver, LocalFileResolver};
+        use workload_spec::secrets::{SecretAccess, SecretConsumer};
+        use yah_object_store::{InMemoryObjectStore, ObjectStore as _};
+
+        let kek = [4u8; 32];
+        let mem = std::sync::Arc::new(InMemoryObjectStore::new());
+        let store = FleetSecretStore::new(mem.clone(), "le", "prod");
+        let rec = seal_cluster_secret(
+            &kek,
+            NOISE_KEY_SECRET,
+            b"privkey:fleet",
+            1,
+            SecretAccess::AllowAny,
+        );
+        mem.put(
+            &store.object_key(NOISE_KEY_SECRET).unwrap(),
+            serde_json::to_vec(&rec).unwrap(),
+        )
+        .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let resolver = ClusterResolver::new(
+            Ok(store),
+            kek,
+            LocalFileResolver::new(root.path()),
+            SecretConsumer::workload("headscale"),
+        );
+        let outcome = materialize_noise_key_off_runtime(Some(resolver), dir.path().to_path_buf())
+            .await
+            .unwrap();
+        assert_eq!(outcome, NoiseIdentity::Carried);
+        assert_eq!(
+            std::fs::read(dir.path().join(NOISE_KEY_FILE)).unwrap(),
+            b"privkey:fleet"
+        );
     }
 
     // ── R858-T16: config.yaml hydration ─────────────────────────────────────

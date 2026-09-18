@@ -18,6 +18,12 @@ members = [
     # deliberately not part of the yubaba server crate — see its crate doc.
     "crates/tenant-streamer",
     "crates/yubaba",
+    # noisetable R118-T11 (W138/A111): the raft core — state machine, log store, HTTP
+    # network factory, ClusterPolicy and the membership ratchet — carved out of
+    # the fleet daemon so a gallery plinth links consensus without pond,
+    # litestream, ACME, cheers or containerd. `yubaba` is now a consumer; see
+    # the crate's own header for what stayed behind and why.
+    "crates/yubaba-consensus",
     "crates/yubaba-client",
     "crates/yubaba-test-harness",
     "crates/yubaba-test-macros",
@@ -25,7 +31,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.37"
+version = "0.8.40"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"
@@ -35,3 +41,13 @@ repository = "https://github.com/yah-ai/yubaba"
 # local development. Redirects the version-based deps to their local paths for
 # atomic monorepo dev; stripped on export (scripts/export-oss.sh) so the
 # standalone mirror resolves yah-base/kamaji/qed crates from crates.io.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
+# W308/R745-T1: `-C incremental` makes sccache refuse a crate outright. This
+# glob applies to DEPENDENCIES and never to workspace members, so crates you
+# edit here keep incremental and crates you merely consume become cacheable.
+incremental = false

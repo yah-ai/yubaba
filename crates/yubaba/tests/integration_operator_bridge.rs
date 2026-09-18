@@ -47,7 +47,7 @@ use tower::ServiceExt;
 use kamaji::fake::FakeRuntime;
 use workload_spec::{
     ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, OperatorExpose, ResourceLimits,
-    RestartPolicy, SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
+    RestartPolicy, StopPolicy, TierTag, WorkloadSpec,
 };
 use yubaba::testing::headscale_mock::HeadscaleMock;
 use yubaba::OperatorBridgeMode;
@@ -56,7 +56,6 @@ use yubaba::OperatorBridgeMode;
 
 fn operator_workload_spec(name: &str, tag: &str, port: u16) -> WorkloadSpec {
     WorkloadSpec {
-        schema_version: SchemaVersion::V1,
         name: name.to_string(),
         image: ImageRef {
             registry: "docker.io".into(),
@@ -78,7 +77,10 @@ fn operator_workload_spec(name: &str, tag: &str, port: u16) -> WorkloadSpec {
         resources: ResourceLimits {
             memory_mb: 64,
             cpu_millis: 128,
-            ephemeral_storage_mb: 128,
+            memory_request_mb: None,
+            cpu_limit_millis: None,
+            pids_max: None,
+            scratch_floor_mb: None,
         },
         depends_on: vec![],
         requires: vec![],
@@ -102,6 +104,7 @@ fn operator_workload_spec(name: &str, tag: &str, port: u16) -> WorkloadSpec {
             }),
         },
         labels: Default::default(),
+        durability: None,
         annotations: Default::default(),
         files: Vec::new(),
     }

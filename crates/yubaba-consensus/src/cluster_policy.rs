@@ -531,7 +531,7 @@ impl MembershipRatchet {
     /// This was `requires_declared_origin` for one revision, when the joiner's
     /// lineage arrived as a field on the add-learner request body. It does not:
     /// the leader dials the joiner and reads it off
-    /// ([`membership_ratchet::ask_origin`](crate::membership_ratchet::ask_origin)),
+    /// ([`membership_ratchet::OriginSource`](crate::membership_ratchet::OriginSource)),
     /// for the reason that module records — a request body cannot be the source
     /// of a fact whose whole purpose is to catch a mis-aimed request, and a
     /// *required* field could not tell a node with no history from a caller that
@@ -592,11 +592,11 @@ pub enum IngressOwnership {
     ///
     /// Under this variant ownership moves on owner **failure** only, the
     /// candidate set is judged by
-    /// [`judge_appliance_candidate`](crate::appliance_ownership::judge_appliance_candidate),
+    /// `yubaba::appliance_ownership::judge_appliance_candidate`,
     /// a failed deploy backs that node off rather than being retried instantly,
     /// and a node that cannot stand the appliance up claims nothing and reports
-    /// [`ApplianceHealth::Unhealthy`](crate::appliance_ownership::ApplianceHealth::Unhealthy).
-    /// See [`crate::appliance_ownership`] for the bounds that keep re-election
+    /// `yubaba::appliance_ownership::ApplianceHealth::Unhealthy`.
+    /// See `yubaba::appliance_ownership` for the bounds that keep re-election
     /// from flapping.
     ElectedFromEligible,
 
@@ -822,7 +822,7 @@ pub struct ClusterPolicy {
     /// `POST /raft/initialize` when judging a founding membership.
     pub quorum_geography: QuorumGeography,
     /// Whether the raft leader carries the cluster's external identity — read
-    /// by the [`leader`](crate::leader) watcher on every leadership transition.
+    /// by the `yubaba::leader` watcher on every leadership transition.
     pub ingress_ownership: IngressOwnership,
     /// Raft election/heartbeat timings — read by
     /// [`raft::open`](crate::raft::open) when constructing the node, and by

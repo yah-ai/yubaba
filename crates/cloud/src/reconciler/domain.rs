@@ -112,7 +112,10 @@ fn parent_zone_name(domain: &str) -> &str {
 
 use crate::config::{DomainConfig, DomainRoute, FrontDoor, RouteMode};
 use crate::provider::cloudflare::WorkerBinding;
-use crate::reconciler::mesofact_static::WORKER_SCRIPT;
+use crate::reconciler::mesofact_static::{
+    worker_config_bindings, BackendOrigins, ConfigBinding, WorkerMode, WORKER_SCRIPT,
+};
+use crate::route_table::WorkerAssets;
 use std::collections::BTreeMap;
 
 /// The plan for deploying one subdomain's static Worker — everything decided
@@ -125,44 +128,60 @@ pub struct DomainWorkerPlan {
     pub worker_name: String,
     /// Hostname to bind via Workers Custom Domains, e.g. `scrabcake.net.yah.dev`.
     pub custom_domain: String,
-    /// `ASSET_ORIGIN` the Worker fetches from: `<cdn_base>/<service>/<env>`.
-    pub asset_origin: String,
-    /// `plain_text` Worker bindings (mirrors the Static-mode shape of
-    /// mesofact_static's `worker_config_bindings`).
-    pub bindings: Vec<(String, String)>,
+    /// `ASSET_ORIGIN` the Worker fetches from — the fall-through for a path no
+    /// `ROUTE_TABLE` entry claims, i.e. the first component static route's
+    /// `<cdn_base>/<service>/<env>`. `None` when no route is a component route
+    /// (a bucket-only CDN, R560-F13): its entries read R2 bindings, and the
+    /// binding is emitted empty.
+    pub asset_origin: Option<String>,
+    /// Worker bindings — the plain-text config plus one R2 bucket binding per
+    /// distinct bucket route — produced by
+    /// [`mesofact_static::worker_config_bindings`](crate::reconciler::mesofact_static)
+    /// — the same one producer the mirror-driven arm calls (R898-T4), not a
+    /// hand-synced twin of it.
+    pub bindings: Vec<ConfigBinding>,
 }
 
-/// Static-mode Worker bindings for an alias-tier subdomain. Kept in lockstep
-/// with `mesofact_static::worker_config_bindings(WorkerMode::Static, …)`.
+/// Build the [`DomainWorkerPlan`] for a `front_door = "worker"` manifest.
 ///
-/// `route_headers` is the manifest's own `DomainConfig::route_headers_json` —
-/// this planner already holds the domain, so unlike the mirror-driven path it
-/// needs no lookup to find it (R746).
-fn static_worker_bindings(asset_origin: &str, route_headers: String) -> Vec<(String, String)> {
-    vec![
-        ("ASSET_ORIGIN".to_string(), asset_origin.to_string()),
-        ("UPLOAD_ORIGIN".to_string(), String::new()),
-        ("WORKER_MODE".to_string(), "static".to_string()),
-        ("SSR_ORIGIN".to_string(), String::new()),
-        ("SSR_PREFIXES".to_string(), "[]".to_string()),
-        ("ROUTE_HEADERS".to_string(), route_headers),
-    ]
-}
-
-/// Build the [`DomainWorkerPlan`] for a per-tenant alias-tier manifest.
+/// `assets` says how component static routes resolve. For the alias tier it is
+/// [`WorkerAssets::PerComponent`]: `cdn_base` is the tier's CDN origin (an R2
+/// custom domain bound to the tier bucket, e.g. `https://cdn.net.yah.dev`) and
+/// `env` the mirror env the publisher wrote under (e.g. `prod`). The publisher
+/// lays assets down at `<bucket>/<service>/<env>/<key>` and the Worker fetches
+/// `${origin}/<key>`, so a component route resolves to
+/// `<cdn_base>/<service>/<env>` — per route, through its own component.
 ///
-/// `cdn_base` is the tier's CDN origin (an R2 custom domain bound to the
-/// tier bucket, e.g. `https://cdn.net.yah.dev`); `env` is the mirror env the
-/// publisher wrote under (e.g. `cloud`). The publisher lays assets down at
-/// `<bucket>/<service>/<env>/<key>` and the Worker fetches
-/// `${ASSET_ORIGIN}/<key>`, so `ASSET_ORIGIN = <cdn_base>/<service>/<env>`.
+/// **R560-F13: bucket routes need no `assets` at all.** A `bucket = "…"` route
+/// compiles to an entry naming its R2 binding, and the binding set gains one
+/// R2 bucket binding per distinct bucket. A manifest-only Worker — one no
+/// mirror deploys, planned by `yah cloud apply`'s domain pass — passes
+/// [`WorkerAssets::Unplaced`], under which a component route is refused naming
+/// itself rather than resolved to an origin nobody computed.
+///
+/// **R898-T4: every declared route is planned, in manifest order.** This used
+/// to `find_map` the FIRST `RouteMode::Static` route and discard the rest with
+/// a bare `_ => None` ("v1 alias tier serves one site per subdomain"), so a
+/// manifest's second static route and every backend/redirect route were
+/// silently dropped — and a dropped entry does not 503, it falls through to
+/// whichever shorter route matches and serves the wrong thing with a 200. The
+/// routes now compile through [`DomainConfig::route_table`], the same producer
+/// every other consumer reads, with [`WorkerPlacement`] as the placement:
+/// static routes resolve per component, backend routes to the manifest's
+/// declared `origin` (the one door for which that field is the answer).
+///
+/// This also retires `static_worker_bindings`, whose own doc said it was "kept
+/// in lockstep with `mesofact_static::worker_config_bindings` by hand". It was
+/// not: it still emitted `UPLOAD_ORIGIN`, `SSR_ORIGIN`, `SSR_PREFIXES` and
+/// `ROUTE_HEADERS` after R898-F3 deleted all four from the Worker, so an
+/// alias-tier Worker would have deployed with a binding set the bundled router
+/// no longer reads. There is one producer now and this calls it.
 ///
 /// Fails fast (before any network call) when the manifest has no `static`
-/// route or its component ref is malformed.
+/// route, or when any route's origin does not resolve.
 pub fn plan_domain_worker(
     domain: &DomainConfig,
-    cdn_base: &str,
-    env: &str,
+    assets: WorkerAssets<'_>,
 ) -> Result<DomainWorkerPlan> {
     // R594-F12: refuse to synthesize a Worker for a domain that declared a
     // different front door. Without this the plan succeeds and deploys a
@@ -178,37 +197,38 @@ pub fn plan_domain_worker(
         );
     }
 
-    // First static route wins (v1 alias tier serves one site per subdomain).
-    let component = domain
-        .routes
-        .iter()
-        .find_map(|r| match &r.mode {
-            RouteMode::Static { component } => Some(component.as_str()),
-            _ => None,
-        })
-        .with_context(|| {
-            format!(
-                "domain {} ({}) has no `static` route — nothing for a static Worker to serve",
-                domain.name, domain.domain
-            )
-        })?;
+    if !domain.routes.iter().any(|r| {
+        matches!(
+            r.mode,
+            RouteMode::Static { .. } | RouteMode::StaticBucket { .. }
+        )
+    }) {
+        anyhow::bail!(
+            "domain {} ({}) has no `static` route — nothing for a static Worker to serve",
+            domain.name,
+            domain.domain
+        );
+    }
 
-    let service = component
-        .split_once('/')
-        .map(|(svc, _)| svc)
-        .with_context(|| {
-            format!(
-                "domain {}: route component {component:?} — expected \"<service>/<component-id>\"",
-                domain.name
-            )
-        })?;
+    // An unresolvable component origin is refused here, naming the route and
+    // its component.
+    let bindings = worker_config_bindings(
+        &WorkerMode::Static,
+        assets,
+        &BackendOrigins::default(),
+        Some(domain),
+    )?;
 
-    let asset_origin = format!("{}/{}/{}", cdn_base.trim_end_matches('/'), service, env);
+    // `ASSET_ORIGIN` is a single binding, so it carries the fall-through for a
+    // path no table entry claims — the first component route's origin. Every
+    // static route still has its own entry in `ROUTE_TABLE`, which is what the
+    // door matches on.
+    let asset_origin = assets.fallback_origin(Some(domain));
 
     Ok(DomainWorkerPlan {
         worker_name: domain.name.clone(),
         custom_domain: domain.domain.clone(),
-        bindings: static_worker_bindings(&asset_origin, domain.route_headers_json()),
+        bindings,
         asset_origin,
     })
 }
@@ -239,10 +259,7 @@ pub async fn deploy_domain_worker(
     let worker_bindings: Vec<WorkerBinding<'_>> = plan
         .bindings
         .iter()
-        .map(|(k, v)| WorkerBinding::PlainText {
-            name: k.as_str(),
-            text: v.as_str(),
-        })
+        .map(ConfigBinding::as_worker_binding)
         .collect();
 
     cf.deploy_worker_script(
@@ -1107,10 +1124,12 @@ pub async fn ensure_passway_apex(
         }
         anyhow::bail!(
             "domain {} ({}) declares front_door = \"passway\" and {} A record(s) are live at \
-             the apex ({}), but no passway ingress edge collates onto it. An edge that was \
-             fronting this apex has disappeared from the declaration, and these records now \
-             point at whatever used to serve. Restore the ingress edge, or move the domain \
-             off `passway`, before applying again.",
+             the apex ({}), but no passway ingress edge collates onto it as a public origin. \
+             Either an edge that was fronting this apex has disappeared from the declaration, \
+             and these records now point at whatever used to serve — restore the edge, or move \
+             the domain off `passway` — or every door fronting it now sits behind a cloudflare \
+             tunnel (`via = \"passway\"`, R910), whose hostname is a CNAME the tunnel owns: \
+             delete these A records, since Cloudflare refuses a CNAME beside them.",
             domain.name,
             domain.domain,
             live.len(),
@@ -1168,6 +1187,12 @@ pub async fn ensure_passway_apex(
 /// that can tell "never stood up" from "the door vanished", because that takes
 /// a DNS read this pure function must not make).
 ///
+/// A passway door a cloudflare tunnel stacks in front of for this hostname
+/// (R910, [`NodeFrontDoor::stacked`](crate::reconciler::NodeFrontDoor::stacked))
+/// counts as no door here: its hostname is a CNAME to the tunnel, so it has no
+/// apex origin to publish, and a domain served only through such doors plans
+/// to `None`.
+///
 /// Note the narrowness: `None` means the *collation* produced no passway edge.
 /// A declared edge whose machine lacks the `public-ip` taint, or carries a
 /// private address, still reaches [`plan_domain_passway`] and still trips its
@@ -1191,11 +1216,24 @@ pub fn plan_passway_apex(
         }
     }
 
+    // Only the doors that front THIS domain's hostname (R858-B27). This used to
+    // take every passway door in the camp, so a domain inherited doors declared
+    // for a different hostname entirely: staging.noisetable.com, whose own edge
+    // is on a LAN box with no public address, was published at production's
+    // doors and served production's site from there.
     let mut front_door_machines: Vec<String> = report
         .collation
         .front_doors
         .iter()
         .filter(|fd| fd.provider == crate::config::IngressProvider::Passway)
+        .filter(|fd| fd.rules.iter().any(|r| r.hostname == domain.domain))
+        // R910: a door a cloudflare tunnel stacks in front of for this hostname
+        // is not an apex origin. The world reaches it through the tunnel's
+        // CNAME, so an A record for its machine would sit beside that CNAME —
+        // and a tunnel-fronted node is usually one with no public address at
+        // all, where `public_origins` would refuse the private one outright
+        // (us-west-011's 192.168.10.11 is the case that filed this).
+        .filter(|fd| !fd.stacked.contains(&domain.domain))
         .map(|fd| fd.machine.clone())
         .collect();
     front_door_machines.sort();
@@ -1266,6 +1304,168 @@ mod tests {
 
     use super::{plan_domain_worker, DomainWorkerPlan};
     use crate::config::{DomainConfig, DomainRoute, FrontDoor, RouteMode};
+    use crate::reconciler::mesofact_static::ConfigBinding;
+    use crate::route_table::WorkerAssets;
+
+    const NET_TIER: WorkerAssets<'static> = WorkerAssets::PerComponent {
+        cdn_base: "https://cdn.net.yah.dev",
+        env: "prod",
+    };
+
+    /// The plain-text half of a plan's bindings, by name.
+    fn plain_text(plan: &DomainWorkerPlan) -> std::collections::BTreeMap<String, String> {
+        plan.bindings
+            .iter()
+            .filter_map(|b| match b {
+                ConfigBinding::PlainText { name, text } => Some((name.clone(), text.clone())),
+                ConfigBinding::R2Bucket { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The R2 half of a plan's bindings: `(binding name, bucket)`, in order.
+    fn r2_buckets(plan: &DomainWorkerPlan) -> Vec<(&str, &str)> {
+        plan.bindings
+            .iter()
+            .filter_map(|b| match b {
+                ConfigBinding::R2Bucket { name, bucket_name } => {
+                    Some((name.as_str(), bucket_name.as_str()))
+                }
+                ConfigBinding::PlainText { .. } => None,
+            })
+            .collect()
+    }
+
+    /// cdn.noisetable.com's decided shape, abridged: several prefixes over
+    /// three buckets, one bucket named twice, the default bucket last.
+    fn multi_bucket_manifest() -> DomainConfig {
+        let bucket_route = |path: &str, bucket: &str| DomainRoute {
+            headers: Default::default(),
+            path: path.into(),
+            mode: RouteMode::StaticBucket {
+                bucket: bucket.into(),
+            },
+        };
+        DomainConfig {
+            schema_version: 1,
+            name: "cdn-noisetable-com".into(),
+            domain: "cdn.noisetable.com".into(),
+            front_door: FrontDoor::Worker,
+            cdn_bucket: "noisetable-marketing".into(),
+            worker_bundle_path: None,
+            routes: vec![
+                bucket_route("/engine/*", "noisetable-releases"),
+                bucket_route("/nt-cas/*", "noisetable-assets"),
+                bucket_route("/dev/*", "noisetable-releases"),
+                bucket_route("/*", "noisetable-marketing"),
+            ],
+        }
+    }
+
+    /// R560-F13 acceptance: one Worker domain over several buckets compiles
+    /// every route, in manifest order, to an entry naming the R2 binding it
+    /// reads — distinct per bucket, shared by routes naming the same bucket,
+    /// and carrying NO origin (these buckets have no public hostname).
+    #[test]
+    fn a_multi_bucket_domain_compiles_each_route_to_its_buckets_binding_in_manifest_order() {
+        let plan = plan_domain_worker(&multi_bucket_manifest(), WorkerAssets::Unplaced).unwrap();
+        let table = table_of(&plan);
+        let got: Vec<(&str, &str, &str)> = table
+            .iter()
+            .map(|e| {
+                assert_eq!(e["mode"], "static", "{e}");
+                assert!(
+                    e.get("origin").is_none() && e.get("component").is_none(),
+                    "a bucket entry is read through its binding, never fetched: {e}"
+                );
+                (
+                    e["path"].as_str().unwrap(),
+                    e["bucket"].as_str().unwrap(),
+                    e["binding"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("/engine/*", "noisetable-releases", "R2_NOISETABLE_RELEASES"),
+                ("/nt-cas/*", "noisetable-assets", "R2_NOISETABLE_ASSETS"),
+                ("/dev/*", "noisetable-releases", "R2_NOISETABLE_RELEASES"),
+                ("/*", "noisetable-marketing", "R2_NOISETABLE_MARKETING"),
+            ]
+        );
+    }
+
+    /// The binding list carries exactly one R2 bucket binding per DISTINCT
+    /// bucket, in first-use order, and every binding a table entry names is
+    /// one the upload creates — a name the upload lacks is a 502 at the door.
+    #[test]
+    fn the_binding_list_carries_one_r2_bucket_binding_per_distinct_bucket() {
+        let plan = plan_domain_worker(&multi_bucket_manifest(), WorkerAssets::Unplaced).unwrap();
+        let r2 = r2_buckets(&plan);
+        assert_eq!(
+            r2,
+            [
+                ("R2_NOISETABLE_RELEASES", "noisetable-releases"),
+                ("R2_NOISETABLE_ASSETS", "noisetable-assets"),
+                ("R2_NOISETABLE_MARKETING", "noisetable-marketing"),
+            ]
+        );
+        for entry in table_of(&plan) {
+            let binding = entry["binding"].as_str().unwrap();
+            assert!(r2.iter().any(|(name, _)| *name == binding), "{binding} not bound");
+        }
+        // No component route, so nothing falls through to an HTTP origin.
+        assert_eq!(plan.asset_origin, None);
+        assert_eq!(plain_text(&plan)["ASSET_ORIGIN"], "");
+        assert_eq!(
+            plan.bindings.iter().map(ConfigBinding::name).collect::<Vec<_>>(),
+            [
+                "ASSET_ORIGIN",
+                "POINTER_ORIGIN",
+                "WORKER_MODE",
+                "ROUTE_TABLE",
+                "R2_NOISETABLE_RELEASES",
+                "R2_NOISETABLE_ASSETS",
+                "R2_NOISETABLE_MARKETING",
+            ]
+        );
+    }
+
+    /// The alias tier must not move: a component-only domain deploys exactly
+    /// the binding set it did before R560-F13 — no R2 binding, and a
+    /// `ROUTE_TABLE` byte-identical to R898-T4's.
+    #[test]
+    fn a_component_only_domain_deploys_exactly_todays_bindings() {
+        let plan = plan_domain_worker(&net_tier_manifest(), NET_TIER).unwrap();
+        let plain = |name: &str, text: &str| ConfigBinding::PlainText {
+            name: name.into(),
+            text: text.into(),
+        };
+        assert_eq!(
+            plan.bindings,
+            vec![
+                plain("ASSET_ORIGIN", "https://cdn.net.yah.dev/scrabcake/prod"),
+                plain("POINTER_ORIGIN", "https://cdn.net.yah.dev/scrabcake/prod"),
+                plain("WORKER_MODE", "static"),
+                plain(
+                    "ROUTE_TABLE",
+                    r#"[{"path":"/*","mode":"static","component":"scrabcake/site","origin":"https://cdn.net.yah.dev/scrabcake/prod","auth":"anonymous"}]"#,
+                ),
+            ]
+        );
+    }
+
+    /// A manifest-only Worker has no CDN tier to resolve a component against,
+    /// so a component route is refused naming itself — never deployed with an
+    /// origin nobody computed.
+    #[test]
+    fn an_unplaced_worker_refuses_a_component_static_route() {
+        let err = plan_domain_worker(&net_tier_manifest(), WorkerAssets::Unplaced).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("scrabcake/site"), "{msg}");
+        assert!(msg.contains("no resolved origin"), "{msg}");
+    }
 
     fn net_tier_manifest() -> DomainConfig {
         // Mirrors .yah/domains/scrabcake-net-yah-dev.toml.
@@ -1286,35 +1486,126 @@ mod tests {
         }
     }
 
+    /// The compiled `ROUTE_TABLE` binding, parsed.
+    fn table_of(plan: &DomainWorkerPlan) -> Vec<serde_json::Value> {
+        let raw = plain_text(plan)
+            .remove("ROUTE_TABLE")
+            .expect("ROUTE_TABLE binding");
+        serde_json::from_str(&raw).expect("ROUTE_TABLE is JSON")
+    }
+
+    /// R898-T4 REWROTE THIS TEST, and what it used to pin is the reason.
+    ///
+    /// It asserted the literal six-binding list `static_worker_bindings`
+    /// emitted — `UPLOAD_ORIGIN`, `SSR_ORIGIN`, `SSR_PREFIXES`,
+    /// `ROUTE_HEADERS` included. R898-F3 deleted all four from the Worker,
+    /// and because that binding set was a hand-kept twin of
+    /// `worker_config_bindings` rather than a call to it, this test kept
+    /// passing while pinning a set the bundled router no longer reads. The
+    /// binding set is now the one producer's output, so this pins that.
     #[test]
-    fn plan_resolves_worker_name_domain_and_asset_origin() {
+    fn plan_resolves_worker_name_domain_and_the_one_producers_bindings() {
         let plan =
-            plan_domain_worker(&net_tier_manifest(), "https://cdn.net.yah.dev", "cloud").unwrap();
+            plan_domain_worker(&net_tier_manifest(), NET_TIER).unwrap();
+        assert_eq!(plan.worker_name, "scrabcake-net-yah-dev");
+        assert_eq!(plan.custom_domain, "scrabcake.net.yah.dev");
         assert_eq!(
-            plan,
-            DomainWorkerPlan {
-                worker_name: "scrabcake-net-yah-dev".into(),
-                custom_domain: "scrabcake.net.yah.dev".into(),
-                asset_origin: "https://cdn.net.yah.dev/scrabcake/cloud".into(),
-                bindings: vec![
-                    (
-                        "ASSET_ORIGIN".into(),
-                        "https://cdn.net.yah.dev/scrabcake/cloud".into()
-                    ),
-                    ("UPLOAD_ORIGIN".into(), String::new()),
-                    ("WORKER_MODE".into(), "static".into()),
-                    ("SSR_ORIGIN".into(), String::new()),
-                    ("SSR_PREFIXES".into(), "[]".into()),
-                    ("ROUTE_HEADERS".into(), "[]".into()),
-                ],
-            }
+            plan.asset_origin.as_deref(),
+            Some("https://cdn.net.yah.dev/scrabcake/prod")
+        );
+        assert_eq!(
+            plan.bindings.iter().map(ConfigBinding::name).collect::<Vec<_>>(),
+            ["ASSET_ORIGIN", "POINTER_ORIGIN", "WORKER_MODE", "ROUTE_TABLE"],
+            "the alias tier must deploy the same binding set the mirror-driven \
+             arm does — a twin is how it drifted last time"
+        );
+        let map = plain_text(&plan);
+        assert_eq!(map["ASSET_ORIGIN"], "https://cdn.net.yah.dev/scrabcake/prod");
+        assert_eq!(map["POINTER_ORIGIN"], "https://cdn.net.yah.dev/scrabcake/prod");
+        assert_eq!(map["WORKER_MODE"], "static");
+        let table = table_of(&plan);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table[0]["path"], "/*");
+        assert_eq!(table[0]["mode"], "static");
+        assert_eq!(table[0]["component"], "scrabcake/site");
+        assert_eq!(table[0]["origin"], "https://cdn.net.yah.dev/scrabcake/prod");
+    }
+
+    /// R898-T4, the ticket's own acceptance: EVERY static route is planned, in
+    /// manifest order, each resolved through its OWN component.
+    ///
+    /// This is also R560-F13's first verify line ("one Worker domain fronting
+    /// several buckets" at the unit level). Before this, `plan_domain_worker`
+    /// `find_map`-ed the first `RouteMode::Static` and dropped the rest with a
+    /// bare `_ => None`, so the second site here was served by the first's
+    /// catch-all — a wrong body with a 200, never a 404.
+    #[test]
+    fn plan_carries_every_static_route_in_manifest_order_with_its_own_origin() {
+        let mut dom = net_tier_manifest();
+        dom.routes = vec![
+            DomainRoute {
+                headers: Default::default(),
+                path: "/docs/*".into(),
+                mode: RouteMode::Static {
+                    component: "handbook/site".into(),
+                },
+            },
+            DomainRoute {
+                headers: Default::default(),
+                path: "/*".into(),
+                mode: RouteMode::Static {
+                    component: "scrabcake/site".into(),
+                },
+            },
+        ];
+        let plan = plan_domain_worker(&dom, NET_TIER).unwrap();
+        let table = table_of(&plan);
+        assert_eq!(table.len(), 2, "both static routes, not just the first");
+        assert_eq!(table[0]["path"], "/docs/*");
+        assert_eq!(table[0]["origin"], "https://cdn.net.yah.dev/handbook/prod");
+        assert_eq!(table[1]["path"], "/*");
+        assert_eq!(table[1]["origin"], "https://cdn.net.yah.dev/scrabcake/prod");
+        // ASSET_ORIGIN is the single fall-through binding, so it stays the
+        // first static route's origin; the per-route origins ride the table.
+        assert_eq!(
+            plan.asset_origin.as_deref(),
+            Some("https://cdn.net.yah.dev/handbook/prod")
         );
     }
 
-    /// R746: headers declared on a route reach the deployed Worker as the
-    /// ROUTE_HEADERS binding. Without this the manifest could declare them and
-    /// the Worker would serve without them — the exact silent gap the primitive
-    /// exists to close.
+    /// A `front_door = "worker"` domain's non-static routes are planned too —
+    /// they were dropped entirely by the old `_ => None`. The backend origin is
+    /// the manifest's DECLARED one, which R898-F3 established is the right
+    /// answer for the Worker arm specifically.
+    #[test]
+    fn plan_carries_backend_and_redirect_routes_the_old_planner_dropped() {
+        let mut dom = net_tier_manifest();
+        dom.routes.insert(
+            0,
+            DomainRoute {
+                headers: Default::default(),
+                path: "/old/*".into(),
+                mode: RouteMode::Redirect {
+                    target: "https://elsewhere.example".into(),
+                    status: 308,
+                },
+            },
+        );
+        let plan = plan_domain_worker(&dom, NET_TIER).unwrap();
+        let table = table_of(&plan);
+        assert_eq!(table.len(), 2);
+        assert_eq!(table[0]["mode"], "redirect");
+        assert_eq!(table[0]["target"], "https://elsewhere.example");
+        assert_eq!(table[0]["status"], 308);
+        assert_eq!(table[1]["mode"], "static");
+    }
+
+    /// R746: headers declared on a route reach the deployed Worker. They rode
+    /// the `ROUTE_HEADERS` binding until R898-F3 folded that table into
+    /// `ROUTE_TABLE`; this asserts the same thing about the binding that
+    /// survived. Without it the manifest could declare them and the Worker
+    /// would serve without them — the exact silent gap the primitive exists to
+    /// close.
     #[test]
     fn plan_carries_declared_route_headers_into_the_bindings() {
         let mut dom = net_tier_manifest();
@@ -1327,22 +1618,50 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let plan = plan_domain_worker(&dom, "https://cdn.net.yah.dev", "cloud").unwrap();
-        let binding = plan
-            .bindings
-            .iter()
-            .find(|(k, _)| k == "ROUTE_HEADERS")
-            .expect("ROUTE_HEADERS binding");
-        assert!(binding.1.contains("same-origin"), "{}", binding.1);
-        assert!(binding.1.contains("require-corp"), "{}", binding.1);
-        assert!(binding.1.contains("/*"), "{}", binding.1);
+        let plan = plan_domain_worker(&dom, NET_TIER).unwrap();
+        let table = table_of(&plan);
+        assert_eq!(table[0]["path"], "/*");
+        assert_eq!(
+            table[0]["headers"]["Cross-Origin-Opener-Policy"],
+            "same-origin"
+        );
+        assert_eq!(
+            table[0]["headers"]["Cross-Origin-Embedder-Policy"],
+            "require-corp"
+        );
+    }
+
+    /// A static route whose component ref is not `<service>/<component-id>`
+    /// refuses the plan, naming the route — it does not quietly resolve to a
+    /// truncated origin. The refusal moved from `plan_domain_worker`'s own
+    /// `split_once` into `DomainConfig::route_table`, which names more.
+    #[test]
+    fn plan_refuses_a_malformed_component_ref() {
+        let mut dom = net_tier_manifest();
+        dom.routes[0].mode = RouteMode::Static {
+            component: "no-slash".into(),
+        };
+        let err = plan_domain_worker(&dom, NET_TIER).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no-slash"), "{msg}");
+        assert!(msg.contains("no resolved origin"), "{msg}");
     }
 
     #[test]
     fn plan_trims_trailing_slash_on_cdn_base() {
         let plan =
-            plan_domain_worker(&net_tier_manifest(), "https://cdn.net.yah.dev/", "cloud").unwrap();
-        assert_eq!(plan.asset_origin, "https://cdn.net.yah.dev/scrabcake/cloud");
+            plan_domain_worker(
+                &net_tier_manifest(),
+                WorkerAssets::PerComponent {
+                    cdn_base: "https://cdn.net.yah.dev/",
+                    env: "prod",
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            plan.asset_origin.as_deref(),
+            Some("https://cdn.net.yah.dev/scrabcake/prod")
+        );
     }
 
     /// R594-F12: a manifest that declares a different front door must not
@@ -1353,7 +1672,7 @@ mod tests {
         for door in [FrontDoor::BucketDirect, FrontDoor::Passway] {
             let mut dom = net_tier_manifest();
             dom.front_door = door;
-            let err = plan_domain_worker(&dom, "https://cdn.net.yah.dev", "cloud").unwrap_err();
+            let err = plan_domain_worker(&dom, NET_TIER).unwrap_err();
             let msg = format!("{err:#}");
             assert!(msg.contains("front_door"), "{msg}");
             assert!(msg.contains(door.as_str()), "{msg}");
@@ -1371,7 +1690,7 @@ mod tests {
                 status: 308,
             },
         }];
-        let err = plan_domain_worker(&dom, "https://cdn.net.yah.dev", "cloud").unwrap_err();
+        let err = plan_domain_worker(&dom, NET_TIER).unwrap_err();
         assert!(
             format!("{err:#}").contains("no `static` route"),
             "got: {err:#}"
@@ -1730,6 +2049,129 @@ mod tests {
                 .map(|o| o.address.to_string())
                 .collect::<Vec<_>>(),
             vec!["51.81.85.145".to_string()],
+        );
+    }
+
+    /// R858-B27: a domain publishes only the doors that front ITS hostname.
+    ///
+    /// The camp below has two passway edges on two public machines: the apex
+    /// (`yah.dev`) on us-east-001 and a staging hostname on us-west-001. Before
+    /// the fix, `plan_passway_apex` took every passway door in the collation, so
+    /// the apex would have published us-west-001 too. The live instance was
+    /// staging.noisetable.com being published at production's doors.
+    #[test]
+    fn a_domain_publishes_only_the_doors_fronting_its_own_hostname() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".yah/infra/machines")).unwrap();
+        for (name, addr) in [("us-east-001", "51.81.85.145"), ("us-west-001", "15.204.89.240")] {
+            std::fs::write(
+                root.join(format!(".yah/infra/machines/{name}.toml")),
+                format!(
+                    "name = \"{name}\"\nprovider = \"ovh\"\nmesh_tags = []\n\
+                     taints = [\"public-ip\"]\n\
+                     [connect]\naddress = \"{addr}\"\nssh = \"root@{addr}\"\n\
+                     identity_file = \"~/.ssh/yah\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        for (svc_name, mirror, machine, zone) in [
+            ("marketing", "cloud", "us-east-001", "yah.dev"),
+            ("staging-site", "staging", "us-west-001", "staging.yah.dev"),
+        ] {
+            let svc = root.join(format!(".yah/services/{svc_name}"));
+            std::fs::create_dir_all(svc.join("mirrors")).unwrap();
+            std::fs::write(
+                svc.join("service.toml"),
+                format!(
+                    "schema_version = 1\nname = \"{svc_name}\"\ndomain = \"yah.dev\"\n\
+                     [[components]]\nid = \"site\"\nkind = \"static-asset\"\n\
+                     path = \"{svc_name}/site\"\nrole = \"static\"\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                svc.join(format!("mirrors/{mirror}.toml")),
+                format!(
+                    "schema_version = 1\nshape = \"single-machine\"\n\
+                     ingress = \"passway\"\ningress_machines = [\"{machine}\"]\n\
+                     [providers.compute]\nuse = \"hetzner\"\nzone = \"{zone}\"\n\
+                     port = 8080\nupstream_host = \"100.64.0.5\"\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let plan = plan_passway_apex(root, &passway_manifest())
+            .expect("both edges plan")
+            .expect("the apex has a door of its own");
+        assert_eq!(
+            plan.origins
+                .iter()
+                .map(|o| o.address.to_string())
+                .collect::<Vec<_>>(),
+            vec!["51.81.85.145".to_string()],
+            "the staging hostname's door must not be published at the apex"
+        );
+    }
+
+    /// R910: a passway door a cloudflare tunnel stacks in front of is not an
+    /// apex origin. The machine is the one that filed it — `public-ip`-tainted
+    /// but on a LAN address — so without the filter `public_origins` refuses
+    /// 192.168.10.11 and the apply fails, instead of planning no apex at all.
+    #[test]
+    fn a_door_behind_a_cloudflare_tunnel_is_not_an_apex_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".yah/infra/machines")).unwrap();
+        std::fs::write(
+            root.join(".yah/infra/machines/us-west-011.toml"),
+            "name = \"us-west-011\"\nprovider = \"ovh\"\nmesh_tags = []\n\
+             taints = [\"public-ip\"]\n\
+             [connect]\naddress = \"192.168.10.11\"\nssh = \"root@192.168.10.11\"\n\
+             identity_file = \"~/.ssh/yah\"\n",
+        )
+        .unwrap();
+        let svc = root.join(".yah/services/staging");
+        std::fs::create_dir_all(svc.join("mirrors")).unwrap();
+        std::fs::write(
+            svc.join("service.toml"),
+            "schema_version = 1\nname = \"staging\"\ndomain = \"yah.dev\"\n\
+             [[components]]\nid = \"site\"\nkind = \"static-asset\"\n\
+             path = \"staging/site\"\nrole = \"static\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            svc.join("mirrors/staging.toml"),
+            "schema_version = 1\nshape = \"single-machine\"\n\
+             [[ingress]]\nprovider = \"passway\"\nmachines = [\"us-west-011\"]\n\
+             hostnames = [\"yah.dev\"]\n\
+             [ingress.tunnel_door]\ncontact_email = \"ops@yah.dev\"\nzone_id = \"z\"\n\
+             token_secret = \"yah/cf-dns\"\nports = { \"yah.dev\" = 8445 }\n\
+             [[ingress]]\nprovider = \"cloudflare-tunnel\"\nvia = \"passway\"\n\
+             machines = [\"us-west-011\"]\nhostnames = [\"yah.dev\"]\n\
+             [providers.compute]\nuse = \"hetzner\"\nzone = \"yah.dev\"\n\
+             port = 8080\nupstream_host = \"100.64.0.5\"\n",
+        )
+        .unwrap();
+
+        let report = crate::validate::collate_workspace_ingress(root).unwrap();
+        assert!(report.problems.is_empty(), "the pair plans cleanly");
+        assert!(
+            report
+                .collation
+                .front_doors
+                .iter()
+                .any(|d| d.provider == crate::config::IngressProvider::Passway
+                    && d.stacked == ["yah.dev"]),
+            "the passway door collates, marked stacked"
+        );
+        assert!(
+            plan_passway_apex(root, &passway_manifest())
+                .expect("a tunnel-fronted door must not trip the private-address guard")
+                .is_none(),
+            "no apex origin for a door reached through the tunnel"
         );
     }
 

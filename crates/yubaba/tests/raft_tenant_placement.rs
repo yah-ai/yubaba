@@ -110,7 +110,7 @@ fn tenant() -> TenantId {
 /// upstream field rename breaks this at compile time instead of turning into a
 /// silently-mismatched body.
 async fn write(base_url: &str, request: YubabaRequest) {
-    let resp = reqwest::Client::new()
+    let resp = yubaba_test_harness::http()
         .post(format!("{base_url}/raft/write"))
         .json(&serde_json::json!({ "request": request }))
         .send()

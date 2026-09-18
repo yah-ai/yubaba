@@ -512,10 +512,23 @@ pub(crate) async fn deploy(
     // Without a kamaji (no `--kamaji-socket`, e.g. a bare `yubaba serve` or a
     // unit test) pond falls back to driving the docker CLI in-process and keeps
     // its own resurrect loop — the pre-R626 behaviour, unchanged.
+    //
+    // R881-B8: the question is `is_sibling()`, not "is there a backend". A
+    // fleet-shaped node whose kamaji went away still answers `Some` — with the
+    // legacy in-process runtime, which supervises nothing — and the old
+    // condition set `daemon_supervised = true` on the strength of that, telling
+    // pond's reconcilers to stand down while nobody was holding the restart
+    // policy. A crashed slot then stayed dead and the probes reported it
+    // faithfully. Falling back to the in-process launcher *with* the resurrect
+    // loop is the honest degrade, and it is the pre-R626 behaviour this comment
+    // already describes.
     let (launcher, daemon_supervised): (Arc<dyn ContainerLauncher>, bool) =
-        match state.active_backend() {
-            Some(backend) => (Arc::new(launcher::KamajiLauncher::new(backend)), true),
-            None => (runtime.clone() as Arc<dyn ContainerLauncher>, false),
+        match state.workload_backend() {
+            Some(backend) if backend.is_sibling() => (
+                Arc::new(launcher::KamajiLauncher::new(backend.into_runtime())),
+                true,
+            ),
+            _ => (runtime.clone() as Arc<dyn ContainerLauncher>, false),
         };
     tracing::info!(
         ident = %req.ident,

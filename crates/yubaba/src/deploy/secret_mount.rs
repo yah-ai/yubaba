@@ -123,6 +123,7 @@ pub fn materialize_file_secrets(
             source: VolumeSource::Bind { host_path },
             target: fm.path.clone(),
             read_only: true,
+            from_secret_mount: true,
         });
     }
 
@@ -198,6 +199,114 @@ pub fn teardown_secret_dir(root: &Path, ident: &str) {
             error = %e,
             "failed to reap materialized secret dir; plaintext lingers until reboot (tmpfs)"
         ),
+    }
+}
+
+/// Materialize every `SecretTarget::File` mount in `mounts` **directly to its
+/// declared host path** — no per-workload tmpfs staging dir, no `VolumeMount`
+/// rewrite (R876-B16).
+///
+/// [`materialize_file_secrets`]'s tmpfs-then-bind-mount indirection exists
+/// because a *container* has its own mount namespace: yubaba cannot put a file
+/// inside one from the outside, so it stages the plaintext on the host and
+/// hands kamaji a bind to rewrite into the container's OCI spec. A **native**
+/// process — this is the bundle/revalidate-receiver path, `deploy_non_container`
+/// — forks straight into the host filesystem, so the declared `path` already
+/// *is* somewhere the process can read; the bind-mount step would be pure
+/// overhead reproducing a namespace that was never created.
+///
+/// `EnvVar`-target mounts are left untouched (same convention as
+/// [`materialize_file_secrets`]): the native path never resolves them, because
+/// the whole point of routing a credential through `SecretMount` here is that
+/// its plaintext value never becomes part of the spec kamaji records.
+///
+/// Fails closed: all mounts are resolved before any file is written, so a
+/// resolve failure (missing / undecryptable cluster secret) never leaves a
+/// half-materialized set of files behind. Returns the paths written, so the
+/// caller can persist them for [`teardown_native_secret_files`].
+pub fn materialize_native_file_secrets(
+    mounts: &[SecretMount],
+    resolver: &dyn SecretResolver,
+) -> Result<Vec<std::path::PathBuf>, SecretError> {
+    let file_mounts: Vec<SecretMount> = mounts
+        .iter()
+        .filter(|m| matches!(m.target, SecretTarget::File { .. }))
+        .cloned()
+        .collect();
+    if file_mounts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Resolve everything BEFORE touching the filesystem — same fail-closed
+    // ordering as materialize_file_secrets, for the same reason.
+    let resolved = resolve_secrets(&file_mounts, resolver)?;
+
+    let mut written = Vec::with_capacity(resolved.file_mounts.len());
+    for fm in &resolved.file_mounts {
+        if let Some(parent) = fm.path.parent() {
+            std::fs::create_dir_all(parent).map_err(io_err("creating", parent))?;
+        }
+        write_secret_file(&fm.path, &fm.content, fm.mode)?;
+        written.push(fm.path.clone());
+    }
+    Ok(written)
+}
+
+/// Persist the paths [`materialize_native_file_secrets`] wrote for `ident`, so
+/// a later [`teardown_native_secret_files`] call — which runs in a different
+/// request, with no `WorkloadSpec` in hand — knows what to reap. The manifest
+/// holds paths only, never secret content.
+///
+/// `root` is the same tmpfs base the container path uses
+/// ([`DEFAULT_SECRET_MOUNT_ROOT`]); native manifests live under a `native/`
+/// subdir so they can't collide with a container ident's own materialized-file
+/// dir of the same name.
+pub fn write_native_secret_manifest(root: &Path, ident: &str, paths: &[std::path::PathBuf]) {
+    let manifest_dir = root.join("native");
+    if let Err(e) = std::fs::create_dir_all(&manifest_dir) {
+        tracing::warn!(dir = %manifest_dir.display(), error = %e, "could not create native secret manifest dir");
+        return;
+    }
+    let manifest_path = manifest_dir.join(format!("{}.json", sanitize_component(ident)));
+    let body = serde_json::to_vec(paths).unwrap_or_default();
+    if let Err(e) = std::fs::write(&manifest_path, body) {
+        tracing::warn!(path = %manifest_path.display(), error = %e, "could not write native secret manifest");
+    }
+}
+
+/// Reap the plaintext files [`materialize_native_file_secrets`] wrote for
+/// `ident`, using the manifest [`write_native_secret_manifest`] recorded.
+/// Idempotent — a missing manifest (no native File secrets, or already reaped)
+/// is a no-op. Called on workload destroy so decrypted credentials do not
+/// outlive the bundle.
+pub fn teardown_native_secret_files(root: &Path, ident: &str) {
+    let manifest_path = root
+        .join("native")
+        .join(format!("{}.json", sanitize_component(ident)));
+    let body = match std::fs::read(&manifest_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(path = %manifest_path.display(), error = %e, "could not read native secret manifest");
+            return;
+        }
+    };
+    let paths: Vec<std::path::PathBuf> = serde_json::from_slice(&body).unwrap_or_default();
+    for path in &paths {
+        match std::fs::remove_file(path) {
+            Ok(()) => tracing::debug!(path = %path.display(), "reaped native secret file"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to reap native secret file; plaintext lingers"
+            ),
+        }
+    }
+    if let Err(e) = std::fs::remove_file(&manifest_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %manifest_path.display(), error = %e, "could not remove native secret manifest");
+        }
     }
 }
 
@@ -753,5 +862,124 @@ mod tests {
 
         teardown_secret_dir(tmp.path(), "ingress");
         assert!(!secret_dir_exists(tmp.path(), "ingress"));
+    }
+
+    // ── native (non-container) materialization, R876-B16 ─────────────────────
+
+    #[test]
+    fn native_materialize_writes_the_sentinel_straight_to_the_declared_path_and_no_spec_ever_holds_it()
+     {
+        const SENTINEL: &[u8] = b"SENTINEL-live-credential-4f1c9a";
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("nested/r2-access-key-id");
+
+        let resolver = FakeResolver::new().cluster("mesofact-r2-access-key-id", SENTINEL);
+        let mounts = vec![file_mount(
+            SecretRef::Cluster {
+                name: "mesofact-r2-access-key-id".into(),
+            },
+            dest.to_str().unwrap(),
+            0o400,
+        )];
+
+        let written = materialize_native_file_secrets(&mounts, &resolver).unwrap();
+
+        // The bar: the receiver can actually authenticate (it reads the exact
+        // resolved bytes back off the declared path) ...
+        assert_eq!(written, vec![dest.clone()]);
+        assert_eq!(std::fs::read(&dest).unwrap(), SENTINEL);
+
+        // ... but the SecretMount itself — the only thing that ever becomes
+        // part of a WorkloadSpec / MesofactRevalidateReceiver on the wire or in
+        // kamaji's deploy record — carries no bytes of it. Value-shaped, like
+        // the R876-B13 test: assert on the mount's own serialized form, not on
+        // a named field, so a reshape can't make this pass vacuously.
+        let mount_json = serde_json::to_string(&mounts).unwrap();
+        assert!(
+            !mount_json.contains(std::str::from_utf8(SENTINEL).unwrap()),
+            "the SecretMount reference must never itself carry the resolved secret value: {mount_json}"
+        );
+    }
+
+    #[test]
+    fn native_materialize_leaves_envvar_targets_untouched() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = tmp.path().join("only-file-targets-are-native-materialized");
+        let resolver = FakeResolver::new()
+            .cluster("a-file-secret", b"file-bytes")
+            .cluster("an-envvar-secret", b"envvar-bytes");
+        let mounts = vec![
+            file_mount(
+                SecretRef::Cluster {
+                    name: "a-file-secret".into(),
+                },
+                dest.to_str().unwrap(),
+                0o400,
+            ),
+            SecretMount {
+                source: SecretRef::Cluster {
+                    name: "an-envvar-secret".into(),
+                },
+                target: SecretTarget::EnvVar {
+                    name: "IGNORED".into(),
+                },
+            },
+        ];
+
+        let written = materialize_native_file_secrets(&mounts, &resolver).unwrap();
+        assert_eq!(written, vec![dest.clone()]);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"file-bytes");
+    }
+
+    #[test]
+    fn native_materialize_fails_closed_on_a_missing_cluster_secret_and_writes_nothing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ok_dest = tmp.path().join("ok");
+        let missing_dest = tmp.path().join("missing");
+        let resolver = FakeResolver::new().cluster("present", b"bytes");
+        let mounts = vec![
+            file_mount(
+                SecretRef::Cluster {
+                    name: "present".into(),
+                },
+                ok_dest.to_str().unwrap(),
+                0o400,
+            ),
+            file_mount(
+                SecretRef::Cluster {
+                    name: "absent".into(),
+                },
+                missing_dest.to_str().unwrap(),
+                0o400,
+            ),
+        ];
+
+        let err = materialize_native_file_secrets(&mounts, &resolver).unwrap_err();
+        assert!(matches!(err, SecretError::ClusterNotFound { .. }));
+        // Resolved-before-written, same as the container path: a later mount
+        // failing to resolve must not leave an earlier one's plaintext behind.
+        assert!(!ok_dest.exists());
+        assert!(!missing_dest.exists());
+    }
+
+    #[test]
+    fn native_manifest_round_trips_through_write_and_teardown() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let secret_path = tmp.path().join("secrets/mirror-key");
+        std::fs::create_dir_all(secret_path.parent().unwrap()).unwrap();
+        std::fs::write(&secret_path, b"bearer").unwrap();
+
+        write_native_secret_manifest(tmp.path(), "yah-marketing", &[secret_path.clone()]);
+        assert!(secret_path.exists());
+
+        // A different ident's teardown must not touch this one's file.
+        teardown_native_secret_files(tmp.path(), "some-other-workload");
+        assert!(secret_path.exists());
+
+        teardown_native_secret_files(tmp.path(), "yah-marketing");
+        assert!(!secret_path.exists(), "teardown must reap the manifested file");
+        // Idempotent: a second teardown (manifest already gone) is a no-op,
+        // not a panic or an error surfaced anywhere.
+        teardown_native_secret_files(tmp.path(), "yah-marketing");
     }
 }

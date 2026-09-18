@@ -97,7 +97,7 @@ use workload_spec::secrets::{SecretAccess, SecretConsumer, WorkloadMatch};
 use workload_spec::{Millis, TenantPasswayTls, TenantPasswayWorkload, Workload};
 use zeroize::Zeroizing;
 
-use crate::acme_issuer::{cert_secret_name, key_secret_name};
+use crate::secrets::{cert_secret_name, key_secret_name};
 use crate::cert_store::{CertStoreError, Enrollment, ObjectCertStore};
 use crate::secrets::{load_cluster_kek, open_cluster_secret, CLUSTER_KEK_PATH};
 
@@ -184,6 +184,11 @@ pub struct TenantPasswayConfig {
     pub idle_ttl: Option<Millis>,
     /// Seconds between sweeps.
     pub sweep: Duration,
+    /// The node this sweep runs on (R910-F2), for [`Enrollment::serves_on`].
+    /// Not parsed here: `main` builds it from `leader::derive_machine_name`, the
+    /// one source every other node-name consumer uses, and
+    /// `YUBABA_ENROLLMENT_SCOPE`.
+    pub node: crate::cert_store::ServingNode,
 }
 
 /// Parse the reconciler config from a `key -> value` lookup — a pure function
@@ -235,6 +240,7 @@ pub fn parse_config(
         // tenant's passway churn once a second.
         idle_ttl: (idle_ttl_secs > 0).then(|| Millis::from_secs(idle_ttl_secs)),
         sweep: Duration::from_secs(sweep_secs),
+        node: crate::cert_store::ServingNode::default(),
     }))
 }
 
@@ -246,7 +252,6 @@ pub fn parse_config(
 /// placement — which is the order onboarding actually happens in.
 pub fn declare(domain: &str, enrollment: &Enrollment, cfg: &TenantPasswayConfig) -> Workload {
     Workload::TenantPassway(TenantPasswayWorkload {
-        schema_version: workload_spec::SchemaVersion::V1,
         domain: domain.to_string(),
         // The enrollment's own address, rendered once. See the module doc.
         listen: enrollment.tls_backend.to_string(),
@@ -255,6 +260,7 @@ pub fn declare(domain: &str, enrollment: &Enrollment, cfg: &TenantPasswayConfig)
         idle_ttl: cfg.idle_ttl,
         command: None,
         env: BTreeMap::new(),
+        discover: enrollment.discover.clone(),
     })
 }
 
@@ -497,7 +503,7 @@ fn materialize_pair(
 /// enrolled domain per sweep, so an unconditional `set_permissions` is 10k
 /// pointless metadata writes every five minutes on a directory tree that has not
 /// changed since the last sweep.
-fn restrict_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn restrict_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let perms = std::fs::metadata(dir)?.permissions();
     if perms.mode() & 0o777 == DIR_MODE {
@@ -515,7 +521,7 @@ fn restrict_dir(dir: &Path) -> std::io::Result<()> {
 /// malformed cert. The temp file is created with [`PAIR_MODE`] rather than
 /// chmod-ed afterwards, so a tenant's private key is never briefly readable by
 /// anything else on the node.
-fn write_if_changed(path: &Path, content: &[u8]) -> std::io::Result<bool> {
+pub(crate) fn write_if_changed(path: &Path, content: &[u8]) -> std::io::Result<bool> {
     if let Ok(existing) = std::fs::read(path) {
         if existing == content {
             return Ok(false);
@@ -784,7 +790,10 @@ pub async fn reconcile_once(
     kamaji: &KamajiClient,
     cfg: &TenantPasswayConfig,
 ) -> Result<Reconciled, ReconcileError> {
-    let enrolled = store.enrolled()?;
+    // R910-F2: the same scope filter the demux publisher applies, so a domain
+    // is armed on exactly the machines its route is published on. It also
+    // bounds `prune`: a record scoped elsewhere is not this node's to keep.
+    let enrolled = crate::cert_store::serving_on(store.enrolled()?, &cfg.node);
     // R852-B4: the digest rides the same listing, so "what is armed" and "what
     // is it armed WITH" are one observation and cannot disagree.
     let live: Vec<Live> = kamaji
@@ -820,7 +829,10 @@ pub async fn reconcile_once(
         // same node. Passing a mesh sentinel here would read on the wire as a
         // real instruction to bind one — see `KamajiClient::deploy_envelope`.
         match kamaji.deploy_envelope(id, workload, None).await {
-            Ok(()) => out.armed += 1,
+            // R850-T4: the reply's hydrate measurement is structurally `None`
+            // here — hydrate-on-place runs only on kamaji's container-deploy
+            // path, and a passway declares no durable volume to restore.
+            Ok(_hydrate) => out.armed += 1,
             Err(e) => {
                 out.failed += 1;
                 warn!(id = %id.0, error = %e, "tenant passway: arming failed");
@@ -920,6 +932,7 @@ mod tests {
             kek_path: PathBuf::from(CLUSTER_KEK_PATH),
             idle_ttl: Some(Millis::from_secs(60)),
             sweep: Duration::from_secs(300),
+            node: crate::cert_store::ServingNode::default(),
         }
     }
 
@@ -1049,6 +1062,55 @@ mod tests {
         assert!(p.stop.is_empty());
         assert_eq!(p.unchanged, 2);
         assert!(p.is_empty(), "a steady-state sweep applies nothing");
+    }
+
+    #[test]
+    fn a_record_scoped_to_another_machine_is_not_armed_here() {
+        let mut elsewhere = enrollment("127.0.0.1:8445");
+        elsewhere.machines = vec!["us-west-011".into()];
+        let enrolled = vec![
+            ("here.example.com".to_string(), enrollment("127.0.0.1:8443")),
+            ("staging.example.com".to_string(), elsewhere),
+        ];
+        use crate::cert_store::{serving_on, EnrollmentScope, ServingNode};
+        let node = |machine: &str, scope| ServingNode {
+            machine: Some(machine.into()),
+            scope,
+        };
+        let mine = serving_on(enrolled.clone(), &node("us-south-001", EnrollmentScope::Fleet));
+        let p = plan(&mine, &[], &cfg(), &all(&mine));
+        assert_eq!(
+            p.deploy.iter().map(|(id, _)| id.0.clone()).collect::<Vec<_>>(),
+            vec![workload_ident("here.example.com")]
+        );
+        let theirs = serving_on(enrolled.clone(), &node("us-west-011", EnrollmentScope::Fleet));
+        assert_eq!(plan(&theirs, &[], &cfg(), &all(&theirs)).deploy.len(), 2);
+
+        // The 2026-09-15 us-west-011 incident: a private node at the default
+        // scope arms its own door and none of the fleet's tenant domains.
+        let private = serving_on(enrolled, &node("us-west-011", EnrollmentScope::Named));
+        assert_eq!(
+            plan(&private, &[], &cfg(), &all(&private))
+                .deploy
+                .iter()
+                .map(|(id, _)| id.0.clone())
+                .collect::<Vec<_>>(),
+            vec![workload_ident("staging.example.com")]
+        );
+    }
+
+    #[test]
+    fn declare_carries_the_records_discovery_onto_the_door() {
+        let d = workload_spec::TenantPasswayDiscovery {
+            urls: vec!["http://100.64.0.10:7443".into()],
+            ident: "noisetable-staging".into(),
+        };
+        let mut e = enrollment("127.0.0.1:8445");
+        e.discover = Some(d.clone());
+        match declare("staging.example.com", &e, &cfg()) {
+            Workload::TenantPassway(w) => assert_eq!(w.discover, Some(d)),
+            _ => panic!("declare must produce a tenant passway"),
+        }
     }
 
     #[test]
@@ -1191,8 +1253,8 @@ mod tests {
             .write_pair(
                 &cert_secret_name(domain),
                 &key_secret_name(domain),
-                &seal_cluster_secret(&KEK, b"CERTPEM", 1, rule.clone()),
-                &seal_cluster_secret(&KEK, b"KEYPEM", 1, rule),
+                &seal_cluster_secret(&KEK, &cert_secret_name(domain), b"CERTPEM", 1, rule.clone()),
+                &seal_cluster_secret(&KEK, &key_secret_name(domain), b"KEYPEM", 1, rule),
             )
             .expect("sealed pair stored");
     }
@@ -1310,8 +1372,8 @@ mod tests {
             .write_pair(
                 &cert_secret_name("a.io"),
                 &key_secret_name("a.io"),
-                &seal_cluster_secret(&KEK, b"CERT2", 2, rule.clone()),
-                &seal_cluster_secret(&KEK, b"KEY2", 2, rule),
+                &seal_cluster_secret(&KEK, &cert_secret_name("a.io"), b"CERT2", 2, rule.clone()),
+                &seal_cluster_secret(&KEK, &key_secret_name("a.io"), b"KEY2", 2, rule),
             )
             .unwrap();
 
@@ -1339,8 +1401,8 @@ mod tests {
             .write_pair(
                 &cert_secret_name("a.io"),
                 &key_secret_name("a.io"),
-                &seal_cluster_secret(&KEK, b"CERTPEM", 1, stale.clone()),
-                &seal_cluster_secret(&KEK, b"KEYPEM", 1, stale),
+                &seal_cluster_secret(&KEK, &cert_secret_name("a.io"), b"CERTPEM", 1, stale.clone()),
+                &seal_cluster_secret(&KEK, &key_secret_name("a.io"), b"KEYPEM", 1, stale),
             )
             .unwrap();
 
@@ -1372,7 +1434,7 @@ mod tests {
         certs
             .write_secret(
                 &key_secret_name("a.io"),
-                &seal_cluster_secret(&KEK, b"KEYPEM", 1, SecretAccess::AllowAny),
+                &seal_cluster_secret(&KEK, &key_secret_name("a.io"), b"KEYPEM", 1, SecretAccess::AllowAny),
             )
             .unwrap();
         let m = materialize(&certs, &KEK, &cfg, &enrolled);

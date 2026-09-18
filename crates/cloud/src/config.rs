@@ -171,7 +171,6 @@
 //! @yah:next("ONE DESIGN QUESTION PHASE 1 LEFT OPEN, stated so it is not rediscovered as a bug. A bundle-tier component at a non-root mount now gets its own entry in the inner-door table pointing at the SAME bundle upstream, purely so the domain manifest's per-path response headers can be applied (see a_bundle_components_sub_mount_keeps_its_headers_and_the_bundle_upstream). That is correct for headers and harmless for routing, but it means the inner door re-states routing the bundle already does internally. If the outer door or the Worker is ALREADY applying those headers for a config-1 service, the inner door would apply them twice — check which tier owns route headers for a passway front door before wiring step 4, because R746 put ROUTE_HEADERS into the Cloudflare Worker and I did not confirm the passway-front-door equivalent.")
 //! @yah:verify("THE LIVE HALF, unrun and needing a fleet: a two-component service whose components deploy independently gets one inner door from one `yah cloud apply`, with https://&lt;host&gt;/ and https://&lt;host&gt;/app/ both 200 and `curl -sI` on /app/ carrying cross-origin-opener-policy: same-origin AND cross-origin-embedder-policy: require-corp while / carries neither. The config-side half of exactly that assertion is already green as inner_door::tests::each_mount_carries_only_its_own_routes_headers, and the transport-side half as the forked-binary cleartext test — what remains unproven is only that apply joins them. THE NEGATIVE'S node-side half is also unrun: for a single-component service (yah-marketing), assert NO routes file is materialized on the node and NO extra workload appears in kamaji's table.")
 //! @yah:next("PHASE 2 IS FIVE STEPS AND EVERY INPUT ALREADY EXISTS. (1) Call inner_door::plan(&svc.service, &cfg.domains) once per service in the apply path; Ok(None) is the common answer and means do nothing at all. (2) Allocate the loopback port. It is deliberately a PARAMETER of InnerDoorPlan::workload rather than config — which port is free is a property of the node — so this is the only genuinely new decision: either take it from kamaji's ledger (oss/kamaji/crates/kamaji/src/ports.rs) or pin one per service. (3) Resolve each DeployedUnit to an address for the `address` closure: DeployedUnit::Bundle is the service's one bundle workload (R870-B11), DeployedUnit::Component(id) is that component's own workload. (4) Deploy the rendered workload in the bundle deploy sequence — BEFORE the outer door is repointed, since the door 503s until its upstream is up. (5) Repoint the outer door's PASSWAY_UPSTREAMS at 127.0.0.1:&lt;port&gt; instead of at the bundle, via IngressPlan::resolve_upstreams (oss/yubaba/crates/cloud/src/reconciler/ingress.rs:397).")
-//! @yah:next("CHECK THE BACKEND BEFORE STEP 4, because getting it wrong is a refused deploy rather than a silent one and you should know which it is. Only kamaji's NATIVE backend materializes WorkloadSpec::files; containerd/docker/microvm call reject_unmaterializable_files and refuse the spec by name. So an inner door must land on a node whose kamaji routes it to Backend::Native. If the fleet's containerd path is where this has to run, the honest fix is to implement the write there (a pre-exec write or a mount), NOT to relax the guard — the guard exists because a door started against an absent route table reports healthy and routes wrongly.")
 //! @yah:handoff("DEFECT IN THIS TICKET'S OWN CHANGE, CAUGHT IN REVIEW BY @Ashguard:eclipse (session:e188ccc2) AND FIXED BEFORE IT LEFT THE TREE. WorkloadSpec rides the postcard `Deploy` frame (kamaji-proto/src/messages.rs:373, and V7's own stanza names `Workload::Container(WorkloadSpec)` as what that frame carries), and kamaji-proto/src/version.rs states the rule twice: every field on a postcard message is mandatory and always encoded, and the only compatibility mechanism is a ProtocolVersion bump. V2/V4/V5/V6 were each exactly \"a field appended to a struct\" and each got one. `files` is that shape and I had not bumped. The reasoning that made me miss it is the one V6's stanza already refutes: `#[serde(default)]` makes an OLD spec decode fine, so the JSON leg really is unaffected — but `default` only affects DEserialization, so a new yubaba still ENCODES a length varint an old kamaji reads as the next field and misparses from there. Now V8, CURRENT = V8, with a stanza naming the wrong reasoning rather than only the rule. cargo test -p kamaji-proto --all-features = 33/0; oss/kamaji workspace = 18+208+5+303+2+2+2+1, 0 failed.")
 //! @yah:gotcha("CORRECTION TO THE FLAKE GOTCHA ABOVE — my characterization was too narrow and would mislead the next reader, so read this one instead. I wrote that the tenant_passway digest test is \"green 303/303 in-package, fails only workspace-wide\". @Ashguard:eclipse measured the counter-example on the same tree: `cargo test -p kamaji -p kamaji-bin --lib --all-features`, in-package and parallel, failed a DIFFERENT test in the same module — deploy_arms_the_declared_socket_and_stop_releases_it (server.rs:8590) — and it failed identically before my sweep. On my own later run the workspace-wide invocation came back 303/0. So the truth is: at least two tests in server::tests::tenant_passway are intermittently flaky in BOTH configurations, the cause is `free_port()` probe-and-release losing the port between the probe and the bind (server.rs ~:8667), and it predates R870-F23. Do NOT read an in-package red there as a regression, and do not read a single green run as proof either. The fix is bind-and-hold; it belongs to neither R870 nor R881 and is unfiled — @Ashguard:eclipse tried and board.open refused for want of a parent relay.")
 //! @yah:gotcha("CONSEQUENCE OF THE V8 BUMP FOR ANY FLEET OPERATION, not just for this relay — relayed by @Ashguard:eclipse (session:e188ccc2) who is holding the fleet on R881-T6, and worth acting on before the next roll. The tree is now ProtocolVersion::V8; EVERY node runs a pre-V8 pair (us-east-001 on 0.8.37-h1/h2, us-south-001 and us-west-001 on 0.8.37-h5, the other six on 0.8.28-0.8.34). Nothing is broken, because each node is internally matched and the protocol is a node-local UDS. What changed is that `hotship --binaries yubaba` ALONE — or `kamaji` alone — is now a footgun on every node: it puts a V8 binary against a V7 sibling, and per version.rs:71 that does not fail cleanly, it misreads every field after the desync, \"which is how a wrong image or a wrong volume mount gets deployed instead of an error\". Ship the PAIR. That was harmless before this ticket and is not now.")
@@ -192,16 +191,49 @@
 //! @yah:verify("WHAT IS DELIBERATELY NOT VERIFIED, and it is the operator's call rather than an oversight: the LIVE half. No node was touched, nothing was deployed, nothing committed (git policy is `defer`). Running it needs a service with `deploy = \"workload\"` declared — none exists on disk — and the moment anything actually SETS `WorkloadSpec::files`, this ticket's own V8 roll-order gotcha binds: confirm the target node's kamaji link codec (kamaji-proto/src/codec.rs) and roll the kamaji+yubaba PAIR, never one alone.")
 //! @yah:verify("INDEPENDENTLY RE-RUN BY A SECOND COURIER (@Ashguard:dove, session:60d4f41f) who did not implement it, because a courier's self-report is the inner gate and not the outer one. All six commands reproduced the claimed counts EXACTLY: yah-cloud 1163/0 (4 ignored), yubaba 952/0, passway 285/0 (205+43+37), kamaji --lib --all-features 217/0, yah --lib 1549/0 (1 ignored), workspace --all-features --no-run clean. Every content check held: `point_at_inner_door` at ingress.rs:438; `inner_door::plan` reached from the apply path via `service_inner_door` (cloud.rs:9219) through `deploy_inner_door` (cloud.rs:9274, invoked at 7100 and 11877) and the ingress repoint at 7726; the port confirmed a deterministic per-service pin (FNV-1a into 10000-19999, inner_door.rs:346) and NOT kamaji's ledger, with the native.rs:282 `pin.is_none()` justification verified at the site. The negative is asserted three times, not once. CAVEAT ON THE MEASUREMENT ITSELF: the camp skew detector flagged 4 of 6 runs SUSPECT — peers edited kamaji/src/microvm.rs, kamaji-bin/src/main.rs and cloud/reconciler/mesofact_bundle.rs mid-run — so these are shared-tree numbers, not a frozen-tree measurement.")
 //! @yah:verify("ONE CLAIM CORRECTED AND ONE DEFECT FOUND BY THAT RE-RUN, both recorded rather than smoothed over. (1) CORRECTION: `cargo test -p yah-cloud --lib` does NOT run from the repo root — yah-cloud is not a root workspace member and needs dev-dependencies; it only works from `oss/yubaba`. Anyone reproducing the 1163/0 above must cd there first. (2) DEFECT, pre-existing and NOT caused by this ticket: `embedded_template_matches_workspace_canonical` is green VACUOUSLY — it resolves the workspace root via CARGO_MANIFEST_DIR.ancestors() to oss/yubaba, whose .yah/ holds only a .gitignore, so it takes the bootstrap branch and asserts nothing, while the repo-root twin at .yah/infra/cloud-init/mirror.yml is 128 diff-lines stale and missing the whole R858-F17 turso-backup block. FILED AS R870-B25, not left here. Note `rendered_runcmd_entries_are_all_strings` is a DIFFERENT test, is genuinely green, and is the gate that really catches the colon-space footgun this ticket fixed.")
+//! @yah:gotcha("SUPERSEDED BY R870-F27, and the @yah:next that said otherwise has been removed from this block: containerd DOES materialize WorkloadSpec::files now, so an inner door is no longer pinned to native-capable nodes. The backend-check step this ticket told its reader to perform before deploying is gone. Still refusing: Docker and MicroVm. The single fact both halves read is kamaji::Backend::materializes_files (oss/kamaji/crates/kamaji/src/lib.rs), not a list in prose.")
+//!
+//! @yah:ticket(R885-T14, "No cap:bundle-serving mesh capability exists — bundle/almanac/passway workloads are placed with nothing modelling where they can run")
+//! @yah:status(review)
+//! @yah:at(2026-09-12T07:16:50Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R885)
+//! @yah:severity(P3)
+//! @yah:next("FOUND WHILE DISPROVING R885-T13, and it is the real gap that ticket's false premise was standing next to. `cap:native-exec` exists and is honoured (config.rs:2353-2357 via wants_native_exec) for `yah.exec = native` Container specs. But the workloads actually running on the fleet — MesofactServeBundle / Almanac / TenantPassway, served by kamaji's BundleBackend and JitRuntime — have NO corresponding mesh capability at all. All four live workloads on us-east-001 are of those kinds. So placement for the entire class of workload this fleet actually runs is unmodelled: nothing declares which nodes can serve bundles, and nothing checks. It works today because there is effectively one node doing it, which is exactly the condition under which an unmodelled constraint stays invisible. THE SHAPE OF THE FIX IS ALREADY IN THE TREE: R860-T5 closed this same gap for native-exec. Follow it — a `cap:bundle-serving` capability declared in .yah/infra/machines/*.toml, a `wants_bundle_serving` predicate beside `wants_native_exec`, and the placement check wired the same way. Establish the right granularity first: whether bundle / almanac / tenant-passway want one shared capability or separate ones is a real design question, and the answer depends on whether a node can serve one kind and not another. Tier: Cleric. ITS NATURAL HOME IS R860's AXIS, NOT R885's — R885 is about workloads running unbounded once placed, this is about where they are placed at all. Filed under R885 because that is where it was found and where the evidence is; move it to R860 if that relay is still live. Not urgent: nothing is broken today, and the cost is that the first multi-node bundle placement decision will be made by something that has no model of the constraint.")
+//! @yah:handoff("GRANULARITY SETTLED BY OPENING KAMAJI, NOT BY GUESSING — and the answer is smaller than the ticket assumed. kamaji gates each backend on its own cargo feature + startup flag: BundleBackend on `bundle-serving` + `--bundle-cache-dir` + `--bundle-origin` (`attach_bundle_backend`, oss/kamaji/crates/kamaji-bin/src/main.rs:924), JitRuntime on `tenant-passway` + `--tenant-passway-dir` (:706). Independent flags means separate capabilities, not one shared tag. But only ONE of the three named in the ticket needs modelling today: (1) BUNDLE gets `cap:bundle-serving`. (2) TENANT-PASSWAY gets nothing — there is no placement decision to gate: `yubaba::tenant_passway::reconcile_once` runs inside a node's own yubaba and drives that node's own kamaji over the local UDS, so which node arms a domain is decided by `YUBABA_TENANT_PASSWAY_STATE_DIR`, not by a selector. A tag would have no reader, which is the same wrong-fact R860-T5 refused to state for `cap:microvm`. (3) ALMANAC gets nothing ever — kamaji refuses `Workload::Almanac` outright (\"almanac and static-asset live in yubaba's reconcilers\", kamaji-bin/src/server.rs:1846) and yubaba reconciles it, so it is never node-placed.")
+//! @yah:verify("MEASURED, every number an exit-visible run. `cargo test -p yah-cloud --lib` (oss/yubaba, CARGO_TARGET_DIR=/tmp/r885t14-target) = 1205 passed / 0 failed / 4 ignored. The baseline is 1200 and it is recoverable from this session's own output rather than asserted: the first post-edit run read 1195 passed / 5 FAILED, those five being pre-existing fixtures the new axis correctly broke (synthetic machines with no `mesh_tags`), so 1200 before, +5 new tests, 1205 after. `cargo test -p xtask --test main` = 69 passed / 0 failed (the real-tree suite, incl. all 11 mirror_ingress, all 4 apex_failover, all 4 fleet_build_placement). `cargo test -p xtask --doc` green. `cargo check -p yubaba --all-targets` (oss/yubaba) clean. `cargo check -p yah --all-targets` (root) clean — flagged SUSPECT by the camp build rail (peers edited app/yah/cli/src/camp.rs, mesh.rs, oss/yah-base/crates/keys/src/spec.rs, oss/yubaba/crates/yubaba/src/lib.rs mid-run); none of those is a file this ticket touched and the CLI's only contact with the change is `resolve_bundle_machines`, whose signature is unchanged.")
+//! @yah:handoff("WHAT LANDED. (1) `pub const BUNDLE_SERVING_MESH_TAG: &str = \"cap:bundle-serving\"` in oss/yubaba/crates/cloud/src/config.rs beside NATIVE_EXEC_MESH_TAG, carrying the node-side gate, why a positive capability and not a taint, and why there is no `cap:tenant-passway` beside it. (2) oss/yubaba/crates/cloud/src/reconciler/mesofact_bundle.rs: `with_bundle_capability(&RequiredSpec) -> RequiredSpec` (idempotent) and `ensure_bundle_capable(&MachineConfig, ..)`, wired into BOTH arms of `resolve_bundle_machines` — the constraint arm gets the tag appended to the derived mesh_tags, the literal `machines = [...]` pin is refused with an error naming the tag AND the .yah/infra/machines/<name>.toml to edit. (3) oss/yubaba/crates/cloud/src/reconciler/ingress.rs: `required_for_role(role, required)` applied in both `resolve_ingress_placements` and `resolve_ingress_candidates`, so the deployer and the discovery fanout stay set-for-set across the new axis — the property resolve_bundle_machines' own doc promises and which a bundle-only check would have broken. (4) .yah/infra/machines/us-east-001.toml declares the tag. (5) W338 §Placement consequences gains item 5.")
+//! @yah:handoff("THE ARCHITECTURAL POINT, because it is why this was not one line beside the native tag. `cap:native-exec` is read in `admission_spec`, which covers `Workload::Container` and NOTHING ELSE. A bundle never reaches that function — it is placed by `resolve_bundle_machines` off the mirror's `providers.bundle` declaration, a completely separate resolver that an operator writes by hand. So the gap was not \"one more tag in the same `if`\"; it was the same class of gap one resolver over. The rule the two instances share, now written into W338: a capability tag belongs wherever a SELECTOR chooses a node, not wherever a spec is admitted. Anything that picks a machine has to know what that machine's kamaji was started with, because every kamaji backend is an opt-in flag.")
+//! @yah:handoff("THREE EXTRA FIXES, all outside the ticket title, all loud. (a) xtask/src/install.rs:717 — `clear_stale_provenance`'s doc comment had an INDENTED log excerpt, which rustdoc compiles as Rust, so `cargo test -p xtask` failed its doctest on main for everyone. Fenced as ```text. Pre-existing, unrelated to this ticket, one line. (b) .yah/schema/mirror.toml.schema.json regenerated (`cargo run -p xtask -- emit-schemas`) — the schema-drift gate was RED on arrival and the drift is @Ashguard:coffee's R584-F2 `local-mailcrab` doc-comment change on `MirrorConfig::drivers`, not mine (verified by reading the one-line diff before regenerating). Regenerated per the generated-artifacts-are-not-ownable rule; they were told. Zero of my own types are schemars-derived, so this change contributes nothing to any schema. (c) Corrected three stale claims at their sites rather than leaving them: config.rs's NATIVE_EXEC_MESH_TAG doc said `Workload::MesofactServeBundle` and `Workload::Almanac` are BundleBackend-served (MesofactServeBundle is a FIELD on Workload::MesofactStatic, not a variant; Almanac is never node-placed at all), and us-east-001.toml's R885-T13 block repeated the same three wrong names for the four processes it observes — all four are bundle workloads.")
+//! @yah:verify("NEW TESTS. Five in mesofact_bundle's `mod tests`, each keeping a capable AND an incapable node in one CloudConfig so a pass provably comes from the capability rather than an empty pool: a_node_without_the_bundle_backend_cannot_be_pinned_to_serve_a_bundle (refusal names the tag and the file; the SAME fleet + same declaration shape at a capable node still resolves); a_constraint_places_past_a_matching_node_that_cannot_serve_bundles (the incapable node is declared FIRST, so a resolver ignoring the axis returns it and the test fails; then dropping the capable node makes the same declaration refuse); the_ingress_planner_applies_the_same_capability_as_the_deployer (set-for-set, plus the candidate widener must not widen past the capability); a_mirror_that_declares_the_capability_itself_is_unchanged (idempotence); a_non_bundle_slot_requires_no_capability (regression guard on the role mapping — a static slot still places on a node with no bundle backend). The shared `machine()` fixture now carries the tag by default, with `machine_without_bundle_backend()` beside it, because every placement test there presupposes an eligible pool.")
+//! @yah:verify("REAL-TREE HALF, which is where the live-safety answer is. New xtask/tests/mirror_ingress.rs::exactly_one_machine_in_the_real_fleet_can_serve_a_bundle asserts the capable set over .yah/infra/machines/ is exactly [\"us-east-001\"] and that a `replicas = 2` bundle constraint therefore refuses NAMING the tag. It is a deliberate tripwire: the day a second node declares the capability, the \"one node serves every bundle\" reasoning scattered through yah-marketing's and noisetable's mirrors stops holding and this is what says so. The pre-existing a_constraint_with_replicas_two_… had to change — its scale-2 assertions need two capable nodes and the real fleet has one — so it now grants the capability to us-south-001/us-west-001 IN MEMORY, asserts first that neither declares it on disk (so the grant cannot go silently vacuous), and says at the site that this is a hypothetical fleet, not a claim about those boxes. Every one of its original assertions (repel-by-default moving the second slot, the toleration lever recovering the pre-B7 answer, absent-replicas being exactly one, the short-count refusal, the two-backend render through collate) is unchanged and green.")
+//! @yah:gotcha("THIS FAILS CLOSED AND THE BLAST RADIUS WAS CHECKED, NOT ASSUMED. A bundle can now only be placed on a node declaring `cap:bundle-serving`, and exactly one does. Every live bundle placement in reach still resolves: yah-marketing's `required = { regions = [\"us-east\"], mesh_tags = [\"tag:cloud-runner\"] }` lands on us-east-001 (green in the real-tree suite), and the noisetable camp's two `providers.bundle.machines = [\"us-east-001\"]` pins are covered because ~/ss/noisetable/.yah/infra/machines/ is an EMPTY DIRECTORY — that camp borrows this repo's inventory read-only through its .yah/infra/sources.toml [[source]] link, so declaring the tag here fixes it there too and no cross-camp edit was needed. NOT EXECUTED, and say so rather than implying it: I did not run `yah cloud validate`/`ingress collate` from ~/ss/noisetable against a rebuilt binary. That conclusion is read off the two mirrors' pins plus the sources.toml link, not observed.")
+//! @yah:assumes("us-east-001's `cap:bundle-serving` rests on a BEHAVIOURAL reading, not on that box's ExecStart line: it is the node every bundle in the fleet is placed on today, R870-T9 records noisetable.com serving live through a bundle from it, and R885-T13 observed four kamaji-forked bundle processes there on 2026-09-11. Nothing in-repo records `--bundle-cache-dir` on its kamaji command line. The tag is therefore right about what the box demonstrably does and unverified about how it was started; if a roll ever drops the flag the tag becomes a lie in the fail-OPEN direction (a deploy that is admitted and then refused — i.e. exactly today's behaviour, not worse). Settle it with `ps -o args= -C kamaji` / the kamaji.service ExecStart, the same evidence us-west-001.toml:61-67 records for the native tag.")
+//! @yah:cleanup("us-south-001 is the obvious second bundle-capable candidate — it already shares the passway demux pair with us-east-001 — and is deliberately left undeclared because nothing in-repo reads its kamaji flags either way. One `ps -o args= -C kamaji` on that box settles it; declaring it wrongly would route a bundle to a node that refuses it, which is the failure this axis exists to remove. Until then the fleet is genuinely single-node for bundle serving and exactly_one_machine_in_the_real_fleet_can_serve_a_bundle says so out loud.")
+//!
+//! @yah:relay(R926, "Register iroh relay + headscale as first-class camp services, with descriptions and HA-aware health checks")
+//! @yah:at(2026-09-18T03:47:41Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @arch:see(.yah/docs/working/W122-yah-mobile.md)
+//! @yah:handoff("FILED 2026-09-17 from an operator request made during R726-S22's device run (@Ashguard:dove, session:639e7b78). THE ASK, in the operator's words: the iroh relay and headscale should be listed in the yah services with DESCRIPTIONS and HEALTH CHECKS, \"since they can move around in HA mode\". GROUNDED STATE OF THE WORLD AT FILING, read rather than assumed: (1) The service registry is .yah/services/&lt;name&gt;/service.toml. Exactly nine services are registered - scrabcake, yah-analytics, yah-chat, yah-cloud, yah-cloud-admin, yah-cr, yah-dashboard, yah-desktop, yah-marketing. NEITHER an iroh relay NOR headscale is among them, so the operator's observation is correct. (2) The generated schema .yah/schema/service.toml.schema.json has top-level properties [components, db, domain, health_path, name, schema_version], required [domain, name, schema_version]. So a health HOOK already exists in the shape of `health_path` - this is NOT greenfield - but there is NO `description` field at all, which is new schema surface. (3) .yah/infra/machines/*.toml are pure INVENTORY (name, [allocatable], [connect], [registration]); they are not where a service is declared, so do not add it there. (4) The Rust side of health_path lives in oss/yubaba/crates/cloud/src/config.rs and src/lib.rs (also mirrored in oss/mesofact/crates/mesofact/src/lib.rs).")
+//! @yah:next("Wire the iroh relay explicitly rather than implicitly. R726-S22 measured a phone falling back to relay because there was no shared address family with the camp; the relay is the DESIGNED path in that case, not a failure - but today nothing in the service registry says the relay exists, so its health is unobservable from the camp UI.")
+//! @yah:next("Add a `description` field to the service schema (new surface - it does not exist), then REGENERATE the artifacts: `cargo run -p xtask -- emit-schemas` and the workload-spec export. They no longer regenerate on commit and schema-drift-guard in the `check` QED pipeline will fail the build otherwise.")
+//! @yah:next("HA is the actual hard part and deserves a design decision before code: `health_path` is a single path on a single declared domain, which cannot express \"this service currently lives on whichever of N machines won the election\". Decide whether a service gains a set of candidate endpoints with a liveness winner, or whether the registry queries the mesh's own service-records endpoint (the 100.64.0.3:7443/service-records?ready=true surface referenced in us-west-001.toml) as the source of truth. Do NOT bolt a second health mechanism beside health_path - see the repo's below-v1.0.0 rule; change the one that exists.")
+//! @yah:gotcha("HEADSCALE HAS A LOUD, DOCUMENTED FAILURE HISTORY AND THIS TICKET IS PARTLY A RESPONSE TO IT - read R858 before designing the health check. .yah/infra/machines/us-west-001.toml carries R858 (\"Mesh coordination outage: cloud.mesh.yah.dev refuses :443, so no camp machine can reach any 100.64.0.0/10 address\") plus a measured 2026-09-04 gotcha: tailscale reported \"fetch control key ... connect: connection refused\", port 22 answered while 80/443 were REFUSED, and consequently every mesh address stopped answering. THE PART THAT MATTERS FOR A HEALTH CHECK: the same gotcha records that THE PUBLIC SITE STAYED GREEN THROUGHOUT (yah.dev HTTP 200 in 0.81s) because the apex serves from us-east-001's own passway and never traverses the coordination server. So a naive HTTP health check against a public domain would have reported HEALTHY during a total mesh outage. Whatever check this ticket adds for headscale MUST probe the coordination path itself (the control-key fetch, or a mesh-address dial), not a public endpoint that is up for unrelated reasons. The repo's CLAUDE.md also warns that the headscale appliance already accumulated four half-owners of \"does this node have a config.yaml\" and that the seam between two of them took the mesh down twice - so give this ONE owner.")
 
 use anyhow::{bail, Context, Result};
+// R870-F26: an `[[ingress]]` edge embeds the renderer's own auth type rather
+// than a config-side copy of its five fields — see `IngressEdge::auth`.
+use local_driver::passway_ingress::{AuthSpelling, PasswayAuth};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::Path;
 use thiserror::Error;
 use workload_spec::secrets::SecretAccess;
 use workload_spec::sovereign::Membership;
 pub use workload_spec::sovereign::SovereignRole;
-use workload_spec::{validate, LifecycleArchetype, Locality, TenantId, WorkloadSpec};
+use workload_spec::{validate, LifecycleArchetype, Locality, WorkloadSpec};
 
 /// Static node capacity declaration on `machine.toml` (R572-F3).
 ///
@@ -1361,43 +1393,6 @@ fn default_bucket_policy() -> String {
     "private".to_string()
 }
 
-/// Per-service config from `.yah/cloud/services/<name>.toml`.
-///
-/// **Deprecated.** The `services/` layout was replaced by `workloads/` in R092-F1.
-/// Kept to allow in-place reads for repos that haven't migrated yet; use
-/// `yah cloud config migrate-services-to-workloads` to upgrade.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LegacyServiceConfig {
-    pub name: String,
-    pub image: String,
-    pub version: String,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    #[serde(default)]
-    pub ports: Vec<PortMapping>,
-    #[serde(default)]
-    pub mesh_only: bool,
-    /// Network interface this service binds to exclusively (e.g. `"tailscale0"`).
-    ///
-    /// When set the compose renderer emits `network_mode: "host"` and the
-    /// service is NOT joined to the shared compose bridge network. The service
-    /// process must bind its listen socket to the named interface's IP — for
-    /// Postgres this means setting `POSTGRES_LISTEN_ADDRESSES` to the node's
-    /// `tailscale ip --4` output at first boot. See [`crate::mesh_service`] for
-    /// the standard pg_hba.conf snippet and ufw rules to pair with this field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bind_interface: Option<String>,
-
-    /// Tenant this service belongs to (W206 isolation axis). Absent in the
-    /// service TOML → [`TenantId::singleton`], keeping single-tenant machines
-    /// on one shared compose network. When a machine hosts services from two
-    /// or more distinct tenants, the compose renderer (R558-T2) splits them
-    /// into per-tenant `<tenant>-<tier>` networks so cross-tenant stacks on the
-    /// same host are not bridged together.
-    #[serde(default = "TenantId::singleton")]
-    pub tenant: TenantId,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PortMapping {
     pub host: u16,
@@ -1441,11 +1436,13 @@ pub struct ServiceWithMirrors {
 /// - `.yah/infra/` — `machines/`, `providers/`
 /// - `.yah/services/<svc>/` — `service.toml` + `mirrors/<env>.toml`
 ///
-/// Pre-R215 fields (`legacy_mirrors`, `legacy_services`, `workloads`,
-/// `topology`) are still populated from `.yah/cloud/` when present so
-/// pre-R215 callers (compose.rs, bucket commands) keep compiling — they
-/// just see empty collections in a post-B1 workspace where the legacy
-/// data was deleted. These fields are scheduled for removal in B3-T3.
+/// Pre-R215 fields (`legacy_mirrors`, `workloads`, `topology`) are still
+/// populated from `.yah/cloud/` when present so pre-R215 callers (bucket
+/// commands) keep compiling — they just see empty collections in a post-B1
+/// workspace where the legacy data was deleted. These fields are scheduled
+/// for removal in B3-T3. (`legacy_services` was the last of this group with
+/// a live renderer — the compose/Caddy generator over it — and was removed
+/// along with that renderer in R895-T2.)
 #[derive(Debug)]
 pub struct CloudConfig {
     /// Workspace root that was loaded — useful for path-resolving
@@ -1469,6 +1466,17 @@ pub struct CloudConfig {
     pub provider_origins: BTreeMap<String, InfraOrigin>,
     /// `.yah/services/<svc>/` — service.toml plus mirrors/<env>.toml.
     pub services: BTreeMap<String, ServiceWithMirrors>,
+    /// Measured restore times replayed from `.yah/cloud/recovery.jsonl`
+    /// (R850-T2), keyed by workload name and summed across that workload's
+    /// subjects. Empty in every camp that has never timed a restore — a missing
+    /// journal is not an error, exactly like an unsynced infra source.
+    ///
+    /// This field is what lets [`crate::topology::analyze`] report a measured
+    /// recovery instead of an extrapolation **while staying pure**: the
+    /// measurement is read off the local tree here, at load, alongside every
+    /// other declaration, so the analyzer gains no I/O and no `Path` argument.
+    /// See [`crate::recovery_journal`].
+    pub recovery_measurements: BTreeMap<String, crate::recovery_journal::WorkloadRecovery>,
     /// `.yah/domains/<name>.toml` — public-facing routing manifests
     /// (R347). Single file per domain; no nested per-env tree because
     /// domains themselves aren't projected onto infra — they describe
@@ -1482,8 +1490,6 @@ pub struct CloudConfig {
     pub workloads: Vec<WorkloadConfig>,
     /// Topology from `.yah/cloud/topology.toml` (mirror→machine assignments).
     pub topology: TopologyConfig,
-    /// Legacy services from `.yah/cloud/services/*.toml` (pre-R092 layout).
-    pub legacy_services: Vec<LegacyServiceConfig>,
 }
 
 impl CloudConfig {
@@ -1535,12 +1541,11 @@ impl CloudConfig {
         // Legacy `.yah/cloud/` reads — empty in post-B1 workspaces. Wrapped in
         // a helper so a missing tree is silent (no error, no warning).
         let cloud_dir = crate::paths::legacy_cloud_dir(workspace_root);
-        let (legacy_mirrors, legacy_workloads, topology, legacy_services) = if cloud_dir.exists() {
+        let (legacy_mirrors, legacy_workloads, topology) = if cloud_dir.exists() {
             (
                 load_mirrors(cloud_dir.join("mirrors"))?,
                 load_workloads(cloud_dir.join("workloads"))?,
                 load_topology(cloud_dir.join("topology.toml"))?,
-                load_dir::<LegacyServiceConfig>(cloud_dir.join("services"))?,
             )
         } else {
             Default::default()
@@ -1591,12 +1596,17 @@ impl CloudConfig {
             providers,
             machine_origins: fleet.origins,
             provider_origins,
+            // Local, offline, and absent in most camps — the journal replays to
+            // an empty map when the file isn't there (R850-T2).
+            recovery_measurements: crate::recovery_journal::RecoveryJournal::at_workspace(
+                workspace_root,
+            )
+            .replay(),
             services,
             domains,
             legacy_mirrors,
             workloads,
             topology,
-            legacy_services,
         })
     }
 
@@ -1641,12 +1651,16 @@ impl CloudConfig {
             providers,
             machine_origins: BTreeMap::new(),
             provider_origins: BTreeMap::new(),
+            // Same reasoning as the sources overlay above: the recovery journal
+            // is tied to `paths::recovery_journal(workspace_root)`, which has no
+            // meaning for an arbitrary sibling config dir — and this loader
+            // returns no `workloads` for a measurement to attach to anyway.
+            recovery_measurements: BTreeMap::new(),
             services,
             domains,
             legacy_mirrors: vec![],
             workloads: vec![],
             topology: TopologyConfig::default(),
-            legacy_services: vec![],
         })
     }
 
@@ -1663,6 +1677,18 @@ impl CloudConfig {
         let provider_ids: std::collections::HashSet<&str> =
             providers.iter().map(|p| p.id.as_str()).collect();
         for (svc_name, svc) in services {
+            // A relative health path would be joined onto the origin as if it
+            // were absolute by one URL builder and dropped by the next, so the
+            // probe would silently ask a different question than the file
+            // reads. Refuse it at load instead.
+            if let Some(p) = &svc.service.health_path {
+                if !p.starts_with('/') {
+                    anyhow::bail!(
+                        "services/{svc_name}/service.toml: health_path = \"{p}\" \
+                         must be absolute — write \"/{p}\""
+                    );
+                }
+            }
             for (env, mirror) in &svc.mirrors {
                 for (slot, body) in &mirror.providers {
                     if let Some(id) = body.provider_id() {
@@ -1688,6 +1714,28 @@ impl CloudConfig {
                                  declare it at infra/providers/{id}.toml"
                             );
                         }
+                    }
+                }
+                // R905. A `[build.<id>]` override keyed by a component this
+                // service does not declare is always a typo, and it is the
+                // silent kind: nothing reads the table for a component that
+                // isn't there, so the environment goes on building with the
+                // command the operator believed they had replaced — which is
+                // exactly the defect the override exists to fix, wearing a
+                // config that looks like the fix.
+                for key in mirror.build.keys() {
+                    if !svc.service.components.iter().any(|c| &c.id == key) {
+                        let declared: Vec<&str> = svc
+                            .service
+                            .components
+                            .iter()
+                            .map(|c| c.id.as_str())
+                            .collect();
+                        anyhow::bail!(
+                            "services/{svc_name}/mirrors/{env}.toml: \
+                             [build.{key}] — no component {key:?} in \
+                             services/{svc_name}/service.toml (declared: {declared:?})"
+                        );
                     }
                 }
             }
@@ -1973,7 +2021,7 @@ impl CloudConfig {
     /// repulsion/affinity by enriching [`RequiredSpec::matches`] /
     /// [`Self::resolve_machine`]. Do not fork a second selector.
     pub fn admit_workload(&self, ws: &WorkloadSpec) -> Result<&MachineConfig> {
-        self.resolve_machine(&admission_spec(ws, &self.workloads))
+        self.resolve_machine(&admission_spec(ws, &self.workloads)?)
     }
 
     /// Every machine that admits `ws`, in declaration order — the *pool*
@@ -2006,7 +2054,7 @@ impl CloudConfig {
     /// message [`Self::admit_workload`] would have produced. "No node admits
     /// this" and "the pool is empty" are the same failure and must read the same.
     pub fn admit_workload_candidates(&self, ws: &WorkloadSpec) -> Result<Vec<&MachineConfig>> {
-        let req = admission_spec(ws, &self.workloads);
+        let req = admission_spec(ws, &self.workloads)?;
         let all: Vec<&MachineConfig> = self.machines.iter().collect();
         let matched = matching(&all, &req);
         if matched.is_empty() {
@@ -2046,7 +2094,7 @@ impl CloudConfig {
         );
         first_match(
             &members,
-            &admission_spec(ws, &self.workloads),
+            &admission_spec(ws, &self.workloads)?,
             &format!("machines in sovereign group '{group}'"),
             &empty_pool,
         )
@@ -2270,8 +2318,31 @@ fn matching<'a>(candidates: &[&'a MachineConfig], req: &RequiredSpec) -> Vec<&'a
 /// @yah:gotcha("CORRECTION FROM R860-T6, and the leader propagated the error so it is worth naming: this ticket's handoff asserted \\\"`yubaba` already depends on `cloud`, so the predicate is directly callable from there\\\". THAT IS WRONG. `cloud` is a DEV-dependency of yubaba only — oss/yubaba/crates/yubaba/Cargo.toml:150-152, under the comment \\\"Integration test harness\\\" — and cloud's own Cargo.toml records that the runtime yubaba→cloud edge was DELIBERATELY avoided from R374-F3 onward. The leader repeated the claim verbatim in R860-T6's dispatch brief; T6's courier checked it against the manifest instead of trusting it, which is the only reason it did not become a runtime dependency inversion. Resolution: `group_is_drainable`'s body moved down to `workload_spec::group_is_drainable` (workload-spec/src/lib.rs:2365), the shared home both crates already depend on, and `cloud::config::group_is_drainable` (config.rs:2240) now delegates to it keeping its signature. Verified after the move: yah-cloud still 1093/0/4, yah-workload-spec 171+98/0.")
 /// @yah:handoff("Tree anchor at handoff: 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2 — the shared tree as I left it. Diff against it (`git diff 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
 /// @yah:verify("RE-VERIFIED AT HEAD 00ee20d1 (session:aa5e882d, 2026-09-05). `cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib` = 1141 passed / 0 failed / 4 ignored, exit 0 (was 1093 at the first leader's check, 1110 at the second; the deltas are peers' tests). Group placement confirmed by content in oss/yubaba/crates/cloud/src/config.rs: `placement_group` derivation at :2073/:2108, `repel_archetypes: Vec&lt;LifecycleArchetype&gt;` at :3878. NOTE FOR ANYONE RE-RUNNING THIS: `cargo test -p yah-cloud --lib` from the repo root FAILS with \"package `yah-cloud` cannot be tested because it requires dev-dependencies and is not a member of the workspace\" — yah-cloud lives in the oss/yubaba workspace, so the invocation needs `--manifest-path oss/yubaba/Cargo.toml`.")
-fn admission_spec(ws: &WorkloadSpec, declared: &[WorkloadConfig]) -> RequiredSpec {
+fn admission_spec(ws: &WorkloadSpec, declared: &[WorkloadConfig]) -> Result<RequiredSpec> {
     let group = placement_group(ws, declared);
+
+    // R894-F1: trust is a declared axis, and the substrate floor it implies is
+    // a REFUSAL here — not a tag, not a downgrade, not a warning.
+    //
+    // Every other axis in this function narrows the candidate set: "which nodes
+    // can host this". Trust is not that question. A `yah.trust = untrusted`
+    // spec asking for `yah.exec = native` is not unplaceable — it is
+    // *incoherent*, and there is no fleet on which it becomes coherent. Making
+    // it a mesh tag would render it as "no node admits this", which reads like
+    // a capacity problem and sends the operator to look at machines.
+    //
+    // It mirrors `wants_microvm`'s no-silent-downgrade semantics from the other
+    // direction: kamaji refuses to run a microVM-marked spec as a container
+    // because that delivers less isolation than was asked for; admission
+    // refuses to place an untrusted spec on a weaker substrate for exactly the
+    // same reason, one layer earlier, where the operator can still read why.
+    //
+    // Checked per member over the whole `placement_group`, not just `ws`.
+    // R860-T4 made a `local` edge co-place its provider, so an untrusted member
+    // reaching a node is reaching it whether or not the requirer is the
+    // untrusted one — and each member carries its own pair, so the check is
+    // per-member rather than over a group-wide maximum.
+    check_trust_substrate(&group)?;
 
     // Capacity is the group's demand, not the requirer's (W338 §Placement
     // consequences 1). Saturating rather than wrapping: an absurd declared
@@ -2331,7 +2402,21 @@ fn admission_spec(ws: &WorkloadSpec, declared: &[WorkloadConfig]) -> RequiredSpe
         mesh_tags.push(NATIVE_EXEC_MESH_TAG.to_string());
     }
 
-    RequiredSpec {
+    // R894-F1 / R860-T5's deferred second half: the identical axis for the
+    // microVM backend. Same `if`, same group-wide reasoning, same reason it is a
+    // tag and not a taint — see [`MICROVM_MESH_TAG`] for why the precondition
+    // R860-T5 was waiting on (a node that can actually boot a guest) is now met.
+    //
+    // This is what makes the trust floor above land somewhere real: without it,
+    // an untrusted workload passes the coherence check and is then placed on a
+    // node whose kamaji has no microVM backend, which refuses at dispatch.
+    if group.iter().any(WorkloadSpec::wants_microvm)
+        && !mesh_tags.iter().any(|t| t == MICROVM_MESH_TAG)
+    {
+        mesh_tags.push(MICROVM_MESH_TAG.to_string());
+    }
+
+    Ok(RequiredSpec {
         mesh_tags,
         // R833-F8: imperative node pin. Derived here alongside the inferred
         // mesh tags rather than short-circuiting the resolver, so a pinned
@@ -2370,7 +2455,63 @@ fn admission_spec(ws: &WorkloadSpec, declared: &[WorkloadConfig]) -> RequiredSpe
             .iter()
             .find_map(|m| m.requires_taint().map(str::to_owned)),
         ..Default::default()
+    })
+}
+
+/// Refuse any group member whose declared trust exceeds what its requested
+/// [`workload_spec::ExecSubstrate`] provides (R894-F1).
+///
+/// The rule in one line: **a caller may request a stricter substrate than its
+/// trust level requires, never a looser one.** `Trusted` floors at
+/// [`workload_spec::ExecSubstrate::Native`] — the bottom of the ordering, i.e. no constraint,
+/// which is what every workload in the fleet has today — and `Untrusted` floors
+/// at [`workload_spec::ExecSubstrate::MicroVm`], which is the operator's 2026-09-11 call that
+/// untrusted code never shares a kernel with the fleet.
+///
+/// A malformed [`workload_spec::TRUST_ANNOTATION`] is refused too, rather than
+/// resolving to either side. See [`workload_spec::TrustDeclError`] for why
+/// guessing in either direction is worse than a named refusal.
+///
+/// # Why here and not in `RequiredSpec::matches`
+///
+/// `matches` answers "can this node host this group". Trust coherence is a
+/// property of the *spec alone* — no node makes an untrusted-and-native spec
+/// legal — so it belongs on the path in, where it can fail with its own
+/// sentence. Putting it in the predicate would spend a fleet scan to conclude
+/// "no candidates", which names the wrong thing.
+///
+/// It is sited inside [`admission_spec`] and not in each `admit_*` method for
+/// the reason that function's own docs give: `admission_spec` is the one place
+/// the three admission entry points share, so a fourth entry point cannot be
+/// added that skips this. Returning `Result` from it is what makes that
+/// structural rather than a convention.
+fn check_trust_substrate(group: &[WorkloadSpec]) -> Result<()> {
+    for member in group {
+        let trust = member.trust().map_err(|e| {
+            anyhow::anyhow!(
+                "workload '{}' has an unreadable trust declaration: {e}",
+                member.name
+            )
+        })?;
+        let floor = trust.minimum_substrate();
+        let requested = member.exec_substrate();
+        if requested < floor {
+            bail!(
+                "workload '{}' declares {}={} but requests the {} substrate, which is weaker than \
+                 the {} minimum that trust level requires — untrusted code does not share a kernel \
+                 with the fleet, so set {}={} on this spec (a stricter substrate is always allowed, \
+                 a weaker one never is)",
+                member.name,
+                workload_spec::TRUST_ANNOTATION,
+                trust.as_str(),
+                requested.as_str(),
+                floor.as_str(),
+                workload_spec::NATIVE_EXEC_ANNOTATION,
+                floor.annotation_value().unwrap_or("<container>"),
+            );
+        }
     }
+    Ok(())
 }
 
 /// The workloads that must be placed together with `ws`: the transitive closure
@@ -2538,7 +2679,126 @@ fn resolve_requirement_ident(
 /// constraint, which is the whole point. Declared today (from readings recorded
 /// in-repo, not inferred) on `us-west-001` and `us-west-003`; see those
 /// machines' TOMLs for the evidence and the date.
+///
+/// # What it does NOT cover — the reading that looks like an inversion
+///
+/// This tag gates exactly one backend: [`WorkloadSpec::wants_native_exec`] on a
+/// `Workload::Container` spec, whose only two in-tree producers are
+/// `yubaba::headscale_appliance::appliance_spec` and
+/// `velveteen_exec::remote::mark_native_exec` (forge build steps).
+///
+/// kamaji has **other** ways to fork a process onto the host userland, and none
+/// of them are `yah.exec = native`: a `Workload::MesofactStatic` carrying a
+/// `serve_bundle` is served by `BundleBackend` (cargo feature `bundle-serving`
+/// + `--bundle-cache-dir` + `--bundle-origin`), and `Workload::TenantPassway`
+/// by `kamaji::jit::JitRuntime` (cargo feature `tenant-passway` +
+/// `--tenant-passway-dir`). Those are separate node-local startup decisions.
+/// The bundle one is now modelled — see [`BUNDLE_SERVING_MESH_TAG`], R885-T14.
+/// The JIT one deliberately is **not**; that const's docs say why.
+///
+/// The practical consequence, because it has already misled one reader: a node
+/// can run several kamaji-forked host processes and correctly carry no
+/// `cap:native-exec`. On 2026-09-11 `us-east-001` ran four (two bundle servers,
+/// a revalidate receiver, an almanac feed) with no such tag while `us-west-001`
+/// carried the tag and ran none, which reads as an inversion and is not one:
+/// none of those four is a native-exec workload, and the tag never claimed
+/// them.
 pub const NATIVE_EXEC_MESH_TAG: &str = "cap:native-exec";
+
+/// The mesh tag a node declares to advertise that its kamaji can **serve W272
+/// bundles** — R885-T14, the same axis [`NATIVE_EXEC_MESH_TAG`] models for the
+/// native-exec backend.
+///
+/// A `Workload::MesofactStatic` carrying a `serve_bundle` is materialized and
+/// supervised by `kamaji_bin::BundleBackend`, which only exists when the node's
+/// kamaji was **built** with the `bundle-serving` cargo feature and **started**
+/// with `--bundle-cache-dir` *and* `--bundle-origin` (or `$KAMAJI_BUNDLE_ORIGIN`)
+/// — `attach_bundle_backend` in `oss/kamaji/crates/kamaji-bin/src/main.rs`
+/// returns the context untouched without the cache dir, logging
+/// "Deploy { MesofactStatic + serve_bundle } will refuse with BackendRefused".
+/// All three are node-local startup decisions, invisible to everything upstream.
+///
+/// # The gap this closes
+///
+/// Bundle placement does not go through [`admission_spec`] at all — a bundle is
+/// placed by `reconciler::mesofact_bundle::resolve_bundle_machines`, off the
+/// mirror's `providers.bundle` declaration (`machines = [...]` or `required =
+/// { … }`), which the operator writes and which knows nothing about backends.
+/// So before this tag, a mirror whose constraint matched a node without the
+/// bundle backend deployed there and was refused at dispatch, exactly the way
+/// R858 lost headscale for 25 hours on the native axis. It stayed invisible
+/// because one node (`us-east-001`) serves every bundle in the fleet — the
+/// condition under which an unmodelled constraint costs nothing right up until
+/// the second node appears.
+///
+/// Both arms of `resolve_bundle_machines` enforce it, including the literal
+/// `machines = [...]` pin: an operator naming a node by hand is making exactly
+/// the claim this tag exists to check, and a pin is where the mistake is most
+/// likely, not least.
+///
+/// # Fails closed, like the native tag
+///
+/// A node that does not declare it cannot serve a bundle. Declared today on
+/// `us-east-001` only; see that machine's TOML for the evidence and the date.
+///
+/// # Why there is no `cap:tenant-passway` beside this
+///
+/// Checked rather than assumed, and it is a real asymmetry.
+/// `Workload::TenantPassway` has **no placement decision to gate**:
+/// `yubaba::tenant_passway::reconcile_once` runs *inside the node's own yubaba*
+/// and drives *that node's own* kamaji over the local UDS. Which node arms a
+/// domain is decided by which node was started with
+/// `YUBABA_TENANT_PASSWAY_STATE_DIR`, not by any selector — so a capability tag
+/// would have no consumer, and R852-B4 records that the tier is enabled on no
+/// fleet machine today. Declaring it now would be the same wrong fact
+/// [`NATIVE_EXEC_MESH_TAG`]'s notes refuse to state for `cap:microvm`. Model it
+/// when a *selector* exists to read it.
+///
+/// `Workload::Almanac` needs no tag either, and the reason is stronger: kamaji
+/// refuses it outright (`server.rs`, "almanac and static-asset live in yubaba's
+/// reconcilers"), so it is never node-placed. An "almanac feed" observed
+/// forked on `us-east-001` is a bundle-staged feed fetcher running under
+/// `BundleBackend`, covered by *this* tag — not a `Workload::Almanac`.
+pub const BUNDLE_SERVING_MESH_TAG: &str = "cap:bundle-serving";
+
+/// The mesh tag a node declares to advertise that its kamaji can **boot a
+/// Firecracker microVM** — the third instance of the axis
+/// [`NATIVE_EXEC_MESH_TAG`] and [`BUNDLE_SERVING_MESH_TAG`] model, and the one
+/// R860-T5 deliberately left open.
+///
+/// # Why it was deferred, and why it is no longer
+///
+/// R860-T5's `@yah:cleanup` says this tag is "one line from done in the same
+/// `if` in [`admission_spec`]" and refuses to take it, because **no node in the
+/// fleet could host a microVM**: the guest kernel and rootfs were gated on
+/// R605-F14, and declaring a capability nothing has is asserting a false fact.
+/// That precondition is met. `us-west-003` has had the backend attached since
+/// 2026-09-10T23:27Z (its TOML records the drop-in, the journal line and the
+/// staged guest material), and on 2026-09-11 R605-T24's
+/// `.yah/qed/microvm-dispatch-smoke.toml` drove a forge through the entire
+/// chain — qed → velveteen-exec → yubaba admission → kamaji → `MicroVmRuntime`
+/// — asserting on `/proc/cmdline` tokens a container cannot produce.
+///
+/// R894-F1 is what made taking it *necessary* rather than merely available: an
+/// untrusted workload now has [`workload_spec::ExecSubstrate::MicroVm`] as a hard floor, so
+/// without this axis every untrusted workload would be admitted onto whichever
+/// node won the tie-break and refused at dispatch — the exact 25-hour-outage
+/// shape R858 paid for on the native axis.
+///
+/// # Fails closed, and the node-side fact is in a drop-in, not ExecStart
+///
+/// A node that does not declare it cannot host a microVM workload. Declared
+/// today on `us-west-003` only.
+///
+/// Reading `ExecStart` **cannot** answer whether a node has this backend, and
+/// that trap is written into `us-west-003`'s own TOML: the backend is enabled by
+/// `Environment=KAMAJI_MICROVM_DIR=…` in
+/// `/etc/systemd/system/kamaji.service.d/10-microvm.conf`, so the unit's
+/// `ExecStart` carries no `--microvm-dir` while `MicroVmRuntime` constructs
+/// anyway. The same TOML records that rolling the node to a published version
+/// reverts the staged guest material — so this tag, like the other two, must be
+/// re-checked after any roll.
+pub const MICROVM_MESH_TAG: &str = "cap:microvm";
 
 /// Parse the R594 mesh-tag node-selector off a workload's annotations into the
 /// requested tag set. Absent annotation or empty value ⇒ empty vec ("no
@@ -2595,21 +2855,26 @@ fn load_providers(dir: &Path) -> Result<Vec<ProviderConfig>> {
 
 /// Map legacy mirror file stems to their canonical tier names.
 ///
-/// Canonical tiers: `dev` / `pond` / `cloud` / `ha`.
-/// Legacy stems pre-R362: `local` (dev tier), `local-sim` / `sim` (pond tier), `prod` (cloud tier).
+/// Canonical tiers: `dev` / `pond` / `prod` / `ha`.
+/// Legacy stems pre-R362: `local` (dev tier), `local-sim` / `sim` (pond tier).
+/// Legacy stem `cloud` (prod tier) — renamed 2026-09-14: "cloud" named the
+/// deployment mechanism, not the environment, and every operator-facing
+/// surface already said "prod" (`yah cloud apply --env prod`, `mirror up ...
+/// for prod`, the mirror files themselves are `prod.toml`) while only this
+/// loader's internal key disagreed.
 /// Both forms are accepted; canonical names are preferred for new files.
 pub fn canonical_tier(stem: &str) -> &str {
     match stem {
         "local" => "dev",
         "local-sim" | "sim" => "pond",
-        "prod" => "cloud",
+        "cloud" => "prod",
         other => other,
     }
 }
 
 /// Walk `.yah/services/<svc>/` for every service and its mirrors.
 /// Missing directory → empty map. Mirror file stems are normalized to canonical
-/// tier names via [`canonical_tier`] so callers always see `dev/pond/cloud/ha`.
+/// tier names via [`canonical_tier`] so callers always see `dev/pond/prod/ha`.
 fn load_services(
     dir: &Path,
     workspace_root: &Path,
@@ -2709,7 +2974,7 @@ fn read_component_transform_recipe(workspace_root: &Path, component_path: &str) 
 
 /// Load every `.yah/domains/*.toml` into a [`DomainConfig`] map keyed by
 /// file stem. Missing directory → empty map.
-fn load_domains(dir: &Path) -> Result<BTreeMap<String, DomainConfig>> {
+pub(crate) fn load_domains(dir: &Path) -> Result<BTreeMap<String, DomainConfig>> {
     if !dir.exists() {
         return Ok(BTreeMap::new());
     }
@@ -2761,6 +3026,9 @@ fn load_workloads(dir: std::path::PathBuf) -> Result<Vec<WorkloadConfig>> {
         let spec: WorkloadSpec =
             toml::from_str(&src).with_context(|| format!("parsing {}", path_str))?;
 
+        // R892-B1: refuse a file whose keys the parser silently threw away.
+        refuse_dropped_keys(&src, &spec, &path_str)?;
+
         // Shape-validate before accepting into the loaded config.
         validate::shape(&spec)
             .map_err(|e| anyhow::anyhow!("workload {} failed shape validation: {e}", path_str))?;
@@ -2768,6 +3036,111 @@ fn load_workloads(dir: std::path::PathBuf) -> Result<Vec<WorkloadConfig>> {
         items.push(WorkloadConfig { spec });
     }
     Ok(items)
+}
+
+/// Refuse a workload file that declares keys the parser did not keep (R892-B1).
+///
+/// `WorkloadSpec` deliberately does **not** carry `deny_unknown_fields`, and
+/// must not: the JSON leg of the deploy wire relies on an un-rolled node
+/// ignoring a field it has never heard of, which is what lets a fleet cross a
+/// schema change one node at a time. That forgiveness is right on the wire and
+/// wrong in a hand-authored file — there, an ignored key is an operator's
+/// declared intent evaporating between parse and serialise, with no diagnostic.
+///
+/// On 2026-09-11 that cost a production outage: `[resources]
+/// ephemeral_storage_mb = 256` in noisetable's `noisetable-account.toml` had
+/// been deleted from `ResourceLimits` by R885-T6, so the CLI read the file, drop
+/// the value, and sent a spec the (older) node could not parse — after it had
+/// destroyed the incumbent. The file said the right thing the whole time.
+///
+/// The check is a round trip rather than a key whitelist, so it needs no list to
+/// maintain and catches every renamed, removed or misspelled key at once: parse
+/// the file, re-serialise the parsed spec, and report any key the source
+/// declared that the re-serialisation does not carry. Value *representation* may
+/// legitimately change across that trip (an enum canonicalising its spelling),
+/// so only missing KEYS are reported, never differing values.
+fn refuse_dropped_keys(src: &str, spec: &WorkloadSpec, path_str: &str) -> Result<()> {
+    let declared: toml::Value = match toml::from_str(src) {
+        Ok(v) => v,
+        // Unreachable: the caller just parsed this same text into a typed spec.
+        Err(_) => return Ok(()),
+    };
+    let kept = match toml::Value::try_from(spec) {
+        Ok(v) => v,
+        // A spec that cannot be re-serialised is a bug in the schema, not in the
+        // operator's file — say so rather than blaming their config, and let the
+        // load proceed exactly as it did before this check existed.
+        Err(e) => {
+            eprintln!(
+                "warning: {path_str} could not be checked for silently-dropped keys \
+                 (re-serialising the parsed spec failed: {e})"
+            );
+            return Ok(());
+        }
+    };
+
+    let mut dropped = Vec::new();
+    collect_dropped_keys(&declared, &kept, "", &mut dropped);
+
+    // R896-B5: a key whose field was deleted as inert is ignored, not refused —
+    // otherwise every field deletion forces a same-day sweep of every camp's
+    // committed TOML. Say so, so the dead key still gets cleaned up eventually.
+    dropped.retain(|path| {
+        let Some(retired) = workload_spec::RETIRED_KEYS.iter().find(|r| r.path == path) else {
+            return true;
+        };
+        eprintln!(
+            "warning: {path_str} declares `{path}`, retired by {} and ignored; delete it",
+            retired.retired_by
+        );
+        false
+    });
+    if dropped.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "{path_str} declares {} the workload schema does not have, and their values were being \
+         discarded in silence:\n\
+         \x20 {}\n\
+         \n\
+         Delete them, or correct the spelling. A key that is present in the file and absent \
+         from the deployed spec is exactly the failure that destroyed a live workload on \
+         2026-09-11 (R892): the declaration reads as honoured and is not.",
+        if dropped.len() == 1 { "a key" } else { "keys" },
+        dropped.join("\n  ")
+    );
+}
+
+/// Recursive half of [`refuse_dropped_keys`] — keys in `declared` with no
+/// counterpart in `kept`, reported as dotted paths.
+fn collect_dropped_keys(
+    declared: &toml::Value,
+    kept: &toml::Value,
+    prefix: &str,
+    out: &mut Vec<String>,
+) {
+    match (declared, kept) {
+        (toml::Value::Table(d), toml::Value::Table(k)) => {
+            for (key, value) in d {
+                match k.get(key) {
+                    Some(kept_value) => {
+                        collect_dropped_keys(value, kept_value, &format!("{prefix}{key}."), out)
+                    }
+                    None => out.push(format!("{prefix}{key}")),
+                }
+            }
+        }
+        // Element-wise only when nothing was added or removed. A length change
+        // means the serialiser reshaped the list (materialisation appends mounts,
+        // for one), and pairing across that would report nonsense.
+        (toml::Value::Array(d), toml::Value::Array(k)) if d.len() == k.len() => {
+            for (i, (dv, kv)) in d.iter().zip(k).enumerate() {
+                collect_dropped_keys(dv, kv, &format!("{prefix}{i}."), out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Load all mirror configs from the `mirrors/` directory.
@@ -2877,7 +3250,7 @@ fn load_dir<T: for<'de> Deserialize<'de>>(dir: std::path::PathBuf) -> Result<Vec
 /// - **Account/runtime providers** (`cloudflare`, `hetzner`, `local-container`)
 ///   live as files under `.yah/infra/providers/<id>.toml` and are referenced
 ///   from a mirror via `use = "<id>"`.
-/// - **Inline-only providers** (`local-static`, `miniflare-container`,
+/// - **Inline-only providers** (`miniflare-native`, `miniflare-container`,
 ///   `minio-container`) declare an operator-local stand-in directly inside a
 ///   mirror via `kind = "..."`. They carry no credentials and have no provider
 ///   file. The container-backed kinds ride on top of whichever
@@ -2899,9 +3272,28 @@ pub enum Provider {
     /// machine bootstrap`); reach is declared in the machine's `[connect]`
     /// block. No create/destroy driver — placement-only.
     Static,
-    /// Built-in static-file server bound to localhost. Inline-only; never
-    /// declared as a standalone provider file because it carries no creds.
-    LocalStatic,
+    /// Dev-tier static surface: miniflare (workerd) running **natively** — no
+    /// container — in front of whatever the mirror binds to the `s3`
+    /// capability (W265, R584-F4).
+    ///
+    /// The door at every tier is the same compiled Worker bundle
+    /// (`worker/router.bundle.js`); only the object store underneath differs,
+    /// and that difference is now declared rather than branched on:
+    ///
+    /// ```toml
+    /// [providers.static]
+    /// kind = "miniflare-native"
+    /// port = 4321
+    ///
+    /// [drivers.s3]
+    /// kind = "local-s3-fs"
+    /// ```
+    ///
+    /// This replaces `local-static`, which served a workload's `dist/` off
+    /// disk and so gave the dev tier a storage interface no other tier had —
+    /// the fork W265 exists to delete. Inline-only; it carries no credentials
+    /// (the store is loopback, the Worker runs on this machine).
+    MiniflareNative,
     /// Local container runtime (orbstack/colima/docker). Configured by a
     /// provider file under `.yah/infra/providers/` so the discovery hints +
     /// runtime override sit in one place.
@@ -2936,6 +3328,46 @@ pub enum Provider {
     /// kind = "local-pg-dev"
     /// ```
     LocalPgDev,
+    /// Dev/pond-tier SMTP — [mailcrab] supervised by kamaji as the
+    /// `yah-smtp-dev` workload (W265, R584-F2). A real SMTP listener that
+    /// accepts every message and delivers none of them, plus a web inbox to
+    /// read what was sent. No docker daemon: the driver fetches the per-arch
+    /// mailcrab release binary on first run and caches it under
+    /// `.yah/cache/mailcrab/`.
+    ///
+    /// Inline-only — it carries no credentials at all (the listener is
+    /// loopback-bound and unauthenticated, which is the point: a catcher that
+    /// refused unauthenticated mail would not catch the mail your app sends).
+    /// Declared under [`MirrorConfig::drivers`], not `providers`:
+    ///
+    /// ```toml
+    /// [drivers.smtp]
+    /// kind = "local-mailcrab"
+    /// ```
+    ///
+    /// [mailcrab]: https://github.com/tweedegolf/mailcrab
+    LocalMailcrab,
+    /// Dev-tier S3 — a filesystem-backed, path-style S3 surface supervised by
+    /// kamaji as the `yah-s3-fs` workload (W265, R584-F3). No docker daemon
+    /// and no download: the driver *is* the server, and objects live under
+    /// `.yah/infra/state/dev/s3/data/<bucket>/`.
+    ///
+    /// Inline-only — the credentials are fixed dev strings on a loopback
+    /// listener, which is not an account to point a provider file at.
+    /// Declared under [`MirrorConfig::drivers`], not `providers`:
+    ///
+    /// ```toml
+    /// [drivers.s3]
+    /// kind = "local-s3-fs"
+    /// ```
+    ///
+    /// Unlike its two siblings the binding is **optional**: the camp brings
+    /// this driver up for any camp with a dev mirror whether or not a stanza
+    /// says so, because every static-asset component needs object storage and
+    /// [`crate::capability::Capability::for_component_kind`] already says as
+    /// much. Declaring it is documentation, not activation — see
+    /// `crate::reconciler::s3_driver::camp_needs_s3_driver`.
+    LocalS3Fs,
 }
 
 /// A provider account/runtime binding from `.yah/infra/providers/<id>.toml`.
@@ -2952,7 +3384,7 @@ pub struct ProviderConfig {
     pub kind: Provider,
     /// Reference into the OS keystore for live credentials (e.g.
     /// `"keystore://cloudflare/yah"`). `None` for providers that don't need
-    /// creds (local-static, optionally local-container).
+    /// creds (miniflare-native, optionally local-container).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials: Option<String>,
     /// Kind-specific fields. Examples:
@@ -2988,6 +3420,27 @@ pub struct ServiceConfig {
     pub schema_version: u32,
     pub name: String,
     pub domain: String,
+    /// Path the front-door health probe requests, relative to
+    /// [`domain`](Self::domain). `None` means `/`.
+    ///
+    /// `/` is the right question for a service whose root serves a site, and
+    /// the wrong one for an API. An account/RPC origin that versions its
+    /// surface answers only under its prefix and 404s everything else *on
+    /// purpose* — so probing the root reported a broken cell for a service
+    /// that was behaving exactly as designed, which is the failure mode the
+    /// probe exists to remove rather than add to. Naming the path here makes
+    /// the probe ask a question the service has agreed to answer.
+    ///
+    /// Service-scoped rather than per-component or per-mirror: one domain has
+    /// one front door and therefore one canonical liveness URL, and that URL
+    /// is a property of the service's own router — it does not vary by
+    /// environment, so repeating it per mirror would only let the copies
+    /// drift.
+    ///
+    /// Must be absolute (leading `/`); [`validate`](Self::validate) refuses
+    /// anything else rather than silently joining it onto the origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<ServiceComponent>,
     /// Databases this service exposes, grouped by environment (W241). Every
@@ -3829,6 +4282,46 @@ impl IngressProvider {
     }
 }
 
+/// What a `cloudflare-tunnel` edge dials instead of the fronted workload —
+/// W348 §1.3's **stacked** shape (R910).
+///
+/// `via = "passway"` puts the tunnel in front of the same node's passway door
+/// for the same hostnames: cloudflared → the node's sni-demux on loopback
+/// `:443` → the per-tenant passway → the workload. Passway keeps everything it
+/// does on a public door — origin TLS, host routing, `[ingress.auth]`, ACME
+/// (by DNS-01, the one challenge that reaches a NAT'd node) — and Cloudflare
+/// owns only the browser-facing handshake. Without it a tunnel edge dials the
+/// workload directly, and a tunnel edge and a passway edge claiming one
+/// hostname is a partition conflict.
+///
+/// An enum rather than a bool because what it names is a front door, and
+/// passway is simply the only one a tunnel can stack in front of today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum IngressVia {
+    /// The node's own passway door, reached through its sni-demux.
+    Passway,
+}
+
+impl IngressVia {
+    /// Kebab-case wire name, as it appears in `mirrors/<env>.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Passway => "passway",
+        }
+    }
+
+    /// The provider of the edge a tunnel carrying this `via` stacks in front
+    /// of — the edge that has to exist, on the same machines, for the pair to
+    /// plan.
+    pub fn provider(self) -> IngressProvider {
+        match self {
+            Self::Passway => IngressProvider::Passway,
+        }
+    }
+}
+
 /// One declared **edge**: a front door, the slots it fronts, and the nodes it
 /// is placed on (W305 F2).
 ///
@@ -3929,6 +4422,112 @@ pub struct IngressEdge {
     /// copy by hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// Cheers bearer-auth for this edge's door, spelled as an `[ingress.auth]`
+    /// table under the `[[ingress]]` entry (R870-F26).
+    ///
+    /// ```toml
+    /// [[ingress]]
+    /// provider = "passway"
+    /// image    = "localhost/passway:v1@sha256:…"
+    ///
+    /// [ingress.auth]
+    /// key_secret       = "cheers/yah-camp/verify"
+    /// kid              = "YOHV4Riq-g8fX4uYl8rTjQ"
+    /// iss              = "yah-camp"
+    /// aud              = "analytics.yah.dev"
+    /// require_prefixes = ["/"]
+    /// ```
+    ///
+    /// **This is what makes an apply-driven push FAITHFUL rather than merely
+    /// blocked.** Before it, `yah cloud apply`'s Passway arm rebuilt the door's
+    /// spec with `auth: None` because a mirror had no way to say otherwise, and
+    /// `/workloads/deploy` is a full replace — so pushing at a door someone had
+    /// deployed with `--auth-key-secret …` took its auth away and brought it
+    /// back anonymous (R870-B24). That strip is guarded by a read-back in
+    /// `push_passway_ingress`, and the guard STAYS: it covers a door that
+    /// acquired auth in a way no mirror can see. This field is what lets the
+    /// common case sail past that guard by carrying the auth instead of losing
+    /// it — the guard early-returns on any push that carries auth of its own.
+    ///
+    /// [`PasswayAuth`] verbatim, not a config-side copy of its five fields: all
+    /// five are required by `Deserialize`, so a half-written table is refused
+    /// by serde naming the missing field, and the renderer that emits the
+    /// `PASSWAY_AUTH_*` variables reads the very same struct.
+    ///
+    /// Only meaningful on a `provider = "passway"` edge — a cloudflare-tunnel
+    /// edge carrying one is refused by [`MirrorConfig::ingress_edges`] rather
+    /// than silently ignored, since ignoring it yields exactly the
+    /// believed-protected-but-public door this vocabulary exists to prevent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<PasswayAuth>,
+    /// Stack this edge in front of another front door on the same node instead
+    /// of dialing the workload (R910) — see [`IngressVia`].
+    ///
+    /// ```toml
+    /// [[ingress]]
+    /// provider  = "passway"
+    /// machines  = ["us-west-011"]
+    /// hostnames = ["api-staging.noisetable.com"]
+    ///
+    /// [[ingress]]
+    /// provider  = "cloudflare-tunnel"
+    /// via       = "passway"
+    /// use       = "cloudflare-tunnel-staging"
+    /// machines  = ["us-west-011"]
+    /// hostnames = ["api-staging.noisetable.com"]
+    /// ```
+    ///
+    /// Only a `cloudflare-tunnel` edge may carry it, and the mirror must also
+    /// declare the edge it names, claiming the **same hostnames on the same
+    /// machines** — the tunnel dials its own node's loopback demux, so a pair
+    /// split across nodes routes to nothing. Refused otherwise by
+    /// [`plan_ingress`](crate::reconciler::plan_ingress), naming both edges.
+    ///
+    /// `None` is every mirror written before R910.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<IngressVia>,
+    /// The door behind a tunnel, spelled `[ingress.tunnel_door]` on the
+    /// **passway** edge a `via = "passway"` tunnel stacks in front of (R910-F2).
+    ///
+    /// ```toml
+    /// [ingress.tunnel_door]
+    /// contact_email = "ops@example.com"
+    /// zone_id       = "<cloudflare zone id>"
+    /// token_secret  = "example/staging/cf-dns-token"
+    /// ports         = { "staging.example.com" = 8445 }
+    /// ```
+    ///
+    /// Required exactly when the edge is derived behind a tunnel, refused
+    /// otherwise — see `partition`. `yah cloud apply` turns it into one scoped
+    /// enrollment per hostname, which the tunnel's machines route, arm and
+    /// issue from; see [`TunnelDoor`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_door: Option<TunnelDoor>,
+}
+
+/// What a passway door behind a cloudflare tunnel needs that a public door
+/// does not (R910-F2): where its per-hostname loopback listeners are, and the
+/// inputs to issue its own certificates by DNS-01 — the only ACME challenge
+/// that works when nothing public reaches the node.
+///
+/// One door (one cold passway, one certificate) per hostname, which is the
+/// per-tenant shape yubaba's tenant tier arms — so each hostname names its own
+/// port rather than sharing one listener.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct TunnelDoor {
+    /// ACME account contact.
+    pub contact_email: String,
+    /// Cloudflare zone id the `_acme-challenge` TXT records are written into.
+    pub zone_id: String,
+    /// Cluster secret holding a `Zone:DNS:Edit` token for that zone, declared
+    /// in the machines' sovereign group with an access rule naming each
+    /// hostname's door (`passway.<hostname>`).
+    pub token_secret: String,
+    /// Loopback port each hostname's door listens on — the demux backend the
+    /// tunnel's SNI is spliced to. Every fronted hostname needs one.
+    pub ports: std::collections::BTreeMap<String, u16>,
 }
 
 impl IngressEdge {
@@ -3943,7 +4542,104 @@ impl IngressEdge {
             tunnel_id: None,
             provider_id: None,
             image: None,
+            auth: None,
+            via: None,
+            tunnel_door: None,
         }
+    }
+
+    /// Refuse `via` on an edge that cannot stack (R910). A passway edge
+    /// terminates the connection itself, so `via` there would be ignored — and
+    /// an ignored `via` is a mirror that reads as tunnel-fronted while
+    /// publishing the door's own address.
+    pub fn validate_via(&self) -> Result<()> {
+        if self.via.is_some() && self.provider != IngressProvider::CloudflareTunnel {
+            bail!(
+                "{}: declares `via`, but only a `provider = \"cloudflare-tunnel\"` edge can stack \
+                 in front of another front door — a {:?} edge terminates the connection itself. \
+                 Move `via` to the tunnel edge, or drop it.",
+                self.label(),
+                self.provider.as_str()
+            );
+        }
+        Ok(())
+    }
+
+    /// Refuse an `[ingress.auth]` table that cannot produce a protected door
+    /// (R870-F26). Called from [`MirrorConfig::ingress_edges`], so every reader
+    /// of a mirror — plan, collate, `yah cloud validate`, apply — gets it.
+    ///
+    /// Two failures, and they fail in opposite directions, which is why both
+    /// are here rather than left to the deploy:
+    ///
+    /// - **Auth on a non-passway edge.** Nothing downstream would read it, so
+    ///   the operator gets a door they believe is protected and is not. Only
+    ///   passway renders `PASSWAY_AUTH_*`; a cloudflare-tunnel edge publishes
+    ///   through Cloudflare Access instead and has no place to put these.
+    /// - **A present-but-empty field.** `Deserialize` already refuses a
+    ///   *missing* one by name; [`PasswayAuth::validate`] covers the rest, and
+    ///   is the same implementation `yah cloud ingress deploy` runs on its
+    ///   flags — so the two doors cannot diverge on what counts as configured.
+    pub fn validate_auth(&self) -> Result<()> {
+        let Some(auth) = &self.auth else {
+            return Ok(());
+        };
+        if !matches!(self.provider, IngressProvider::Passway) {
+            bail!(
+                "{}: declares `[ingress.auth]`, but only `provider = \"passway\"` renders the \
+                 PASSWAY_AUTH_* variables — this edge would deploy a door with NO bearer auth \
+                 while the mirror says otherwise. Move the auth to the passway edge, or drop it.",
+                self.label()
+            );
+        }
+        auth.validate(AuthSpelling::MirrorTable)
+            .map_err(|why| anyhow::anyhow!("{}: {why}", self.label()))
+    }
+
+    /// Refuse an `[ingress.tunnel_door]` that cannot produce a working door
+    /// (R910-F2). Whether the edge is actually behind a tunnel is a property
+    /// of the pair, so `partition` checks that half.
+    pub fn validate_tunnel_door(&self) -> Result<()> {
+        let Some(door) = &self.tunnel_door else {
+            return Ok(());
+        };
+        if self.provider != IngressProvider::Passway {
+            bail!(
+                "{}: declares `[ingress.tunnel_door]`, but only the `provider = \"passway\"` edge a \
+                 tunnel stacks in front of has a door to describe. Move it to that edge, or drop it.",
+                self.label()
+            );
+        }
+        for (field, value) in [
+            ("contact_email", &door.contact_email),
+            ("zone_id", &door.zone_id),
+            ("token_secret", &door.token_secret),
+        ] {
+            if value.trim().is_empty() {
+                bail!("{}: `[ingress.tunnel_door].{field}` is empty", self.label());
+            }
+        }
+        if door.ports.is_empty() {
+            bail!(
+                "{}: `[ingress.tunnel_door].ports` is empty — each fronted hostname needs the \
+                 loopback port its door listens on",
+                self.label()
+            );
+        }
+        let mut seen: std::collections::BTreeMap<u16, &str> = std::collections::BTreeMap::new();
+        for (host, port) in &door.ports {
+            if *port == 0 {
+                bail!("{}: `[ingress.tunnel_door].ports.{host:?}` is 0", self.label());
+            }
+            if let Some(other) = seen.insert(*port, host) {
+                bail!(
+                    "{}: `[ingress.tunnel_door].ports` gives {other:?} and {host:?} the same port \
+                     {port} — one held socket cannot be two hostnames' door",
+                    self.label()
+                );
+            }
+        }
+        Ok(())
     }
 
     /// `true` when this edge names which slots/hostnames it fronts.
@@ -4139,6 +4835,9 @@ pub struct MirrorConfig {
     /// ```toml
     /// [drivers.pg]
     /// kind = "local-pg-dev"     # dev  — kamaji-supervised loopback postgres
+    ///
+    /// [drivers.smtp]
+    /// kind = "local-mailcrab"   # dev/pond — a catcher with a browsable inbox
     /// ```
     ///
     /// Additive in P1: `drivers` lands *alongside* `providers`, and migrating
@@ -4155,6 +4854,111 @@ pub struct MirrorConfig {
     /// from the catalog. Validated against the workload catalog at sync time.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub asset_aliases: BTreeMap<String, String>,
+    /// Per-environment build overrides, keyed by **component id** (R905).
+    ///
+    /// A `[build]` block lives on the component's `workload.toml`, and a
+    /// component is declared exactly once in `service.toml` — so without this
+    /// table a service that deploys the same component to two environments
+    /// builds it identically for both. That is wrong for any bundle whose
+    /// contents depend on the tier it is being built *for*: noisetable's
+    /// landing site bakes `NOISETABLE_API_ORIGIN` into the shipped JS, so the
+    /// staging site was served a production API origin and every call from it
+    /// was blocked by production CORS.
+    ///
+    /// ```toml
+    /// # .yah/services/noisetable-marketing/mirrors/staging.toml
+    /// [build.site]
+    /// command = "bun run build:staging"
+    ///
+    /// # or, without a sibling script per environment:
+    /// [build.site.env]
+    /// NOISETABLE_API_ORIGIN = "https://api-staging.noisetable.com"
+    /// ```
+    ///
+    /// The environment axis stays on the mirror, where `providers`, `drivers`
+    /// and `ingress` already live, rather than growing an `env`-keyed table on
+    /// the component's own `BuildConfig` — a per-component struct is the wrong
+    /// place to enumerate environments, and doing it there would have made the
+    /// mirror the *second* per-environment surface instead of the only one.
+    ///
+    /// Deliberately NOT overridable here: `out_dir`. Where a bundler writes is
+    /// a property of the project's own toolchain, not of the tier it is built
+    /// for, and it is read independently of `[build]` by the publish path
+    /// (`read_workload_out_dir`, `collect_component_files`) — making it
+    /// per-environment would mean threading the mirror into every one of those
+    /// readers to buy a knob no tier needs.
+    ///
+    /// Keys are validated against the service's declared component ids at
+    /// config load (`cross_ref_validate`), so a typo is a refusal rather than
+    /// an override that silently never fires.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub build: BTreeMap<String, MirrorBuildOverride>,
+}
+
+/// One component's per-environment build override — the value type of
+/// [`MirrorConfig::build`] (R905).
+///
+/// Every field is additive-or-replacing against the component's own
+/// `workload.toml [build]` table; an empty override is indistinguishable from
+/// declaring none.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MirrorBuildOverride {
+    /// Replaces `build.command` for this environment.
+    ///
+    /// Absent leaves the workload's own command in place — including absent,
+    /// which means "this project has no external bundler step" and must keep
+    /// meaning that (R838-B1). An override may therefore *introduce* a command
+    /// where the workload's `[build]` table declares none — a deliberate
+    /// per-tier opt-in to a bundler, since the only way to write it is to name
+    /// one. A workload with no `[build]` table at all is still skipped
+    /// wholesale: there is no `out_dir` to publish from, so an override there
+    /// would have nothing to hand the publish step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Replaces `build.render_command` — the data-only re-render
+    /// (`revalidate_static`). Overridden separately from `command` because the
+    /// two run at different times against different inputs; a tier that needs
+    /// a different bundler command usually needs the same renderer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_command: Option<String>,
+    /// Environment variables exported to the build (and render) subprocess,
+    /// applied on top of the inherited environment.
+    ///
+    /// This is the knob for the common case — the command is the same, only a
+    /// baked-in origin/flag differs — and it is what keeps a project from
+    /// having to pre-declare one `build:<env>` script per environment before
+    /// any environment can exist.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
+
+impl MirrorBuildOverride {
+    /// `true` when this override would change nothing.
+    pub fn is_empty(&self) -> bool {
+        self.command.is_none() && self.render_command.is_none() && self.env.is_empty()
+    }
+
+    /// The override's `env` table as the `Vec<(String, String)>` that both
+    /// `ExecContext::with_env` and `std::process::Command::envs` want.
+    pub fn env_pairs(&self) -> Vec<(String, String)> {
+        self.env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+}
+
+impl MirrorConfig {
+    /// This environment's build override for `component_id`, if any.
+    ///
+    /// Returns `None` for an override that exists but changes nothing, so
+    /// callers can treat `Some(_)` as "something differs here" without
+    /// re-checking each field.
+    pub fn build_override(&self, component_id: &str) -> Option<&MirrorBuildOverride> {
+        self.build.get(component_id).filter(|o| !o.is_empty())
+    }
 }
 
 impl MirrorConfig {
@@ -4223,6 +5027,9 @@ impl MirrorConfig {
                             edge.label()
                         );
                     }
+                    edge.validate_auth()?;
+                    edge.validate_via()?;
+                    edge.validate_tunnel_door()?;
                 }
                 Ok(edges.clone())
             }
@@ -4305,7 +5112,7 @@ impl MirrorConfig {
         let legacy: &[&str] = match env {
             "dev" => &["local"],
             "pond" => &["local-sim", "sim"],
-            "cloud" => &["prod"],
+            "prod" => &["cloud"],
             _ => &[],
         };
         for stem in legacy {
@@ -4799,22 +5606,39 @@ pub struct DomainRoute {
     pub mode: RouteMode,
 }
 
-/// Body of a [`DomainRoute`]. Three modes:
-/// - **Static** — Worker reads from the domain's CDN bucket. Component
-///   ref points at a `kind = "mesofact-static"` (or similar) service
-///   component.
+/// Body of a [`DomainRoute`]. Three modes on the wire, four shapes here:
+/// - **Static** (`mode = "static"`, `component = …`) — the door serves a
+///   published component's bytes from its CDN prefix. Component ref points at
+///   a `kind = "mesofact-static"` (or similar) service component.
+/// - **StaticBucket** (`mode = "static"`, `bucket = …`, R560-F13) — the door
+///   serves an R2 bucket's ROOT, keyed by the request path minus its leading
+///   slash with nothing stripped or prepended. For a CDN whose route prefixes
+///   ARE its buckets' top-level key prefixes (cdn.noisetable.com), where xlb
+///   derives a blob's key from the very URL path it serves at, so path == key
+///   is an invariant rather than a convention.
 /// - **Backend** — Worker proxies to an HTTP origin owned by a backend
 ///   component (yubaba workload, gateway, etc.).
 /// - **Redirect** — Worker emits a 30x to the target URL. Used to keep
 ///   old paths alive during domain refactors.
+///
+/// The two static shapes are separate variants rather than one variant with
+/// two optional fields, so "both" and "neither" have no spelling in Rust. The
+/// TOML keeps one `mode = "static"` and the choice between `component` and
+/// `bucket` is refused at parse time unless exactly one is present — see
+/// [`RouteModeWire`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-#[serde(tag = "mode", rename_all = "kebab-case")]
+#[serde(try_from = "RouteModeWire", into = "RouteModeWire")]
 pub enum RouteMode {
     Static {
         /// Component reference `"<service>/<component-id>"`. Validated
         /// at [`CloudConfig::load`] time.
         component: String,
+    },
+    StaticBucket {
+        /// R2 bucket name. Validated against R2's naming rule at parse time,
+        /// which is also what makes [`crate::route_table::r2_binding_name`]
+        /// injective.
+        bucket: String,
     },
     Backend {
         /// Component reference `"<service>/<component-id>"`. Validated
@@ -4824,6 +5648,19 @@ pub enum RouteMode {
         /// be `https://...`, `wss://...`, or a yah-internal mesh URL
         /// resolved by yubaba.
         origin: String,
+        /// The path prefix this route's `path` becomes at the origin, when the
+        /// two differ (R898-F3). `/api/issues*` with `origin_path = "/issues"`
+        /// proxies `/api/issues/42` to `<origin>/issues/42`.
+        ///
+        /// Absent means an identity proxy — the public path reaches the origin
+        /// unchanged. It is declared here rather than derived because it is a
+        /// fact about the *upstream's* path layout, which this repo does not
+        /// own: the issue tracker serves `/issues` and the almanac serves
+        /// `/releases`, and both are live contracts that predate the domain
+        /// manifest. Compiled into [`RouteRewrite`](crate::route_table::RouteRewrite)
+        /// by [`DomainConfig::route_table`](crate::route_table).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_path: Option<String>,
     },
     Redirect {
         /// Absolute URL or path the Worker emits a 30x to.
@@ -4837,6 +5674,174 @@ pub enum RouteMode {
 
 fn default_redirect_status() -> u16 {
     308
+}
+
+/// The TOML/JSON shape of a [`RouteMode`]: one `mode = "static"` whose body
+/// names a `component` OR a `bucket`.
+///
+/// Private to parsing. The two optional fields exist only here, and
+/// `TryFrom` turns them into exactly one [`RouteMode`] variant or refuses the
+/// manifest naming both keys — so the contradictory route never reaches a
+/// consumer. It is also the JSON schema's source, since the schema describes
+/// what an author writes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(tag = "mode", rename_all = "kebab-case")]
+enum RouteModeWire {
+    Static {
+        /// Component reference `"<service>/<component-id>"`: serve that
+        /// component's published bytes. Exactly one of `component` / `bucket`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        component: Option<String>,
+        /// R2 bucket name: serve the bucket ROOT, the key being the request
+        /// path minus its leading slash with nothing stripped or prepended
+        /// (R560-F13). Requires `front_door = "worker"`. Exactly one of
+        /// `component` / `bucket`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bucket: Option<String>,
+    },
+    // Field docs below are the schema's text; they restate [`RouteMode`]'s.
+    Backend {
+        /// Component reference `"<service>/<component-id>"`. Validated
+        /// at [`CloudConfig::load`] time.
+        component: String,
+        /// Origin URL the Worker `fetch()`es. Schema-permissive — could
+        /// be `https://...`, `wss://...`, or a yah-internal mesh URL
+        /// resolved by yubaba.
+        origin: String,
+        /// The path prefix this route's `path` becomes at the origin, when the
+        /// two differ (R898-F3). `/api/issues*` with `origin_path = "/issues"`
+        /// proxies `/api/issues/42` to `<origin>/issues/42`.
+        ///
+        /// Absent means an identity proxy — the public path reaches the origin
+        /// unchanged. It is declared here rather than derived because it is a
+        /// fact about the *upstream's* path layout, which this repo does not
+        /// own: the issue tracker serves `/issues` and the almanac serves
+        /// `/releases`, and both are live contracts that predate the domain
+        /// manifest. Compiled into [`RouteRewrite`](crate::route_table::RouteRewrite)
+        /// by [`DomainConfig::route_table`](crate::route_table).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_path: Option<String>,
+    },
+    Redirect {
+        /// Absolute URL or path the Worker emits a 30x to.
+        target: String,
+        /// HTTP status code. Defaults to 308 (permanent + method-preserving)
+        /// so deprecations don't silently turn POSTs into GETs.
+        #[serde(default = "default_redirect_status")]
+        status: u16,
+    },
+}
+
+impl TryFrom<RouteModeWire> for RouteMode {
+    type Error = String;
+
+    fn try_from(wire: RouteModeWire) -> std::result::Result<Self, String> {
+        Ok(match wire {
+            RouteModeWire::Static {
+                component: Some(component),
+                bucket: None,
+            } => Self::Static { component },
+            RouteModeWire::Static {
+                component: None,
+                bucket: Some(bucket),
+            } => {
+                validate_r2_bucket_name(&bucket)?;
+                Self::StaticBucket { bucket }
+            }
+            RouteModeWire::Static {
+                component: Some(component),
+                bucket: Some(bucket),
+            } => {
+                return Err(format!(
+                    "a static route declares both component = \"{component}\" and bucket = \
+                     \"{bucket}\" — declare exactly one: `component` serves a published \
+                     component from its CDN prefix, `bucket` serves an R2 bucket root with \
+                     the request path as the key"
+                ))
+            }
+            RouteModeWire::Static {
+                component: None,
+                bucket: None,
+            } => {
+                return Err("a static route declares neither `component` nor `bucket` — \
+                     declare exactly one"
+                    .to_string())
+            }
+            RouteModeWire::Backend {
+                component,
+                origin,
+                origin_path,
+            } => Self::Backend {
+                component,
+                origin,
+                origin_path,
+            },
+            RouteModeWire::Redirect { target, status } => Self::Redirect { target, status },
+        })
+    }
+}
+
+impl From<RouteMode> for RouteModeWire {
+    fn from(mode: RouteMode) -> Self {
+        match mode {
+            RouteMode::Static { component } => Self::Static {
+                component: Some(component),
+                bucket: None,
+            },
+            RouteMode::StaticBucket { bucket } => Self::Static {
+                component: None,
+                bucket: Some(bucket),
+            },
+            RouteMode::Backend {
+                component,
+                origin,
+                origin_path,
+            } => Self::Backend {
+                component,
+                origin,
+                origin_path,
+            },
+            RouteMode::Redirect { target, status } => Self::Redirect { target, status },
+        }
+    }
+}
+
+// Hand-written only because schemars 0.8 does not follow `#[serde(try_from)]`:
+// a derive would describe the Rust variants (`static-bucket`), which no
+// manifest may spell. The schema is the wire shape an author writes.
+#[cfg(feature = "json-schema")]
+impl schemars::JsonSchema for RouteMode {
+    fn schema_name() -> String {
+        "RouteMode".to_string()
+    }
+
+    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        <RouteModeWire as schemars::JsonSchema>::json_schema(gen)
+    }
+}
+
+/// R2's bucket naming rule: 3–63 characters of lowercase letters, digits and
+/// hyphens, starting and ending with a letter or digit.
+///
+/// Checked at parse time rather than left to the deploy's 400, and load-bearing
+/// beyond that: the Worker binding name derived from a bucket
+/// ([`crate::route_table::r2_binding_name`]) only maps `-` to `_`, which is
+/// collision-free exactly because a bucket name can carry no `_` of its own.
+fn validate_r2_bucket_name(bucket: &str) -> std::result::Result<(), String> {
+    let valid_chars = bucket
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    let valid_ends = bucket.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && bucket.ends_with(|c: char| c.is_ascii_alphanumeric());
+    if (3..=63).contains(&bucket.len()) && valid_chars && valid_ends {
+        Ok(())
+    } else {
+        Err(format!(
+            "bucket = \"{bucket}\" is not an R2 bucket name — 3 to 63 characters of \
+             lowercase letters, digits and hyphens, starting and ending with a letter or digit"
+        ))
+    }
 }
 
 /// Normalize a component `mount` to a storage/URL key prefix: strip the
@@ -4880,6 +5885,14 @@ pub fn domain_serving_service<'a>(
 /// workspace's domain manifests. `"[]"` when no route-driven domain routes the
 /// service, or when the one that does declares no headers.
 ///
+/// R898-F1 widened this into
+/// [`route_table_for_service`](crate::route_table::route_table_for_service):
+/// same lookup, same `.yah/domains/` read, the whole compiled table
+/// (`{path, mode, resolved origin, headers, auth}`) instead of its header
+/// column. This spelling survives because it is what the *bindings* carry until
+/// R898-F2/F3 widen those consumers — and because it needs no placement, which
+/// the reconcilers calling it do not have.
+///
 /// Reads `.yah/domains/` directly rather than taking a loaded [`CloudConfig`]:
 /// the static reconcilers are handed a per-component [`ReconcileCtx`], not the
 /// whole workspace config, and threading a config reference through all 22 of
@@ -4888,10 +5901,23 @@ pub fn domain_serving_service<'a>(
 /// loads is a deploy-stopping fact, not a reason to ship a Worker with the
 /// headers quietly missing.
 pub fn route_headers_for_service(workspace_root: &Path, service: &str) -> Result<String> {
-    let domains = load_domains(&crate::paths::domains_dir(workspace_root))?;
-    Ok(domain_serving_service(&domains, service)
+    Ok(domain_for_service(workspace_root, service)?
+        .as_ref()
         .map(DomainConfig::route_headers_json)
         .unwrap_or_else(|| "[]".to_string()))
+}
+
+/// The route-driven domain manifest serving `service`, loaded from
+/// `.yah/domains/`.
+///
+/// The whole manifest rather than one projection of it, for the consumer that
+/// needs more than the header column: R898-F3's Worker reconciler compiles the
+/// full route table (`{path, mode, origin, rewrite, headers, auth}`) and cannot
+/// re-derive modes and origins from `route_headers_json`'s output. Same lookup
+/// [`route_headers_for_service`] makes — it is now a caller of this.
+pub fn domain_for_service(workspace_root: &Path, service: &str) -> Result<Option<DomainConfig>> {
+    let domains = load_domains(&crate::paths::domains_dir(workspace_root))?;
+    Ok(domain_serving_service(&domains, service).cloned())
 }
 
 impl DomainConfig {
@@ -4946,6 +5972,25 @@ impl DomainConfig {
                 }
             }
             FrontDoor::Worker | FrontDoor::Passway => {
+                // R560-F13: a bucket route is read through a Worker R2 binding.
+                // Passway has no R2 read path, so accepting one there would
+                // compile an entry the door cannot serve — refused naming the
+                // route instead.
+                if self.front_door == FrontDoor::Passway {
+                    if let Some(route) = self
+                        .routes
+                        .iter()
+                        .find(|r| matches!(r.mode, RouteMode::StaticBucket { .. }))
+                    {
+                        anyhow::bail!(
+                            "front_door = \"passway\" but routes path = \"{}\" declares \
+                             `bucket` — a bucket route is served through a Cloudflare Worker \
+                             R2 binding, and passway has no R2 read path. Set front_door = \
+                             \"worker\", or serve the path from a published `component`.",
+                            route.path
+                        );
+                    }
+                }
                 if self.routes.is_empty() {
                     anyhow::bail!(
                         "front_door = \"{}\" but [[routes]] is empty — a front door \
@@ -4960,35 +6005,9 @@ impl DomainConfig {
         Ok(())
     }
 
-    /// The `ROUTE_HEADERS` Worker binding for this domain (R746) — the route
-    /// table's `path` + `headers` pairs, in manifest order, with routes that
-    /// declare no headers dropped. `"[]"` when nothing declares any.
-    ///
-    /// Order is load-bearing and must survive serialization: the front door
-    /// applies the FIRST matching rule, so `/app/*` above `/*` is what gives
-    /// the app its isolation headers and leaves the marketing site alone.
-    /// That is why this is a `Vec` of pairs and not a map keyed by path.
-    ///
-    /// Infallible by design — [`Self::validate_route_headers`] has already run
-    /// at [`Self::load`], so by the time a reconciler calls this the table is
-    /// known to be one both front doors can apply.
-    pub fn route_headers_json(&self) -> String {
-        #[derive(Serialize)]
-        struct Rule<'a> {
-            path: &'a str,
-            headers: &'a BTreeMap<String, String>,
-        }
-        let rules: Vec<Rule<'_>> = self
-            .routes
-            .iter()
-            .filter(|r| !r.headers.is_empty())
-            .map(|r| Rule {
-                path: &r.path,
-                headers: &r.headers,
-            })
-            .collect();
-        serde_json::to_string(&rules).unwrap_or_else(|_| "[]".to_string())
-    }
+    // `route_headers_json` — the header column of the compiled route table —
+    // lives in `crate::route_table` alongside `route_table`, `RouteTable` and
+    // the one serializer both projections share (R898-F1).
 
     /// R749-T5 — everything [`Self::route_headers_json`] emits must be
     /// *applicable*, checked here where the table is PRODUCED.
@@ -5084,11 +6103,12 @@ impl DomainConfig {
 }
 
 impl RouteMode {
-    /// Component reference for static/backend modes; `None` for redirects.
+    /// Component reference for static/backend modes; `None` for redirects and
+    /// bucket-root static routes, which reference no component.
     pub fn component(&self) -> Option<&str> {
         match self {
             Self::Static { component } | Self::Backend { component, .. } => Some(component),
-            Self::Redirect { .. } => None,
+            Self::StaticBucket { .. } | Self::Redirect { .. } => None,
         }
     }
 }
@@ -5112,9 +6132,10 @@ impl RouteMode {
 ///
 /// ```toml
 /// #:schema ../../schema/secret.toml.schema.json
-/// schema_version = 1
+/// schema_version = 2
 /// name = "cheers/cloud-admin/verify-key"
 /// vault_slot = "cheers-cloud-admin-verify-key"
+/// groups = ["prod"]
 /// description = "Ed25519 public key yah-cloud-admin verifies operator PASETOs with"
 ///
 /// [access]
@@ -5140,6 +6161,17 @@ pub struct SecretConfig {
     /// particular the value is not in this file, so the declaration is safe to
     /// commit.
     pub vault_slot: String,
+
+    /// The sovereign groups this secret belongs to (R911-F8). Required and
+    /// non-empty; each entry must be a `sovereign_group` that some
+    /// `.yah/infra/machines/*.toml` declares ([`SecretConfig::load`] checks).
+    ///
+    /// Cluster secrets live per group in the fleet object store
+    /// (`secrets/<group>/<name>.sealed`), so a declaration with no group has
+    /// nowhere to land and nothing to be compared against. `yah cloud secret
+    /// put` refuses a node whose `/raft/status` group is not listed here, and
+    /// `status` counts a declaration only against nodes in one of these groups.
+    pub groups: Vec<String>,
 
     /// Human note for `yah cloud secret ls`. What this secret is and who minted
     /// it — the thing nobody remembers 6 months later.
@@ -5245,14 +6277,23 @@ impl SecretTargetDecl {
     }
 }
 
+/// The `schema_version` every [`SecretConfig`] must carry. Version 2 added the
+/// required `groups` (R911-F8).
+pub const SECRET_CONFIG_SCHEMA_VERSION: u32 = 2;
+
 impl SecretConfig {
     /// Parse a single `.yah/infra/secrets/<slug>.toml`.
-    pub fn load(path: &Path) -> Result<Self> {
+    ///
+    /// `sovereign_groups` is the camp's group vocabulary
+    /// ([`CloudConfig::declared_sovereign_groups`]); every entry in `groups`
+    /// must be one of them.
+    pub fn load(path: &Path, sovereign_groups: &[&str]) -> Result<Self> {
         let src =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let cfg: Self =
             toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
         cfg.validate()
+            .and_then(|()| cfg.validate_groups(sovereign_groups))
             .with_context(|| format!("validating {}", path.display()))?;
         Ok(cfg)
     }
@@ -5263,7 +6304,7 @@ impl SecretConfig {
     /// Two files declaring the same `name` is a hard error, not a last-writer-
     /// wins merge: they would race to define the access rule for one record, and
     /// whichever lost would look correct in git while being inert on the fleet.
-    pub fn load_dir(dir: &Path) -> Result<BTreeMap<String, Self>> {
+    pub fn load_dir(dir: &Path, sovereign_groups: &[&str]) -> Result<BTreeMap<String, Self>> {
         let mut out: BTreeMap<String, Self> = BTreeMap::new();
         if !dir.exists() {
             return Ok(out);
@@ -5273,7 +6314,7 @@ impl SecretConfig {
             if path.extension().is_none_or(|e| e != "toml") {
                 continue;
             }
-            let cfg = Self::load(&path)?;
+            let cfg = Self::load(&path, sovereign_groups)?;
             if let Some(prev) = out.insert(cfg.name.clone(), cfg) {
                 anyhow::bail!(
                     "two secret declarations both claim name {:?} (one of them is {}); \
@@ -5288,9 +6329,32 @@ impl SecretConfig {
     }
 
     /// Reject declarations that would produce an unusable or dangerous record.
+    ///
+    /// Structural only: whether each of `groups` names a real sovereign group
+    /// needs the camp's machines, so that half is [`Self::validate_groups`].
     pub fn validate(&self) -> Result<()> {
+        if self.schema_version != SECRET_CONFIG_SCHEMA_VERSION {
+            anyhow::bail!(
+                "`schema_version` is {}, expected {SECRET_CONFIG_SCHEMA_VERSION}: version 2 \
+                 added the required `groups = [\"<sovereign group>\", ...]` (R911-F8)",
+                self.schema_version
+            );
+        }
         if self.name.trim().is_empty() {
             anyhow::bail!("`name` must not be empty");
+        }
+        if self.groups.is_empty() {
+            anyhow::bail!(
+                "`groups` must name at least one sovereign group: cluster secrets live per \
+                 group (secrets/<group>/), so a declaration in no group has nowhere to land"
+            );
+        }
+        if let Some(bad) = self.groups.iter().find(|g| g.trim().is_empty()) {
+            anyhow::bail!("`groups` has an empty entry: {bad:?}");
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        if let Some(dup) = self.groups.iter().find(|g| !seen.insert(g.as_str())) {
+            anyhow::bail!("`groups` lists {dup:?} twice");
         }
         if self.vault_slot.trim().is_empty() {
             anyhow::bail!(
@@ -5316,6 +6380,29 @@ impl SecretConfig {
         }
         Ok(())
     }
+
+    /// Every entry in `groups` must be a sovereign group the camp's machines
+    /// declare. A typo would otherwise produce a declaration no node ever
+    /// matches, which `put` would refuse everywhere and `status` would never
+    /// count, without either one saying why.
+    pub fn validate_groups(&self, sovereign_groups: &[&str]) -> Result<()> {
+        if let Some(unknown) = self
+            .groups
+            .iter()
+            .find(|g| !sovereign_groups.contains(&g.as_str()))
+        {
+            anyhow::bail!(
+                "`groups` names {unknown:?}, which no .yah/infra/machines/*.toml declares as a \
+                 `sovereign_group` (declared: {})",
+                if sovereign_groups.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    sovereign_groups.join(", ")
+                }
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -5332,15 +6419,17 @@ mod secret_config_tests {
     fn minimal_declaration_parses_with_narrow_defaults() {
         let cfg = parse(
             r#"
-schema_version = 1
+schema_version = 2
 name = "svc/token"
 vault_slot = "svc-token"
+groups = ["prod"]
 [access]
 workloads = [{ workload = "svc" }]
 "#,
         )
         .unwrap();
 
+        assert_eq!(cfg.groups, vec!["prod".to_string()]);
         assert_eq!(cfg.encoding, SecretEncoding::Utf8, "text is the default");
         assert!(cfg.target.is_none());
         // The omitted tenant/namespace must narrow to the singletons, not widen
@@ -5358,9 +6447,10 @@ workloads = [{ workload = "svc" }]
         // The operator-facing spelling, pinned: `access = "allow_any"`.
         let cfg = parse(
             r#"
-schema_version = 1
+schema_version = 2
 name = "public/thing"
 vault_slot = "slot"
+groups = ["prod"]
 access = "allow_any"
 "#,
         )
@@ -5375,9 +6465,10 @@ access = "allow_any"
         // not silently produce a secret nobody can mount.
         let err = parse(
             r#"
-schema_version = 1
+schema_version = 2
 name = "svc/token"
 vault_slot = "svc-token"
+groups = ["prod"]
 "#,
         )
         .unwrap_err()
@@ -5389,18 +6480,20 @@ vault_slot = "svc-token"
     fn empty_name_or_slot_is_rejected() {
         assert!(parse(
             r#"
-schema_version = 1
+schema_version = 2
 name = ""
 vault_slot = "slot"
+groups = ["prod"]
 access = "allow_any"
 "#
         )
         .is_err());
         assert!(parse(
             r#"
-schema_version = 1
+schema_version = 2
 name = "x"
 vault_slot = "  "
+groups = ["prod"]
 access = "allow_any"
 "#
         )
@@ -5411,9 +6504,10 @@ access = "allow_any"
     fn target_declaration_maps_onto_the_workload_spec_type() {
         let cfg = parse(
             r#"
-schema_version = 1
+schema_version = 2
 name = "svc/token"
 vault_slot = "slot"
+groups = ["prod"]
 access = "allow_any"
 [target]
 kind = "file"
@@ -5433,15 +6527,93 @@ path = "/run/secrets/t"
     #[test]
     fn load_dir_is_empty_for_a_camp_with_no_secrets() {
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(SecretConfig::load_dir(&tmp.path().join("nope"))
+        assert!(SecretConfig::load_dir(&tmp.path().join("nope"), &["prod"])
             .unwrap()
             .is_empty());
+    }
+
+    /// Write `body` to a temp file and run the real loader over it, so the
+    /// assertions see the error chain an operator would.
+    fn load_body(body: &str, sovereign_groups: &[&str]) -> Result<SecretConfig> {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("decl.toml");
+        std::fs::write(&path, body).unwrap();
+        SecretConfig::load(&path, sovereign_groups)
+    }
+
+    #[test]
+    fn a_declaration_without_groups_fails_to_load_naming_the_field() {
+        let err = format!(
+            "{:#}",
+            load_body(
+                "schema_version = 2\nname = \"svc/token\"\nvault_slot = \"slot\"\n\
+                 access = \"allow_any\"\n",
+                &["prod"],
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("groups"), "must name the field: {err}");
+        assert!(err.contains("decl.toml"), "must name the file: {err}");
+    }
+
+    #[test]
+    fn an_empty_or_duplicated_group_list_is_rejected() {
+        let err = format!(
+            "{:#}",
+            load_body(
+                "schema_version = 2\nname = \"s\"\nvault_slot = \"slot\"\ngroups = []\n\
+                 access = \"allow_any\"\n",
+                &["prod"],
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("at least one sovereign group"), "got {err}");
+
+        let err = format!(
+            "{:#}",
+            load_body(
+                "schema_version = 2\nname = \"s\"\nvault_slot = \"slot\"\n\
+                 groups = [\"prod\", \"prod\"]\naccess = \"allow_any\"\n",
+                &["prod"],
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("twice"), "got {err}");
+    }
+
+    #[test]
+    fn a_group_no_machine_declares_is_rejected_naming_the_vocabulary() {
+        let err = format!(
+            "{:#}",
+            load_body(
+                "schema_version = 2\nname = \"s\"\nvault_slot = \"slot\"\n\
+                 groups = [\"stagin\"]\naccess = \"allow_any\"\n",
+                &["dev", "prod"],
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("\"stagin\""), "names the bad entry: {err}");
+        assert!(err.contains("dev, prod"), "names what is declared: {err}");
+    }
+
+    #[test]
+    fn a_version_1_declaration_is_refused_naming_the_migration() {
+        let err = format!(
+            "{:#}",
+            load_body(
+                "schema_version = 1\nname = \"s\"\nvault_slot = \"slot\"\n\
+                 groups = [\"prod\"]\naccess = \"allow_any\"\n",
+                &["prod"],
+            )
+            .unwrap_err()
+        );
+        assert!(err.contains("schema_version") && err.contains("groups"), "got {err}");
     }
 }
 
 /// Split a `"<service>/<component-id>"` ref. Returns `None` if the ref
 /// isn't shaped like `service/component`.
-fn split_component_ref(s: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_component_ref(s: &str) -> Option<(&str, &str)> {
     let (svc, comp) = s.split_once('/')?;
     if svc.is_empty() || comp.is_empty() || comp.contains('/') {
         return None;
@@ -5504,12 +6676,12 @@ mod tests {
             providers: vec![],
             machine_origins: BTreeMap::new(),
             provider_origins: BTreeMap::new(),
+            recovery_measurements: BTreeMap::new(),
             services: BTreeMap::new(),
             domains: BTreeMap::new(),
             legacy_mirrors: vec![],
             workloads: vec![],
             topology: TopologyConfig::default(),
-            legacy_services: vec![],
         }
     }
 
@@ -6276,73 +7448,6 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
     }
 
     #[test]
-    fn round_trip_service_legacy() {
-        let cfg = LegacyServiceConfig {
-            name: "asset-registry".into(),
-            image: "ghcr.io/noisetable/asset-registry".into(),
-            version: "v1.0.0".into(),
-            env: HashMap::new(),
-            ports: vec![PortMapping {
-                host: 8080,
-                container: 8080,
-            }],
-            mesh_only: false,
-            bind_interface: None,
-            tenant: TenantId::singleton(),
-        };
-        let s = toml::to_string(&cfg).unwrap();
-        let back: LegacyServiceConfig = toml::from_str(&s).unwrap();
-        assert_eq!(back.name, cfg.name);
-        assert_eq!(back.image, cfg.image);
-    }
-
-    #[test]
-    fn service_bind_interface_round_trips() {
-        let cfg = LegacyServiceConfig {
-            name: "postgres".into(),
-            image: "postgres".into(),
-            version: "16".into(),
-            env: HashMap::new(),
-            ports: vec![PortMapping {
-                host: 5432,
-                container: 5432,
-            }],
-            mesh_only: true,
-            bind_interface: Some("tailscale0".into()),
-            tenant: TenantId::singleton(),
-        };
-        let s = toml::to_string(&cfg).unwrap();
-        let back: LegacyServiceConfig = toml::from_str(&s).unwrap();
-        assert_eq!(back.bind_interface.as_deref(), Some("tailscale0"));
-    }
-
-    #[test]
-    fn service_bind_interface_absent_is_none() {
-        let toml_str = "name = \"app\"\nimage = \"app\"\nversion = \"v1\"\n";
-        let cfg: LegacyServiceConfig = toml::from_str(toml_str).unwrap();
-        assert!(
-            cfg.bind_interface.is_none(),
-            "bind_interface should default to None"
-        );
-    }
-
-    #[test]
-    fn service_bind_interface_skipped_when_none() {
-        let cfg = LegacyServiceConfig {
-            name: "app".into(),
-            image: "app".into(),
-            version: "v1".into(),
-            env: HashMap::new(),
-            ports: vec![],
-            mesh_only: false,
-            bind_interface: None,
-            tenant: TenantId::singleton(),
-        };
-        let s = toml::to_string(&cfg).unwrap();
-        assert!(!s.contains("bind_interface"), "None should be skipped: {s}");
-    }
-
-    #[test]
     fn load_dir_missing_is_empty() {
         let dir = std::path::PathBuf::from("/nonexistent/path");
         let result: Vec<MachineConfig> = load_dir(dir).unwrap();
@@ -6429,16 +7534,10 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
         std::fs::create_dir_all(cloud_dir.join("mirrors")).unwrap();
         std::fs::write(cloud_dir.join("mirrors/noisetable.toml"), mirror_toml).unwrap();
 
-        // Legacy services/ dir (backward compat)
-        let svc_toml = "name = \"asset-registry\"\nimage = \"ghcr.io/noisetable/asset-registry\"\nversion = \"v1.0.0\"\nmesh_only = false\n";
-        std::fs::create_dir_all(cloud_dir.join("services")).unwrap();
-        std::fs::write(cloud_dir.join("services/asset-registry.toml"), svc_toml).unwrap();
-
         let cfg = CloudConfig::load(root).unwrap();
 
         assert_eq!(cfg.machines.len(), 1);
         assert_eq!(cfg.legacy_mirrors.len(), 1);
-        assert_eq!(cfg.legacy_services.len(), 1);
         assert_eq!(cfg.workloads.len(), 0); // no workloads/ dir yet
         assert!(cfg.services.is_empty(), "no R215+ services/ tree");
         assert!(cfg.providers.is_empty(), "no R215+ providers/ tree");
@@ -6532,7 +7631,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
     fn workload_config_load_and_validate() {
         use workload_spec::{
             ExposeSpec, ImageRef, MeshExpose, MeshIdent, NamespaceId, ResourceLimits,
-            RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
+            RestartPolicy, StopPolicy, TenantId, TierTag, WorkloadSpec,
         };
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6541,7 +7640,6 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
         std::fs::create_dir_all(cloud_dir.join("workloads")).unwrap();
 
         let spec = WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: "asset-registry".into(),
             image: ImageRef {
                 registry: "ghcr.io".into(),
@@ -6561,7 +7659,10 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             resources: ResourceLimits {
                 memory_mb: 256,
                 cpu_millis: 512,
-                ephemeral_storage_mb: 512,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -6584,6 +7685,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             tenant: TenantId::singleton(),
             namespace: NamespaceId::singleton(),
             labels: Default::default(),
+            durability: None,
             annotations: Default::default(),
             files: Vec::new(),
         };
@@ -6604,10 +7706,9 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
     fn minimal_spec(name: &str, replicas: u32) -> workload_spec::WorkloadSpec {
         use workload_spec::{
             ExposeSpec, ImageRef, MeshExpose, MeshIdent, NamespaceId, ResourceLimits,
-            RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
+            RestartPolicy, StopPolicy, TenantId, TierTag, WorkloadSpec,
         };
         WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: name.into(),
             image: ImageRef {
                 registry: "cr.yah.dev".into(),
@@ -6627,7 +7728,10 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             resources: ResourceLimits {
                 memory_mb: 256,
                 cpu_millis: 250,
-                ephemeral_storage_mb: 128,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -6650,6 +7754,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             tenant: TenantId::singleton(),
             namespace: NamespaceId::singleton(),
             labels: Default::default(),
+            durability: None,
             annotations: Default::default(),
             files: Vec::new(),
         }
@@ -6734,7 +7839,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
     fn workload_loader_rejects_bad_spec() {
         use workload_spec::{
             ExposeSpec, ImageRef, MeshExpose, MeshIdent, NamespaceId, ResourceLimits,
-            RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
+            RestartPolicy, StopPolicy, TenantId, TierTag, WorkloadSpec,
         };
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6745,7 +7850,6 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
         // Construct a spec that round-trips through TOML but fails shape
         // validation: replicas = 200 is above the max of 100.
         let mut spec = WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: "asset-registry".into(),
             image: ImageRef {
                 registry: "ghcr.io".into(),
@@ -6765,7 +7869,10 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             resources: ResourceLimits {
                 memory_mb: 256,
                 cpu_millis: 512,
-                ephemeral_storage_mb: 512,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -6788,6 +7895,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             tenant: TenantId::singleton(),
             namespace: NamespaceId::singleton(),
             labels: Default::default(),
+            durability: None,
             annotations: Default::default(),
             files: Vec::new(),
         };
@@ -6816,14 +7924,13 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
     fn workload_config_save_round_trip() {
         use workload_spec::{
             ExposeSpec, ImageRef, MeshExpose, MeshIdent, NamespaceId, ResourceLimits,
-            RestartPolicy, SchemaVersion, StopPolicy, TenantId, TierTag, WorkloadSpec,
+            RestartPolicy, StopPolicy, TenantId, TierTag, WorkloadSpec,
         };
 
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
 
         let spec = WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: "signing-service".into(),
             image: ImageRef {
                 registry: "ghcr.io".into(),
@@ -6843,7 +7950,10 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             resources: ResourceLimits {
                 memory_mb: 128,
                 cpu_millis: 256,
-                ephemeral_storage_mb: 256,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -6866,6 +7976,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             tenant: TenantId::singleton(),
             namespace: NamespaceId::singleton(),
             labels: Default::default(),
+            durability: None,
             annotations: Default::default(),
             files: Vec::new(),
         };
@@ -7098,7 +8209,7 @@ schema_version = 1
 shape = "local"
 
 [providers.static]
-kind = "local-static"
+kind = "miniflare-native"
 port = 4321
 artifact_dir = ".yah/infra/state/local/static"
 
@@ -7109,7 +8220,7 @@ use = "orbstack"
         assert_eq!(cfg.shape, MirrorShape::Local);
 
         let static_slot = cfg.providers.get("static").expect("static slot");
-        assert_eq!(static_slot.inline_kind(), Some(Provider::LocalStatic));
+        assert_eq!(static_slot.inline_kind(), Some(Provider::MiniflareNative));
         assert!(static_slot.provider_id().is_none());
         if let MirrorProviderSlot::Inline { fields, .. } = static_slot {
             assert_eq!(fields.get("port").and_then(|v| v.as_integer()), Some(4321));
@@ -7690,7 +8801,7 @@ role = "static"
         )
         .unwrap();
         std::fs::write(
-            svc.join("mirrors/prod.toml"),
+            svc.join("mirrors/cloud.toml"),
             r#"schema_version = 1
 shape = "single-machine"
 
@@ -7707,7 +8818,7 @@ zone = "yah.dev"
 shape = "local"
 
 [providers.static]
-kind = "local-static"
+kind = "miniflare-native"
 port = 4321
 
 [providers.compute]
@@ -7733,15 +8844,14 @@ use = "orbstack"
         assert_eq!(dev.service.domain, "yah.dev");
         assert_eq!(dev.service.components.len(), 1);
         assert_eq!(dev.mirrors.len(), 2);
-        // Legacy file stems "prod" and "local" are normalised to canonical tier names.
-        assert!(dev.mirrors.contains_key("cloud"), "prod.toml → cloud tier");
+        // Legacy file stems "cloud" and "local" are normalised to canonical tier names.
+        assert!(dev.mirrors.contains_key("prod"), "cloud.toml → prod tier");
         assert!(dev.mirrors.contains_key("dev"), "local.toml → dev tier");
-        assert_eq!(dev.mirrors["cloud"].shape, MirrorShape::SingleMachine);
+        assert_eq!(dev.mirrors["prod"].shape, MirrorShape::SingleMachine);
         assert_eq!(dev.mirrors["dev"].shape, MirrorShape::Local);
 
         // Legacy fields stay empty when no .yah/cloud/ exists.
         assert!(cfg.legacy_mirrors.is_empty());
-        assert!(cfg.legacy_services.is_empty());
         assert!(cfg.workloads.is_empty());
     }
 
@@ -7772,6 +8882,91 @@ use = "orbstack"
             msg.contains("providers/fly-io.toml") || msg.contains("no such provider"),
             "error should hint at remedy, got: {msg}"
         );
+    }
+
+    /// R905. `[build.<id>]` is the per-environment build override, and it is
+    /// keyed by component id — so a key naming no declared component is a
+    /// silent no-op: the environment goes on building with the command the
+    /// operator believed they had replaced.
+    #[test]
+    fn cloud_config_cross_ref_fails_on_a_build_override_for_an_unknown_component() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let svc = root.join(".yah").join("services").join("dev-yah");
+        std::fs::create_dir_all(svc.join("mirrors")).unwrap();
+        std::fs::write(
+            svc.join("service.toml"),
+            "schema_version = 1\nname = \"dev-yah\"\ndomain = \"yah.dev\"\n\n\
+             [[components]]\nid = \"site\"\nkind = \"mesofact-spa\"\n\
+             path = \"web/landing\"\nrole = \"static\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            svc.join("mirrors/staging.toml"),
+            "schema_version = 1\nshape = \"single-machine\"\n\n\
+             [build.sight]\ncommand = \"bun run build:staging\"\n",
+        )
+        .unwrap();
+
+        let msg = CloudConfig::load(root).unwrap_err().to_string();
+        assert!(
+            msg.contains("build.sight") && msg.contains("site"),
+            "error should name the bad key and the declared ids, got: {msg}"
+        );
+    }
+
+    /// The same mirror, spelled correctly, loads and resolves — including the
+    /// `env` half, which is the knob a project uses when it does not want a
+    /// sibling `build:<env>` script per environment (R905).
+    #[test]
+    fn a_mirror_build_override_resolves_by_component_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let svc = root.join(".yah").join("services").join("dev-yah");
+        std::fs::create_dir_all(svc.join("mirrors")).unwrap();
+        std::fs::write(
+            svc.join("service.toml"),
+            "schema_version = 1\nname = \"dev-yah\"\ndomain = \"yah.dev\"\n\n\
+             [[components]]\nid = \"site\"\nkind = \"mesofact-spa\"\n\
+             path = \"web/landing\"\nrole = \"static\"\n\n\
+             [[components]]\nid = \"app\"\nkind = \"mesofact-static\"\n\
+             path = \"app/browser\"\nrole = \"static\"\nmount = \"/app\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            svc.join("mirrors/staging.toml"),
+            "schema_version = 1\nshape = \"single-machine\"\n\n\
+             [build.site]\ncommand = \"bun run build:staging\"\n\n\
+             [build.site.env]\nAPI_ORIGIN = \"https://api-staging.example.com\"\n",
+        )
+        .unwrap();
+
+        let cfg = CloudConfig::load(root).unwrap();
+        let mirror = &cfg.service("dev-yah").unwrap().mirrors["staging"];
+
+        let site = mirror.build_override("site").expect("site override");
+        assert_eq!(site.command.as_deref(), Some("bun run build:staging"));
+        assert_eq!(
+            site.env_pairs(),
+            vec![(
+                "API_ORIGIN".to_string(),
+                "https://api-staging.example.com".to_string()
+            )]
+        );
+        // A sibling component under the same mirror is untouched — the
+        // override is per component, not per mirror.
+        assert!(mirror.build_override("app").is_none());
+    }
+
+    /// An override that names nothing reads as no override at all, so callers
+    /// can treat `Some(_)` as "something differs here" (R905).
+    #[test]
+    fn an_empty_build_override_reads_as_absent() {
+        let empty = MirrorBuildOverride::default();
+        assert!(empty.is_empty());
+        let mut m = mirror("");
+        m.build.insert("site".into(), empty);
+        assert!(m.build_override("site").is_none());
     }
 
     #[test]
@@ -7805,7 +9000,7 @@ use = "orbstack"
 
     #[test]
     fn cloud_config_cross_ref_passes_on_inline_only_mirror() {
-        // Inline `kind = "local-static"` doesn't require an infra provider.
+        // Inline `kind = "miniflare-native"` doesn't require an infra provider.
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
         let svc = root.join(".yah").join("services").join("local-only");
@@ -7817,7 +9012,7 @@ use = "orbstack"
         .unwrap();
         std::fs::write(
             svc.join("mirrors/local.toml"),
-            "schema_version = 1\nshape = \"local\"\n\n[providers.static]\nkind = \"local-static\"\nport = 8080\n",
+            "schema_version = 1\nshape = \"local\"\n\n[providers.static]\nkind = \"miniflare-native\"\nport = 8080\n",
         ).unwrap();
 
         // Should load fine: no `use=` references, no providers required.
@@ -7883,6 +9078,126 @@ use = "orbstack"
         assert_eq!(orphaned.passway_machines(), None);
     }
 
+    /// Same as [`mirror`] but surfacing the parse error instead of panicking —
+    /// R870-F26's half-written-auth cases are refused BY serde, so the message
+    /// only exists on this side of the `expect`.
+    fn try_mirror(src: &str) -> std::result::Result<MirrorConfig, toml::de::Error> {
+        toml::from_str(&format!("schema_version = 1\nshape = \"single-machine\"\n{src}"))
+    }
+
+    const FULL_AUTH: &str = "[ingress.auth]\n\
+         key_secret = \"cheers/yah-camp/verify\"\n\
+         kid = \"YOHV4Riq-g8fX4uYl8rTjQ\"\n\
+         iss = \"yah-camp\"\n\
+         aud = \"analytics.yah.dev\"\n\
+         require_prefixes = [\"/\"]\n";
+
+    /// R870-F26 — the vocabulary itself: a complete `[ingress.auth]` table
+    /// lands on the edge as the renderer's own `PasswayAuth`, which is what
+    /// `apply` hands to `PasswayIngressSpec` so the push carries the five
+    /// variables rather than stripping them.
+    #[test]
+    fn an_ingress_edge_carries_a_declared_auth_table_through_to_the_renderers_type() {
+        let m = mirror(&format!(
+            "[[ingress]]\nprovider = \"passway\"\nmachines = [\"us-east-001\"]\n{FULL_AUTH}"
+        ));
+        let edges = m.ingress_edges().expect("a complete auth table is accepted");
+        let auth = edges[0].auth.as_ref().expect("the table reached the edge");
+        assert_eq!(auth.key_secret, "cheers/yah-camp/verify");
+        assert_eq!(auth.kid, "YOHV4Riq-g8fX4uYl8rTjQ");
+        assert_eq!(auth.iss, "yah-camp");
+        assert_eq!(auth.aud, "analytics.yah.dev");
+        assert_eq!(auth.require_prefixes, vec!["/".to_string()]);
+    }
+
+    /// An edge with no auth is byte-identically what it was before the field
+    /// existed. The default path is the one this must not move.
+    #[test]
+    fn an_edge_that_declares_no_auth_is_unchanged() {
+        let m = mirror("[[ingress]]\nprovider = \"passway\"\nmachines = [\"us-east-001\"]\n");
+        assert_eq!(m.ingress_edges().unwrap()[0].auth, None);
+        // And the scalar spelling, which cannot express auth at all.
+        assert_eq!(
+            mirror("ingress = \"passway\"\n").ingress_edges().unwrap()[0].auth,
+            None
+        );
+    }
+
+    /// A HALF-WRITTEN table is refused at load, naming the field that is
+    /// missing — never deployed as a half-configured door.
+    ///
+    /// This is serde's own doing, and deliberately so: all five fields are
+    /// required on `PasswayAuth`, so there is no partial value to construct.
+    /// The dangerous half is the one that fails QUIETLY — `kid`/`iss`/`aud`
+    /// without `key_secret` makes passway skip the whole feature and come up
+    /// anonymous, with nothing anywhere complaining.
+    #[test]
+    fn a_half_written_auth_table_is_refused_naming_the_missing_field() {
+        let cases = [
+            ("key_secret", "kid = \"k\"\niss = \"i\"\naud = \"a\"\nrequire_prefixes = [\"/\"]\n"),
+            ("kid", "key_secret = \"s\"\niss = \"i\"\naud = \"a\"\nrequire_prefixes = [\"/\"]\n"),
+            ("iss", "key_secret = \"s\"\nkid = \"k\"\naud = \"a\"\nrequire_prefixes = [\"/\"]\n"),
+            ("aud", "key_secret = \"s\"\nkid = \"k\"\niss = \"i\"\nrequire_prefixes = [\"/\"]\n"),
+            ("require_prefixes", "key_secret = \"s\"\nkid = \"k\"\niss = \"i\"\naud = \"a\"\n"),
+        ];
+        for (missing, body) in cases {
+            let err = try_mirror(&format!(
+                "[[ingress]]\nprovider = \"passway\"\n[ingress.auth]\n{body}"
+            ))
+            .expect_err("a partial auth table must not load");
+            assert!(
+                err.to_string().contains(missing),
+                "the refusal must name {missing}, got: {err}"
+            );
+        }
+    }
+
+    /// The half serde cannot catch: a field that is PRESENT and empty. Refused
+    /// by `PasswayAuth::validate`, the same implementation
+    /// `yah cloud ingress deploy` runs against its flags — so the two authoring
+    /// routes cannot disagree about what counts as configured.
+    #[test]
+    fn a_present_but_empty_auth_field_is_refused_naming_the_toml_key() {
+        let err = mirror(
+            "[[ingress]]\nprovider = \"passway\"\n[ingress.auth]\n\
+             key_secret = \"s\"\nkid = \"\"\niss = \"i\"\naud = \"a\"\nrequire_prefixes = [\"/\"]\n",
+        )
+        .ingress_edges()
+        .expect_err("an empty kid is a boot panic on a remote node")
+        .to_string();
+        assert!(err.contains("[ingress.auth].kid"), "{err}");
+
+        // The quiet one: a verify key protecting nothing is authenticated and
+        // anonymous at once. The message names the TOML key, not the flag —
+        // sending a mirror author to look for `--require-auth` costs them the
+        // search this validation exists to save.
+        let err = mirror(&format!(
+            "[[ingress]]\nprovider = \"passway\"\n{}",
+            FULL_AUTH.replace("require_prefixes = [\"/\"]", "require_prefixes = []")
+        ))
+        .ingress_edges()
+        .expect_err("a door protecting no prefix must be refused")
+        .to_string();
+        assert!(err.contains("[ingress.auth].require_prefixes"), "{err}");
+        assert!(!err.contains("--require-auth"), "wrong vocabulary: {err}");
+    }
+
+    /// Auth on a non-passway edge is refused rather than ignored. Only passway
+    /// renders `PASSWAY_AUTH_*`; silently dropping it hands the operator a door
+    /// they believe is protected and is not — the exact outcome this whole
+    /// vocabulary exists to prevent.
+    #[test]
+    fn auth_on_a_cloudflare_tunnel_edge_is_refused_rather_than_ignored() {
+        let err = mirror(&format!(
+            "[[ingress]]\nprovider = \"cloudflare-tunnel\"\nmachines = [\"cf-01\"]\n{FULL_AUTH}"
+        ))
+        .ingress_edges()
+        .expect_err("only a passway edge can render bearer auth")
+        .to_string();
+        assert!(err.contains("passway"), "{err}");
+        assert!(err.contains("[ingress.auth]"), "{err}");
+    }
+
     #[test]
     fn cloud_config_load_derives_passway_machines_only_for_passway_envs() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7895,23 +9210,23 @@ use = "orbstack"
         )
         .unwrap();
         std::fs::write(
-            svc.join("mirrors/cloud.toml"),
+            svc.join("mirrors/prod.toml"),
             "schema_version = 1\nshape = \"single-machine\"\n\
              ingress = \"passway\"\ningress_machines = [\"us-east-001\", \"us-west-001\"]\n\n\
-             [providers.static]\nkind = \"local-static\"\nport = 8080\n",
+             [providers.static]\nkind = \"miniflare-native\"\nport = 8080\n",
         )
         .unwrap();
         std::fs::write(
             svc.join("mirrors/local.toml"),
             "schema_version = 1\nshape = \"local\"\n\n\
-             [providers.static]\nkind = \"local-static\"\nport = 8080\n",
+             [providers.static]\nkind = \"miniflare-native\"\nport = 8080\n",
         )
         .unwrap();
 
         let cfg = CloudConfig::load(root).unwrap();
         let svc = cfg.service("dev-yah").unwrap();
         assert_eq!(
-            svc.passway_machines.get("cloud"),
+            svc.passway_machines.get("prod"),
             Some(&vec!["us-east-001".to_string(), "us-west-001".to_string()])
         );
         assert!(
@@ -7996,6 +9311,7 @@ out_dir = "dist"
             schema_version: 1,
             name: "dev-yah".into(),
             domain: "yah.dev".into(),
+            health_path: None,
             db: DbCatalog::default(),
             components: vec![ServiceComponent {
                 mount: None,
@@ -8032,6 +9348,61 @@ out_dir = "dist"
     }
 
     #[test]
+    fn a_declared_health_path_survives_the_loader() {
+        // The field is only worth having if it reaches the consumer — the
+        // desktop front-door probe reads it off the loaded service, so a
+        // round-trip that drops it would leave the probe on `/` with the
+        // config still reading correctly.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        ServiceConfig {
+            schema_version: 1,
+            name: "api".into(),
+            domain: "api.noisetable.com".into(),
+            health_path: Some("/api/v1/status".into()),
+            components: vec![],
+            db: DbCatalog::default(),
+        }
+        .save(root)
+        .unwrap();
+
+        let cfg = CloudConfig::load(root).unwrap();
+        assert_eq!(
+            cfg.service("api").unwrap().service.health_path.as_deref(),
+            Some("/api/v1/status")
+        );
+    }
+
+    #[test]
+    fn a_relative_health_path_is_refused_at_load() {
+        // Not a style rule. A relative path joins onto the origin differently
+        // depending on which URL builder gets it, so the probe would ask a
+        // question the file does not read as asking — and it would paint a
+        // confident dot either way.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        ServiceConfig {
+            schema_version: 1,
+            name: "api".into(),
+            domain: "api.noisetable.com".into(),
+            health_path: Some("api/v1/status".into()),
+            components: vec![],
+            db: DbCatalog::default(),
+        }
+        .save(root)
+        .unwrap();
+
+        let err = CloudConfig::load(root).expect_err("a relative health_path must not load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("health_path") && msg.contains("/api/v1/status"),
+            "the error must name the field and the fix, got: {msg}"
+        );
+    }
+
+    #[test]
     fn service_config_save_overwrites_in_place() {
         let tmp = tempfile::TempDir::new().unwrap();
         let root = tmp.path();
@@ -8040,6 +9411,7 @@ out_dir = "dist"
             schema_version: 1,
             name: "dev-yah".into(),
             domain: "yah.dev".into(),
+            health_path: None,
             components: vec![],
             db: DbCatalog::default(),
         };
@@ -8064,6 +9436,7 @@ out_dir = "dist"
             schema_version: 1,
             name: "dev-yah".into(),
             domain: "yah.dev".into(),
+            health_path: None,
             components: vec![],
             db: DbCatalog::default(),
         }
@@ -8095,7 +9468,7 @@ out_dir = "dist"
         providers_map.insert(
             "compute".to_string(),
             MirrorProviderSlot::Inline {
-                kind: Provider::LocalStatic,
+                kind: Provider::MiniflareNative,
                 fields: {
                     let mut f = BTreeMap::new();
                     f.insert("port".to_string(), toml::Value::Integer(4321));
@@ -8111,11 +9484,12 @@ out_dir = "dist"
             ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: Default::default(),
+            build: Default::default(),
         };
-        // Save with canonical name; legacy "prod" is normalised to "cloud" on load.
-        mirror.save(root, "dev-yah", "cloud").unwrap();
+        // Save with canonical name; legacy "cloud" is normalised to "prod" on load.
+        mirror.save(root, "dev-yah", "prod").unwrap();
 
-        let path = crate::paths::service_mirror_toml(root, "dev-yah", "cloud");
+        let path = crate::paths::service_mirror_toml(root, "dev-yah", "prod");
         assert!(
             path.exists(),
             "mirror toml should exist at {}",
@@ -8123,12 +9497,12 @@ out_dir = "dist"
         );
 
         let cfg = CloudConfig::load(root).unwrap();
-        let loaded = &cfg.service("dev-yah").unwrap().mirrors["cloud"];
+        let loaded = &cfg.service("dev-yah").unwrap().mirrors["prod"];
         assert_eq!(loaded.shape, MirrorShape::SingleMachine);
         assert_eq!(loaded.providers["static"].provider_id(), Some("cloudflare"));
         assert_eq!(
             loaded.providers["compute"].inline_kind(),
-            Some(Provider::LocalStatic)
+            Some(Provider::MiniflareNative)
         );
     }
 
@@ -8141,6 +9515,7 @@ out_dir = "dist"
             schema_version: 1,
             name: "dev-yah".into(),
             domain: "yah.dev".into(),
+            health_path: None,
             components: vec![],
             db: DbCatalog::default(),
         };
@@ -8153,6 +9528,7 @@ out_dir = "dist"
             ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: Default::default(),
+            build: Default::default(),
         }
         .save(root, "dev-yah", "local")
         .unwrap();
@@ -8178,6 +9554,7 @@ out_dir = "dist"
             schema_version: 1,
             name: "dev-yah".into(),
             domain: "yah.dev".into(),
+            health_path: None,
             components: vec![],
             db: DbCatalog::default(),
         }
@@ -8192,6 +9569,7 @@ out_dir = "dist"
                 ingress_machines: Vec::new(),
                 drivers: Default::default(),
                 asset_aliases: Default::default(),
+                build: Default::default(),
             }
             .save(root, "dev-yah", env)
             .unwrap();
@@ -8204,8 +9582,8 @@ out_dir = "dist"
         let svc = cfg
             .service("dev-yah")
             .expect("service survives mirror delete");
-        // Legacy file stems are normalised on load: "prod" → "cloud", "local" → "dev".
-        assert!(!svc.mirrors.contains_key("cloud"));
+        // "prod" is canonical and deletes directly; "local" normalises to "dev" on load.
+        assert!(!svc.mirrors.contains_key("prod"));
         assert!(svc.mirrors.contains_key("dev"));
     }
 
@@ -8216,6 +9594,7 @@ out_dir = "dist"
             schema_version: 1,
             name: "yah-marketing".into(),
             domain: "yah.dev".into(),
+            health_path: None,
             db: DbCatalog::default(),
             components: vec![ServiceComponent {
                 mount: None,
@@ -8255,6 +9634,7 @@ out_dir = "dist"
                     mode: RouteMode::Backend {
                         component: "yah-dashboard/api".into(),
                         origin: "https://api.dashboard.yah.dev".into(),
+                        origin_path: None,
                     },
                 },
                 DomainRoute {
@@ -8274,6 +9654,75 @@ out_dir = "dist"
         assert!(matches!(back.routes[0].mode, RouteMode::Static { .. }));
         assert!(matches!(back.routes[1].mode, RouteMode::Backend { .. }));
         assert!(matches!(back.routes[2].mode, RouteMode::Redirect { .. }));
+    }
+
+    /// A one-route `cdn.noisetable.com`-shaped manifest whose static route body
+    /// is `body`.
+    fn static_route_manifest(body: &str) -> String {
+        format!(
+            "schema_version = 1\nname = \"cdn-noisetable-com\"\ndomain = \"cdn.noisetable.com\"\n\
+             front_door = \"worker\"\ncdn_bucket = \"noisetable-marketing\"\n\n\
+             [[routes]]\npath = \"/engine/*\"\nmode = \"static\"\n{body}\n"
+        )
+    }
+
+    /// R560-F13 — a static route names a `component` OR a `bucket`, never both
+    /// and never neither, and a bucket has to be a real R2 bucket name.
+    #[test]
+    fn a_static_route_names_exactly_one_of_component_or_bucket() {
+        let dom: DomainConfig =
+            toml::from_str(&static_route_manifest("bucket = \"noisetable-releases\"")).unwrap();
+        assert!(matches!(
+            &dom.routes[0].mode,
+            RouteMode::StaticBucket { bucket } if bucket == "noisetable-releases"
+        ));
+        dom.validate_front_door().unwrap();
+
+        let dom: DomainConfig =
+            toml::from_str(&static_route_manifest("component = \"svc/site\"")).unwrap();
+        assert!(matches!(
+            &dom.routes[0].mode,
+            RouteMode::Static { component } if component == "svc/site"
+        ));
+
+        for (body, needle) in [
+            (
+                "component = \"svc/site\"\nbucket = \"noisetable-releases\"",
+                "both",
+            ),
+            ("", "neither"),
+            ("bucket = \"Noisetable_Releases\"", "not an R2 bucket name"),
+        ] {
+            let err = toml::from_str::<DomainConfig>(&static_route_manifest(body))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{body:?}: {err}");
+        }
+    }
+
+    /// The Rust variant is `StaticBucket`; the manifest spelling stays
+    /// `mode = "static"` + `bucket`, through a save as well as a load.
+    #[test]
+    fn a_bucket_route_round_trips_as_mode_static_with_a_bucket_key() {
+        let dom: DomainConfig =
+            toml::from_str(&static_route_manifest("bucket = \"noisetable-releases\"")).unwrap();
+        let s = toml::to_string(&dom).unwrap();
+        assert!(s.contains("mode = \"static\""), "{s}");
+        assert!(s.contains("bucket = \"noisetable-releases\""), "{s}");
+        assert!(!s.contains("component"), "{s}");
+        let back: DomainConfig = toml::from_str(&s).unwrap();
+        assert!(matches!(back.routes[0].mode, RouteMode::StaticBucket { .. }));
+    }
+
+    /// Passway has no R2 read path, so a bucket route on it is refused at load
+    /// naming the route, not compiled into an entry that door cannot serve.
+    #[test]
+    fn passway_refuses_a_bucket_route() {
+        let mut dom: DomainConfig =
+            toml::from_str(&static_route_manifest("bucket = \"noisetable-releases\"")).unwrap();
+        dom.front_door = FrontDoor::Passway;
+        let err = dom.validate_front_door().unwrap_err().to_string();
+        assert!(err.contains("passway") && err.contains("/engine/*"), "{err}");
     }
 
     #[test]
@@ -8450,6 +9899,7 @@ worker_bundle_path = ".yah/workers/cdn-yah-dev/"
             schema_version: 1,
             name: "yah-marketing".into(),
             domain: "yah.dev".into(),
+            health_path: None,
             db: DbCatalog::default(),
             components: vec![
                 ServiceComponent {
@@ -8754,6 +10204,7 @@ component = "yah-marketing/site"
             schema_version: 1,
             name: "noisetable-marketing".into(),
             domain: "noisetable.com".into(),
+            health_path: None,
             db: DbCatalog::default(),
             components: vec![
                 ServiceComponent {
@@ -8799,6 +10250,7 @@ component = "yah-marketing/site"
             schema_version: 1,
             name: "noisetable-marketing".into(),
             domain: "noisetable.com".into(),
+            health_path: None,
             db: DbCatalog::default(),
             components: vec![
                 ServiceComponent {
@@ -8845,6 +10297,7 @@ component = "yah-marketing/site"
             schema_version: 1,
             name: "noisetable".into(),
             domain: "noisetable.com".into(),
+            health_path: None,
             db: DbCatalog::default(),
             components: vec![
                 ServiceComponent {
@@ -8889,6 +10342,7 @@ component = "yah-marketing/site"
             schema_version: 1,
             name: "noisetable".into(),
             domain: "noisetable.com".into(),
+            health_path: None,
             db: DbCatalog::default(),
             components: vec![
                 ServiceComponent {
@@ -9416,7 +10870,7 @@ taints = ["no-server", "no-appliance", "no-job"]
     #[test]
     fn admission_preserves_archetype_scoped_repulsion_across_the_inversion() {
         let ws = minimal_spec("srv", 1); // a Server
-        let req = admission_spec(&ws, &[]);
+        let req = admission_spec(&ws, &[]).unwrap();
         assert_eq!(ws.effective_archetype(), LifecycleArchetype::Server);
 
         let no_server = make_machine_with_capacity("n", 8192, 4000, vec!["no-server"]);
@@ -9875,7 +11329,7 @@ sovereign_group = "dev"
     }
 
     fn server_spec(memory_mb: u32, cpu_millis: u32) -> WorkloadSpec {
-        use workload_spec::{ImageRef, LifecycleArchetype, ResourceLimits, TierTag};
+        use workload_spec::{ImageRef, LifecycleArchetype, TierTag};
         let mut ws = WorkloadSpec::for_forge(
             "f5-test",
             ImageRef {
@@ -9888,11 +11342,8 @@ sovereign_group = "dev"
             vec![],
         );
         ws.archetype = Some(LifecycleArchetype::Server);
-        ws.resources = ResourceLimits {
-            memory_mb,
-            cpu_millis,
-            ephemeral_storage_mb: 0,
-        };
+        ws.resources.memory_mb = memory_mb;
+        ws.resources.cpu_millis = cpu_millis;
         // These are SERVER specs that borrow `for_forge` as a constructor
         // shortcut, so drop the forge memory request it stamps on — otherwise
         // every spec here silently requests the forge default instead of the
@@ -9900,8 +11351,7 @@ sovereign_group = "dev"
         // stop testing their own argument. A server workload declares no
         // request, which is the documented fall-back-to-`resources.memory_mb`
         // path (`WorkloadSpec::memory_request_mb`).
-        ws.annotations
-            .remove(workload_spec::MEMORY_REQUEST_ANNOTATION);
+        ws.resources.memory_request_mb = None;
         ws
     }
 
@@ -10822,7 +12272,7 @@ path  = "../first"
     #[test]
     fn a_spec_with_no_local_edges_admits_exactly_as_it_did_before() {
         let ws = ws_with_selector(Some("tag:build-worker,arch:x86"));
-        let req = admission_spec(&ws, &[]);
+        let req = admission_spec(&ws, &[]).unwrap();
 
         assert_eq!(req.mesh_tags, vec!["tag:build-worker", "arch:x86"]);
         assert_eq!(req.memory_mb, ws.memory_request_mb());
@@ -10929,7 +12379,7 @@ path  = "../first"
             vec![requirement("headscale-replicator", Locality::Local)],
         );
 
-        let req = admission_spec(&requirer, &inventory);
+        let req = admission_spec(&requirer, &inventory).unwrap();
         assert!(
             !req.mesh_tags.iter().any(|t| t == NATIVE_EXEC_MESH_TAG),
             "no native member ⇒ no capability axis, got: {:?}",
@@ -10942,5 +12392,337 @@ path  = "../first"
             ..make_empty_cfg(vec![make_machine("plain", vec![])])
         };
         assert_eq!(cfg.admit_workload(&requirer).unwrap().name, "plain");
+    }
+
+    // ─── R894-F1: trust declares a minimum isolation substrate ───────────────
+
+    /// A `minimal_spec` marked untrusted **without** raising its substrate —
+    /// i.e. the incoherent pairing this ticket exists to refuse.
+    ///
+    /// It deliberately does not go through `WorkloadSpec::stamp_untrusted`,
+    /// which raises the substrate as it stamps: the point of these tests is the
+    /// admission-side gate, so the spec has to arrive in the state a buggy or
+    /// hostile producer would leave it in, not the state the correct producer
+    /// guarantees.
+    fn untrusted_spec(name: &str, exec: Option<&str>) -> WorkloadSpec {
+        let mut ws = minimal_spec(name, 1);
+        ws.annotations.insert(
+            workload_spec::TRUST_ANNOTATION.to_string(),
+            workload_spec::TRUST_UNTRUSTED_VALUE.to_string(),
+        );
+        if let Some(v) = exec {
+            ws.annotations.insert(
+                workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+                v.to_string(),
+            );
+        }
+        assert_eq!(
+            ws.trust().unwrap(),
+            workload_spec::TrustLevel::Untrusted,
+            "precondition: the trust marker must read back"
+        );
+        ws
+    }
+
+    /// THE ACCEPTANCE GATE. Both refusals happen inside `admit_workload` — the
+    /// real dispatch path `MeshYubabaClient::elect_node` calls — against a fleet
+    /// that contains a microVM-capable node, so the refusal is provably the
+    /// trust rule and not "nothing admits this".
+    #[test]
+    fn admit_workload_refuses_untrusted_code_on_a_shared_kernel() {
+        let cfg = make_empty_cfg(vec![
+            make_machine("plain", vec![]),
+            make_machine("us-west-003", vec![MICROVM_MESH_TAG]),
+        ]);
+
+        // (1) Untrusted + `yah.exec = native`: the widest possible substrate.
+        let native = untrusted_spec("tenant-camp", Some(workload_spec::NATIVE_EXEC_VALUE));
+        let err = cfg.admit_workload(&native).unwrap_err().to_string();
+        assert!(
+            err.contains("tenant-camp") && err.contains("native") && err.contains("microvm"),
+            "the refusal must name the workload, what it asked for and the floor, got: {err}"
+        );
+
+        // (2) Untrusted with no substrate marker at all — the container default.
+        // This is the one a "absent means trusted for ALL origins" spelling
+        // would have admitted.
+        let container = untrusted_spec("tenant-camp", None);
+        assert_eq!(
+            container.exec_substrate(),
+            workload_spec::ExecSubstrate::Container,
+            "precondition: no marker means the container backend"
+        );
+        let err = cfg.admit_workload(&container).unwrap_err().to_string();
+        assert!(
+            err.contains("container") && err.contains("microvm"),
+            "an unmarked untrusted spec is refused for the same reason, got: {err}"
+        );
+
+        // (3) The same spec asking for a microVM is admitted, onto the node that
+        // declares the capability. Same fleet, same workload name — so (1) and
+        // (2) provably failed on the substrate and nothing else.
+        let vm = untrusted_spec("tenant-camp", Some(workload_spec::MICROVM_EXEC_VALUE));
+        assert_eq!(cfg.admit_workload(&vm).unwrap().name, "us-west-003");
+    }
+
+    /// A caller may always request *more* isolation than it needs. A trusted
+    /// workload asking for a microVM is not "exceeding" anything — the rule is
+    /// one-directional.
+    #[test]
+    fn a_trusted_workload_may_still_request_a_stricter_substrate() {
+        let mut ws = minimal_spec("forge-build", 1);
+        ws.annotations.insert(
+            workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+            workload_spec::MICROVM_EXEC_VALUE.to_string(),
+        );
+        assert_eq!(ws.trust().unwrap(), workload_spec::TrustLevel::Trusted);
+
+        let cfg = make_empty_cfg(vec![
+            make_machine("plain", vec![]),
+            make_machine("us-west-003", vec![MICROVM_MESH_TAG]),
+        ]);
+        assert_eq!(cfg.admit_workload(&ws).unwrap().name, "us-west-003");
+    }
+
+    /// An untrusted member reached by a `local` edge is still on the node, so
+    /// the group is refused even though the spec being deployed is fine — the
+    /// same group-wide reasoning every other axis in `admission_spec` uses.
+    #[test]
+    fn an_untrusted_provider_refuses_the_whole_placement_group() {
+        let requirer = spec_requiring(
+            "camp-front",
+            vec![requirement("tenant-camp", Locality::Local)],
+        );
+        assert_eq!(
+            requirer.trust().unwrap(),
+            workload_spec::TrustLevel::Trusted,
+            "precondition: the requirer itself is an ordinary trusted workload"
+        );
+
+        let cfg = CloudConfig {
+            workloads: declared(vec![untrusted_spec("tenant-camp", None)]),
+            ..make_empty_cfg(vec![make_machine("us-west-003", vec![MICROVM_MESH_TAG])])
+        };
+        let err = cfg.admit_workload(&requirer).unwrap_err().to_string();
+        assert!(
+            err.contains("tenant-camp"),
+            "the refusal must name the offending MEMBER, not the requirer, got: {err}"
+        );
+
+        // The same requirer without the edge admits fine, so the refusal
+        // provably came from the group.
+        let alone = minimal_spec("camp-front", 1);
+        assert_eq!(cfg.admit_workload(&alone).unwrap().name, "us-west-003");
+    }
+
+    /// A typo in the trust value is refused, not resolved to either side.
+    /// Reading it as trusted would turn the microVM floor off by misspelling.
+    #[test]
+    fn an_unreadable_trust_declaration_is_refused_rather_than_defaulted() {
+        let mut ws = minimal_spec("tenant-camp", 1);
+        ws.annotations.insert(
+            workload_spec::TRUST_ANNOTATION.to_string(),
+            "untrused".to_string(),
+        );
+
+        let cfg = make_empty_cfg(vec![make_machine("plain", vec![])]);
+        let err = cfg.admit_workload(&ws).unwrap_err().to_string();
+        assert!(
+            err.contains("untrused") && err.contains("tenant-camp"),
+            "the refusal must quote the unreadable value, got: {err}"
+        );
+    }
+
+    /// The regression guard for the new mesh-tag axis, in the shape R860-T5's
+    /// own guard uses: nothing in the fleet is microVM-marked today, so every
+    /// existing spec's axes must be untouched.
+    #[test]
+    fn a_group_with_no_microvm_member_does_not_require_the_capability() {
+        let ws = minimal_spec("headscale-ui", 1);
+        let req = admission_spec(&ws, &[]).unwrap();
+        assert!(
+            !req.mesh_tags.iter().any(|t| t == MICROVM_MESH_TAG),
+            "no microVM member ⇒ no capability axis, got: {:?}",
+            req.mesh_tags
+        );
+
+        // And a microVM-marked spec is refused by a node declaring nothing,
+        // naming the tag — the dispatch-time surprise R858 paid for.
+        let mut vm = minimal_spec("forge-build", 1);
+        vm.annotations.insert(
+            workload_spec::NATIVE_EXEC_ANNOTATION.to_string(),
+            workload_spec::MICROVM_EXEC_VALUE.to_string(),
+        );
+        let cfg = make_empty_cfg(vec![make_machine("plain", vec![])]);
+        let err = cfg.admit_workload(&vm).unwrap_err().to_string();
+        assert!(
+            err.contains(MICROVM_MESH_TAG),
+            "the refusal must name the missing capability, got: {err}"
+        );
+    }
+
+    /// The gate is structural, not a convention followed at three call sites:
+    /// every admission entry point goes through `admission_spec`, so all three
+    /// refuse the same spec.
+    #[test]
+    fn every_admission_entry_point_enforces_the_trust_floor() {
+        let ws = untrusted_spec("tenant-camp", Some(workload_spec::NATIVE_EXEC_VALUE));
+        let mut machine = make_machine("us-west-003", vec![MICROVM_MESH_TAG]);
+        machine.sovereign_group = Some("home".to_string());
+        let cfg = make_empty_cfg(vec![machine]);
+
+        assert!(cfg.admit_workload(&ws).is_err());
+        assert!(cfg.admit_workload_candidates(&ws).is_err());
+        assert!(cfg.admit_workload_in_group(&ws, "home").is_err());
+    }
+
+    // ── R892-B1: a declared key must never be dropped in silence ─────────────
+
+    /// The real shape, not a hand-minimised one: a key check that passes on a
+    /// toy spec and trips on a production file is worse than no check.
+    /// Modelled on `.yah/infra/workloads/yah-cloud-admin.toml`.
+    const REAL_WORKLOAD_TOML: &str = r#"
+name = "yah-cloud-admin"
+tier = "infra"
+archetype = "server"
+replicas = 1
+restart_policy = "always"
+
+[image]
+registry = "cr.yah.dev"
+repository = "yah-cloud-admin"
+tag = "20260903-amd64"
+digest = "sha256:efaa7824ebf1654b226e4bf9cf4f86f1ce39b17900895b1f9d83e4d987f58733"
+
+[resources]
+memory_mb = 256
+cpu_millis = 250
+
+[annotations]
+"yah.network" = "host"
+
+[expose.mesh]
+identity = "yah-cloud-admin"
+ports = [4325]
+allow_from = []
+
+[[env]]
+name = "YAH_CLOUD_ADMIN_ADDR"
+value = { literal = { value = "100.64.0.1:4325" } }
+
+[[secrets]]
+source = { cluster = { name = "cheers/cloud-admin/verify-key" } }
+target = { file = { path = "/run/secrets/cheers-verify.key", mode = 0o400 } }
+
+[healthcheck]
+probe = { http_get = { path = "/__mesofact/health", port = 4325, expect_status = 200 } }
+interval = 15000
+timeout = 5000
+initial_delay = 20000
+failure_threshold = 3
+
+[stop_policy]
+signal = 15
+grace_period = 10000
+"#;
+
+    fn check_keys(src: &str) -> Result<()> {
+        let spec: WorkloadSpec = toml::from_str(src).expect("fixture must parse");
+        refuse_dropped_keys(src, &spec, "fixture.toml")
+    }
+
+    /// Non-vacuity, and the guard against a check that flags everything: a file
+    /// whose every key the schema knows must load clean.
+    #[test]
+    fn a_workload_file_whose_keys_all_survive_the_parse_is_accepted() {
+        check_keys(REAL_WORKLOAD_TOML).expect("a fully-known file must not be refused");
+    }
+
+    /// The 2026-09-11 outage, reproduced in one line of TOML: R885-T6 deleted
+    /// `ResourceLimits::ephemeral_storage_mb`, every camp's file still declared
+    /// it, and serde discarded it without a word.
+    #[test]
+    fn the_key_that_caused_the_outage_is_now_refused_by_name() {
+        let src = REAL_WORKLOAD_TOML.replace(
+            "cpu_millis = 250",
+            "cpu_millis = 250\nephemeral_storage_mb = 256",
+        );
+        let err = check_keys(&src).expect_err("a dropped key must refuse the file");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("resources.ephemeral_storage_mb"),
+            "the refusal must name the key by its full path, got: {msg}"
+        );
+    }
+
+    /// Nested and top-level keys are both reported, so a misspelling anywhere in
+    /// the file is as loud as a removed field.
+    #[test]
+    fn every_unknown_key_is_named_not_just_the_first() {
+        let src = format!("{REAL_WORKLOAD_TOML}\nreplica_count = 3\n\n[healthcheck_typo]\nx = 1\n");
+        let err = check_keys(&src).expect_err("unknown keys must refuse the file");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("replica_count"), "got: {msg}");
+        assert!(msg.contains("healthcheck_typo"), "got: {msg}");
+    }
+
+    /// A value the serialiser re-spells (an enum, a duration) is not a dropped
+    /// key. Only a missing KEY is, which is what keeps this check from firing on
+    /// every legitimate file in the fleet.
+    #[test]
+    fn a_canonicalised_value_is_not_reported_as_dropped() {
+        let declared = toml::Value::try_from(toml::toml! {
+            restart = "always"
+            [nested]
+            list = [1, 2]
+        })
+        .unwrap();
+        let kept = toml::Value::try_from(toml::toml! {
+            restart = "Always"
+            [nested]
+            list = [9, 9]
+        })
+        .unwrap();
+        let mut out = Vec::new();
+        collect_dropped_keys(&declared, &kept, "", &mut out);
+        assert!(out.is_empty(), "values differ, keys do not: {out:?}");
+    }
+
+    /// R896-B5: a key whose field was deleted as inert loads with a warning
+    /// instead of refusing the file, so deleting the field does not break every
+    /// camp whose committed TOML still declares it. Driven off the registry, so
+    /// the next retired key is covered the moment it is listed.
+    #[test]
+    fn every_retired_key_is_ignored_not_refused() {
+        for retired in workload_spec::RETIRED_KEYS {
+            let mut declared: toml::Value = toml::from_str(REAL_WORKLOAD_TOML).unwrap();
+            let (parents, leaf) = match retired.path.rsplit_once('.') {
+                Some((p, l)) => (p.split('.').collect::<Vec<_>>(), l),
+                None => (vec![], retired.path),
+            };
+            let mut table = declared.as_table_mut().unwrap();
+            for p in parents {
+                table = table
+                    .entry(p)
+                    .or_insert_with(|| toml::Value::Table(Default::default()))
+                    .as_table_mut()
+                    .unwrap();
+            }
+            table.insert(leaf.into(), toml::Value::Integer(1));
+            let src = toml::to_string(&declared).unwrap();
+            check_keys(&src)
+                .unwrap_or_else(|e| panic!("retired `{}` must not refuse: {e:#}", retired.path));
+        }
+    }
+
+    /// The registry is an exemption from R892-B1, not a hole in it: a retired
+    /// key sitting beside an unknown one still refuses the file, naming only the
+    /// unknown key.
+    #[test]
+    fn a_retired_key_does_not_excuse_an_unknown_one() {
+        let src = format!("schema_version = 1\n{REAL_WORKLOAD_TOML}\nreplica_count = 3\n");
+        let msg = format!("{:#}", check_keys(&src).expect_err("unknown key must still refuse"));
+        assert!(msg.contains("replica_count"), "got: {msg}");
+        assert!(!msg.contains("schema_version"), "retired key must not be named: {msg}");
     }
 }

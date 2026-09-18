@@ -58,8 +58,11 @@
 //! @yah:gotcha("ONE DELIBERATE BEHAVIOUR CHANGE beyond the decoupling: the issuer used to build its own ObjectCertStore from its own config, so a bucket that failed to connect at boot got a second connect attempt when the issuer started. It now shares the node's store, so a failed connect means no mirror for that process lifetime — main logs \"cert store unavailable — per-domain TLS material will not resolve on this node\" at boot, and the issuer keeps writing to raft exactly as before (a missing mirror has never been allowed to stop issuance). Also new: a half-configured store (BUCKET set, ACCOUNT_ID missing) used to fail parse_issuer_config and take the whole issuer down with it; it is now reported on its own line (\"cert store config invalid — no per-domain TLS material on this node\") and leaves the issuer running.")
 //! @yah:verify("LEADER RE-VERIFICATION (session:abde2cbb, 2026-09-09), independent of the courier. `cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib --bins` = 865 passed / 0 failed, matching the courier's count against the 864 baseline it measured first on anchor 718dfacb. Then checked the two properties that mattered more than the count, because this ticket was ABOUT a hidden coupling and a shim would have preserved it: (1) `IssuerConfig::cert_store` is GONE — a grep of acme_issuer.rs for the field returns nothing, so the store is passed IN as a mirror rather than read back out, which is what the ticket asked for rather than an Option-of-Option; (2) `acme_directory` now has exactly one definition, at cert_store.rs:321. That second one was discovered work, not the brief: the ACME directory default was already duplicated in FOUR places and the hoist would have made main.rs a fifth, on a value that names the store's issuer path segment — so a drift between copies means a reader addressing an empty prefix. Collapsing it to one owner was the right call and is exactly the \"change the abstraction rather than shortcut around it\" case. A PostToolUse tree-drift warning fired on my run naming oss/yubaba/crates/cloud/src/reconciler/ingress.rs, which is R870-F16's file and not on this ticket's path, so the result stands.")
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+// noisetable R118-T11: only `DomainCmd::Enrol`'s backend args are typed on it,
+// and that subcommand is `acme`-gated.
+#[cfg(feature = "acme")]
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -188,6 +191,34 @@ enum Cmd {
         /// `Environment=` composes; a second `ExecStart=` does not.
         #[arg(long, env = "YUBABA_CONTAINER_NET")]
         container_net: Option<String>,
+        /// R881-S2: this node's own mesh address — the address it advertises
+        /// in every service record it publishes. Defaults to the address
+        /// derived from `--bind`, which is correct whenever a node binds
+        /// exactly one mesh address.
+        ///
+        /// Set this when it does not. The dev raft group
+        /// (us-west-011/013/014) binds `0.0.0.0:7443` on purpose — the
+        /// R608-F18 `40-raft.conf` drop-in, so each node answers on both its
+        /// LAN and its mesh address — and a wildcard is not an address
+        /// anything can dial. Without this flag those nodes published every
+        /// workload at `127.0.0.1` and marked it `unroutable`, so
+        /// `GET /service-records?ready=true` was permanently empty and
+        /// `yah cloud apply` could not resolve an ingress upstream against
+        /// them. Rebinding them is not the alternative: their raft peers
+        /// advertise `192.168.10.11|13|14:7443`, so a mesh-only bind
+        /// partitions the group.
+        ///
+        /// Readable from `$YUBABA_MESH_IP` for the same reason
+        /// `--container-net` is: a fleet node's `ExecStart=` is already
+        /// re-declared by the raft drop-in, and `Environment=` composes where
+        /// a second `ExecStart=` silently drops flags.
+        ///
+        /// A malformed or undialable value fails startup rather than
+        /// degrading to the derived address — an operator who passed this
+        /// asked for a specific advertised address, and quietly advertising a
+        /// different one is the failure class R881 exists to remove.
+        #[arg(long, env = "YUBABA_MESH_IP")]
+        mesh_ip: Option<String>,
         /// R406-T8: UDS path for the Kamaji sibling process. When set,
         /// yubaba dispatches workload list/state/drain through Kamaji
         /// over postcard-framed messages. If the connection fails at
@@ -407,6 +438,16 @@ enum Cmd {
         /// it, which is the behaviour every yubaba cluster had before R734-T4.
         #[arg(long)]
         leader_anchor: Option<String>,
+        /// R330-F17: operator override for the nearest-first router's
+        /// geo-distance/transit-cost tables and alpha/beta weights.
+        ///
+        /// Points at a copy of `.yah/infra/transit-cost.toml`, staged on this
+        /// box the same way a machine's other declared facts are staged — a
+        /// fleet node never loads `.yah/infra/` itself (see `--region`).
+        /// Unset means [`yubaba::route_score::RouteTables::defaults`], which
+        /// is a real, documented set of values, not an empty table.
+        #[arg(long)]
+        transit_cost_file: Option<PathBuf>,
         /// Phase 2: S3 URL for litestream Headscale DB replication.
         /// Format: `s3://bucket/path?endpoint=https://fsn1.your-objectstorage.com`
         /// When set, the leader watcher manages litestream replicate + restore.
@@ -423,8 +464,38 @@ enum Cmd {
         /// that authenticate to it and the two must never drift apart.
         /// `yubaba.service` reads that file via `EnvironmentFile=-`, so turning
         /// replication on for a node is one file, not a unit edit and a roll.
+        ///
+        /// noisetable R118-T11: the flag itself is behind the `litestream`
+        /// feature. A build that cannot run the sidecar must not ADVERTISE a
+        /// knob for it — an accepted-and-ignored `--litestream-s3-url` is
+        /// exactly the parsed-but-unenforced flag this camp forbids.
+        #[cfg(feature = "litestream")]
         #[arg(long, env = "YUBABA_LITESTREAM_S3_URL")]
         litestream_s3_url: Option<String>,
+        /// R858-B23: declare a `yah.durability.*` tier on the headscale
+        /// appliance's WorkloadSpec. **Off by default, and it must stay that
+        /// way until the node has the credential.**
+        ///
+        /// kamaji fail-closes on a tier-declaring workload it cannot hydrate
+        /// (`kamaji-bin/src/hydrate.rs`), so this is not a "replicate if you
+        /// can" hint — with it on and no credential in kamaji's own
+        /// environment, the mesh coordinator is refused on every reconcile
+        /// tick. R858-F17 shipped the declaration unconditionally on
+        /// 2026-09-11 and headscale was down for fourteen hours. Turn it on in
+        /// the same provisioning step that writes the store credential — never
+        /// ahead of it.
+        ///
+        /// Env as well as flag for the same reason `YUBABA_LITESTREAM_S3_URL`
+        /// is: `yubaba.service` ships verbatim onto every node, so per-node
+        /// configuration belongs in an `Environment=`/`EnvironmentFile=` line
+        /// beside the credential it depends on, not in a unit edit.
+        #[arg(
+            long,
+            env = "YUBABA_HEADSCALE_DURABILITY",
+            action = clap::ArgAction::SetTrue,
+            value_parser = clap::builder::BoolishValueParser::new(),
+        )]
+        headscale_durability: bool,
         /// R609-F1 (A032 §"yah-aware control plane"): bind the yah control
         /// plane — an `mshr::Endpoint` on this machine's hostkey — so
         /// yah-aware callers (a camp daemon, the desktop, the mobile app)
@@ -450,6 +521,38 @@ enum Cmd {
         /// containment on top of that, never a substitute for it.
         #[arg(long = "camp-rpc-root", value_name = "PATH")]
         camp_rpc_roots: Vec<PathBuf>,
+        /// R726-F9 (W122:131): enumerate the camps under this root on
+        /// `GET /camps`, so a phone can list this node's hosted camps
+        /// beside the desktop's NodeId-addressed ones. Repeatable.
+        ///
+        /// Unlike `--camp-rpc-root` this spawns nothing and reads no
+        /// workspace content — it reports a path, a name and an mtime. It
+        /// is still an information disclosure, so an empty list (the
+        /// default) enumerates nothing.
+        #[arg(long = "hosted-camp-root", value_name = "PATH")]
+        hosted_camp_roots: Vec<PathBuf>,
+        /// R726-F9: the public HTTPS base this deployment's ingress serves,
+        /// e.g. `https://camps.yah.dev`. Each hosted camp reports
+        /// `<base>/camps/<id>` as the URL a phone dials.
+        ///
+        /// Never derived from `--bind`: that is typically a mesh address a
+        /// phone cannot route to, and publishing it would produce camp rows
+        /// that look dialable and time out. Unset means every camp reports
+        /// no URL, which is the honest answer.
+        #[arg(long = "hosted-camp-base-url", value_name = "URL")]
+        hosted_camp_base_url: Option<String>,
+        /// R726-F9 (W122:205): hex `NodeId` of the push-relay that fans a
+        /// hosted camp's gates out to registered phones. For a cloud camp
+        /// this is normally the relay co-located on this machine.
+        #[arg(long = "push-relay-node-id", value_name = "NODE_ID")]
+        push_relay_node_id: Option<String>,
+        /// R726-F9: `keystore://<slot>` naming the FCM service-account JSON
+        /// the co-located relay reads, resolved against this node's secret
+        /// store like any other yubaba secret. Declarative — yubaba
+        /// validates the reference at boot and never reads the bytes; the
+        /// relay process is what needs them.
+        #[arg(long = "push-relay-fcm-credentials", value_name = "KEYSTORE_URI")]
+        push_relay_fcm_credentials: Option<String>,
         /// R609-F3 (W268 §"The binding"): admit control-plane dials from
         /// this `NodeId`. Repeatable. Accepts the hex spelling `GET
         /// /identity` reports (`node_id`) — copy it off the dialing machine.
@@ -465,6 +568,44 @@ enum Cmd {
         /// somehow (R609-F5 turns first-connect TOFU into an entry here).
         #[arg(long = "control-plane-allow", value_name = "NODE_ID")]
         control_plane_allow: Vec<String>,
+        /// R876-B15: whether the HTTP control plane REFUSES an
+        /// unauthenticated caller (`require`) or merely logs one (`warn`,
+        /// the default).
+        ///
+        /// `warn` exists so a node can be upgraded ahead of the callers that
+        /// sign — it is a roll sequencer, not "auth off": a credential that
+        /// is present and bad is refused in both modes. Flipping the default
+        /// and deleting the flag is R876-T18.
+        #[arg(long = "auth-mode", env = "YUBABA_AUTH_MODE", default_value = "warn")]
+        auth_mode: String,
+        /// R876-B15: trust an operator token signed by this key. Repeatable,
+        /// or comma-separated via `YUBABA_OPERATOR_KEYS`.
+        ///
+        /// The 64-char hex spelling of a 32-byte ed25519 public key — the
+        /// same hex convention `--control-plane-allow` uses for `NodeId`s.
+        /// The secret half stays with the operator; a node can verify an
+        /// operator token and can never mint one.
+        #[arg(
+            long = "operator-key",
+            env = "YUBABA_OPERATOR_KEYS",
+            value_delimiter = ',',
+            value_name = "HEX_PUBKEY"
+        )]
+        operator_keys: Vec<String>,
+        /// R876-B15: file holding the 64-char hex cluster key that peer
+        /// tokens are minted and verified under. Every node in the cluster
+        /// holds the same one.
+        ///
+        /// A file rather than an env var because it is a bearer secret: an
+        /// env var is readable from `/proc/<pid>/environ`, inherited by
+        /// every child yubaba spawns, and printed by half the diagnostics in
+        /// this repo.
+        #[arg(
+            long = "cluster-key-file",
+            env = "YUBABA_CLUSTER_KEY_FILE",
+            value_name = "PATH"
+        )]
+        cluster_key_file: Option<PathBuf>,
         /// R609-F2: the `yah` binary the camp-RPC lane execs. Bare `yah`
         /// resolves through `$PATH`, matching what the SSH path runs on the
         /// far side today.
@@ -525,6 +666,12 @@ enum Cmd {
         #[arg(long, default_value = DEFAULT_STATE_PATH)]
         state: PathBuf,
     },
+    /// R876-B15: control-plane credentials — generate the keys `serve`
+    /// trusts, and mint the tokens a caller presents.
+    Auth {
+        #[command(subcommand)]
+        cmd: AuthCmd,
+    },
     /// Raft coordination commands (Phase 2 — R040-F20).
     Raft {
         /// Yubaba daemon address to query (default: localhost).
@@ -539,6 +686,13 @@ enum Cmd {
     /// raft state, so these verbs need no quorum, no leader, and no running
     /// daemon, only `YUBABA_CERT_STORE_*` and the `cloudflare-r2-*` credentials
     /// the daemon itself uses.
+    ///
+    /// noisetable R118-T11: `acme`-gated, with `Holding` below. Both verbs go
+    /// through `domain_admin::AdminConfig`, whose `directory_url` is
+    /// `cert_store::acme_directory(...).url()` — the store's issuer segment.
+    /// Without `passway-acme` there is no segment to address, so the subcommand
+    /// does not exist rather than existing and failing.
+    #[cfg(feature = "acme")]
     Domain {
         #[command(subcommand)]
         cmd: DomainCmd,
@@ -547,6 +701,7 @@ enum Cmd {
     ///
     /// Same store and same credentials as `domain`, and for the same reason:
     /// the pages sit beside the enrollment set in the bucket, not in raft.
+    #[cfg(feature = "acme")]
     Holding {
         #[command(subcommand)]
         cmd: HoldingCmd,
@@ -562,6 +717,50 @@ enum Cmd {
     State {
         #[command(subcommand)]
         cmd: StateCmd,
+    },
+}
+
+/// R876-B15: the credential half of the HTTP control plane's trust model.
+///
+/// Secret halves are read from and written to **files**, never argv: `ps`
+/// is world-readable on the fleet's nodes, and a token pasted into a shell
+/// line lands in the operator's history.
+#[derive(Subcommand)]
+enum AuthCmd {
+    /// Generate an operator keypair. The public half goes on each node as
+    /// `--operator-key`; the secret half stays with the operator and is what
+    /// `auth mint` signs with.
+    Keygen {
+        /// Write the secret half here, mode 0600. Printed to stdout when
+        /// omitted — fine for piping into a vault, bad for a terminal.
+        #[arg(long, value_name = "PATH")]
+        secret_out: Option<PathBuf>,
+    },
+    /// Generate a cluster key — the symmetric secret every node in one
+    /// cluster holds, and the only thing that mints a peer-tier token.
+    ClusterKeygen {
+        /// Write it here, mode 0600. Printed to stdout when omitted.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+    /// Mint a bearer token for `Authorization: Bearer <token>`.
+    Mint {
+        /// Operator secret key file from `auth keygen`. Mutually exclusive
+        /// with `--cluster-key-file`.
+        #[arg(long, value_name = "PATH")]
+        secret_file: Option<PathBuf>,
+        /// Cluster key file from `auth cluster-keygen`, for a peer token.
+        #[arg(long, value_name = "PATH")]
+        cluster_key_file: Option<PathBuf>,
+        /// `sub` claim — who this token speaks for, e.g. `user:leif` or
+        /// `node:us-east-001`. Recorded on every refusal and on the span of
+        /// every request it opens.
+        #[arg(long, default_value = "user:unknown")]
+        subject: String,
+        /// Lifetime in seconds. Capped by the node at
+        /// [`yubaba::http_auth::MAX_TOKEN_TTL_SECS`].
+        #[arg(long, default_value_t = yubaba::http_auth::DEFAULT_TOKEN_TTL_SECS)]
+        ttl: i64,
     },
 }
 
@@ -609,6 +808,7 @@ enum StateCmd {
 }
 
 #[derive(Subcommand)]
+#[cfg(feature = "acme")]
 enum DomainCmd {
     /// Register a domain and print the DNS records its owner must create.
     ///
@@ -703,6 +903,7 @@ enum DomainCmd {
 /// are their own commands: at ten thousand tenants and a handful of brands, the
 /// pages are the small set.
 #[derive(Subcommand)]
+#[cfg(feature = "acme")]
 enum HoldingCmd {
     /// Store (or replace) a page from a local HTML file.
     Put {
@@ -811,6 +1012,7 @@ fn default_serve() -> Cmd {
         channel: "stable".to_string(),
         containerd_socket: DEFAULT_CONTAINERD_SOCKET.to_string(),
         container_net: None,
+        mesh_ip: None,
         kamaji_socket: None,
         scryer_endpoint: None,
         raft_node_id: None,
@@ -826,10 +1028,20 @@ fn default_serve() -> Cmd {
         sovereign_role: SovereignRole::default(),
         jurisdiction: None,
         leader_anchor: None,
+        transit_cost_file: None,
+        #[cfg(feature = "litestream")]
         litestream_s3_url: None,
+        headscale_durability: false,
         control_plane: false,
         camp_rpc_roots: Vec::new(),
+        hosted_camp_roots: Vec::new(),
+        hosted_camp_base_url: None,
+        push_relay_node_id: None,
+        push_relay_fcm_credentials: None,
         control_plane_allow: Vec::new(),
+        auth_mode: "warn".to_string(),
+        operator_keys: Vec::new(),
+        cluster_key_file: None,
         camp_rpc_yah_bin: "yah".to_string(),
         xlb_seeds: Vec::new(),
         xlb_relays: Vec::new(),
@@ -854,6 +1066,7 @@ async fn main() -> Result<()> {
             channel,
             containerd_socket,
             container_net,
+            mesh_ip,
             kamaji_socket,
             scryer_endpoint,
             raft_node_id,
@@ -869,10 +1082,20 @@ async fn main() -> Result<()> {
             sovereign_role,
             jurisdiction,
             leader_anchor,
+            transit_cost_file,
+            #[cfg(feature = "litestream")]
             litestream_s3_url,
+            headscale_durability,
             control_plane,
             camp_rpc_roots,
+            hosted_camp_roots,
+            hosted_camp_base_url,
+            push_relay_node_id,
+            push_relay_fcm_credentials,
             control_plane_allow,
+            auth_mode,
+            operator_keys,
+            cluster_key_file,
             camp_rpc_yah_bin,
             xlb_seeds,
             xlb_relays,
@@ -924,14 +1147,49 @@ async fn main() -> Result<()> {
                     "this cluster is a residency cell (W250) — cross-jurisdiction joins refused"
                 );
             }
-            // R599-F12: `--bind` is also this node's own mesh address (in
-            // production it is the tailscale0 IP), and a natively forked
+            // R599-F12 / R881-S2: this node's own mesh address is what every
+            // service record it publishes advertises, and a natively forked
             // workload can only bind an address the node already holds. Record
             // it so a bundle deploy can tell kamaji where to listen instead of
             // being pinned to loopback.
+            //
+            // `--bind` DERIVES it (in production the bind is the tailscale0
+            // IP), which is correct only where a node binds exactly one mesh
+            // address. `--mesh-ip` STATES it, for the nodes that cannot: the
+            // dev raft group binds 0.0.0.0 on purpose so each node answers on
+            // both its LAN and its mesh address, and a wildcard is not an
+            // address anything can dial.
+            //
+            // A bad `--mesh-ip` fails startup rather than falling back to the
+            // derived address — same rule as `--container-net` below, and for
+            // the same reason: an operator who named an address asked for
+            // that one, and quietly advertising a different one is the
+            // silent-unreachability class R881 exists to remove. Validated
+            // through yubaba's own `parse_node_mesh_ip`, so an explicit
+            // address and a derived one cannot drift apart on what counts as
+            // dialable.
+            let mesh_ip = match mesh_ip.as_deref() {
+                Some(raw) => Some(yubaba::parse_node_mesh_ip(raw).ok_or_else(|| {
+                    anyhow!(
+                        "--mesh-ip: {raw:?} is not an address another node can dial. \
+                         It must be a node-local unicast IPv4 address — this node's \
+                         mesh address, e.g. 100.64.0.10 — and not a wildcard, a \
+                         loopback address, a hostname, or IPv6."
+                    )
+                })?),
+                None => None,
+            };
+            if let Some(ip) = mesh_ip {
+                tracing::info!(
+                    mesh_ip = %ip,
+                    %bind,
+                    "advertising an explicit mesh address (R881-S2); --bind is not \
+                     used to derive it"
+                );
+            }
             let mut server_state = ServerState::load(state)?
                 .with_cluster_policy(policy)
-                .with_bind_addr(&bind);
+                .with_mesh_addr(mesh_ip, &bind);
 
             // R881-T4 (W343). A malformed range fails startup rather than
             // degrading to "no container networking": an operator who passed
@@ -961,9 +1219,17 @@ async fn main() -> Result<()> {
                 server_state = server_state.with_scryer_endpoint(endpoint);
             }
 
+            #[cfg(feature = "litestream")]
             if let Some(s3_url) = litestream_s3_url {
                 server_state = server_state.with_litestream_s3_url(s3_url);
             }
+
+            // R858-B23: the ONE value the appliance spec is built with on this
+            // node. Set unconditionally rather than only when true, so the
+            // state carries the node's declared configuration either way —
+            // `false` here is "this node does not declare a durability tier",
+            // which is what lets kamaji start the coordinator at all.
+            server_state = server_state.with_headscale_durability(headscale_durability);
 
             // R858-T16: the coordinator's public base URL. Two readers, one
             // fact: the operator-bridge preauth path already used it, and
@@ -981,8 +1247,17 @@ async fn main() -> Result<()> {
             // Resolved here, once, rather than per request — the handler must
             // be a pure function of node config so it is testable and so two
             // requests in the same second cannot disagree.
+            //
+            // noisetable R118-T11: only the DELEGATE ZONE half is `acme`-gated
+            // — `DELEGATE_ZONE_ENV` is `domain_issuer`'s const and there is no
+            // challenge delegation without an issuer. `public_ingress` is wired
+            // either way; it is node config, not ACME config.
+            #[cfg(feature = "acme")]
+            let delegate_zone = std::env::var(yubaba::domain_issuer::DELEGATE_ZONE_ENV).ok();
+            #[cfg(not(feature = "acme"))]
+            let delegate_zone: Option<String> = None;
             server_state = server_state.with_domain_onboarding(
-                std::env::var(yubaba::domain_issuer::DELEGATE_ZONE_ENV).ok(),
+                delegate_zone,
                 yubaba::public_ingress_targets(std::env::var(yubaba::PUBLIC_INGRESS_ENV).ok()),
             );
 
@@ -1003,6 +1278,17 @@ async fn main() -> Result<()> {
             // publisher, no per-domain issuer and no tenant passways, with
             // nothing in the log to attribute it to (us-west-001, 2026-09-09).
             // A cert store is a property of the node, not of the issuer.
+            //
+            // noisetable R118-T11: the whole block is `acme`-gated, and the
+            // reason is `cert_store::acme_directory` — see its doc comment. The
+            // store's path segment IS the ACME directory host, so a build with
+            // no ACME has no segment to address and connects no store. Nothing
+            // downstream is half-wired by that: `ServerState::cert_store` stays
+            // `None`, which is the state every node without
+            // `YUBABA_CERT_STORE_BUCKET` has been in since R779. The demux
+            // publisher and the per-domain issuer are nested inside on purpose
+            // — both write ACME-issued material.
+            #[cfg(feature = "acme")]
             match yubaba::cert_store::CertStoreConfig::parse(|k| std::env::var(k).ok()) {
                 Ok(Some(store_cfg)) => {
                     let directory_url =
@@ -1027,7 +1313,11 @@ async fn main() -> Result<()> {
                             match yubaba::demux_routes::parse_publisher_config(|k| {
                                 std::env::var(k).ok()
                             }) {
-                                Ok(Some(pub_cfg)) => {
+                                Ok(Some(mut pub_cfg)) => {
+                                    // R910-F2: scoped records publish only on
+                                    // the machines they name, unscoped ones only
+                                    // on a node declaring itself `fleet`.
+                                    pub_cfg.node = serving_node();
                                     if let Some(store) = server_state.cert_store.clone() {
                                         let _publisher =
                                             yubaba::demux_routes::spawn(store, pub_cfg);
@@ -1113,11 +1403,44 @@ async fn main() -> Result<()> {
             // see `tenant_passway`'s module doc for why deriving them from
             // different sources is the failure to avoid.
             match yubaba::tenant_passway::parse_config(|k| std::env::var(k).ok()) {
-                Ok(Some(tp_cfg)) => match (
+                Ok(Some(mut tp_cfg)) => match (
                     server_state.cert_store.clone(),
                     server_state.constable_client.clone(),
                 ) {
                     (Some(store), Some(kamaji)) => {
+                        let node = serving_node();
+                        tp_cfg.node = node.clone();
+                        // R910-F2: a node that arms doors also issues the certs
+                        // of the self-declared ones scoped to it — nobody else
+                        // can open their group-scoped token.
+                        #[cfg(feature = "acme")]
+                        match (
+                            yubaba::fleet_secrets::FleetSecretStore::for_rails(
+                                Some(&*store),
+                                sovereign_group.as_deref(),
+                            ),
+                            yubaba::domain_issuer::parse_declared_issuer_config(
+                                |k| std::env::var(k).ok(),
+                                node,
+                            ),
+                        ) {
+                            (Ok(secrets), Ok(declared_cfg)) => {
+                                let _declared_issuer = yubaba::domain_issuer::spawn_declared(
+                                    store.clone(),
+                                    secrets,
+                                    bind.clone(),
+                                    declared_cfg,
+                                );
+                            }
+                            (Err(rail), _) => tracing::warn!(
+                                "declared issuer not started — self-declared domains will not \
+                                 be issued on this node: {rail}"
+                            ),
+                            (_, Err(e)) => tracing::error!(
+                                "declared issuer config invalid — not started (fix YUBABA_ACME_* \
+                                 / YUBABA_DOMAIN_ISSUER_*): {e}"
+                            ),
+                        }
                         let _tenant_passways = yubaba::tenant_passway::spawn(store, kamaji, tp_cfg);
                     }
                     // Configured but unusable. Named rather than silent: the
@@ -1150,7 +1473,12 @@ async fn main() -> Result<()> {
             // without it the pond routes answer 503 and every camp deploy
             // silently fails. Cloud/systemd deployments don't mount the
             // socket, so this is a no-op there.
-            server_state = attach_pond_runtime(server_state).await;
+            //
+            // noisetable R118-T11: `pond`-gated with the module.
+            #[cfg(feature = "pond")]
+            {
+                server_state = attach_pond_runtime(server_state).await;
+            }
 
             // R609-F4: resolved before the `--control-plane` branch, and
             // fatally, because a malformed seed is a typo either way. The
@@ -1167,6 +1495,17 @@ async fn main() -> Result<()> {
                 )?
                 .with_lan(!xlb_no_lan);
 
+            // R876-B15: who may call this node's HTTP control plane. Built
+            // before anything binds, and FATAL on a bad value — a node that
+            // silently fell back to serving everyone is the state this
+            // ticket exists to end, and `--auth-mode require` with no trust
+            // root would 401 every route while looking like a partition.
+            server_state = server_state.with_http_auth(build_http_auth_policy(
+                &auth_mode,
+                &operator_keys,
+                cluster_key_file.as_deref(),
+            )?);
+
             // R609-F1: the yah control plane. Bound before raft so the
             // NodeId is logged early — it is the address an operator copies
             // into a desktop dial, and it should not be buried behind
@@ -1181,6 +1520,18 @@ async fn main() -> Result<()> {
                 seed_flags_given,
             )
             .await?;
+
+            // R726-F9: after the control plane, because both lanes want the
+            // endpoint it bound — the hosted-camp rows advertise its NodeId
+            // so a desktop can dial camp-rpc for the same workspace, and
+            // push dispatch rides it to reach the relay.
+            server_state = attach_hosted_camps(
+                server_state,
+                hosted_camp_roots,
+                hosted_camp_base_url,
+                push_relay_node_id,
+                push_relay_fcm_credentials,
+            );
 
             if let Some(node_id) = raft_node_id {
                 tracing::info!(node_id, dir = ?raft_dir, "starting raft coordination layer");
@@ -1215,6 +1566,16 @@ async fn main() -> Result<()> {
                     .with_cluster_state(state_machine.clone());
                 if let Some(region) = region.clone() {
                     server_state = server_state.with_region(region);
+                }
+                // R330-F17: operator override for the nearest-first router's
+                // tables/weights. A malformed file is fatal at startup, same
+                // posture as the ingress effector config below — a router
+                // that silently fell back to defaults because of a typo
+                // would misroute quietly instead of failing loudly once.
+                if let Some(path) = transit_cost_file.clone() {
+                    server_state = server_state
+                        .with_route_tables_file(&path)
+                        .context("--transit-cost-file")?;
                 }
                 // R742-F1: declaring a group turns on the add-learner gate on
                 // this node. Unset leaves it off — see the flag's doc.
@@ -1328,6 +1689,18 @@ async fn main() -> Result<()> {
                         public_address,
                     },
                 );
+                // R330-F17: fleet-wide service-record directory — polls every
+                // other member's `?ready=true` records and merges them,
+                // tagged with that member's region/provider (read straight
+                // off the same replicated member row above), into
+                // `shared_state.mesh_directory`. See the module doc for why
+                // this is a poll rather than a push.
+                let _mesh_directory = yubaba::mesh_directory::spawn(
+                    node_id,
+                    state_machine.clone(),
+                    Arc::clone(&shared_state.service_records),
+                    Arc::clone(&shared_state.mesh_directory),
+                );
                 // R734-T4: soft leader pin. Started on every node, not just the
                 // leader — a follower's loop reaches `NotLeader` and does
                 // nothing, so there is no start/stop edge to get wrong across an
@@ -1424,6 +1797,10 @@ async fn main() -> Result<()> {
                         state_machine.clone(),
                         policy,
                         yubaba::membership_ratchet::RatchetConfig::default(),
+                        // noisetable R118-T11: the epochs are this build's compile-time
+                        // constants, handed to consensus as data — that crate
+                        // does not read `cluster-epochs.json`, this one does.
+                        yubaba::origin_source::build_epochs(),
                     )
                 });
                 // R118-T5: the rollout supervisor. Started on every node for
@@ -1472,6 +1849,11 @@ async fn main() -> Result<()> {
                 // cert renewal it re-renders the local tmpfs mount and graceful-
                 // upgrades the consuming workload. No-op until a workload with a
                 // cluster File secret is deployed on this node.
+                // R911-F2: the node's fleet secret watch. Polls the fleet
+                // object store and bumps `ServerState::secret_epoch` when a
+                // record changes; both watchers below wake on it. Inert on a
+                // node with no cert-store config.
+                tokio::spawn(yubaba::secret_watch::run(Arc::clone(&shared_state)));
                 tokio::spawn(yubaba::secret_reload::run(Arc::clone(&shared_state)));
                 // R600-F10: the same delivery for a door systemd supervises
                 // rather than kamaji. The watcher above finds its consumers in
@@ -1517,21 +1899,31 @@ async fn main() -> Result<()> {
                 // R600-F3 (W273): the fleet-shared ACME issuer. Opt-in — only
                 // spawns when YUBABA_ACME_DOMAIN et al are set (the HA fleet),
                 // and only one node issues at a time (raft-lock elected). Reads
-                // the stored cert's age via the state-machine handle to decide
-                // renewal; seals cert+key under the node KEK and PutSecrets them.
+                // the stored cert from the fleet object store to decide renewal;
+                // seals cert+key under the node KEK and writes them there.
+                //
+                // noisetable R118-T11: `acme`-gated with the module.
+                #[cfg(feature = "acme")]
                 match yubaba::acme_issuer::parse_issuer_config(|k| std::env::var(k).ok()) {
-                    Ok(Some(issuer_cfg)) => {
-                        let _issuer = yubaba::acme_issuer::spawn(
-                            node_id,
-                            raft_node,
-                            state_machine,
-                            issuer_cfg,
-                            // R870-B20: the node's store, connected above, handed
-                            // in as the issuer's mirror. The issuer no longer
-                            // parses or connects one of its own.
-                            shared_state.cert_store.clone(),
-                        );
-                    }
+                    Ok(Some(issuer_cfg)) => match shared_state.cert_store.clone() {
+                        // R911-F3: the fleet cert lives in the node's fleet
+                        // object store (R870-B20: connected above and handed
+                        // in), so an issuer without one has nowhere to read or
+                        // write it and is not started.
+                        Some(store) => {
+                            let _issuer = yubaba::acme_issuer::spawn(
+                                node_id,
+                                raft_node,
+                                issuer_cfg,
+                                store,
+                            );
+                        }
+                        None => tracing::error!(
+                            "acme issuer configured (YUBABA_ACME_*) but this node has no fleet \
+                             object store (YUBABA_CERT_STORE_*) — issuer not started: since R911 \
+                             the fleet cert is stored there"
+                        ),
+                    },
                     Ok(None) => {}
                     Err(e) => tracing::error!(
                         "acme issuer config invalid — issuer not started (fix YUBABA_ACME_*): {e}"
@@ -1664,6 +2056,8 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
+        Cmd::Auth { cmd } => run_auth_cmd(cmd),
+
         Cmd::Raft { daemon, cmd } => match cmd {
             RaftCmd::Status => {
                 let body: serde_json::Value = reqwest::get(format!("{daemon}/raft/status"))
@@ -1786,7 +2180,9 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        #[cfg(feature = "acme")]
         Cmd::Domain { cmd } => run_domain_cmd(cmd),
+        #[cfg(feature = "acme")]
         Cmd::Holding { cmd } => run_holding_cmd(cmd),
         // Off the runtime, unlike its two siblings above — see `run_state_cmd`.
         Cmd::State { cmd } => tokio::task::spawn_blocking(move || run_state_cmd(cmd)).await?,
@@ -1814,6 +2210,24 @@ async fn main() -> Result<()> {
 /// recovery. `yubaba domain` and `yubaba holding` still have the un-wrapped
 /// shape and still panic from a debug build; that is their tickets' call, not
 /// R869's.
+/// R910-F2: the node every enrollment consumer (demux publisher, tenant-passway
+/// sweep, declared issuer) filters for. A bad `YUBABA_ENROLLMENT_SCOPE` is
+/// logged and read as the fail-closed default rather than refusing to start —
+/// a door whose publisher found nothing to serve keeps its existing route table.
+fn serving_node() -> yubaba::cert_store::ServingNode {
+    let machine = yubaba::leader::derive_machine_name();
+    let node = yubaba::cert_store::ServingNode::from_env(|k| std::env::var(k).ok(), machine.clone())
+        .unwrap_or_else(|e| {
+            tracing::error!("{e} — acting only on enrollments that name this machine");
+            yubaba::cert_store::ServingNode {
+                machine,
+                ..Default::default()
+            }
+        });
+    tracing::info!(machine = ?node.machine, scope = ?node.scope, "enrollment scope");
+    node
+}
+
 fn run_state_cmd(cmd: StateCmd) -> Result<()> {
     use yubaba::state_backup;
 
@@ -1871,7 +2285,6 @@ fn run_state_cmd(cmd: StateCmd) -> Result<()> {
             println!();
             println!("members            {}", snap.state.members.len());
             println!("service placement  {}", snap.state.service_placement.len());
-            println!("cluster secrets    {}", snap.state.secrets.len());
             println!("tenants            {}", snap.state.tenants.len());
             println!("tenant placement   {}", snap.state.placement.len());
             println!("ingress owner      {:?}", snap.state.ingress_owner);
@@ -1898,11 +2311,9 @@ fn run_state_cmd(cmd: StateCmd) -> Result<()> {
                 dir.display()
             );
             println!(
-                "  members={} services={} secrets={} tenants={} placement={} (locks and rollouts \
-                 dropped)",
+                "  members={} services={} tenants={} placement={} (locks and rollouts dropped)",
                 state.members.len(),
                 state.service_placement.len(),
-                state.secrets.len(),
                 state.tenants.len(),
                 state.placement.len()
             );
@@ -1948,6 +2359,7 @@ fn run_state_cmd(cmd: StateCmd) -> Result<()> {
 /// Synchronous inside an async `main` on purpose: [`yubaba::cert_store`]'s API
 /// is blocking, these are one-shot commands with nothing else on the runtime,
 /// and wrapping four `get`s in `spawn_blocking` would buy nothing but noise.
+#[cfg(feature = "acme")]
 fn run_domain_cmd(cmd: DomainCmd) -> Result<()> {
     use yubaba::domain_admin::{self, DomainReport};
 
@@ -2071,6 +2483,7 @@ fn run_domain_cmd(cmd: DomainCmd) -> Result<()> {
 }
 
 /// `yubaba holding …` — the page bodies, beside the enrollment set (R870-F8).
+#[cfg(feature = "acme")]
 fn run_holding_cmd(cmd: HoldingCmd) -> Result<()> {
     use yubaba::domain_admin;
 
@@ -2168,6 +2581,9 @@ async fn attach_runtime(mut state: ServerState, containerd_socket: &str) -> Serv
 /// non-standard runtimes. When neither is present (cloud/systemd nodes),
 /// pond stays unwired and the routes answer 503 — that's the correct
 /// shape for non-pond deployments.
+///
+/// noisetable R118-T11: `pond`-gated with the module.
+#[cfg(feature = "pond")]
 async fn attach_pond_runtime(state: ServerState) -> ServerState {
     let docker_host = match std::env::var("DOCKER_HOST") {
         Ok(h) if !h.trim().is_empty() => h,
@@ -2355,6 +2771,100 @@ async fn attach_control_plane(
     Ok(state.with_control_plane_planes(endpoint, planes))
 }
 
+/// R726-F9 (W122): turn on `GET /camps` and, when a relay was named, the
+/// push dispatch that wakes a phone when one of those camps raises a gate.
+///
+/// Infallible by construction. Every failure mode here is a
+/// misconfiguration the operator can see in the log and fix without a
+/// restart loop, and none of them should take the node's other three
+/// planes down: a hosted-camp lane that cannot start is a `/camps` that
+/// answers with what it does know, not a daemon that refuses to boot.
+fn attach_hosted_camps(
+    state: ServerState,
+    hosted_camp_roots: Vec<PathBuf>,
+    hosted_camp_base_url: Option<String>,
+    push_relay_node_id: Option<String>,
+    push_relay_fcm_credentials: Option<String>,
+) -> ServerState {
+    let mut state = state;
+
+    if hosted_camp_roots.is_empty() {
+        if hosted_camp_base_url.is_some() {
+            tracing::warn!(
+                "--hosted-camp-base-url given without --hosted-camp-root; no camp is \
+                 enumerated, so the base URL addresses nothing"
+            );
+        }
+    } else {
+        let mut config = yubaba::hosted_camps::HostedCampConfig::new(hosted_camp_roots);
+        config.base_url = hosted_camp_base_url;
+        if config.base_url.is_none() {
+            // WARN because the surface still works and a reader could
+            // reasonably think it is finished. A phone reading these rows
+            // gets a name and a path it cannot dial.
+            tracing::warn!(
+                path = yubaba::hosted_camps::HOSTED_CAMPS_PATH,
+                "--hosted-camp-root given without --hosted-camp-base-url; camps are \
+                 enumerated but carry no URL, so a phone can list them and not open one. \
+                 Pass the deployment's public ingress base."
+            );
+        }
+        state = state.with_hosted_camps(config);
+        let camps = state.hosted_camps.enumerate();
+        tracing::info!(
+            path = yubaba::hosted_camps::HOSTED_CAMPS_PATH,
+            roots = ?state.hosted_camps.roots,
+            camps = camps.len(),
+            "hosted-camp surface serving"
+        );
+    }
+
+    let Some(relay_node_id) = push_relay_node_id else {
+        if push_relay_fcm_credentials.is_some() {
+            tracing::warn!(
+                "--push-relay-fcm-credentials given without --push-relay-node-id; there is \
+                 no relay to send to, so the credential reference is unused"
+            );
+        }
+        return state;
+    };
+
+    let mut config = yubaba::push_dispatch::PushDispatchConfig::new(relay_node_id);
+    config.fcm_credentials = push_relay_fcm_credentials;
+
+    // The endpoint the control plane bound. Without one there is no
+    // transport, and saying so beats a dispatcher that fails on the first
+    // gate — which is when someone is already waiting on an approval.
+    let Some(endpoint) = state.control_plane.clone() else {
+        tracing::warn!(
+            relay = %config.node_id,
+            "--push-relay-node-id given but no control-plane endpoint is bound; push \
+             dispatch rides that endpoint, so hosted-camp gates will not reach a phone. \
+             Pass --control-plane."
+        );
+        return state;
+    };
+
+    match yubaba::push_dispatch::PushDispatcher::over_mshr(endpoint, config) {
+        Ok(dispatcher) => {
+            tracing::info!(
+                relay = %dispatcher.config().node_id,
+                alpn = yubaba::push_dispatch::PUSH_RELAY_ALPN_STR,
+                fcm_credentials = ?dispatcher.config().fcm_credentials,
+                "hosted-camp push dispatch configured"
+            );
+            state.with_push_dispatch(Arc::new(dispatcher))
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = format!("{e}"),
+                "push dispatch not configured; hosted-camp gates will not reach a phone"
+            );
+            state
+        }
+    }
+}
+
 /// Assemble the control plane's [`Admission`](yubaba::control_plane::Admission)
 /// policy from the operator's allowlist and whatever cheers client this
 /// daemon holds (R609-F3).
@@ -2369,6 +2879,132 @@ async fn attach_control_plane(
 /// of tolerating it — a node that boots clean and then refuses the one
 /// desktop the operator meant to admit — is discovered at the worst
 /// possible time, over a transport with no other way in.
+/// R876-B15: assemble the HTTP control plane's trust policy from `serve`'s
+/// flags.
+///
+/// Fatal on every bad value, for the same reason [`build_admission`] is: a
+/// node that boots clean and then behaves differently from what the operator
+/// configured is discovered at the worst possible time. That covers a
+/// malformed key, an unreadable cluster-key file, and `--auth-mode require`
+/// with nothing to trust — the last would 401 every authenticated route
+/// while the unit stayed `active`, which reads on the wire as a partition.
+fn build_http_auth_policy(
+    auth_mode: &str,
+    operator_keys: &[String],
+    cluster_key_file: Option<&std::path::Path>,
+) -> Result<yubaba::http_auth::HttpAuthPolicy> {
+    let mode = yubaba::http_auth::AuthMode::parse(auth_mode).map_err(|e| anyhow!(e))?;
+    let cluster_key = match cluster_key_file {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("reading --cluster-key-file {}", path.display()))?
+                .trim()
+                .to_string(),
+        ),
+        None => None,
+    };
+    let policy = yubaba::http_auth::HttpAuthPolicy::new(mode, operator_keys, cluster_key.as_deref())
+        .map_err(|e| anyhow!(e))?;
+    tracing::info!(
+        mode = auth_mode,
+        operator_keys = operator_keys.len(),
+        cluster_key = policy.has_trust_root() && cluster_key_file.is_some(),
+        "http control-plane auth policy"
+    );
+    if !policy.is_enforcing() {
+        tracing::warn!(
+            "http control plane is in auth-mode=warn: unauthenticated callers are SERVED and \
+             logged. Pass --auth-mode require once every caller signs (R876-T18)."
+        );
+    }
+    Ok(policy)
+}
+
+/// R876-B15: `yubaba auth …` — generate the keys `serve` trusts and mint the
+/// tokens a caller presents.
+fn run_auth_cmd(cmd: AuthCmd) -> Result<()> {
+    use yubaba::http_auth;
+
+    /// Secrets land at 0600 or not at all — a key file the rest of the box
+    /// can read is not a key.
+    fn write_secret(path: &std::path::Path, contents: &str) -> Result<()> {
+        std::fs::write(path, format!("{contents}\n"))
+            .with_context(|| format!("writing {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("chmod 0600 {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    match cmd {
+        AuthCmd::Keygen { secret_out } => {
+            let (public, secret) =
+                http_auth::generate_operator_keypair_hex().map_err(|e| anyhow!(e))?;
+            // The public half on stdout unconditionally: it is what the
+            // operator copies onto every node, and it is not a secret.
+            println!("public {public}");
+            match secret_out {
+                Some(path) => {
+                    write_secret(&path, &secret)?;
+                    eprintln!("secret written to {} (mode 0600)", path.display());
+                }
+                None => println!("secret {secret}"),
+            }
+            Ok(())
+        }
+        AuthCmd::ClusterKeygen { out } => {
+            let hex = http_auth::generate_cluster_key_hex().map_err(|e| anyhow!(e))?;
+            match out {
+                Some(path) => {
+                    write_secret(&path, &hex)?;
+                    eprintln!("cluster key written to {} (mode 0600)", path.display());
+                }
+                None => println!("{hex}"),
+            }
+            Ok(())
+        }
+        AuthCmd::Mint {
+            secret_file,
+            cluster_key_file,
+            subject,
+            ttl,
+        } => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let token = match (secret_file, cluster_key_file) {
+                (Some(_), Some(_)) => {
+                    bail!("pass exactly one of --secret-file (operator) or --cluster-key-file (peer)")
+                }
+                (Some(path), None) => {
+                    let raw = std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading {}", path.display()))?;
+                    let secret =
+                        http_auth::operator_secret_from_hex(raw.trim()).map_err(|e| anyhow!(e))?;
+                    http_auth::mint_operator_token(&secret, &subject, ttl, now)
+                        .map_err(|e| anyhow!(e))?
+                }
+                (None, Some(path)) => {
+                    let raw = std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading {}", path.display()))?;
+                    let key =
+                        http_auth::cluster_key_from_hex(raw.trim()).map_err(|e| anyhow!(e))?;
+                    http_auth::mint_peer_token(&key, &subject, ttl, now).map_err(|e| anyhow!(e))?
+                }
+                (None, None) => {
+                    bail!("pass --secret-file (operator token) or --cluster-key-file (peer token)")
+                }
+            };
+            println!("{token}");
+            Ok(())
+        }
+    }
+}
+
 fn build_admission(
     state: &ServerState,
     hostkey_dir: &std::path::Path,

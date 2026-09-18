@@ -317,7 +317,7 @@
 //! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:next("Two children: a spike that settles which mechanism owns workload expose.public, then a task that wires the winner and deletes or documents the loser.")
-//! @yah:gotcha("Proven 2026-08-16: ServerState::cloudflared_url is set ONLY by with_cloudflared_url (lib.rs:1351), whose three callers are two tests in tests/integration_public_ingress.rs and one doc comment in testing/cloudflared_mock.rs. The shipping startup chain is load().with_cluster_policy().with_bind_addr() (main.rs:520) plus the litestream/runtime/kamaji/pond attachers; main.rs has zero matches for 'cloudflared'. Every production yubaba therefore takes the lib.rs:3089 fallback ('no cloudflared URL configured; using port-mapping fallback for expose.public') on every node, regardless of what is installed on the box.")
+//! @yah:gotcha("Proven 2026-08-16: ServerState::cloudflared_url is set ONLY by with_cloudflared_url (lib.rs:1351), whose three callers are two tests in tests/integration_public_ingress.rs and one doc comment in testing/cloudflared_mock.rs. The shipping startup chain is load().with_cluster_policy().with_mesh_addr() (main.rs:520) plus the litestream/runtime/kamaji/pond attachers; main.rs has zero matches for 'cloudflared'. Every production yubaba therefore takes the lib.rs:3089 fallback ('no cloudflared URL configured; using port-mapping fallback for expose.public') on every node, regardless of what is installed on the box.")
 //! @yah:gotcha("A second, newer mechanism exists and may be the real owner: reconciler::ingress::ensure_tunnel_ingress (oss/yubaba/crates/cloud/src/reconciler/ingress.rs) + local_driver::cloudflared_ingress::CloudflaredIngressSpec (oss/yah-base), driven from handle_cloudflared_deploy at app/yah/cli/src/cloud.rs:3509 — one cloudflared per (machine, cohort), keyed on MachineConfig.cloudflared. Do not wire the ServerState path before settling which of the two owns workload expose.public; wiring both is two tunnels for one route.")
 //! @yah:assumes("Reported by the noisetable camp (its R131-T6, app.noisetable.com public origin). Whether us-west-001 actually runs cloudflared is UNVERIFIED: machine.toml's cloudflared field only injects an install block into cloud-init at provision time, and us-west-001 is provider = static — an attached box cloud-init may never have run for. Settle with: ssh debian@15.204.89.240 'systemctl is-active cloudflared'.")
 //! @arch:see(.yah/docs/architecture/A053-yah-yubaba-integration-testing.md)
@@ -343,7 +343,7 @@
 //! @yah:at(2026-08-19T05:35:36Z)
 //! @yah:assignee(agent:bundle-anthropic-miravel)
 //! @yah:parent(R780)
-//! @yah:next("If S1 says the ServerState path owns it: give yubaba a source for cloudflared_url (machine manifest field, config, or env) and attach it in main.rs's startup chain next to with_cluster_policy/with_bind_addr. If S1 says the reconciler path owns it: delete cloudflared_url, post_tunnel_route, and the two integration tests that are its only production-shaped callers, so the dead branch stops looking wired.")
+//! @yah:next("If S1 says the ServerState path owns it: give yubaba a source for cloudflared_url (machine manifest field, config, or env) and attach it in main.rs's startup chain next to with_cluster_policy/with_mesh_addr. If S1 says the reconciler path owns it: delete cloudflared_url, post_tunnel_route, and the two integration tests that are its only production-shaped callers, so the dead branch stops looking wired.")
 //! @yah:next("Either way the port-mapping fallback must stop being silent-on-purpose in a deployment that asked for expose.public — warn-and-continue is right for a node with no tunnel, wrong for one that declared cloudflared in its machine manifest. Make that case loud (or fail the deploy).")
 //! @yah:next("Tier: Warrior — the design decision is S1's; this is plumbing plus a test.")
 //! @yah:verify("cd /Users/leif/ss/yah && cargo test -p yubaba --test integration_public_ingress")
@@ -414,6 +414,46 @@
 //! @yah:handoff("LANDED by @Ashguard:coffee (courier, session:0c8cd807) 2026-09-09, commissioned from the noisetable camp with operator authorisation. ACCEPTANCE SHAPE CHOSEN — publish the record but never mark it Ready, rather than withholding the record. `workload_bind_ip` becomes `workload_bind_ip(&spec) -> Option<Ipv4Addr>` and returns None for an isolated netns; `ServiceRecord` gains a persisted `routable` flag whose false value pins health to `NotReady { reason: \"unroutable\" }` through every write path via a single `health_for` funnel. The funnel is load-bearing: without it the sweep re-promotes the record off `WorkloadStatus::Running`, and a restart re-promotes it off the ledger — hence `routable` is a ledger field, defaulting true for pre-R881 files. Publishing-but-not-Ready was chosen over withholding because the wire ALREADY carries health + reason, so `?ready=false` shows an operator exactly why while `?ready=true` goes empty and ingress.rs:389-392 refuses unchanged. The deploy itself still succeeds, so the container stays nsenter-debuggable — the failure is loud without being destructive.")
 //! @yah:verify("Baselines measured before any edit, not taken from the ticket. `cargo test -p yubaba --lib` 865/0 -> 878/0 (that range includes a peer's concurrent demux_routes tests, so it is not all mine). `cargo test -p yubaba --features testing --test testing` = 30 passed / 0 failed / 1 ignored, the +1 being the acceptance test: it deploys the real triggering shape (tenant tier, isolated netns, [expose.mesh] ports=[4332], mesh node 100.64.0.3) through the real handler, feeds `?ready=true` into cloud's ServiceRecordFanout, and asserts `resolve_upstreams_from` ERRORS naming api.noisetable.com and never renders 100.64.0.3:4332 — i.e. it pins the exact production failure that triggered R881. `--test main -- integration_deploy_through_kamaji pond_kamaji` 4/0. `cargo check --workspace --all-targets` in oss/yubaba clean. Peer check ran before editing: camp.roster showed no session on yubaba or kamaji.")
 //! @yah:gotcha("DELIBERATE SECOND-ORDER BEHAVIOUR CHANGE, now pinned by a test — read this before it surprises you. Deploy dependency gating and FromMesh env rendering both read `is_ready`, so an unroutable dependency now REFUSES a consumer's deploy with 424 instead of starting that consumer against an unreachable service. That is the correct direction (it is the same loud-failure principle one level up) but it means the first deploy after this lands can fail where it previously appeared to succeed. The failure names the reason.")
+//!
+//! @yah:ticket(R881-B8, "yubaba silently deploys through its in-process containerd runtime when the kamaji sibling is unreachable — no netns, no resolver, and the service record still says 10.128.3.2")
+//! @yah:status(review)
+//! @yah:at(2026-09-11T07:58:33Z)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:parent(R881)
+//! @yah:severity(high)
+//! @yah:next("THE FIX IS PROBABLY THE REFUSAL, NOT THE SECOND IMPLEMENTATION. kamaji-bin/src/server.rs:2240-2242 already states the principle for its own path — an address that was promised and then could not be wired is \"a refused deploy rather than a silent fallback: the workload would come up unreachable, and shipping unreachable workloads that look healthy is the defect this relay exists to remove\". The in-process runtime violates exactly that, so either (a) active_backend refuses a non-host-networked container deploy when the sibling is absent (smallest, and honest: the inlined runtime is the legacy path), or (b) the inlined runtime learns container_net too (duplicates R881-T3 in a second place — the drift that kamaji-containerd-core exists to prevent). Recommend (a). Either way the fallback must stop being silent: it currently logs nothing at all.")
+//! @yah:gotcha("THE RECORD STILL ADVERTISES THE ADDRESS THE CONTAINER DOES NOT HAVE, which is R881's founding defect arriving through a second door. yubaba allocated 10.128.3.2 (workload_bind_ip -> allocate_container_address, lib.rs:1841) and the fallback backend faithfully stamped it: `yah.mesh_ip=10.128.3.2` label and `YAH_MESH_IP=10.128.3.2` env were BOTH present on a container whose only interface was 127.0.0.1/8, verified with `ctr -n yah c info`. R881-B1's binds_node_ports predicate cannot catch this — it reads the SPEC, and the spec was fine; what failed was the backend that ran it. Anything reading service-records would have routed traffic at a dead veth.")
+//! @yah:verify("Repro without a fleet node: start yubaba with --containerd-socket AND --kamaji-socket, kill the kamaji sibling, deploy a non-host-networked workload, assert the resulting OCI spec's network namespace carries a path (or that the deploy is refused). oss/yubaba/crates/yubaba/tests/integration_deploy_through_kamaji.rs is the existing home for the sibling-attached direction.")
+//! @yah:gotcha("MEASURED LIVE ON us-east-001 (51.81.85.145) 2026-09-11 06:54-06:58 UTC by @Ashguard:coffee (session:91597c1e), while verifying R881-B7. Sequence: a kamaji-only hotship put 0.8.38-h4 on the node beside the released yubaba 0.8.37. The tree carries an UNRELEASED kamaji-proto bump to V10 (R850-T4, oss/kamaji/crates/kamaji-proto/src/version.rs, uncommitted) which removes AckKind::Deploy and renumbers the rest, so the V9 yubaba and V10 kamaji misframed each other — `WARN kamaji_bin::server: connection handler error error=decode failed: frame too large: 542393671 > 1048576`. yubaba's active_backend (lib.rs:1995) then fell through `constable_client.and_then(KamajiSibling::current)` to `.or_else(|| self.runtime.clone())`, its in-process containerd runtime. TWO deploys of noisetable-account through that fallback came up with ONLY lo: kamaji/src/containerd.rs:547-553 hardcodes `join_netns: None` (its doc says isolated-netns join is \"deferred\"), and the inlined path never calls container_net at all — so no netns is wired on deploy and none is torn down on destroy (the orphan from the previous deploy survived, still carrying eth0 10.128.3.2, while the live container sat in a fresh empty one). NOTHING was logged by either side about the fallback. Restored: `scripts/roll-node.sh us-east-001 --to 0.8.37 --yes` + one more `yah cloud workload rolling noisetable-account`; the node is back on published bytes with `container network namespace wired ... address=10.128.3.2 gateway=10.128.3.1` in the kamaji journal at 06:57:28.")
+//! @yah:handoff("FIXED AS OPTION (a), THE REFUSAL — and the silence is gone on both lifecycle verbs. Three edits, all in oss/yubaba/crates/yubaba/src/lib.rs. (1) NEW `pub enum WorkloadBackend { Sibling(Arc<dyn ContainerRuntime>), Inlined(Arc<dyn ContainerRuntime>) }` with `wires_container_netns()` / `name()` / `runtime()` / `into_runtime()`. (2) NEW `ServerState::workload_backend()` is now THE selector (same preference order: sibling, then legacy in-process `runtime`, then None); `active_backend()` is a one-line projection `self.workload_backend().map(WorkloadBackend::into_runtime)` so the two cannot drift and all nine existing call sites (leader.rs x3, service_records.rs x2, secret_reload.rs, pond.rs, destroy, deploy) kept compiling untouched. (3) THE GATE, in deploy_workload_spec right after `let bind_ip = s.workload_bind_ip(&spec)`: `needs_wired_netns = bind_ip.is_some() && !service_records::binds_node_ports(&spec)`; if that holds and `!backend.wires_container_netns()`, return 503 SERVICE_UNAVAILABLE with `{status:\"rejected\", runtime:\"inlined\", error:\"workload needs a wired container network namespace...\"}` and an `error!` carrying ident/backend/bind_ip/sibling_configured. The refusal happens BEFORE `rt.deploy_workload`, which is the load-bearing half — a 503 after the container started would leave exactly the orphan netns the incident left behind.")
+//! @yah:handoff("WHY THE GATE IS THAT PREDICATE AND NOT \"refuse every non-host-networked deploy through the inlined runtime\". The blunt version breaks every dev/pond/CI node, where the in-process runtime is the ONLY backend and isolated-netns deploys are routine. `bind_ip.is_some() && !binds_node_ports(spec)` fires only when yubaba has ALREADY ALLOCATED an address out of the node's container /24 — i.e. the node was started with `--container-net` and has therefore PROMISED a veth that only the sibling wires (R881-T3). A node with no `--container-net` gets `workload_bind_ip == None`, publishes `NotReady { reason: \"unroutable\" }` per R881-B1, and is untouched by this change; a host-networked or `yah.docker.publish` workload is `binds_node_ports == true` and is untouched too. So the refusal is scoped exactly to the fleet shape that produced the incident.")
+//! @yah:handoff("DESTROY IS LOGGED, NOT REFUSED — deliberate, and the reasoning is in the comment at the site. Refusing teardown when the sibling is down leaves an operator with no destroy verb at all, and the inlined runtime is the CORRECT backend on a node that never had a sibling. So `destroy_workload` now resolves through `workload_backend()` too and emits `warn!(\"kamaji sibling unreachable — tearing down through the legacy in-process runtime, which did not deploy this workload\")`, which makes the R823-B4 cross-process split-brain attributable instead of mysterious. Deploy emits the matching warn on a fallback that is ALLOWED (host-networked workload, sibling down): `\"kamaji sibling unreachable — deploying through the legacy in-process runtime instead\"`. Both are gated on `s.constable_client.is_some()`, so a node that never had a sibling stays quiet.")
+//! @yah:handoff("DISCOVERED + FIXED IN THE SAME PASS — THE SAME DEFECT IN THE READ DIRECTION, and it is arguably worse than the one filed. oss/yubaba/crates/yubaba/src/service_records.rs `sweep_once` re-resolves the backend every 15s tick and reconciles the whole record set against `list_workloads()`. Its Err arm already refuses to reconcile on a blip, with the comment \"A failed list is NOT an empty list ... would retract every record on a transient backend blip and yank live upstreams out from under the ingress proxy\". But a fleet node whose sibling goes away does NOT get an Err: `workload_backend()` hands back the in-process runtime, which answers Ok with its own view of containerd — nothing it deployed, and differently-derived ids where it did (`forge.<uuid>` vs kamaji-bin's `forge-<uuid>`, R823-B4). A SUCCESSFUL, WRONG list walks straight through the guard that exists to stop exactly this, and `reconcile` retracts every record for containers kamaji is still running. A `systemctl restart kamaji` was therefore enough to drain the front door. Now: `sweep_once` resolves through `workload_backend()` and returns false with a warn when `state.sibling_substituted(&backend)`, which is the same conservative answer the Err arm gives — a record goes stale rather than false, and the next tick with a real sibling corrects it.")
+//! @yah:handoff("SECOND DISCOVERED INSTANCE, ALSO FIXED: oss/yubaba/crates/yubaba/src/pond.rs `pond deploy` chose its supervision seam on `match state.active_backend() { Some(_) => KamajiLauncher + daemon_supervised=true, None => LocalRuntime + own resurrect loop }`. A substituted backend answers `Some`, so a node whose kamaji went away built a KamajiLauncher over the IN-PROCESS runtime and set `daemon_supervised = true` — standing pond's own reconcilers down while nothing at all held the restart policy. A crashed slot then stayed dead and the probes reported it faithfully. Now `match state.workload_backend() { Some(b) if b.is_sibling() => ..., _ => LocalRuntime }`, which is the pre-R626 degrade that seam's own comment already describes.")
+//! @yah:cleanup("NOT FIXED, SEPARABLE, SAME NEIGHBOURHOOD — two more `active_backend()` callers resolve the backend ONCE and hold it, so they hold a SNAPSHOT `Arc<KamajiClient>` that a reconnect makes dead. (1) oss/yubaba/crates/yubaba/src/secret_reload.rs:185 `let Some(backend) = state.active_backend() else { return }` at task startup, then drives `graceful_upgrade_workload` off that handle for the life of the process — so a cert rotation after any `systemctl restart kamaji` graceful-upgrades through a client that can only answer PeerClosed. (2) oss/yubaba/crates/yubaba/src/leader.rs:1369/:1713/:1887 resolve per call, which is fine, but they call the backend DIRECTLY rather than through `deploy_workload_spec`, so the R881-B8 refusal does not cover the headscale appliance deploy. That one is benign today — `headscale_appliance::appliance_spec` sets NATIVE_EXEC_ANNOTATION, so `binds_node_ports` is true and there is no netns to wire — but it is a second deploy door with no gate on it. Left alone deliberately: (1) is a stale-handle bug, not a wrong-backend one, and (2) is R858's appliance seam.")
+//! @yah:gotcha("TWO THINGS THE NEXT AGENT WILL TRIP OVER, neither caused by this ticket. (1) PRE-EXISTING COMPILE BREAK, FIXED HERE: oss/yubaba/crates/yubaba/tests/integration_service_records.rs:561 would not compile — `cloud::reconciler::ingress::IngressPlan` gained a required `auth: Option<PasswayAuth>` field (R870-F26) and R881-B1's `IngressPlan { .. }` literal was never updated, so `--test testing` failed with E0063 before any test ran. Added `auth: None`. (2) THE `-p yubaba --features testing --test main` TARGET MASS-FAILS UNDER LOAD AND IT IS NOT THIS CHANGE. 37 of 93 failed on a full-suite run, every one of them a raft test panicking with \"nodes never agreed on a leader; last per-node current_leader was [None, None, None]\" — an election timeout under CPU contention on a camp machine running several concurrent builds. `--test-threads=4` took it to 1 failure in 79, and `the_partitioned_leader_stops_leading_and_the_survivors_elect_a_new_one` passes on its own. None of those tests reaches the container deploy/destroy path this ticket touches.")
+//! @yah:verify("THREE NEW REGRESSION TESTS in oss/yubaba/crates/yubaba/tests/integration_service_records.rs, driven through the real `build_router` handlers. (1) `a_workload_needing_a_wired_netns_is_refused_when_the_sibling_is_gone` — container-net node, no sibling: 503, error body names \"network namespace\", `FakeRuntime::deploy_calls()` EMPTY (a 503 after the container started leaves the same orphan the incident left), no record published. (2) `the_refusal_spares_host_networked_workloads_and_nodes_with_no_range` — both halves of \"narrow\": a host-networked spec still deploys on the container-net node, and an isolated spec still deploys on a node with no `--container-net` (R881-B1's honest unroutable record, which a blunt refusal would have broken on every dev node). (3) `a_configured_but_unreachable_sibling_refuses_the_deploy_and_skips_the_sweep` — BOTH ARMS of the selector on one fleet-shaped node: arm one spawns a real kamaji-bin over a real UDS and asserts `is_sibling()` + `!sibling_substituted()`; arm two holds a configured-but-unreachable sibling and asserts `sibling_substituted()`, the deploy 503 with `deploy_calls()` empty, AND `service_records::sweep_once` returning false. Tests (1)/(2) run with `constable_client: None`, so without (3) the `sibling_substituted` branches had no coverage at all.")
+//! @yah:gotcha("\"KILL THE SIBLING\" DOES NOT WORK IN AN IN-PROCESS TEST, and the first version of test (3) proved it the expensive way — it sat through its whole 15s window while the watchdog never cleared. `kamaji_bin::serve_with_shutdown` (oss/kamaji/crates/kamaji-bin/src/server.rs, the `tokio::spawn` inside its accept loop) spawns every connection handler DETACHED, so signalling its shutdown stops the accept loop and removes the socket file but leaves an established client fully connected — `KamajiClient::is_dead()` stays false forever and `KamajiSibling`'s watchdog has nothing to react to. The substituted state is therefore unreachable from inside one process by killing the server. FIXED BY ADDING THE AFFORDANCE, one cfg-gated constructor: `KamajiSibling::disconnected(socket)` at oss/kamaji/crates/kamaji/src/sibling.rs, `#[cfg(feature = \"testing\")]`, seeds the watch channel with `None` and spawns NO watchdog (so it stays disconnected instead of racing a redial against the assertions). Nine lines, no production surface. `cargo check --workspace --all-targets` in oss/kamaji is clean with the feature off.")
+//! @yah:verify("GREEN, run after the camp's disk sweep removed oss/yubaba/target mid-session and forced a cold rebuild. `cargo test -p yubaba --features testing --lib --test testing` = lib 954 passed / 0 failed, testing target 33 passed / 0 failed / 1 ignored, EXIT=0. `cargo check --workspace --all-targets` in oss/kamaji = EXIT=0, which is what proves the new `#[cfg(feature = \"testing\")]` constructor does not leak into a featureless build.")
+//!
+//! @yah:relay(R903, "34 persistent raft leader-election test failures in the yubaba workspace, load-independent")
+//! @yah:status(review)
+//! @yah:at(2026-09-15T18:20:14Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:next("Tier: Wizard — a persistently failing distributed-consensus suite is a real correctness question, not a flake to re-run away. MEASURED 2026-09-13 by the R895 relay while verifying an unrelated ticket; filed rather than fixed because it belongs to the yubaba raft/rollout owner. One of the 11 binaries in `cargo test --manifest-path oss/yubaba/Cargo.toml --workspace` fails persistently; the other 10 are green at 2204 passed / 0 failed. All failures are leader-election timeouts, panic text `voters never agreed on a leader; last per-node current_leader was [None, None, None]`. THE KEY EVIDENCE IS THAT LOAD IS NOT THE CAUSE, which was the first and most attractive hypothesis and was disproved by measurement: run 1 at load average 16.82 with 9 concurrent compilers gave 61 passed / 33 failed; run 2 at load 9.78 with 2 compilers gave 60 passed / 34 failed with a no-skew verdict. Halving the machine load did not reduce the failures — it added one. Run 1's failing set is a STRICT SUBSET of run 2's, the single extra being raft_leader_pin::an_off_anchor_leader_hands_leadership_to_the_anchor_region. So these are persistent pre-existing failures with one timing-sensitive straggler, not contention artifacts.")
+//! @yah:gotcha("RULED OUT as the cause, four independent ways, so nobody re-treads this: R895-T2's deletion of LegacyServiceConfig / legacy_services / the compose renderer is NOT responsible. (1) Structural — a removed struct field fails at COMPILE time, yet these binaries compiled and ran 60+ passing tests alongside the failures. (2) `grep -rn --include='*.rs'` over oss/yubaba returns only board-annotation prose for legacy_services and LegacyServiceConfig, zero code references. (3) The only use of cloud::CloudConfig anywhere under oss/yubaba/crates/yubaba/tests/ is in pond_reconciler_smoke.rs, which is not among the failures. (4) Symptom shape — leader-election timeout — has no relationship to config loading. Note on measurement conditions, because it bounds the result: no formally quiet window was ever available. `camp.machine` reported quiet:false on both runs due to 4 live slots in the FOREIGN `noisetable` camp, which camp.roster cannot see by contract (it is scoped to this camp only, so a loud machine reads as a quiet camp). Rather than wait indefinitely for a quiet that never came, the measurement was taken as a two-point load comparison, which is what makes the load hypothesis falsifiable at all. A future attempt at a genuinely quiet run should use camp.machine's `quiet` field rather than load average or camp.roster.")
+//! @yah:handoff("ROOT CAUSE, MEASURED 2026-09-15 by DYLD interposition on the unmodified test binary: every reqwest::Client build walks the macOS trust store (reqwest's rustls-tls-native-roots is feature-unified on via object_store -> turso-backup -> tenant-streamer), one trustd IPC per root cert through a single serialized daemon. openraft calls RaftNetworkFactory::new_client per voter on EVERY vote/pre-vote round and awaits it inline in RaftCore (raft_core.rs:1442/1537), and YubabaNetworkFactory built a fresh client there; test helpers also built one per 50 ms poll. At 15 test threads: SecTrustSettingsCopyCertificates mean 393 ms over 5,727 builds (37 min cumulative stall in a 129 s run), trustd pinned 60-84% CPU while the test process used 1.3 of 15 cores -> 32 failed. Same binary with only that call short-circuited: 94/94 in 36 s at load 17.8. Failing tests are the ClusterPolicy::rig() ones (election 450-900 ms, vote soft-TTL 337 ms); fleet-timed modules tolerated the stall.")
+//! @yah:gotcha("HYPOTHESES FALSIFIED BY MEASUREMENT, so nobody re-treads them: (1) CPU oversubscription — the prior commit c2e87d70's ctor capping RUST_TEST_THREADS=4 rested on this; failing runs used 1.3 cores, and the cap still left rig_singleton_ownership::singleton_role_has_exactly_one_owner_across_a_power_cycle failing (93/94). (2) F_FULLFSYNC in raft store write_atomic — rewriting it to plain fsync cut sync time 26.7 s -> 0.16 s with failures unchanged (35). (3) Ephemeral port / TIME_WAIT exhaustion — peak 536 TIME_WAIT of 16,384, zero os error 49. (4) fd limits — direct runs inherit 92,160. (5) process-global statics / cross-module shared state — none in consensus/harness/tests; modules each pass alone at 15 threads.")
+//! @yah:handoff("FIXED AT THE ROOT, NOT CAPPED. yubaba-consensus raft/network.rs: YubabaNetworkFactory now holds ONE reqwest::Client built by YubabaNetworkFactory::new() (called from open_with_state_machine, raft/mod.rs) and clones it per new_client. openraft calls new_client per voter on every vote/pre-vote round inside RaftCore, and each client build walked the macOS trust store (393 ms mean under the suite). The why and the numbers live in the factory's doc comment.")
+//! @yah:handoff("DISCOVERED WORK, same mechanism: (1) yubaba ServerState gained `http: reqwest::Client`, built once in ServerState::load; commit_rollout, report_boot_health and report_peer_liveness (yubaba/src/lib.rs) now clone it instead of building a client per request. (2) yubaba-test-harness gained `http()`, a process-wide client with idle pooling off so it is runtime-agnostic, and all 32 per-poll `reqwest::Client::new()` sites in yubaba/tests + harness now use it. (3) Two test readiness races exposed once elections got fast: ClusterHandle::wait_for_agreed_leader, the harness bootstrap wait (it used to break when ANY node saw a leader), and raft_membership_loop's SoloNode wait now also require the leader to have applied its membership entry (a new membership_applied helper). That removes the 'already undergoing a configuration change ... last committed membership log id: None' 500s and the 'no leader address to forward to (leader_id=None)' 503.")
+//! @yah:handoff("REVERTED the c2e87d70 concurrency cap: the RUST_TEST_THREADS=4 ctor and its `ctor` dev-dependency are deleted from tests/main.rs and yubaba/Cargo.toml, and the module doc now records why a cap is the wrong tool here (it rested on a CPU-oversubscription theory the measurements disproved).")
+//! @yah:verify("cd oss/yubaba && cargo test -p yubaba --test main -- --test-threads=15  # measured 2026-09-15, twice, binary relinked 11:17:47 after the last edit at 11:16:30: 94 passed / 0 failed (53.8 s) and 94 / 0 (50.5 s). Before the fix, the same flag gave 60/34, 59/35 and 62/32.")
+//! @yah:verify("cargo test -p yubaba-consensus --lib raft::network  # 3 passed (the pre-vote transport tests, now built via YubabaNetworkFactory::new())")
+//! @yah:verify("cargo test -p yubaba --lib --no-run; --features testing --test testing --no-run; --features containerd-integration --test containerd --no-run  # all EXIT 0")
+//! @yah:verify("Mechanism proof, reproducible without code edits: /tmp/r903/trust_interpose.c (DYLD interpose of SecTrustSettingsCopyCertificates). Pre-fix binary at 15 threads: pass-through gave 32 failed with 5,727 builds at 393 ms mean; short-circuited gave 94/94 in 36 s at load 17.8. Factory + test-client fix only (before the handler/readiness pass): 1,680 builds at 158 ms mean, 94/94 once and 91/94 once.")
+//! @yah:gotcha("Shared-tree note from verification: a first rebuild failed on E0425/E0433 in yubaba/src/cert_store.rs and on serving_node in yubaba/src/main.rs. Those were in-flight R910 edits by @Ashguard:dove, transient, and resolved by the next build. None of R903's changes touch those files. The uncommitted cloud/src/config.rs and reconciler/ingress.rs diffs in the tree are not R903's either.")
+//! @yah:cleanup("Remaining per-call client builds, off the hot path and deliberately left: the per-file `fn client()` builder helpers in tests/{rollout_resume,raft_membership_ratchet,rig_singleton_ownership,raft_partition}.rs and raft_tenant_placement.rs:490 (a handful of calls per test, each with a 5 s timeout); sovereign_group::ask_peer (once per join); rollout/gate.rs PrometheusGateEvaluator::new (only when a Prometheus URL is set); yubaba/src/main.rs CLI subcommands (one-shot). Convert them only if a future measurement shows them mattering.")
+//! @yah:cleanup("Root-of-roots, not addressed here: reqwest's rustls-tls-native-roots is unified onto every reqwest 0.12 user in the yubaba workspace by object_store's `aws` feature via turso-backup -> tenant-streamer. The raft transport is plain http and needs no roots at all. Narrowing that feature is a dependency-graph call across oss/turso-backup.")
 
 /// The version this binary reports to the fleet.
 ///
@@ -445,6 +485,11 @@ pub const VERSION: &str = match option_env!("YAH_HOTSHIP_VERSION") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
+/// noisetable R118-T11: behind the default-on `acme` feature — this and
+/// [`domain_issuer`] / [`domain_admin`] are the crate's only users of
+/// `passway-acme`, so turning the feature off drops that crate and
+/// `instant-acme` out of the dependency graph entirely.
+#[cfg(feature = "acme")]
 pub mod acme_issuer;
 /// R858-T3: who owns the pinned-singleton appliance, elected from an
 /// eligibility set instead of aliased to raft leadership.
@@ -453,6 +498,9 @@ pub mod appliance_ownership;
 /// the store W267's free-tier ingress needs at 10k domains, where one
 /// `PutSecret` per cert would rewrite the whole raft state on every node.
 pub mod cert_store;
+/// The one cluster-secret store every node resolves from: sealed records in the
+/// fleet object store, keyed per sovereign group (R911-F1, W294 Decision 8).
+pub mod fleet_secrets;
 /// Deliver the fleet-shared cert to a passway that **systemd** supervises
 /// (R600-F10) — the edge [`secret_reload`] cannot reach, because it walks the
 /// deployed-workload registry and the live yah.dev doors are not workloads.
@@ -465,10 +513,17 @@ pub mod demux_routes;
 /// create (R779 / W267 §Decision 2) — the operator's end of [`cert_store`]'s
 /// enrollment set, and the one place the `_acme-challenge` CNAME contract is
 /// rendered for a human.
+///
+/// noisetable R118-T11: behind the `acme` feature — it renders the challenge
+/// name via `acme_engine::dns01_record_name`.
+#[cfg(feature = "acme")]
 pub mod domain_admin;
 /// Per-domain ACME issuance for custom tenant domains (R779 / W267 §Decision 2)
 /// — sweeps the [`cert_store`] enrollment set, validates by DNS-01 CNAME
 /// delegation, and writes the sealed pair to the object store rather than raft.
+///
+/// noisetable R118-T11: behind the `acme` feature.
+#[cfg(feature = "acme")]
 pub mod domain_issuer;
 /// Arm one cold passway per enrolled custom domain (R852-F1 / W267) — the
 /// far end of the splice [`demux_routes`] publishes, deployed through kamaji's
@@ -479,6 +534,16 @@ pub mod tenant_passway;
 /// reaches a BYO VPS exactly as it reaches a managed rig. Opt-in via
 /// `serve --camp-rpc-root <PATH>`.
 pub mod camp_rpc;
+/// The hosted-camp surface (R726-F9 / W122:131): enumerate the camps this
+/// node hosts so a phone can list them by URL alongside the desktop's
+/// NodeId-addressed camps. Opt-in via `serve --hosted-camp-root <PATH>`;
+/// the URL half needs `--hosted-camp-base-url` and is never derived.
+pub mod hosted_camps;
+/// Dispatch a gate raised on a hosted camp to that camp's registered
+/// mobile devices (R726-F9 / W122:205). Speaks `push-relay`'s wire
+/// protocol; holds no FCM credential itself. See the module header for
+/// why the protocol is mirrored rather than the crate depended on.
+pub mod push_dispatch;
 /// The cell this raft group is: its id (the sovereign-group label) and the
 /// jurisdiction that binds it, plus the gate that keeps a cell from taking a
 /// voter outside its own jurisdiction (R736-T3, W250).
@@ -491,7 +556,13 @@ pub mod cluster_epoch;
 /// The deployment-wide rules this cluster runs under — voter admission,
 /// external-ingress ownership, raft timings — named as a value instead of
 /// hardcoded at the sites that obey them (R118-T9).
-pub mod cluster_policy;
+///
+/// noisetable R118-T11: lives in [`yubaba_consensus`] now and is re-exported here, so
+/// `crate::cluster_policy::…` and `yubaba::cluster_policy::…` keep resolving for
+/// every existing caller. Deliberately **not** behind a cargo feature — policy
+/// is a runtime value, and a build that cannot express `Frozen` is a build that
+/// cannot read another cluster's config.
+pub use yubaba_consensus::cluster_policy;
 /// The yah control plane (R609-F1): an `mshr::Endpoint` bound on this
 /// machine's hostkey, so yah-aware callers dial the node by `NodeId` over
 /// NAT-punched QUIC instead of by IP/SSH. Opt-in via `serve --control-plane`.
@@ -523,11 +594,22 @@ pub mod headscale_appliance;
 /// Headscale's on-disk state dir: the single writer for `headscale_dir`, and
 /// the pre-start materialization of the coordinator's noise identity (R858-T2).
 pub mod headscale_state;
+/// Who may call this node's HTTP control plane (R876-B15). Route classes,
+/// the two credential tiers, and the middleware `build_router` layers.
+pub mod http_auth;
 pub mod identity;
 pub mod leader;
 /// Soft-prefer an anchor region for raft leadership, without ever blocking a
 /// failover away from it (R734-T4).
 pub mod leader_pin;
+/// The litestream-headscale replication sidecar (R040-F21).
+///
+/// noisetable R118-T11: behind the default-on `litestream` feature — a gallery
+/// plinth runs no Headscale and replicates no SQLite WAL, so it compiles none
+/// of this. The sidecar is systemd plus the `litestream` binary, so turning it
+/// off removes code and not one crate from the dependency graph; see the
+/// feature's comment in Cargo.toml.
+#[cfg(feature = "litestream")]
 pub mod litestream;
 /// Each node's own raft member row — the `region` tag the quorum-geography rule
 /// is judged on, kept live rather than only checked at founding (R734-F5).
@@ -535,28 +617,73 @@ pub mod member_registration;
 /// The membership ratchet (R118-F8, W138/W158): demote voters a physically
 /// independent channel proves are *off*, while the cluster still holds the
 /// quorum to commit that decision, and rest at a single voter rather than wedge.
-pub mod membership_ratchet;
+///
+/// noisetable R118-T11: lives in [`yubaba_consensus`] now and is re-exported here. The
+/// planner is pure; the one piece of I/O it used to own — reading a joiner's
+/// lineage off the joiner — is now the `OriginSource` port, implemented by
+/// [`origin_source::HttpOriginSource`] on this side of the seam.
+pub use yubaba_consensus::membership_ratchet;
 pub mod mesh;
+/// R330-F17: fleet-wide service-record peer discovery — polls every OTHER
+/// raft member's `GET /service-records?ready=true` and merges into a local,
+/// region/provider-tagged candidate set per ident. See the module doc.
+pub mod mesh_directory;
 pub mod node;
+/// pond deploy: the MinIO + miniflare + SSR-runtime slot lifecycle behind the
+/// four `/pond/*` routes.
+///
+/// noisetable R118-T11: behind the default-on `pond` feature. Off, the module
+/// tree, the routes and `ServerState`'s two pond fields all disappear. It
+/// removes no crate — `local-driver` LOOKS like pond's dependency and is not,
+/// because `headscale_appliance` re-exports
+/// `local_driver::passway_ingress::front_door_upstream_rule` from it.
+#[cfg(feature = "pond")]
 pub mod pond;
 /// Live quorum health (R859-F2): `yubaba-failover.md`'s "do not fail over out
 /// of a degraded quorum" pre-check, as a pure function over the voter set and
 /// one detector's report.
 pub mod quorum_health;
-pub mod raft;
+/// The replicated state machine, its openraft log store and the HTTP network
+/// factory nodes replicate over.
+///
+/// noisetable R118-T11: lives in [`yubaba_consensus`] now and is re-exported here, so every
+/// `crate::raft::…` path in this daemon and every `yubaba::raft::…` path in the
+/// integration tests keeps resolving unchanged. The `/raft/*` HTTP **routes**
+/// stay in this crate — they are surface; the request and state types they carry
+/// are consensus.
+pub use yubaba_consensus::raft;
+/// The joiner-lineage fetch behind `membership_ratchet::OriginSource` — the one
+/// seam the noisetable R118-T11 extraction had to cut, kept on the daemon's side because it
+/// reads routes the daemon defines.
+pub mod origin_source;
 pub mod rollout;
+/// R330-F17: nearest-first scoring — pure geo-distance/transit-cost tables
+/// and the weighted-sum score/rank/pick_nearest functions. See the module
+/// doc for the default-weight worked example.
+pub mod route_score;
 pub mod runtime;
 /// Leader-resident tenant placement scheduler (R737-F3, W246): re-places a
 /// tenant off a confirmed-dead owner onto live, admitting capacity.
 pub mod scheduler;
 pub mod secret_reload;
+/// Polls the fleet secret store and bumps [`ServerState::secret_epoch`] on a
+/// change (R911-F2).
+pub mod secret_watch;
 pub mod secrets;
 pub mod service_records;
+/// R876-B13: strips resolved secret VALUES out of a `Workload` before
+/// `GET /workloads/{ident}/spec` serialises it.
+pub mod spec_redact;
 /// R742-F1 (W305): the sovereign-group gate on `POST /raft/add-learner`.
 pub mod sovereign_group;
 /// R869 (W339): the off-fleet copy of the applied raft state, and the guard
 /// that stops a wiped raft dir from overwriting it.
 pub mod state_backup;
+/// The cadence half of kamaji's probe runner — the loop that re-issues
+/// `YubabaToKamaji::Probe` and folds the answers through the declared
+/// `failure_threshold`. Without it every `[healthcheck]` block in the fleet is
+/// declared and never executed.
+pub mod workload_health;
 
 #[cfg(feature = "testing")]
 pub mod testing;
@@ -690,11 +817,6 @@ pub fn carried_policy_is_permissive_default(carried: &str) -> bool {
     let carried = squeeze(carried);
     carried.is_empty() || carried == squeeze(DEFAULT_ACL_POLICY_HUJSON)
 }
-/// Default directory for compose.yml + Caddyfile (R040-F7).
-pub const DEFAULT_COMPOSE_DIR: &str = "/etc/yah-cloud";
-/// Systemd unit name for the Podman Compose service stack.
-pub const COMPOSE_UNIT: &str = "yah-cloud-services";
-
 /// This machine's node enrollment as known to this process (R593-F4):
 /// which mshr NodeId was enrolled and the cheers ownership-row id backing
 /// it. Both halves travel together — the row id alone can't detect a
@@ -710,14 +832,23 @@ pub struct NodeEnrollment {
 /// Shared in-memory state. Wraps a `Mutex<StateOnDisk>` so concurrent handlers
 /// see consistent snapshots.
 pub struct ServerState {
+    /// One HTTP client for every forward-to-leader write a handler makes
+    /// (`client_write_forwarded`, `commit_guarded`), built once in
+    /// [`ServerState::load`].
+    ///
+    /// R903: those handlers used to build a `reqwest::Client` per request.
+    /// Every build walks the OS trust store — reqwest's native-roots feature is
+    /// unified on in this workspace — which on macOS is a serialized `trustd`
+    /// IPC per root certificate and measured 158–393 ms a build under the
+    /// integration suite's load. Per node, not process-global: a pooled
+    /// connection belongs to the tokio runtime that opened it, and the test
+    /// harness runs many nodes on many runtimes in one process.
+    pub http: reqwest::Client,
     pub state_path: PathBuf,
     pub state: Mutex<identity::StateOnDisk>,
     /// Directory that `POST /headscale/deploy` writes into.
     /// Defaults to [`DEFAULT_HEADSCALE_DIR`]; override in tests via a tempdir.
     pub headscale_dir: PathBuf,
-    /// Directory for `compose.yml` + `Caddyfile` (R040-F7).
-    /// Defaults to [`DEFAULT_COMPOSE_DIR`]; override in tests via a tempdir.
-    pub compose_dir: PathBuf,
     /// R646-B1: where `download_headscale_binary` fetches the headscale binary
     /// from. `None` (the default) means the upstream GitHub release URL for the
     /// requested version — see [`headscale_linux_download_url`].
@@ -730,6 +861,34 @@ pub struct ServerState {
     /// rather than as either. Tests point this at a `file://` fixture, which
     /// keeps the real curl/chmod/systemd path under test with a local source.
     pub headscale_download_url: Option<String>,
+    /// R726-F9 (W122:131): which camps this node hosts, as `GET /camps`
+    /// reports them.
+    ///
+    /// Default is empty, which enumerates nothing — the lane is off until
+    /// the operator passes `serve --hosted-camp-root <PATH>`. Held as
+    /// config rather than as a materialized list because the answer has to
+    /// include a workspace created since boot; see
+    /// [`hosted_camps::HostedCampConfig::enumerate`] for the bound on that
+    /// scan.
+    pub hosted_camps: hosted_camps::HostedCampConfig,
+
+    /// R876-B15: who may call this node's HTTP control plane.
+    ///
+    /// Defaults to [`http_auth::HttpAuthPolicy::default`] — `warn` mode with
+    /// no trust root, i.e. every route serves an anonymous caller and logs
+    /// it. That default is what keeps the ~900 tests that drive
+    /// [`build_router`] with no credential meaningful, and it is what lets a
+    /// node upgraded ahead of its callers keep talking to the fleet. It is
+    /// not the end state: see the [`http_auth`] module header and R876-T18.
+    pub http_auth: http_auth::HttpAuthPolicy,
+
+    /// R726-F9 (W122:205): where a gate raised on a hosted camp is pushed.
+    ///
+    /// `None` on a node that was not configured with a relay — gates then
+    /// reach the phone only when the app is foregrounded and polling,
+    /// which is the pre-R726 behaviour rather than a failure.
+    pub push_dispatch: Option<Arc<push_dispatch::PushDispatcher>>,
+
     /// R556-F7-T3: local scryer endpoint advertised via `/services`.
     ///
     /// Set to the kamaji-managed scryer's tailnet-bound HTTP base URL (e.g.
@@ -889,18 +1048,16 @@ pub struct ServerState {
     /// only when a spec carries a `SecretRef::Cluster` mount.
     pub cluster_kek_path: PathBuf,
 
-    /// R779 (W267): object-store fallback for per-domain TLS material.
+    /// R779 (W267): the fleet object store, as the per-domain TLS store.
     ///
-    /// Layered *behind* the raft replica by [`cert_store::LayeredSecretStore`],
-    /// so raft answers everything it holds and only a `tls/<domain>/cert|key`
-    /// name raft has never seen reaches the object store. `None` on an
-    /// unconfigured node (see [`cert_store::CertStoreConfig::parse`]), which
-    /// resolves exactly as it did before R779.
+    /// R911-F1: also the connection every cluster secret resolves through —
+    /// [`fleet_secrets::FleetSecretStore::for_node`] builds the node's one
+    /// secret store over this bucket. `None` on an unconfigured node (see
+    /// [`cert_store::CertStoreConfig::parse`]), which then has no
+    /// cluster-secret rail and fails any cluster-secret read closed, by name.
     ///
-    /// The object-store trait is synchronous, so a fallback hit blocks the
-    /// calling thread on an HTTPS GET. Acceptable here and nowhere hotter: the
-    /// fallback is consulted only on a raft miss, on the deploy path, for a
-    /// secret name that is per-domain TLS material.
+    /// The object-store trait is synchronous, so every cluster-secret read
+    /// blocks the calling thread on an HTTPS GET.
     pub cert_store: Option<std::sync::Arc<cert_store::ObjectCertStore>>,
 
     /// R852-F2: this deployment's **public** ingress address(es) — the host
@@ -953,12 +1110,36 @@ pub struct ServerState {
     /// the [`secret_reload`] rotation task, which re-renders each entry's tmpfs
     /// mount and graceful-upgrades the workload when its cluster secret rotates.
     pub secret_workloads: secret_reload::SecretWorkloadRegistry,
+
+    /// R911-F2: the fleet secret epoch. [`secret_watch`] bumps it when a record
+    /// this node resolves changes in the fleet object store; [`secret_reload`]
+    /// and [`cert_materialize`] subscribe to it. The sender lives here, not in
+    /// the watch task, so a consumer can subscribe before the watch has started
+    /// and a node with no store simply never bumps.
+    pub secret_epoch: tokio::sync::watch::Sender<u64>,
     /// Phase 2 (R040-F21): S3 URL for litestream Headscale replication.
     /// Format: `s3://bucket/path?endpoint=...`
     /// When set, the leader watcher manages `litestream replicate` as a
     /// sidecar and runs `litestream restore` before starting Headscale on
     /// leader election.
+    ///
+    /// noisetable R118-T11: behind the `litestream` feature, with the module.
+    #[cfg(feature = "litestream")]
     pub litestream_s3_url: Option<String>,
+    /// R858-B23: whether the headscale appliance declares a `yah.durability.*`
+    /// tier, i.e. the single value
+    /// [`crate::headscale_appliance::appliance_spec`] is built with on this
+    /// node. **Defaults to `false`**, and the reason is on that function: a
+    /// declared tier kamaji cannot hydrate is a refusal, not a degradation, so
+    /// declaring one before the store credential exists takes the mesh
+    /// coordinator down (2026-09-11). Set by `--headscale-durability` /
+    /// `YUBABA_HEADSCALE_DURABILITY` in the same provisioning step that writes
+    /// that credential.
+    ///
+    /// One field rather than two computations: R858-T4's placement probe and
+    /// the deploy both read the appliance spec through this node's state, so
+    /// they cannot disagree about what is being placed (R858-B9's lesson).
+    pub headscale_durability: bool,
     /// Unique ID for this daemon session. Generated once at startup;
     /// stamped on every tracing span by the correlation-ID middleware so log
     /// lines from the same yubaba process can be correlated across restarts.
@@ -1015,6 +1196,29 @@ pub struct ServerState {
     ///   the existing entry is `Appliance` (single live instance invariant).
     pub archetype_registry: Mutex<HashMap<String, LifecycleArchetype>>,
 
+    /// R880: mesh idents currently mid-deploy or mid-destroy on THIS node.
+    ///
+    /// Two independent callers (two agent sessions, or an agent racing an
+    /// operator) can each run `yah cloud workload deploy <name>` against the
+    /// same node with nothing to stop them — R880 is the near-miss where that
+    /// happened for real against noisetable-account/noisetable-api on
+    /// 2026-09-09, caught only by an alert reader noticing a file change
+    /// under them, not by any structural guard. `deploy_workload_spec` and
+    /// `destroy_workload` both insert the ident here for the duration of the
+    /// handler (see [`DeployLockGuard`]) and refuse a second concurrent
+    /// mutation of the same ident with 409, rather than letting two backend
+    /// calls (two `ctr images pull`, two teardown-then-deploy sequences) land
+    /// interleaved against the same container.
+    ///
+    /// Deliberately per-ident, not a single node-wide lock: two different
+    /// workloads deploying concurrently on the same node is normal traffic,
+    /// not a race. A `HashSet` and not a richer lease — the guard's `Drop`
+    /// is the only release path, so a handler that panics mid-deploy still
+    /// frees the ident when its stack unwinds, and there is nothing here for
+    /// a crashed process to leak: the set is in-memory and starts empty on
+    /// every restart.
+    pub deploy_locks: Mutex<std::collections::HashSet<String>>,
+
     /// R860-T6 (W338): what each live workload's *requirement edges* committed
     /// this node to — the `supply = "self"` providers it stood up, and the
     /// placement group it belongs to. Keyed on mesh ident, with exactly the
@@ -1051,6 +1255,17 @@ pub struct ServerState {
     /// merging these fields into the serialized JSON, which keeps both wire
     /// shapes additive rather than unifying them.
     pub workload_resources: node::ResourceRegistry,
+
+    /// Live health verdicts, one per workload kamaji reports.
+    ///
+    /// Written only by [`crate::workload_health`]'s sweep and read by
+    /// `GET /workloads`. Deliberately NOT merged into
+    /// [`Self::workload_resources`] despite the identical lifecycle: that map
+    /// is the *accepted spec's* request, which cannot change without a
+    /// redeploy, while this one is a measurement that changes every tick. One
+    /// mutex serving both would put a probe's write in the path of every
+    /// capacity read.
+    pub workload_health: workload_health::HealthRegistry,
 
     /// Node spec + usage collector backing `GET /node` and `GET /node/usage`.
     ///
@@ -1131,11 +1346,17 @@ pub struct ServerState {
     /// [`Self::with_pond_local_runtime`] after detecting an orbstack/
     /// docker-desktop/colima/podman/docker socket. `None` outside camp;
     /// `POST /pond/deploy` returns 503 in that case.
+    ///
+    /// noisetable R118-T11: behind the `pond` feature, with the module.
+    #[cfg(feature = "pond")]
     pub pond_local_runtime: Option<Arc<local_driver::LocalRuntime>>,
 
     /// R374-F2: in-memory pond workload registry. Always present; empty when
     /// no pond workloads have been registered. Desktop reads this via
     /// `GET /pond/state?ident=...` to drive its adopt path.
+    ///
+    /// noisetable R118-T11: behind the `pond` feature, with the module.
+    #[cfg(feature = "pond")]
     pub pond_registry: Arc<pond::PondRegistry>,
 
     /// R594-F3/F6: upstream-discovery read-model — serving workload →
@@ -1149,6 +1370,29 @@ pub struct ServerState {
     /// restart without redeploying every serving workload — ports are
     /// admission-time knowledge that `list_workloads()` cannot re-derive.
     pub service_records: Arc<service_records::ServiceRecords>,
+
+    /// R330-F17: fleet-wide, region/provider-tagged service-record directory
+    /// — [`mesh_directory::run`]'s cache, merging this node's own
+    /// [`Self::service_records`] with every other member's
+    /// `GET /service-records?ready=true`. Always present (starts empty, one
+    /// poll tick behind on a fresh boot); [`deploy::mesh_resolve::ServiceRecordMeshState`]
+    /// reads it to score candidates across nodes instead of only this one.
+    pub mesh_directory: Arc<mesh_directory::MeshDirectory>,
+
+    /// R330-F17: the geo-distance/transit-cost tables [`route_score::score`]
+    /// reads. Defaults to [`route_score::RouteTables::defaults`];
+    /// `yubaba serve --transit-cost-file` overrides via [`Self::with_route_tables_file`].
+    ///
+    /// A fleet node never loads `.yah/infra/` (same reason `region` and
+    /// `provider` arrive as CLI flags rather than a machine-file read — see
+    /// [`Self::region`]), so an operator whose negotiated egress deal
+    /// diverges from the built-in defaults stages a copy of
+    /// `.yah/infra/transit-cost.toml` on the box and points this flag at it.
+    pub route_tables: Arc<route_score::RouteTables>,
+
+    /// R330-F17: weights paired with [`Self::route_tables`], loaded from the
+    /// same file.
+    pub route_weights: route_score::RouteWeights,
 
     /// R609-F1: the yah control-plane endpoint, bound on this machine's
     /// hostkey so yah-aware callers can dial it by `NodeId` (see
@@ -1203,6 +1447,74 @@ pub struct ServerState {
     container_net: Option<kamaji::container_net::ContainerNet>,
 }
 
+/// Which backend [`ServerState::workload_backend`] resolved to, and the one
+/// thing the deploy path has to know about the difference (R881-B8).
+///
+/// The two are interchangeable through the [`ContainerRuntime`] trait for every
+/// verb *except* container networking: only the sibling wires a workload's
+/// network namespace (R881-T3, `kamaji-bin`'s `build_container_netns`). The
+/// in-process runtime hard-codes `join_netns: None`
+/// (`kamaji::containerd::ContainerdRuntime`) and never calls `container_net` at
+/// all, so a workload it starts gets the bare namespace runc unshares — `lo`
+/// and nothing else. Erasing that distinction behind a bare `Arc<dyn
+/// ContainerRuntime>` is what let a sibling outage ship two unreachable
+/// `noisetable-account` deploys on us-east-001 while yubaba published
+/// `10.128.3.2` for them (measured 2026-09-11).
+pub enum WorkloadBackend {
+    /// The `kamaji.service` sibling over its UDS — the cloud-tier backend, and
+    /// the only one that wires a container network namespace.
+    Sibling(Arc<dyn ContainerRuntime + Send + Sync>),
+    /// The legacy in-process `ContainerRuntime` ([`ServerState::runtime`]) —
+    /// desktop, CI and pond, plus whatever a fleet node falls back to while its
+    /// sibling is unreachable.
+    Inlined(Arc<dyn ContainerRuntime + Send + Sync>),
+}
+
+impl WorkloadBackend {
+    /// The runtime to drive, whichever backend this is.
+    pub fn runtime(&self) -> &Arc<dyn ContainerRuntime + Send + Sync> {
+        match self {
+            Self::Sibling(rt) | Self::Inlined(rt) => rt,
+        }
+    }
+
+    /// Consume into the runtime — for the call sites that don't care which.
+    pub fn into_runtime(self) -> Arc<dyn ContainerRuntime + Send + Sync> {
+        match self {
+            Self::Sibling(rt) | Self::Inlined(rt) => rt,
+        }
+    }
+
+    /// Is this the sibling — the process that actually holds a fleet node's
+    /// containers, and the one every other lifecycle verb has been talking to?
+    pub fn is_sibling(&self) -> bool {
+        matches!(self, Self::Sibling(_))
+    }
+
+    /// Can this backend put a workload in a namespace with a real address?
+    ///
+    /// The question [`ServerState::workload_bind_ip`] implicitly answers `true`
+    /// to when it allocates a container address: that address is only an
+    /// address if something wires a veth behind it.
+    ///
+    /// Today this coincides with [`Self::is_sibling`] because the sibling is
+    /// the only backend that wires one. They are kept separate because they are
+    /// different questions — "can it make this address real" versus "is it
+    /// holding my containers" — and a second netns-capable backend would split
+    /// them.
+    pub fn wires_container_netns(&self) -> bool {
+        self.is_sibling()
+    }
+
+    /// Short name for logs and error bodies.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Sibling(_) => "kamaji-sibling",
+            Self::Inlined(_) => "inlined",
+        }
+    }
+}
+
 /// Extract this node's own mesh address from a `--bind` argument (R599-F12).
 ///
 /// Accepts `"<ip>:<port>"` or a bare `"<ip>"`. Returns `None` — meaning "this
@@ -1215,7 +1527,12 @@ pub struct ServerState {
 /// - loopback: the pre-R599-F12 behaviour, and correct on a dev host.
 /// - a hostname, or an IPv6 address: the mesh plane is IPv4 (`100.64.0.0/10`),
 ///   and `MeshAssignment.mesh_ip` is an `Ipv4Addr`.
-fn parse_node_mesh_ip(bind: &str) -> Option<std::net::Ipv4Addr> {
+///
+/// Public because it is also how the binary validates an explicit
+/// `--mesh-ip` (R881-S2). Deliberately ONE parser for both inputs: an
+/// explicit address and a derived one have to satisfy identical rules, and
+/// two spellings of "is this dialable" is how they drift apart.
+pub fn parse_node_mesh_ip(bind: &str) -> Option<std::net::Ipv4Addr> {
     use std::net::{Ipv4Addr, SocketAddr};
 
     let ip = bind
@@ -1232,16 +1549,77 @@ fn parse_node_mesh_ip(bind: &str) -> Option<std::net::Ipv4Addr> {
     Some(v4)
 }
 
+impl ServerState {
+    /// Whether litestream replication is configured on this node — the one
+    /// field `Debug` reports about the sidecar.
+    ///
+    /// noisetable R118-T11: two cfg'd bodies rather than a cfg inside the
+    /// `debug_struct` chain (attributes are not allowed on a method-call
+    /// expression). In a build without the `litestream` feature the sidecar
+    /// cannot run at all, so `false` is the honest answer, not a stub.
+    #[cfg(feature = "litestream")]
+    fn litestream_configured(&self) -> bool {
+        self.litestream_s3_url.is_some()
+    }
+
+    #[cfg(not(feature = "litestream"))]
+    fn litestream_configured(&self) -> bool {
+        false
+    }
+
+    /// Whether a pond docker-CLI runtime is attached — the one field `Debug`
+    /// reports about pond. Same two-bodied shape, same reason.
+    #[cfg(feature = "pond")]
+    fn pond_local_runtime_configured(&self) -> bool {
+        self.pond_local_runtime.is_some()
+    }
+
+    #[cfg(not(feature = "pond"))]
+    fn pond_local_runtime_configured(&self) -> bool {
+        false
+    }
+}
+
+/// RAII release for [`ServerState::deploy_locks`] (R880). Held for the
+/// duration of a deploy/destroy handler; `Drop` removes the ident so a panic
+/// mid-handler cannot leak the lock and wedge every future mutation of that
+/// ident.
+struct DeployLockGuard {
+    state: Arc<ServerState>,
+    ident: String,
+}
+
+impl Drop for DeployLockGuard {
+    fn drop(&mut self) {
+        self.state.deploy_locks.lock().unwrap().remove(&self.ident);
+    }
+}
+
+impl ServerState {
+    /// Claim the per-ident deploy/destroy lock (R880), or `None` if another
+    /// deploy/destroy of the same ident is already in flight on this node.
+    fn try_lock_deploy(state: &Arc<ServerState>, ident: &str) -> Option<DeployLockGuard> {
+        let mut locks = state.deploy_locks.lock().unwrap();
+        if !locks.insert(ident.to_string()) {
+            return None;
+        }
+        drop(locks);
+        Some(DeployLockGuard {
+            state: state.clone(),
+            ident: ident.to_string(),
+        })
+    }
+}
+
 impl std::fmt::Debug for ServerState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ServerState")
             .field("state_path", &self.state_path)
             .field("headscale_dir", &self.headscale_dir)
-            .field("compose_dir", &self.compose_dir)
             .field("raft_configured", &self.raft.is_some())
             .field("node_id", &self.node_id)
             .field("region", &self.region)
-            .field("litestream_configured", &self.litestream_s3_url.is_some())
+            .field("litestream_configured", &self.litestream_configured())
             .field("session_id", &self.session_id)
             .field("runtime_configured", &self.runtime.is_some())
             .field(
@@ -1268,7 +1646,7 @@ impl std::fmt::Debug for ServerState {
             .field("prometheus_url", &self.prometheus_url)
             .field(
                 "pond_local_runtime_configured",
-                &self.pond_local_runtime.is_some(),
+                &self.pond_local_runtime_configured(),
             )
             .field(
                 "control_plane_node_id",
@@ -1351,14 +1729,25 @@ impl ServerState {
         let service_records = Arc::new(service_records::ServiceRecords::with_ledger(
             hostkey_dir_for(&state_path).join(service_records::LEDGER_FILE_NAME),
         ));
+        let mesh_directory = Arc::new(mesh_directory::MeshDirectory::new());
+        let http = reqwest::Client::builder()
+            .timeout(raft::FORWARD_TIMEOUT)
+            .build()
+            .context("building the forward-to-leader HTTP client")?;
 
         Ok(Self {
+            http,
             state_path,
             state: Mutex::new(state),
             service_records,
+            mesh_directory,
+            route_tables: Arc::new(route_score::RouteTables::defaults()),
+            route_weights: route_score::RouteWeights::DEFAULT,
             headscale_dir: PathBuf::from(DEFAULT_HEADSCALE_DIR),
-            compose_dir: PathBuf::from(DEFAULT_COMPOSE_DIR),
             headscale_download_url: None,
+            hosted_camps: hosted_camps::HostedCampConfig::default(),
+            http_auth: http_auth::HttpAuthPolicy::default(),
+            push_dispatch: None,
             scryer_endpoint: None,
             raft: None,
             node_id: None,
@@ -1379,22 +1768,31 @@ impl ServerState {
             secret_mount_root: PathBuf::from(deploy::secret_mount::DEFAULT_SECRET_MOUNT_ROOT),
             local_secret_store_root: PathBuf::from(secrets::SECRET_STORE_ROOT),
             secret_workloads: Default::default(),
+            secret_epoch: tokio::sync::watch::channel(0).0,
+            #[cfg(feature = "litestream")]
             litestream_s3_url: None,
+            // R858-B23: off until a node is provisioned with the store
+            // credential kamaji's hydrate needs.
+            headscale_durability: false,
             session_id: new_session_id(),
             runtime: None,
             constable_client: None,
             cheers_client: None,
             ownership_rows: Mutex::new(HashMap::new()),
             archetype_registry: Mutex::new(HashMap::new()),
+            deploy_locks: Mutex::new(std::collections::HashSet::new()),
             requirement_graph: Mutex::new(HashMap::new()),
             workload_resources: Default::default(),
+            workload_health: Default::default(),
             node_probe: node::NodeProbe::new(),
             node_enrollment: Mutex::new(None),
             bootstrap_tokens: identity::bootstrap::BootstrapTokenRegistry::new(),
             headscale_url: None,
             operator_bridge_mode: OperatorBridgeMode::from_env(),
             prometheus_url: std::env::var("YAH_PROMETHEUS_URL").ok(),
+            #[cfg(feature = "pond")]
             pond_local_runtime: None,
+            #[cfg(feature = "pond")]
             pond_registry: Arc::new(pond::PondRegistry::new()),
             control_plane: None,
             control_plane_planes: control_plane::Planes::default(),
@@ -1404,15 +1802,42 @@ impl ServerState {
         })
     }
 
-    /// Record this node's own mesh address, derived from the `--bind` argument
-    /// (R599-F12). See [`ServerState::node_mesh_ip`] for why a natively forked
-    /// workload needs this rather than an allocated per-workload address.
+    /// Record this node's own mesh address — the address it advertises in
+    /// every service record it publishes. See [`ServerState::node_mesh_ip`]
+    /// for why a natively forked workload needs this rather than an allocated
+    /// per-workload address.
     ///
-    /// Only a genuinely node-local unicast address counts: loopback,
-    /// `0.0.0.0`, and a non-IP host all mean "no mesh plane here", and are
+    /// `explicit` is `--mesh-ip`; `bind` is `--bind`, from which the address
+    /// is *derived* when no explicit one is given (R599-F12). Only a
+    /// genuinely node-local unicast address counts either way: loopback,
+    /// `0.0.0.0`, and a non-IP host all mean "no mesh plane here" and are
     /// stored as `None` so kamaji keeps the pre-R599-F12 loopback bind.
-    pub fn with_bind_addr(mut self, bind: &str) -> Self {
-        self.node_mesh_ip = parse_node_mesh_ip(bind);
+    ///
+    /// # Why an explicit address exists at all (R881-S2)
+    ///
+    /// "Where do I listen" and "what address do I advertise" are two
+    /// different questions, and deriving the second from the first is only
+    /// correct when a node binds exactly one mesh address. The dev raft group
+    /// (us-west-011/013/014) binds `0.0.0.0:7443` — deliberately, via the
+    /// R608-F18 `40-raft.conf` drop-in, so each node answers on both its LAN
+    /// and its mesh address. That made [`parse_node_mesh_ip`] return `None`,
+    /// which made [`ServerState::workload_bind_ip`] publish every workload at
+    /// `127.0.0.1`, which made every record on those nodes
+    /// `NotReady { reason: "unroutable" }` — so `GET
+    /// /service-records?ready=true` was permanently empty and `yah cloud
+    /// apply` could never resolve an ingress upstream against them. Measured
+    /// on us-west-011, 2026-09-14.
+    ///
+    /// Rebinding those nodes to their mesh address is NOT the fix: their raft
+    /// peers advertise `192.168.10.11|13|14:7443`, so a mesh-only bind
+    /// partitions the group.
+    ///
+    /// The precedence lives here and nowhere else, and this is the only
+    /// setter for the field — the binary resolves `--mesh-ip` through
+    /// [`parse_node_mesh_ip`] and hands the result down, rather than there
+    /// being a second way to set it that could disagree with this one.
+    pub fn with_mesh_addr(mut self, explicit: Option<std::net::Ipv4Addr>, bind: &str) -> Self {
+        self.node_mesh_ip = explicit.or_else(|| parse_node_mesh_ip(bind));
         self
     }
 
@@ -1464,6 +1889,7 @@ impl ServerState {
     /// `kind = "local-container"` provider via cloud's
     /// `local_container_spec_from_provider` adapter and hands the resulting
     /// [`local_driver::LocalRuntime`] to yubaba once at startup.
+    #[cfg(feature = "pond")]
     pub fn with_pond_local_runtime(mut self, runtime: Arc<local_driver::LocalRuntime>) -> Self {
         self.pond_local_runtime = Some(runtime);
         self
@@ -1929,6 +2355,21 @@ impl ServerState {
         self
     }
 
+    /// R330-F17: load [`Self::route_tables`] / [`Self::route_weights`] from
+    /// an operator-staged override file (`yubaba serve --transit-cost-file`),
+    /// on top of [`route_score::RouteTables::defaults`]. `Err` on a file that
+    /// exists but fails to parse — a typo'd override should be loud, not
+    /// silently ignored in favour of defaults the operator thinks they
+    /// changed.
+    pub fn with_route_tables_file(mut self, path: &std::path::Path) -> Result<Self> {
+        self.route_tables = Arc::new(
+            route_score::RouteTables::load(path).map_err(|e| anyhow::anyhow!(e))?,
+        );
+        self.route_weights =
+            route_score::RouteTables::load_weights(path).map_err(|e| anyhow::anyhow!(e))?;
+        Ok(self)
+    }
+
     /// R742-F1: declare this node's sovereign group
     /// (`yubaba serve --sovereign-group`).
     ///
@@ -1992,15 +2433,47 @@ impl ServerState {
     /// `runtime`. `None` in stub mode (no backend configured). The deploy
     /// handler and the R600-F4 [`secret_reload`] rotation task both route
     /// through this so they drive the same supervisor.
+    ///
+    /// R881-B8: this is the projection — [`Self::workload_backend`] is the
+    /// selector, and the two cannot disagree because there is only one. Use the
+    /// selector wherever *which* backend answered changes what is safe to do;
+    /// use this one wherever it genuinely does not.
     pub fn active_backend(&self) -> Option<Arc<dyn ContainerRuntime + Send + Sync>> {
-        self.constable_client
-            .as_ref()
-            .and_then(KamajiSibling::current)
-            .map(|c| {
-                let backend: Arc<dyn ContainerRuntime + Send + Sync> = c;
-                backend
-            })
-            .or_else(|| self.runtime.clone())
+        self.workload_backend().map(WorkloadBackend::into_runtime)
+    }
+
+    /// The active workload backend, discriminated (R881-B8).
+    ///
+    /// Same preference order as [`Self::active_backend`] — sibling first,
+    /// legacy in-process `runtime` second, `None` in stub mode — but it keeps
+    /// the one distinction that is not an implementation detail: whether the
+    /// backend that answered can wire a container network namespace.
+    ///
+    /// `KamajiSibling::current` returns `None` while a reconnect is in flight
+    /// *or* while the socket is wedged, and the fallback below is silent by
+    /// construction — a `Sibling` node whose sibling died keeps deploying, into
+    /// a backend that cannot give a workload an address. The callers that care
+    /// are the lifecycle verbs: [`deploy_workload_spec`] refuses a deploy whose
+    /// address this backend cannot make real, and both it and
+    /// [`destroy_workload`] log the substitution.
+    pub fn workload_backend(&self) -> Option<WorkloadBackend> {
+        if let Some(client) = self.constable_client.as_ref().and_then(KamajiSibling::current) {
+            return Some(WorkloadBackend::Sibling(client));
+        }
+        self.runtime.clone().map(WorkloadBackend::Inlined)
+    }
+
+    /// Did [`Self::workload_backend`] just substitute the legacy in-process
+    /// runtime for a sibling this node *has* (R881-B8)?
+    ///
+    /// The distinction a bare `Inlined` cannot make: on a desktop, in CI or on
+    /// a pond node the in-process runtime is the only backend there ever was
+    /// and nothing is wrong. On a fleet node it means `kamaji.service` is down,
+    /// wedged, or — the measured case — misframing across a protocol-version
+    /// skew, and every answer from here on is coming from a process that does
+    /// not hold this node's containers.
+    pub fn sibling_substituted(&self, backend: &WorkloadBackend) -> bool {
+        !backend.is_sibling() && self.constable_client.is_some()
     }
 
     /// Override the cluster KEK path and materialized-secret tmpfs root — used
@@ -2023,11 +2496,12 @@ impl ServerState {
         self
     }
 
-    /// R779 (W267): attach the object-store fallback for per-domain TLS material.
+    /// R779 (W267): attach the fleet object store (per-domain TLS material and,
+    /// since R911-F1, every cluster secret).
     ///
     /// Built from the daemon environment at startup
     /// ([`cert_store::CertStoreConfig::parse`] then `connect`); an unconfigured
-    /// node never calls this and keeps resolving from raft alone.
+    /// node never calls this and cannot read cluster secrets.
     pub fn with_cert_store(mut self, store: cert_store::ObjectCertStore) -> Self {
         self.cert_store = Some(std::sync::Arc::new(store));
         self
@@ -2049,8 +2523,18 @@ impl ServerState {
     }
 
     /// Set the S3 URL for litestream Headscale replication (Phase 2 only).
+    #[cfg(feature = "litestream")]
     pub fn with_litestream_s3_url(mut self, url: impl Into<String>) -> Self {
         self.litestream_s3_url = Some(url.into());
+        self
+    }
+
+    /// R858-B23: opt this node's headscale appliance into declaring a
+    /// durability tier. See [`ServerState::headscale_durability`] — turning
+    /// this on without the store credential in kamaji's environment stops the
+    /// mesh coordinator from starting at all.
+    pub fn with_headscale_durability(mut self, on: bool) -> Self {
+        self.headscale_durability = on;
         self
     }
 
@@ -2091,9 +2575,38 @@ impl ServerState {
         self
     }
 
-    /// Override the compose directory — useful for integration tests.
-    pub fn with_compose_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.compose_dir = dir.into();
+    /// R726-F9: turn on the hosted-camp surface (`GET /camps`).
+    ///
+    /// The node's own hex `NodeId` is filled in here from the identity
+    /// already loaded into state, so every enumerated camp reports the
+    /// mshr address a desktop would dial alongside the URL a phone would.
+    /// A node with no identity yet simply reports no `nodeId` — that is
+    /// the same node whose `/identity` 404s, and guessing one would be
+    /// worse than omitting it.
+    /// R876-B15: install the HTTP control-plane trust policy.
+    pub fn with_http_auth(mut self, policy: http_auth::HttpAuthPolicy) -> Self {
+        self.http_auth = policy;
+        self
+    }
+
+    pub fn with_hosted_camps(mut self, config: hosted_camps::HostedCampConfig) -> Self {
+        // The same derivation `GET /identity` publishes (R593-T2), so the
+        // `nodeId` on a camp row and the one an operator curls off the node
+        // cannot disagree.
+        let node_id = self
+            .snapshot()
+            .identity
+            .and_then(|id| identity::node_id_hex(&id).ok());
+        self.hosted_camps = hosted_camps::HostedCampConfig {
+            node_id: config.node_id.or(node_id),
+            ..config
+        };
+        self
+    }
+
+    /// R726-F9: give this node somewhere to send a hosted camp's gates.
+    pub fn with_push_dispatch(mut self, dispatcher: Arc<push_dispatch::PushDispatcher>) -> Self {
+        self.push_dispatch = Some(dispatcher);
         self
     }
 
@@ -2126,9 +2639,40 @@ impl ServerState {
     }
 }
 
+/// Build the HTTP control plane.
+///
+/// R876-B15: the router is assembled as **three sub-routers, one per
+/// [`http_auth::AuthClass`]**, each layered with its own auth middleware.
+/// The classification is structural on purpose — there is no path table to
+/// drift out of sync with the routes, and adding a route means choosing a
+/// sub-router to add it to, which is a decision the diff makes visible.
+/// Before this, exactly one layer was applied (`correlation_id_layer`) and
+/// every route on the surface was unauthenticated.
+///
+/// The default policy is `warn` with no trust root, so an unauthenticated
+/// caller is served and logged. See the [`http_auth`] module header for why
+/// the flip to `require` is a sequenced roll rather than a landing, and
+/// R876-T18 for the ticket that removes the mode.
 pub fn build_router(state: Arc<ServerState>) -> Router {
-    Router::new()
+    // ── AuthClass::Public ────────────────────────────────────────────────
+    //
+    // Liveness probes only. Both of these answer *before* the node is
+    // configured — which is their purpose — and neither discloses anything
+    // a port scan does not. Everything else belongs in one of the two
+    // classes below.
+    let public = Router::new()
         .route("/health", get(health))
+        // R040-F21: Cloudflare healthcheck — 200 iff raft leader + headscale
+        // running. Dialed by Cloudflare, which holds no yubaba credential and
+        // never will.
+        .route("/mesh/leader-health", get(mesh_leader_health));
+
+    // ── AuthClass::Peer ──────────────────────────────────────────────────
+    //
+    // Node-to-node RPC plus the in-fleet read surface. A peer OR an operator
+    // token opens these. Nothing here mutates the node's own install, hands
+    // out a resolved secret, or changes cluster membership.
+    let peer = Router::new()
         .route("/capabilities", get(get_capabilities))
         .route("/identity", get(get_identity))
         .route("/node", get(get_node))
@@ -2139,20 +2683,16 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/node/metrics", post(report_node_metrics))
         .route("/node/metrics", get(get_node_metrics))
         .route("/node/metrics/{source}", delete(withdraw_node_metrics))
-        .route("/register-hostkey", post(register_hostkey))
-        .route("/headscale/deploy", post(headscale_deploy))
-        .route("/headscale/bootstrap", post(headscale_bootstrap))
         .route("/headscale/health", get(headscale_health_check))
-        // R040-F21: Cloudflare healthcheck — 200 iff raft leader + headscale running
-        .route("/mesh/leader-health", get(mesh_leader_health))
         // R737-F2: every node's periodic push onto the leader's node-lease
         // evidence channel — see `lease_detector` module doc for why this is
         // separate from raft's own heartbeat.
         .route("/mesh/lease-renew", post(mesh_lease_renew))
         .route("/mesh/rpo-report", post(mesh_rpo_report))
-        // R040-F7: service management (R040-era compose path, superseded by /workloads)
-        // R706 (W294): metadata only — name, updated_at, access-rule summary.
-        .route("/secrets", get(list_secrets))
+        // R893-F18: the same evidence channel read back as a window. Peer
+        // rather than operator — it is a read of in-fleet telemetry, mutates
+        // nothing, and hands out no secret.
+        .route("/mesh/rpo-series", get(mesh_rpo_series))
         // R118-T1 (W138): singleton-role ownership, served from locally-applied
         // state so a realtime sibling process never awaits a raft commit.
         .route("/cluster/singletons", get(cluster_singletons))
@@ -2162,7 +2702,6 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         // RenewTenantLease already ride the generic `POST /raft/write`.
         .route("/tenants/{id}", get(get_tenant_ownership))
         .route("/services", get(get_services))
-        .route("/compose", post(deploy_compose))
         // R091-F1: WorkloadSpec-based orchestration (replaces compose path)
         .route("/workloads", get(list_workloads))
         .route("/workloads/{ident}/state", get(get_workload_state))
@@ -2170,14 +2709,6 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
             "/workloads/{ident}/deploy-status",
             get(get_workload_deploy_status),
         )
-        // R092-F3: drain workloads before machine destroy. Pre-runtime stub:
-        // returns 200 with an empty list. R091-F5 fills in the real drain.
-        .route("/workloads/drain", post(drain_workloads))
-        // R092-F5: WorkloadSpec deploy via yubaba RPC (operator-signed)
-        .route("/workloads/deploy", post(deploy_workload_spec))
-        // R427-F1: explicit destroy endpoint — tears down via runtime +
-        // revokes cheers ownership row (if one was registered at deploy).
-        .route("/workloads/{ident}/destroy", post(destroy_workload))
         // R092-F5: workload log streaming (R091-F1 SSE stub; R093 delivers scryer.tail)
         .route("/workloads/{ident}/logs", get(get_workload_logs))
         // R603-T5: read a forge step's durable produced artifact off the host's
@@ -2185,20 +2716,6 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         // (the bytes live on the host bind-mount, not the container rootfs), so
         // boot-reconcile can retrieve + publish after a daemon outage.
         .route("/workloads/{ident}/produced", get(get_produced_file))
-        // R092-F3: cloud-init log tail for `yah cloud machine provision`
-        // failure surfacing. Reads /var/log/cloud-init{,-output}.log.
-        .route("/diagnostics", get(get_diagnostics))
-        // R608-F10: mesh-native, SSH-free control-plane roll. The orchestrator
-        // POSTs a signed release ref; the node self-installs the yubaba+kamaji
-        // pair via a detached systemd-run unit (yubaba's own process is
-        // sandboxed and cannot write /usr/local/bin). Bootstraps the SSH-free
-        // path — every roll after the first is over the mesh, no SSH.
-        .route("/self-update", post(self_update))
-        // R278-F1: rollout API — linear strategy + Prometheus gate evaluation
-        .route("/v1/rollouts", post(create_rollout))
-        .route("/v1/rollouts", get(list_rollouts))
-        .route("/v1/rollouts/{id}", get(get_rollout))
-        .route("/v1/rollouts/{id}/override", post(override_rollout))
         // R118-T5 (W138): a node's own post-update boot verdict, filed against
         // whichever in-flight rollout is waiting on it.
         .route("/v1/nodes/{node}/boot-health", post(report_boot_health))
@@ -2209,7 +2726,11 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
             "/v1/nodes/{node}/peer-liveness",
             post(report_peer_liveness),
         )
-        // R040-F20: raft RPC (peer-to-peer, Tailscale mesh only)
+        // R040-F20: raft RPC (peer-to-peer, Tailscale mesh only). These are
+        // the five `raft/network.rs` reserves for openraft's own traffic —
+        // an operator never calls them by hand, and a node must be able to
+        // verify them with no network round-trip, which is exactly what the
+        // symmetric cluster key buys.
         .route("/raft/append-entries", post(raft_append_entries))
         .route("/raft/vote", post(raft_vote))
         // R734-T1: Pre-Vote. A peer asks whether we *would* grant it a vote at
@@ -2220,8 +2741,113 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/raft/pre-vote", post(raft_pre_vote))
         // openraft 0.10 streaming snapshot (replaces chunked /raft/install-snapshot)
         .route("/raft/snapshot", post(raft_snapshot))
-        // R040-F20: raft operator API
+        // R608-B11: openraft-native TransferLeader message — the leader's
+        // RaftNetworkV2 posts here so the target campaigns at once.
+        .route("/raft/transfer-leader-msg", post(raft_transfer_leader_msg))
         .route("/raft/status", get(raft_status))
+        // R732-T4 / R869: the generic cluster write. Peer class rather than
+        // operator because a FOLLOWER forwards here on `ForwardToLeader`
+        // (member_registration, the rollout CAS, tenant epoch claims) — it is
+        // as much node-to-node traffic as `/raft/append-entries` is. An
+        // operator token still opens it, which is what the CLI's secret verbs
+        // use.
+        .route("/raft/write", post(raft_write))
+        // R594-F8: upstream discovery for an ingress proxy. `?ready=true`
+        // filters to routable records. Read-only, same mesh-bound posture as
+        // GET /workloads — this is the sovereign twin of the rented arm's
+        // "generate tunnel ingress rules from deployed workloads" API call.
+        .route(
+            service_records::DISCOVERY_PATH,
+            get(service_records::get_service_records),
+        )
+        // R726-F9 (W122:131): the camps this node hosts, URL-addressed, so
+        // a phone can list them next to the desktop's NodeId camps.
+        // Read-only and root-scoped — see the module header.
+        .route(
+            hosted_camps::HOSTED_CAMPS_PATH,
+            get(hosted_camps::list_hosted_camps),
+        )
+        .route(
+            hosted_camps::HOSTED_CAMP_PATH,
+            get(hosted_camps::get_hosted_camp),
+        );
+
+    // ── AuthClass::Operator ──────────────────────────────────────────────
+    //
+    // Everything that mutates this node's install, hands out a resolved
+    // secret, or changes cluster membership. A peer token is refused here in
+    // BOTH modes: holding the symmetric cluster key means being a member of
+    // the cluster, not being allowed to order its members around.
+    let operator = Router::new()
+        // R910-F2: the declarative enrollment write `yah cloud apply` reconciles
+        // a mirror's tunnel-fronted door through. Operator class: it re-points
+        // a domain's routing, and the camp holds no bucket credentials.
+        .route(
+            "/domains/{domain}/enrollment",
+            get(get_enrollment)
+                .put(put_enrollment)
+                .delete(delete_enrollment),
+        )
+        .route("/register-hostkey", post(register_hostkey))
+        .route("/headscale/deploy", post(headscale_deploy))
+        .route("/headscale/bootstrap", post(headscale_bootstrap))
+        // R706 (W294): metadata only — name, updated_at, access-rule summary.
+        .route("/secrets", get(list_secrets))
+        // R911-F3: the node-mediated write path, operator class beside the
+        // index: holding the cluster key makes a peer a member, not an author
+        // of secrets. Any node with a fleet object store and a sovereign group
+        // serves it; no raft leader is involved.
+        .route(
+            "/secrets/{*name}",
+            axum::routing::put(put_secret).delete(delete_secret),
+        )
+        // R870-B24: the spec a live workload is RUNNING WITH, so a caller
+        // about to replace it can see what the replacement would drop.
+        // `/state` cannot answer that — it reports status and ports, not env.
+        //
+        // R876-B13 redacted the resolved secret VALUES out of this response;
+        // it is operator class anyway, because the env NAMES, argv and mount
+        // layout it still reports are the shape of a tenant's deployment.
+        .route("/workloads/{ident}/spec", get(get_workload_spec))
+        // R092-F3: drain workloads before machine destroy. Pre-runtime stub:
+        // returns 200 with an empty list. R091-F5 fills in the real drain.
+        .route("/workloads/drain", post(drain_workloads))
+        // R092-F5: WorkloadSpec deploy via yubaba RPC
+        .route("/workloads/deploy", post(deploy_workload_spec))
+        // R892-B1: "would you accept this spec?", answered off the same code
+        // `/workloads/deploy` answers with, and touching nothing. Operator
+        // class rather than peer because the body it judges is a deploy body —
+        // the same document, carrying the same secret refs and mount layout —
+        // and its answer tells a caller what this node's admission policy is.
+        .route("/workloads/validate", post(validate_workload_spec))
+        // R427-F1: explicit destroy endpoint — tears down via runtime +
+        // revokes cheers ownership row (if one was registered at deploy).
+        .route("/workloads/{ident}/destroy", post(destroy_workload))
+        // R092-F3: cloud-init log tail for `yah cloud machine provision`
+        // failure surfacing. Reads /var/log/cloud-init{,-output}.log.
+        .route("/diagnostics", get(get_diagnostics))
+        // R893-F11 (W346 §6): last N journal lines of ONE allow-listed control-
+        // plane unit. A sibling of /diagnostics, not a field on it — see
+        // `get_logs` for why it must stay off `probe_yubaba`'s fan-out. Operator
+        // class because a unit journal is strictly more sensitive than a
+        // cloud-init log.
+        .route("/logs", get(get_logs))
+        // R608-F10: mesh-native, SSH-free control-plane roll. The orchestrator
+        // POSTs a release ref; the node self-installs the yubaba+kamaji pair
+        // via a detached systemd-run unit (yubaba's own process is sandboxed
+        // and cannot write /usr/local/bin). The highest-blast-radius route on
+        // the surface: it swaps this node's own binary. `quorum_write_guard`
+        // proves a leader exists, which is not the same as proving the caller
+        // is allowed — that is this class's job.
+        .route("/self-update", post(self_update))
+        // R278-F1: rollout API — linear strategy + Prometheus gate evaluation.
+        // The list half is operator class too, so `/v1/rollouts` has one class
+        // for both methods rather than a split that only a merge would reveal.
+        .route("/v1/rollouts", post(create_rollout))
+        .route("/v1/rollouts", get(list_rollouts))
+        .route("/v1/rollouts/{id}", get(get_rollout))
+        .route("/v1/rollouts/{id}/override", post(override_rollout))
+        // R040-F20: raft operator API — membership and leadership changes.
         .route("/raft/initialize", post(raft_initialize))
         // R569-F3: add a node to a *running* quorum as a non-voting learner
         // (dynamic membership). `/raft/initialize` only founds a fresh cluster;
@@ -2234,29 +2860,53 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         // Takes a SET, because the surviving voter count must stay odd and so
         // 5 -> 3 is one change removing two members.
         .route("/raft/remove-member", post(raft_remove_member))
-        .route("/raft/write", post(raft_write))
-        .route("/raft/transfer-leader", post(raft_transfer_leader))
-        // R608-B11: openraft-native TransferLeader message — the leader's
-        // RaftNetworkV2 posts here so the target campaigns at once.
-        .route("/raft/transfer-leader-msg", post(raft_transfer_leader_msg))
-        // R594-F8: upstream discovery for an ingress proxy. `?ready=true`
-        // filters to routable records. Read-only, same mesh-bound posture as
-        // GET /workloads — this is the sovereign twin of the rented arm's
-        // "generate tunnel ingress rules from deployed workloads" API call.
-        .route(
-            service_records::DISCOVERY_PATH,
-            get(service_records::get_service_records),
-        )
-        // R852-F2 (W267 §Decision 2): the two DNS records a custom domain's
-        // owner must create, for a UI to render. Read-only and derivation-only
-        // — see the handler for why this is a GET on the daemon while
-        // `yubaba domain enroll` deliberately is not.
-        .route("/domains/{domain}/onboarding", get(get_domain_onboarding))
-        // R374-F2: pond (sim-tier mesofact-static) status surface
-        .route("/pond/deploy", post(pond::deploy))
-        .route("/pond/teardown", post(pond::teardown))
+        .route("/raft/transfer-leader", post(raft_transfer_leader));
+
+    // R852-F2 (W267 §Decision 2): the two DNS records a custom domain's owner
+    // must create, for a UI to render. Read-only and derivation-only — see the
+    // handler for why this is a GET on the daemon while `yubaba domain enroll`
+    // deliberately is not.
+    //
+    // noisetable R118-T11: `acme`-gated, because its payload is
+    // `domain_admin::Onboarding` and the record names come from
+    // `acme_engine::dns01_record_name`. The chain is bound to a `let` rather
+    // than cfg'd in place because an attribute is not permitted on a
+    // method-call expression.
+    #[cfg(feature = "acme")]
+    let peer = peer.route("/domains/{domain}/onboarding", get(get_domain_onboarding));
+
+    // R374-F2: pond (sim-tier mesofact-static) status surface.
+    //
+    // noisetable R118-T11: the four routes exist only in a `pond` build. Off,
+    // the handlers are not compiled and the paths 404 — deliberately NOT the
+    // 503 an unwired `pond_local_runtime` produces, because "this binary has no
+    // pond" and "this node has no docker socket" are different facts and a
+    // caller should be able to tell them apart.
+    #[cfg(feature = "pond")]
+    let peer = peer
         .route("/pond/state", get(pond::get_state))
-        .route("/pond", get(pond::list_state))
+        .route("/pond", get(pond::list_state));
+    #[cfg(feature = "pond")]
+    let operator = operator
+        .route("/pond/deploy", post(pond::deploy))
+        .route("/pond/teardown", post(pond::teardown));
+
+    // `route_layer` and not `layer`: the auth middleware must run only for
+    // requests that MATCHED a route in its sub-router. A plain `layer` would
+    // also wrap the fallback, so an unknown path would 401 instead of 404 —
+    // turning the surface into an oracle for which routes exist.
+    let peer = peer.route_layer(middleware::from_fn_with_state(
+        (state.clone(), http_auth::AuthClass::Peer),
+        http_auth::auth_layer,
+    ));
+    let operator = operator.route_layer(middleware::from_fn_with_state(
+        (state.clone(), http_auth::AuthClass::Operator),
+        http_auth::auth_layer,
+    ));
+
+    public
+        .merge(peer)
+        .merge(operator)
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state, correlation_id_layer))
 }
@@ -2388,6 +3038,110 @@ where
     }
 }
 
+/// Attempts `rehydrate_workload_resources` makes at boot before giving up and
+/// logging the degraded state loudly. Short and bounded: `attach_constable_client`
+/// (main.rs) already rode out the "kamaji socket not up yet" boot race with
+/// its own multi-second budget before `serve`/`serve_on_listener` is even
+/// called, so a fresh failure here is unexpected rather than routine — worth
+/// a few retries, not worth blocking the listener indefinitely.
+const REHYDRATE_ATTEMPTS: u32 = 3;
+
+/// R885-B7: recover `ServerState::workload_resources` from the runtime
+/// backend at boot, so `GET /node/usage`'s `yah.workloads.count` agrees with
+/// `GET /workloads` immediately after a restart instead of reading a
+/// confident zero until the next deploy repopulates the map. The map is
+/// in-memory only (written by the deploy handler on success, removed by
+/// destroy) and nothing else survives the process exiting — see
+/// [`node::ResourceRegistry`].
+///
+/// Mirrors `list_workloads`'s own backend selection (kamaji sibling first,
+/// legacy in-process runtime second) so the two endpoints never disagree
+/// about which backend is authoritative for "what does this node hold".
+/// Idents recovered this way land via
+/// [`node::record_seen_with_unknown_resources`] rather than a fabricated
+/// zero request — see that function's doc for why the distinction matters to
+/// a bin-packer reading `GET /workloads`.
+///
+/// On failure this does **not** leave the registry empty and carry on
+/// quietly — that would reproduce R885-B7 under a different trigger. It
+/// retries [`REHYDRATE_ATTEMPTS`] times and, if still unable to list, logs
+/// loudly instead of silently under-reporting `yah.workloads.count` with no
+/// trace of why. `NodeUsage::workloads_count` is a plain `u32` on the wire
+/// (additive-only schema — see `NODE_SCHEMA_VERSION`) with no room for an
+/// explicit "unknown" state without a breaking change to every consumer of
+/// `GET /node/usage`; the tracing line is the honest signal available at
+/// this tier.
+async fn rehydrate_workload_resources(state: &ServerState) {
+    let idents = match live_workload_idents_with_retry(state).await {
+        Ok(idents) => idents,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                attempts = REHYDRATE_ATTEMPTS,
+                "boot-time workload_resources rehydration failed; GET /node/usage \
+                 yah.workloads.count will under-report this node's actual holdings \
+                 until the next deploy or destroy touches the registry"
+            );
+            return;
+        }
+    };
+    if idents.is_empty() {
+        return;
+    }
+    let count = idents.len();
+    for ident in idents {
+        node::record_seen_with_unknown_resources(&state.workload_resources, ident);
+    }
+    tracing::info!(
+        count,
+        "rehydrated workload_resources from the runtime backend at boot"
+    );
+}
+
+async fn live_workload_idents_with_retry(state: &ServerState) -> Result<Vec<String>> {
+    let mut backoff = std::time::Duration::from_millis(500);
+    let mut last_err = None;
+    for attempt in 1..=REHYDRATE_ATTEMPTS {
+        match live_workload_idents(state).await {
+            Ok(idents) => return Ok(idents),
+            Err(e) => {
+                if attempt < REHYDRATE_ATTEMPTS {
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("loop runs REHYDRATE_ATTEMPTS >= 1 times"))
+}
+
+/// The idents `GET /workloads` would report right now, from whichever
+/// backend is authoritative. Empty when neither a kamaji sibling nor a
+/// legacy runtime is attached (stub mode) — nothing to rehydrate, and that is
+/// the correct answer, not a failure.
+async fn live_workload_idents(state: &ServerState) -> Result<Vec<String>> {
+    if let Some(client) = state
+        .constable_client
+        .as_ref()
+        .and_then(KamajiSibling::current)
+    {
+        let entries = client.list().await.context("kamaji client.list()")?;
+        return Ok(entries
+            .into_iter()
+            .map(|e| e.mesh_ident.unwrap_or_else(|| e.id.as_str().to_string()))
+            .collect());
+    }
+    if let Some(rt) = &state.runtime {
+        let workloads = rt
+            .list_workloads()
+            .await
+            .context("runtime.list_workloads()")?;
+        return Ok(workloads.into_iter().map(|w| w.ident.0).collect());
+    }
+    Ok(Vec::new())
+}
+
 /// Bind to `addr`, accept connections forever. Cancellation is up to the caller.
 ///
 /// The bind is retried with bounded backoff while the address is merely
@@ -2401,7 +3155,9 @@ pub async fn serve(addr: &str, state: Arc<ServerState>) -> Result<()> {
     .with_context(|| format!("binding {addr}"))?;
     let local = listener.local_addr().ok();
     tracing::info!(addr = ?local, "yah-yubaba listening");
+    rehydrate_workload_resources(&state).await;
     tokio::spawn(service_records::run(Arc::clone(&state)));
+    tokio::spawn(workload_health::run(Arc::clone(&state)));
     axum::serve(listener, build_router(state))
         .await
         .context("axum::serve")
@@ -2416,10 +3172,12 @@ pub async fn serve_on_listener(
 ) -> Result<()> {
     let local = listener.local_addr().ok();
     tracing::info!(addr = ?local, "yah-yubaba listening (embedded)");
+    rehydrate_workload_resources(&state).await;
     // R594-F6: same refresh sweep as `serve`. Spawned here rather than in
     // `build_router` because the router is also built by tests, which want no
     // background task; both real entry points are exactly these two.
     tokio::spawn(service_records::run(Arc::clone(&state)));
+    tokio::spawn(workload_health::run(Arc::clone(&state)));
     axum::serve(listener, build_router(state))
         .await
         .context("axum::serve")
@@ -2635,6 +3393,10 @@ pub fn public_ingress_targets(raw: Option<String>) -> Vec<String> {
 /// The payload is `domain_admin::Onboarding::to_json` verbatim; the record
 /// names come from `acme_engine::dns01_record_name`, the same function the
 /// issuer publishes under. Nothing here formats a name.
+///
+/// noisetable R118-T11: behind the `acme` feature with [`domain_admin`], whose
+/// `Onboarding` type this returns.
+#[cfg(feature = "acme")]
 async fn get_domain_onboarding(
     State(s): State<Arc<ServerState>>,
     axum::extract::Path(domain): axum::extract::Path<String>,
@@ -3023,6 +3785,100 @@ async fn mesh_rpo_report(
     }
 }
 
+/// `GET /mesh/rpo-series?since_minutes=N` — the same evidence channel, read
+/// back as a window (R893-F18, W346 §4).
+///
+/// The registry is leader-resident and non-raft, so this answers from
+/// *whatever this node happens to hold*: on the leader that is the live fleet
+/// picture, on a follower it is whatever it collected while it last held the
+/// term, and on a node that has never been leader it is empty. The caller is
+/// expected to resolve the leader first (`GET /raft/status`) exactly as the
+/// writing streamer does — which is why this reports `leader` and `node_id`
+/// rather than leaving the reader to assume it asked the right node.
+///
+/// Deliberately a *window*, never a now-value: "how laggy has the db-to-R2 tail
+/// been" is an aggregate (Analytics), while "is the streamer keeping up right
+/// now" is a declared-vs-live question about a service (Services). W346 §4.2
+/// splits the front door on exactly this line.
+#[derive(Deserialize)]
+struct RpoSeriesQuery {
+    since_minutes: Option<u64>,
+}
+
+/// One tick, on the wire. `at_epoch_ms` is the receipt wall clock, not the
+/// moment the watermark itself stalled.
+#[derive(Serialize)]
+struct RpoSeriesSample {
+    node_id: raft::YubabaNodeId,
+    tenant: String,
+    at_epoch_ms: u64,
+    /// `null` = that node's streamer had never persisted a watermark for this
+    /// tenant at that tick. Structurally distinct from a lag of zero, and the
+    /// renderer must keep it that way.
+    watermark_age_secs: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct RpoSeriesResponse {
+    /// This node's own id, and whether it currently believes it is the leader —
+    /// the two facts needed to tell "the fleet is quiet" from "you asked a
+    /// node that never sees the reports".
+    node_id: Option<raft::YubabaNodeId>,
+    leader: bool,
+    since_minutes: u64,
+    samples: Vec<RpoSeriesSample>,
+    /// True when the row cap clipped the answer: these are the most recent
+    /// ticks, not the whole window.
+    truncated: bool,
+}
+
+/// Longest window this endpoint will answer, matching the Analytics tab's
+/// longest `LOOKBACK_OPTIONS` entry (24h).
+const RPO_SERIES_MAX_MINUTES: u64 = 24 * 60;
+/// Row cap across all `(node, tenant)` pairs, so one response can never be
+/// unbounded no matter how many tenants a fleet grows.
+const RPO_SERIES_MAX_ROWS: usize = 20_000;
+
+async fn mesh_rpo_series(
+    State(s): State<Arc<ServerState>>,
+    axum::extract::Query(q): axum::extract::Query<RpoSeriesQuery>,
+) -> axum::response::Response {
+    let Some(registry) = &s.rpo_registry else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let since_minutes = q.since_minutes.unwrap_or(60).clamp(1, RPO_SERIES_MAX_MINUTES);
+    let mut rows = registry.series_since(std::time::Duration::from_secs(since_minutes * 60));
+    rows.sort_by_key(|e| e.sample.at_epoch_ms);
+    let truncated = rows.len() > RPO_SERIES_MAX_ROWS;
+    if truncated {
+        // Keep the most recent ticks — a clipped tail of a long window is the
+        // half an operator is actually looking at.
+        rows.drain(..rows.len() - RPO_SERIES_MAX_ROWS);
+    }
+    let leader = match (&s.raft, s.node_id) {
+        (Some(raft), Some(my_id)) => {
+            raft.metrics().borrow_watched().current_leader == Some(my_id)
+        }
+        _ => false,
+    };
+    Json(RpoSeriesResponse {
+        node_id: s.node_id,
+        leader,
+        since_minutes,
+        samples: rows
+            .into_iter()
+            .map(|e| RpoSeriesSample {
+                node_id: e.node,
+                tenant: e.tenant.0,
+                at_epoch_ms: e.sample.at_epoch_ms,
+                watermark_age_secs: e.sample.watermark_age.map(|d| d.as_secs()),
+            })
+            .collect(),
+        truncated,
+    })
+    .into_response()
+}
+
 // ── Workload management (R091-F1) ─────────────────────────────────────────────
 
 // ── Raft quorum helpers ───────────────────────────────────────────────────────
@@ -3083,6 +3939,7 @@ async fn list_workloads(State(s): State<Arc<ServerState>>) -> axum::response::Re
             Ok(entries) => {
                 let mut rows = serde_json::json!(entries);
                 node::enrich_workloads(&s.workload_resources, &mut rows);
+                workload_health::enrich_workloads(&s.workload_health, &mut rows);
                 (
                     StatusCode::OK,
                     headers,
@@ -3245,6 +4102,143 @@ async fn get_workload_deploy_status(
             Json(serde_json::json!({ "error": message })),
         )
             .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            headers,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /workloads/{ident}/spec` (R870-B24) — the `Workload` envelope kamaji
+/// is currently supervising `ident` with.
+///
+/// The read half of `POST /workloads/deploy`, and it exists because that verb
+/// is a **full replace**: kamaji tears the predecessor down and brings the new
+/// spec up, so every variable, mount and annotation the outgoing spec omits is
+/// one the running workload loses. Nothing else on this surface can answer
+/// what those are — `/state` reports status and ports, `/workloads` reports
+/// idents and requests, and `WorkloadEntry.spec_digest` can only confirm a
+/// spec the caller already holds. A caller that means to preserve what it did
+/// not author has to be able to read it first.
+///
+/// `200 {"spec": <Workload>}` — the envelope kamaji last accepted, with every
+/// resolved secret VALUE replaced by [`spec_redact::REDACTED`] (R876-B13).
+/// **Names and shape only**: every env key, mount, path, port and annotation
+/// survives; env values, inline-file bodies and feed-config bodies do not.
+/// That is enough for this route's purpose — a caller preserving what it did
+/// not author needs the key set, not the credentials — and it is required
+/// because this router carries no auth layer, so an un-redacted answer is a
+/// live credential served to anything that can reach the node's mesh address.
+/// A caller round-tripping a read spec back into a deploy must re-resolve the
+/// values from their vault slots; nothing in-tree does that today.
+/// `200 {"spec": null}` — kamaji answered and has **no record**: the workload
+/// was never admitted here, or kamaji restarted since (the record is
+/// in-memory, like `/deploy-status`'s). This is deliberately not a 404: the
+/// caller asked what kamaji is holding and got a definite "nothing", which is
+/// different from the ident not existing. Either way it is **unknown**, not
+/// "empty" — a caller guarding a destructive deploy must not read a null as
+/// permission to proceed.
+/// `501` when this yubaba has no kamaji client, `503` while the sibling is
+/// reconnecting, `504` when kamaji does not answer, `502` for anything else.
+///
+/// @yah:ticket(R876-B13, "yubaba serves live secret VALUES to an unauthenticated GET /workloads/{ident}/spec — same defect class as R876-B9, on the read path")
+/// @yah:status(review)
+/// @yah:at(2026-09-12T07:28:38Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R876)
+/// @yah:severity(high)
+/// @yah:gotcha("MECHANISM, READ OUT OF THE SOURCE NOT INFERRED. In `build_router` (oss/yubaba/crates/yubaba/src/lib.rs) the routes are `.route(\"/workloads/{ident}/spec\", get(get_workload_spec))` and `.route(\"/workloads/deploy\", post(deploy_workload_spec))`, and the ONLY layer applied to the finished router is `middleware::from_fn_with_state(state, correlation_id_layer)` — there is no auth layer, and `get_workload_spec` takes exactly `State(Arc<ServerState>)` and `axum::extract::Path(String)`, i.e. no extractor that could authenticate a caller. It answers `200 {\"spec\": <Workload>}` by serialising, verbatim, the envelope kamaji is supervising. That envelope carries RESOLVED env literals BY DESIGN: kamaji's `validate_spec_for_constable()` rejects a spec still holding `EnvValue::FromSecret` / `FromMesh`, so yubaba's admission must pre-resolve every secret into a literal before handing the spec over. The read route therefore returns materialised secret VALUES, not secret references.")
+/// @yah:gotcha("OBSERVED, 2026-09-11, while diagnosing noisetable R131's outage. An unauthenticated `GET http://100.64.0.3:7443/workloads/yah-marketing/spec` returned the `revalidate_receiver` env block containing a Cloudflare API token and the mesofact S3 access key id + secret access key, all as literal strings. Values deliberately not reproduced anywhere — re-read the endpoint if you need them, and HASH rather than print.")
+/// @yah:gotcha("SCOPE — THIS IS MESH-INTERNAL, NOT PUBLIC. Say that plainly so nobody over- or under-reacts. The evidence was taken against 100.64.0.3, an RFC 6598 CGNAT address, i.e. the headscale mesh interface, not against the node's public IP 51.81.85.145. NOT VERIFIED, and worth being step 0 for whoever claims this: whether :7443 is also bound on the public interface. It still matters at HIGH severity for two reasons. (a) It is a FLAT credential surface behind a SINGLE network boundary: anything that reaches the mesh address — any workload on the mesh, any node, any operator laptop joined to headscale — reads every workload's secrets with one unauthenticated GET, and there is no per-caller scoping, no audit distinction, no second factor. (b) The affected secrets are SHARED ACROSS WORKLOADS, not scoped per caller: the Cloudflare token in evidence is account-wide (R876-T10 exists precisely to enumerate its users), so one mesh foothold is fleet-wide credential disclosure rather than one tenant's.")
+/// @yah:gotcha("THE WRITE HALF OF THE SAME SURFACE IS ALSO UNAUTHENTICATED. `WorkloadDeployBody` declares `#[serde(default)] operator_signature: Option<String>`; in `deploy_workload_spec` the `is_none()` branch only emits `tracing::warn!(\"workload deploy received without operator signature (unsigned accepted in stub mode — R044 will enforce rejection)\")` and proceeds. So the same unauthenticated reach both READS every workload's secrets and DEPLOYS workloads. R044 (key vault) is the ticket the in-code comment names as the one that will enforce signature rejection; nothing enforces anything today.")
+/// @yah:gotcha("ORDERING MATTERS AND THE REFLEX IS WRONG HERE: DO NOT ROTATE FIRST. This endpoint DIRECTLY UNDERCUTS A ROTATION THAT COMPLETED TODAY. noisetable R131-T19 rotated the R2 admin pair on 2026-09-11; the vault slots now fingerprint `yah keys get cloudflare-r2-access-key-id | shasum -a 256 | cut -c1-16` = f293d33294250d04 and `cloudflare-r2-secret-key` = 8d0ad8c9470d48df, and R876-B9 confirms the yah-marketing deploy record was re-applied to exactly those. The NEW pair is what this endpoint now serves. Rotating again while the endpoint stays open buys NOTHING — the replacement is disclosed by the same unauthenticated GET the moment it is deployed. THE FIX IS FIRST: authenticate the route, and/or stop materialising secret VALUES into a spec response at all. Any rotation is an AFTER step, once a caller can no longer read the result.")
+/// @yah:gotcha("SAME DEFECT CLASS AS R876-B9, REACHED OVER HTTP INSTEAD OF THE FILESYSTEM. B9 records kamaji writing deploy records to disk with live secrets inline (its chmod remediation landed; its own gotchas say explicitly that the secrets-inline half is UNCHANGED and that rotating each exposed secret one at a time is not the fix). This ticket is that same 'secret values materialised into a servable artifact' defect on the READ PATH. It is filed separately rather than as another gotcha on B9 because B9 SITS AT `review` — a ticket in review is a dead-letter box: a note appended there reaches a reviewer signing off, not an implementer who will claim and fix it. The two share a fix direction (indirect by vault-slot reference, resolved at the last possible moment, never into a durable or servable representation) and should be looked at together.")
+/// @yah:next("Tier: Wizard — the fix is a design call about the trust model of yubaba's HTTP surface (who may read a spec, and whether a spec representation should ever carry resolved secret literals), not a mechanical edit. It has to land coherently with R044's signature enforcement rather than ahead of it in a way that has to be redone.")
+/// @yah:next("STEP 0, CHEAP AND ANSWERS THE SEVERITY QUESTION: determine whether :7443 is bound only on the mesh interface or also on the node's public interface. The evidence for this ticket was all taken over 100.64.0.3 (mesh). If it is public-bound, this stops being mesh-internal and the ordering below compresses to an emergency.")
+/// @yah:next("IMMEDIATE, CHEAPEST REAL MITIGATION — REDACT ON THE READ PATH. `get_workload_spec` currently serialises kamaji's envelope verbatim. Walk the spec before serialising and replace every resolved secret-bearing value with a non-reversible placeholder (or the vault slot name it came from), so the route still answers its actual purpose — 'what variables, mounts and annotations does the running workload have, so a full-replace deploy does not drop them' (its own doc comment) — while carrying names and shape rather than values. Note the honest cost: a caller round-tripping a read spec back into a deploy then needs the deploy path to re-resolve from slot names, which is the right shape anyway.")
+/// @yah:next("STRUCTURAL FIX — STOP RESOLVING SECRETS INTO THE SUPERVISED ENVELOPE. Today yubaba must pre-resolve `EnvValue::FromSecret` / `FromMesh` into literals because `validate_spec_for_constable()` rejects unresolved ones, so the resolved values live in kamaji's in-memory record for the lifetime of the workload and are readable by anything that can ask kamaji. The alternative is that kamaji resolves from the vault at container-start and the envelope keeps slot references. That is the same conclusion R876-B9 reached from the on-disk side; doing it once fixes both.")
+/// @yah:next("AUTHENTICATE THE SURFACE. Every route on this router is unauthenticated, not just these two — correlation_id_layer is the only middleware. R044's operator-signature enforcement covers the WRITE half; the read half needs its own answer, and 'it is on the mesh' is currently the entire access-control story for both.")
+/// @yah:verify("THE BAR: an UNAUTHENTICATED GET of that path must return NO secret VALUE. From a mesh-joined host: `curl -sS http://100.64.0.3:7443/workloads/yah-marketing/spec` — today this returns a Cloudflare API token and the mesofact S3 pair as literal strings inside the revalidate env block; after the fix every such field must be absent, or a placeholder, or a vault slot NAME. *** WARNING TO WHOEVER RUNS THIS: DO NOT PRINT THE RESPONSE. *** Pipe it through a hash — e.g. extract the field with jq and `shasum -a 256 | cut -c1-16` — and compare fingerprints. Printing it copies a live credential into a transcript, which is how a mesh-internal exposure becomes a stored one. The known-good fingerprints to compare against are in R876-B9: f293d33294250d04 (cloudflare-r2-access-key-id) and 8d0ad8c9470d48df (cloudflare-r2-secret-key); a match means the endpoint is still serving the live vault value.")
+/// @yah:verify("A HERMETIC REGRESSION TEST, so this cannot come back silently: build a WorkloadSpec whose env carries a resolved secret literal, admit it through the router used by yubaba's existing integration tests, GET /workloads/{ident}/spec, and assert the literal's bytes do NOT appear anywhere in the response body. That assertion is value-shaped rather than field-shaped, so it survives the spec struct being reshaped.")
+/// @yah:gotcha("STEP 0 ANSWERED, 2026-09-11, READ-ONLY FROM THE NODE — :7443 IS MESH-ONLY, NOT PUBLIC. `ssh debian@51.81.85.145 'sudo ss -lntp | grep 7443'` returns exactly one row, bind address `100.64.0.3:7443`, user `yubaba` pid 663550 fd 16. That is the literal mesh IP — not 0.0.0.0, not 51.81.85.145 — so the listener is unreachable from the public interface and the SCOPE gotcha above stands as written: mesh-internal, high, not an emergency. STEP 0 is closed; it does not need re-running.")
+/// @yah:handoff("REDACTION ON THE READ PATH IS LANDED. NEW `oss/yubaba/crates/yubaba/src/spec_redact.rs` (pub mod, declared next to `service_records` in lib.rs) exposes `pub const REDACTED = \"[redacted]\"` and `pub fn redact_for_read(&mut workload_spec::Workload)`; `get_workload_spec` calls it on the `Ok(spec)` arm before `Json(json!({\"spec\": spec}))`, so the 200 body can no longer carry a value. The match over `Workload`'s five variants and over `EnvValue`'s three is EXHAUSTIVE on purpose — a new variant is a compile error in the redactor rather than a new silent way to serve a credential.")
+/// @yah:handoff("THE CRUX, ANSWERED FROM SOURCE: PROVENANCE IS LOST FOR RESOLVED VALUES, AND SURVIVES ONLY FOR UNRESOLVED ONES. `EnvValue` (oss/yah-base/crates/workload-spec/src/lib.rs:4381) has exactly three variants — `Literal{value}`, `FromSecret{secret,key}`, `FromMesh{ident,kind}` — and resolution rewrites a `FromSecret` into a `Literal`, keeping no marker. So at the point `get_workload_spec` serialises, a secret-derived literal is byte-indistinguishable from an ordinary one. The redactor therefore does BOTH halves of the leader's ruling: every `Literal` value is replaced (no heuristic, no hash, no prefix, no length hint — the two-value test asserts a 1-byte and a 4096-byte value redact to byte-identical output, so the response is not a length oracle), while `FromSecret` is left INTACT and its `{secret,key}` vault slot name is served as-is, which is strictly more useful than nothing.")
+/// @yah:handoff("SCOPE OF THE WALK IS WIDER THAN \"env\", AND THE LIVE LEAK WAS NOT ON A CONTAINER SPEC. yah-marketing is a `Workload::MesofactStatic`, whose secret channels are `revalidate_receiver.env` (documented at workload-spec/src/lib.rs:1370 as \"resolved from the keystore at deploy time — the node never sees slot names\" — this is the exact block that served the Cloudflare token and the S3 pair), `serve_bundle.env`, and `ssr_runtime` (a nested WorkloadSpec). Redacted: all four `env` channels (Vec&lt;EnvVar&gt; on WorkloadSpec, and the BTreeMap&lt;String,String&gt; on ContainerRunConfig / MesofactServeBundle / MesofactRevalidateReceiver / TenantPasswayWorkload), plus `InlineFile.content` and `AlmanacFeed.config_toml` — both verbatim file bodies travelling by value. KEPT BY DESIGN, each checked in source rather than assumed: `SecretMount` is a reference only (`SecretRef::LocalFile{path}` / `Cluster{name}`, lib.rs:4477); `TenantPasswayTls.cert`/`key` are node-side PEM PATHS (lib.rs:1754-1767); `MesofactRevalidateReceiver.publish_config` is a path; `mirror_key_env` is an env var NAME; labels, annotations, volumes, expose, image, digests, ports.")
+/// @yah:handoff("CALL-SITE AUDIT — NOTHING ROUND-TRIPS A READ SPEC INTO A DEPLOY, SO THE PRE-1.0 BREAK COSTS NOTHING. The route has exactly two consumers in-tree: `CloudClient::get_workload_spec` (crates/yah/cloud-client/src/lib.rs:1559) and its one caller, the passway read-back guard at app/yah/cli/src/cloud.rs:9314. The guard's predicate is `carries_passway_auth` (cloud.rs:9095) = `spec.env.iter().any(|e| e.name == AUTH_KEY_FILE_VAR)` — an env NAME test, unaffected by value redaction — and `apply`'s passway arm reconstructs the outgoing spec from the mirror, never from the read spec. No `?include_secrets=` flag and no un-redacted variant was added, per the pre-1.0 rule. The cloud-client doc comment was updated in the same pass to say the values are placeholders and that a would-be round-tripper must re-resolve from slots (that is the only edit outside oss/yubaba).")
+/// @yah:verify("HERMETIC, MEASURED 2026-09-12 AGAINST A BASELINE TAKEN BEFORE THE FIRST EDIT. `cargo test -p yubaba --lib` from oss/yubaba: baseline 867 passed / 0 failed, after 870 passed / 0 failed — +3 are spec_redact's unit tests (mesofact value-shaped redaction with a non-vacuity precondition; container Literal-vs-FromSecret plus InlineFile; the length-oracle equality test). THE END-TO-END BAR is `a_served_spec_carries_env_names_but_never_resolved_secret_values` in oss/yubaba/crates/yubaba/tests/integration_deploy_through_kamaji.rs: real `build_router`, real handler, real KamajiClient handshake over a real UDS with real postcard frames; only kamaji's registry is scripted, because `Describe` answers a record only for a workload kamaji actually admitted and a bare kamaji has no container backend to admit one with. It asserts the sentinel's BYTES are absent from the whole response body (value-shaped, survives a spec reshape) AND that CLOUDFLARE_API_TOKEN / MESOFACT_S3_SECRET_ACCESS_KEY are still present, so it cannot pass by answering empty. NOTE the target name: these files are aggregated by tests/main.rs, so it is `cargo test -p yubaba --test main -- integration_deploy_through_kamaji` (6 passed / 0 failed) — `--test integration_deploy_through_kamaji` does not exist.")
+/// @yah:gotcha("PRE-EXISTING AND NOT ATTRIBUTABLE TO THIS TICKET: the FULL aggregated integration suite is red on this tree. `cargo test -p yubaba --test main` = 58 passed / 36 failed, and every one of the 36 is a raft / rollout / rig-singleton test (raft_membership_ratchet, raft_membership_loop, raft_partition, raft_tenant_placement, rollout_resume, rig_singleton_ownership, ...). The failure text is timing, not logic: \"voters never agreed on a leader; last per-node current_leader was [None, None, None]\" and \"3-node rig cluster: raft leader election timed out after 15s during cluster bootstrap\". Re-run in isolation they PASS (`raft_quorum_geography::a_rig_founds_three_untagged_voters` alone: 1 passed). None of them can reach `/workloads/{ident}/spec`. Read as bootstrap-election timeouts under a loaded box — the camp had several concurrent cargo runs queued on the shared target dir throughout — not as regressions. Anyone measuring this suite should run it on a quiet machine (`camp.machine`, read `quiet`) or per-module.")
+/// @yah:next("LIVE RE-CHECK, NOT RUN — DELIBERATELY DEFERRED, IT IS AN OPERATOR'S CALL. No yubaba was shipped to the fleet: us-east-001 serves noisetable.com and a kamaji/yubaba restart there is tenant-visible. The documented step, to run AFTER a ship: from a mesh-joined host, `curl -sS http://100.64.0.3:7443/workloads/yah-marketing/spec | jq -r '.spec[\"mesofact-static\"].revalidate_receiver.env.MESOFACT_S3_SECRET_ACCESS_KEY' | shasum -a 256 | cut -c1-16` and the same for `MESOFACT_S3_ACCESS_KEY_ID` / `CLOUDFLARE_API_TOKEN`. *** DO NOT PRINT THE BODY — compare fingerprints only. *** A match against R876-B9's f293d33294250d04 (access-key-id) or 8d0ad8c9470d48df (secret-key) means the node is still running an unfixed yubaba. After the fix those fields read the literal string `[redacted]` (sha256 prefix of that constant, computed once locally, is the only value you should ever see), and the env KEYS must still be present — if the keys vanished too, the redactor over-reached and the read-back guard at app/yah/cli/src/cloud.rs:9095 is blinded.")
+/// @yah:next("STILL OPEN AFTER THIS CHANGE, STATED SO NOBODY READS THE REDACTION AS A CLOSE. (a) STRUCTURAL — filed as R876-B14: stop resolving secrets into the supervised envelope at all; kamaji resolves from the vault at container-start. Until that lands the values are still materialised in kamaji's in-memory record and in its on-disk deploy records (R876-B9), so anything that can talk to kamaji's UDS still reads them; this ticket only closed the HTTP read path. (b) AUTH — NOT ATTEMPTED, deliberately: this must land coherently with R044's operator-signature enforcement rather than ahead of it. After this change \"it is on the mesh\" is STILL the entire access-control story for every route on that router, including the WRITE half — `deploy_workload_spec`'s `operator_signature: Option<String>` `is_none()` branch still only `tracing::warn!`s and proceeds, so an unauthenticated caller can still deploy. (c) RESIDUAL VALUE CHANNELS left un-redacted on purpose, named in spec_redact.rs's module doc: free-form argv (`WorkloadSpec::command`/`entrypoint`, `AlmanacManifest::command`), URLs (`AlmanacTarget::Http`, `FetchSource::url`), labels and annotations. None is a secret channel by design and all are load-bearing for the route's purpose; an operator who pastes a credential into an argv still leaks it. (b) and (c) are answered by R044 and R876-B14 respectively, not by another redaction pass.")
+/// @yah:gotcha("NO REPRODUCIBLE COUNT EXISTS FOR `cargo test -p yubaba --test main` ON THIS TREE — DO NOT QUOTE ONE AS A BASELINE. Three runs on 2026-09-12 gave 58 passed/36 failed, 53/41 and 60/34, and yah's build-skew guard flagged runs SUSPECT with peers editing `oss/yubaba/crates/cloud/*` mid-run. The count is load-dependent, not change-dependent. An earlier gotcha on this ticket quoted 58/36 as if it were a measurement; treat that number as void. WHAT DOES HOLD, confirmed across all three runs: the failing set is 100% `raft_membership_*` / `raft_partition` / `raft_tenant_placement` / `raft_leader_pin` / `rollout_resume::*` / `rig_singleton_ownership::*`, ZERO overlap with `spec_redact` or `get_workload_spec`; every failure text is election/timeout-shaped (\"raft leader election timed out after 15s during cluster bootstrap\", \"voters never agreed on a leader; last per-node current_leader was [None, None, None]\") rather than assertion-shaped; and the ones re-run in isolation PASS. THE ATTRIBUTABLE NUMBERS FOR THIS TICKET ARE THE OTHER TWO: `cargo test -p yubaba --lib` 870/0 (baseline 867/0 taken before the first edit) and `cargo test -p yubaba --test main -- integration_deploy_through_kamaji` 6/0. Anyone who wants a real aggregate must take it on a quiet box — check `camp.machine`'s `quiet` field first — or run per-module; chasing a phantom regression here costs an hour.")
+/// @yah:handoff("CORRECTION TO THIS TICKET'S OWN EARLIER ENTRIES — THE AUTH HALF NOW HAS A TICKET, AND R044 IS NOT IT. Two entries above (the \"Tier: Wizard\" next and the \"STILL OPEN\" next, clause (b)) say the auth half must land coherently with R044's operator-signature enforcement. That premise is FALSE and is superseded: measured with `board show R044`, R044 is \"DRY credential resolution: KeysStore::get_or_env (vault -> env fallback) for CLI + headless\", status `review`, and it never covered signature verification — so the write half had no owner at all. Filed as R876-B15 (tier Wizard), which covers the whole unauthenticated HTTP surface, not just `deploy_workload_spec`. The three stale in-code R044 pointers were corrected in the same pass, all in oss/yubaba/crates/yubaba/src/lib.rs: `WorkloadDeployBody`'s doc comment, `deploy_workload_spec`'s `operator_signature.is_none()` warn, and the self-update handler's identical warn (that one swaps the node's own binary and is quorum-gated but not signature-gated). Read clause (b) as pointing at R876-B15.")
+/// @yah:handoff("FIX LANDED — read-path redaction, one new module. `oss/yubaba/crates/yubaba/src/spec_redact.rs` (declared `pub mod spec_redact;` at lib.rs:640) is called as `redact_for_read(&mut w)` from `get_workload_spec` (lib.rs:3811-3820) before the `Json(json!({\"spec\": spec}))` response is built. It is exhaustive over `Workload`'s 5 variants and `EnvValue`'s 3: every resolved `Literal` env value, `InlineFile.content` and `AlmanacFeed.config_toml` becomes a fixed non-reversible placeholder, while all names, mounts, paths, annotations and UNRESOLVED `FromSecret` slot names survive — so the route still answers its stated purpose (what variables/mounts/annotations does the running workload have) carrying names and shape rather than values. PROVENANCE WAS DETERMINED LOST, which is why redaction is value-blind rather than targeted: resolution rewrites `FromSecret` into `Literal` with no marker, so at serialisation time a secret-derived literal is indistinguishable from an ordinary one, and a \"which of these looks secret\" heuristic would leak the one it got wrong. No placeholder carries a hash or a value prefix — a truncated hash of a short credential is still an oracle. NO COMPATIBILITY FLAG was added (pre-1.0): the only in-tree consumer is `cloud-client::get_workload_spec` (lib.rs:1570) from the single call site app/yah/cli/src/cloud.rs:9314, feeding `classify_live_spec_readback` -> `passway_auth_strip_refusal`, whose predicate `carries_passway_auth` (cloud.rs:9095-9096) is `spec.env.iter().any(|e| e.name == AUTH_KEY_FILE_VAR)` — a pure env-var-NAME check, untouched by value redaction.")
+/// @yah:verify("LEADER RE-VERIFICATION (@Ashguard:dove), run by a separate auditor rather than taken from the implementing courier, because the central claim of this ticket is a negative and negatives fail silently. (1) WIRED, not merely written — confirmed by reading every return path out of `get_workload_spec`: the only arm that can carry a spec redacts before responding, and the other four (no-kamaji 501/503, timeout 504, `Err(e)` 502) never construct a `Workload`, so none is a bypass. (2) COUNTS REPRODUCED EXACTLY, twice, by two different sessions: `cargo test -p yubaba --lib` = 870 passed / 0 failed against an 867/0 baseline taken before the first edit (+3 `spec_redact` unit tests); `cargo test -p yubaba --test main -- integration_deploy_through_kamaji` = 6 passed / 0 failed. (3) THE REGRESSION TEST IS NON-VACUOUS AND THIS WAS PROVED EMPIRICALLY, not argued — the auditor commented out the single `redact_for_read` call site, re-ran, and the integration test FAILED with the sentinel printed raw in the body (`\"CLOUDFLARE_API_TOKEN\":\"SENTINEL-live-credential-4f1c9a\"`), then restored the line and confirmed via `git diff` that the file was byte-clean with no residual marker. The audit also found the integration test did not assert its own input precondition (only the two unit tests did), which would have let a future fixture refactor make it vacuous silently while still going green; that assert has since been added, so the test now pins its own premise rather than depending on this one-off experiment.")
+/// @yah:gotcha("SEVERITY ANSWER — :7443 IS MESH-ONLY, so the ticket's mesh-internal scope stands and this was never a public exposure. Measured on us-east-001 via `ss -lntp`: yubaba binds 100.64.0.3:7443 ONLY — not 0.0.0.0, not the public 51.81.85.145. That was this ticket's own STEP 0 and it is now answered. It does NOT reduce the finding to nothing: the reach is still flat (any workload, node or headscale-joined laptop reads every workload's secrets with one unauthenticated GET, no per-caller scoping, no audit distinction) and the credentials are shared across workloads rather than per-caller, so one mesh foothold was fleet-wide disclosure. NOTHING WAS SHIPPED TO THE FLEET — the fixed yubaba is in the tree only, deliberately: us-east-001 serves noisetable.com and a yubaba/kamaji restart there is tenant-visible. The live fingerprint re-check (confirm the endpoint no longer returns `f293d33294250d04` / `8d0ad8c9470d48df`) is therefore still OWED and must be run after the next ship.")
+/// @yah:verify("LIVE LEG DEFERRED BY OPERATOR DECISION, 2026-09-12 — DO NOT SIGN THIS OFF AS FLEET-VERIFIED. The fix is verified HERMETICALLY only (870/0, plus a regression test independently proved non-vacuous by commenting out the call site). The fixed yubaba is NOT on us-east-001 and was deliberately not shipped: the operator was offered \"ship now\" versus \"batch with R876-B15/B16\" and chose BATCH, on the grounds that this exposure is mesh-internal rather than public (`:7443` binds 100.64.0.3 only — measured) and that R876-B16 is the fix that actually removes the credential from kamaji's record, rather than redacting one route that serves it. SO THE OWED CHECK NOW RIDES ON R876-B16's SHIP: after that paired `yubaba,kamaji` ship lands, confirm the endpoint no longer returns fingerprint `f293d33294250d04` (cloudflare-r2-access-key-id) or `8d0ad8c9470d48df` (cloudflare-r2-secret-key) — hash and compare, never print the body. Until then the live endpoint is still serving values and the redaction exists only in the tree.")
+async fn get_workload_spec(
+    State(s): State<Arc<ServerState>>,
+    axum::extract::Path(ident): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let freshness = raft_freshness(&s);
+    let headers = [
+        ("x-state-freshness", freshness),
+        ("x-workload-source", "kamaji"),
+    ];
+
+    let Some(client) = s.constable_client.as_ref().and_then(KamajiSibling::current) else {
+        let (status, error) = if s.constable_client.is_some() {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "kamaji sibling is reconnecting — retry shortly",
+            )
+        } else {
+            (
+                StatusCode::NOT_IMPLEMENTED,
+                "reading a deployed spec needs a kamaji backend; this yubaba has none",
+            )
+        };
+        return (status, headers, Json(serde_json::json!({ "error": error }))).into_response();
+    };
+
+    let id = kamaji_proto::WorkloadId::new(ident.clone());
+    // Same bound and the same reason as `/deploy-status` (R746-B11): this is a
+    // registry lookup on the far side, so anything past the deadline is a
+    // stalled sibling. A guard blocked on this call needs an answer — even a
+    // bad one — rather than a parked connection.
+    let answered = tokio::time::timeout(DEPLOY_STATUS_TIMEOUT, client.describe(&id)).await;
+    let Ok(answered) = answered else {
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            headers,
+            Json(serde_json::json!({
+                "error": format!(
+                    "kamaji did not answer Describe for {ident} within {}s",
+                    DEPLOY_STATUS_TIMEOUT.as_secs()
+                )
+            })),
+        )
+            .into_response();
+    };
+    match answered {
+        Ok(spec) => {
+            // R876-B13: kamaji's envelope carries RESOLVED secret literals by
+            // design, and this route has no auth layer in front of it. Strip
+            // the values — never the names — before serialising. See
+            // `spec_redact` for what is kept and why.
+            let spec = spec.map(|mut w| {
+                crate::spec_redact::redact_for_read(&mut w);
+                w
+            });
+            (
+                StatusCode::OK,
+                headers,
+                Json(serde_json::json!({ "spec": spec })),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::BAD_GATEWAY,
             headers,
@@ -3439,15 +4433,20 @@ async fn drain_workloads(State(s): State<Arc<ServerState>>) -> impl IntoResponse
 
 /// `POST /workloads/deploy` request body.
 ///
-/// `spec` is the JSON-encoded `WorkloadSpec`; `operator_signature` is a
-/// base64-encoded Ed25519 signature over the spec JSON (operator key from the
-/// cluster's known-keys list, per R044). Until R044 ships the key vault,
-/// unsigned deploys are accepted with a warning.
+/// `spec` is the JSON-encoded `WorkloadSpec`.
+///
+/// R876-B15: this body carried an `operator_signature: Option<String>` from
+/// R092-F5 until 2026-09-12. Nothing ever verified it — the `is_none()`
+/// branch only logged — and the comment promising enforcement named a ticket
+/// (R044) that turned out to be about credential *resolution* and never
+/// covered signatures at all. It is deleted rather than kept beside the real
+/// mechanism: authentication is now a router-level concern
+/// ([`http_auth::AuthClass::Operator`] on this route), and a decorative field
+/// next to a working layer is exactly the shim that reads as the intended
+/// path three months later.
 #[derive(Deserialize, Debug)]
 struct WorkloadDeployBody {
     spec: serde_json::Value,
-    #[serde(default)]
-    operator_signature: Option<String>,
     /// R427-F1: the cheers camp principal this deploy is scoped to
     /// (`camp:<id>`). Becomes the `principal_id` on the ownership row.
     /// Optional in stub/dev tiers that have no cheers client wired; the
@@ -3613,8 +4612,58 @@ async fn deploy_non_container(
     // reaches the same answer through `ServerState::workload_bind_ip`.
     let mesh = s.node_mesh_ip.map(crate::mesh::MeshAssignment::stub);
 
+    // R876-B16: materialize the revalidate receiver's File-target secrets
+    // straight to their declared host paths before the process forks. This
+    // branch has no container namespace (see the doc comment at the top of
+    // this fn), so there is no bind-mount indirection to set up the way
+    // `deploy_workload_spec` does above — the plaintext just needs to be on
+    // disk, at the path the receiver's own argv/env was told to read, before
+    // `kamaji.deploy_envelope` forks it.
+    if let workload_spec::Workload::MesofactStatic(w) = &workload {
+        if let Some(receiver) = &w.revalidate_receiver {
+            if !receiver.secrets.is_empty() {
+                let consumer = workload_spec::secrets::SecretConsumer::workload(name.clone());
+                let resolver =
+                    match build_secret_resolver(s, &ident, &receiver.secrets, consumer) {
+                        Ok(r) => r,
+                        Err(resp) => return resp,
+                    };
+                // R911-F2: blocking store reads run off the runtime.
+                let mounts = receiver.secrets.clone();
+                let placed = crate::fleet_secrets::off_runtime(move || {
+                    crate::deploy::secret_mount::materialize_native_file_secrets(
+                        &mounts,
+                        resolver.as_ref(),
+                    )
+                })
+                .await;
+                match placed {
+                    Ok(paths) => crate::deploy::secret_mount::write_native_secret_manifest(
+                        &s.secret_mount_root,
+                        &name,
+                        &paths,
+                    ),
+                    Err(e) => {
+                        return (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            Json(serde_json::json!({
+                                "status": "rejected",
+                                "ident": ident,
+                                "error": format!("secret materialization failed: {e}"),
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+        }
+    }
+
     match kamaji.deploy_envelope(&id, &workload, mesh.as_ref()).await {
-        Ok(()) => {
+        // R850-T4: `None` by construction on this path — hydrate-on-place runs
+        // on kamaji's container-deploy path only, and a bundle's content is
+        // content-addressed and fetched, not restored from a durability store.
+        Ok(_hydrate) => {
             tracing::info!(
                 ident = %ident,
                 bind_ip = ?s.node_mesh_ip,
@@ -3670,6 +4719,182 @@ async fn deploy_non_container(
         )
             .into_response(),
     }
+}
+
+/// What [`materialize_spec_secrets`] hands back: the (rewritten) spec, the
+/// materialization outcome, and — on success with cluster `File` mounts — the
+/// content digest that seeds the rotation registry.
+struct MaterializedSecrets {
+    spec: workload_spec::WorkloadSpec,
+    result: Result<usize, workload_spec::secrets::SecretError>,
+    digest: Option<u64>,
+}
+
+/// The blocking half of a container deploy's secret materialization, run off
+/// the async runtime (R911-F2).
+///
+/// Resolving a cluster secret reads the fleet object store over blocking HTTPS
+/// (and a `LocalFile` one reads disk), so the handler moves the spec and the
+/// resolver onto the blocking pool, materializes, and takes the spec back.
+/// The digest is taken in the same pass: it re-resolves the original cluster
+/// `File` mounts so a later rotation can be detected. A transient failure there,
+/// a line after the same mounts resolved, is recorded as `0` ("unknown") so the
+/// first rotation bump re-resolves and upgrades.
+async fn materialize_spec_secrets(
+    mut spec: workload_spec::WorkloadSpec,
+    ident: String,
+    resolver: Box<dyn workload_spec::secrets::SecretResolver + Send>,
+    root: std::path::PathBuf,
+    cluster_file_mounts: Vec<workload_spec::SecretMount>,
+) -> MaterializedSecrets {
+    crate::fleet_secrets::off_runtime(move || {
+        let result = crate::deploy::secret_mount::materialize_file_secrets(
+            &mut spec,
+            &ident,
+            resolver.as_ref(),
+            &root,
+        );
+        let digest = (result.is_ok() && !cluster_file_mounts.is_empty()).then(|| {
+            match crate::secrets::resolve_secrets(&cluster_file_mounts, resolver.as_ref()) {
+                Ok(resolved) => crate::secret_reload::content_digest(&resolved),
+                Err(_) => 0,
+            }
+        });
+        MaterializedSecrets {
+            spec,
+            result,
+            digest,
+        }
+    })
+    .await
+}
+
+#[cfg(test)]
+mod materialize_spec_secrets_tests {
+    use super::*;
+
+    /// R911-F2: the container deploy's materialization against a real fleet
+    /// store on a multi-thread runtime. The store's debug tripwire panics if
+    /// the resolve runs on a worker thread, so this fails the moment the
+    /// handler's helper stops hopping to the blocking pool.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deploy_resolves_cluster_secrets_off_the_runtime() {
+        use crate::fleet_secrets::FleetSecretStore;
+        use crate::secrets::{seal_cluster_secret, ClusterResolver, LocalFileResolver};
+        use workload_spec::secrets::{SecretAccess, SecretConsumer};
+        use workload_spec::{ImageRef, SecretMount, SecretRef, SecretTarget, TierTag, WorkloadSpec};
+        use yah_object_store::{InMemoryObjectStore, ObjectStore as _};
+
+        let kek = [8u8; 32];
+        let mem = std::sync::Arc::new(InMemoryObjectStore::new());
+        let store = FleetSecretStore::new(mem.clone(), "le", "prod");
+        let rec = seal_cluster_secret(&kek, "cf/dns-token", b"token", 1, SecretAccess::AllowAny);
+        mem.put(
+            &store.object_key("cf/dns-token").unwrap(),
+            serde_json::to_vec(&rec).unwrap(),
+        )
+        .unwrap();
+
+        let mut spec = WorkloadSpec::for_forge(
+            "fixture",
+            ImageRef {
+                registry: "localhost".into(),
+                repository: "test".into(),
+                tag: "latest".into(),
+                digest: workload_spec::testing::test_digest(),
+            },
+            TierTag("infra".into()),
+            vec![],
+        );
+        let mount = SecretMount {
+            source: SecretRef::Cluster {
+                name: "cf/dns-token".into(),
+            },
+            target: SecretTarget::File {
+                path: "/run/secrets/token".into(),
+                mode: 0o400,
+            },
+        };
+        spec.secrets = vec![mount.clone()];
+
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = Box::new(ClusterResolver::new(
+            Ok::<_, crate::fleet_secrets::MissingRail>(store),
+            kek,
+            LocalFileResolver::new(tmp.path().join("local")),
+            SecretConsumer::of(&spec),
+        ));
+        let out = materialize_spec_secrets(
+            spec,
+            "fixture".into(),
+            resolver,
+            tmp.path().join("mounts"),
+            vec![mount],
+        )
+        .await;
+        assert!(out.result.is_ok(), "materialization failed: {:?}", out.result);
+        assert!(
+            out.digest.is_some_and(|d| d != 0),
+            "a resolved cluster mount seeds a real digest, got {:?}",
+            out.digest
+        );
+    }
+}
+
+/// Build the `SecretResolver` for a set of `File`-target secret mounts,
+/// choosing the cluster-backed resolver when any mount references
+/// `SecretRef::Cluster` and the per-machine local-file resolver otherwise
+/// (R876-B16).
+///
+/// Factored out of [`deploy_workload_spec`], which used to inline this
+/// ~35-line selection, so [`deploy_non_container`]'s native materialization
+/// path (bundle/revalidate-receiver secrets) can share the exact same
+/// resolver-selection logic rather than growing a second copy that could
+/// silently drift from it — e.g. by forgetting the R706 consumer binding and
+/// making a cluster secret bearer-authorized again.
+///
+/// Returns `Err(response)` pre-built for the caller to return directly, since
+/// every call site rejects the deploy with the same JSON shape on failure.
+fn build_secret_resolver(
+    s: &ServerState,
+    ident: &str,
+    mounts: &[workload_spec::SecretMount],
+    consumer: workload_spec::secrets::SecretConsumer,
+) -> Result<Box<dyn workload_spec::secrets::SecretResolver + Send>, axum::response::Response> {
+    use axum::response::IntoResponse;
+
+    let needs_cluster = mounts.iter().any(|m| {
+        matches!(m.source, workload_spec::SecretRef::Cluster { .. })
+            && matches!(m.target, workload_spec::SecretTarget::File { .. })
+    });
+    if !needs_cluster {
+        return Ok(Box::new(crate::secrets::LocalFileResolver::new(
+            s.local_secret_store_root.clone(),
+        )));
+    }
+    // R911-F1: every cluster secret resolves from the fleet object store, and
+    // only from there. A node missing a rail (no store config, no sovereign
+    // group) still gets a resolver: its store answers the named rail error at
+    // resolve time, so the deploy is rejected naming the secret it could not
+    // read.
+    crate::secrets::ClusterResolver::from_kek_file(
+        crate::fleet_secrets::FleetSecretStore::for_node(s),
+        &s.cluster_kek_path,
+        &s.local_secret_store_root,
+        consumer,
+    )
+    .map(|r| Box::new(r) as Box<dyn workload_spec::secrets::SecretResolver + Send>)
+    .map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "status": "rejected",
+                "ident": ident,
+                "error": format!("cluster secret resolver init failed: {e}"),
+            })),
+        )
+            .into_response()
+    })
 }
 
 /// Type-erased re-entry into [`deploy_workload_spec`] — R860-T6.
@@ -3754,6 +4979,59 @@ async fn self_supply_refusal(
         .into_response()
 }
 
+/// @yah:ticket(R876-B14, "Stop resolving secrets into kamaji's supervised envelope — keep slot references and have kamaji resolve from the vault at container-start")
+/// @yah:status(review)
+/// @yah:at(2026-09-12T07:37:37Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R876)
+/// @yah:severity(high)
+/// @yah:gotcha("THE DESIGN, AND WHY IT IS THE REAL FIX. Today yubaba's admission MUST pre-resolve `EnvValue::FromSecret` / `FromMesh` into literals, because kamaji refuses an unresolved spec — `validate_spec_for_constable()` (oss/kamaji/crates/kamaji-bin/src/server.rs:2507 and :2609, oss/kamaji/crates/kamaji-bin/src/containerd.rs:1236, oss/kamaji/crates/kamaji/src/microvm.rs:772) bails by name on `FromSecret`. The consequence is that the resolved VALUES live in kamaji's in-memory record for the workload's whole lifetime and are readable by anything that can ask kamaji. The alternative shape: the envelope keeps slot REFERENCES, `validate_spec_for_constable` accepts them, and each backend resolves from the vault at container-start — the last possible moment, into the child's environment only. That is the same conclusion R876-B9 reached from the on-disk side (kamaji writing deploy records with live secrets inline), so doing it once closes BOTH halves. Spans kamaji + yubaba + the vault, which is why R876-B13 did the read-path redaction instead and filed this.")
+/// @yah:gotcha("WHAT R876-B13 ALREADY DID, SO THIS IS NOT RE-DERIVED. B13 landed `oss/yubaba/crates/yubaba/src/spec_redact.rs` — `redact_for_read(&mut Workload)`, called from `get_workload_spec` before serialising — which strips resolved VALUES (env literals, `InlineFile.content`, `AlmanacFeed.config_toml`) to a fixed `[redacted]` placeholder while keeping every NAME. That is a read-path bandage on ONE route: the values are still materialised in kamaji's record, still written to kamaji's on-disk deploy records (B9), and still reachable by anything that can talk to kamaji's UDS directly. B13's redactor deliberately keeps an UNRESOLVED `EnvValue::FromSecret` intact and serves the slot name — which is exactly the representation this ticket makes universal, so when this lands the redactor's env arm becomes a no-op for the secret case and can be narrowed.")
+/// @yah:next("Tier: Wizard — this is a trust-model change across three components (kamaji's admission contract, yubaba's deploy-time resolution, the vault's read surface from a node), not a mechanical edit. It reopens `validate_spec_for_constable` and changes what a supervised envelope is allowed to contain.")
+/// @yah:next("SEQUENCE THAT DOES NOT BREAK A ROLLING FLEET: (1) teach every kamaji backend to resolve `FromSecret`/`FromMesh` at container-start (native.rs spawn_child, containerd, docker, microvm) and give kamaji a vault reader; (2) relax `validate_spec_for_constable` to ACCEPT references once every backend can resolve them; (3) only then stop yubaba's admission from pre-resolving. Steps 2 and 3 in the other order deploys unresolved specs to a kamaji that still refuses them, and step 3 before step 1 starts containers with literal `FromSecret` placeholders in their environment. CLAUDE.md's rolling-upgrade rule applies: design the code as if one version exists, sequence the roll as if two do.")
+/// @yah:verify("THE BAR: after this lands, a kamaji deploy record on disk and a kamaji in-memory record both hold slot NAMES, never values — assert value-shaped (the credential's bytes appear nowhere in the serialised record) rather than field-shaped, the same assertion style R876-B13's regression test uses (oss/yubaba/crates/yubaba/tests/integration_deploy_through_kamaji.rs, `a_served_spec_carries_env_names_but_never_resolved_secret_values`). Second bar: a container started from a reference-carrying spec must still see the resolved value in its own environment, or the change has broken every workload that uses a secret.")
+/// @yah:gotcha("DISPROOF OF THIS TICKET'S CAUSAL PREMISE — NOTHING PRE-RESOLVES `FromSecret`, SO STEP 3 WAS A NO-OP AND STEP 1 WAS NOT A MOVE BUT A NEW DELIVERY PATH. Read from source 2026-09-12, before any edit. There is NO `EnvValue::FromSecret` -> `EnvValue::Literal` conversion anywhere in the tree. In the entire `yubaba` crate the only `FromSecret` mentions in code are `spec_redact.rs`'s no-op arm (:119). `resolve_env_from_mesh` (oss/yah-base/crates/workload-spec/src/validate.rs:1043) IS on the production deploy path (oss/yubaba/crates/yubaba/src/lib.rs:4964, inside `deploy_workload_spec`) and it genuinely does pre-resolve `FromMesh` — but its match arm passes `FromSecret` through UNTOUCHED and its doc (:1022) says why, by design: \"secret resolution is the secrets layer's job (R090-F5), not the mesh resolver's\". So the two reference arms were never symmetric: FromMesh is pre-resolved, FromSecret never was. The gotcha above that says \"yubaba's admission MUST pre-resolve `EnvValue::FromSecret`\" is WRONG, and every conclusion drawn from it inherits the error.")
+/// @yah:gotcha("STEP 1 WOULD HAVE REVERSED AN ADOPTED SECURITY DECISION, NOT FILLED A GAP. oss/yah-base/crates/workload-spec/src/admission.rs:63-70 refuses env-target secret delivery in BOTH spellings — `SecretTarget::EnvVar` and `EnvValue::FromSecret` — and states the reason: \"Nothing implements it end to end ... and `SecretTarget`'s own doc says to prefer `File` because env leaks through subprocess env and log dumps. Admitting an unimplemented delivery path would mean signing for something whose behaviour is not yet decided.\" So \"teach every kamaji backend to resolve FromSecret at container-start\" is not a mechanical edit: it implements, across four backends, precisely the shape an adopted design refuses. LEADER'S RULING (@Ashguard:dove, 2026-09-12): we CONFORM to that decision rather than reverse it. Steps 1-3 are abandoned, no vault reader is added to kamaji, and the four refusal sites (kamaji-bin/src/server.rs:2507 and :2609, kamaji-bin/src/containerd.rs:1236, kamaji/src/microvm.rs:772 — all verified still at those exact lines, no drift) STAY AS THEY ARE. The adopted path already exists and already works: `SecretMount` + `SecretTarget::File`, materialised by yubaba to tmpfs and bind-mounted, so kamaji only ever sees a path.")
+/// @yah:gotcha("VAULT REACHABILITY, ANSWERED FROM SOURCE: NO — AND THERE ARE THREE DISTINCT STORES, NOT ONE. (1) The `keys` crate (oss/yah-base/crates/keys/src/lib.rs:1-25) is an AES-256-GCM blob under `ProjectDirs::data_dir()` keyed by a per-host `machine.key` — an OPERATOR-WORKSTATION vault, not on a node, and its own threat-model note says it does not defend against a same-uid process. (2) `LocalFileResolver` reads `/var/lib/yah/yubaba/secrets/` (oss/yubaba/crates/yubaba/src/secrets.rs:33) — node-side plain files; kamaji runs as root under systemd so this is the ONE arm it can reach. (3) `ClusterResolver`'s `SecretRef::Cluster` ciphertext lives ONLY in `YubabaStateMachine`'s in-memory applied state (oss/yubaba/crates/yubaba-consensus/src/raft/store.rs:569 `cluster_secret`), inside yubaba's process; the node-local KEK at `/var/lib/yah/yubaba/cluster.kek` IS root-readable by kamaji, but a KEK without ciphertext is nothing. FOUR INDEPENDENT REASONS kamaji cannot get that ciphertext: neither kamaji-bin/Cargo.toml nor kamaji/Cargo.toml depends on `keys` or `yubaba-consensus`; `KamajiToYubaba` (oss/kamaji/crates/kamaji-proto/src/messages.rs:495) has NO secret-fetch variant — every arm is a response or a lifecycle push; kamaji is the UDS *server* so it cannot dial out; and kamaji cannot take a dep on the `yubaba` crate where `ClusterResolver` lives because the publish DAG `yah-base &lt;- {qed,kamaji} &lt;- yubaba` inverts. yubaba's `GET /secrets` is not an escape hatch either — store.rs:594 deliberately serves metadata with NO ciphertext and documents that choice.")
+/// @yah:gotcha("THE TICKET AS WRITTEN COULD NOT CLOSE ITS OWN BAR. Even with all three steps done, R876-B13's sentinel would STILL reach kamaji's record — because yubaba never put it there. app/yah/cli/src/cloud.rs:10761-10779 has the CLI, on the OPERATOR'S WORKSTATION, call `fob::get_or_env` against its local `keys` vault for the R2 access key, the R2 secret key and the Cloudflare API token, then `env.insert(\"MESOFACT_S3_SECRET_ACCESS_KEY\", secret_key)` etc. as plain `EnvValue::Literal`s before POSTing the spec to yubaba. Keeping \"slot REFERENCES\" in the envelope cannot fix a `Literal`, because a `Literal` carries no slot to keep — which is the exact provenance loss R876-B13 already documented when it chose value-blind redaction. The credential is injected by the CLIENT, travels as a VALUE, and lands in kamaji's in-memory record and its on-disk deploy record (the R876-B9 half). That is the real defect and it is a different crate from the one this ticket pointed at; filed as its own ticket — see the successor cross-referenced below.")
+/// @yah:gotcha("LATENT BUG FOUND WHILE DISPROVING THIS TICKET, TRUE TODAY AND INDEPENDENT OF IT — TWO KAMAJI BACKENDS SILENTLY DROP A NON-LITERAL ENV VALUE INSTEAD OF REFUSING IT. The four sites this ticket named all `bail!` by name on `FromSecret`, but `oss/kamaji/crates/kamaji/src/native.rs` and `oss/kamaji/crates/kamaji/src/docker.rs` do NOT: both filter with `if let EnvValue::Literal { value } = &e.value` and drop anything else on the floor, with no error and no log. So a spec carrying `FromSecret` (or an unresolved `FromMesh`) loses that variable on those two backends and the workload starts MISSING a credential while the deploy reports success — a silent-failure shape, strictly worse than the refusal the other four give. This also means relaxing validation without teaching those two first would have dropped a secret rather than errored, which is the trap the sequencing in `@yah:next` was meant to prevent but did not cover. Filed separately as its own bug under R876.")
+/// @yah:gotcha("SUCCESSORS FILED 2026-09-12. R876-B16 (Wizard, high) — the REAL fix: app/yah/cli/src/cloud.rs:10761-10779 injects R2/Cloudflare credentials as plain env literals from the CLI's operator-workstation `keys` vault; migrate to the adopted `SecretMount` + `SecretTarget::File` path modelled on local-driver/src/passway_ingress.rs. Closes the R876-B9 on-disk half at its source and makes R876-B13's read-path redaction a bandage over a defect that is gone. Confirmed two-sided: mesofact-publisher/src/config.rs:55-73 reads credentials by env-var NAME only, with no `_FILE` variant, so the receiver must learn to read a path. R876-B17 (Thief, medium) — the latent silent-drop in kamaji/src/native.rs and kamaji/src/docker.rs, independent of this ticket. THIS TICKET (B14) NEEDS NO IMPLEMENTATION: its goal is inherited by B16 and its mechanism is withdrawn.")
+/// @yah:verify("NOTHING WAS IMPLEMENTED AND NOTHING NEEDS TO BE, so there are no pass/fail counts to report against a baseline — the session's product is the disproof above plus R876-B16 / R876-B17. No file in the tree was edited: no kamaji backend gained a vault reader, `validate_spec_for_constable`'s four refusal sites are untouched at kamaji-bin/src/server.rs:2507 and :2609, kamaji-bin/src/containerd.rs:1236 and kamaji/src/microvm.rs:772 (each verified still at its stated line, no drift from the shared tree), and yubaba's admission path was not opened. Tree anchor for this reading: 44408b59059e5e4874deafc0b48dd262444a461a. No secret VALUE was read, printed or placed in a fixture; the credentials named here are identified by env-var name and vault slot name only.")
+/// @yah:handoff("SCOPE RETIRED ON EVIDENCE — NOTHING WAS IMPLEMENTED, AND THAT IS THE CORRECT OUTCOME, NOT A SHORTFALL. This ticket was dispatched to build steps 1-2 of its own sequence (teach every kamaji backend to resolve `FromSecret`/`FromMesh` at container-start; relax `validate_spec_for_constable` to accept references). The courier was instructed to settle vault reachability from source BEFORE writing code, and doing so disproved the ticket's causal premise. It stopped and escalated instead of building against it. On-disk change is +13/+12 pure board-annotation insertions in cloud.rs and native.rs; no code was touched, no vault reader was stubbed, the four refusal sites are all still intact and re-verified at their stated lines (server.rs:2507/:2609, containerd.rs:1236, microvm.rs:772), and yubaba's admission path is untouched. LEADER RULING, recorded so it is not re-litigated: option (b), and option (c) — \"park pending a design decision on whether env-target secret delivery is permitted\" — is explicitly NOT a prerequisite. Step 1 would have implemented the exact delivery shape `admission.rs:63-70` refuses on stated security grounds (\"env leaks through subprocess env and log dumps\"), so the move is to CONFORM to that adopted decision, not to reverse it. `SecretMount` + `SecretTarget::File` already exists and already works — yubaba materialises it to tmpfs and bind-mounts, so kamaji only ever sees a path. There was never an open design question; there was one call site bypassing a settled design. Option (a) (make `LocalFileResolver` the vault kamaji reads) was rejected for failing this ticket's own bar: it covers no cluster secrets and does not stop the CLI injection.")
+/// @yah:next("SUPERSEDED BY TWO FILED TICKETS — named here rather than left as unowned work on a ticket in review. **R876-B16** (bug, Wizard, high) is the real fix: `app/yah/cli/src/cloud.rs:10761-10779` has the CLI read its LOCAL operator-workstation `keys` vault and stuff a plain `EnvValue::Literal` into the spec before POSTing, so the credential is injected by the CLIENT, travels as a value, and lands in kamaji's in-memory record and its on-disk deploy record — which is why keeping \"slot references\" could never close this ticket's bar (a `Literal` carries no slot to keep). B16 migrates that injection to the `passway_ingress` SecretMount+File pattern, and carries the two-sided flag CONFIRMED from source: `mesofact-publisher/src/config.rs:55-73` has no `_FILE` variant, so the receiving workload must learn to read a path — this is a two-sided change, not a one-sided edit. B16 also closes R876-B9's on-disk half. **R876-B17** (bug, Thief, medium) is the latent bug found on the way: `native.rs` and `docker.rs` do not REFUSE a non-literal env value, they FILTER to `EnvValue::Literal` and silently DROP it, so a spec legitimately carrying `FromSecret` loses the variable today with no error on those two backends.")
+/// @yah:verify("NO TEST COUNTS ARE REPORTED AND NONE ARE OWED — no code changed, so there is no baseline to compare against and a green suite here would assert nothing. What WAS verified is the disproof itself, entirely by reading source rather than by inference from filenames, and it is recorded on this ticket as six `@yah:gotcha` entries with file:line citations. The three load-bearing findings: (1) NOTHING pre-resolves `FromSecret` — there is no `FromSecret`->`Literal` conversion anywhere in the tree, and `resolve_env_from_mesh` (workload-spec/src/validate.rs:1043) passes it through UNTOUCHED by design (R090-F5) while genuinely pre-resolving `FromMesh` — so this ticket's step 3 was a no-op and its step 1 was not a move but a new delivery path. (2) kamaji CANNOT reach the vault: of three distinct stores it reaches only `LocalFileResolver` (/var/lib/yah/yubaba/secrets/) as root; the `keys` crate vault is operator-workstation-only, and `SecretRef::Cluster` ciphertext lives solely inside yubaba's process — `KamajiToYubaba` (kamaji-proto/src/messages.rs:495) has no secret-fetch variant, kamaji is the UDS SERVER so it cannot dial out, `GET /secrets` (store.rs:594) deliberately serves metadata without ciphertext, and the `yah-base <- {qed,kamaji} <- yubaba` publish DAG forbids the dependency that would fix it. (3) The ticket as written COULD NOT CLOSE ITS OWN BAR — even with all three steps done, R876-B13's sentinel would still reach kamaji as a `Literal`, because the CLI put it there. NOTE ON ANNOTATION HYGIENE: this ticket's ORIGINAL gotcha and next still assert the disproved premise verbatim, deliberately left in place rather than deleted — on a shared tree, silently removing a peer-authored annotation destroys the record of what was believed and why. The correction explicitly names the stale entries as wrong, so a reader hits both and can see the reversal.")
+///
+/// @yah:ticket(R876-B15, "yubaba's HTTP surface has no authentication at all and the write half accepts unsigned deploys — the R044 pointer in the source comment is wrong, so nobody owns this")
+/// @yah:status(review)
+/// @yah:at(2026-09-12T08:33:32Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R876)
+/// @yah:severity(high)
+/// @yah:gotcha("THE POINTER IN THE SOURCE IS WRONG — DO NOT TRUST IT, THIS IS THE FINDING. Two in-code comments promise that R044 will enforce operator-signature rejection: oss/yubaba/crates/yubaba/src/lib.rs `deploy_workload_spec` (\"Strict rejection lands with R044 (key vault). Log a warning now so the operator knows unsigned deploys will break once R044 ships\" / \"unsigned accepted in stub mode - R044 will enforce rejection\") and the self-update handler (\"Same posture as deploy_workload_spec: warn now, enforce with R044\" / \"unsigned accepted until R044 key vault enforces rejection\"). MEASURED 2026-09-12 with `board show R044`: R044's real title is \"DRY credential resolution: KeysStore::get_or_env (vault -> env fallback) for CLI + headless\", its status is `review`, assignee agent:claude, no live claim, and every line of its handoff is about credential RESOLUTION (a vault-then-env lookup helper and its call sites). It never covered signature VERIFICATION and it is essentially done. So the enforcement those comments defer to was never going to arrive, and when R044 archives the pointer becomes a dangling reference to a closed ticket. Both comments were rewritten in place to name THIS ticket instead (R876-B13's courier, same pass that found it).")
+/// @yah:gotcha("MECHANISM, READ OUT OF SOURCE. `build_router` applies exactly ONE layer to the finished router — `middleware::from_fn_with_state(state, correlation_id_layer)` — so EVERY route on yubaba's HTTP surface is unauthenticated, not just the two this relay looked at. On the write half, `WorkloadDeployBody` declares `#[serde(default)] operator_signature: Option<String>` and `deploy_workload_spec`'s `if req.operator_signature.is_none()` branch does nothing but `tracing::warn!` and fall through to the deploy. The same is true of the self-update handler, which swaps yubaba's OWN BINARY on the node — it is quorum-gated (`quorum_write_guard`) but not signature-gated, so the guard proves a leader exists, not that the caller is allowed. Net: one unauthenticated reach to a node's mesh address both READS every workload's spec and DEPLOYS workloads and can drive a control-plane self-update. \"It is on the mesh\" is the entire access-control story.")
+/// @yah:gotcha("SCOPE RELATIVE TO ITS SIBLINGS, SO NOBODY RE-LITIGATES IT. R876-B13 closed the READ path by redaction only (oss/yubaba/crates/yubaba/src/spec_redact.rs — resolved values stripped, names kept); it deliberately added no auth, on the then-current instruction to defer to R044. That instruction was reversed once R044's real title was measured, which is why this ticket exists. R876-B14 is the structural secrets fix (envelope keeps slot references, kamaji resolves at container-start) — orthogonal: B14 stops the spec from CARRYING values, this one decides WHO may ask. Neither makes the other unnecessary. The bind is mesh-only (verified on us-east-001: `LISTEN 100.64.0.3:7443`, not 0.0.0.0 and not the public 51.81.85.145), so this is high, not an emergency — but it is a flat credential-and-deploy surface behind a single network boundary with no per-caller scoping.")
+/// @yah:next("Tier: Wizard — this is a trust-model design call for yubaba's whole HTTP surface (what signs a request, what verifies it, which routes are operator-only vs peer-only vs open, and how a rolling fleet keeps talking to itself while the answer changes), not a mechanical edit. Decide the model once and apply it as a layer, rather than per-handler `is_none()` checks that each rot separately — the two stale R044 comments are what per-handler deferral looks like after a year.")
+/// @yah:verify("THE BAR: an unauthenticated request to a node's :7443 must be REFUSED (not warned about) on every route that reads a spec, deploys a workload, or self-updates the binary — asserted in yubaba's own test suite through `build_router`, the way R876-B13's regression test drives the real router. Non-vacuity requirement: the same test must show an AUTHENTICATED request still succeeding, or a change that simply breaks the surface passes. Rolling-fleet requirement before any ship: node-to-node calls must keep working across a partially-upgraded fleet, so the enforcement flip has to be sequenced (accept-and-log, then require) rather than landed in one step.")
+/// @yah:gotcha("SHIP SEQUENCING — OPERATOR DECISION, 2026-09-12. The next fleet ship is deliberately BATCHED across this ticket and R876-B16 rather than run now; the full decision and the verification it owes are recorded on R876-B16's gotchas, and that is the one to read before shipping anything. Short form: R876-B13's read-path redaction and R876-B17's backend refusal are landed in the tree but NOT on the fleet, and they ride out with this batch. The ship is a paired `scripts/hotship.sh --nodes us-east-001 --binaries yubaba,kamaji` (yubaba cannot go alone), us-east-001 serves noisetable.com so a kamaji restart there is tenant-visible, and the decision to run it is the OPERATOR's. RELEVANT TO THIS TICKET SPECIFICALLY: enforcing `operator_signature` is a flag day — every existing unsigned caller (the CLI, the passway doors, cloud-client) breaks the moment enforcement turns on, so design the code as if one version exists but sequence the roll as if two do. Landing enforcement in this shared tree AHEAD of the callers that sign would arm exactly the trap this relay spent a day untangling: the next person to run a hotship pushes a yubaba that refuses the fleet's own traffic.")
+/// @yah:handoff("THE MODEL, DECIDED ONCE AND APPLIED AS A LAYER — new module oss/yubaba/crates/yubaba/src/http_auth.rs (declared at lib.rs:576). Every route is in exactly one AuthClass and the classification is STRUCTURAL, not a path table: `build_router` now assembles THREE sub-routers, each `route_layer`ed with its own middleware carrying its class, then merges them. Adding a route means choosing a sub-router, which the diff makes visible; there is nothing to drift out of sync. PUBLIC (no credential): GET /health, GET /mesh/leader-health — liveness probes whose purpose is to answer before a node is configured, one of them dialled by Cloudflare which holds no yubaba credential and never will. PEER: node-to-node RPC plus the in-fleet read surface — the five raft routes raft/network.rs reserves, /raft/write, /raft/status, lease-renew, rpo-report, boot-health, peer-liveness, /capabilities, /identity, /node*, /services, /workloads read routes, service-records discovery, hosted-camps. OPERATOR: everything that mutates the install, hands out a resolved secret, or changes cluster membership — /workloads/deploy, /workloads/{id}/spec, /workloads/{id}/destroy, /workloads/drain, /self-update, /secrets, /compose, /register-hostkey, /headscale/{deploy,bootstrap}, /diagnostics, /v1/rollouts, and the raft membership verbs.")
+/// @yah:handoff("TWO CREDENTIAL TIERS, ONE VERIFICATION PATH, AND THE SPLIT IS THE DESIGN CALL. PEER tokens are PASETO v4.local — SYMMETRIC, under one cluster-wide key every node holds. Chosen because the holders are mutually-trusting members of a single trust domain who must verify each other with NO network round-trip: raft cannot depend on cheers being reachable to hold an election. One secret, N holders, no distribution graph. OPERATOR tokens are PASETO v4.public — ASYMMETRIC, verified against operator public keys configured on the node. Chosen because a node must be able to VERIFY an operator token and must never be able to FORGE one: exactly the property /self-update needs, since compromising one node must not yield the ability to order its peers to reinstall themselves. An operator token satisfies Peer; a peer token NEVER satisfies Operator and is 403'd in both modes. Both tiers ride pasetors 0.7, already a yubaba dep for the cheers service principal, so no new crypto dependency.")
+/// @yah:handoff("THE ROLLING-FLEET HALF. AuthMode { Warn (default), Require } is a ROLL SEQUENCER with a removal ticket, not a feature flag: the code is written as if only Require exists and Warn exists only so the roll can see two versions at once. Crucially WARN IS NOT AUTH-OFF — a credential that is PRESENT AND BAD (bad signature, expired, wrong audience, missing scope, wrong tier) is refused in BOTH modes; only ABSENCE is tolerated under Warn. That is what makes the soak meaningful: each caller wired up during the roll gets real verification the moment it starts signing, so the flip to Require is a no-op for everything already talking. Default is Warn with no trust root, which is also what keeps the ~870 existing credential-free router tests in this crate meaningful rather than rewritten.")
+/// @yah:handoff("CONFIGURATION AND KEY CEREMONY, all new on `yubaba serve`: --auth-mode (env YUBABA_AUTH_MODE, default warn), --operator-key repeatable (env YUBABA_OPERATOR_KEYS, comma-separated, 64-char hex pubkey — the same hex convention --control-plane-allow already uses), --cluster-key-file (env YUBABA_CLUSTER_KEY_FILE). The cluster key is a FILE and not an env var on purpose: it is a bearer secret, and an env var is readable from /proc/<pid>/environ, inherited by every child yubaba spawns, and printed by half the diagnostics in this repo. build_http_auth_policy is FATAL on every bad value, and `--auth-mode require` with no trust root REFUSES TO BOOT — it would otherwise 401 every authenticated route while the unit stayed active, which reads on the wire as a partition. New `yubaba auth` subcommand: `keygen [--secret-out]`, `cluster-keygen [--out]`, `mint --secret-file|--cluster-key-file [--subject] [--ttl]`. Secrets are read from and written to files at mode 0600, never argv — `ps` is world-readable on the fleet's nodes.")
+/// @yah:handoff("THE CALLER SIDE, SO THE FLIP IS ACTUALLY REACHABLE. cloud-client now attaches `Authorization: Bearer <token>` as a reqwest DEFAULT HEADER in CloudClient::build (crates/yah/cloud-client/src/lib.rs), sourced from YUBABA_OPERATOR_TOKEN_FILE then YUBABA_OPERATOR_TOKEN, or passed explicitly through the new CloudClient::with_token. Default header and not per-method: that client has ~50 request sites and no shared send() seam, so ~50 `.bearer_auth()` edits is ~50 chances for a 51st method to be silently unauthenticated — the exact failure this ticket exists to fix. The header value is marked sensitive so it does not land in reqwest's debug output. That one seam covers the `yah` CLI, yah-agent-tools and rollout apply, since all three go through cloud-client. It carries a pre-minted token rather than minting: cloud-client's package description makes thin-client-ness an explicit constraint, and minting belongs where the key material lives.")
+/// @yah:handoff("DISCOVERED WORK DONE IN THIS PASS, NOT DEFERRED: the vestigial `operator_signature` field is GONE — all 16 struct-literal sites and all four wire types. It was `#[serde(default)] Option<String>` on WorkloadDeployBody + SelfUpdateBody (yubaba) and WorkloadDeployRequest + SelfUpdateRequest (cloud-client); nothing ever verified it, both `is_none()` branches only `tracing::warn!`d, and every call site in the tree passed None. Deleting it is the pre-1.0 rule applied literally — a decorative field left beside a working auth layer is exactly the shim that reads as the intended path three months later, which is how this ticket's own finding happened. Sites swept: app/yah/cli/src/cloud.rs (10), crates/yah/agent-tools/src/cloud_tools.rs (2), crates/yah/cloud-client/src/lib.rs (2), app/yah/cli/src/yubaba_client.rs (1), app/yah/cli/src/rollout/apply.rs (1 + one stale assertion), oss/yubaba/crates/yubaba/src/lib.rs (1). Both handlers' warn branches are replaced by a comment naming the class that now owns the question.")
+/// @yah:handoff("FOLLOWUP FILED AS R876-T18 — NOT B18. The allocator handed out T18, and the three in-code pointers were corrected to match in the same pass, since a dangling ticket reference in a comment is the precise defect this ticket was opened about. T18 owns: signing the callers that still send nothing (raft/network.rs's five RPC paths plus raft/mod.rs:2549's hand-rolled /raft/write forward, passway's discovery poll, tenant-streamer's rpo-report, yubaba's own peer-dialing loops — all PEER tier, so one cluster key opens all of them); distributing the keys to the fleet; then flipping the default to require and DELETING AuthMode::Warn, the --auth-mode flag, and decide()'s anonymous branch.")
+/// @yah:verify("MEASURED, ON THIS TREE, WITH A BASELINE. `cargo test -p yubaba --lib` from oss/yubaba: 895 passed / 0 failed, against R876-B13's recorded 870/0 baseline. +25 = 17 http_auth unit tests + 1 pinning that a hand-built ServerState defaults to the permissive policy + 7 router-level tests. Re-run twice after the final edits, same count both times, no skew reported on either. `cargo check -p yubaba --bins` EXIT=0, confirmed to actually compile main.rs by touching it and watching cargo re-Check yubaba rather than no-op.")
+/// @yah:verify("THE TICKET'S BAR, ASSERTED THROUGH THE REAL build_router (http_auth::router_tests). `an_unauthenticated_request_is_refused_on_every_operator_route` drives GET /workloads/{id}/spec, POST /workloads/deploy, POST /self-update and GET /secrets against an enforcing node and asserts 401 on each — the three routes the ticket names by hand, plus one more. NON-VACUITY: `an_operator_token_still_gets_through_to_the_handler` replays the same four with a valid operator token and asserts neither 401 nor 403, THEN pins POST /workloads/drain at a clean 200 — chosen because it is the one operator route reaching 200 on a state with no runtime wired (the pre-existing `drain_workloads_returns_empty_until_runtime` proves that independently), so the assertion is \"the handler RAN\", not \"the handler changed which error it returns\". A change that simply broke the surface fails this.")
+/// @yah:verify("THE ROLLING-FLEET REQUIREMENT, ALSO ASSERTED. `a_peer_token_opens_the_node_to_node_routes` shows /capabilities, /workloads and /raft/status refusing anonymous and admitting a cluster-key token — i.e. a partially-upgraded fleet still elects and forwards. `a_peer_token_cannot_deploy_or_self_update` shows the same token 403ing on all four operator routes. `warn_mode_serves_the_fleet_but_not_a_forged_token` shows warn serving an anonymous call 200 AND 401ing a token signed by an untrusted key — the property that makes the step-by-step roll safe. `the_public_probes_stay_open_under_require` pins /health and /mesh/leader-health.")
+/// @yah:verify("route_layer AND NOT layer, WITH A TEST FOR IT: `an_unknown_path_is_a_404_not_a_401`. A plain `.layer` would wrap the fallback too, so an unknown path would 401 — turning the surface into an oracle for which routes exist. Invisible in review, obvious in a test.")
+/// @yah:verify("END-TO-END OVER A REAL SOCKET, WHICH IS THE ONLY TEST THAT CAN CATCH A CLIENT/SERVER DISAGREEMENT: cloud-client's `an_enforcing_yubaba_refuses_a_tokenless_client_and_serves_a_tokened_one` binds a real enforcing yubaba on 127.0.0.1:0 via axum::serve, proves the server is up with a public GET /health (so a bind failure cannot masquerade as a refusal), then asserts CloudClient::new 401s on drain_workloads and CloudClient::with_token succeeds on the same route. Both sides' unit tests pass happily while disagreeing about the header name, the `Bearer ` prefix, the audience or the scope; this one does not. `cargo test -p cloud-client` = 45 passed / 0 failed + 1 doc-test, against 44 before.")
+/// @yah:verify("WORKSPACE-WIDE, for the operator_signature sweep: `cargo check -p cloud-client -p yah -p yah-agent-tools --all-targets` EXIT=0 (8m39s). The two unused-import warnings it emits are in crates/yah/board/src/ticket.rs and crates/yah/agent-tools/src/kg_tools.rs — files this ticket never touched, pre-existing.")
+/// @yah:verify("ADVERSARIAL CASES COVERED BY UNIT TEST, each one a way this could have been security theatre: a token signed by an untrusted operator key; a peer token under a foreign cluster key; an expired token; a token whose exp is beyond the 24h ceiling even though it SIGNS (hand-minted, because mint_operator_token refuses that TTL itself — a hostile minter is the only way to produce the shape); a cheers-audience token signed by a TRUSTED key (the replay the aud pin exists for); a token missing its tier's scope; a non-Bearer Authorization header (classified Invalid, not Anonymous — so `Authorization: Basic ...` cannot slip through warn mode as if nothing were sent); require-with-no-trust-root refusing to build. All refused.")
+/// @yah:gotcha("NOTHING SHIPPED TO THE FLEET, AND THE FLEET IS STILL UNAUTHENTICATED. This is tree-only. us-east-001 today runs a yubaba with no auth layer at all, and even once this ships the default is auth-mode=warn with no keys — behaviourally identical to today. THE SECURITY POSTURE DOES NOT CHANGE UNTIL R876-T18's STEP 3. What this ticket bought is that the enforcement now EXISTS, is tested, and can be turned on per-node without a code change. Read the batched-ship decision on R876-B16's gotchas before shipping anything; this rides the same paired `hotship.sh --nodes us-east-001 --binaries yubaba,kamaji`.")
+/// @yah:gotcha("DO NOT SET --auth-mode require ON A FLEET NODE YET. The peer-side callers (raft/network.rs, passway discovery, tenant-streamer, yubaba's own peer-dialing loops) still send NO credential — only cloud-client was wired. An enforcing node 401s every /raft/append-entries and /raft/vote it receives, which takes it out of the quorum while systemd still reports it active. Same failure shape as this relay's protocol-skew gotcha, reached by a different mechanism. Sequence is R876-T18 steps 1 -> 2 -> 3, in that order.")
+/// @yah:gotcha("ONE ROUTE'S CLASS IS A JUDGEMENT CALL WORTH RE-READING RATHER THAN INHERITING: POST /raft/write is PEER, not Operator. A follower forwards here on openraft's ForwardToLeader (member_registration, the rollout CAS and tenant epoch claims all do), so it is genuinely node-to-node traffic, and classing it Operator would break those the moment enforcement turns on. The cost is that a cluster-key holder can drive an arbitrary raft write. An operator token still opens it, which is what the CLI's secret verbs (cloud-client's PutSecret/DeleteSecret) use. If that trade is revisited, the fix is to split the route by request VARIANT, not to reclassify the path.")
+/// @yah:gotcha("GET /v1/rollouts IS OPERATOR EVEN THOUGH ONLY ITS POST NEEDS TO BE, deliberately rather than sloppily: it is the one path whose two methods would otherwise land in DIFFERENT sub-routers, and merging two already-`route_layer`ed MethodRouters on one path is a shape I did not want to depend on. Both methods in one class removes the question. /node/metrics has GET+POST too but both are Peer, so it is unaffected.")
+/// @yah:gotcha("THE AUDIENCE PIN IS DOING REAL WORK AND MUST NOT BE RELAXED. yubaba ALREADY mints PASETO v4.public tokens with an Ed25519 service-principal key, for cheers (cheers_client.rs). If that key were ever also added to YUBABA_OPERATOR_KEYS, every cheers token would otherwise open this surface. `aud: \"yubaba:control-plane\"` is what stops it, and `a_cheers_audience_token_signed_by_a_trusted_key_is_still_refused_here` is the test. Audience separation is the cheap half of not reusing keys; the expensive half is not reusing keys — keep the operator trust set separate from the cheers principal.")
 async fn deploy_workload_spec(
     State(s): State<Arc<ServerState>>,
     Json(req): Json<WorkloadDeployBody>,
@@ -3765,120 +5043,38 @@ async fn deploy_workload_spec(
         return err_resp;
     }
 
-    // R599-T5: the body carries either a full `Workload` envelope (externally
-    // tagged, e.g. `{"mesofact-static": {...}}`) or — the pre-migration shape
-    // every deployed client still sends — a bare `WorkloadSpec`, which means
-    // `Container`. The two are unambiguous: `Workload` is externally tagged, so
-    // a bare spec (many top-level keys) can never parse as one. Once the CLI
-    // and desktop are rolled onto the envelope form, drop the fallback.
-    let envelope: workload_spec::Workload =
-        match serde_json::from_value::<workload_spec::Workload>(req.spec.clone()) {
-            Ok(w) => w,
-            Err(envelope_err) => {
-                match serde_json::from_value::<workload_spec::WorkloadSpec>(req.spec) {
-                    Ok(spec) => workload_spec::Workload::container(spec),
-                    Err(spec_err) => {
-                        return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(serde_json::json!({
-                        "status": "rejected",
-                        "ident": "",
-                        "runtime": "stub",
-                        "error": format!(
-                            "spec JSON parse error: not a Workload envelope ({envelope_err}) \
-                             nor a bare WorkloadSpec ({spec_err})"
-                        ),
-                    })),
-                )
-                    .into_response();
-                    }
-                }
-            }
-        };
-
-    // Bundle-serving workloads take a short, dedicated path: kamaji materializes
-    // the content-addressed bundle and forks its serve binary, so none of the
-    // container admission below (mesh-IP allocation, secret materialization,
-    // produced dirs, archetype registry) applies to them.
-    let mut spec = match envelope {
-        workload_spec::Workload::Container(manifest) => match manifest.into_spec() {
-            Ok(spec) => spec,
-            // R783-F1 / W324: `kind = "container"` also names a local
-            // Dockerfile RECIPE, which has no digest until it is built and so
-            // has nothing yubaba can admit. It cannot arrive over the postcard
-            // wire (the serializer refuses it), but this endpoint takes JSON.
-            Err(recipe) => {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(serde_json::json!({
-                        "status": "rejected",
-                        "ident": recipe.name,
-                        "runtime": "stub",
-                        "error": "this is a local container BUILD RECIPE (a [build] table), \
-                                  not a digest-pinned WorkloadSpec — build it first and deploy \
-                                  the lowered spec",
-                    })),
-                )
-                    .into_response();
-            }
-        },
-        other => return deploy_non_container(&s, other, req.id).await,
+    // R892-B1: parse, shape and admission are shared verbatim with
+    // `POST /workloads/validate` — see `check_deploy_body`.
+    let (mut spec, admitted_grant) = match check_deploy_body(req.spec) {
+        SpecCheck::Container { spec, grant } => (*spec, grant),
+        // Bundle-serving workloads take a short, dedicated path: kamaji
+        // materializes the content-addressed bundle and forks its serve binary,
+        // so none of the container admission below (mesh-IP allocation, secret
+        // materialization, produced dirs, archetype registry) applies to them.
+        SpecCheck::NonContainer(other) => return deploy_non_container(&s, *other, req.id).await,
+        SpecCheck::Refused(resp) => return resp,
     };
 
-    if let Err(e) = workload_spec::validate::shape(&spec) {
+    // R876-B15: the caller check that used to live here (and only warned) is
+    // now `http_auth::AuthClass::Operator` on this route in `build_router`.
+    let ident = spec.expose.mesh.identity.0.clone();
+
+    // R880: refuse a second concurrent deploy/destroy of this ident rather
+    // than let two backend calls (two image pulls, two teardown-then-deploy
+    // sequences) land interleaved. `_deploy_lock` is held for the rest of
+    // this handler and released on every return path by its `Drop`.
+    let Some(_deploy_lock) = ServerState::try_lock_deploy(&s, &ident) else {
         return (
-            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "status": "rejected",
-                "ident": spec.expose.mesh.identity.0,
-                "runtime": "stub",
-                "error": format!("shape validation failed: {e}"),
+                "ident": ident,
+                "error": "a deploy or destroy of this workload is already in progress on this \
+                          node — retry once it completes rather than racing it",
             })),
         )
             .into_response();
-    }
-
-    // R555-F5: admission runs HERE, before anything is resolved on this spec's
-    // behalf — not only in kamaji, where F4 put it.
-    //
-    // Two reasons, and the first is the ticket. Secret resolution happens in
-    // yubaba (the KEK never leaves the node) and *precedes* the backend call, so
-    // a gate that lives only in kamaji sees the spec after the credentials have
-    // already been decrypted onto tmpfs, and sees `spec.secrets` emptied into
-    // binds — it is checking a document from which the thing it is meant to
-    // authorize has been erased. Second, and more mundane: a workload that will
-    // be refused should not first have a cluster secret decrypted for it.
-    //
-    // Same posture, same pinned keys, same env vars as kamaji — but yubaba and
-    // kamaji are separate units, so both need `YAH_ADMISSION_KEYS`. Under the
-    // default permissive policy an ungranted spec is untouched, which is every
-    // service on the fleet today.
-    let admitted_grant = match workload_spec::admission::check_grant(&spec) {
-        Ok(g) => g,
-        Err(e) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({
-                    "status": "rejected",
-                    "ident": spec.expose.mesh.identity.0,
-                    "error": format!("workload not admitted: {e}"),
-                })),
-            )
-                .into_response();
-        }
     };
-
-    if req.operator_signature.is_none() {
-        // Strict rejection lands with R044 (key vault). Log a warning now so
-        // the operator knows unsigned deploys will break once R044 ships.
-        tracing::warn!(
-            ident = %spec.expose.mesh.identity.0,
-            "workload deploy received without operator signature \
-             (unsigned accepted in stub mode — R044 will enforce rejection)"
-        );
-    }
-
-    let ident = spec.expose.mesh.identity.0.clone();
 
     // R572-F4: reject a second deploy of the same appliance ident while the
     // first is still live.  Servers are freely re-deployable (rolling update);
@@ -3911,9 +5107,13 @@ async fn deploy_workload_spec(
     // `drain` already prefer Kamaji, so a Kamaji-attached yubaba that
     // deployed via the legacy runtime would never find its own workloads when
     // reading them back. Deploy must use the same backend the read handlers do.
-    let backend: Option<Arc<dyn ContainerRuntime + Send + Sync>> = s.active_backend();
+    //
+    // R881-B8: discriminated, because the fallback is not equivalent for a
+    // workload that needs a network namespace wired around it — see the refusal
+    // below.
+    let backend: Option<WorkloadBackend> = s.workload_backend();
 
-    if let Some(rt) = backend {
+    if let Some(backend) = backend {
         // R844-B11: this node's OWN mesh address, never an invented one. The
         // value travels straight through to the workload's service record —
         // containerd writes it as the `yah.mesh_ip` label, echoes it back in
@@ -3937,6 +5137,63 @@ async fn deploy_workload_spec(
         // and re-deriving routability from the spec alone downstream would now
         // get it wrong.
         let bind_ip = s.workload_bind_ip(&spec);
+
+        // R881-B8: an allocated container address is a PROMISE that something
+        // will wire a veth behind it, and only the sibling does. If the sibling
+        // is unreachable this is the backend that would run the workload into a
+        // bare namespace — `lo` and nothing else — while `upsert_deployed`
+        // published `bind_ip` as a `Ready` endpoint. Measured on us-east-001
+        // 2026-09-11: two deploys, both reachable only via `nsenter`, both
+        // advertising `10.128.3.2`, nothing logged by either side.
+        //
+        // Refuse instead, which is the same answer kamaji-bin already gives on
+        // its own path ("a refused deploy rather than a silent fallback",
+        // `build_container_netns`). The condition is deliberately narrow: it
+        // needs an address that only container networking can deliver, so a
+        // host-networked or `yah.docker.publish` workload (`binds_node_ports`)
+        // is unaffected, and so is every node started without `--container-net`
+        // — there `workload_bind_ip` is already `None` and the record is
+        // already published `NotReady { reason: "unroutable" }` (R881-B1),
+        // which is honest rather than broken.
+        let needs_wired_netns =
+            bind_ip.is_some() && !crate::service_records::binds_node_ports(&spec);
+        if needs_wired_netns && !backend.wires_container_netns() {
+            tracing::error!(
+                ident = %ident,
+                backend = backend.name(),
+                bind_ip = ?bind_ip,
+                sibling_configured = s.constable_client.is_some(),
+                "refusing deploy: this workload needs a wired container network \
+                 namespace and the kamaji sibling is not reachable"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "rejected",
+                    "ident": ident,
+                    "runtime": backend.name(),
+                    "error": "workload needs a wired container network namespace, which only \
+                              the kamaji sibling provides, and it is not reachable — deploying \
+                              through the in-process runtime would start it in a bare namespace \
+                              and advertise an address nothing answers on",
+                })),
+            )
+                .into_response();
+        }
+
+        // R881-B8: the substitution itself, logged. A node that was given a
+        // sibling and is not using it has lost supervision, restart policy and
+        // container networking all at once, and until this line it did so
+        // without a word in either journal.
+        if s.sibling_substituted(&backend) {
+            tracing::warn!(
+                ident = %ident,
+                "kamaji sibling unreachable — deploying through the legacy \
+                 in-process runtime instead"
+            );
+        }
+
+        let rt = backend.into_runtime();
         let mesh = crate::mesh::MeshAssignment::stub(
             bind_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST),
         );
@@ -4013,74 +5270,27 @@ async fn deploy_workload_spec(
             .iter()
             .any(|m| matches!(m.target, workload_spec::SecretTarget::File { .. }))
         {
-            let needs_cluster = spec.secrets.iter().any(|m| {
-                matches!(m.source, workload_spec::SecretRef::Cluster { .. })
-                    && matches!(m.target, workload_spec::SecretTarget::File { .. })
-            });
-            let resolver: Box<dyn workload_spec::secrets::SecretResolver> = if needs_cluster {
-                let Some(sm) = &s.cluster_state else {
-                    return (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        Json(serde_json::json!({
-                            "status": "rejected",
-                            "ident": ident,
-                            "error": "spec references a cluster secret but this node \
-                                      is not part of a raft cluster (no cluster state)",
-                        })),
-                    )
-                        .into_response();
+            // R706 (W294): bind the resolver to THIS spec's identity, so every
+            // cluster secret it reads is checked against the record's access
+            // rule. The consumer is derived from the spec yubaba is about to
+            // run — not from anything the caller asserts — so a hand-rolled
+            // deploy cannot claim to be a workload it isn't without also
+            // actually being deployed under that name. R555-F5: a dispatched
+            // build's workload name is a fresh `forge-<uuid>` every run, so
+            // `SecretAccess::Workloads` can never name it and `AllowAny` was
+            // the only rule under which it could read a credential at all.
+            // The verified grant carries a durable identity underneath the
+            // ephemeral one — the signed recipe name plus the key that
+            // vouched for it — which `SecretAccess::Recipes` matches on.
+            // `admitted_grant` is `Some` only past attribution, signature AND
+            // coverage, so this cannot be asserted by a caller.
+            let consumer =
+                crate::deploy::secret_mount::consumer_for(&spec, admitted_grant.as_ref());
+            let resolver: Box<dyn workload_spec::secrets::SecretResolver + Send> =
+                match build_secret_resolver(&s, &ident, &spec.secrets, consumer) {
+                    Ok(r) => r,
+                    Err(resp) => return resp,
                 };
-                // R706 (W294): bind the resolver to THIS spec's identity, so
-                // every cluster secret it reads is checked against the record's
-                // access rule. The consumer is derived from the spec yubaba is
-                // about to run — not from anything the caller asserts — so a
-                // hand-rolled deploy cannot claim to be a workload it isn't
-                // without also actually being deployed under that name.
-                // R555-F5: a dispatched build's workload name is a fresh
-                // `forge-<uuid>` every run, so `SecretAccess::Workloads` can
-                // never name it and `AllowAny` was the only rule under which it
-                // could read a credential at all. The verified grant carries a
-                // durable identity underneath the ephemeral one — the signed
-                // recipe name plus the key that vouched for it — which
-                // `SecretAccess::Recipes` matches on. `admitted_grant` is
-                // `Some` only past attribution, signature AND coverage, so this
-                // cannot be asserted by a caller.
-                let consumer = crate::deploy::secret_mount::consumer_for(
-                    &spec,
-                    admitted_grant.as_ref(),
-                );
-                // R779 (W267): raft first, object cert store second. Per-domain
-                // TLS material is deliberately not in raft — 10k certs would
-                // rewrite the whole state on every PutSecret — so a
-                // `tls/<domain>/cert|key` name raft has never seen falls through
-                // to R2. Everything raft does hold answers locally, unchanged,
-                // and an unconfigured node's `None` fallback holds nothing.
-                let secret_store =
-                    crate::cert_store::LayeredSecretStore::new(sm.clone(), s.cert_store.clone());
-                match crate::secrets::ClusterResolver::from_kek_file(
-                    secret_store,
-                    &s.cluster_kek_path,
-                    &s.local_secret_store_root,
-                    consumer,
-                ) {
-                    Ok(r) => Box::new(r),
-                    Err(e) => {
-                        return (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            Json(serde_json::json!({
-                                "status": "rejected",
-                                "ident": ident,
-                                "error": format!("cluster secret resolver init failed: {e}"),
-                            })),
-                        )
-                            .into_response();
-                    }
-                }
-            } else {
-                Box::new(crate::secrets::LocalFileResolver::new(
-                    s.local_secret_store_root.clone(),
-                ))
-            };
 
             // R848: only reap on failure if this materialization is the one that
             // created the dir. On a *re*deploy the dir already holds the running
@@ -4092,12 +5302,19 @@ async fn deploy_workload_spec(
                 &s.secret_mount_root,
                 &ident,
             );
-            if let Err(e) = crate::deploy::secret_mount::materialize_file_secrets(
-                &mut spec,
-                &ident,
-                resolver.as_ref(),
-                &s.secret_mount_root,
-            ) {
+            // R911-F2: resolving reads the fleet object store over blocking
+            // HTTPS, so the whole materialization runs off the runtime.
+            let materialized = materialize_spec_secrets(
+                spec,
+                ident.to_string(),
+                resolver,
+                s.secret_mount_root.clone(),
+                cluster_file_mounts.clone(),
+            )
+            .await;
+            spec = materialized.spec;
+            let registration_digest = materialized.digest;
+            if let Err(e) = materialized.result {
                 // Fail closed: a missing / undecryptable cluster secret rejects
                 // the deploy rather than starting a workload without its cert.
                 if secret_dir_is_new {
@@ -4120,17 +5337,7 @@ async fn deploy_workload_spec(
             // from the *original* cluster File mounts so a later re-resolve can
             // detect an actual rotation. Held pending; committed only if the
             // backend accepts the workload below.
-            if !cluster_file_mounts.is_empty() {
-                let digest = match crate::secrets::resolve_secrets(
-                    &cluster_file_mounts,
-                    resolver.as_ref(),
-                ) {
-                    Ok(resolved) => crate::secret_reload::content_digest(&resolved),
-                    // Resolvable a line ago (materialize succeeded); treat a
-                    // transient failure here as "unknown" so the first rotation
-                    // bump re-resolves and upgrades.
-                    Err(_) => 0,
-                };
+            if let Some(digest) = registration_digest {
                 pending_secret_registration = Some(crate::secret_reload::SecretWorkloadEntry {
                     spec: spec.clone(),
                     mesh: mesh.clone(),
@@ -4180,7 +5387,6 @@ async fn deploy_workload_spec(
             let p_body = match serde_json::to_value(provider) {
                 Ok(spec_json) => WorkloadDeployBody {
                     spec: spec_json,
-                    operator_signature: None,
                     requesting_camp_id: req.requesting_camp_id.clone(),
                     on_behalf_of_user: req.on_behalf_of_user.clone(),
                     id: None,
@@ -4240,9 +5446,19 @@ async fn deploy_workload_spec(
         // this seam. `None` (yubaba on loopback / 0.0.0.0) makes a `local`
         // requirement unsatisfiable, deliberately: see `requirement_satisfied`.
         {
+            // R330-F17: the directory only has anything in it once
+            // `mesh_directory::spawn` is running, which only happens on a
+            // raft-configured node (main.rs). On a single-node/dev/pond
+            // node — no `node_id` — pass `None` so `lookup` falls back to
+            // the pre-R330-F17 local-only path instead of seeing a
+            // permanently-empty directory and resolving nothing.
+            let directory = s.node_id.map(|_| s.mesh_directory.as_ref());
             let mesh_state = crate::deploy::mesh_resolve::ServiceRecordMeshState::new(
                 &s.service_records,
                 s.node_mesh_ip(),
+                directory,
+                &s.route_tables,
+                s.route_weights,
             );
             let deadline = crate::deploy::mesh_resolve::compute_dependency_deadline(
                 &spec,
@@ -4458,6 +5674,23 @@ async fn deploy_workload_spec(
                     "container_id": &result.container_id,
                     "mesh_ip": result.mesh_ip.to_string(),
                 });
+                // R850-T4: pass the hydrate-on-place measurement through to the
+                // caller. `Some` only when kamaji actually restored this
+                // workload's volume in front of the deploy, which is every
+                // first placement of a workload declaring `yah.durability.tier`
+                // and nothing else.
+                //
+                // Yubaba deliberately does NOT journal it here, even though it
+                // is the closest thing to the restore. A journal record needs
+                // {workload, node}, and this process knows only the first: it
+                // is the node, so it has no name for itself that the camp's
+                // `.yah/infra/machines/*.toml` would recognize — and it is not
+                // running in the camp tree the journal lives in. The caller
+                // dialed a machine BY name to get here, which is why
+                // attribution happens one hop further out.
+                if let Some(line) = &result.hydrate {
+                    resp_json["hydrate"] = serde_json::Value::String(line.clone());
+                }
                 if let Some(key) = preauthkey {
                     resp_json["preauthkey"] = serde_json::Value::String(key);
                     resp_json["operator_mode"] = serde_json::Value::String(operator_mode.into());
@@ -4511,10 +5744,10 @@ async fn deploy_workload_spec(
                 // itself full the moment one build lands.
                 s.workload_resources.lock().unwrap().insert(
                     ident.clone(),
-                    node::WorkloadResources {
+                    Some(node::WorkloadResources {
                         memory_mb: spec.memory_request_mb(),
                         cpu_millis: spec.resources.cpu_millis,
-                    },
+                    }),
                 );
                 // R594-F6: publish the upstream-discovery record. This is the
                 // one moment yubaba holds both halves at once — the spec's
@@ -4599,6 +5832,220 @@ async fn deploy_workload_spec(
         .into_response()
 }
 
+/// What the runtime-free half of a deploy request decided (R892-B1).
+enum SpecCheck {
+    /// A container workload that parsed, shape-validated and cleared admission.
+    Container {
+        spec: Box<workload_spec::WorkloadSpec>,
+        grant: Option<workload_spec::admission::AdmissionGrant>,
+    },
+    /// A non-container envelope that parsed. Everything else a bundle needs is
+    /// decided inside [`deploy_non_container`], which owns state this function
+    /// deliberately does not touch.
+    NonContainer(Box<workload_spec::Workload>),
+    /// Refused — the response to hand back verbatim.
+    Refused(axum::response::Response),
+}
+
+/// Parse, shape-validate and admission-check a deploy body **without touching
+/// the runtime** (R892-B1).
+///
+/// Extracted so [`deploy_workload_spec`] and [`validate_workload_spec`] run the
+/// same code rather than two implementations of the same intent. That is the
+/// whole value of the validate route: a caller asks "would you accept this?"
+/// precisely because it is about to do something irreversible on the answer, so
+/// an answer produced by a parallel copy of these checks is worth nothing the
+/// moment the two drift — and drift between a client's schema and a node's is
+/// the failure this endpoint exists to catch.
+///
+/// Everything here is a pure function of the request body. The state-dependent
+/// refusals deploy can still raise afterwards (quorum, the appliance
+/// single-instance guard, a missing container-netns backend) stay in their
+/// handlers; validate reproduces the ones that are non-destructive to check,
+/// and says so in its own doc.
+fn check_deploy_body(spec_json: serde_json::Value) -> SpecCheck {
+    use axum::response::IntoResponse;
+
+    let rejected = |ident: &str, error: String| -> SpecCheck {
+        SpecCheck::Refused(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "status": "rejected",
+                    "ident": ident,
+                    "runtime": "stub",
+                    "error": error,
+                })),
+            )
+                .into_response(),
+        )
+    };
+
+    // R599-T5: the body carries either a full `Workload` envelope (externally
+    // tagged, e.g. `{"mesofact-static": {...}}`) or — the pre-migration shape
+    // every deployed client still sends — a bare `WorkloadSpec`, which means
+    // `Container`. The two are unambiguous: `Workload` is externally tagged, so
+    // a bare spec (many top-level keys) can never parse as one. Once the CLI
+    // and desktop are rolled onto the envelope form, drop the fallback.
+    let envelope: workload_spec::Workload =
+        match serde_json::from_value::<workload_spec::Workload>(spec_json.clone()) {
+            Ok(w) => w,
+            Err(envelope_err) => {
+                match serde_json::from_value::<workload_spec::WorkloadSpec>(spec_json) {
+                    Ok(spec) => workload_spec::Workload::container(spec),
+                    Err(spec_err) => {
+                        // R892-B1: this is the exact text a version-skewed
+                        // client sees, so it has to name the field. serde's
+                        // message does ("missing field `x`" / "unknown field
+                        // `x`"); keep both halves rather than summarising.
+                        return rejected(
+                            "",
+                            format!(
+                                "spec JSON parse error: not a Workload envelope ({envelope_err}) \
+                                 nor a bare WorkloadSpec ({spec_err})"
+                            ),
+                        );
+                    }
+                }
+            }
+        };
+
+    let spec = match envelope {
+        workload_spec::Workload::Container(manifest) => match manifest.into_spec() {
+            Ok(spec) => spec,
+            // R783-F1 / W324: `kind = "container"` also names a local
+            // Dockerfile RECIPE, which has no digest until it is built and so
+            // has nothing yubaba can admit. It cannot arrive over the postcard
+            // wire (the serializer refuses it), but this endpoint takes JSON.
+            Err(recipe) => {
+                return rejected(
+                    &recipe.name,
+                    "this is a local container BUILD RECIPE (a [build] table), not a \
+                     digest-pinned WorkloadSpec — build it first and deploy the lowered spec"
+                        .to_string(),
+                );
+            }
+        },
+        other => return SpecCheck::NonContainer(Box::new(other)),
+    };
+
+    if let Err(e) = workload_spec::validate::shape(&spec) {
+        let ident = spec.expose.mesh.identity.0.clone();
+        return rejected(&ident, format!("shape validation failed: {e}"));
+    }
+
+    // R555-F5: admission runs HERE, before anything is resolved on this spec's
+    // behalf — not only in kamaji, where F4 put it.
+    //
+    // Two reasons, and the first is the ticket. Secret resolution happens in
+    // yubaba (the KEK never leaves the node) and *precedes* the backend call, so
+    // a gate that lives only in kamaji sees the spec after the credentials have
+    // already been decrypted onto tmpfs, and sees `spec.secrets` emptied into
+    // binds — it is checking a document from which the thing it is meant to
+    // authorize has been erased. Second, and more mundane: a workload that will
+    // be refused should not first have a cluster secret decrypted for it.
+    //
+    // Same posture, same pinned keys, same env vars as kamaji — but yubaba and
+    // kamaji are separate units, so both need `YAH_ADMISSION_KEYS`. Under the
+    // default permissive policy an ungranted spec is untouched, which is every
+    // service on the fleet today.
+    let grant = match workload_spec::admission::check_grant(&spec) {
+        Ok(g) => g,
+        Err(e) => {
+            let ident = spec.expose.mesh.identity.0.clone();
+            return rejected(&ident, format!("workload not admitted: {e}"));
+        }
+    };
+
+    SpecCheck::Container {
+        spec: Box::new(spec),
+        grant,
+    }
+}
+
+/// `POST /workloads/validate` — would this node accept this spec? (R892-B1)
+///
+/// Runs [`check_deploy_body`] — the same parse, shape validation and admission
+/// check `POST /workloads/deploy` runs — and answers **without touching the
+/// runtime**: nothing is created, nothing is destroyed, no secret is resolved,
+/// no registry entry is written.
+///
+/// It exists because `yah cloud workload rolling` destroys the incumbent before
+/// it deploys the replacement, so on 2026-09-11 a CLI built after R885-T6
+/// deleted `ResourceLimits::ephemeral_storage_mb` tore down a live auth service
+/// and then got 422 `spec JSON parse error` from a node that still required the
+/// field. Nothing in the protocol let the client ask first, so the destructive
+/// step could not be made conditional on the constructive one succeeding.
+///
+/// Answers:
+///
+/// - `200 {"status": "validated", "ident": …}` — accepted.
+/// - `422 {"status": "rejected", …, "error": …}` — the identical body deploy
+///   would have returned, error text and all.
+/// - `503` — quorum is unavailable, so deploy would be refused before it read
+///   the spec. Checked here too: a roll that would fail on quorum should fail
+///   before the destroy, not after.
+/// - `404` from a node that predates this route. Callers MUST distinguish that
+///   from a rejection — it means "this node cannot answer", not "no".
+///
+/// What it deliberately does **not** promise: the state-dependent refusals that
+/// can only be judged at the moment of deploy — the appliance single-instance
+/// guard (which a rolling replace is *about* to clear by destroying the
+/// incumbent, so checking it here would refuse every legitimate roll), image
+/// presence in containerd, and whether the kamaji sibling is still reachable a
+/// second later. A `validated` answer means the node can *read and admit* this
+/// spec, which is exactly the class of failure that leaves an operator with
+/// nothing running.
+///
+/// @yah:ticket(R892-T2, "Ship yubaba to the fleet so POST /workloads/validate exists, then install the CLI")
+/// @yah:status(review)
+/// @yah:at(2026-09-13T07:39:45Z)
+/// @yah:assignee(agent:bundle-anthropic-miravel)
+/// @yah:parent(R892)
+/// @yah:next("Re-run the ticket's live bar afterwards, which only a real node can answer: point this CLI at a node and confirm a spec it cannot parse leaves the incumbent in GET /workloads and exits non-zero naming the field.")
+/// @yah:gotcha("R892-B1 landed the gate in the tree only. Until yubaba carries `POST /workloads/validate`, every fleet node answers 404 and `yah cloud workload rolling` refuses by design, naming --allow-unvalidated. Order matters: ship yubaba FIRST, install the CLI second, or the operator meets the refusal before the thing that satisfies it exists.")
+/// @yah:blocked_on(operator)
+/// @yah:handoff("Hot-shipped yubaba+kamaji 0.8.40-h2 to the dev raft group (us-west-011/013/014, operator's pick — quorum verified healthy before/after, leader 11 unchanged, follower noisetable-account-staging on 011 survived untouched). All three now answer POST /workloads/validate.")
+/// @yah:handoff("Installed the CLI to ~/.local/bin/yah via `cargo xtask install` (R892-B1's CLI-side rolling/validate code was already in the tree from a prior session; this ticket's job was purely getting yubaba+CLI onto real hardware).")
+/// @yah:handoff("Discovered work fixed in-pass, all outside any live peer's in-flight files: two missing `from_secret_mount` field sites in yubaba's own crate (headscale_appliance.rs:454, pond/launcher.rs:174) and one missing `secrets` field site (cloud/src/reconciler/mesofact_bundle.rs, yubaba/src/spec_redact.rs) left by R858-B26's/R876-B16's in-flight VolumeMount/MesofactRevalidateReceiver field additions — all were blocking yubaba's own build/test compile, none touched the owning peers' active edits (workload-spec crate was left alone while @Miravel:dove was live on it). Also fixed a missing `axum::response::Response` import in @Ashguard's in-flight R893-F18 mesh_rpo_series handler (lib.rs:3635) that was blocking the yubaba crate build — notified R893-F18 and the courier (sigil griffin) directly.")
+/// @yah:verify("Hermetic: `cargo test -p yubaba --lib` 905/905 pass post-fixes, including the 3 R892-B1 validate tests and all 7 http_auth::router_tests.")
+/// @yah:verify("Live, real fleet: `POST /workloads/validate` on us-west-013 (100.64.0.8) returns 422 for an unparseable body. Deployed a real throwaway native container workload (r892-t2-livebar) to us-west-013, then ran `yah cloud workload rolling r892-t2-livebar` for real — it refused with exit 1, destroyed nothing (incumbent's pid was unchanged in GET /workloads afterward), and named us-east-001 by name as the reason: that node still predates R892-B1 and answers 404 on /workloads/validate. This is the live bar the ticket asked for, encountered organically rather than staged — proof the destructive step is now genuinely gated on a real, currently-mixed fleet. Cleaned up: POST .../destroy on the throwaway workload, deleted its .yah/infra/workloads/ file, confirmed GET /workloads empty on us-west-013 again.")
+/// @yah:gotcha("us-east-001 (and us-south-001, us-west-001/002/003, us-west-015) still run pre-R892-B1 yubaba and 404 on /workloads/validate — `rolling` will refuse on any of them today unless `--allow-unvalidated` is passed. us-east-001's yubaba+kamaji ship is deliberately BATCHED with R876-B16 per that ticket's own operator-decision gotcha (paired `hotship.sh --nodes us-east-001 --binaries yubaba,kamaji`, tenant-visible restart on noisetable.com) — that batch is what will close the gap on the remaining nodes, not a repeat of this ticket.")
+async fn validate_workload_spec(
+    State(s): State<Arc<ServerState>>,
+    Json(req): Json<WorkloadDeployBody>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    if let Some(err_resp) = quorum_write_guard(&s) {
+        return err_resp;
+    }
+
+    match check_deploy_body(req.spec) {
+        SpecCheck::Container { spec, .. } => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "validated",
+                "ident": spec.expose.mesh.identity.0,
+                "kind": "container",
+                "runtime": s.workload_backend().map_or("stub", |b| b.name()),
+            })),
+        )
+            .into_response(),
+        SpecCheck::NonContainer(other) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "validated",
+                "ident": req.id.unwrap_or_default(),
+                "kind": other.kind_str(),
+                "runtime": "kamaji",
+            })),
+        )
+            .into_response(),
+        SpecCheck::Refused(resp) => resp,
+    }
+}
+
 /// `POST /workloads/{ident}/destroy` — tear down a workload and revoke its
 /// cheers ownership row (R427-F1).
 ///
@@ -4623,6 +6070,22 @@ async fn destroy_workload(
     if let Some(err_resp) = quorum_write_guard(&s) {
         return err_resp;
     }
+
+    // R880: same per-ident lock deploy takes — a destroy racing a deploy (or
+    // another destroy) of the same ident is exactly the interleaving R880
+    // exists to refuse rather than let land against the backend twice.
+    let Some(_deploy_lock) = ServerState::try_lock_deploy(&s, &ident) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "rejected",
+                "ident": ident,
+                "error": "a deploy or destroy of this workload is already in progress on this \
+                          node — retry once it completes rather than racing it",
+            })),
+        )
+            .into_response();
+    };
 
     let mesh_ident = workload_spec::MeshIdent(ident.clone());
     let mut teardown_status = "destroyed";
@@ -4656,7 +6119,22 @@ async fn destroy_workload(
     // kamaji-bin resolves it to the real container by its `yah.mesh-ident`
     // label. Deploy and destroy now enter the same process and agree about
     // which container backs an ident, instead of being two halves that didn't.
-    if let Some(rt) = &s.active_backend() {
+    //
+    // R881-B8: not refused when the sibling is missing — a destroy that cannot
+    // reach the process holding the container is exactly the split-brain above,
+    // but refusing it leaves an operator with no verb at all, and the inlined
+    // runtime is the right one on a node that never had a sibling. Logged
+    // instead, so the "destroyed" that follows a silent substitution is
+    // attributable rather than mysterious.
+    if let Some(backend) = s.workload_backend() {
+        if s.sibling_substituted(&backend) {
+            tracing::warn!(
+                ident = %ident,
+                "kamaji sibling unreachable — tearing down through the legacy \
+                 in-process runtime, which did not deploy this workload"
+            );
+        }
+        let rt = backend.into_runtime();
         match rt.teardown_workload(&mesh_ident).await {
             Ok(()) => {}
             Err(e) => {
@@ -4686,6 +6164,9 @@ async fn destroy_workload(
     // decrypted PEM does not outlive the container. Idempotent — a no-op when
     // the workload had no File secrets.
     crate::deploy::secret_mount::teardown_secret_dir(&s.secret_mount_root, &ident);
+    // R876-B16: reap the bundle/revalidate-receiver's native File secrets the
+    // same way — no-op when this ident never materialized any.
+    crate::deploy::secret_mount::teardown_native_secret_files(&s.secret_mount_root, &ident);
     // R600-F4: stop tracking it for cert-rotation reload (no-op if unregistered).
     s.secret_workloads.lock().unwrap().remove(&ident);
     // R572-F4: clear the archetype so a fresh deploy of the same ident is accepted.
@@ -5113,6 +6594,39 @@ struct DiagnosticsQuery {
 /// log so a failed `yah cloud machine provision --wait` can surface what
 /// went wrong without needing SSH. Always 200 — missing files yield empty
 /// strings rather than 404 (dev machines won't have them).
+///
+/// @yah:ticket(R893-F11, "yubaba GET /logs — bounded journalctl tail for an allow-listed unit set, OPERATOR class, off the fan-out")
+/// @yah:status(review)
+/// @yah:at(2026-09-13T08:10:14Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R893)
+/// @yah:next("Tier: Warrior — tricky implementation with a clear spec across two crates (an oss/ router + auth class + the shared cloud-client type), heavy integration, but no design left open.")
+/// @yah:next("ADD A NEW ROUTE, DO NOT EXTEND /diagnostics. `GET /logs?unit=<u>&lines=<n>` registered in the OPERATOR sub-router — the `let operator = Router::new()` block at oss/yubaba/crates/yubaba/src/lib.rs:2590, next to the existing `.route(\"/diagnostics\", get(get_diagnostics))` at :2622. Operator class, not peer: a unit journal is strictly more sensitive than a cloud-init log.")
+/// @yah:next("WHY NOT A FIELD ON DiagnosticsBody (this is the reason the ticket exists in this shape): probe_yubaba (crates/yah/fleet-metrics/src/lib.rs:975) calls client.diagnostics(None) unconditionally inside the seven-way tokio::join! at :1006, for every node on every fan-out, with no per-endpoint selector. A field added there is paid by every collect_live caller forever — including R893-F4's desktop wrapper. /logs must be fetched on demand and must NOT join that fan-out.")
+/// @yah:next("SHAPE, mirroring the existing precedent exactly: a pure helper (`read_unit_log(unit, lines) -> LogTailBody`) so tests can drive it without a real journald, the way `read_diagnostics` (:6068) / `read_tail` (:6087) already do. Clamp `lines` the way get_diagnostics does (default 200, clamp 1..=2000, :6057). ALLOW-LIST the unit — {kamaji, yubaba, yah-scryer} — and reject anything else with 400; never interpolate a caller string into the command. Spawn `journalctl -u <unit> -n <lines> --no-pager` with std::process::Command, which is established practice in this daemon (lib.rs:6166, :6187, :6505, leader.rs:1918). Return 200 with an `errors` vec on a journalctl failure rather than a 5xx, matching get_diagnostics's always-200 discipline.")
+/// @yah:next("FEASIBILITY IS CONFIRMED, not assumed: app/yah/cli/resources/yubaba.service declares no `User=` so yubaba runs as root, and ProtectSystem=strict (:245) makes the tree read-only while still permitting reads — which is how read_diagnostics already reads /var/log. Nothing new is needed in the unit.")
+/// @yah:next("CLIENT HALF: add `CloudClient::logs(unit, lines)` + a `LogTailBody` to crates/yah/cloud-client/src/lib.rs beside `diagnostics` (:1789) and `DiagnosticsBody` (:941). Do NOT add it to probe_yubaba. Note the body type is duplicated between yubaba and cloud-client today (lib.rs:6027 vs cloud-client:941) — follow that existing convention rather than introducing a shared crate in this ticket.")
+/// @yah:gotcha("An older yubaba 404s /logs. The caller must render that as \"this node's yubaba predates the route\", never as \"no logs\" — the same three-states-not-two discipline W346 §6 item 4 and R573-F7 already landed.")
+/// @arch:see(.yah/docs/working/W346-services-tab-three-views-and-the-tab-boundary.md)
+/// @yah:handoff("LANDED. Node half, oss/yubaba/crates/yubaba/src/lib.rs: `GET /logs` registered in the OPERATOR sub-router at :2632 (immediately after `.route(\"/diagnostics\", ...)` at :2626) — operator class comes from the existing `route_layer(AuthClass::Operator)` at :2700, no path table anywhere to update. Handler `get_logs` :6357, pure helper `read_unit_log(unit, lines) -> Option<LogTailBody>` :6384, `pub const LOG_UNITS: [&str; 3] = [\"kamaji\", \"yubaba\", \"yah-scryer\"]` :6311, `pub struct LogTailBody` :6315, private `LogTailQuery` :6332. NOT added to `probe_yubaba` and NOT a field on `DiagnosticsBody` — the fan-out is untouched.")
+/// @yah:handoff("WIRE SHAPE, verbatim, for R893-F12 to code against. `GET /logs?unit=<u>&lines=<n>`. `unit` is REQUIRED (no default; omitting it is axum's Query rejection = 400). `lines` optional, default 200, clamped 1..=2000 exactly as `get_diagnostics` does. Response `LogTailBody` has FOUR fields: `unit: String` (echoed, always one of LOG_UNITS), `log: String` (journalctl stdout, oldest line first), `lines: usize` (the CLAMPED value, so a caller sees 2000 back when it asked for 99999), `errors: Vec<String>` (`#[serde(default, skip_serializing_if = \"Vec::is_empty\")]` — ABSENT from the JSON when empty, so F12 must treat a missing key as an empty vec, not as a parse failure). No other keys.")
+/// @yah:handoff("STATUS CONTRACT. Exactly two statuses from a yubaba that HAS the route: 400 when `unit` is outside LOG_UNITS or absent, otherwise 200. The 400 body is `{\"error\": \"unit \\\"sshd\\\" is not readable through this route\", \"allowed\": [\"kamaji\",\"yubaba\",\"yah-scryer\"]}` — it names the allow-list so a caller can self-correct. A journalctl that is missing or exits non-zero is 200 with `errors` populated and `log` empty, matching get_diagnostics's always-200 discipline; never a 5xx.")
+/// @yah:handoff("ALLOW-LIST IS THE SECURITY BOUND AND IT LIVES IN THE HELPER, not the handler (:6385): `let unit: &'static str = LOG_UNITS.iter().copied().find(|u| *u == unit)?;` — the matched `&'static str` literal is what reaches `journalctl`, so the caller's String is compared and then dropped. Nothing is sanitised and nothing is interpolated; `journalctl` is spawned via `std::process::Command` with `.args([\"-u\", unit, \"-n\"]).arg(lines.to_string()).arg(\"--no-pager\")`, no shell. Tenant workload logs are deliberately NOT in the set — those stay at peer-class `GET /workloads/{ident}/logs` (:2526).")
+/// @yah:handoff("CLIENT HALF, crates/yah/cloud-client/src/lib.rs: `pub async fn CloudClient::logs(&self, unit: &str, lines: Option<usize>) -> Result<Option<LogTailBody>>` at :1936, beside `diagnostics` (:1893). `pub struct LogTailBody` :1007 and a mirrored `pub const LOG_UNITS` :997, both immediately after `DiagnosticsBody` (:982) — duplicated across the crate boundary per the existing convention, NOT a new shared crate. The mirrored const exists so a UI can render a unit picker without a round-trip; the node still refuses off-list units itself, so drift costs a 400 and never an unintended read. A drift guard test (`the_client_allow_list_matches_the_nodes`, :2994) asserts `LOG_UNITS == yubaba::LOG_UNITS`.")
+/// @yah:handoff("THE 404 IS A THIRD STATE AND THE CLIENT MODELS IT AS `Ok(None)` — the same shape `validate_workload` (:1694) and `workload_deploy_status` (:1733) already use, per W346 §6 item 4 / R573-F7. R893-F12 MUST branch three ways, and the doc comment at :1917-1934 spells it out: (1) `Ok(Some(b))` with `b.errors` empty -> `b.log` is the tail; an empty `log` here genuinely means the unit has logged nothing. (2) `Ok(Some(b))` with `b.errors` non-empty -> the node answered but could not read the journal (no journald, journalctl failed); render the error text, NOT \"no logs\". (3) `Ok(None)` -> the node 404'd, i.e. its yubaba predates /logs; render \"this node's yubaba predates /logs\", NEVER \"no logs\". Every fleet node is in state (3) until yubaba ships. A 400 stays an `Err(ClientError::UnexpectedStatus{status: 400, ..})` on purpose — that is a caller bug, not a node state, and collapsing it into `Ok(None)` would make it indistinguishable from an old node.")
+/// @yah:handoff("TESTS ADDED — 5 in yubaba (lib.rs :11314-11395): `read_unit_log_refuses_every_unit_outside_the_allow_list` (drives sshd, empty string, `yubaba; rm -rf /`, `kamaji.service`, `../kamaji`, `-u`, `--output=cat` — all must be None, refused not sanitised), `read_unit_log_reports_a_missing_journalctl_instead_of_panicking` (the dev-Mac path; asserts echoed fields hold, tail is bounded, and a non-empty `errors` implies an empty `log`), `logs_rejects_a_unit_outside_the_allow_list_with_400`, `logs_clamps_lines_and_still_answers_200_without_a_journal` (asserts body[\"lines\"] == 2000 for lines=99999), `logs_without_a_unit_param_is_a_400_not_a_default`. 4 in cloud-client (:2930-2996): `logs_round_trips_via_yubaba` (real yubaba router on an ephemeral port), `logs_refuses_a_unit_outside_the_allow_list_as_an_error`, `logs_reports_an_absent_route_as_a_node_that_predates_it` (empty `axum::Router::new()` = an older yubaba, asserts `Ok(None)`), `the_client_allow_list_matches_the_nodes`.")
+/// @yah:handoff("VERIFIED against a baseline measured on the same tree BEFORE any edit. `cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib`: baseline 905 passed / 0 failed -> after 910 passed / 0 failed (+5, exactly the new tests). `cargo test -p cloud-client`: baseline 48 passed / 0 failed + 1 doc-test -> after 52 passed / 0 failed + 1 doc-test (+4). Clippy: `cargo clippy --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib --all-targets` and `cargo clippy -p cloud-client --all-targets` both 0 errors, and grepping the diagnostics for my edited line ranges (lib.rs 6200-6399 / 11300-11399, cloud-client 900-3099) returns nothing — every warning in the output is pre-existing. NOTE the command form: `cargo test -p yubaba --lib` from the repo root fails with \"not a member of the workspace\" because oss/yubaba is excluded from the root workspace; that is not a test failure.")
+/// @yah:handoff("NO DISCOVERED WORK TO REPORT — no broken call site, stale test or disproved doc comment was found in the blast radius, so nothing extra was fixed and nothing was filed as a followup. Two things checked and deliberately left alone: `http_auth.rs:29`'s operator-class table lists example routes (\"e.g.\" style, not an inventory) so it is not made stale by a new one; and W346 §6's \"`journalctl -u kamaji` is out of scope\" paragraph is that relay's own scope statement recording why this was split out as R893-F11, not a claim this change disproves. No route-inventory test, OpenAPI doc or surface hash exists for yubaba (checked: `\"/diagnostics\"` appears only at lib.rs:2626 and as a comment in fleet-metrics/src/lib.rs:1641), so there is nothing to regenerate. No unit-file change was needed, as the ticket predicted.")
+/// @yah:handoff("SHARED TREE: @Miravel:libra (session:592a7b04, R876) confirmed by name that their oss/yubaba lib.rs edits are `build_secret_resolver` (~L4466-4530), `deploy_non_container`'s native-secret block (~L4394-4432) and a small `destroy_workload` addition (~L5730) — no overlap with this footprint, and they gave the go-ahead before I edited. My hunks are purely additive: one route line, one ~120-line block before `// ── Service management (R040-F7) ──`, one test block before `// ── Rollout API tests (R278-F1) ──`. Nothing was reflowed, reformatted or reorganised, no git write verb was used, and the repo has no rustfmt.toml and no fmt step in `.yah/qed/yah-check.toml`, so no `cargo fmt` was run (formatting was checked read-only with `rustfmt --check` and the pre-existing diffs it reports are repo-wide, not mine).")
+/// @yah:handoff("Tree anchor at handoff: e0530813af8f7d86f5eb7ea9a6b5a57d386bf30b — the shared tree as I left it. Diff against it (`git diff e0530813af8f7d86f5eb7ea9a6b5a57d386bf30b..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+/// @yah:next("R893-F12 (desktop `machine_logs` command + panel) is unblocked and should code against the LogTailBody shape and the three-state contract recorded in this ticket's handoff — in particular: `errors` is absent from the JSON when empty, `lines` comes back CLAMPED, and `CloudClient::logs` returns `Ok(None)` for the predates-the-route 404 which must NOT render as \"no logs\".")
+/// @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib  (910 passed / 0 failed; baseline before this change was 905/0)")
+/// @yah:verify("cargo test -p cloud-client  (52 passed / 0 failed + 1 doc-test; baseline before this change was 48/0 + 1)")
+/// @yah:verify("cargo clippy --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib --all-targets  (0 errors, 0 new warnings in the edited ranges)")
+/// @yah:verify("cargo clippy -p cloud-client --all-targets  (0 errors, 0 new warnings)")
+/// @yah:handoff("LEADER SIGN-OFF (relay R893, @Ashguard:polaris). Accepted. The security bound is in the right place and was checked, not assumed: the allow-list lives in the pure helper (lib.rs:6385) and rebinds to the matched &'static str literal before spawning, so the caller's String is compared and dropped rather than sanitised, and journalctl is spawned via std::process::Command with no shell. The adversarial unit cases in read_unit_log_refuses_every_unit_outside_the_allow_list (sshd, empty string, `yubaba; rm -rf /`, `kamaji.service`, `../kamaji`, `-u`, `--output=cat`) all assert refusal rather than sanitisation, which is the correct posture. R893-F12 was dispatched against the wire shape recorded here and did not have to re-derive any of it -- that is what a good contract entry buys.")
+/// @yah:verify("THE CONSTRAINT NO TEST WOULD HAVE CAUGHT, checked separately and by grep because a green suite proves nothing about it: /logs did NOT join the per-node fan-out. crates/yah/fleet-metrics/src/lib.rs probe_yubaba (fn at :975) still has no `logs` reference, and its tokio::join! at :1006 still has exactly the same seven arms -- health, identity, list_workloads, diagnostics, raft_status, node, node_usage -- closing before :1036. The only `logs` in that file is the pre-existing fetch_workload_logs at :1049 (the peer-class GET /workloads/{ident}/logs), which predates this ticket and is deliberately outside the fan-out. This was the ticket's central reason for existing in this shape, so it is recorded as its own verify line.")
+/// @yah:verify("RE-VERIFIED BY THE LEADER, not taken on the courier's self-report: an independent read-only session (@Ashguard:coffee, session:8fad32f0) re-ran all four gates. cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib 910 pass / 0 fail (baseline 905, +5 all named and all this ticket's); cargo test -p cloud-client 52 pass / 0 fail + 1 doc-test (baseline 48 + 1, the 4 new tests present by name); yubaba clippy 0 errors with every remaining lib.rs warning at :4532 / :8964 / :8991 / :9107, far from this ticket's sites (route :2632, LOG_UNITS :6327, LogTailBody :6331, read_unit_log :6400, tests :11333+); cloud-client clippy 0 errors, cloud-client itself clean. The two warnings that do appear are peer contention, not this ticket: deploy/secret_mount.rs:972 is R876, and an unused parse_list_v2 at oss/yah-base/crates/object-store/src/r2.rs:625 is unrelated to cloud-client entirely.")
 async fn get_diagnostics(
     axum::extract::Query(q): axum::extract::Query<DiagnosticsQuery>,
 ) -> impl IntoResponse {
@@ -5161,134 +6675,122 @@ fn read_tail(path: &std::path::Path, n: usize, errors: &mut Vec<String>) -> Stri
     }
 }
 
-// ── Service management (R040-F7) ────────────────────────────────────────────
+// ── Unit journal tail (R893-F11) ─────────────────────────────────────────────
 
-/// `POST /compose` request — push a new compose bundle to the machine.
+/// The systemd units `GET /logs` will read, and the only ones it will read.
+///
+/// This is an ALLOW-LIST, not a sanitiser. `unit` arrives from a caller and
+/// ends up as an argv element of a spawned process, so the only discipline
+/// that holds is to refuse everything not named here — see
+/// [`read_unit_log`], which returns the matched `&'static str` rather than
+/// the caller's string so what is spawned is provably one of these literals.
+///
+/// The set is the yah control plane on a node: kamaji (the supervisor),
+/// yubaba (this daemon) and yah-scryer. A tenant workload's logs are NOT
+/// here — those are `GET /workloads/{ident}/logs`, which is peer class and
+/// goes through the runtime rather than the host journal.
+pub const LOG_UNITS: [&str; 3] = ["kamaji", "yubaba", "yah-scryer"];
+
+/// `GET /logs` response body — last N journal lines of one allow-listed unit.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct LogTailBody {
+    /// The unit that was read — always one of [`LOG_UNITS`], echoed so a
+    /// caller holding several responses can tell them apart.
+    pub unit: String,
+    /// `journalctl`'s stdout: up to `lines` lines, oldest first. Empty when
+    /// the read failed (see `errors`) or the unit has never logged.
+    pub log: String,
+    /// How many lines were requested (matches the `lines` query param;
+    /// default 200, clamped 1..=2000).
+    pub lines: usize,
+    /// Why `log` is empty, when it is empty for a reason. A host with no
+    /// journald at all (any dev Mac) lands here rather than 5xx-ing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
 #[derive(Deserialize)]
-pub struct ComposeDeployRequest {
-    /// Podman Compose YAML to write as `compose.yml`.
-    pub compose_yaml: String,
-    /// Optional Caddyfile for public services; omitted when all are mesh-only.
-    pub caddyfile: Option<String>,
-    /// Shell commands to run after writing files (R040-F16: ufw rules for
-    /// services with `bind_interface` set). Each is executed via `sh -c`.
-    /// Failures are logged but don't abort the deploy.
+struct LogTailQuery {
+    /// Which unit to tail. Required; must be in [`LOG_UNITS`].
+    unit: String,
+    /// Last N journal lines (default 200; clamped to 1..=2000).
     #[serde(default)]
-    pub firewall_cmds: Vec<String>,
+    lines: Option<usize>,
 }
 
-/// `POST /compose` response.
-#[derive(Serialize)]
-pub struct ComposeDeployResponse {
-    /// `"started"` | `"restarted"` | `"files-written-systemd-unavailable"`
-    pub status: String,
+/// `GET /logs?unit=<u>&lines=<n>` — last N journal lines of one allow-listed
+/// unit, so an operator can read why kamaji or yubaba is unhappy on a node
+/// without SSH.
+///
+/// Operator class, not peer: a unit journal carries argv, env names, secret
+/// *references* and tenant identifiers, which is strictly more than the
+/// cloud-init log `/diagnostics` hands out.
+///
+/// Deliberately NOT a field on [`DiagnosticsBody`] and deliberately NOT part
+/// of the fleet fan-out: `fleet_metrics::probe_yubaba` calls `diagnostics`
+/// unconditionally for every node on every `collect_live`, with no
+/// per-endpoint selector, so anything added there is paid by every caller
+/// forever. This route is fetched on demand or not at all.
+///
+/// Two statuses only: 400 for a unit outside the allow-list, and otherwise
+/// 200 — a journalctl that is missing or fails yields an `errors` entry, the
+/// same always-200 discipline [`get_diagnostics`] keeps.
+async fn get_logs(
+    axum::extract::Query(q): axum::extract::Query<LogTailQuery>,
+) -> impl IntoResponse {
+    let lines = q.lines.unwrap_or(200).clamp(1, 2_000);
+    match read_unit_log(&q.unit, lines) {
+        Some(body) => (StatusCode::OK, Json(body)).into_response(),
+        None => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("unit {:?} is not readable through this route", q.unit),
+                "allowed": LOG_UNITS,
+            })),
+        )
+            .into_response(),
+    }
 }
 
-async fn deploy_compose(
-    State(s): State<Arc<ServerState>>,
-    Json(req): Json<ComposeDeployRequest>,
-) -> Result<Json<ComposeDeployResponse>, (StatusCode, String)> {
-    let dir = &s.compose_dir;
-    std::fs::create_dir_all(dir).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("mkdir {}: {e}", dir.display()),
-        )
-    })?;
-
-    std::fs::write(dir.join("compose.yml"), &req.compose_yaml).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("write compose.yml: {e}"),
-        )
-    })?;
-
-    if let Some(cf) = &req.caddyfile {
-        std::fs::write(dir.join("Caddyfile"), cf).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("write Caddyfile: {e}"),
-            )
-        })?;
-    }
-
-    // Reconcile the systemd unit to what this binary generates, on every deploy.
-    // It used to be written only when absent, which meant a node that took the
-    // unit once kept it forever — a corrected directive could never reach a
-    // machine that had already been deployed to, and the only way to find out
-    // was to read the unit on the box. Same failure shape as the headscale unit
-    // in `write_and_start_headscale_unit`: the fix lands in the generator and
-    // the fleet never sees it. Written only when the text actually differs, so
-    // the common redeploy still skips the `daemon-reload`.
-    let unit_path = format!("/etc/systemd/system/{COMPOSE_UNIT}.service");
-    let unit = compose_unit_text(dir);
-    let current = std::fs::read_to_string(&unit_path).unwrap_or_default();
-    if current != unit {
-        let _ = std::fs::write(&unit_path, unit);
-        let _ = std::process::Command::new("systemctl")
-            .args(["daemon-reload"])
-            .status();
-    }
-
-    // Apply firewall rules for mesh-bound services (R040-F16). Run before
-    // starting the compose stack so ports are protected on first activation.
-    // Failures are logged but do NOT abort the deploy — ufw may not be
-    // installed on dev machines or in CI.
-    for cmd in &req.firewall_cmds {
-        let result = std::process::Command::new("sh").args(["-c", cmd]).status();
-        match result {
-            Ok(s) if s.success() => {}
-            Ok(s) => tracing::warn!(cmd, exit = ?s.code(), "firewall_cmd exited non-zero"),
-            Err(e) => tracing::warn!(cmd, err = %e, "firewall_cmd spawn failed"),
+/// Tail one unit's journal. Pure-function helper in the same sense as
+/// [`read_diagnostics`]: it returns the body rather than a response, so a
+/// test can drive it — including on a host with no journald, where it must
+/// report the failure in `errors` instead of panicking or 5xx-ing.
+///
+/// `None` means `unit` is not in [`LOG_UNITS`]; the caller turns that into a
+/// 400. The check is here rather than in the handler on purpose — it is the
+/// security bound, so it belongs with the spawn it guards. Note the rebind:
+/// the `&'static str` that matched is what gets passed to `journalctl`, so
+/// the caller's string is compared and then dropped, never interpolated.
+fn read_unit_log(unit: &str, lines: usize) -> Option<LogTailBody> {
+    let unit: &'static str = LOG_UNITS.iter().copied().find(|u| *u == unit)?;
+    let mut errors = Vec::new();
+    let log = match std::process::Command::new("journalctl")
+        .args(["-u", unit, "-n"])
+        .arg(lines.to_string())
+        .arg("--no-pager")
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Ok(out) => {
+            errors.push(format!(
+                "journalctl -u {unit} exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+            String::new()
         }
-    }
-
-    // Enable + (re)start. On non-systemd hosts (dev machines, CI) this will
-    // fail — files are written regardless, so the compose stack can be started
-    // manually with `podman compose up -d`.
-    let svc_ok = std::process::Command::new("systemctl")
-        .args(["enable", "--now", COMPOSE_UNIT])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-
-    if !svc_ok {
-        // Maybe it was already enabled; try a restart.
-        let _ = std::process::Command::new("systemctl")
-            .args(["restart", COMPOSE_UNIT])
-            .status();
-    }
-
-    let status = if svc_ok {
-        "started"
-    } else {
-        "files-written-systemd-unavailable"
+        Err(e) => {
+            errors.push(format!("spawning journalctl -u {unit}: {e}"));
+            String::new()
+        }
     };
-    Ok(Json(ComposeDeployResponse {
-        status: status.into(),
-    }))
-}
-
-/// The `yah-cloud-services.service` unit text, split out of [`deploy_compose`]
-/// so it is assertable without a systemd host — `/etc/systemd/system` is not
-/// writable in a test. Mirrors [`headscale_unit_text`].
-fn compose_unit_text(dir: &std::path::Path) -> String {
-    format!(
-        "[Unit]\n\
-         Description=yah-cloud managed services (Podman Compose)\n\
-         After=network-online.target\n\
-         \n\
-         [Service]\n\
-         WorkingDirectory={dir}\n\
-         ExecStart=/usr/bin/podman compose up\n\
-         ExecStop=/usr/bin/podman compose down\n\
-         Restart=on-failure\n\
-         RestartSec=10\n\
-         \n\
-         [Install]\n\
-         WantedBy=multi-user.target\n",
-        dir = dir.display(),
-    )
+    Some(LogTailBody {
+        unit: unit.to_string(),
+        log,
+        lines,
+        errors,
+    })
 }
 
 /// W264 §Discovery service-entry — what yubaba advertises at `GET /services`.
@@ -6318,28 +7820,270 @@ async fn raft_transfer_leader_msg(
 /// Backs `yah cloud secret ls`, and is how an operator confirms a rule actually
 /// landed on the fleet rather than only in the camp's declaration file.
 async fn list_secrets(State(s): State<Arc<ServerState>>) -> impl IntoResponse {
-    let Some(sm) = &s.cluster_state else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": "this node is not part of a raft cluster (no cluster state)",
-            })),
-        )
-            .into_response();
+    // R911-F3: served from the fleet object store, same JSON shape as the raft
+    // index it replaces. A node with no store answers 503 naming the missing
+    // rail — never an empty list, which would read as a fleet with zero secrets.
+    let store = match node_secret_store(&s) {
+        Ok(store) => store,
+        Err(resp) => return resp,
     };
-    let secrets: Vec<serde_json::Value> = sm
-        .cluster_secret_index()
+    let rows = match crate::fleet_secrets::off_runtime(move || store.index()).await {
+        Ok(rows) => rows,
+        Err(e) => return secret_store_unavailable(&e),
+    };
+    let secrets: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(name, updated_at, access, digest)| {
+        .map(|row| {
             serde_json::json!({
-                "name": name,
-                "updated_at": updated_at,
-                "access": access,
-                "digest": digest,
+                "name": row.name,
+                "updated_at": row.updated_at,
+                "access": row.access,
+                "digest": row.digest,
             })
         })
         .collect();
     Json(serde_json::json!({ "secrets": secrets })).into_response()
+}
+
+/// This node's fleet secret store, or the 503 naming the rail it lacks
+/// (R911-F3).
+fn node_secret_store(
+    s: &ServerState,
+) -> Result<crate::fleet_secrets::FleetSecretStore, axum::response::Response> {
+    crate::fleet_secrets::FleetSecretStore::for_node(s).map_err(|rail| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": format!("this node has no fleet secret store: {rail}"),
+            })),
+        )
+            .into_response()
+    })
+}
+
+/// A store verb failed: the bucket, not the request. 503, so a caller retries
+/// or picks another node rather than reading it as "no such secret".
+fn secret_store_unavailable(e: &crate::secrets::SecretStoreError) -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": format!("the fleet secret store could not be used: {e}"),
+        })),
+    )
+        .into_response()
+}
+
+/// The 400 for a name the secret write routes refuse, or `None` if it is
+/// writable (R911-F3).
+///
+/// `tls/*` is refused outright: those records are issued by the fleet ACME
+/// issuer into `certs/<issuer>/`, and a camp-originated write there is not a
+/// thing this path does. Every other name gets exactly the rules
+/// [`fleet_secrets::FleetSecretStore`] applies, checked before any store is
+/// touched.
+fn refuse_unwritable_secret_name(name: &str) -> Option<axum::response::Response> {
+    let reason = if name.starts_with("tls/") {
+        format!(
+            "{name:?} is per-domain TLS material issued by the fleet ACME issuer; it cannot be \
+             written or deleted through /secrets"
+        )
+    } else {
+        match crate::fleet_secrets::validate_secret_name(name) {
+            Ok(()) => return None,
+            Err(e) => e.to_string(),
+        }
+    };
+    Some((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": reason }))).into_response())
+}
+
+/// `PUT /secrets/{*name}` request body (R911-F3): a sealed record, sealed by
+/// the camp under the cluster KEK. Plaintext never reaches the node.
+///
+/// `deny_unknown_fields` and no `sans`/`ari`: those are stamped only by an
+/// issuer from a chain a CA returned, and a camp write has no business claiming
+/// them. `access` is required — a record without a rule is refused at the
+/// door rather than landing as deny-all.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutSecretBody {
+    /// AES-256-GCM output with the tag appended.
+    pub ciphertext: Vec<u8>,
+    /// The 12-byte GCM nonce.
+    pub nonce: Vec<u8>,
+    /// Writer-stamped unix seconds.
+    pub updated_at: u64,
+    /// Which workloads may be served this secret.
+    pub access: workload_spec::secrets::SecretAccess,
+    /// Keyed digest of the plaintext (R720-F1), when the writer computed one.
+    #[serde(default)]
+    pub digest: Option<Vec<u8>>,
+}
+
+/// `PUT /secrets/{*name}` — write a sealed cluster secret into the fleet object
+/// store through this node (R911-F3). Overwrites.
+async fn put_secret(
+    State(s): State<Arc<ServerState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    Json(body): Json<PutSecretBody>,
+) -> axum::response::Response {
+    if let Some(refusal) = refuse_unwritable_secret_name(&name) {
+        return refusal;
+    }
+    if body.nonce.len() != 12 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "nonce is {} bytes; an AES-256-GCM nonce is 12, and a record with any other \
+                     length could never be opened",
+                    body.nonce.len()
+                ),
+            })),
+        )
+            .into_response();
+    }
+    let store = match node_secret_store(&s) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let rec = raft::SecretRecord {
+        ciphertext: body.ciphertext,
+        nonce: body.nonce,
+        updated_at: body.updated_at,
+        access: body.access,
+        digest: body.digest,
+        sans: None,
+        ari: None,
+    };
+    let written = {
+        let name = name.clone();
+        crate::fleet_secrets::off_runtime(move || store.write_secret(&name, &rec)).await
+    };
+    match written {
+        Ok(()) => Json(serde_json::json!({ "name": name })).into_response(),
+        Err(e) => secret_store_unavailable(&e),
+    }
+}
+
+/// `DELETE /secrets/{*name}` — remove a cluster secret from the fleet object
+/// store through this node (R911-F3). Idempotent. Does not stop a workload that
+/// already has the value mounted.
+async fn delete_secret(
+    State(s): State<Arc<ServerState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> axum::response::Response {
+    if let Some(refusal) = refuse_unwritable_secret_name(&name) {
+        return refusal;
+    }
+    let store = match node_secret_store(&s) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let deleted = {
+        let name = name.clone();
+        crate::fleet_secrets::off_runtime(move || store.delete_secret(&name)).await
+    };
+    match deleted {
+        Ok(()) => Json(serde_json::json!({ "name": name })).into_response(),
+        Err(e) => secret_store_unavailable(&e),
+    }
+}
+
+/// This node's cert store, or the 503 that says it has none.
+fn enrollment_store(
+    s: &ServerState,
+) -> Result<std::sync::Arc<cert_store::ObjectCertStore>, axum::response::Response> {
+    s.cert_store.clone().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "this node has no cert store (YUBABA_CERT_STORE_BUCKET is unset), so \
+                          it cannot read or write the enrollment set",
+            })),
+        )
+            .into_response()
+    })
+}
+
+/// A cert-store error as the status an operator can act on.
+fn enrollment_refusal(e: &cert_store::CertStoreError) -> axum::response::Response {
+    use cert_store::CertStoreError as E;
+    let status = match e {
+        E::InvalidDomain { .. } | E::InvalidEnrollment { .. } => StatusCode::BAD_REQUEST,
+        E::BackendTaken { .. } | E::AlreadyEnrolled { .. } => StatusCode::CONFLICT,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+}
+
+/// `GET /domains/{domain}/enrollment` — one record, for `apply` to diff (R910-F2).
+async fn get_enrollment(
+    State(s): State<Arc<ServerState>>,
+    axum::extract::Path(domain): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let store = match enrollment_store(&s) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let lookup = domain.clone();
+    match crate::fleet_secrets::off_runtime(move || store.enrollment(&lookup)).await {
+        Ok(Some(record)) => Json(record).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("{domain} is not enrolled") })),
+        )
+            .into_response(),
+        Err(e) => enrollment_refusal(&e),
+    }
+}
+
+/// `PUT /domains/{domain}/enrollment` — make the record exactly the body,
+/// through [`cert_store::ObjectCertStore::declare_enrollment`] (R910-F2).
+/// Answers `{domain, declared: created|unchanged|replaced, previous}`.
+async fn put_enrollment(
+    State(s): State<Arc<ServerState>>,
+    axum::extract::Path(domain): axum::extract::Path<String>,
+    Json(body): Json<cert_store::Enrollment>,
+) -> axum::response::Response {
+    let store = match enrollment_store(&s) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let target = domain.clone();
+    match crate::fleet_secrets::off_runtime(move || store.declare_enrollment(&target, &body)).await
+    {
+        Ok(declared) => {
+            let (word, previous) = match declared {
+                cert_store::Declared::Created => ("created", None),
+                cert_store::Declared::Unchanged => ("unchanged", None),
+                cert_store::Declared::Replaced(prev) => ("replaced", Some(prev)),
+            };
+            Json(serde_json::json!({
+                "domain": domain,
+                "declared": word,
+                "previous": previous,
+            }))
+            .into_response()
+        }
+        Err(e) => enrollment_refusal(&e),
+    }
+}
+
+/// `DELETE /domains/{domain}/enrollment` — unenroll (R910-F2). Idempotent;
+/// leaves the cert material in place, as `yubaba domain unenroll` does.
+async fn delete_enrollment(
+    State(s): State<Arc<ServerState>>,
+    axum::extract::Path(domain): axum::extract::Path<String>,
+) -> axum::response::Response {
+    let store = match enrollment_store(&s) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let target = domain.clone();
+    match crate::fleet_secrets::off_runtime(move || store.unenroll(&target)).await {
+        Ok(()) => Json(serde_json::json!({ "domain": domain })).into_response(),
+        Err(e) => enrollment_refusal(&e),
+    }
 }
 
 /// `GET /cluster/singletons` — who owns each singleton role, read from this
@@ -6937,19 +8681,21 @@ async fn raft_add_learner(
     // `MembershipRatchet::vets_joiner_lineage`.
     //
     // The joiner is ASKED, not believed, exactly as the sovereign-group gate
-    // above asks it: see `membership_ratchet::ask_origin` for why this is not a
-    // request-body field.
+    // above asks it: see `membership_ratchet::OriginSource` for why this is not
+    // a request-body field, and why the fetch is a port this crate implements
+    // (`origin_source::HttpOriginSource`) rather than a function consensus owns.
     let origin_judged = if s.cluster_policy.membership_ratchet.vets_joiner_lineage() {
-        let local = membership_ratchet::LocalLineage {
-            cluster_protocol: cluster_epoch::CLUSTER_PROTOCOL,
-            state_epoch: cluster_epoch::STATE_EPOCH,
-            current_term: raft.metrics().borrow_watched().current_term,
-        };
+        let local = origin_source::build_epochs()
+            .lineage(raft.metrics().borrow_watched().current_term);
         // 502, not 409, and the distinction is the same one the sovereign gate
         // draws: "the box did not answer" and "the box answered, from the wrong
         // cluster" call for different operator actions. Unreachable is
         // retryable; a foreign incarnation is not.
-        let asked = membership_ratchet::ask_origin(&body.addr).await.map_err(|e| {
+        let asked = {
+            use membership_ratchet::OriginSource as _;
+            origin_source::HttpOriginSource.ask_origin(&body.addr).await
+        }
+        .map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
                 format!(
@@ -7382,6 +9128,12 @@ async fn raft_remove_member(
     })))
 }
 
+/// What `/raft/write` answers a `PutSecret` or `DeleteSecret` (R911-F3): an old
+/// CLI still shipping cluster secrets through raft. The variants stay decodable
+/// for log replay; nothing may write them any more.
+pub const RAFT_SECRET_WRITE_REFUSAL: &str = "cluster secrets moved to the fleet object store \
+     (R911): upgrade yah — `yah cloud secret put`/`rm` now go through PUT/DELETE /secrets/{name}";
+
 /// `POST /raft/write` request — write a [`raft::YubabaRequest`] through consensus.
 #[derive(Deserialize)]
 struct RaftWriteRequest {
@@ -7396,6 +9148,14 @@ async fn raft_write(
     State(s): State<Arc<ServerState>>,
     Json(body): Json<RaftWriteRequest>,
 ) -> Result<Json<raft::YubabaResponse>, (StatusCode, String)> {
+    // R911-F3: checked before the raft precondition, so an old CLI gets the
+    // upgrade message from any node, raft member or not.
+    if matches!(
+        body.request,
+        raft::YubabaRequest::PutSecret { .. } | raft::YubabaRequest::DeleteSecret { .. }
+    ) {
+        return Err((StatusCode::GONE, RAFT_SECRET_WRITE_REFUSAL.to_string()));
+    }
     let raft = require_raft!(s);
     let resp = raft
         .client_write(body.request)
@@ -7559,8 +9319,6 @@ struct SelfUpdateBody {
     version: String,
     url: String,
     sha256: String,
-    #[serde(default)]
-    operator_signature: Option<String>,
 }
 
 /// Build the `systemd-run` argv (after the program name) that runs the install
@@ -7606,14 +9364,12 @@ async fn self_update(
         return err_resp;
     }
 
-    if req.operator_signature.is_none() {
-        // Same posture as deploy_workload_spec: warn now, enforce with R044.
-        tracing::warn!(
-            version = %req.version,
-            "self-update received without operator signature \
-             (unsigned accepted until R044 key vault enforces rejection)"
-        );
-    }
+    // R876-B15: the quorum gate above proves a leader exists, not that the
+    // caller is allowed to swap this node's own binary. That second question
+    // is `http_auth::AuthClass::Operator` on this route in `build_router` —
+    // the strictest class on the surface, and deliberately closed to a peer
+    // token, so compromising one node does not let it order its peers to
+    // reinstall themselves.
 
     // Same trusted builder the SSH path uses; sudo=false because the transient
     // unit runs as root. Integrity is the manifest sha256 the script verifies.
@@ -7734,16 +9490,7 @@ async fn commit_rollout(
         )
             .into_response());
     };
-    let client = reqwest::Client::builder()
-        .timeout(raft::FORWARD_TIMEOUT)
-        .build()
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("building HTTP client: {e}") })),
-            )
-                .into_response()
-        })?;
+    let client = s.http.clone();
     rollout::commit_guarded(raft, sm, rollout_id, Some(&client), intent)
         .await
         .map_err(|e| {
@@ -8023,19 +9770,7 @@ async fn report_boot_health(
         )
             .into_response();
     };
-    let client = match reqwest::Client::builder()
-        .timeout(raft::FORWARD_TIMEOUT)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("building HTTP client: {e}") })),
-            )
-                .into_response()
-        }
-    };
+    let client = s.http.clone();
 
     let reported_at = rollout::now_unix_secs();
     let mut reports = Vec::new();
@@ -8166,19 +9901,7 @@ async fn report_peer_liveness(
         )
             .into_response();
     };
-    let client = match reqwest::Client::builder()
-        .timeout(raft::FORWARD_TIMEOUT)
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("building HTTP client: {e}") })),
-            )
-                .into_response()
-        }
-    };
+    let client = s.http.clone();
 
     let observed_at = rollout::now_unix_secs();
     let mut reports = Vec::new();
@@ -8269,6 +9992,212 @@ mod tests {
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // ── R911-F3: the node-mediated cluster-secret write path ─────────────────
+
+    const R911_LE: &str = "https://acme-v02.api.letsencrypt.org/directory";
+
+    fn state_with_fleet_store(
+        group: Option<&str>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<ServerState>,
+        Arc<yah_object_store::InMemoryObjectStore>,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mem = Arc::new(yah_object_store::InMemoryObjectStore::new());
+        let mut state = ServerState::load(tmp.path().join("identity.json"))
+            .unwrap()
+            .with_cert_store(cert_store::ObjectCertStore::new(mem.clone(), R911_LE));
+        if let Some(group) = group {
+            state = state.with_sovereign_group(group);
+        }
+        (tmp, Arc::new(state), mem)
+    }
+
+    fn secret_put(name: &str, body: serde_json::Value) -> Request<Body> {
+        Request::put(format!("/secrets/{name}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn secret_delete(name: &str) -> Request<Body> {
+        Request::delete(format!("/secrets/{name}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn sealed_body(digest: &[u8]) -> serde_json::Value {
+        serde_json::json!({
+            "ciphertext": [1, 2, 3],
+            "nonce": vec![0u8; 12],
+            "updated_at": 42,
+            "access": workload_spec::secrets::SecretAccess::workloads(["noisetable-account"]),
+            "digest": digest,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_put_secret_is_listed_with_its_digest_and_never_its_bytes() {
+        use yah_object_store::ObjectStore as _;
+        let (_tmp, state, mem) = state_with_fleet_store(Some("prod"));
+
+        let resp = build_router(state.clone())
+            .oneshot(secret_put(
+                "noisetable/account/session-key",
+                sealed_body(&[0xab, 0xcd]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            mem.get("secrets/prod/noisetable/account/session-key.sealed")
+                .unwrap()
+                .is_some(),
+            "the record lands under this node's sovereign group"
+        );
+
+        let resp = build_router(state)
+            .oneshot(Request::get("/secrets").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let rows = body["secrets"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = rows[0].as_object().unwrap();
+        assert_eq!(row["name"], "noisetable/account/session-key");
+        assert_eq!(row["updated_at"], 42);
+        assert_eq!(row["digest"], "abcd");
+        let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["access", "digest", "name", "updated_at"],
+            "metadata only — no ciphertext or nonce on the index"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deleted_secret_leaves_the_index() {
+        let (_tmp, state, _mem) = state_with_fleet_store(Some("prod"));
+        let resp = build_router(state.clone())
+            .oneshot(secret_put("cf/dns-token", sealed_body(&[1])))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        for _ in 0..2 {
+            let resp = build_router(state.clone())
+                .oneshot(secret_delete("cf/dns-token"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "delete is idempotent");
+        }
+
+        let resp = build_router(state)
+            .oneshot(Request::get("/secrets").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["secrets"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn tls_and_malformed_names_and_bad_nonces_are_refused_before_the_store() {
+        let (_tmp, state, mem) = state_with_fleet_store(Some("prod"));
+        for name in ["tls/yah.dev/cert", "tls/yah.dev/key", "a/../b", "a/./b", "a//b"] {
+            let resp = build_router(state.clone())
+                .oneshot(secret_put(name, sealed_body(&[1])))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "PUT {name}");
+            let resp = build_router(state.clone())
+                .oneshot(secret_delete(name))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "DELETE {name}");
+        }
+
+        let mut short_nonce = sealed_body(&[1]);
+        short_nonce["nonce"] = serde_json::json!([0, 1]);
+        let resp = build_router(state.clone())
+            .oneshot(secret_put("x/y", short_nonce))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // A camp body may not claim issuer-only metadata.
+        let mut with_sans = sealed_body(&[1]);
+        with_sans["sans"] = serde_json::json!(["yah.dev"]);
+        let resp = build_router(state)
+            .oneshot(secret_put("x/y", with_sans))
+            .await
+            .unwrap();
+        assert!(resp.status().is_client_error(), "got {}", resp.status());
+
+        assert!(mem.keys().is_empty(), "nothing may reach the bucket");
+    }
+
+    #[tokio::test]
+    async fn a_node_missing_a_rail_answers_503_naming_it_never_an_empty_list() {
+        let (_tmp, no_group, _mem) = state_with_fleet_store(None);
+        let resp = build_router(no_group.clone())
+            .oneshot(Request::get("/secrets").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let err = body_json(resp).await["error"].as_str().unwrap().to_string();
+        assert!(err.contains("--sovereign-group"), "{err}");
+
+        let resp = build_router(no_group)
+            .oneshot(secret_put("x/y", sealed_body(&[1])))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let (_tmp2, bare) = fresh_state();
+        let resp = build_router(bare)
+            .oneshot(Request::get("/secrets").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let err = body_json(resp).await["error"].as_str().unwrap().to_string();
+        assert!(err.contains("YUBABA_CERT_STORE"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn raft_write_refuses_secret_writes_with_the_upgrade_message() {
+        let (_tmp, state) = fresh_state();
+        for request in [
+            serde_json::json!({
+                "PutSecret": {
+                    "name": "cheers/cloud-admin/verify-key",
+                    "ciphertext": [1],
+                    "nonce": vec![0u8; 12],
+                    "updated_at": 1,
+                }
+            }),
+            serde_json::json!({ "DeleteSecret": { "name": "cheers/cloud-admin/verify-key" } }),
+        ] {
+            let resp = build_router(state.clone())
+                .oneshot(
+                    Request::post("/raft/write")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({ "request": request }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::GONE);
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains("R911") && text.contains("upgrade yah"), "{text}");
+        }
     }
 
     // ── R732-T4: GET /tenants/{id}, the fencing-token transport ──────────────
@@ -8492,17 +10421,17 @@ mod tests {
             let mut reg = state.workload_resources.lock().unwrap();
             reg.insert(
                 "api.pdx".into(),
-                node::WorkloadResources {
+                Some(node::WorkloadResources {
                     memory_mb: 512,
                     cpu_millis: 250,
-                },
+                }),
             );
             reg.insert(
                 "worker.pdx".into(),
-                node::WorkloadResources {
+                Some(node::WorkloadResources {
                     memory_mb: 1024,
                     cpu_millis: 500,
-                },
+                }),
             );
         }
         let app = build_router(state);
@@ -8674,10 +10603,10 @@ mod tests {
         let (_tmp, state) = fresh_state();
         state.workload_resources.lock().unwrap().insert(
             "api.pdx".into(),
-            node::WorkloadResources {
+            Some(node::WorkloadResources {
                 memory_mb: 512,
                 cpu_millis: 250,
-            },
+            }),
         );
         let app = build_router(state);
 
@@ -8695,6 +10624,121 @@ mod tests {
         );
         let body = body_json(resp).await;
         assert_eq!(body["workloads"], serde_json::json!([]));
+    }
+
+    /// A [`kamaji::Kamaji`] backend whose only real behaviour is
+    /// `list_workloads`, for exercising `rehydrate_workload_resources`
+    /// against the legacy in-process path without a real containerd/docker
+    /// daemon. Every other method is unreachable by the rehydration test and
+    /// panics loudly if one is ever called, rather than quietly returning
+    /// nonsense.
+    struct FixedListRuntime {
+        workloads: Vec<kamaji::WorkloadState>,
+    }
+
+    #[async_trait::async_trait]
+    impl kamaji::Kamaji for FixedListRuntime {
+        fn backend(&self) -> kamaji::Backend {
+            kamaji::Backend::Containerd
+        }
+        async fn deploy_workload(
+            &self,
+            _spec: &workload_spec::WorkloadSpec,
+            _mesh: &kamaji::MeshAssignment,
+        ) -> anyhow::Result<kamaji::DeployResult> {
+            unreachable!("FixedListRuntime: deploy_workload not exercised by this test")
+        }
+        async fn list_workloads(&self) -> anyhow::Result<Vec<kamaji::WorkloadState>> {
+            Ok(self.workloads.clone())
+        }
+        async fn get_workload(
+            &self,
+            _ident: &workload_spec::MeshIdent,
+        ) -> anyhow::Result<Option<kamaji::WorkloadState>> {
+            unreachable!("FixedListRuntime: get_workload not exercised by this test")
+        }
+        async fn stream_logs(
+            &self,
+            _ident: &workload_spec::MeshIdent,
+            _opts: kamaji::LogOpts,
+        ) -> anyhow::Result<kamaji::LogStream> {
+            unreachable!("FixedListRuntime: stream_logs not exercised by this test")
+        }
+        async fn restart_workload(&self, _ident: &workload_spec::MeshIdent) -> anyhow::Result<()> {
+            unreachable!("FixedListRuntime: restart_workload not exercised by this test")
+        }
+        async fn teardown_workload(&self, _ident: &workload_spec::MeshIdent) -> anyhow::Result<()> {
+            unreachable!("FixedListRuntime: teardown_workload not exercised by this test")
+        }
+        async fn health(&self) -> anyhow::Result<kamaji::RuntimeHealth> {
+            unreachable!("FixedListRuntime: health not exercised by this test")
+        }
+    }
+
+    /// R885-B7's own regression guard, and it must not fall into the trap the
+    /// ticket calls out: a test that deploys first would pass against the
+    /// unfixed code, because a deploy repopulates `workload_resources` on its
+    /// own. This asserts `yah.workloads.count` against `GET /workloads`
+    /// immediately after `rehydrate_workload_resources` runs, with no deploy
+    /// anywhere in the test.
+    #[tokio::test]
+    async fn node_usage_workload_count_matches_workloads_after_boot_rehydration_no_deploy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let rt = Arc::new(FixedListRuntime {
+            workloads: vec![
+                kamaji::WorkloadState {
+                    ident: workload_spec::MeshIdent("forge-a".into()),
+                    container_id: "forge-a".into(),
+                    status: kamaji::WorkloadStatus::Pending,
+                    mesh_ip: None,
+                    ports: Default::default(),
+                },
+                kamaji::WorkloadState {
+                    ident: workload_spec::MeshIdent("forge-b".into()),
+                    container_id: "forge-b".into(),
+                    status: kamaji::WorkloadStatus::Pending,
+                    mesh_ip: None,
+                    ports: Default::default(),
+                },
+            ],
+        });
+        let state = Arc::new(
+            ServerState::load(tmp.path().join("identity.json"))
+                .unwrap()
+                .with_runtime(rt.clone()),
+        );
+
+        // The bug this ticket fixes: before rehydration, the registry starts
+        // empty every boot regardless of what the runtime actually holds.
+        assert_eq!(node::committed_totals(&state.workload_resources).0, 0);
+
+        rehydrate_workload_resources(&state).await;
+
+        let app = build_router(Arc::clone(&state));
+        let usage = body_json(
+            app.clone()
+                .oneshot(
+                    Request::get("/node/usage?window_ms=50")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let workloads = body_json(
+            app.oneshot(Request::get("/workloads").body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        let workloads_len = workloads["workloads"].as_array().unwrap().len();
+        assert_eq!(workloads_len, 2);
+        assert_eq!(usage["yah.workloads.count"], workloads_len);
+        // Resource amounts for a rehydrated-but-never-redeployed workload are
+        // genuinely unrecoverable — see `node::ResourceRegistry` — so they
+        // must read as absent, not a fabricated 0.
+        assert!(workloads["workloads"][0].get("memory_mb").is_none());
     }
 
     #[tokio::test]
@@ -9734,130 +11778,13 @@ mod tests {
         assert_eq!(body["state_epoch"], declared["state_epoch"]);
     }
 
-    // ── compose (R040-F7) ────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn compose_deploy_writes_files() {
-        let (tmp, state_base) = fresh_state();
-        let compose_tmp = tempfile::TempDir::new().unwrap();
-        let state = {
-            let raw = Arc::try_unwrap(state_base).unwrap();
-            Arc::new(raw.with_compose_dir(compose_tmp.path()))
-        };
-        let app = build_router(state);
-
-        let req_body = serde_json::json!({
-            "compose_yaml": "version: \"3.8\"\nservices:\n  foo:\n    image: foo:v1\n",
-            "caddyfile": ":8080 {\n    reverse_proxy foo:8080\n}\n"
-        });
-        let resp = app
-            .oneshot(
-                Request::post("/compose")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // Status may be 200 (systemd started) or 200 with files-written
-        // (systemd unavailable on dev machine — both are OK responses).
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "unexpected non-2xx from /compose"
-        );
-
-        let body = body_json(resp).await;
-        assert!(body["status"].is_string(), "status field missing");
-
-        // Files must be written regardless of systemd outcome.
-        let compose = std::fs::read_to_string(compose_tmp.path().join("compose.yml")).unwrap();
-        assert!(
-            compose.contains("image: foo:v1"),
-            "compose.yml content wrong"
-        );
-
-        let caddyfile = std::fs::read_to_string(compose_tmp.path().join("Caddyfile")).unwrap();
-        assert!(
-            caddyfile.contains("reverse_proxy foo:8080"),
-            "Caddyfile content wrong"
-        );
-
-        // Suppress unused-var warning from the tmpdir used for state_path.
-        drop(tmp);
-    }
-
-    /// `deploy_compose` now rewrites the unit whenever the generated text
-    /// differs from what is on disk, instead of only writing when the file is
-    /// absent. Two properties hold that up: the text must be a pure function of
-    /// the compose dir (otherwise the compare rewrites and `daemon-reload`s on
-    /// every single deploy), and it must actually *vary* with the dir (a node
-    /// deployed once under an old `compose_dir` kept a stale `WorkingDirectory`
-    /// forever under the old guard).
-    #[test]
-    fn the_compose_unit_text_is_stable_and_tracks_the_dir() {
-        let a = compose_unit_text(std::path::Path::new("/var/lib/yah-cloud/compose"));
-        assert_eq!(
-            a,
-            compose_unit_text(std::path::Path::new("/var/lib/yah-cloud/compose")),
-            "same dir must yield byte-identical text, or every deploy rewrites"
-        );
-        assert!(a.contains("WorkingDirectory=/var/lib/yah-cloud/compose"));
-
-        let b = compose_unit_text(std::path::Path::new("/srv/compose"));
-        assert_ne!(a, b, "a moved compose dir must reach the unit");
-        assert!(b.contains("WorkingDirectory=/srv/compose"));
-    }
-
-    #[tokio::test]
-    async fn compose_deploy_without_caddyfile_ok() {
-        let (tmp, state_base) = fresh_state();
-        let compose_tmp = tempfile::TempDir::new().unwrap();
-        let state = {
-            let raw = Arc::try_unwrap(state_base).unwrap();
-            Arc::new(raw.with_compose_dir(compose_tmp.path()))
-        };
-        let app = build_router(state);
-
-        let req_body = serde_json::json!({
-            "compose_yaml": "version: \"3.8\"\nservices: {}\n",
-            "caddyfile": null
-        });
-        let resp = app
-            .oneshot(
-                Request::post("/compose")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(
-            !compose_tmp.path().join("Caddyfile").exists(),
-            "Caddyfile written unexpectedly"
-        );
-        drop(tmp);
-    }
-
     #[tokio::test]
     async fn services_is_compose_independent_post_r556_f7_t3() {
         // /services no longer shells out to podman compose ps — that path moved
-        // to /workloads via kamaji. Even with a compose.yml present, /services
-        // is empty until something is explicitly advertised (e.g. scryer).
-        let (tmp, state_base) = fresh_state();
-        let compose_tmp = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            compose_tmp.path().join("compose.yml"),
-            "version: \"3.8\"\nservices: {}\n",
-        )
-        .unwrap();
-        let state = {
-            let raw = Arc::try_unwrap(state_base).unwrap();
-            Arc::new(raw.with_compose_dir(compose_tmp.path()))
-        };
+        // to /workloads via kamaji (and the compose renderer itself is gone,
+        // R895-T2). /services is empty until something is explicitly
+        // advertised (e.g. scryer).
+        let (tmp, state) = fresh_state();
         let app = build_router(state);
 
         let resp = app
@@ -9945,6 +11872,95 @@ mod tests {
         assert!(body.cloud_init_log.contains("gamma"));
         assert!(body.cloud_init_output_log.contains("two"));
         assert!(body.errors.is_empty());
+    }
+
+    // ── Unit journal tail tests (R893-F11) ────────────────────────────────────
+
+    #[test]
+    fn read_unit_log_refuses_every_unit_outside_the_allow_list() {
+        // Includes the shapes an injection attempt takes. None of them may be
+        // reached by the spawn, and the discriminator is `None`, not a
+        // sanitised string — nothing here is rewritten and then run.
+        for unit in [
+            "sshd",
+            "",
+            "yubaba; rm -rf /",
+            "kamaji.service",
+            "../kamaji",
+            "-u",
+            "--output=cat",
+        ] {
+            assert!(
+                read_unit_log(unit, 10).is_none(),
+                "{unit:?} must be refused, not sanitised"
+            );
+        }
+    }
+
+    #[test]
+    fn read_unit_log_reports_a_missing_journalctl_instead_of_panicking() {
+        // This is the dev-host path: no journald on a Mac, so the spawn fails
+        // and the failure must land in `errors` with the body still well
+        // formed. On a Linux host with a journal it simply succeeds — either
+        // way the echoed fields hold and the tail stays bounded.
+        let body = read_unit_log("yubaba", 7).expect("yubaba is allow-listed");
+        assert_eq!(body.unit, "yubaba");
+        assert_eq!(body.lines, 7);
+        assert!(
+            body.log.lines().count() <= 7,
+            "tail must not exceed the requested line count"
+        );
+        if !body.errors.is_empty() {
+            assert!(body.log.is_empty(), "a failed read must not report a tail");
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_rejects_a_unit_outside_the_allow_list_with_400() {
+        let (_tmp, state) = fresh_state();
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::get("/logs?unit=sshd")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["allowed"].as_array().unwrap().len(), LOG_UNITS.len());
+    }
+
+    #[tokio::test]
+    async fn logs_clamps_lines_and_still_answers_200_without_a_journal() {
+        let (_tmp, state) = fresh_state();
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::get("/logs?unit=kamaji&lines=99999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Always 200, the same discipline /diagnostics keeps: a host with no
+        // journald reports that in `errors` rather than 5xx-ing.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["lines"], 2_000);
+        assert_eq!(body["unit"], "kamaji");
+    }
+
+    #[tokio::test]
+    async fn logs_without_a_unit_param_is_a_400_not_a_default() {
+        let (_tmp, state) = fresh_state();
+        let app = build_router(state);
+        let resp = app
+            .oneshot(Request::get("/logs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     // ── Rollout API tests (R278-F1) ───────────────────────────────────────────
@@ -11328,6 +13344,7 @@ mod tests {
                 container_id: "recorded".into(),
                 mesh_ip: mesh.mesh_ip,
                 task_pid: 1,
+                hydrate: None,
                 ports: std::collections::BTreeMap::new(),
             })
         }
@@ -11428,6 +13445,135 @@ mod tests {
             .unwrap()
     }
 
+    // ── R892-B1: POST /workloads/validate ────────────────────────────────────
+    //
+    // The route exists so `yah cloud workload rolling` can make its destroy
+    // conditional on the replacement being acceptable. Two properties carry
+    // that: it must answer the same way `/deploy` would, and it must change
+    // nothing — a validate that deployed would be worse than no validate at all.
+
+    async fn post_validate(
+        state: Arc<ServerState>,
+        spec_json: serde_json::Value,
+    ) -> axum::response::Response {
+        let body = serde_json::json!({ "spec": spec_json });
+        build_router(state)
+            .oneshot(
+                Request::post("/workloads/validate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A spec this node accepts validates — and the backend is never touched.
+    /// The second half is the one that matters: the caller is about to destroy
+    /// a live workload on the strength of this answer.
+    #[tokio::test]
+    async fn validate_accepts_a_good_spec_without_deploying_it() {
+        let (_tmp, state, runtime) = state_with_recording_runtime();
+        let spec = mesh_spec("validate-ok", 8080);
+
+        let resp = post_validate(
+            Arc::clone(&state),
+            serde_json::to_value(&spec).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = body_json(resp).await;
+        assert_eq!(body["status"], "validated");
+        assert_eq!(body["ident"], "validate-ok");
+
+        assert!(
+            runtime.specs().is_empty(),
+            "validate must not deploy anything, backend saw: {:?}",
+            runtime.deploy_order()
+        );
+        assert!(
+            runtime.teardown_order().is_empty(),
+            "validate must not tear anything down"
+        );
+    }
+
+    /// The outage, in the shape it actually arrived in: a spec carrying a field
+    /// this node's `WorkloadSpec` does not have, sent by a client built from a
+    /// newer tree. Validate must refuse it with the parse error — that refusal
+    /// is what now stands between the CLI and an unconditional destroy.
+    #[tokio::test]
+    async fn validate_refuses_a_spec_this_node_cannot_parse_and_names_the_field() {
+        let (_tmp, state, runtime) = state_with_recording_runtime();
+        let mut spec_json = serde_json::to_value(mesh_spec("validate-skew", 8080)).unwrap();
+        // Delete a required field, the way a schema change on the *other* side
+        // of the wire does.
+        spec_json["resources"]
+            .as_object_mut()
+            .unwrap()
+            .remove("memory_mb");
+
+        let resp = post_validate(Arc::clone(&state), spec_json).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body = body_json(resp).await;
+        assert_eq!(body["status"], "rejected");
+        let error = body["error"].as_str().unwrap();
+        assert!(
+            error.contains("memory_mb"),
+            "the refusal must name the field the node could not parse, got: {error}"
+        );
+        assert!(runtime.specs().is_empty(), "a refused spec must not deploy");
+    }
+
+    /// Non-vacuity for the pair above: the SAME body that validate refuses is
+    /// refused by deploy, and the same body it accepts is accepted by deploy.
+    /// Without this, validate could be answering from its own private opinion —
+    /// which is the one way this route can be worse than useless, because a
+    /// caller destroys things on the strength of its answer.
+    #[tokio::test]
+    async fn validate_and_deploy_agree_on_the_same_body() {
+        let (_tmp, state, _runtime) = state_with_recording_runtime();
+        let good = mesh_spec("agree-ok", 8080);
+        let mut bad = serde_json::to_value(mesh_spec("agree-bad", 8080)).unwrap();
+        bad["resources"]
+            .as_object_mut()
+            .unwrap()
+            .remove("memory_mb");
+
+        let good_json = serde_json::to_value(&good).unwrap();
+        assert_eq!(
+            post_validate(Arc::clone(&state), good_json).await.status(),
+            StatusCode::OK
+        );
+        let deployed = post_deploy(Arc::clone(&state), &good).await;
+        assert!(
+            deployed.status().is_success() || deployed.status() == StatusCode::ACCEPTED,
+            "deploy refused a body validate accepted: {}",
+            deployed.status()
+        );
+
+        let (_tmp2, state2, _rt2) = state_with_recording_runtime();
+        let validated = post_validate(Arc::clone(&state2), bad.clone()).await;
+        assert_eq!(validated.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let deploy_resp = build_router(Arc::clone(&state2))
+            .oneshot(
+                Request::post("/workloads/deploy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "spec": bad })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            deploy_resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "deploy accepted a body validate refused"
+        );
+    }
+
     // ── R858-B11: the health field must read the shape yubaba deploys ────────
 
     /// A kamaji that answers `get_workload` for the appliance and records what
@@ -11462,6 +13608,7 @@ mod tests {
                 container_id: "native:517125".into(),
                 mesh_ip: mesh.mesh_ip,
                 task_pid: 517125,
+                hydrate: None,
                 ports: std::collections::BTreeMap::new(),
             })
         }
@@ -11765,7 +13912,7 @@ mod tests {
         let rt = Arc::new(RecordingRuntime::default());
         let state = ServerState::load(tmp.path().join("identity.json"))
             .unwrap()
-            .with_bind_addr(&format!("{node_ip}:9443"))
+            .with_mesh_addr(None, &format!("{node_ip}:9443"))
             .with_runtime(rt.clone());
         (tmp, Arc::new(state), rt)
     }
@@ -12459,6 +14606,137 @@ mod tests {
             "registry should be empty after destroy"
         );
     }
+
+    // ── R880: per-ident deploy/destroy lock ──────────────────────────────
+
+    #[test]
+    fn try_lock_deploy_refuses_a_second_claim_and_releases_on_drop() {
+        let (_tmp, state) = fresh_state();
+        let first = ServerState::try_lock_deploy(&state, "my-workload");
+        assert!(first.is_some(), "first claim of an unlocked ident succeeds");
+
+        let second = ServerState::try_lock_deploy(&state, "my-workload");
+        assert!(
+            second.is_none(),
+            "a second concurrent claim of the same ident must be refused"
+        );
+
+        // A different ident is unaffected — this is a per-ident lock, not a
+        // node-wide one.
+        assert!(ServerState::try_lock_deploy(&state, "other-workload").is_some());
+
+        drop(first);
+        assert!(
+            ServerState::try_lock_deploy(&state, "my-workload").is_some(),
+            "dropping the guard must release the ident for the next claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_of_a_locked_ident_is_refused_409_and_never_reaches_admission() {
+        let (_tmp, state) = fresh_state();
+        // Simulate a deploy already in flight for this ident.
+        state
+            .deploy_locks
+            .lock()
+            .unwrap()
+            .insert("my-appliance".into());
+
+        let app = build_router(state.clone());
+        let body = appliance_spec("my-appliance");
+        let resp = app
+            .oneshot(
+                Request::post("/workloads/deploy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        // The archetype-appliance gate lives just past the lock check —
+        // reaching it (and writing the registry) would mean the request
+        // slipped past the lock instead of being refused by it.
+        assert!(
+            !state
+                .archetype_registry
+                .lock()
+                .unwrap()
+                .contains_key("my-appliance"),
+            "a lock-refused deploy must never reach admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_of_a_locked_ident_is_refused_409_and_never_tears_down() {
+        let (_tmp, state) = fresh_state();
+        state
+            .archetype_registry
+            .lock()
+            .unwrap()
+            .insert("my-appliance".into(), LifecycleArchetype::Appliance);
+        state
+            .deploy_locks
+            .lock()
+            .unwrap()
+            .insert("my-appliance".into());
+
+        let app = build_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::post("/workloads/my-appliance/destroy")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert!(
+            state
+                .archetype_registry
+                .lock()
+                .unwrap()
+                .contains_key("my-appliance"),
+            "a lock-refused destroy must never tear down or clear the registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deploy_lock_is_released_after_the_handler_returns_so_a_later_deploy_is_not_blocked()
+    {
+        let (_tmp, state) = fresh_state();
+        let app = build_router(state.clone());
+        let body = appliance_spec("my-appliance");
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::post("/workloads/deploy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(first.status(), StatusCode::CONFLICT);
+
+        // Once the first request has returned, its guard has dropped — a
+        // second, unrelated request for the same ident must not still see it
+        // held.
+        let destroy = app
+            .oneshot(
+                Request::post("/workloads/my-appliance/destroy")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            destroy.status(),
+            StatusCode::CONFLICT,
+            "the deploy's lock must have been released once its handler returned"
+        );
+    }
 }
 
 // ── R599-T5: bundle deploys through POST /workloads/deploy ──────────────────
@@ -12475,7 +14753,6 @@ mod bundle_deploy_tests {
 
     fn bundle_workload(digest: &str) -> workload_spec::Workload {
         workload_spec::Workload::MesofactStatic(workload_spec::MesofactStaticWorkload {
-            schema_version: workload_spec::SchemaVersion::V1,
             build: workload_spec::BuildConfig {
                 command: Some("bun run build".into()),
                 out_dir: "dist".into(),
@@ -12544,7 +14821,6 @@ mod bundle_deploy_tests {
                 wg_private_key: String::new(),
                 wg_listen_port: 0,
                 peers: vec![],
-                netns_name: None,
             }),
         };
         let bytes = kamaji_proto::encode_frame(&frame).unwrap();
@@ -12570,7 +14846,7 @@ mod bundle_deploy_tests {
 
         let (_tmp, s) = state();
         let mesh = Arc::try_unwrap(s)
-            .map(|s| s.with_bind_addr("100.64.0.3:7443"))
+            .map(|s| s.with_mesh_addr(None, "100.64.0.3:7443"))
             .unwrap_or_else(|_| unreachable!("sole owner"));
         assert_eq!(mesh.node_mesh_ip(), Some(Ipv4Addr::new(100, 64, 0, 3)));
 
@@ -12582,13 +14858,76 @@ mod bundle_deploy_tests {
         ] {
             let (_t, s) = state();
             let s = Arc::try_unwrap(s)
-                .map(|s| s.with_bind_addr(no_mesh_plane))
+                .map(|s| s.with_mesh_addr(None, no_mesh_plane))
                 .unwrap_or_else(|_| unreachable!("sole owner"));
             assert_eq!(
                 s.node_mesh_ip(),
                 None,
                 "{no_mesh_plane} is not an address another node can dial — \
                  kamaji must keep binding loopback"
+            );
+        }
+    }
+
+    /// R881-S2: an explicit `--mesh-ip` is what this node advertises, and it
+    /// is the only thing that rescues a node which binds a wildcard **on
+    /// purpose**.
+    ///
+    /// The dev raft group (us-west-011/013/014) binds `0.0.0.0:7443` via the
+    /// R608-F18 `40-raft.conf` drop-in, so each node answers on both its LAN
+    /// and its mesh address. Measured on us-west-011 2026-09-14: that made
+    /// every service record it published read `127.0.0.1` /
+    /// `NotReady { reason: "unroutable" }`, which made
+    /// `GET /service-records?ready=true` permanently empty and left
+    /// `yah cloud apply` unable to resolve an ingress upstream against the
+    /// node. The wildcard case below IS that node — asserting it is the
+    /// regression guard, not a restatement of the setter.
+    #[test]
+    fn an_explicit_mesh_address_overrides_what_the_bind_flag_would_derive() {
+        use std::net::Ipv4Addr;
+
+        let explicit = Ipv4Addr::new(100, 64, 0, 10);
+
+        // The bug itself: a wildcard bind derives nothing, so the explicit
+        // address is the only reason this node advertises anything dialable.
+        let (_tmp, s) = state();
+        let s = Arc::try_unwrap(s)
+            .map(|s| s.with_mesh_addr(Some(explicit), "0.0.0.0:7443"))
+            .unwrap_or_else(|_| unreachable!("sole owner"));
+        assert_eq!(
+            s.node_mesh_ip(),
+            Some(explicit),
+            "a node that binds a wildcard on purpose must still advertise the \
+             address it was given, or every record it publishes is unroutable"
+        );
+
+        // Explicit wins even where the bind WOULD have derived one, so the
+        // two can never both be live and disagree about the answer.
+        let (_tmp, s) = state();
+        let s = Arc::try_unwrap(s)
+            .map(|s| s.with_mesh_addr(Some(explicit), "100.64.0.3:7443"))
+            .unwrap_or_else(|_| unreachable!("sole owner"));
+        assert_eq!(s.node_mesh_ip(), Some(explicit));
+
+        // Absent an explicit address the derivation is untouched — the
+        // property every already-deployed fleet node relies on.
+        let (_tmp, s) = state();
+        let s = Arc::try_unwrap(s)
+            .map(|s| s.with_mesh_addr(None, "100.64.0.3:7443"))
+            .unwrap_or_else(|_| unreachable!("sole owner"));
+        assert_eq!(s.node_mesh_ip(), Some(Ipv4Addr::new(100, 64, 0, 3)));
+
+        // `--mesh-ip` is handed a BARE address, not `host:port`. That branch
+        // of the parser is otherwise only reached from the derivation path,
+        // and the binary validates the flag through this same function
+        // precisely so the two cannot drift on what counts as dialable.
+        assert_eq!(crate::parse_node_mesh_ip("100.64.0.10"), Some(explicit));
+        for rejected in ["0.0.0.0", "127.0.0.1", "localhost", "::1", "not-an-ip"] {
+            assert_eq!(
+                crate::parse_node_mesh_ip(rejected),
+                None,
+                "--mesh-ip {rejected} must fail startup, not quietly fall back \
+                 to the address --bind would have derived"
             );
         }
     }
@@ -12628,7 +14967,7 @@ mod bundle_deploy_tests {
         let spec = host_networked_spec();
         let (_tmp, s) = state();
         let s = Arc::try_unwrap(s)
-            .map(|s| s.with_bind_addr("100.64.0.3:7443"))
+            .map(|s| s.with_mesh_addr(None, "100.64.0.3:7443"))
             .unwrap_or_else(|_| unreachable!("sole owner"));
 
         for nth in 1..=8 {
@@ -12646,7 +14985,7 @@ mod bundle_deploy_tests {
         // neighbour's address, which reads as a healthy Ready record.
         let (_t, dev) = state();
         let dev = Arc::try_unwrap(dev)
-            .map(|s| s.with_bind_addr("0.0.0.0:7443"))
+            .map(|s| s.with_mesh_addr(None, "0.0.0.0:7443"))
             .unwrap_or_else(|_| unreachable!("sole owner"));
         assert_eq!(dev.node_mesh_ip(), None);
         assert_eq!(dev.workload_bind_ip(&spec), Some(Ipv4Addr::LOCALHOST));
@@ -12696,7 +15035,7 @@ mod bundle_deploy_tests {
 
         let (_tmp, s) = state();
         let s = Arc::try_unwrap(s)
-            .map(|s| s.with_bind_addr("100.64.0.3:7443"))
+            .map(|s| s.with_mesh_addr(None, "100.64.0.3:7443"))
             .unwrap_or_else(|_| unreachable!("sole owner"));
         assert_eq!(
             s.workload_bind_ip(&spec),
@@ -12708,7 +15047,7 @@ mod bundle_deploy_tests {
 
         let (_t, dev) = state();
         let dev = Arc::try_unwrap(dev)
-            .map(|s| s.with_bind_addr("0.0.0.0:7443"))
+            .map(|s| s.with_mesh_addr(None, "0.0.0.0:7443"))
             .unwrap_or_else(|_| unreachable!("sole owner"));
         assert_eq!(dev.workload_bind_ip(&spec), None);
     }
@@ -12737,7 +15076,7 @@ mod bundle_deploy_tests {
         let (tmp, s) = state();
         let s = Arc::try_unwrap(s)
             .map(|s| {
-                s.with_bind_addr("100.64.0.3:7443")
+                s.with_mesh_addr(None, "100.64.0.3:7443")
                     .with_container_net(kamaji::container_net::ContainerNet::defaults())
             })
             .unwrap_or_else(|_| unreachable!("sole owner"));
@@ -12837,7 +15176,7 @@ mod bundle_deploy_tests {
         let (_tmp, s) = state();
         let s = Arc::try_unwrap(s)
             .map(|s| {
-                s.with_bind_addr("0.0.0.0:7443")
+                s.with_mesh_addr(None, "0.0.0.0:7443")
                     .with_container_net(kamaji::container_net::ContainerNet::defaults())
             })
             .unwrap_or_else(|_| unreachable!("sole owner"));

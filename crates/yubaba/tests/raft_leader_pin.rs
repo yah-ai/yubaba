@@ -78,7 +78,7 @@ fn start_pins(nodes: &[SoloNode], anchor: &str) -> Pins {
 }
 
 async fn post_json(base_url: &str, path: &str, body: serde_json::Value) -> (u16, String) {
-    let resp = reqwest::Client::new()
+    let resp = yubaba_test_harness::http()
         .post(format!("{base_url}{path}"))
         .json(&body)
         .send()

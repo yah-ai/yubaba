@@ -95,6 +95,41 @@ pub use tenant_ownership::LocalOwnership;
 
 /// R734-F2: one uninitialised node on loopback, for the routes and RPCs whose
 /// interesting behaviour happens *before* a cluster exists.
+/// The HTTP client every harness helper and test should talk to nodes with.
+///
+/// R903: do not call `reqwest::Client::new()` per request. Each build walks the
+/// OS trust store (this workspace unifies reqwest's `rustls-tls-native-roots`
+/// on), which on macOS is a `trustd` IPC per root certificate through one
+/// serialized daemon — 393 ms a build when a test binary's modules run
+/// concurrently. A 50 ms leader-poll loop that builds a client per poll spends
+/// its whole budget there.
+///
+/// Process-wide rather than per-test, and with idle pooling OFF: libtest runs
+/// each test on its own tokio runtime, and a pooled connection is bound to the
+/// runtime that opened it. With no idle connections kept, a clone used from
+/// any runtime dials fresh (loopback, microseconds) and nothing outlives the
+/// test that created it. The expensive part — the build — happens once.
+pub fn http() -> reqwest::Client {
+    static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .build()
+            .expect("yubaba-test-harness shared HTTP client")
+    });
+    CLIENT.clone()
+}
+
+/// Whether this node has applied its own current membership entry — the point
+/// after which openraft accepts a membership change from it. A freshly elected
+/// leader believes in the founding membership before it has committed it, and
+/// refuses add-learner / remove-member until it does (R903).
+fn membership_applied(metrics: &openraft::RaftMetrics<yubaba::raft::YubabaRaftConfig>) -> bool {
+    match (metrics.membership_config.log_id(), &metrics.last_applied) {
+        (Some(membership), Some(applied)) => applied.index >= membership.index,
+        _ => false,
+    }
+}
+
 pub mod solo_node;
 pub use solo_node::{
     solo_node, solo_node_in_cell, solo_node_in_region, solo_node_in_sovereign_group,
@@ -128,7 +163,7 @@ impl WardenHandle {
     pub(crate) fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            client: reqwest::Client::new(),
+            client: http(),
         }
     }
 
@@ -907,8 +942,18 @@ impl Cluster {
             if let Some(Some(first)) = beliefs.first().copied() {
                 // node_id is 1-indexed: node 0 → id 1.
                 let idx = (first as usize).saturating_sub(1);
-                let leader_is_running = self.nodes.get(idx).is_some_and(|n| n.raft.is_some());
-                if leader_is_running && beliefs.iter().all(|b| *b == Some(first)) {
+                let leader_raft = self.nodes.get(idx).and_then(|n| n.raft.as_ref());
+                // R903: agreement alone is not readiness. A leader everyone
+                // believes in can still be holding its membership entry
+                // uncommitted, and openraft refuses every membership change
+                // until it lands ("already undergoing a configuration change
+                // ... last committed membership log id: None"). Callers of this
+                // wait go straight to add-learner / remove-member, so wait for
+                // the leader to have applied its current membership too.
+                let leader_ready = leader_raft.is_some_and(|raft| {
+                    membership_applied(&raft.metrics().borrow_watched())
+                });
+                if leader_ready && beliefs.iter().all(|b| *b == Some(first)) {
                     return Ok(idx);
                 }
             }
@@ -1226,7 +1271,7 @@ async fn test_cluster_local(
     }
 
     // Phase 3: wait for every node's yubaba to report healthy.
-    let client = reqwest::Client::new();
+    let client = http();
     for node in &cluster_nodes {
         let url = format!("{}/health", node.yubaba.base_url);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -1271,17 +1316,31 @@ async fn test_cluster_local(
             .context("raft cluster bootstrap: initialize() on node 0")?;
 
         // Wait for leader election (up to 15s: election_timeout_max=3s + margin).
+        //
+        // R903: until then this broke out as soon as ANY node saw a leader, so
+        // a test's first request to a follower could land before that follower
+        // knew one ("not the leader and no leader address to forward to
+        // (leader_id=None)"). Every node must name the same leader, and that
+        // leader must have applied its membership — the state a bootstrapped
+        // cluster is promised to be in when this returns.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        'election: loop {
+        loop {
             if tokio::time::Instant::now() > deadline {
                 bail!("raft leader election timed out after 15s during cluster bootstrap");
             }
-            for node in &cluster_nodes {
-                if let Some(raft) = &node.raft {
-                    if raft.metrics().borrow_watched().current_leader.is_some() {
-                        break 'election;
-                    }
-                }
+            let metrics: Vec<_> = cluster_nodes
+                .iter()
+                .filter_map(|n| n.raft.as_ref())
+                .map(|raft| raft.metrics().borrow_watched().clone())
+                .collect();
+            let leader = metrics.first().and_then(|m| m.current_leader);
+            let agreed = leader.is_some() && metrics.iter().all(|m| m.current_leader == leader);
+            let leader_ready = metrics
+                .iter()
+                .find(|m| Some(m.id) == leader)
+                .is_some_and(membership_applied);
+            if agreed && leader_ready {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -1443,7 +1502,7 @@ async fn wait_for_server_ip<P: MachineProvider>(provider: &P, name: &str) -> Res
 
 /// Poll `GET /health` until it returns 200 or the deadline expires.
 async fn wait_for_yubaba_health(base_url: &str) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = http();
     let url = format!("{base_url}/health");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
     loop {

@@ -326,7 +326,7 @@ async fn a_yubaba_restart_on_the_owner_leaves_the_appliance_in_place() {
 
 /// `POST /raft/transfer-leader`, returning the HTTP status.
 async fn post_transfer(base_url: &str, to: u64) -> reqwest::StatusCode {
-    reqwest::Client::new()
+    yubaba_test_harness::http()
         .post(format!("{base_url}/raft/transfer-leader"))
         .json(&serde_json::json!({ "to": to }))
         .send()

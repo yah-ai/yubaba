@@ -52,7 +52,7 @@ use pasetors::version4::{PublicToken, V4};
 use kamaji::fake::FakeRuntime;
 use workload_spec::{
     ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, ResourceLimits, RestartPolicy,
-    SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
+    StopPolicy, TierTag, WorkloadSpec,
 };
 use yubaba::cheers_client::{CheersClient, CheersConfig};
 
@@ -188,7 +188,6 @@ fn mesh_only_spec(name: &str) -> WorkloadSpec {
     // on this state, so an expose with either would short-circuit before
     // reaching the cheers call.
     WorkloadSpec {
-        schema_version: SchemaVersion::V1,
         name: name.to_string(),
         image: ImageRef {
             registry: "docker.io".into(),
@@ -210,7 +209,10 @@ fn mesh_only_spec(name: &str) -> WorkloadSpec {
         resources: ResourceLimits {
             memory_mb: 64,
             cpu_millis: 128,
-            ephemeral_storage_mb: 128,
+            memory_request_mb: None,
+            cpu_limit_millis: None,
+            pids_max: None,
+            scratch_floor_mb: None,
         },
         depends_on: vec![],
         requires: vec![],
@@ -231,6 +233,7 @@ fn mesh_only_spec(name: &str) -> WorkloadSpec {
             operator: None,
         },
         labels: Default::default(),
+        durability: None,
         annotations: Default::default(),
         files: Vec::new(),
     }

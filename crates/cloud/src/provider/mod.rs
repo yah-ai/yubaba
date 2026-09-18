@@ -17,8 +17,9 @@ use async_trait::async_trait;
 pub mod cloudflare;
 pub use cloudflare::{
     CfAccountInfo, CloudflareClient, CreateR2BucketResult, CreateTokenResult, CreateTunnelResult,
-    GrantScope, R2BucketInfo, R2CustomDomain, TokenGrant, TunnelConnState, TunnelDnsRecord,
-    TunnelDriftRow, TunnelDriftState, WorkerDeployResult, MESOFACT_STATIC_GRANTS,
+    DnsRecordDetail, GrantScope, R2BucketInfo, R2CustomDomain, TokenGrant, TunnelConnState,
+    TunnelDnsRecord, TunnelDriftRow, TunnelDriftState, WorkerDeployResult, MESOFACT_STATIC_GRANTS,
+    TUNNEL_EDIT_GRANTS,
 };
 
 pub mod hetzner;

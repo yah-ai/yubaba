@@ -29,7 +29,7 @@ fn node_id(idx: usize) -> u64 {
 
 /// POST `/raft/transfer-leader` and return the HTTP status.
 async fn post_transfer(base_url: &str, to: u64) -> reqwest::StatusCode {
-    reqwest::Client::new()
+    yubaba_test_harness::http()
         .post(format!("{base_url}/raft/transfer-leader"))
         .json(&serde_json::json!({ "to": to }))
         .send()
@@ -119,7 +119,7 @@ async fn transfer_leader_moves_leadership_and_keeps_membership() {
     // (3) Membership intact: a single uniform config with all 3 voters. This is
     // the R608-B11 invariant — the handoff never touches membership, so there is
     // no quorum reduction and the cluster is never left in a joint config.
-    let status_json: serde_json::Value = reqwest::Client::new()
+    let status_json: serde_json::Value = yubaba_test_harness::http()
         .get(format!("{}/raft/status", cluster.yubaba(f0).base_url))
         .send()
         .await

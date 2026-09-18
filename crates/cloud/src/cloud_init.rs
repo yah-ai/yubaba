@@ -172,10 +172,56 @@ pub const COSIGN_SHA256_ARM64: &str =
 /// rejects (R605-F1).
 pub use crate::release_manifest::COSIGN_OIDC_ISSUER;
 
+/// Where the twin-drift guard should look for the canonical `mirror.yml`.
+///
+/// The canonical copy lives at `<monorepo root>/.yah/infra/cloud-init/mirror.yml`
+/// and is what [`load_template`] — and therefore every real provision — actually
+/// reads. The embedded [`DEFAULT_TEMPLATE`] is only the fallback for when that
+/// file is absent, so the two must not be allowed to diverge.
+///
+/// Resolving that root is not as simple as "first ancestor with a `.yah/`".
+/// `oss/yubaba` is a deliberately independent cargo workspace (monorepo
+/// CLAUDE.md, "Co-developed OSS repos"), and its own `.yah/` carries nothing
+/// but a `.gitignore` — so an ancestor walk keyed on `.yah/` stops AT
+/// `oss/yubaba`, where the canonical file can never exist. That is exactly how
+/// `embedded_template_matches_workspace_canonical` spent months taking its
+/// "file not there yet, nothing to compare" branch and asserting nothing while
+/// the twin drifted 128 lines behind (R870-B25).
+///
+/// The discriminator is `.yah/infra/`: the monorepo has it (machines,
+/// cloud-init, preseed, rules, …), and a standalone export of this subtree —
+/// where the repo root genuinely *is* `oss/yubaba` — does not.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CanonicalHome {
+    /// Built inside the yah monorepo. The canonical `mirror.yml` MUST exist
+    /// under this root; its absence is a defect, never a bootstrap case.
+    Monorepo(std::path::PathBuf),
+    /// Built from the standalone `yubaba` export, which ships no `.yah/infra/`
+    /// and therefore no canonical copy. Nothing on disk to compare against —
+    /// the embedded template is the only template there is.
+    StandaloneExport,
+}
+
+/// Walk `start`'s ancestors for the monorepo root that owns the canonical
+/// cloud-init template. See [`CanonicalHome`] for why `.yah/infra/` is the
+/// marker rather than `.yah/`.
+pub fn locate_canonical_home(start: &Path) -> CanonicalHome {
+    match start
+        .ancestors()
+        .find(|p| p.join(".yah").join("infra").is_dir())
+    {
+        Some(root) => CanonicalHome::Monorepo(root.to_path_buf()),
+        None => CanonicalHome::StandaloneExport,
+    }
+}
+
 /// Load the cloud-init template for a workspace.
 ///
 /// Prefers `<workspace_root>/.yah/infra/cloud-init/mirror.yml` if it exists,
-/// otherwise returns the embedded [`DEFAULT_TEMPLATE`].
+/// otherwise returns the embedded [`DEFAULT_TEMPLATE`]. In the monorepo that
+/// file always exists, so **the on-disk canonical copy is what provisioning
+/// ships** — the embedded one is a fallback for fresh/exported workspaces, not
+/// the live path (R870-B25).
 pub fn load_template(workspace_root: &Path) -> Result<String> {
     let custom = crate::paths::cloud_init_template(workspace_root);
     if custom.exists() {
@@ -953,23 +999,266 @@ mod tests {
     #[test]
     fn embedded_template_matches_workspace_canonical() {
         // Drift test: .yah/infra/cloud-init/mirror.yml must stay in sync with
-        // the embedded DEFAULT_TEMPLATE (crates/yah/cloud/templates/mirror.yml).
-        // Edit both files together; this test catches divergence.
-        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .find(|p| p.join(".yah").is_dir())
-            .expect("workspace root not found from CARGO_MANIFEST_DIR");
-        let canonical_path = crate::paths::cloud_init_template(workspace_root);
-        if canonical_path.exists() {
-            let canonical =
-                std::fs::read_to_string(&canonical_path).expect("reading workspace canonical");
-            assert_eq!(
-                canonical.trim_end(),
-                DEFAULT_TEMPLATE.trim_end(),
-                ".yah/infra/cloud-init/mirror.yml drifted from crates/yah/cloud/templates/mirror.yml — edit both files together"
+        // the embedded DEFAULT_TEMPLATE (templates/mirror.yml). Edit both files
+        // together; this test catches divergence.
+        //
+        // It only catches it because the root is resolved via
+        // locate_canonical_home rather than "first ancestor with a `.yah/`" —
+        // the latter stops at oss/yubaba, whose .yah/ holds only a .gitignore,
+        // so the canonical file was never found, the old `if exists` branch
+        // never fired, and this test asserted NOTHING for months (R870-B25).
+        // A missing canonical file inside the monorepo is now a hard failure,
+        // not a bootstrap case.
+        match locate_canonical_home(Path::new(env!("CARGO_MANIFEST_DIR"))) {
+            CanonicalHome::Monorepo(root) => {
+                let canonical_path = crate::paths::cloud_init_template(&root);
+                let canonical = std::fs::read_to_string(&canonical_path).unwrap_or_else(|e| {
+                    panic!(
+                        "{} is unreadable ({e}) — in the monorepo this file is REQUIRED, not \
+                         optional: cloud_init::load_template prefers it over the embedded \
+                         template, so it is the copy real provisions ship",
+                        canonical_path.display()
+                    )
+                });
+                assert_eq!(
+                    canonical.trim_end(),
+                    DEFAULT_TEMPLATE.trim_end(),
+                    "{} drifted from the embedded templates/mirror.yml — edit both files \
+                     together. The on-disk copy is the one provisioning actually reads.",
+                    canonical_path.display()
+                );
+            }
+            CanonicalHome::StandaloneExport => {
+                // The exported yubaba repo carries no .yah/infra/ and therefore
+                // no canonical copy; the embedded template is the only one.
+                // This is the ONLY branch allowed to skip the comparison, and
+                // locate_canonical_home_* below pin what can reach it.
+            }
+        }
+    }
+
+    /// Anchors that must appear in BOTH `mirror.yml` and its SSH twin
+    /// `.yah/infra/cloud-init/stand-up-yubaba.sh` for the two to count as level
+    /// on what they install.
+    ///
+    /// Every entry is asserted against the template as well as the script, so
+    /// the list cannot rot into pinning a step the template has since dropped —
+    /// a stale anchor goes red on the template side instead of quietly
+    /// over-constraining the script.
+    ///
+    /// This is deliberately an ANCHOR list, not a diff: the two files are
+    /// different languages with different runtime contracts (cloud-init runs
+    /// once as root on a fresh box; the script is idempotent, re-runnable and
+    /// `$SUDO`-prefixed), and several divergences are correct — the script's
+    /// `enable` + `restart` instead of `enable --now`, its write-if-absent
+    /// journald ceiling, its cluster-KEK install, its loopback bind. What must
+    /// NOT diverge is the set of artifacts a node ends up carrying.
+    const STAND_UP_TWIN_ANCHORS: &[(&str, &str)] = &[
+        // R858-F17 durability helpers. Absent → kamaji refuses to deploy any
+        // workload declaring a `yah.durability.tier` (kamaji-bin/src/hydrate.rs).
+        (
+            "/usr/local/bin/turso-backup-hydrate",
+            "durability helper binary",
+        ),
+        (
+            "/usr/local/bin/turso-backup-tail",
+            "durability helper binary",
+        ),
+        ("KAMAJI_HYDRATE_HELPER", "kamaji drop-in env var"),
+        ("KAMAJI_TAIL_HELPER", "kamaji drop-in env var"),
+        (
+            "/etc/systemd/system/kamaji.service.d",
+            "drop-in dir the helper env vars land in",
+        ),
+        // R858 headscale DB continuity. The unit is staged and never enabled —
+        // leader.rs starts it on gaining the ingress owner role — and yubaba
+        // runs ProtectSystem=strict, so a node that did not get it at stand-up
+        // can never acquire it at runtime.
+        ("litestream-headscale.service", "staged replication unit"),
+        ("/usr/local/bin/litestream", "replicate/restore binary"),
+        // R858-T4: every node is a coordinator candidate, and the appliance is
+        // a NATIVE workload kamaji forks rather than pulls.
+        (
+            "/var/lib/yah-cloud/headscale/headscale",
+            "pre-staged headscale binary",
+        ),
+    ];
+
+    /// Maximal runs of lowercase hex exactly 64 chars long — the sha256 pins
+    /// for third-party downloads. `{{YAH_YUBABA_SHA256}}` is a placeholder, not
+    /// hex, so it is not picked up; the four real pins (litestream and
+    /// headscale, amd64 and arm64) are.
+    fn sha256_pins(s: &str) -> std::collections::BTreeSet<String> {
+        s.split(|c: char| !c.is_ascii_hexdigit() || c.is_ascii_uppercase())
+            .filter(|t| t.len() == 64)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Every `https://github.com/<owner>/<repo>/releases/download/<tag>/`
+    /// prefix in `s`. Owner, repo and tag are the pinned part; the asset
+    /// filename after the tag is arch-templated and left free.
+    fn upstream_release_pins(s: &str) -> std::collections::BTreeSet<String> {
+        const MARK: &str = "https://github.com/";
+        let mut out = std::collections::BTreeSet::new();
+        for (i, _) in s.match_indices(MARK) {
+            let rest = &s[i..];
+            let Some(dl) = rest.find("/releases/download/") else {
+                continue;
+            };
+            let after = &rest[dl + "/releases/download/".len()..];
+            let Some(slash) = after.find('/') else {
+                continue;
+            };
+            out.insert(rest[..dl + "/releases/download/".len() + slash + 1].to_string());
+        }
+        out
+    }
+
+    #[test]
+    fn stand_up_script_carries_the_templates_install_steps() {
+        // THIRD-TWIN GUARD (R870-B25). mirror.yml had two copies and one
+        // vacuous guard between them; the SSH transcription
+        // .yah/infra/cloud-init/stand-up-yubaba.sh is a third copy of the same
+        // install list with NO guard at all, which is how it came to be missing
+        // the R858-F17 durability helpers and the R858 litestream/headscale
+        // pre-stage while both mirror.yml copies carried them.
+        //
+        // The pins below are DERIVED FROM THE TEMPLATE rather than restated, so
+        // bumping litestream or headscale in mirror.yml alone turns this red
+        // instead of leaving the script pinned to a superseded checksum.
+        let root = match locate_canonical_home(Path::new(env!("CARGO_MANIFEST_DIR"))) {
+            CanonicalHome::Monorepo(root) => root,
+            // Same single permitted skip as the mirror.yml drift guard: the
+            // exported yubaba repo ships no .yah/infra/, so there is no script.
+            // drift_guard_cannot_go_vacuous_in_the_monorepo pins that this
+            // branch is unreachable from inside the monorepo.
+            CanonicalHome::StandaloneExport => return,
+        };
+        let script_path = crate::paths::stand_up_script(&root);
+        let script = std::fs::read_to_string(&script_path).unwrap_or_else(|e| {
+            panic!(
+                "{} is unreadable ({e}) — it is mirror.yml's SSH twin for LAN nodes \
+                 (W257 step 6) and must stay level with it",
+                script_path.display()
+            )
+        });
+
+        for (anchor, what) in STAND_UP_TWIN_ANCHORS {
+            assert!(
+                DEFAULT_TEMPLATE.contains(anchor),
+                "STAND_UP_TWIN_ANCHORS is stale: templates/mirror.yml no longer mentions \
+                 {anchor} ({what}) — drop the anchor here rather than holding the script \
+                 to a step the template abandoned"
+            );
+            assert!(
+                script.contains(anchor),
+                "{} is behind templates/mirror.yml: no {anchor} ({what}). A LAN node stood \
+                 up by this script would not carry it. Transcribe the step in the script's \
+                 own idiom ($SUDO install from $D, tee for drop-ins, non-fatal WARNING) — \
+                 this is not a byte-diff, only the resulting artifacts must match.",
+                script_path.display()
             );
         }
-        // If the file doesn't exist yet, the test passes (bootstrap case).
+
+        let pins = sha256_pins(DEFAULT_TEMPLATE);
+        assert!(
+            pins.len() >= 4,
+            "expected the template's four third-party sha256 pins (litestream and \
+             headscale, amd64 and arm64), found {} — the extractor is broken, and a \
+             broken extractor makes this guard vacuous",
+            pins.len()
+        );
+        for pin in &pins {
+            assert!(
+                script.contains(pin.as_str()),
+                "{} is missing the sha256 pin {pin} that templates/mirror.yml verifies. \
+                 An unpinned or stale-pinned download is the failure this guard exists \
+                 for — copy the checksum across when you bump the version.",
+                script_path.display()
+            );
+        }
+
+        let releases = upstream_release_pins(DEFAULT_TEMPLATE);
+        assert!(
+            releases.len() >= 2,
+            "expected the litestream and headscale release pins in the template, found {}",
+            releases.len()
+        );
+        for release in &releases {
+            assert!(
+                script.contains(release.as_str()),
+                "{} does not fetch {release} — the script and the template must pin the \
+                 SAME upstream version, or a LAN node and a cloud node run different \
+                 headscale/litestream builds against the same replicated DB.",
+                script_path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn locate_canonical_home_finds_monorepo_root_not_the_inner_workspace() {
+        // Shape of the monorepo: repo root carries .yah/infra/, the inner
+        // oss/yubaba workspace carries a .yah/ with no infra/ (a .gitignore
+        // lives there in the real tree). The walk must climb PAST the inner one.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".yah/infra/cloud-init")).unwrap();
+        let crate_dir = root.join("oss/yubaba/crates/cloud");
+        std::fs::create_dir_all(&crate_dir).unwrap();
+        std::fs::create_dir_all(root.join("oss/yubaba/.yah")).unwrap();
+        std::fs::write(root.join("oss/yubaba/.yah/.gitignore"), "*\n").unwrap();
+
+        assert_eq!(
+            locate_canonical_home(&crate_dir),
+            CanonicalHome::Monorepo(root.to_path_buf()),
+            "walk stopped at the inner independent workspace instead of the monorepo root"
+        );
+    }
+
+    #[test]
+    fn locate_canonical_home_reports_standalone_export() {
+        // Shape of the exported yubaba repo: no .yah/infra/ anywhere above the
+        // crate. Nothing to compare against, and that must be a distinct,
+        // named verdict rather than a silent miss.
+        let tmp = tempfile::tempdir().unwrap();
+        let crate_dir = tmp.path().join("crates/cloud");
+        std::fs::create_dir_all(&crate_dir).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".yah")).unwrap();
+        std::fs::write(tmp.path().join(".yah/.gitignore"), "*\n").unwrap();
+
+        assert_eq!(
+            locate_canonical_home(&crate_dir),
+            CanonicalHome::StandaloneExport
+        );
+    }
+
+    #[test]
+    fn drift_guard_cannot_go_vacuous_in_the_monorepo() {
+        // Guards the guard, off a signal INDEPENDENT of the `.yah/infra/`
+        // marker locate_canonical_home uses — otherwise this would just restate
+        // it. `git subtree split --prefix=oss/yubaba` (scripts/export-oss.sh)
+        // strips that prefix, so a manifest dir still ending in
+        // `oss/yubaba/crates/cloud` means we are in the monorepo, where the
+        // comparison MUST happen. Re-break root resolution and this goes red
+        // instead of the drift guard going quietly green.
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        if manifest.ends_with("oss/yubaba/crates/cloud") {
+            let home = locate_canonical_home(manifest);
+            let root = match &home {
+                CanonicalHome::Monorepo(root) => root,
+                CanonicalHome::StandaloneExport => panic!(
+                    "running inside the monorepo at {} but the drift guard resolved \
+                     StandaloneExport — it would skip the comparison and assert nothing",
+                    manifest.display()
+                ),
+            };
+            assert!(
+                crate::paths::cloud_init_template(root).is_file(),
+                "monorepo root {} has .yah/infra/ but no cloud-init/mirror.yml",
+                root.display()
+            );
+        }
     }
 
     #[test]

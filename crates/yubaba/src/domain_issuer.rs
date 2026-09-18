@@ -55,7 +55,7 @@
 //! are the sealed pair and the claim object.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -65,9 +65,10 @@ use tracing::{error, info, warn};
 use zeroize::Zeroizing;
 
 use crate::acme_issuer::{cert_secret_name, key_secret_name};
-use crate::cert_store::{CertStoreError, ObjectCertStore};
+use crate::cert_store::{serving_on, CertStoreError, EnrollmentAcme, ObjectCertStore, ServingNode};
+use crate::fleet_secrets::FleetSecretStore;
 use crate::raft::SecretRecord;
-use crate::secrets::{load_cluster_kek, seal_cluster_secret, CLUSTER_KEK_PATH};
+use crate::secrets::{load_cluster_kek, open_cluster_secret, seal_cluster_secret, CLUSTER_KEK_PATH};
 use workload_spec::secrets::SecretAccess;
 
 /// Env key naming the zone tenants delegate their challenge into. Its presence
@@ -365,7 +366,15 @@ async fn sweep(
     last_order: &mut Option<Instant>,
 ) -> Result<SweepOutcome, CertStoreError> {
     let store_for_list = Arc::clone(store);
-    let enrolled = blocking(move || store_for_list.enrolled()).await?;
+    // R910-F2: a self-declared record names its own zone and token and is
+    // issued by the node it is scoped to ([`spawn_declared`]). This issuer has
+    // neither input for it, so ordering one would only fail and park a domain
+    // that is not broken.
+    let enrolled: Vec<_> = blocking(move || store_for_list.enrolled())
+        .await?
+        .into_iter()
+        .filter(|(_, e)| e.acme.is_none())
+        .collect();
 
     let mut outcome = SweepOutcome {
         considered: enrolled.len(),
@@ -546,8 +555,15 @@ async fn store_issued(
     // domains, and `AllowAny` over-answers it by making every tenant private key
     // a bearer secret. See `tenant_passway::grant`.
     let access = crate::tenant_passway::grant(&cfg.access, domain);
-    let mut cert_rec =
-        seal_cluster_secret(kek, issued.cert_chain_pem.as_bytes(), stamp, access.clone());
+    // R911-F4: each record is sealed under the exact name it is stored and
+    // resolved under, so the pair cannot be swapped or re-homed in the bucket.
+    let mut cert_rec = seal_cluster_secret(
+        kek,
+        cert_name,
+        issued.cert_chain_pem.as_bytes(),
+        stamp,
+        access.clone(),
+    );
     // R853-F10: stamp the ARI id of the chain the CA just returned, so the next
     // sweep's renewal can name it. `sans` deliberately stays `None` here —
     // `order_identifiers` pins a tenant order to exactly one name that cannot
@@ -567,7 +583,7 @@ async fn store_issued(
     // node's own plaintext copy of a tenant's private key, and it should not
     // linger in a freed heap page after this frame.
     let key_bytes = Zeroizing::new(issued.key_pem.into_bytes());
-    let key_rec = seal_cluster_secret(kek, &key_bytes, stamp, access);
+    let key_rec = seal_cluster_secret(kek, key_name, &key_bytes, stamp, access);
 
     // `write_pair` is key-first/cert-last, which is what makes a partial write
     // heal: `needs_issuance` gates off the CERT record, so a half-written pair
@@ -588,6 +604,260 @@ async fn store_issued(
             })
     })
     .await
+}
+
+// ── Self-declared domains (R910-F2) ──────────────────────────────────────────
+
+/// Node directory each self-declared domain's DNS token is written into.
+/// Under `/run`, so no plaintext token survives a reboot on disk — the cluster
+/// secret in the object store is the durable copy (R911).
+pub const DECLARED_TOKEN_DIR: &str = "/run/yah/yubaba/acme-tokens";
+
+/// Per-node inputs of the declared issuer. Everything per-domain — contact,
+/// zone, token — comes off the enrollment record itself.
+#[derive(Debug, Clone)]
+pub struct DeclaredIssuerConfig {
+    /// This node; only records scoped to its machine are issued here.
+    pub node: ServingNode,
+    /// The cert store's own directory, so the pair lands under the issuer
+    /// segment the tenant-passway sweep reads it back from.
+    pub directory: acme_engine::AcmeDirectory,
+    /// ACME account cache — the same key, and default, as the delegation
+    /// issuer: one account per node, one order budget.
+    pub account_cache_path: String,
+    /// Cloudflare API base override (tests).
+    pub api_base: Option<String>,
+    /// DNS-01 propagation wait before asking the CA to validate.
+    pub propagation: Duration,
+    /// Where tokens are materialized; [`DECLARED_TOKEN_DIR`].
+    pub token_dir: PathBuf,
+    /// Node-local cluster KEK — opens the token, seals the pair.
+    pub kek_path: PathBuf,
+    /// Seconds between sweeps.
+    pub sweep: Duration,
+    /// Minimum spacing between two orders from this node.
+    pub min_order_interval: Duration,
+    /// How long a failed domain is parked.
+    pub failure_cooldown: Duration,
+    /// Assumed issued-cert validity.
+    pub cert_lifetime: Duration,
+    /// Renew within this margin of expiry.
+    pub renew_before: Duration,
+}
+
+/// Parse the declared issuer's per-node config. Never `None`: every key has a
+/// default, because whether this runs is decided by the node arming tenant
+/// passways (`main`), not by a switch of its own — a node that arms a
+/// self-declared door and does not issue its cert serves nothing.
+pub fn parse_declared_issuer_config(
+    get: impl Fn(&str) -> Option<String>,
+    node: ServingNode,
+) -> Result<DeclaredIssuerConfig, String> {
+    let propagation_secs = parse_u64(&get, "YUBABA_ACME_DNS01_PROPAGATION_SECS", 10)?;
+    let sweep_secs = parse_u64(&get, SWEEP_SECS_ENV, DEFAULT_SWEEP_SECS)?;
+    let min_order_secs = parse_u64(&get, MIN_ORDER_SECS_ENV, DEFAULT_MIN_ORDER_SECS)?;
+    let failure_cooldown_secs =
+        parse_u64(&get, FAILURE_COOLDOWN_SECS_ENV, DEFAULT_FAILURE_COOLDOWN_SECS)?;
+    let renew_before_days = parse_u64(&get, "YUBABA_ACME_RENEW_BEFORE_DAYS", 30)?;
+    let cert_lifetime_days = parse_u64(&get, "YUBABA_ACME_CERT_LIFETIME_DAYS", 90)?;
+    if sweep_secs == 0 {
+        return Err(format!("{SWEEP_SECS_ENV} must be greater than zero"));
+    }
+    if min_order_secs == 0 {
+        return Err(format!(
+            "{MIN_ORDER_SECS_ENV} must be greater than zero — it is the per-account new-order \
+             pacing"
+        ));
+    }
+    Ok(DeclaredIssuerConfig {
+        node,
+        directory: crate::cert_store::acme_directory(&get),
+        account_cache_path: get("YUBABA_ACME_ACCOUNT_CACHE")
+            .unwrap_or_else(|| "/var/lib/yah/yubaba/acme-account.json".to_string()),
+        api_base: crate::acme_issuer::cf_api_base(&get),
+        propagation: Duration::from_secs(propagation_secs),
+        token_dir: PathBuf::from(DECLARED_TOKEN_DIR),
+        kek_path: PathBuf::from(
+            get("YUBABA_ACME_KEK_PATH").unwrap_or_else(|| CLUSTER_KEK_PATH.to_string()),
+        ),
+        sweep: Duration::from_secs(sweep_secs),
+        min_order_interval: Duration::from_secs(min_order_secs),
+        failure_cooldown: Duration::from_secs(failure_cooldown_secs),
+        cert_lifetime: Duration::from_secs(cert_lifetime_days * 86_400),
+        renew_before: Duration::from_secs(renew_before_days * 86_400),
+    })
+}
+
+/// The [`DomainIssuerConfig`] one self-declared record orders under — so the
+/// claim, pacing, order, seal and store path is [`consider_domain`], shared
+/// with the delegation issuer rather than restated.
+///
+/// The access rule starts EMPTY and [`store_issued`] widens it with
+/// [`crate::tenant_passway::grant`], so the pair admits exactly this domain's
+/// own passway and nothing else.
+fn declared_record_config(
+    base: &DeclaredIssuerConfig,
+    acme: &EnrollmentAcme,
+    token_file: &Path,
+) -> DomainIssuerConfig {
+    DomainIssuerConfig {
+        issue: IssueConfig {
+            domains: Vec::new(),
+            contact_email: acme.contact_email.clone(),
+            directory: base.directory.clone(),
+            account_cache_path: base.account_cache_path.clone(),
+            challenge: AcmeChallengeKind::Dns01Cloudflare {
+                token_file: token_file.display().to_string(),
+                zone_id: acme.zone_id.clone(),
+                // The record's own zone holds the name: no delegation.
+                delegate_zone: None,
+                api_base: base.api_base.clone(),
+            },
+            dns01_propagation_delay: base.propagation,
+            directory_root_cert: None,
+        },
+        kek_path: base.kek_path.clone(),
+        access: SecretAccess::workloads(std::iter::empty::<String>()),
+        sweep: base.sweep,
+        min_order_interval: base.min_order_interval,
+        failure_cooldown: base.failure_cooldown,
+        cert_lifetime: base.cert_lifetime,
+        renew_before: base.renew_before,
+    }
+}
+
+/// Spawn the declared issuer: orders certs for the self-declared records scoped
+/// to this node, with each record's token opened from the fleet secret store.
+pub fn spawn_declared(
+    store: Arc<ObjectCertStore>,
+    secrets: FleetSecretStore,
+    node_id: String,
+    cfg: DeclaredIssuerConfig,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let kek = match load_cluster_kek(&cfg.kek_path) {
+            Ok(k) => k,
+            Err(e) => {
+                error!(
+                    kek_path = ?cfg.kek_path,
+                    "declared issuer: cannot load cluster KEK — self-declared domains will not \
+                     be issued on this node: {e}"
+                );
+                return;
+            }
+        };
+        info!(
+            machine = ?cfg.node.machine,
+            scope = ?cfg.node.scope,
+            group = %secrets.group(),
+            issuer = %store.issuer(),
+            "declared issuer: watching for self-declared domains scoped to this node"
+        );
+        let mut last_order: Option<Instant> = None;
+        loop {
+            match declared_sweep(&store, &secrets, &node_id, &cfg, &kek, &mut last_order).await {
+                Ok(SweepOutcome { considered, issued }) if issued > 0 => {
+                    info!(considered, issued, "declared issuer: sweep complete")
+                }
+                Ok(_) => {}
+                Err(e) => warn!("declared issuer: sweep aborted (retrying next tick): {e}"),
+            }
+            tokio::time::sleep(cfg.sweep).await;
+        }
+    })
+}
+
+/// One pass over the self-declared records scoped to this node.
+async fn declared_sweep(
+    store: &Arc<ObjectCertStore>,
+    secrets: &FleetSecretStore,
+    node_id: &str,
+    cfg: &DeclaredIssuerConfig,
+    kek: &[u8; 32],
+    last_order: &mut Option<Instant>,
+) -> Result<SweepOutcome, CertStoreError> {
+    let store_for_list = Arc::clone(store);
+    let enrolled = blocking(move || store_for_list.enrolled()).await?;
+    let mine: Vec<(String, EnrollmentAcme)> = serving_on(enrolled, &cfg.node)
+        .into_iter()
+        .filter(|(_, e)| !e.machines.is_empty())
+        .filter_map(|(d, e)| e.acme.map(|a| (d, a)))
+        .collect();
+
+    let mut outcome = SweepOutcome {
+        considered: mine.len(),
+        issued: 0,
+    };
+    for (domain, acme) in mine {
+        // Materialized every sweep, not only when an order is due: one GET per
+        // self-declared domain, a no-op write when unchanged, and a rotated
+        // token is on disk before the renewal that needs it.
+        let token = {
+            let (secrets, kek, dir, domain, name) = (
+                secrets.clone(),
+                *kek,
+                cfg.token_dir.clone(),
+                domain.clone(),
+                acme.token_secret.clone(),
+            );
+            tokio::task::spawn_blocking(move || {
+                materialize_token(&secrets, &kek, &dir, &domain, &name)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("token task failed: {e}")))
+        };
+        let token = match token {
+            Ok(path) => path,
+            Err(e) => {
+                warn!(domain = %domain, "declared issuer: skipped: {e}");
+                continue;
+            }
+        };
+        let record_cfg = declared_record_config(cfg, &acme, &token);
+        match consider_domain(store, node_id, &record_cfg, kek, &domain, last_order).await {
+            Ok(true) => outcome.issued += 1,
+            Ok(false) => {}
+            Err(e) => warn!(domain = %domain, "declared issuer: skipped: {e}"),
+        }
+    }
+    Ok(outcome)
+}
+
+/// Open `name` as `domain`'s passway and write it to `<dir>/<domain>.token`
+/// (`0600`, under a `0700` dir), returning the path.
+///
+/// Opened as [`crate::tenant_passway::consumer`]`(domain)` — the identity the
+/// token's access rule is declared against — rather than a yubaba-wide
+/// identity, so one token cannot be borrowed by a record for a domain its
+/// declaration never named.
+fn materialize_token(
+    secrets: &FleetSecretStore,
+    kek: &[u8; 32],
+    dir: &Path,
+    domain: &str,
+    name: &str,
+) -> Result<PathBuf, String> {
+    let rec = secrets
+        .read_secret(name)
+        .map_err(|e| format!("reading cluster secret {name}: {e}"))?
+        .ok_or_else(|| {
+            format!(
+                "cluster secret {name} does not exist in sovereign group {}",
+                secrets.group()
+            )
+        })?;
+    let who = crate::tenant_passway::consumer(domain);
+    let token = Zeroizing::new(
+        open_cluster_secret(kek, name, &rec, &who)
+            .map_err(|e| format!("opening cluster secret {name} as {}: {e}", who.workload))?,
+    );
+    std::fs::create_dir_all(dir)
+        .and_then(|()| crate::tenant_passway::restrict_dir(dir))
+        .map_err(|e| format!("token directory {}: {e}", dir.display()))?;
+    let path = dir.join(format!("{domain}.token"));
+    crate::tenant_passway::write_if_changed(&path, &token)
+        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// Run a synchronous [`ObjectCertStore`] call off the runtime's worker threads.
@@ -612,6 +882,45 @@ where
 mod tests {
     use super::*;
     use std::collections::HashMap as Map;
+
+    #[test]
+    fn a_declared_record_orders_against_its_own_zone_and_seals_for_its_own_passway_only() {
+        let base = parse_declared_issuer_config(
+            env(&[(crate::cert_store::DIRECTORY_ENV, "production")]),
+            ServingNode {
+                machine: Some("us-west-011".into()),
+                ..ServingNode::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(base.token_dir, PathBuf::from(DECLARED_TOKEN_DIR));
+        let acme = EnrollmentAcme {
+            contact_email: "ops@example.com".into(),
+            zone_id: "zone-1".into(),
+            token_secret: "noisetable/staging/cf-dns".into(),
+        };
+        let token = Path::new("/run/yah/yubaba/acme-tokens/staging.example.com.token");
+        let rc = declared_record_config(&base, &acme, token);
+        assert_eq!(rc.issue.contact_email, "ops@example.com");
+        match &rc.issue.challenge {
+            AcmeChallengeKind::Dns01Cloudflare {
+                token_file,
+                zone_id,
+                delegate_zone,
+                ..
+            } => {
+                assert_eq!(zone_id, "zone-1");
+                assert!(delegate_zone.is_none(), "the record's own zone holds the name");
+                assert_eq!(token_file, &token.display().to_string());
+            }
+            _ => panic!("a declared record orders by DNS-01"),
+        }
+        // Empty until the seal-time grant, so the pair admits exactly this
+        // domain's passway.
+        let sealed_for = crate::tenant_passway::grant(&rc.access, "staging.example.com");
+        assert!(sealed_for.admits(&crate::tenant_passway::consumer("staging.example.com")));
+        assert!(!sealed_for.admits(&crate::tenant_passway::consumer("other.example.com")));
+    }
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: Map<String, String> = pairs

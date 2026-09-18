@@ -258,7 +258,11 @@ use crate::raft::{YubabaNodeId, YubabaRaft, YubabaRequest};
 use crate::scheduler::NodeEligibility;
 use crate::secrets::ClusterResolver;
 use crate::ServerState;
-use crate::{headscale_appliance, headscale_state, litestream};
+use crate::{headscale_appliance, headscale_state};
+// noisetable R118-T11: the sidecar is behind the `litestream` feature, so the
+// three leadership-transition hooks below are too.
+#[cfg(feature = "litestream")]
+use crate::litestream;
 
 /// Spawn the leadership watcher.  The returned `JoinHandle` can be aborted on
 /// daemon shutdown, but the watcher will also exit on its own when the raft
@@ -979,7 +983,10 @@ async fn reconcile_appliance_ownership(
             // denies it exists, and every front door following the record sends
             // mesh clients nowhere (R591-T2).
             if let Some(observed) = running_here {
-                let spec = headscale_appliance::appliance_spec(&state.headscale_dir);
+                let spec = headscale_appliance::appliance_spec(
+                    &state.headscale_dir,
+                    state.headscale_durability,
+                );
                 // A native workload has no namespace of its own, so the
                 // supervisor may report no per-workload address; the node's own
                 // mesh address is the right answer then, exactly as on the
@@ -1467,6 +1474,8 @@ async fn on_became_leader(
     // on.
     claim_required: bool,
 ) -> Result<(), ApplianceStartError> {
+    // noisetable R118-T11: the only reader is the `litestream` install below.
+    #[cfg(feature = "litestream")]
     let headscale_db = state.headscale_dir.join("headscale.db");
 
     // 1. Write the litestream config the replicate unit started in step 3
@@ -1483,6 +1492,7 @@ async fn on_became_leader(
     //    `yah.durability.*` declaration on the appliance's `WorkloadSpec`
     //    (`headscale_appliance::appliance_spec`) — see `start_headscale`
     //    below, which is where kamaji's hydrate-on-place actually runs.
+    #[cfg(feature = "litestream")]
     if let Some(s3_url) = &state.litestream_s3_url {
         if let Err(e) = litestream::install(&headscale_db, s3_url) {
             warn!(
@@ -1500,6 +1510,7 @@ async fn on_became_leader(
 
     // 3. Start litestream sidecar. After the start, not before: replicating a
     //    DB from a node that is not serving it publishes a losing copy to S3.
+    #[cfg(feature = "litestream")]
     if state.litestream_s3_url.is_some() {
         litestream::start();
         info!("litestream-headscale sidecar started");
@@ -1602,6 +1613,7 @@ fn names_another_leader(
 
 async fn on_lost_leader(state: &Arc<ServerState>) {
     // 1. Stop litestream replicate (followers don't replicate).
+    #[cfg(feature = "litestream")]
     if state.litestream_s3_url.is_some() {
         litestream::stop();
         info!("litestream-headscale sidecar stopped");
@@ -1658,7 +1670,8 @@ async fn on_lost_leader(state: &Arc<ServerState>) {
 /// 37 hours with every external healthcheck green. The claim now depends on
 /// this value.
 async fn start_headscale(state: &Arc<ServerState>) -> Result<(), ApplianceStartError> {
-    let spec = headscale_appliance::appliance_spec(&state.headscale_dir);
+    let spec =
+        headscale_appliance::appliance_spec(&state.headscale_dir, state.headscale_durability);
 
     // R858-T2: place the coordinator's noise identity BEFORE either start path
     // below. `headscale serve` mints a fresh key when the file is absent, and
@@ -1667,13 +1680,12 @@ async fn start_headscale(state: &Arc<ServerState>) -> Result<(), ApplianceStartE
     // `/health` still returns 200. So "after" here is indistinguishable from
     // "never", and a refusal to start is the only safe answer when the cluster
     // holds an identity this node cannot put on disk.
+    // R911-F2: the store read is blocking HTTPS, so it runs off the runtime.
     let resolver = noise_key_resolver(state, &spec);
-    if let Err(e) = headscale_state::materialize_noise_key(
-        resolver
-            .as_ref()
-            .map(|r| r as &dyn workload_spec::secrets::SecretResolver),
-        &state.headscale_dir,
-    ) {
+    if let Err(e) =
+        headscale_state::materialize_noise_key_off_runtime(resolver, state.headscale_dir.clone())
+            .await
+    {
         error!("{e}");
         // R858-T3 preserves R858-T2's refusal exactly — including that it comes
         // FIRST, before either start path. The only change is that the refusal
@@ -1837,17 +1849,21 @@ impl std::fmt::Display for ApplianceStartError {
 /// (R706 / W294) rather than bypassed — the consumer is a required constructor
 /// argument precisely so no call site can opt out.
 ///
-/// `None` means this node has no cluster-secret rail at all: no raft state, or
-/// no node-local KEK. That is not treated as a failure here — see
-/// [`headscale_state::materialize_noise_key`] for why an *unavailable* store is
-/// read as an absent record rather than as a reason to refuse to start.
+/// `None` means this node has no node-local KEK, so no cluster secret can be
+/// opened here at all; [`headscale_state::materialize_noise_key`] then falls
+/// through to its on-disk verdicts.
+///
+/// R911-F1: the store is the fleet object store. A node with a KEK but no store
+/// config, or no sovereign group, still gets a resolver — its store answers
+/// `Unconfigured` / `NoSovereignGroup`, which surfaces as `ClusterUnavailable`,
+/// and `materialize_noise_key` refuses to start on that rather than minting an
+/// identity the store may already hold.
 fn noise_key_resolver(
     state: &Arc<ServerState>,
     spec: &workload_spec::WorkloadSpec,
-) -> Option<ClusterResolver<crate::raft::YubabaStateMachine>> {
-    let sm = state.cluster_state.as_ref()?;
+) -> Option<ClusterResolver<crate::fleet_secrets::NodeSecretStore>> {
     match ClusterResolver::from_kek_file(
-        sm.clone(),
+        crate::fleet_secrets::FleetSecretStore::for_node(state),
         &state.cluster_kek_path,
         &state.local_secret_store_root,
         workload_spec::secrets::SecretConsumer::of(spec),
@@ -2269,16 +2285,20 @@ mod tests {
     #[test]
     fn the_probed_paths_are_the_ones_the_spec_names() {
         let dir = std::path::PathBuf::from("/var/lib/yah-cloud/headscale");
-        let spec = headscale_appliance::appliance_spec(&dir);
-        let argv = spec.command.clone().unwrap_or_default();
-        for probed in argv_paths(&dir) {
-            let probed = probed.to_string_lossy().into_owned();
-            assert!(
-                argv.contains(&probed),
-                "placement checks {probed} for existence, but the deploy's argv is {argv:?} — a \
-                 probe that gates on a path the spec does not use is a placement lie in either \
-                 direction"
-            );
+        // R858-B23: both settings of the durability gate, because probe and
+        // deploy must agree whichever one the node is provisioned with.
+        for durability in [false, true] {
+            let spec = headscale_appliance::appliance_spec(&dir, durability);
+            let argv = spec.command.clone().unwrap_or_default();
+            for probed in argv_paths(&dir) {
+                let probed = probed.to_string_lossy().into_owned();
+                assert!(
+                    argv.contains(&probed),
+                    "placement checks {probed} for existence, but the deploy's argv is {argv:?} — \
+                     a probe that gates on a path the spec does not use is a placement lie in \
+                     either direction"
+                );
+            }
         }
     }
 }

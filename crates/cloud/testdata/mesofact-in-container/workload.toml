@@ -13,7 +13,6 @@
 # For an end-to-end run with real bun in docker, supply `YAH_LOCAL_SIM_E2E=1`
 # and run `cargo test -p cloud -- mesofact_in_container -- --include-ignored`.
 
-schema_version = 1
 kind = "mesofact-static"
 
 # Top-level (R658-B1): `routes` is a field of MesofactStaticWorkload, not of

@@ -50,7 +50,7 @@
 //! @yah:assumes("Confirmed rather than assumed: RpoStatus.watermark_age (R574-T4, turso-backup/src/stream.rs) is Option<Duration>, time since the WAL watermark last durably advanced -- matches R782's inherited assumption exactly.")
 //! @yah:verify("cargo test -p yubaba --lib lease_detector::: 18/18 passed after the type_complexity fix (finished after the review was filed) -- the flagged cleanup item is resolved, no residual gap.")
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -145,12 +145,47 @@ impl FailureDetector for LeaseFailureDetector {
 /// same way [`crate::lease_renewal`]'s node-lease client does, just over HTTP
 /// rather than `raft.metrics()` — that process has no raft of its own; see
 /// its module doc for why).
-/// One `(node, tenant)` slot: when it was reported, and what was reported.
-type RpoReports = BTreeMap<(YubabaNodeId, TenantId), (Instant, Option<Duration>)>;
+/// One recorded tick of one streamer's reported watermark age (R893-F18).
+///
+/// Two clocks, deliberately. The gate reading
+/// ([`RpoWatermarkRegistry::watermark_age`]) extrapolates from `received_at`
+/// because a wall clock that steps backwards would make a stale watermark read
+/// *fresher* — the one direction [`judge_readiness`] must never be lied to in.
+/// The windowed reading needs a label an operator can place on a timeline, and
+/// a monotonic `Instant` has no such meaning outside this process.
+#[derive(Debug, Clone, Copy)]
+pub struct RpoSample {
+    received_at: Instant,
+    /// Wall-clock receipt time, milliseconds since the Unix epoch.
+    pub at_epoch_ms: u64,
+    /// What the streamer reported. `None` means it has never persisted a
+    /// watermark for this tenant — see [`RpoWatermarkRegistry::report`].
+    pub watermark_age: Option<Duration>,
+}
+
+/// One flattened row of [`RpoWatermarkRegistry::series_since`].
+#[derive(Debug, Clone)]
+pub struct RpoSeriesEntry {
+    pub node: YubabaNodeId,
+    pub tenant: TenantId,
+    pub sample: RpoSample,
+}
+
+/// Per-`(node, tenant)` cap on retained ticks.
+///
+/// The streamer's default tail interval is 60s
+/// (`tenant_streamer::StreamerConfig::tail_interval`), so this is roughly 34h
+/// of ticks — comfortably past the 24h longest window the Analytics panel
+/// offers, and a hard bound on memory for a registry that is otherwise fed
+/// forever by every tenant on every node.
+pub const RPO_SERIES_CAP: usize = 2048;
+
+/// One `(node, tenant)` slot: its retained ticks, oldest first.
+type RpoSeries = BTreeMap<(YubabaNodeId, TenantId), VecDeque<RpoSample>>;
 
 #[derive(Debug, Default)]
 pub struct RpoWatermarkRegistry {
-    reports: Mutex<RpoReports>,
+    series: Mutex<RpoSeries>,
 }
 
 impl RpoWatermarkRegistry {
@@ -163,8 +198,27 @@ impl RpoWatermarkRegistry {
     /// tenant — recorded rather than treated as "no report", so
     /// [`Self::watermark_age`] can keep answering `None` (fail-closed, per
     /// [`judge_readiness`]) instead of silently reusing a stale prior value.
+    ///
+    /// R893-F18: the tick is *appended* rather than overwriting, up to
+    /// [`RPO_SERIES_CAP`]. The gate still reads only the newest one
+    /// ([`Self::watermark_age`]); the retained tail is what
+    /// [`Self::series_since`] answers a windowed question from, so the
+    /// db-to-R2 lag panel does not need a second measurement path.
     pub fn report(&self, node: YubabaNodeId, tenant: TenantId, watermark_age: Option<Duration>) {
-        self.reports.lock().unwrap().insert((node, tenant), (Instant::now(), watermark_age));
+        let sample = RpoSample {
+            received_at: Instant::now(),
+            at_epoch_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            watermark_age,
+        };
+        let mut series = self.series.lock().unwrap();
+        let slot = series.entry((node, tenant)).or_default();
+        slot.push_back(sample);
+        while slot.len() > RPO_SERIES_CAP {
+            slot.pop_front();
+        }
     }
 
     /// This node's current best estimate of `tenant`'s watermark age, or
@@ -177,9 +231,34 @@ impl RpoWatermarkRegistry {
     /// [`judge_readiness`] already takes for a watermark that was never
     /// reported at all.
     pub fn watermark_age(&self, node: YubabaNodeId, tenant: &TenantId) -> Option<Duration> {
-        let reports = self.reports.lock().unwrap();
-        let &(received_at, age) = reports.get(&(node, tenant.clone()))?;
-        age.map(|a| a + received_at.elapsed())
+        let series = self.series.lock().unwrap();
+        let sample = series.get(&(node, tenant.clone()))?.back()?;
+        sample.watermark_age.map(|a| a + sample.received_at.elapsed())
+    }
+
+    /// Every retained tick from the last `window`, across all `(node, tenant)`
+    /// pairs (R893-F18).
+    ///
+    /// Sliced on the monotonic clock rather than on `at_epoch_ms` for the same
+    /// reason [`RpoSample`] carries both: a wall-clock step must not be able to
+    /// empty or double the window. The reported ages are returned exactly as
+    /// they were pushed — *not* extrapolated forward like
+    /// [`Self::watermark_age`], because a past tick's lag is a fact about that
+    /// moment, and ageing it would make every historical p50 drift upward the
+    /// longer the panel is left unopened.
+    pub fn series_since(&self, window: Duration) -> Vec<RpoSeriesEntry> {
+        let series = self.series.lock().unwrap();
+        let mut out = Vec::new();
+        for ((node, tenant), samples) in series.iter() {
+            for sample in samples.iter().filter(|s| s.received_at.elapsed() <= window) {
+                out.push(RpoSeriesEntry {
+                    node: *node,
+                    tenant: tenant.clone(),
+                    sample: *sample,
+                });
+            }
+        }
+        out
     }
 }
 
@@ -448,13 +527,85 @@ mod tests {
         assert_eq!(r.watermark_age(1, &t("acme")), None);
     }
 
+    /// R893-F18 renamed this from `a_later_report_overwrites_rather_than_
+    /// accumulates`: reports DO accumulate now (that is the whole ticket), and
+    /// the invariant that actually mattered was always about the *gate*, which
+    /// reads only the newest tick. Asserting both halves here is what keeps the
+    /// retained series from ever leaking a stale value into `judge_readiness`.
     #[test]
-    fn a_later_report_overwrites_rather_than_accumulates() {
+    fn the_gate_reads_the_newest_tick_even_though_the_series_retains_both() {
         let r = RpoWatermarkRegistry::new();
         r.report(1, t("acme"), Some(Duration::from_secs(60)));
         r.report(1, t("acme"), Some(Duration::from_secs(1)));
         let age = r.watermark_age(1, &t("acme")).unwrap();
         assert!(age < Duration::from_secs(2), "must reflect the newer, fresher report");
+        assert_eq!(
+            r.series_since(Duration::from_secs(60)).len(),
+            2,
+            "both ticks stay in the window series"
+        );
+    }
+
+    // ── RpoWatermarkRegistry: the retained series (R893-F18) ─────────────
+
+    #[test]
+    fn the_series_carries_every_pair_with_its_reported_age_unextrapolated() {
+        let r = RpoWatermarkRegistry::new();
+        r.report(1, t("acme"), Some(Duration::from_secs(5)));
+        r.report(2, t("acme"), Some(Duration::from_secs(9)));
+        r.report(1, t("widgets"), None);
+
+        std::thread::sleep(Duration::from_millis(20));
+        let rows = r.series_since(Duration::from_secs(60));
+        assert_eq!(rows.len(), 3);
+
+        let acme_1 = rows
+            .iter()
+            .find(|e| e.node == 1 && e.tenant == t("acme"))
+            .expect("node 1 / acme");
+        assert_eq!(
+            acme_1.sample.watermark_age,
+            Some(Duration::from_secs(5)),
+            "a past tick's lag is a fact about that moment — ageing it would drift \
+             every historical p50 upward the longer the panel sits unopened"
+        );
+        assert!(
+            rows.iter().any(|e| e.tenant == t("widgets") && e.sample.watermark_age.is_none()),
+            "a never-persisted watermark stays a distinguishable None in the series, \
+             not a zero and not an omission"
+        );
+        assert!(acme_1.sample.at_epoch_ms > 0, "every tick carries a wall-clock label");
+    }
+
+    #[test]
+    fn the_window_excludes_ticks_older_than_it() {
+        let r = RpoWatermarkRegistry::new();
+        r.report(1, t("acme"), Some(Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            r.series_since(Duration::from_millis(5)).is_empty(),
+            "a tick outside the asked-for window must not be returned"
+        );
+        assert_eq!(r.series_since(Duration::from_secs(60)).len(), 1);
+    }
+
+    #[test]
+    fn the_series_is_bounded_and_drops_the_oldest_first() {
+        let r = RpoWatermarkRegistry::new();
+        for i in 0..(RPO_SERIES_CAP + 10) {
+            r.report(1, t("acme"), Some(Duration::from_secs(i as u64)));
+        }
+        let rows = r.series_since(Duration::from_secs(60));
+        assert_eq!(rows.len(), RPO_SERIES_CAP, "the ring is capped, not unbounded");
+        assert_eq!(
+            rows.first().unwrap().sample.watermark_age,
+            Some(Duration::from_secs(10)),
+            "eviction is oldest-first, so the retained head is tick 10"
+        );
+        assert_eq!(
+            rows.last().unwrap().sample.watermark_age,
+            Some(Duration::from_secs((RPO_SERIES_CAP + 9) as u64))
+        );
     }
 
     // ── TransitionTracker hysteresis ────────────────────────────────────

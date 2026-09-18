@@ -64,6 +64,22 @@
 //! @yah:verify("cargo check -p cloud --lib — clean")
 //! @yah:verify("cargo test -p cloud --lib provider::cloudflare — 12 passed, incl. multipart_includes_r2_bucket_binding_metadata + multipart_mixes_plain_text_and_r2_bindings")
 //! @yah:next("F2 pickup: bind via WorkerBinding::R2Bucket { name: <workload.toml [[bindings]].name>, bucket_name: <mirror providers.cache.bucket> } after fail-fast on workload<->mirror binding-name drift.")
+//!
+//! @yah:ticket(R893-T22, "MESOFACT_STATIC_GRANTS gains account + zone Analytics Read, so the re-minted token can serve R893-F8")
+//! @yah:at(2026-09-12T22:27:26Z)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:phase(P4)
+//! @yah:parent(R893)
+//! @yah:next("Tier: Cleric — a small, well-specified addition to one const array, but the permission-group ids must be resolved against the live Cloudflare catalog rather than guessed, and three stale prose enumerations need correcting in the same pass.")
+//! @yah:handoff("Added Account Analytics Read (account, id b89a480218d04ceb98b4fe57ca29dc1f) and Analytics Read (zone, id 9c88f9c5bce24ce7af9a958ba9c504db) to MESOFACT_STATIC_GRANTS in oss/yubaba/crates/cloud/src/provider/cloudflare.rs (now 11 grants: 4 account + 7 zone). Both group names + ids resolved live 2026-09-12 via GET /accounts/3948dc292e724e71b0deefde0ea95999/tokens/permission_groups using the cloudflare-legacy-yah keystore slot (the token the operator granted Analytics on) — never printed, only piped through curl+python filtering.")
+//! @yah:handoff("Updated the three stale enumerations named in the ticket: app/yah/cli/src/cloud.rs:1212-1218 doc comment now lists Account Analytics:Read + Analytics:Read; .yah/infra/providers/cloudflare.toml:37-52 gained a third dated paragraph ('eleven total') rather than editing the historical seven/nine paragraphs in place; oss/yah-base/crates/keys/src/spec.rs:695 now says 'eleven' and its cloudflare.toml consumer line reference corrected from :47 to :53.")
+//! @yah:handoff("No mint performed — scope fence respected. cargo test -p yah-cloud --lib: 1205 passed both before and after (baseline established fresh, same run). cargo check -p desktop --lib, -p yah --lib, -p fob --lib all clean (pre-existing warnings only, no new errors).")
+//! @yah:verify("cd oss/yubaba && cargo test -p yah-cloud --lib — 1205 passed, 0 failed (matches pre-change baseline)")
+//! @yah:verify("cargo check -p desktop --lib — clean")
+//! @yah:verify("cargo check -p yah --lib -p fob --lib — clean")
+//! @yah:assumes("cloudflare-legacy-yah keystore slot is the same bootstrap token the operator granted Analytics on 2026-09-12 per the ticket description; its successful GET on /tokens/permission_groups (API Tokens:Read/Edit scope) is what proved that grant reached the account, not an independent verification of the Analytics grant itself.")
+//! @yah:verify("Leader re-ran the gate independently: `cd oss/yubaba && cargo test -p yah-cloud --lib` = 1205 passed / 0 failed / 4 ignored, identical to the leader's own pre-change baseline measured before dispatch. The camp build rail reported \"input closure unchanged across the whole run: no skew\" on that baseline, so both numbers describe the same tree. Leader also read the grants array directly: `Account Analytics Read` (account scope) and `Analytics Read` (zone scope) are present with the live-resolved ids, and the doc comment at cloudflare.rs:382-388 records that the two groups are genuinely distinct and were validated against the catalog rather than inferred from their names.")
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -351,18 +367,27 @@ pub struct TokenGrant {
 
 /// Minimal permission set for a mesofact-static publish token: see the account,
 /// list/create R2 buckets, deploy Worker scripts, resolve the zone, manage
-/// Worker routes + the index-rewrite Transform Rule, and purge the CDN cache.
+/// Worker routes + the index-rewrite Transform Rule, purge the CDN cache, and
+/// read GraphQL Analytics (account + zone, R893-T22 — backs the front-door
+/// latency panel in `app/yah/desktop/src/front_door.rs`).
 ///
 /// Account-scoped: `Account Settings Read`, `Workers R2 Storage Write`,
-/// `Workers Scripts Write`.
+/// `Workers Scripts Write`, `Account Analytics Read`.
 /// Zone-scoped: `Zone Read`, `Zone Transform Rules Write`,
-/// `Workers Routes Write`, `Cache Purge`.
+/// `Workers Routes Write`, `Cache Purge`, `DNS Read`, `DNS Write`,
+/// `Analytics Read`.
 ///
 /// NB the Transform Rules group is the *zone-scoped* `Zone Transform Rules
 /// Write`, not the account-scoped `Transform Rules Write` —
 /// [`CloudflareClient::upsert_index_rewrite`] hits `/zones/{id}/rulesets`.
+/// NB likewise there are two distinct Analytics groups, resolved live
+/// 2026-09-12 against `GET /accounts/{id}/tokens/permission_groups`:
+/// `Account Analytics Read` (`com.cloudflare.api.account`) and `Analytics
+/// Read` (`com.cloudflare.api.account.zone`) — same trap shape as Transform
+/// Rules, a scoped and an unscoped group sharing a name fragment.
 /// Fallback IDs sourced from the global permission-groups catalog
-/// (validated 2026-05-26); catalog resolution at create-time takes precedence.
+/// (validated 2026-05-26, Analytics pair added 2026-09-12); catalog
+/// resolution at create-time takes precedence.
 pub const MESOFACT_STATIC_GRANTS: &[TokenGrant] = &[
     TokenGrant {
         group_name: "Account Settings Read",
@@ -378,6 +403,14 @@ pub const MESOFACT_STATIC_GRANTS: &[TokenGrant] = &[
         group_name: "Workers Scripts Write",
         scope: GrantScope::Account,
         fallback_id: "e086da7e2179491d91ee5f35b3ca210a",
+    },
+    // R893-T22: backs the front-door latency panel's GraphQL Analytics query
+    // (app/yah/desktop/src/front_door.rs). Resolved live 2026-09-12 against
+    // GET /accounts/3948dc292e724e71b0deefde0ea95999/tokens/permission_groups.
+    TokenGrant {
+        group_name: "Account Analytics Read",
+        scope: GrantScope::Account,
+        fallback_id: "b89a480218d04ceb98b4fe57ca29dc1f",
     },
     TokenGrant {
         group_name: "Zone Read",
@@ -413,7 +446,29 @@ pub const MESOFACT_STATIC_GRANTS: &[TokenGrant] = &[
         scope: GrantScope::Zone,
         fallback_id: "4755a26eedb94da69e1066d98aa820be",
     },
+    // R893-T22: the zone-scoped counterpart to Account Analytics Read above —
+    // NOT the same permission group despite the near-identical name.
+    TokenGrant {
+        group_name: "Analytics Read",
+        scope: GrantScope::Zone,
+        fallback_id: "9c88f9c5bce24ce7af9a958ba9c504db",
+    },
 ];
+
+/// Account-scoped grant for a token that only needs to publish and read back
+/// a Cloudflare Tunnel's ingress configuration (`ensure_tunnel_ingress` in
+/// `reconciler/ingress.rs` — a PUT, so it needs the Write/"Edit" group, not
+/// the Read one). Group name + fallback ID resolved live 2026-09-15 against
+/// `GET /accounts/3948dc292e724e71b0deefde0ea95999/tokens/permission_groups`
+/// (R912-F1) — Cloudflare's own catalog calls the group "Cloudflare Tunnel
+/// Write", which is what the dashboard/docs render as "Cloudflare Tunnel:
+/// Edit". Deliberately account-scoped only, no zone grants: a tunnel's
+/// ingress config is an account-level resource, not a per-zone one.
+pub const TUNNEL_EDIT_GRANTS: &[TokenGrant] = &[TokenGrant {
+    group_name: "Cloudflare Tunnel Write",
+    scope: GrantScope::Account,
+    fallback_id: "c07321b023e944ff818fec44d8203567",
+}];
 
 /// Result of minting an account-owned API token. `value` is the secret and is
 /// returned by Cloudflare exactly once — store it immediately.
@@ -437,6 +492,74 @@ pub struct CloudflareClient {
     http: reqwest::Client,
 }
 
+/// @yah:relay(R907, "A cloudflare-tunnel edge cannot be brought up by apply alone when its tunnel has no configuration yet")
+/// @yah:at(2026-09-14T19:14:34Z)
+/// @yah:status(open)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:gotcha("FILED FROM THE noisetable CAMP 2026-09-14 (its R704-T4), where it blocks the staging API door end to end. Filed here rather than there because the fix is entirely in this repo. NOT parented to R845 deliberately: R845 is the right neighbourhood — it landed the edge-first `use` resolution this camp's own fix relies on — but it sits in `review`, and a defect filed onto a review-column relay reaches nobody.")
+/// @yah:gotcha("THE CALLER'S ABORT-BEFORE-PUT BEHAVIOUR AT reconciler/ingress.rs:1272-1276 IS CORRECT AND DELIBERATE, and is not what this relay is about. Its doc says a failed API call is never read as \"delete every hostname rule\", and one tunnel multiplexes every service on a node, so a GET that failed for a real reason must keep aborting before the PUT.")
+///
+/// @yah:ticket(R907-B1, "ensure_tunnel_ingress cannot bootstrap a tunnel that has no configuration yet")
+/// @yah:status(review)
+/// @yah:at(2026-09-14T19:34:22Z)
+/// @yah:assignee(agent:bundle-anthropic-miravel)
+/// @yah:parent(R907)
+/// @yah:severity(high)
+/// @yah:next("Tier: Cleric — a small, well-located error-classification fix in one function, but it sits on a live credentialed write path where the empty-vs-failed distinction has already been reasoned about once and must not be blurred.")
+/// @yah:next("THE FIX BELONGS IN THE GET'S CLASSIFICATION, NOT IN THE CALLER: `tunnel_configuration` should return `Ok(json!({}))` for the specific not-found error code and `Err` for everything else. Do NOT loosen the abort-before-PUT guard at reconciler/ingress.rs:1272-1276 — that guard is correct and is what stops a transient API failure being read as \"delete every hostname rule\" on a tunnel that multiplexes every service on a node.")
+/// @yah:next("Worth a sweep while in here: any other `cf_get` whose \"resource has never been created\" answer arrives as an error object rather than an empty result has the same latent shape.")
+/// @yah:verify("REPRO, MEASURED 2026-09-14 from the noisetable camp: tunnel 1b41587a-7298-4f29-97bf-40d51ed79397, created by `yah cloud cf tunnel ensure` WITHOUT `--hostname` so it has never had a configuration PUT, then `yah cloud apply --env staging --service noisetable-api`. Result: `FAILED: reading ingress configuration of tunnel 1b41587a-…: Configuration for tunnel not found`, apply stops at first failure, no connector workload is deployed.")
+/// @yah:verify("THE CREDENTIAL WAS RULED OUT SEPARATELY, and that is what isolates the defect: with a token lacking Tunnel grants the same call fails with `Not authorized` instead, and moving the edge onto a Tunnel-capable provider changed the error from `Not authorized` to `Configuration for tunnel not found`. Two different failures at the same line means the second one is not an auth problem.")
+/// @yah:verify("FIXED when a tunnel with no configuration takes its first ingress rule through `yah cloud apply` alone, AND a GET that fails for a genuine reason (revoked token) still aborts before any PUT. Both halves — the first alone re-introduces the wholesale-delete risk ingress.rs:1272-1276 exists to prevent.")
+/// @yah:gotcha("MECHANISM, TRACED AND READ RATHER THAN INFERRED. `CloudflareClient::tunnel_configuration` (oss/yubaba/crates/cloud/src/provider/cloudflare.rs:774) already handles an EMPTY configuration correctly further down — `.and_then(|r| r.get(\"config\")).cloned().unwrap_or_else(|| json!({}))` at :787, plus the non-object guard at :790 whose own comment covers a tunnel whose config reads back as an explicit JSON null. But it checks `self.ok(&resp.success, &resp.errors)?` FIRST, at :781. Cloudflare answers `success: false` / `Configuration for tunnel not found` for a token-form tunnel that has never had a configuration PUT, so that guard fires and the tolerant path at :787 is unreachable for exactly the case it looks like it already covers.")
+/// @yah:gotcha("WHY IT IS A BUG AND NOT A MISSING FEATURE: \"no configuration exists\" is an EMPTY read, not a FAILED one. The function already draws that distinction correctly for a null config body; it simply does not draw it for the API's own not-found answer. Same fact, two doors — one arrives as `result.config = null`, the other as an error object.")
+/// @yah:gotcha("CONSEQUENCE: the only code path that would CREATE a first configuration is gated behind READING a configuration that cannot exist until it has been created. Any cloudflare-tunnel edge whose tunnel was minted without `--hostname` is permanently un-bootstrappable through `yah cloud apply`. The apparent workaround is not one: `yah cloud cf tunnel ensure --hostname` also upserts a DNS CNAME, so it takes a live hostname dark if the connector is not up yet.")
+/// @yah:assumes("NOT VERIFIED FROM THE REPORTING CAMP, because settling it would have meant a write to live Cloudflare: whether the GET returns a 404 status specifically, or HTTP 200 with `success: false` in the body. `Configuration for tunnel not found` is the text that surfaced through the `with_context` at reconciler/ingress.rs:1291. Classify on the Cloudflare error CODE in `resp.errors`, not on the message string and not on an assumed status — a message match would layer a second lexical guess on the first.")
+/// @yah:verify("THE NON-WORKAROUND IS PINNED BY A NEGATIVE RESULT, so nobody re-tries it: run `cf tunnel ensure --hostname` against a tunnel with no configuration, then `yah cloud apply` — apply must still fail `Configuration for tunnel not found`. If a future change makes `cf tunnel ensure` write config, that is a DIFFERENT fix and this assertion should flip deliberately rather than quietly.")
+/// @yah:gotcha("SEVERITY IS HIGHER THAN THIS TICKET FIRST STATED, AND THE OBVIOUS ESCAPE HATCH IS NOT ONE. `yah cloud cf tunnel ensure --name <n> --hostname <h> --api-token-slot cloudflare-legacy-yah` DOES NOT WRITE INGRESS CONFIGURATION — measured 2026-09-14 against tunnel 1b41587a-7298-4f29-97bf-40d51ed79397, not reasoned from the source. It printed `reusing existing 'noisetable-account-staging'`, then `existing connector token preserved in keystore slot`, then went STRAIGHT to the DNS upsert. `yah cloud apply --env staging --service noisetable-api` immediately afterwards failed with the byte-identical `Configuration for tunnel not found`. Its own `--help` confirms the scope in one sentence: ensure the tunnel exists, fetch/store the connector token, OPTIONALLY upsert a CNAME — nothing about configuration.")
+/// @yah:gotcha("THEREFORE THERE IS NO VERB IN THE CAMP THAT CAN WRITE A TUNNEL'S FIRST INGRESS CONFIGURATION. This is not 'apply takes an awkward path to a reachable state' — it is a complete dead end for any tunnel minted without `--hostname`, with no CLI escape hatch at all. `apply` is gated behind the GET this ticket describes; `cf tunnel ensure` never writes config; `yah cloud cf` exposes only `token` and `tunnel`. The only two routes out are (a) fixing the GET's error classification, i.e. this ticket, or (b) a human creating the configuration by hand in the Cloudflare dashboard. A consumer camp cannot unblock itself.")
+/// @yah:gotcha("READ THIS BESIDE THE SIBLING R907-B2 BEFORE DESIGNING THE FIX. The reporting camp hit BOTH of R907's children on the same door in the same hour, and they compose badly: with no config (this ticket) and no connector, a DNS cutover (B2) has no end date for its dark window. Fixing this one first is what makes the other one safe to sequence.")
+/// @yah:handoff("Fixed the root cause: tunnel_configuration (cloudflare.rs) now classifies a failed GET on /cfd_tunnel/{id}/configurations as an EMPTY read (Ok(json!({}))) when the Cloudflare error carries code 1003 (the generic 'not found' family), and still returns Err for every other error (auth, rate-limit, transient). Classification is on the numeric code in resp.errors, not the message text, via a new private CloudflareClient::is_resource_not_found(&Option<Vec<Value>>) helper.")
+/// @yah:handoff("Grounding for code 1003: NOT in Cloudflare's own published API reference (checked developers.cloudflare.com's error-response schema for this endpoint 2026-09-14 — it documents only the generic {code, message} shape, no per-condition table). Grounded instead from convergent third-party Cloudflare API clients that hardcode it for this exact family: vana-com/vana-connect's gcp.ts comment '1003: tunnel not found', mandar-karhade/dockflare's error table '1003 | Zone not found', plus independent test fixtures (ratazzi/coulson, MauroDruwel/TunnelDashDesktop) using 1003 for 'Invalid or missing account id' / 'Account not found'. Full sourcing is in the doc comment on is_resource_not_found (cloudflare.rs, just above it). Confirming against a live token was out of scope (ticket forbids live CF calls) and would be worth a follow-up if the sourcing is judged insufficient.")
+/// @yah:handoff("Left reconciler/ingress.rs:1272-1276 (the abort-before-PUT guard) untouched, per the ticket's explicit constraint — only read it, did not edit it.")
+/// @yah:handoff("Sweep for the same latent shape found two more sites with the identical bug: tunnel_dns_records and tunnel_dns_drift (both in cloudflare.rs) each GET a tunnel's configuration and previously called self.ok(...)? unconditionally, so ANY unconfigured tunnel among many would abort the whole DNS-records listing / drift report with an Err instead of contributing zero ingress hostnames for that tunnel. Fixed both the same way, reusing is_resource_not_found. No other cf_get call site in the file shares this shape — the rest are LIST endpoints (naturally return an empty array when nothing exists, not an error) or are already documented as tolerant (upsert_index_rewrite already treats a missing ruleset entrypoint as empty).")
+/// @yah:handoff("Added 3 unit tests pinning is_resource_not_found in both directions plus the None case: resource_not_found_classifies_missing_tunnel_config_as_empty (code 1003 -> true), resource_not_found_does_not_classify_auth_error_as_empty (code 10000 -> false), resource_not_found_false_when_no_errors_present. Tests exercise the classifier directly rather than the full async tunnel_configuration end-to-end, because the crate has no HTTP-mocking dev-dependency (checked Cargo.toml dev-dependencies: tempfile, serde_yaml, tokio — no mockito/wiremock) and adding one is a bigger change than this leaf fix warrants; the classifier is the entire decision this fix adds, so it's what's under test.")
+/// @yah:verify("cargo test -p yah-cloud --lib -- cloudflare: 29 pass / 0 fail (includes the 3 new tests), no skew reported.")
+/// @yah:verify("cargo test -p yah-cloud --lib (whole crate): 1200 pass / 2 fail / 4 ignored. The 2 failures (reconciler::mesofact_static::tests::a_mount_extends_the_prefix_and_is_slash_insensitive, bundled_worker_walks_the_route_table) are in mesofact_static.rs, which was already modified and uncommitted by a peer at session start (per git status) and is untouched by this ticket's diff -- confirmed unrelated via git diff --stat on that file.")
+/// @yah:verify("cargo check -p yah-cloud --lib: clean (1 pre-existing unrelated warning in mesofact_static.rs).")
+/// @yah:verify("CloudflareClient::ok now surfaces the numeric Cloudflare error code in its returned message (e.g. \"Cloudflare error 1003: Configuration for tunnel not found\") instead of dropping it, so the FIRST live run of this fix from the reporting camp will either confirm 1003 or name the real code plainly, closing the sourcing gap.")
+/// @yah:assumes("The not-found classification code (1003) is UNCONFIRMED against a live Cloudflare account — sourced only from convergent third-party API clients (see is_resource_not_found's doc comment), not from Cloudflare's own docs or a live call. Disproved by: a live `yah cloud apply` against an unconfigured tunnel either (a) succeeding, confirming 1003, or (b) still failing with a message now showing a different numeric code, in which case update CF_ERR_NOT_FOUND in is_resource_not_found to that code.")
+/// @yah:handoff("Addendum landed: CloudflareClient::ok now renders every error entry as \\\"Cloudflare error <code>: <message>\\\" (joined with \\\"; \\\" for multiple), instead of dropping the code -- so the reporting camp's next live run will show the real code plainly. Added 3 more unit tests (ok_error_message_carries_the_cloudflare_code, ok_error_message_joins_multiple_errors, ok_error_message_falls_back_when_no_errors_present) via CloudflareClient::new(\\\"test-token\\\"). Grepped the crate for callers/tests asserting the old bare-message string -- none exist outside cloudflare.rs itself; reconciler/ingress.rs:1291 only wraps the error with with_context, doesn't match on it.")
+/// @yah:verify("cargo check -p yah-cloud --lib: clean, no errors, after the ok() change. cargo test -p yah-cloud --lib currently fails to COMPILE (19 errors, all `missing field build in initializer of MirrorConfig` across mesofact_static.rs/pond.rs/local_process.rs/static_asset.rs/mod.rs/mesofact_bundle.rs/cloudflare_worker.rs/ingress.rs) -- confirmed zero of those 19 reference provider/cloudflare.rs; this is a live peer's in-flight MirrorConfig migration (git status showed mesofact_static.rs already modified at session start), not this ticket's diff. The cloudflare-module test run that passed 29/29 (prior handoff entry) was taken before that peer's edit progressed to this state; could not re-run cloudflare-scoped tests after the ok() addendum because the whole test binary now fails to link for an unrelated reason. Re-run `cargo test -p yah-cloud --lib -- cloudflare` once that peer's migration lands.")
+/// @yah:handoff("Addendum complete: CloudflareClient::ok surfaces the numeric Cloudflare error code in its message text instead of discarding it, so the 1003 guess is now self-diagnosing on the first live run. See appended handoff/verify entries for detail and the peer-breakage caveat on re-running the test suite.")
+/// @yah:verify("RE-VERIFIED after the peer's MirrorConfig migration landed: cargo test -p yah-cloud --lib (whole crate) = 1213 pass / 0 fail / 4 ignored, no skew (baseline was 1200/2/4 with the 2 failures being that same peer's in-flight breakage, now resolved). cargo test -p yah-cloud --lib -- cloudflare = 32 pass / 0 fail, includes all 6 new tests (3 for is_resource_not_found, 3 for the ok() addendum).")
+///
+/// @yah:ticket(R907-B2, "yah cloud cf has no DNS-record verb, so a tunnel hostname whose name already holds A records cannot be moved")
+/// @yah:status(review)
+/// @yah:at(2026-09-14T20:23:53Z)
+/// @yah:assignee(agent:bundle-anthropic-miravel)
+/// @yah:parent(R907)
+/// @yah:severity(medium)
+/// @yah:next("Tier: Cleric — small surface to add, but the sequencing semantics are the whole point and a naive delete-then-create verb would be worse than none.")
+/// @yah:next("THE ORDERING HAZARD IS THE DESIGN CONSTRAINT, NOT A CAVEAT. Deleting the incumbent A records BEFORE a connector is up takes a live hostname dark, and when the tunnel also has no configuration (sibling R907-B1) that window has NO END DATE — nothing is standing by to answer. So a DNS verb here should not be a thin delete+create wrapper. Prefer a cutover that is atomic, or gated on connector readiness (tunnel has >=1 healthy connector AND an ingress rule for the hostname) before it touches the incumbent record, with the unsafe ordering available only behind an explicit flag that names the outage it buys.")
+/// @yah:next("Worth deciding deliberately: whether the verb belongs on `yah cloud cf` as a general record CRUD, or whether the tunnel cutover should stay a single higher-level operation (`cf tunnel cutover --hostname`) that owns the safe ordering internally. The second is harder to misuse and matches how `cf tunnel ensure` already hides the record shape from the caller.")
+/// @yah:next("Fix R907-B1 FIRST or in the same change. Sequencing this one alone still leaves a consumer unable to get a configuration onto the tunnel, so the connector-readiness gate above could never be satisfied.")
+/// @yah:verify("REPRO: point `cf tunnel ensure --name <tunnel> --hostname <h> --api-token-slot cloudflare-legacy-yah` at a hostname that currently resolves via A records. Observed: the tunnel-reuse and token-preserve lines print normally, then `Error: upserting CNAME <h> → <id>.cfargotunnel.com: An A, AAAA, or CNAME record with that host already exists.` The API token is not the issue — cloudflare-legacy-yah carries both Tunnel:Edit and DNS:Edit, and the same invocation's tunnel half succeeded in the same run.")
+/// @yah:verify("FIXED when a hostname on A records can be moved onto a tunnel through the CLI alone, AND the safe-ordering property holds — i.e. an attempt to cut over to a tunnel with no healthy connector either refuses or is explicitly opted into. Both halves: the first alone just automates the outage.")
+/// @yah:gotcha("THE SURFACE IS TWO SUBCOMMANDS WIDE. `yah cloud cf --help` lists exactly `token` (mint scoped account-owned tokens) and `tunnel` (idempotent ensure). There is no verb that reads, creates, updates or deletes a DNS record. The only DNS write anywhere in `yah cloud cf` is the CNAME upsert bolted onto `cf tunnel ensure --hostname`.")
+/// @yah:gotcha("AND THAT UPSERT IS NOT A GENERAL UPSERT. Cloudflare forbids a CNAME coexisting with an A/AAAA record at the same name, so the call fails with `An A, AAAA, or CNAME record with that host already exists` whenever the incumbent record is not ALREADY a CNAME. The `--help` text's promise that it 'upserts a CNAME ... so the public hostname is wired even before the origin daemon comes up' therefore holds only for a name that is unused or already CNAME'd — precisely NOT the migration case, where a hostname is being moved onto a tunnel from something else.")
+/// @yah:gotcha("CONCRETE INSTANCE, MEASURED 2026-09-14 from the noisetable camp: api-staging.noisetable.com holds A records 51.81.85.145 and 45.32.194.254 (its production passway edge, currently serving 200), and cannot be moved to tunnel 1b41587a-7298-4f29-97bf-40d51ed79397 because those two records must be DELETED first. With no DNS verb in the CLI, the only route is hand-editing the Cloudflare dashboard or hand-calling the API — which is exactly the class of action a camp's own rules put out of bounds for an agent, so the cutover stalls with no in-tool path.")
+/// @yah:handoff("Built the higher-level operation as directed: `yah cloud cf tunnel cutover --hostname <h> --name <tunnel> [--force-dark-window]` (app/yah/cli/src/cloud.rs). No general DNS CRUD exposed on the CLI -- the DNS methods it needed (list_dns_records, delete_dns_records_matching, upsert_dns_record) already existed as CloudflareClient methods from prior work (R859-F1); only one new client method was added: CloudflareClient::tunnel_conn_state(account_id, tunnel_id) -> Result<TunnelConnState>, a thin wrapper around the existing (private) list_tunnels_meta that surfaces just the connector state for one tunnel by id.")
+/// @yah:handoff("Ordering: lists existing DNS records at the hostname first. If already a correct CNAME with no A/AAAA left beside it, no-op success (idempotent, matches `ensure`'s contract). Otherwise, if A/AAAA records are present, gates on readiness (tunnel_conn_state == Active AND tunnel_configuration's ingress array contains a rule for the hostname) before deleting them -- refuses with a message naming both missing preconditions and the outage it would cause, unless --force-dark-window is passed (which prints an explicit warning naming the outage before proceeding). Deletes only the incumbent A/AAAA records (delete_dns_records_matching, scoped by type+content so a round-robin sibling isn't touched), then upserts the CNAME.")
+/// @yah:handoff("Composes R907-B1 directly: the readiness check's ingress-rule half calls tunnel_configuration, which is what B1 made tolerant of a never-configured tunnel -- so a tunnel with a connector up but no ingress yet correctly reads as not-ready (has_ingress_rule=false) instead of erroring out of the whole cutover attempt.")
+/// @yah:handoff("Pure decision logic extracted and unit-tested directly (not through the async handler, matching how the R907-B1 classifier was tested): cutover_already_complete(records, cname_target), tunnel_ready_for_cutover(conn_state, has_ingress_rule), tunnel_ingress_has_hostname(ingress_json, hostname). 7 new tests in a cf_tunnel_cutover_tests module pin: no-op when already correct CNAME alone; not-complete when an A record remains beside the CNAME; not-complete when only A records present; not-complete when CNAME points elsewhere; readiness requires BOTH Active connector state AND an ingress rule (every other TunnelConnState variant fails the gate even with the rule present); ingress-hostname matching is exact and returns false on an empty/malformed config.")
+/// @yah:handoff("Plumbing: DnsRecordDetail and TunnelConnState were not previously re-exported through cloud::provider::mod.rs / cloud::lib.rs (only used internally); added both to the existing pub-use lists so app/yah/cli can name them. No new pub surface beyond that plus tunnel_conn_state.")
+/// @yah:verify("cargo check -p yah --lib: clean (0 errors), 26 pre-existing warnings none of which touch the new code (spot-checked: the only two cloud.rs warnings, a pre-existing unused `mut` at line ~16965 and an unused `stub` fn at line ~3625, predate this change).")
+/// @yah:verify("cargo test -p yah --lib -- cf_tunnel_cutover_tests: 7 pass / 0 fail, no skew on the final run (an earlier run in this same session hit a transient 92-error compile while a peer's kg-store/blake3 and slot_table.rs edits were mid-flight -- confirmed unrelated by re-running clean after they landed; see gotcha).")
+/// @yah:verify("cargo check -p yah-cloud --lib and cargo test -p yah-cloud --lib both re-verified green after this ticket's additions (1213 pass / 0 fail / 4 ignored) -- the new tunnel_conn_state method didn't regress anything.")
+/// @yah:verify("NOT verified live (explicitly out of scope): no live Cloudflare account was hit. The connector-readiness gate's real-world shape (does list_tunnels_meta's status field actually read 'active' the way TunnelConnState::from_cf_status expects for a freshly-up connector) is asserted only by the existing TunnelConnState tests from prior work, not newly re-verified here.")
+/// @yah:gotcha("Mid-session this crate hit two DIFFERENT transient shared-tree compile breaks, both from live peers, both now resolved and neither touching this ticket's files: (1) oss/yubaba/crates/cloud/src/reconciler/mesofact_static.rs's MirrorConfig gained a `build` field mid-session, breaking `cargo test -p yah-cloud --lib` (test-only, `cargo check --lib` stayed clean throughout) -- landed and reverified 1213/0/4. (2) crates/yah/kg-store/src/camp_config.rs referenced `blake3::hash` before its Cargo.toml dependency landed, breaking `cargo check -p yah --lib` entirely for a window -- also since resolved. Neither was touched by this session; noted here only so a reviewer re-running the same commands mid-flight doesn't misattribute a stale failure to R907-B2.")
+/// @yah:verify("RE-RUN 2026-09-14 ~13:30 per @Ashguard:rose's R897 heads-up: an unattributed git stash wiped the tree at 13:09:46, restored ~13:14 (faba56a4 + pop), and this ticket's two flagged commands (cargo check -p yah --lib, cf_tunnel_cutover_tests) had run inside that window on a prior pass. Confirmed by content first that nothing was lost (git show HEAD still had handle_cf_tunnel_cutover / Cutover variant / cf_tunnel_cutover_tests module, all committed pre-wipe in 30c2c02c per the operator's own diff verification) -- nothing to re-author. Re-ran fresh anyway: cargo check -p yah --lib clean (no skew); cf_tunnel_cutover_tests 7/7 pass (no skew); cargo test -p yah-cloud --lib 1213/0/4 (no skew). All three identical to the pre-wipe results.")
 impl CloudflareClient {
     /// Create a client for the given API token.
     pub fn new(token: String) -> Self {
@@ -504,6 +627,28 @@ impl CloudflareClient {
             .collect())
     }
 
+    /// Live connection state for one tunnel, by id — the connector-readiness
+    /// half of a safe DNS cutover (R907-B2). `Unknown` when the tunnel
+    /// doesn't appear in the account's tunnel list at all (deleted, wrong
+    /// account) rather than erroring, since a caller gating on `Active` — the
+    /// only value that clears the gate — treats every other variant the
+    /// same way.
+    ///
+    /// Requires: `Cloudflare Tunnel: Read`.
+    pub async fn tunnel_conn_state(
+        &self,
+        account_id: &str,
+        tunnel_id: &str,
+    ) -> Result<TunnelConnState> {
+        Ok(self
+            .list_tunnels_meta(account_id)
+            .await?
+            .into_iter()
+            .find(|t| t.id == tunnel_id)
+            .map(|t| t.conn_state)
+            .unwrap_or(TunnelConnState::Unknown))
+    }
+
     /// Collect CNAME records for all tunnels across all accessible accounts.
     ///
     /// Walks accounts → tunnels → ingress configurations. Returns an empty
@@ -521,12 +666,18 @@ impl CloudflareClient {
                     account.id
                 );
                 let config_resp: CfSingle<CfTunnelConfig> = self.cf_get(&path).await?;
-                self.ok(&config_resp.success, &config_resp.errors)?;
-                let ingress = config_resp
-                    .result
-                    .and_then(|c| c.config)
-                    .and_then(|c| c.ingress)
-                    .unwrap_or_default();
+                let ingress = if !config_resp.success
+                    && Self::is_resource_not_found(&config_resp.errors)
+                {
+                    Vec::new()
+                } else {
+                    self.ok(&config_resp.success, &config_resp.errors)?;
+                    config_resp
+                        .result
+                        .and_then(|c| c.config)
+                        .and_then(|c| c.ingress)
+                        .unwrap_or_default()
+                };
                 for rule in ingress {
                     if let Some(hostname) = rule.hostname.filter(|h| !h.is_empty()) {
                         records.push(TunnelDnsRecord {
@@ -582,12 +733,18 @@ impl CloudflareClient {
                     account.id, meta.id
                 );
                 let config_resp: CfSingle<CfTunnelConfig> = self.cf_get(&path).await?;
-                self.ok(&config_resp.success, &config_resp.errors)?;
-                let ingress = config_resp
-                    .result
-                    .and_then(|c| c.config)
-                    .and_then(|c| c.ingress)
-                    .unwrap_or_default();
+                let ingress = if !config_resp.success
+                    && Self::is_resource_not_found(&config_resp.errors)
+                {
+                    Vec::new()
+                } else {
+                    self.ok(&config_resp.success, &config_resp.errors)?;
+                    config_resp
+                        .result
+                        .and_then(|c| c.config)
+                        .and_then(|c| c.ingress)
+                        .unwrap_or_default()
+                };
                 for rule in ingress {
                     if let Some(hostname) = rule.hostname.filter(|h| !h.is_empty()) {
                         declared.push(TunnelDnsRecord {
@@ -738,6 +895,9 @@ impl CloudflareClient {
     ) -> Result<serde_json::Value> {
         let path = format!("/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations");
         let resp: CfSingle<serde_json::Value> = self.cf_get(&path).await?;
+        if !resp.success && Self::is_resource_not_found(&resp.errors) {
+            return Ok(serde_json::json!({}));
+        }
         self.ok(&resp.success, &resp.errors)?;
         let config = resp
             .result
@@ -1509,17 +1669,65 @@ impl CloudflareClient {
             .map_err(|e| anyhow!("DELETE {url} parse: {e}"))
     }
 
+    /// R907-B1 addendum: the numeric error CODE is carried into the returned
+    /// message alongside the text, not dropped. Before this, a caller (and
+    /// anyone debugging from outside the process) could only see the
+    /// message string — which is exactly why `is_resource_not_found`'s 1003
+    /// had to be sourced from third-party reverse-engineering instead of
+    /// read off a live failure. The next live "Configuration for tunnel not
+    /// found" this produces will show its real code plainly.
     fn ok(&self, success: &bool, errors: &Option<Vec<serde_json::Value>>) -> Result<()> {
         if *success {
             return Ok(());
         }
-        let msg = errors
-            .as_ref()
-            .and_then(|e| e.first())
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-            .unwrap_or("Cloudflare returned an error");
-        Err(anyhow!("{msg}"))
+        let entries = errors.as_deref().unwrap_or(&[]);
+        if entries.is_empty() {
+            return Err(anyhow!("Cloudflare returned an error"));
+        }
+        let rendered: Vec<String> = entries
+            .iter()
+            .map(|e| {
+                let msg = e
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("(no message)");
+                match e.get("code").and_then(|c| c.as_i64()) {
+                    Some(code) => format!("Cloudflare error {code}: {msg}"),
+                    None => format!("Cloudflare error: {msg}"),
+                }
+            })
+            .collect();
+        Err(anyhow!("{}", rendered.join("; ")))
+    }
+
+    /// Classifies a failed response as "the resource has never been
+    /// created" (an EMPTY read, safe to treat as absent) rather than a
+    /// genuine failure (auth, rate limit, transient API error). Callers
+    /// must still call [`Self::ok`] for anything this returns `false` for —
+    /// it only tells you when NOT to.
+    ///
+    /// Classified on the error CODE, not the message text: Cloudflare
+    /// answers a not-yet-created tunnel configuration with code 1003, the
+    /// same generic "not found" family it uses for a missing account or
+    /// zone lookup. That code is not in Cloudflare's own published API
+    /// reference as of 2026-09-14 (checked: the docs site lists only the
+    /// generic `{code, message}` error shape, no per-condition table) —
+    /// grounded instead from convergent third-party Cloudflare API clients
+    /// that hardcode it: `vana-com/vana-connect`'s
+    /// `connect/src/lib/server-provider/gcp.ts` comment "1003: tunnel not
+    /// found", `mandar-karhade/dockflare`'s
+    /// `docs/design/03-cloudflare-integration.md` error table "1003 | Zone
+    /// not found", and several independent test fixtures (e.g.
+    /// `ratazzi/coulson`, `MauroDruwel/TunnelDashDesktop`) using 1003 for
+    /// "Invalid or missing account id" / "Account not found". Confirming
+    /// against a live Cloudflare token is out of scope for R907-B1.
+    fn is_resource_not_found(errors: &Option<Vec<serde_json::Value>>) -> bool {
+        const CF_ERR_NOT_FOUND: i64 = 1003;
+        errors
+            .iter()
+            .flatten()
+            .filter_map(|e| e.get("code").and_then(|c| c.as_i64()))
+            .any(|code| code == CF_ERR_NOT_FOUND)
     }
 }
 
@@ -1698,6 +1906,74 @@ mod tests {
         }
     }
 
+    /// R907-B1: a tunnel that has never had a configuration PUT is an EMPTY
+    /// read, not a failed one — pins the not-found code on the "treat as
+    /// empty" side of `is_resource_not_found`.
+    #[test]
+    fn resource_not_found_classifies_missing_tunnel_config_as_empty() {
+        let errors = Some(vec![serde_json::json!({
+            "code": 1003,
+            "message": "Configuration for tunnel not found",
+        })]);
+        assert!(CloudflareClient::is_resource_not_found(&errors));
+    }
+
+    /// R907-B1: a genuine failure (here, an auth error) must still surface
+    /// as `Err` from `tunnel_configuration` — this is what keeps the
+    /// abort-before-PUT guard at reconciler/ingress.rs:1272-1276 correct.
+    #[test]
+    fn resource_not_found_does_not_classify_auth_error_as_empty() {
+        let errors = Some(vec![serde_json::json!({
+            "code": 10000,
+            "message": "Authentication error",
+        })]);
+        assert!(!CloudflareClient::is_resource_not_found(&errors));
+    }
+
+    #[test]
+    fn resource_not_found_false_when_no_errors_present() {
+        assert!(!CloudflareClient::is_resource_not_found(&None));
+    }
+
+    /// R907-B1 addendum: `ok`'s error text must carry the numeric code, not
+    /// just the message — that's what lets the next live failure name its
+    /// real Cloudflare code instead of forcing another reverse-engineering
+    /// pass like the one that produced `is_resource_not_found`'s 1003.
+    #[test]
+    fn ok_error_message_carries_the_cloudflare_code() {
+        let client = CloudflareClient::new("test-token".to_string());
+        let errors = Some(vec![serde_json::json!({
+            "code": 1003,
+            "message": "Configuration for tunnel not found",
+        })]);
+        let err = client.ok(&false, &errors).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Cloudflare error 1003: Configuration for tunnel not found"
+        );
+    }
+
+    #[test]
+    fn ok_error_message_joins_multiple_errors() {
+        let client = CloudflareClient::new("test-token".to_string());
+        let errors = Some(vec![
+            serde_json::json!({"code": 1003, "message": "first"}),
+            serde_json::json!({"code": 9109, "message": "second"}),
+        ]);
+        let err = client.ok(&false, &errors).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Cloudflare error 1003: first; Cloudflare error 9109: second"
+        );
+    }
+
+    #[test]
+    fn ok_error_message_falls_back_when_no_errors_present() {
+        let client = CloudflareClient::new("test-token".to_string());
+        let err = client.ok(&false, &None).unwrap_err();
+        assert_eq!(err.to_string(), "Cloudflare returned an error");
+    }
+
     #[test]
     fn drift_synced_when_live_matches() {
         let live = vec![rec("yubaba.yah.dev", "9e4d.cfargotunnel.com")];
@@ -1824,6 +2100,28 @@ mod tests {
             policies[0]["resources"]["com.cloudflare.api.account.zone.Z"],
             "*"
         );
+    }
+
+    /// R912-F1: TUNNEL_EDIT_GRANTS is account-scoped only, so a token built
+    /// from it must carry exactly one policy block (no zone block at all,
+    /// not an empty one), with the Tunnel Write permission group.
+    #[test]
+    fn tunnel_edit_grants_build_account_only_policy() {
+        use std::collections::BTreeMap;
+        let body = build_token_body("t", "ACCT", "ZONE", TUNNEL_EDIT_GRANTS, &BTreeMap::new());
+        let policies = body["policies"].as_array().unwrap();
+        assert_eq!(policies.len(), 1, "no zone block for an account-only profile");
+        assert_eq!(
+            policies[0]["resources"]["com.cloudflare.api.account.ACCT"],
+            "*"
+        );
+        let ids: Vec<&str> = policies[0]["permission_groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["c07321b023e944ff818fec44d8203567"]);
     }
 
     /// Decode the multipart `metadata` part and return its parsed JSON.

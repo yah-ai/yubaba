@@ -144,6 +144,15 @@ pub fn cloud_init_template(workspace_root: &Path) -> PathBuf {
     cloud_init_dir(workspace_root).join("mirror.yml")
 }
 
+/// The SSH-deliverable transcription of [`cloud_init_template`], used to stand
+/// yubaba up on a static/LAN node we did not provision through a cloud API
+/// (W257 step 6). A hand-maintained twin of that template — see
+/// `cloud_init::tests::stand_up_script_carries_the_templates_install_steps`,
+/// which is what keeps the two from drifting (R870-B25).
+pub fn stand_up_script(workspace_root: &Path) -> PathBuf {
+    cloud_init_dir(workspace_root).join("stand-up-yubaba.sh")
+}
+
 pub fn rules_dir(workspace_root: &Path) -> PathBuf {
     infra_dir(workspace_root).join("rules")
 }
@@ -201,6 +210,14 @@ pub fn legacy_cloud_dir(workspace_root: &Path) -> PathBuf {
 /// One JSONL record per reconciler decision; replayed by `yah cloud status`.
 pub fn asset_status_journal(workspace_root: &Path) -> PathBuf {
     yah_dir(workspace_root).join("cloud/status.jsonl")
+}
+
+/// Append-only journal of measured restore times (R850-T2). One JSONL record
+/// per restored subject; replayed by [`crate::config::CloudConfig::load`] so
+/// `yah cloud topology` can report a timed restore instead of an extrapolation.
+/// Nobody prunes it — see [`crate::recovery_journal`].
+pub fn recovery_journal(workspace_root: &Path) -> PathBuf {
+    yah_dir(workspace_root).join("cloud/recovery.jsonl")
 }
 
 /// Registry of app roots for fast discovery (R470-T7).

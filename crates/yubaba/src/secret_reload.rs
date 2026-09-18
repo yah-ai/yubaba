@@ -2,7 +2,7 @@
 //!
 //! The single elected ACME issuer (R600-F3) re-issues the fleet cert and writes
 //! the fresh ciphertext into raft via `PutSecret`. That replicated write bumps
-//! the state machine's [`YubabaStateMachine::subscribe_secrets`] epoch on every
+//! the node's fleet secret epoch ([`crate::secret_watch`]) on every
 //! node. This module is the consumer of that watch: on each bump it re-renders
 //! the affected workloads' tmpfs `File` mounts in place (via F2's
 //! [`ClusterResolver`]) and then asks kamaji to **graceful-upgrade** the
@@ -80,6 +80,33 @@
 //! @yah:handoff("SHIPPED AND PROVEN LIVE, BUT THE TICKET IS NOT DONE — the issuer half is demonstrated, the consumption half is untouched. yubaba 0.8.35 is published to cdn.yah.dev (both musl triples, cosign-signed, per-version manifest proven from the CDN before the pointer was written) and installed on us-east-001 by hash, yubaba binary only, kamaji never restarted. Committed and tagged v0.8.35 (e336e727) with the tag verified to match the published bytes. THE OBSERVATION THIS TICKET EXISTED TO GET: east (node 3), while node 2 held raft leadership, logged `acme issuer: standby — another owner holds the issuer lock acme-issuer/yah.dev` at 2026-09-08T20:23:24Z — a NON-LEADER that actually reached AcquireLock and was denied by the lock rather than short-circuited by the leadership gate. Corroborated off the log text by applied_index moving 2806059 -> 2806060, so the forwarded write really was applied as a raft entry. @Ashguard:libra independently measured the mixed 0.8.35/0.8.34 cluster converging — all three voters term 21, leader 2, last_applied 2806060 identical — which is the observable form of my (b) not-breaking epoch judgement. Fleet green throughout: yah.dev 200, cloud.mesh 200, passway-test 200.")
 //! @yah:handoff("Tree anchor at handoff: e336e7278f7f40780323d40a8ceb6e438bead0b1 — the shared tree as I left it. Diff against it (`git diff e336e7278f7f40780323d40a8ceb6e438bead0b1..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
 //! @yah:next("FIRST THING TO DO, NO ACTION NEEDED, ONLY CHECKING: at 2026-09-09T06:59:54Z us-south-001's squatted lease lapses and east should flip to `acme issuer: ACTIVE` and place the LE STAGING order. `ssh -i ~/.ssh/yah debian@51.81.85.145 'sudo journalctl -u yubaba --since \"-3h\" | grep -i \"acme issuer\"'`. If it did NOT fire, suspect DNS-01 before the lock — R853-B7 already burned a cycle on LE validating before Cloudflare published the TXT, which is why the drop-in sets a 75s propagation delay.")
+//!
+//! @yah:ticket(R911-F5, "Node-side migration: copy the raft secret map and legacy cert objects into FleetSecretStore, re-sealed with AAD; raft map loses every reader")
+//! @yah:status(review)
+//! @yah:at(2026-09-15T05:20:57Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R911)
+//! @yah:next("Tier: Warrior — one-shot data migration on live state; must be idempotent and safe with mixed versions mid-roll.")
+//! @yah:next("Add a startup migration (a new module, e.g. secret_migrate.rs) that runs before the node serves deploys when it has cluster state, a KEK, and cert-store config. For each record in the raft secret map (YubabaStateMachine cluster_secret_index + cluster_secret): open with the LEGACY no-AAD path under the node KEK, re-seal with the R911-F4 AAD format, and write it to FleetSecretStore, preserving updated_at, access and digest. Skip when the store already holds a record with updated_at >= the raft one. Also re-seal legacy per-domain objects under certs/<issuer>/ that fail the new open but pass the legacy one. Plaintext stays in memory only and is zeroized.")
+//! @yah:next("Log one summary line (migrated N, skipped M, failed K, with names but never bytes). A failure on one record does not stop the others and does not stop node start.")
+//! @yah:next("MIXED ROLL: the first upgraded node in a group migrates, and later ones skip. Leave the raft map and PutSecret/DeleteSecret apply intact (only the migration reads them) so an un-upgraded node keeps resolving mid-roll. Remove every OTHER reader of cluster_secret / cluster_secret_index / subscribe_secrets that F1-F3 left.")
+//! @yah:next("Keep the legacy open path private to the migration module. R911-F7 deletes it together with the raft map after both groups roll.")
+//! @yah:verify("cargo test -p yubaba --lib green vs baseline; tests: raft records land in an InMemoryObjectStore re-sealed and open through ClusterResolver; a second run is a no-op; a newer store record is not overwritten; one bad record does not block the rest.")
+//! @yah:depends_on(R911-F4)
+//! @yah:files(oss/yubaba/crates/yubaba/src/lib.rs)
+//! @yah:files(oss/yubaba/crates/yubaba/src/main.rs)
+//! @yah:files(oss/yubaba/crates/yubaba-consensus/src/raft/store.rs)
+//! @yah:handoff("NEW MODULE oss/yubaba/crates/yubaba/src/secret_migrate.rs (declared in lib.rs). `pub async fn run(state: &ServerState) -> Option<MigrationReport>` checks its preconditions in order: raft cluster_state, then the fleet store's rails (FleetSecretStore::for_node), then the node KEK. A missing one logs ONE error, `secret migration: skipped — <reason naming it, e.g. --sovereign-group>`, returns None, and the node still starts. Otherwise all store and crypto work runs in one `off_runtime` call to `migrate(sm, kek, store)`, followed by one summary line.")
+//! @yah:handoff("PASS 1, RAFT MAP: for each name in `cluster_secret_index`, read `cluster_secret`, open with `open_legacy_unbound` under the node KEK into a Zeroizing buffer, then re-seal with `seal(kek, pt, secret_aad(name, &access))`, preserving access, updated_at, digest, sans and ari exactly. The record is written with `FleetSecretStore::write_secret`, so tls/* lands in certs/<issuer>/ through the store mapping. SKIP when the store already holds the name, it opens bound, and store.updated_at >= raft.updated_at. OVERWRITE when the store copy is absent, older, or does not open bound. A raft record that fails the legacy open is FAILED, named, and never written. A store read error is also FAILED; it never falls through to a blind overwrite. PASS 2, CERTS/<ISSUER>/: every tls/* row of `store.index()` not already handled in pass 1 that does not open bound but does open unbound is re-sealed in place under its own name and rule. One that opens neither way is FAILED and left untouched. The index lists only cert/key records, so claim (`issuing`), enrollment and holding objects are never touched.")
+//! @yah:handoff("WIRING (main.rs): `yubaba::secret_migrate::run(&shared_state).await;` sits immediately after `let shared_state = Arc::new(server_state);`, BEFORE `leader::spawn` (start_headscale reads the noise key) and before `serve` and the secret_watch/secret_reload/cert_materialize/tenant-passway spawns. The one-line comment says why. The earlier startup spawns (demux route publisher, per-domain issuer) read only record metadata, never plaintext.")
+//! @yah:handoff("NOT TOUCHED (decision 7): raft apply, PutSecret/DeleteSecret, the secret map, `open_legacy_unbound`. There were no other readers left to remove: a code-only grep shows `cluster_secret`, `cluster_secret_index` and `subscribe_secrets` read only by their definitions in yubaba-consensus raft/store.rs (plus subscribe_secrets' own test), and now by this module. CONCURRENCY: no lock, per decision 5, explained in one module-doc paragraph (two voters write identical plaintext/name/rule/metadata; the secret-watch bump lands on consumers whose digest is unchanged).")
+//! @yah:handoff("T6 JOURNAL LINE — grep on the FIRST upgraded node of each group, right after its restart: `journalctl -u yubaba --since '<restart time>' | grep 'secret migration: '`. Success is exactly one line of the form `secret migration: migrated N / skipped M / failed K; migrated=[name, ...] failed=[...]`. Expected on the first PROD node: migrated=[...] includes all 7 raft names (cheers/cloud-admin/verify-key, headscale/noise-private-key, noisetable/account/{magic-link-key,session-key,smtp-password}, tls/yah.dev/{cert,key}) plus any legacy tenant certs under certs/<issuer>/, with `failed 0`. On the first DEV node migrated=[...] includes cloudflare-tunnel-token and noisetable/account-staging/{magic-link-key,session-key}. Every later node in a group should log `migrated 0 / skipped M / failed 0`. A line starting `secret migration: skipped —` means a rail is missing (the reason names it) and nothing migrated. Per-record failures log separately as `secret migration: <name> failed: <reason>`.")
+//! @yah:verify("BASELINE: yubaba lib 983/0 (operator-verified after F4).")
+//! @yah:verify("AFTER (from oss/yubaba): `cargo check -p yubaba --all-targets` EXIT=0 (log shows Checking yubaba; no yubaba warnings). `cargo test -p yubaba --lib` = 991 passed / 0 failed (+8). `cargo test -p yubaba --features testing --lib secret_reload` = 2 passed / 0 failed. Root `cargo run -p xtask -- cluster-epochs` EXIT=0 (no protocol surface moved).")
+//! @yah:verify("New tests (secret_migrate::tests, InMemoryObjectStore + a raft state machine seeded through `apply_for_test(PutSecret)` with legacy unbound seals): raft_records_land_resealed_with_every_field_and_resolve (access/updated_at/digest/sans/ari preserved, ciphertext re-sealed, tls lands at certs/<issuer>/yah.dev/cert.sealed, both resolve through ClusterResolver, raft map untouched, summary prefix); a_second_run_skips_everything_and_writes_nothing (every object byte-identical before and after, each name counted once); a_newer_bound_store_record_is_not_overwritten; an_older_or_unbound_store_record_is_overwritten (older-bound, and newer-but-unbound); an_unopenable_raft_record_is_named_failed_and_the_rest_migrate (failed=[bad/one] in the summary, never written, no bytes in the summary); an_unbound_certs_object_is_resealed_in_place_and_nothing_else_is_touched (legacy re-sealed, bound skipped, wrong-KEK object failed and byte-identical, claim object byte-identical); a_node_missing_a_rail_skips_with_the_named_error (NoStore(NoSovereignGroup) naming --sovereign-group; NoClusterState); run_migrates_through_the_blocking_pool (the production entry on a multi-thread runtime with a real KEK file).")
+//! @yah:gotcha("SHARED BUCKET, SHARED certs/<issuer>/: prod and dev use one bucket, and both derive the same issuer segment (ACME staging directory), so pass 2 on whichever group's first node runs first re-seals the shared certs/<issuer>/ objects. The other group's first node then skips them, IF both groups share a cluster KEK. I did not verify whether the prod and dev KEKs are the same. If they differ, the second group's node will list those cert names under failed=[...] (it cannot open another group's records) and leave them untouched. That is expected and harmless for those names, but it means T6's 'failed 0' check must allow for them on the second group.")
+//! @yah:gotcha("STARTUP RACE, bounded to the migration window: pass 2 reads then writes each legacy cert object without a precondition. If the per-domain issuer (spawned earlier in main.rs) writes a fresh bound cert for the same domain between those two steps, the migration overwrites it with the re-sealed older, still-valid cert. That cert renews on its normal schedule; nothing is lost that the issuer will not re-issue. The sweep over every tenant cert also costs one GET plus one AEAD open per object on every start until R911-T7 deletes this module.")
+//! @yah:gotcha("ROLL: this build must still be preceded by --sovereign-group on every voter (without it migration logs `skipped — ... --sovereign-group` and every cluster-secret read fails closed), and by the matching CLI install (F4 lockstep).")
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -90,7 +117,6 @@ use workload_spec::{SecretMount, WorkloadSpec};
 
 use crate::deploy::secret_mount::rerender_file_secrets;
 use crate::mesh::MeshAssignment;
-use crate::raft::YubabaStateMachine;
 use crate::secrets::{resolve_secrets, ClusterResolver, ContainerSecrets, SECRET_STORE_ROOT};
 use crate::ServerState;
 
@@ -177,19 +203,46 @@ pub fn content_digest(secrets: &ContainerSecrets) -> u64 {
 /// Subscribe to cluster-secret rotations and drive the re-render → graceful
 /// upgrade loop. Returns immediately (a no-op that logs) on a node with no raft
 /// cluster state or no workload backend — nothing can rotate there.
+///
+/// @yah:ticket(R911-F2, "Secret change watch polls the fleet object store (ETags), replacing raft subscribe_secrets")
+/// @yah:status(review)
+/// @yah:at(2026-09-15T04:33:19Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R911)
+/// @yah:next("Tier: Warrior — async watch plumbing across two consumers, with debounce/stagger semantics to preserve.")
+/// @yah:next("secret_reload::run (:192) and cert_materialize (:417) wake on sm.subscribe_secrets(), a raft epoch. Once secrets live in R2 that epoch never moves on rotation. Add a node-level SecretWatch that polls the FleetSecretStore (R911-F1) on an interval (default 30s, env-overridable), fingerprints the ETags (ObjectStore::etag) or updated_at of the keys under secrets/<group>/ and certs/<issuer>/, and bumps a tokio watch::Sender<u64> on change. Both consumers subscribe to it instead of raft. Keep DEBOUNCE and rolling_stagger unchanged.")
+/// @yah:next("A poll error must not bump the epoch or read as a change; log it once per outage transition, not on every tick.")
+/// @yah:next("Do not delete YubabaStateMachine::subscribe_secrets here. R911-F5 removes the raft secret map.")
+/// @yah:verify("cargo test -p yubaba --lib green vs baseline; tests show a changed object bumps once, an unchanged poll does not, and a poll error does not.")
+/// @yah:depends_on(R911-F1)
+/// @yah:files(oss/yubaba/crates/yubaba/src/secret_reload.rs)
+/// @yah:files(oss/yubaba/crates/yubaba/src/cert_materialize.rs)
+/// @yah:files(oss/yubaba/crates/yubaba/src/lib.rs)
+/// @yah:next("\"BLOCKING I/O (found verifying R911-F1): FleetSecretStore reads R2 through reqwest::blocking::Client (oss/yah-base/crates/object-store/src/r2.rs:33). F1 routed every cluster-secret read through it from async contexts: build_secret_resolver in the lib.rs deploy handler, secret_reload::run/reload_once, cert_materialize::run, and leader.rs start_headscale via noise_key_resolver. That blocks tokio workers, and in debug builds reqwest's blocking wait can panic inside a runtime. Every async caller that resolves or polls must go through tokio::task::spawn_blocking, including the new ETag poll. demux_routes.rs:804 is the in-tree precedent. Add a test that resolves through an async caller on a multi-thread runtime, using a store impl that asserts it is not running on a tokio worker (tokio::runtime::Handle::try_current is Err inside spawn_blocking? no, use a flag set by the wrapper) so the wrapping cannot silently regress.\"")
+/// @yah:handoff("BLOCKING I/O FIXED. `fleet_secrets::off_runtime(f)` runs `f` via `tokio::task::spawn_blocking`, the same shape as the demux_routes sweep. It also sets a thread-local marker for the call's duration, resets it on drop, and resumes panics on the caller. Every FleetSecretStore verb (read/write/delete/index/fingerprint) calls `assert_off_runtime()`. In debug builds that panics when `Handle::try_current()` is Ok and the marker is unset, i.e. a bare call from a runtime thread. Plain sync callers with no runtime are never flagged. Wrapped call sites: lib.rs container deploy (new `materialize_spec_secrets` helper, which moves spec+resolver onto the pool, materializes, computes the registration digest in the same pass, and returns the spec), lib.rs `deploy_non_container` (native secrets), `secret_reload::reload_once` (per-workload resolve), cert_materialize `run`, which calls a new `materialize_pass` wrapper around `materialize_once`, and leader.rs `start_headscale`, which calls the new `headscale_state::materialize_noise_key_off_runtime`. `build_secret_resolver` now returns `Box<dyn SecretResolver + Send>`.")
+/// @yah:handoff("CHANGE WATCH. New module oss/yubaba/crates/yubaba/src/secret_watch.rs: `run(state)` polls `FleetSecretStore::fingerprint()` inside `off_runtime` every `YUBABA_SECRET_WATCH_INTERVAL_SECS` (default 30s; blank/0/unparsable fall back to the default with a warn). It bumps `ServerState::secret_epoch` (new field, a `tokio::sync::watch::Sender<u64>` created in `ServerState::new`, so consumers can subscribe before the watch starts) via `send_modify`, and only when the fingerprint changes. `fingerprint()` hashes the sorted (object key, `etag:<ETag>` or `updated_at:<n>` when the backend's etag is None) pairs over the same key set `index()` lists (certs/<issuer>/ TLS pairs + valid names under secrets/<group>/). An object that vanishes between the listing and its etag probe is skipped; any backend error fails the poll. A pure Tracker holds the bump rules: the first good read is the baseline and does not bump. An error never bumps and never moves the baseline. Recovery to the same fingerprint wakes nobody; to a different one it bumps once. Errors before any baseline make the first good read bump, so consumers whose startup pass hit the same outage retry. The outage is logged once on the transition into it and once on recovery. main.rs spawns `secret_watch::run` beside `secret_reload`/`cert_materialize`. Both consumers now subscribe to `state.secret_epoch` and no longer require raft `cluster_state`. DEBOUNCE and rolling_stagger are unchanged. `YubabaStateMachine::subscribe_secrets` was NOT deleted; its only remaining caller is its own test in yubaba-consensus store.rs.")
+/// @yah:handoff("LEADER DECISION (@Ashguard:griffin, mid-turn 2026-09-14): NO DEFAULT GROUP. Deleted `DEFAULT_GROUP`. `FleetSecretStore::new` takes a required group. New `fleet_secrets::MissingRail { NoObjectStore, NoSovereignGroup }` and `pub type NodeSecretStore = Result<FleetSecretStore, MissingRail>` (implements ClusterSecretStore). New `FleetSecretStore::for_rails(certs, group)` is the pure core that `for_node` delegates to (object store checked first). New `SecretStoreError::NoSovereignGroup`. The F1 `Option<S>` blanket impl was deleted, and every resolver site/signature is now `NodeSecretStore`. A missing rail resolves to `ClusterUnavailable`, so headscale refuses to start and deploys are rejected by secret name. The single startup line is `secret_watch::run`'s error naming `--sovereign-group` on a node that has the bucket but no group; cert_materialize's startup error now names whichever rail is missing.")
+/// @yah:verify("BASELINE (operator-verified after F1): cargo test -p yubaba --lib = 961 passed / 0 failed.")
+/// @yah:verify("AFTER: cargo check -p yubaba --all-targets EXIT=0; cargo check -p yubaba --features testing --lib --tests EXIT=0 (both logs show `Checking yubaba`, i.e. really compiled); no errors or warnings in the touched yubaba files. cargo test -p yubaba --lib = 975 passed / 0 failed, EXIT=0 (+14: secret_watch 7, fleet_secrets +4 net, cert_materialize 1, headscale_state 1, lib.rs materialize_spec_secrets_tests 1). cargo test -p yubaba --features testing --lib secret_reload = 2 passed, EXIT=0.")
+/// @yah:verify("Change-watch tests: secret_watch::tests::{the_baseline_does_not_bump_and_an_unchanged_poll_does_not_either, a_change_bumps_exactly_once, an_error_is_not_a_change_and_does_not_move_the_baseline, an_outage_before_any_baseline_wakes_the_consumers_on_the_first_good_read, the_interval_defaults_and_is_overridable, the_loop_bumps_once_per_change (multi-thread, real poll loop over InMemoryObjectStore), an_unreachable_store_never_bumps}, plus fleet_secrets::tests::{the_fingerprint_moves_only_when_a_resolvable_record_does, the_fingerprint_of_an_unreachable_store_is_an_error}.")
+/// @yah:verify("Regression guard for blocking I/O: fleet_secrets::tests::a_store_verb_on_a_runtime_thread_trips_the_guard (should_panic, debug builds) proves the tripwire fires. off_runtime_runs_the_store_and_does_not_leak_its_marker proves the marker resets on a reused pool thread. Each wrapped call site is exercised on a multi-thread runtime against a real FleetSecretStore, so reverting any of them to an inline call panics its test: cert_materialize::tests::a_pass_resolves_off_the_runtime_and_writes_the_pair, headscale_state::tests::the_async_entry_point_reads_the_fleet_store_off_the_runtime, lib.rs materialize_spec_secrets_tests::a_deploy_resolves_cluster_secrets_off_the_runtime, secret_watch::tests::the_loop_bumps_once_per_change, and the feature-gated secret_reload tests, which now seed and digest through off_runtime.")
+/// @yah:verify("No-default-group tests: fleet_secrets::tests::{a_node_needs_both_rails_and_names_the_missing_one, a_node_missing_a_rail_fails_closed_by_name}; headscale_state::tests::the_real_resolver_over_a_down_or_missing_store_refuses_to_start now covers an outage, NoObjectStore and NoSovereignGroup.")
+/// @yah:gotcha("ROLL GATE (leader decision, fleet recon 2026-09-14): all 6 live raft voters, prod and dev, run with --sovereign-group UNSET even though MachineConfig declares prod/dev. With this build a node lacking the flag has NO fleet secret store: every cluster-secret deploy is rejected ClusterUnavailable, cert_materialize never delivers the fleet cert, secret_watch stays idle, and start_headscale REFUSES to start (NoiseKeyError::StoreUnavailable). R911-T6 must set --sovereign-group on every voter BEFORE this ships. Keep that ordering along with the F1 gate (migrate raft secrets to R2 before rolling the resolver).")
+/// @yah:gotcha("The blocking-I/O tripwire is debug-build only (#[cfg(debug_assertions)]), so release binaries never panic on it. Any future async caller of FleetSecretStore (the node-mediated PUT /secrets endpoint, the startup migration) must go through fleet_secrets::off_runtime or its debug-build tests will panic, naming the fix.")
+/// @yah:gotcha("yah build run still cannot open the camp daemon's TaskRun store (turso short read, page 24050), so every build here ran locally outside the camp queue.")
 pub async fn run(state: Arc<ServerState>) {
-    let Some(sm) = state.cluster_state.clone() else {
-        tracing::debug!("secret_reload: no cluster state on this node; rotation watcher idle");
-        return;
-    };
     let Some(backend) = state.active_backend() else {
         tracing::debug!("secret_reload: no workload backend; rotation watcher idle");
         return;
     };
 
     let stagger = state.node_id.map(rolling_stagger).unwrap_or_default();
+    // R911-F1/F2: secrets are read from the fleet object store, and the wake
+    // signal is the node's fleet secret watch (`crate::secret_watch`), which
+    // polls that same store.
+    let store = crate::fleet_secrets::FleetSecretStore::for_node(&state);
 
-    let mut rx = sm.subscribe_secrets();
+    let mut rx = state.secret_epoch.subscribe();
     // Absorb the initial value so we only react to changes after startup.
     let _ = rx.borrow_and_update();
     tracing::info!(
@@ -215,7 +268,7 @@ pub async fn run(state: Arc<ServerState>) {
         let _ = rx.borrow_and_update();
 
         reload_once(
-            &sm,
+            &store,
             &state.cluster_kek_path,
             &state.secret_mount_root,
             backend.as_ref(),
@@ -234,7 +287,7 @@ pub async fn run(state: Arc<ServerState>) {
 /// on the next bump; its stored digest is left untouched so the retry still sees
 /// a change.
 async fn reload_once(
-    sm: &YubabaStateMachine,
+    store: &crate::fleet_secrets::NodeSecretStore,
     kek_path: &std::path::Path,
     mount_root: &std::path::Path,
     backend: &(dyn crate::ContainerRuntime + Send + Sync),
@@ -267,12 +320,18 @@ async fn reload_once(
 
     for (ident, entry) in entries {
         let resolver = ClusterResolver::new(
-            sm.clone(),
+            store.clone(),
             kek.clone(),
             crate::secrets::LocalFileResolver::new(SECRET_STORE_ROOT),
             workload_spec::secrets::SecretConsumer::of(&entry.spec),
         );
-        let resolved = match resolve_secrets(&entry.file_mounts, &resolver) {
+        // R911-F2: resolving reads the fleet object store over blocking HTTPS.
+        let mounts = entry.file_mounts.clone();
+        let resolved = match crate::fleet_secrets::off_runtime(move || {
+            resolve_secrets(&mounts, &resolver)
+        })
+        .await
+        {
             Ok(r) => r,
             // R706 / W294 decision 5: a rule edit that revokes a *running*
             // workload takes effect on its next deploy, not by tearing it down
@@ -359,13 +418,10 @@ mod tests {
     use super::*;
 
     use kamaji::fake::FakeRuntime;
-    use openraft::entry::RaftEntry;
-    use openraft::storage::{EntryResponder, RaftStateMachine};
-    use openraft::type_config::alias::{CommittedLeaderIdOf, EntryOf, LogIdOf};
-    use openraft::vote::RaftLeaderId;
     use workload_spec::{ImageRef, MeshIdent, SecretRef, SecretTarget, TierTag, WorkloadSpec};
+    use yah_object_store::InMemoryObjectStore;
 
-    use crate::raft::{YubabaRaftConfig, YubabaRequest, YubabaStateMachine};
+    use crate::fleet_secrets::{FleetSecretStore, NodeSecretStore};
     use crate::secrets::{seal_cluster_secret, ClusterResolver};
 
     const KEK: [u8; 32] = [5u8; 32];
@@ -428,49 +484,46 @@ mod tests {
         ])
     }
 
-    fn put_secret(index: u64, name: &str, plaintext: &[u8]) -> EntryOf<YubabaRaftConfig> {
-        let rec = seal_cluster_secret(&KEK, plaintext, index, ingress_access());
-        // openraft 0.10 builds entries through the RaftEntry trait rather than
-        // by struct literal — `Entry` gained three more generics and the
-        // committed-leader-id type now comes from the type config.
-        let log_id = LogIdOf::<YubabaRaftConfig>::new(
-            CommittedLeaderIdOf::<YubabaRaftConfig>::new(1, 1),
-            index,
-        );
-        EntryOf::<YubabaRaftConfig>::new_normal(
-            log_id,
-            YubabaRequest::PutSecret {
-                name: name.into(),
-                ciphertext: rec.ciphertext,
-                nonce: rec.nonce,
-                updated_at: rec.updated_at,
-                access: rec.access,
-                digest: rec.digest,
-                sans: rec.sans,
-                ari: rec.ari,
-            },
-        )
+    /// An empty fleet secret store over an in-memory bucket (R911-F1).
+    fn fleet() -> NodeSecretStore {
+        Ok(FleetSecretStore::new(
+            Arc::new(InMemoryObjectStore::new()),
+            "le",
+            "prod",
+        ))
     }
 
-    /// Apply one entry to `sm`. openraft 0.10's `apply` takes a *stream* of
-    /// `EntryResponder`s rather than an iterator of entries; same shape as the
-    /// helper in `raft::store`'s own tests.
-    async fn apply_one(sm: &mut YubabaStateMachine, entry: EntryOf<YubabaRaftConfig>) {
-        let item: Result<EntryResponder<YubabaRaftConfig>, std::io::Error> = Ok((entry, None));
-        sm.apply(tokio_stream::iter(vec![item])).await.unwrap();
+    /// Seal `plaintext` for the ingress workload and write it to `store`.
+    /// Through `off_runtime`, like every async caller: the store's debug
+    /// tripwire panics on a bare call from a runtime thread.
+    async fn put_secret(
+        store: &NodeSecretStore,
+        index: u64,
+        name: &str,
+        plaintext: &[u8],
+    ) {
+        let rec = seal_cluster_secret(&KEK, name, plaintext, index, ingress_access());
+        let (store, name) = (store.clone().unwrap(), name.to_string());
+        crate::fleet_secrets::off_runtime(move || store.write_secret(&name, &rec))
+            .await
+            .unwrap();
     }
 
     /// Compute the digest a workload's cluster File mounts resolve to against
     /// the current state — mirrors what the deploy handler seeds at registration.
-    fn digest_now(sm: &YubabaStateMachine, mounts: &[SecretMount]) -> u64 {
+    async fn digest_now(store: &NodeSecretStore, mounts: &[SecretMount]) -> u64 {
         let resolver = ClusterResolver::from_kek_file(
-            sm.clone(),
+            store.clone(),
             kek_path(),
             SECRET_STORE_ROOT,
             ingress_consumer(),
         )
         .unwrap();
-        content_digest(&resolve_secrets(mounts, &resolver).unwrap())
+        let mounts = mounts.to_vec();
+        crate::fleet_secrets::off_runtime(move || {
+            content_digest(&resolve_secrets(&mounts, &resolver).unwrap())
+        })
+        .await
     }
 
     // A KEK file the resolver loads. Written once per test into its tempdir; the
@@ -495,12 +548,10 @@ mod tests {
         let kek = set_kek_path(tmp.path());
         let mount_root = tmp.path().join("mounts");
 
-        // Seed the raft state with the initial cert + key.
-        let mut sm = YubabaStateMachine::open(tmp.path().join("raft"))
-            .await
-            .unwrap();
-        apply_one(&mut sm, put_secret(1, CERT_KEY, b"CERT-V1")).await;
-        apply_one(&mut sm, put_secret(2, KEY_KEY, b"KEY-V1")).await;
+        // Seed the fleet store with the initial cert + key.
+        let store = fleet();
+        put_secret(&store, 1, CERT_KEY, b"CERT-V1").await;
+        put_secret(&store, 2, KEY_KEY, b"KEY-V1").await;
 
         // Pretend the workload was already materialized: its host tmpfs files
         // exist with the v1 material (so the test asserts a *rewrite*).
@@ -518,22 +569,22 @@ mod tests {
                 spec: ingress_spec(ident),
                 mesh: crate::mesh::MeshAssignment::stub(std::net::Ipv4Addr::new(100, 64, 0, 1)),
                 file_mounts: mounts.clone(),
-                content_digest: digest_now(&sm, &mounts),
+                content_digest: digest_now(&store, &mounts).await,
             },
         );
 
         let fake = FakeRuntime::new();
 
         // A bump that does NOT change this workload's material → no upgrade.
-        reload_once(&sm, &kek, &mount_root, &fake, &registry).await;
+        reload_once(&store, &kek, &mount_root, &fake, &registry).await;
         assert!(
             fake.graceful_upgrade_calls().is_empty(),
             "no rotation yet → no upgrade"
         );
 
         // Rotate the cert (key unchanged) → the workload's combined digest moves.
-        apply_one(&mut sm, put_secret(3, CERT_KEY, b"CERT-V2-rotated")).await;
-        reload_once(&sm, &kek, &mount_root, &fake, &registry).await;
+        put_secret(&store, 3, CERT_KEY, b"CERT-V2-rotated").await;
+        reload_once(&store, &kek, &mount_root, &fake, &registry).await;
 
         assert_eq!(
             fake.graceful_upgrade_calls(),
@@ -551,7 +602,7 @@ mod tests {
             b"KEY-V1"
         );
         // The stored digest advanced, so a redundant pass does not re-upgrade.
-        reload_once(&sm, &kek, &mount_root, &fake, &registry).await;
+        reload_once(&store, &kek, &mount_root, &fake, &registry).await;
         assert_eq!(
             fake.graceful_upgrade_calls().len(),
             1,
@@ -565,11 +616,9 @@ mod tests {
         let kek = set_kek_path(tmp.path());
         let mount_root = tmp.path().join("mounts");
 
-        let mut sm = YubabaStateMachine::open(tmp.path().join("raft"))
-            .await
-            .unwrap();
-        // Only the key is present — the cert record never replicated.
-        apply_one(&mut sm, put_secret(1, KEY_KEY, b"KEY-V1")).await;
+        let store = fleet();
+        // Only the key is present — the cert record was never written.
+        put_secret(&store, 1, KEY_KEY, b"KEY-V1").await;
 
         let mounts = vec![cert_mount(), key_mount()];
         let registry: SecretWorkloadRegistry = Default::default();
@@ -586,7 +635,7 @@ mod tests {
         );
 
         let fake = FakeRuntime::new();
-        reload_once(&sm, &kek, &mount_root, &fake, &registry).await;
+        reload_once(&store, &kek, &mount_root, &fake, &registry).await;
         assert!(
             fake.graceful_upgrade_calls().is_empty(),
             "an unresolvable (partial) secret must defer, not upgrade"

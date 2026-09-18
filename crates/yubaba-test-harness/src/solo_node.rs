@@ -325,7 +325,7 @@ async fn build(
     });
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let client = reqwest::Client::new();
+    let client = crate::http();
     loop {
         if client
             .get(format!("{base_url}/health"))

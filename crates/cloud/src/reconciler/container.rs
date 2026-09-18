@@ -11,7 +11,7 @@
 //! Config lives in the component's `workload.toml`, parsed through the shared
 //! [`workload_spec::Workload`] envelope as a [`ContainerBuild`] recipe — the
 //! `[build]` table is what selects the recipe form over the digest-pinned
-//! reference form the cloud tier uses (R783-F1 / W324). Its *keys* all default,
+//! reference form the prod tier uses (R783-F1 / W324). Its *keys* all default,
 //! but the header itself must be present.
 //!
 //! ```toml
@@ -124,12 +124,12 @@ impl Reconciler for ContainerReconciler {
         // (no-op for in-tree components).
         ctx.materialize().await?;
 
-        // Scope guard: T1 is the operator-local tier. The cloud tier is
+        // Scope guard: T1 is the operator-local tier. The prod tier is
         // yubaba-mediated (`yah cloud workload deploy`), a separate surface.
         if !matches!(ctx.mirror.shape, MirrorShape::Local) {
             bail!(
                 "component {}: kind \"container\" has only a local reconciler — mirror \
-                 shape is {:?}, not `local`. Deploy the cloud tier via \
+                 shape is {:?}, not `local`. Deploy the prod tier via \
                  `yah cloud workload deploy` against a yubaba machine.",
                 ctx.component.id,
                 ctx.mirror.shape,

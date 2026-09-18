@@ -237,6 +237,11 @@ pub struct RoutePublisherConfig {
     /// (`PASSWAY_HOLDING_DIR`), when this node fronts one. `None` publishes no
     /// override and every tenant keeps passway's built-in page.
     pub holding_dir: Option<PathBuf>,
+    /// The node this publisher runs on (R910-F2): only records that
+    /// [`serve on`](crate::cert_store::Enrollment::serves_on) it are published.
+    /// Set by `main` from `leader::derive_machine_name` plus
+    /// `YUBABA_ENROLLMENT_SCOPE`, not parsed here.
+    pub node: crate::cert_store::ServingNode,
 }
 
 /// One `host=value` route that does not come from the enrollment set.
@@ -399,6 +404,7 @@ pub fn parse_publisher_config(
         pinned,
         http_pinned,
         holding_dir,
+        node: crate::cert_store::ServingNode::default(),
     }))
 }
 
@@ -476,7 +482,11 @@ pub fn publish_sweep(
     store: &ObjectCertStore,
     cfg: &RoutePublisherConfig,
 ) -> Result<Sweep, PublishError> {
-    let enrolled = store.enrolled()?;
+    // R910-F2: scoped BEFORE any tier renders, so the :443 table, the :80 table
+    // and the holding map all describe the same set — and before the
+    // empty-set guard, so a node none of whose records serve on it keeps its
+    // existing table rather than blanking it.
+    let enrolled = crate::cert_store::serving_on(store.enrolled()?, &cfg.node);
     let tls = publish_tls_table(&enrolled, &cfg.routes_file, &cfg.pinned)?;
     let http = cfg
         .http_routes_file
@@ -1238,7 +1248,56 @@ mod tests {
             pinned: vec![],
             http_pinned: vec![],
             holding_dir: None,
+            node: crate::cert_store::ServingNode {
+                machine: None,
+                scope: crate::cert_store::EnrollmentScope::Fleet,
+            },
         }
+    }
+
+    #[test]
+    fn a_scoped_record_is_published_only_on_the_machines_it_names() {
+        // R910-F2, the leak this exists to close: prod and dev share one
+        // bucket, so a tunnel door's loopback route written unscoped would be
+        // rendered into every node's demux and spliced into whatever holds
+        // that port there.
+        let (_mem, certs) = store();
+        certs.enroll("shared.example.com", &enrollment(8443)).unwrap();
+        let mut scoped = enrollment(8445);
+        scoped.machines = vec!["us-west-011".into()];
+        certs.enroll("staging.example.com", &scoped).unwrap();
+
+        use crate::cert_store::{EnrollmentScope, ServingNode};
+        let on = |machine: Option<&str>, scope: EnrollmentScope| {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = RoutePublisherConfig {
+                node: ServingNode {
+                    machine: machine.map(str::to_string),
+                    scope,
+                },
+                ..both_tiers(dir.path())
+            };
+            publish_sweep(&certs, &cfg).unwrap();
+            std::fs::read_to_string(dir.path().join("demux.routes")).unwrap()
+        };
+
+        let west = on(Some("us-west-011"), EnrollmentScope::Fleet);
+        assert!(west.contains("staging.example.com=127.0.0.1:8445"), "{west}");
+        assert!(west.contains("shared.example.com="), "{west}");
+
+        // The tunnel door's own node, left at the default scope: its record
+        // and nothing of the fleet's.
+        let west_named = on(Some("us-west-011"), EnrollmentScope::Named);
+        assert!(west_named.contains("staging.example.com=127.0.0.1:8445"), "{west_named}");
+        assert!(!west_named.contains("shared.example.com"), "{west_named}");
+
+        let south = on(Some("us-south-001"), EnrollmentScope::Fleet);
+        assert!(!south.contains("staging.example.com"), "{south}");
+        assert!(south.contains("shared.example.com="), "{south}");
+
+        // A node that cannot name itself routes nothing scoped.
+        let nameless = on(None, EnrollmentScope::Fleet);
+        assert!(!nameless.contains("staging.example.com"), "{nameless}");
     }
 
     #[test]

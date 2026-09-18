@@ -53,7 +53,16 @@ use std::time::{Duration, Instant};
 
 use cloud::provider::HetznerDriver;
 use yubaba::cluster_policy::ClusterPolicy;
-use yubaba::membership_ratchet::{run_once, RatchetOutcome};
+use yubaba::membership_ratchet::{run_once, BuildEpochs, RatchetOutcome};
+
+/// noisetable R118-T11: the build epochs `run_once` stamps onto the provenance record it
+/// writes. Taken from the daemon's own constants rather than made up, because
+/// these assertions run against a real state machine and a record whose epochs
+/// disagreed with the cluster's would be a different bug wearing this test's
+/// name.
+fn epochs() -> BuildEpochs {
+    yubaba::origin_source::build_epochs()
+}
 use yubaba::raft::{PeerLivenessVerdict, YubabaNodeId};
 use yubaba::runtime::DummyRuntime;
 use yubaba_test_harness::{test_cluster_with_policy, Cluster};
@@ -264,7 +273,7 @@ async fn ratchet_until_at(
             ) else {
                 continue;
             };
-            match run_once(node_id, raft, sm, policy, http, clock()).await {
+            match run_once(node_id, raft, sm, policy, http, clock(), epochs()).await {
                 RatchetOutcome::NotLeader => {}
                 other => last = format!("node {node_id}: {other:?}"),
             }
@@ -305,7 +314,7 @@ async fn tick_once_at(
         ) else {
             continue;
         };
-        match run_once(node_id, raft, sm, policy, http, now).await {
+        match run_once(node_id, raft, sm, policy, http, now, epochs()).await {
             RatchetOutcome::NotLeader => {}
             other => outcome = other,
         }

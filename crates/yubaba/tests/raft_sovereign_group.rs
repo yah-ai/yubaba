@@ -44,7 +44,7 @@ fn policy() -> ClusterPolicy {
 }
 
 async fn status(node: &SoloNode) -> serde_json::Value {
-    reqwest::Client::new()
+    yubaba_test_harness::http()
         .get(format!("{}/raft/status", node.base_url))
         .send()
         .await
@@ -57,7 +57,7 @@ async fn status(node: &SoloNode) -> serde_json::Value {
 /// Found `node` as a cluster-of-one and wait until it has elected itself, so a
 /// later `add-learner` reaches a real leader instead of bouncing on 421.
 async fn found(node: &SoloNode) {
-    let resp = reqwest::Client::new()
+    let resp = yubaba_test_harness::http()
         .post(format!("{}/raft/initialize", node.base_url))
         .json(&json!({ "members": { node.node_id.to_string(): node.addr } }))
         .send()
@@ -97,7 +97,7 @@ async fn add_learner(
     for (k, v) in extra.as_object().cloned().unwrap_or_default() {
         body[k] = v;
     }
-    let resp = reqwest::Client::new()
+    let resp = yubaba_test_harness::http()
         .post(format!("{}/raft/add-learner", leader.base_url))
         .json(&body)
         .send()

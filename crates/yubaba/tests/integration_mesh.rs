@@ -61,7 +61,7 @@ use cloud::provider::MachineProvider;
 use kamaji::Kamaji as ContainerRuntime;
 use workload_spec::{
     ExposeSpec, ImageRef, MeshExpose, MeshIdent, Millis, ResourceLimits, RestartPolicy,
-    SchemaVersion, StopPolicy, TierTag, WorkloadSpec,
+    StopPolicy, TierTag, WorkloadSpec,
 };
 use yubaba_test_harness::{test_cluster, wait_for_state, WorkloadStatus};
 use yubaba_test_macros::test_with_provider;
@@ -70,7 +70,6 @@ use yubaba_test_macros::test_with_provider;
 
 fn test_workload_spec(name: &str) -> WorkloadSpec {
     WorkloadSpec {
-        schema_version: SchemaVersion::V1,
         name: name.to_string(),
         image: ImageRef {
             registry: "docker.io".into(),
@@ -92,7 +91,10 @@ fn test_workload_spec(name: &str) -> WorkloadSpec {
         resources: ResourceLimits {
             memory_mb: 64,
             cpu_millis: 128,
-            ephemeral_storage_mb: 128,
+            memory_request_mb: None,
+            cpu_limit_millis: None,
+            pids_max: None,
+            scratch_floor_mb: None,
         },
         depends_on: vec![],
         requires: vec![],
@@ -113,6 +115,7 @@ fn test_workload_spec(name: &str) -> WorkloadSpec {
             operator: None,
         },
         labels: Default::default(),
+        durability: None,
         annotations: Default::default(),
         files: Vec::new(),
     }
@@ -272,7 +275,7 @@ where
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Read path stays up on the surviving node with X-State-Freshness: stale.
-    let raw_client = reqwest::Client::new();
+    let raw_client = yubaba_test_harness::http();
     let state_url = format!(
         "{}/workloads/{}/state",
         cluster.yubaba(leader_idx).base_url,

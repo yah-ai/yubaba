@@ -11,7 +11,8 @@
 //! issue concurrently.
 //!
 //! The cert material is sealed with the node-local cluster KEK
-//! ([`crate::secrets::seal_cluster_secret`]) and written into raft as two
+//! ([`crate::secrets::seal_cluster_secret`]) and written into the fleet object
+//! store (R911-F3, through [`ObjectCertStore`], key first and cert last) as two
 //! separate cluster secrets — one for the cert chain, one for the private key —
 //! keyed by [`cert_secret_name`] / [`key_secret_name`]. Two records (not one
 //! bundled blob) because the `SecretRef::Cluster` resolver (R600-F2) renders one
@@ -21,7 +22,7 @@
 //!
 //! This module holds the *pure* election + renewal decision so it is unit-
 //! testable without a live raft node or a network ACME round-trip; the loop that
-//! drives `AcquireLock` → `acme_engine::issue` → seal → `PutSecret` is wired on
+//! drives `AcquireLock` → `acme_engine::issue` → seal → object-store write is wired on
 //! top of it (R600-F3 runtime).
 //!
 //! @yah:ticket(R853-B9, "yubaba's fleet issuer decides renewal from the record's updated_at alone, so YUBABA_ACME_EXTRA_DOMAINS is silently ignored until expiry")
@@ -82,7 +83,6 @@ use zeroize::Zeroizing;
 
 use crate::raft::{
     client_write_forwarded, SecretRecord, YubabaNodeId, YubabaRaft, YubabaRequest, YubabaResponse,
-    YubabaStateMachine,
 };
 use crate::cert_store::ObjectCertStore;
 use crate::secrets::{load_cluster_kek, seal_cluster_secret, CLUSTER_KEK_PATH};
@@ -93,17 +93,12 @@ use workload_spec::secrets::SecretAccess;
 /// leadership, not wait a full renewal interval.
 const FIRST_ISSUE_POLL_SECS: u64 = 60;
 
-/// Logical cluster-secret key for the issued cert **chain** PEM of `domain`.
-/// e.g. `cert_secret_name("yah.dev") == "tls/yah.dev/cert"`.
-pub fn cert_secret_name(domain: &str) -> String {
-    format!("tls/{domain}/cert")
-}
-
-/// Logical cluster-secret key for the issued private **key** PEM of `domain`.
-/// e.g. `key_secret_name("yah.dev") == "tls/yah.dev/key"`.
-pub fn key_secret_name(domain: &str) -> String {
-    format!("tls/{domain}/key")
-}
+// noisetable R118-T11: `cert_secret_name` / `key_secret_name` moved to
+// `crate::secrets`, which owns the cluster-secret store they name. This module
+// is `acme`-gated and they are read by modules that are not — see their doc
+// comments. Re-exported here so every existing `acme_issuer::cert_secret_name`
+// path still resolves.
+pub use crate::secrets::{cert_secret_name, key_secret_name};
 
 /// The raft lock key that elects the single issuer for `domain`. Only the holder
 /// issues; the TTL frees it if the holder dies.
@@ -459,28 +454,25 @@ fn parse_u64(
 /// its own if the node-local KEK can't be loaded (this node then can't seal, so
 /// it can't be the issuer — consumers still resolve via the F2 path).
 ///
-/// R870-B20: `mirror` is the node's cert store, connected by the caller, or
-/// `None` on a node without one. Handed IN rather than parsed from the issuer's
-/// own config — a cert store is a property of the *node*, not of the issuer, and
-/// owning it here made `YUBABA_CERT_STORE_*` silently inert on every node that
-/// is not also an ACME issuer.
+/// R870-B20: `store` is the node's cert store, connected by the caller. Handed
+/// IN rather than parsed from the issuer's own config — a cert store is a
+/// property of the *node*, not of the issuer, and owning it here made
+/// `YUBABA_CERT_STORE_*` silently inert on every node that is not also an ACME
+/// issuer.
+///
+/// R911-F3: it is also where the fleet cert lives — read for the renewal gate,
+/// written key first and cert last — so it is required. A node without one
+/// cannot be the issuer, and the caller does not spawn it.
 pub fn spawn(
     node_id: YubabaNodeId,
     raft: YubabaRaft,
-    state_machine: YubabaStateMachine,
     config: IssuerConfig,
-    mirror: Option<Arc<ObjectCertStore>>,
+    store: Arc<ObjectCertStore>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move { run(node_id, raft, state_machine, config, mirror).await })
+    tokio::spawn(async move { run(node_id, raft, config, store).await })
 }
 
-async fn run(
-    node_id: YubabaNodeId,
-    raft: YubabaRaft,
-    sm: YubabaStateMachine,
-    cfg: IssuerConfig,
-    mirror: Option<Arc<ObjectCertStore>>,
-) {
+async fn run(node_id: YubabaNodeId, raft: YubabaRaft, cfg: IssuerConfig, store: Arc<ObjectCertStore>) {
     let kek = match load_cluster_kek(&cfg.kek_path) {
         Ok(k) => k,
         Err(e) => {
@@ -491,16 +483,10 @@ async fn run(
             return;
         }
     };
-    // R779: the object-store mirror, connected by the caller (R870-B20). A node
-    // without a store — or one whose bucket did not connect, which main already
-    // logged — mirrors nothing and keeps renewing the fleet cert through raft;
-    // a missing mirror must never stop issuance.
-    if let Some(store) = &mirror {
-        info!(
-            issuer = %store.issuer(),
-            "acme issuer: mirroring the sealed pair to the object cert store"
-        );
-    }
+    info!(
+        issuer = %store.issuer(),
+        "acme issuer: the fleet cert is read from and sealed into the fleet object store"
+    );
     // Every raft write this loop makes goes through the leader, and this node is
     // usually not it — so the forwarding client is as load-bearing as the KEK,
     // and the same "then this node cannot be the issuer" exit applies. Only
@@ -532,9 +518,43 @@ async fn run(
     // silent. `None` until the first tick, which therefore always logs — an
     // operator restarting the unit sees where it landed rather than nothing.
     let mut last_presence: Option<IssuerPresence> = None;
+    // Inside an outage of the fleet object store: the transition is logged once.
+    let mut store_unreadable = false;
 
     loop {
-        let cert_present = sm.cluster_secret(&cert_key);
+        // R911-F3: the renewal gate reads the fleet object store, on the
+        // blocking pool. An unreadable store SKIPS this tick — it is never "no
+        // cert, so order", which would re-order the fleet cert on every bucket
+        // blip and spend the CA account's rate limit.
+        let read = {
+            let (store, cert_key) = (Arc::clone(&store), cert_key.clone());
+            crate::fleet_secrets::off_runtime(move || store.read_secret(&cert_key)).await
+        };
+        let cert_present = match read {
+            Ok(rec) => {
+                if std::mem::take(&mut store_unreadable) {
+                    info!(
+                        domain = %cfg.domain,
+                        "acme issuer: the fleet object store is readable again"
+                    );
+                }
+                rec
+            }
+            Err(e) => {
+                if !std::mem::replace(&mut store_unreadable, true) {
+                    warn!(
+                        domain = %cfg.domain,
+                        "acme issuer: cannot read the stored fleet cert — skipping renewal \
+                         checks until the fleet object store answers (an unreadable store is \
+                         not an absent cert, so nothing is ordered): {e}"
+                    );
+                } else {
+                    debug!("acme issuer: fleet object store still unreadable; skipping this tick: {e}");
+                }
+                tokio::time::sleep(Duration::from_secs(FIRST_ISSUE_POLL_SECS)).await;
+                continue;
+            }
+        };
         let current_leader = { raft.metrics().borrow_watched().current_leader };
 
         // EVERY configured node asks for the lock, wherever raft leadership sits
@@ -602,11 +622,9 @@ async fn run(
 
         if decide_issuer_action(lock_won.unwrap_or(false), renewal_due) == IssuerAction::Issue {
             store_consistent = issue_and_store(
-                &raft,
-                &client,
+                &store,
                 &kek,
                 &cfg,
-                mirror.as_deref(),
                 &cert_key,
                 &key_key,
                 // R853-F10: the id of the chain we are holding right now, so
@@ -629,8 +647,9 @@ async fn run(
     }
 }
 
-/// Run one ACME order, seal the cert + key under the node KEK, and `PutSecret`
-/// both into the cluster store. Every failure is logged and never panics.
+/// Run one ACME order, seal the cert + key under the node KEK, and write both
+/// into the fleet object store (R911-F3). Every failure is logged and never
+/// panics.
 ///
 /// Returns `true` when the store is left **consistent** — either both records
 /// were written, or nothing was (issuance failed, or the *first* write failed)
@@ -638,11 +657,9 @@ async fn run(
 /// **mismatched** (the new key landed but the cert write failed), so the caller
 /// retries promptly instead of sleeping the renewal interval.
 async fn issue_and_store(
-    raft: &YubabaRaft,
-    client: &reqwest::Client,
+    store: &Arc<ObjectCertStore>,
     kek: &[u8; 32],
     cfg: &IssuerConfig,
-    mirror: Option<&ObjectCertStore>,
     cert_key: &str,
     key_key: &str,
     replaces: Option<&str>,
@@ -668,8 +685,10 @@ async fn issue_and_store(
     };
 
     let stamp = unix_now();
+    // R911-F4: sealed under the name it is stored and resolved under.
     let mut cert_rec = seal_cluster_secret(
         kek,
+        cert_key,
         issued.cert_chain_pem.as_bytes(),
         stamp,
         cfg.access.clone(),
@@ -708,81 +727,46 @@ async fn issue_and_store(
     // freed `String`'s heap page (the engine hands us a plain `String`; this is
     // the issuer's own copy — the sensitive one on this node).
     let key_bytes = Zeroizing::new(issued.key_pem.into_bytes());
-    let key_rec = seal_cluster_secret(kek, &key_bytes, stamp, cfg.access.clone());
+    let key_rec = seal_cluster_secret(kek, key_key, &key_bytes, stamp, cfg.access.clone());
 
     // KEY first, CERT last — deliberately, because `renewal_due` gates off the
     // CERT record's `updated_at` (see `run`). Writing the gate record last means
     // a partial failure leaves the cert stale/absent, so `renewal_due` stays
     // true and the next tick re-issues and heals — the store never gets wedged
     // with a fresh cert paired to a stale key.
-    if let Err(e) = put_secret(raft, client, key_key, key_rec.clone()).await {
+    //
+    // Two writes rather than `ObjectCertStore::write_pair` (same order) because
+    // the return value needs to know WHICH one failed: a failed key write left
+    // the store consistent, a failed cert write after it did not.
+    if let Err(e) = write_record(store, key_key, key_rec).await {
         // Key write is first, so nothing was overwritten — store still consistent.
-        error!("acme issuer: PutSecret(key) failed (prior state intact): {e}");
+        error!("acme issuer: writing the sealed key to the fleet object store failed (prior state intact): {e}");
         return true;
     }
-    if let Err(e) = put_secret(raft, client, cert_key, cert_rec.clone()).await {
+    if let Err(e) = write_record(store, cert_key, cert_rec).await {
         error!(
-            "acme issuer: PutSecret(cert) failed AFTER the key write — store has a \
-             new key against the old cert; retrying promptly to heal: {e}"
+            "acme issuer: writing the sealed cert failed AFTER the key write — the store \
+             has a new key against the old cert; retrying promptly to heal: {e}"
         );
         return false;
     }
     info!(
         domain = %cfg.domain,
         renewed_via_ari = issued.renewed_via_ari,
-        "acme issuer: sealed cert+key written to cluster store — replicating to all nodes"
+        "acme issuer: sealed cert+key written to the fleet object store"
     );
-
-    // R779: mirror to the object store, after raft. Ordered this way on purpose
-    // — raft is the store the live fleet resolves from today, so it must not
-    // wait on an R2 round-trip, and a mirror failure must not be able to make
-    // `renewal_due` retry an order that already succeeded. A missed mirror heals
-    // on the next renewal; a repeated ACME order does not heal, it burns the
-    // account's rate limit.
-    mirror_pair(mirror, cfg, cert_key, key_key, cert_rec, key_rec).await;
     true
 }
 
-/// Write the sealed pair to the object cert store on a blocking thread.
-///
-/// [`ObjectCertStore`] is synchronous (the object-store trait is, so the whole
-/// tree's R2 consumers share one client shape), and this call site is inside a
-/// tokio task — so it goes through `spawn_blocking` rather than stalling a
-/// worker on an HTTPS round-trip. Every failure is logged and swallowed: see the
-/// caller for why a mirror failure must not fail the issuance.
-async fn mirror_pair(
-    mirror: Option<&ObjectCertStore>,
-    cfg: &IssuerConfig,
-    cert_key: &str,
-    key_key: &str,
-    cert_rec: SecretRecord,
-    key_rec: SecretRecord,
-) {
-    let Some(store) = mirror.cloned() else { return };
-    let (domain, cert_key, key_key) = (
-        cfg.domain.clone(),
-        cert_key.to_string(),
-        key_key.to_string(),
-    );
-    let written = tokio::task::spawn_blocking(move || {
-        store.write_pair(&cert_key, &key_key, &cert_rec, &key_rec)
-    })
-    .await;
-    match written {
-        Ok(Ok(())) => info!(
-            domain = %domain,
-            "acme issuer: sealed cert+key mirrored to the object cert store"
-        ),
-        Ok(Err(e)) => warn!(
-            domain = %domain,
-            "acme issuer: object cert store mirror failed (raft write succeeded; \
-             heals on the next renewal): {e}"
-        ),
-        Err(e) => warn!(
-            domain = %domain,
-            "acme issuer: object cert store mirror task failed: {e}"
-        ),
-    }
+/// One sealed record into the fleet object store, on the blocking pool — the
+/// object-store trait is synchronous HTTPS, and this runs inside a tokio task.
+async fn write_record(
+    store: &Arc<ObjectCertStore>,
+    name: &str,
+    rec: SecretRecord,
+) -> Result<(), crate::cert_store::CertStoreError> {
+    let (store, name) = (Arc::clone(store), name.to_string());
+    crate::fleet_secrets::off_runtime(move || store.write_secret(&name, &rec)).await
 }
 
 /// Whether the fleet cert needs a new order this tick, given what the cluster
@@ -837,34 +821,6 @@ fn replaces_id(cert: Option<&SecretRecord>) -> Option<&str> {
     cert.and_then(|r| r.ari.as_deref())
 }
 
-/// Store one sealed record through consensus.
-///
-/// Forwarded like the lock write: the issuer is elected by the lock, so the node
-/// holding it is very often not the raft leader, and a bare `client_write` here
-/// would fail on exactly the nodes the election is now free to pick.
-async fn put_secret(
-    raft: &YubabaRaft,
-    client: &reqwest::Client,
-    name: &str,
-    rec: SecretRecord,
-) -> anyhow::Result<()> {
-    client_write_forwarded(
-        raft,
-        client,
-        YubabaRequest::PutSecret {
-            name: name.to_string(),
-            ciphertext: rec.ciphertext,
-            nonce: rec.nonce,
-            updated_at: rec.updated_at,
-            access: rec.access,
-            digest: rec.digest,
-            sans: rec.sans,
-            ari: rec.ari,
-        },
-    )
-    .await
-    .map(|_| ())
-}
 
 /// Parse `YUBABA_ACME_CONSUMERS` into a [`SecretAccess`] rule (R706 / W294).
 ///
@@ -1445,8 +1401,8 @@ mod tests {
 
         let kek = [5u8; 32];
         for record in [
-            seal_cluster_secret(&kek, b"CERTPEM", 1, cfg.access.clone()),
-            seal_cluster_secret(&kek, b"KEYPEM", 1, cfg.access.clone()),
+            seal_cluster_secret(&kek, "tls/yah.dev/cert", b"CERTPEM", 1, cfg.access.clone()),
+            seal_cluster_secret(&kek, "tls/yah.dev/key", b"KEYPEM", 1, cfg.access.clone()),
         ] {
             assert!(record
                 .access

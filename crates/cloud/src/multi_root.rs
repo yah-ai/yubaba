@@ -37,9 +37,17 @@ use crate::config::CloudConfig;
 /// tenant and (optionally) overriding the directory-derived namespace.
 ///
 /// ```toml
-/// tenant = "ss"            # optional; defaults to the singleton tenant
+/// tenant = "acme"          # optional; defaults to the singleton tenant
 /// namespace = "noisetable" # optional; defaults to the dir name sans leading dot
 /// ```
+///
+/// Omit `tenant` for any tree that belongs to the operator's own tenant. The
+/// tenant id is the network isolation key (kamaji `container_net::bridge_for`,
+/// R895-F3): two roots with different ids are isolated from each other on every
+/// node they share. So a marker naming a tenant "to match" a tree that declares
+/// none creates a second tenant rather than joining the first. noisetable's
+/// marker did exactly that (`tenant = "ss"` against yah's implicit `"default"`)
+/// until 2026-09-14.
 #[derive(Debug, Default, Deserialize)]
 struct RootMarker {
     tenant: Option<String>,

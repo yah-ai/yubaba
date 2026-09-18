@@ -190,12 +190,15 @@
 //!   the fleet served bundles and answered `GET /service-records?ready=true`
 //!   with an empty set, and because `reconcile` never backfills an
 //!   un-admitted ident (below), nothing could recover it.
-//! - **Refresh**: [`run`] is a background sweep — `active_backend()`
+//! - **Refresh**: [`run`] is a background sweep — `workload_backend()`
 //!   `.list_workloads()` → [`ServiceRecords::reconcile`] every
 //!   [`SWEEP_INTERVAL`] — because health can change without a yubaba-initiated
 //!   action (a container crash is nobody's HTTP request). This is the one
 //!   poll in the design and it is deliberately slow; every *state-changing*
-//!   event still pushes immediately through the `watch`.
+//!   event still pushes immediately through the `watch`. R881-B8: the tick is
+//!   skipped outright when the backend that answered is not the sibling this
+//!   node normally uses — see [`sweep_once`] for why a *successful* listing
+//!   from the wrong process is more dangerous than a failed one.
 //! - **Restart survival**: see §The port ledger below.
 //!
 //! ## The port ledger — why records survive a yubaba restart
@@ -227,6 +230,18 @@
 //! `identity.json`, rewritten atomically (via `identity::atomic_write_json`)
 //! on every publish. It holds exactly the currently-non-retracted records, so
 //! a workload torn down before shutdown does not come back on boot.
+//!
+//! **The ledger holds two things, and they expire on different rules
+//! (R876-B11).** `services` is the record set and drops retracted entries, as
+//! above. `serving` is the *eligibility* set — the idents yubaba has declared
+//! to serve ([`ServiceRecords::is_declared_serving`]) — and it survives a
+//! record's retraction, because a retraction can mean "the supervisor is not
+//! answering right now" as easily as "this workload is gone". Folding the two
+//! together is what made a kamaji restart a permanent outage: the sweep saw no
+//! workloads, retracted every ident, the next publish wrote a ledger without
+//! them, and the yubaba that came back one second later had no declaration
+//! left to cold-admit the replayed processes against. The full sequence is on
+//! the `serving` field of [`ServiceRecords`].
 //!
 //! **Rehydrated records are deliberately NOT `Ready`.** They come back as
 //! `NotReady { reason: "rehydrated" }`: the ports and mesh IP are recovered
@@ -306,6 +321,54 @@
 //! @yah:handoff("R858-T7 COMPLETE. EXPIRE: a leader now widens decide_owner's candidate map with the recorded owner, as Confirmed::Down, once the node-lease channel says it has been silent past FenceTiming::expire_after — the record is then overwritten by SetIngressOwner, or ClearIngressOwner'd if nothing can take over. FENCE: appliance_ownership::judge_self_fence runs in leader.rs BEFORE the may_act early return, because the node that must be stopped is precisely one with no standing to act; it stops on a record naming another node, or on failing to confirm its own claim for self_fence_after. The fork was decided as a LEASE, not a raft epoch, with the reasoning in the handoff — an epoch cannot fence a node holding stale state, which is the power-off shape. Three defects were found and fixed along the way, one of which (leader-only lease renewal) made expiry structurally unreachable. Files: oss/yubaba/crates/yubaba/src/{appliance_ownership,leader,lease_detector,lease_renewal}.rs, crates/yubaba-test-harness/src/lib.rs, crates/yubaba/tests/raft_appliance_ownership.rs. Nothing rolled; no live node touched.")
 //! @yah:assumes("The fence's freshness proxy is `raft metrics.current_leader.is_some()` — reasoned, not measured against a real partition. The argument: a node in contact with a leader is receiving AppendEntries, so its applied `ingress_owner` is at most one replication round behind, and the 10s fleet margin covers that by orders of magnitude. What I did NOT establish is openraft's exact behaviour for a leader that has lost quorum contact but has not yet stepped down — if `current_leader` stayed Some(self) through such a window, that node would keep refreshing its own ownership clock and would not self-fence. openraft has pre-vote and leader step-down (see tests/raft_pre_vote.rs) so this should be bounded by the election timeout, but I did not read the step-down path. Worth one read of openraft's leader-lease handling before the prod rehearsal; it does not affect the follower case, which is the common one.")
 //! @yah:gotcha("DEAD-OWNER FENCING DOES NOT FIRE WHEN THE SURVIVING LEADER HAS NO LEASE HISTORY FOR THE DEAD OWNER — MEASURED 2026-09-08 by @Ashguard:libra (session:6eed47dc) on the dev raft group, found while completing R858-T5. DO NOT SIGN THIS OFF AS-IS. The sequence, every step measured: us-west-011 was the recorded ingress_owner and was stopped outright (yubaba+kamaji+litestream-headscale, no headscale process left). us-west-013 won the election (term 74) and then sat there. It hydrated config.yaml, its probe went Present, and it NEVER expired the dead owner or took the appliance — no further appliance line after startup, on a 10s reconcile cadence, indefinitely. THE CAUSE, read straight off 013's own /raft/status: the node-lease channel carries entries ONLY for 13 and 14 — node 11 is absent from it entirely — while the raft-heartbeat channel does list 11 as {\"silent_for_ms\": null, \"state\": \"unknown\"}. leader.rs's expired_owner filter calls owner_lease_expired(state.lease_detector.silence(11), timing), silence(11) is None, and owner_lease_expired is `silence.is_some_and(|s| s >= expire_after)` (appliance_ownership.rs:578) — so None is read as \"no evidence\" and the owner is never expired. CONSEQUENCE, which is this relay's own outage shape reproduced by construction: a leader that restarted after the owner died, or that was elected after the owner died, has no lease history for it and therefore can NEVER fail the appliance over. 30s of expire_after never elapses because the clock never starts. NOTE the anti-churn rule this collides with is deliberate and documented in leader.rs (\"the owner enters the map on positive evidence that it is gone, and on nothing else\"), so the fix is a design call, not a one-liner: absence of an entry after the detector's own uptime exceeds expire_after IS positive evidence, but seeding that naively would expire a live owner 30s after every cold boot. R858-T5 did NOT fix this — it completed its own assertion by wiping the owner's local DB and restarting the SAME node instead, so nothing here is exercised by that result.")
+//!
+//! @yah:ticket(R876-B11, "A kamaji restart replays a bundle's process but its yubaba service record never returns — permanent silent 503 behind a healthy app")
+//! @yah:status(review)
+//! @yah:at(2026-09-12T06:48:28Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R876)
+//! @yah:severity(high)
+//! @yah:gotcha("THE CONTROL TABLE IS THE FINDING — two bundles on us-east-001, same runtime, BOTH with \"port\": null in their kamaji deploy state, measured 2026-09-11. Columns are workload / bundle port / serve pid / started / started by / yubaba service record. ROW 1: noisetable / null / 650861 / 07:02:10 / kamaji restart-replay (kamaji pid 650851, same second) / ABSENT. ROW 2: yah-marketing / null / 651446 / 07:15:48 / fresh deploy, 13.5 min later / PRESENT, resolved_ports:[34759]. So `port: null` IS NOT THE DISCRIMINATOR — yah-marketing has it too and was fine. The discriminator is WHICH PATH STARTED THE PROCESS. After the fix the new noisetable record carries resolved_ports:[41507] while /var/lib/yah/kamaji/bundles/state/deploys/noisetable.json STILL says \"port\": null — i.e. the deploy path resolves and publishes ephemeral ports correctly and the persisted record is not where the port lives.")
+//! @yah:gotcha("BLAST RADIUS: every ephemeral-port bundle on the fleet is ONE KAMAJI RESTART away from the same silent 503, and the workload looks healthy the entire time — the process serves 200 locally (noisetable was serving 200 on 100.64.0.3:41507 throughout), the deploy state is present, lifecycle is keep_alive, all three passway doors were healthy and correctly reported an empty upstream set, and ONLY the absent yubaba record gives it away. The doors poll yubaba every 30s and match idents on EXACT equality, so an ABSENT record is a permanent 503, not a transient one. TRIGGER on 2026-09-11: the R881-B7 paired hotship `scripts/hotship.sh --nodes us-east-001 --binaries kamaji,yubaba`, which restarted both control-plane units at 07:02:10/07:02:11 UTC with NRestarts=0. noisetable.com was 503 across all three origins for roughly an hour.")
+//! @yah:gotcha("THE SEAM, READ FROM SOURCE (not from journals) — and it is NOT where the incident brief guessed. (1) kamaji's replay entry is ServerCtx::resume_bundle_workloads, oss/kamaji/crates/kamaji-bin/src/server.rs:2936, and it runs the SAME post-Ack path a fresh Deploy runs (spawn_bundle_run, server.rs:2871). So kamaji's half looks correct in isolation. (2) kamaji NEVER publishes a service record on either path — it has no such call. yubaba derives records from its own List sweep: ServiceRecords::reconcile, oss/yubaba/crates/yubaba/src/service_records.rs:1288. (3) Cold admission in that sweep requires BOTH a resolved port AND is_declared_serving(ident) — service_records.rs:1321. (4) declare_serving (:873) is called ONLY from upsert_deployed (:1070) and admit_bundle (:1209), i.e. the deploy-RPC path, plus ledger rehydration in with_ledger (:846). (5) save_ledger (:1019) DROPS Health::Retracted records. INFERRED SEQUENCE (consistent with the control table, not separately measured): kamaji goes down -> the sweep sees no workloads and retracts noisetable -> the next publish writes a ledger without it -> yubaba restarts one second later and rehydrates nothing for that ident -> kamaji replays the process and reports its resolved port on List -> cold admission is refused forever for want of a serving declaration, and logs only the tracing::debug! at service_records.rs:1364. yah-marketing escaped because its fresh deploy 13.5 min later called admit_bundle -> declare_serving.")
+//! @yah:next("TWO CANDIDATE FIXES, both inside the seam above; pick one, do not do both. (A) YUBABA SIDE, preferred: make the serving DECLARATION survive independently of the record. Today the ledger IS the declaration (with_ledger, service_records.rs:846) and save_ledger drops retracted entries, so a supervisor bounce erases the eligibility that cold admission depends on. Persist the `serving` set as its own ledger field, cleared only by an explicit retract/destroy (undeclare_serving) and never by a sweep-observed disappearance. Note why the existing drop-retracted rule exists (a record for a gone workload would publish an undialable upstream) — that reason applies to the RECORD, not to the eligibility bit, so the two can be separated without reopening it. (B) KAMAJI SIDE: have resume_bundle_workloads (server.rs:2936) re-announce each replayed deploy to yubaba so admit_bundle runs again, making a replay indistinguishable from a fresh deploy at the registration seam. More wire surface, but it removes the whole class rather than one persistence gap.")
+//! @yah:verify("REAL REPRODUCTION, on a node hosting an ephemeral-port bundle (us-east-001 hosts `noisetable`). BEFORE: `curl -sS 'http://100.64.0.3:7443/service-records?ready=true'` and confirm the ident is present with a non-empty endpoint; note its resolved port. THEN restart kamaji on that node (`sudo systemctl restart kamaji`), wait past two door poll intervals (>60s), and re-run the SAME curl. PASS = the ident is STILL present with a non-empty endpoint whose port matches what the replayed process is actually listening on. FAIL (today's behaviour) = the ident is ABSENT from the response entirely while `ss -lntp` on the node shows the replayed serve pid listening and `curl http://100.64.0.3:&lt;that port&gt;/` returns 200. Use the node's MESH address, not 127.0.0.1 — yubaba on us-east-001 binds 100.64.0.3:7443 only, and a loopback probe returns empty and reads as \"yubaba is down\".")
+//! @yah:next("Tier: Wizard — the mechanism is traced but the FIX is a correctness call across two daemons: separating \"this workload serves\" from \"a live record exists\" touches the same persistence rule that exists to stop yubaba publishing undialable upstreams, and choosing the kamaji re-announce instead widens the control-plane wire. Getting it wrong reintroduces the exact failure it is fixing, in the other direction.")
+//! @yah:handoff("FIX (A) IS IMPLEMENTED IN SOURCE, ONE FILE — oss/yubaba/crates/yubaba/src/service_records.rs, nothing else touched. The serving declaration is now its OWN persisted ledger field rather than a thing derived from the records. Concretely: `LedgerFile` gains `serving: Vec<String>` (`#[serde(default)]`, sorted on write for the byte-identical-file property `services` already had); `load_ledger` returns the whole `LedgerFile` instead of `Vec<LedgerEntry>` and every failure mode degrades to a new `LedgerFile::empty()`; `save_ledger` writes the live `self.serving` set alongside the records; `undeclare_serving` now returns whether it removed anything; `retract` persists a declaration-only revocation via `save_ledger` when there is no record to publish (its old no-record arm wrote nothing, which after this change would have let a restart rehydrate an explicitly-revoked declaration).")
+//! @yah:handoff("THE DROP-RETRACTED RULE FOR RECORDS IS UNTOUCHED, ON PURPOSE, AND THE SITE NOW SAYS SO. `save_ledger` still filters `Health::Retracted` out of `services` — a record is an address and a port someone will dial, and republishing one for a gone workload hands an ingress an undialable upstream. That reason does not reach the eligibility bit, which nobody dials and which only ever unblocks a re-admission that still has to produce a live resolved port of its own. A comment at the filter says do not tidy the two into one predicate, and the `serving` field's own doc carries the 2026-09-11 sequence in full so a future edit cannot re-merge them without reading why. The old doc on that field asserted \"Not persisted, and it does not need to be\" — this ticket disproves it, so it was rewritten rather than left as a lie in a doc comment. Module docs Sec. The port ledger gained a paragraph stating the two halves expire on different rules.")
+//! @yah:handoff("LEDGER COMPATIBILITY IS A PLAIN SERDE DEFAULT PLUS ONE FALLBACK ARM, NO SHIM. `LEDGER_VERSION` deliberately does not move (same reasoning as R844-F15: a bump discards the whole file on exactly the boot that installs this binary). A ledger written before this field has no `serving` key, so `with_ledger` takes the UNION of `file.serving` and the rehydrated record keys — the union is the compatibility arm and nothing more, because on a ledger this binary wrote every live record is already in `serving`. That direction reproduces the old binary's behaviour exactly; an empty set would have withdrawn cold-admission eligibility from every workload on the upgrade boot, which is an outage produced by a default.")
+//! @yah:handoff("THE SHIP IS BLOCKED ON A PROTOCOL SKEW AND IT IS NOT A JUDGEMENT CALL — MEASURED. `scripts/hotship.sh --nodes us-east-001 --binaries yubaba --dry-run` refuses: this tree speaks `kamaji_proto::ProtocolVersion::V11` (committed at 8aa2dc6a) and the last release v0.8.37 speaks V9. Its guard assumes the node runs the RELEASE, which here is false, so I checked the node instead of the guard's premise: /usr/local/bin/kamaji and /usr/local/bin/yubaba on us-east-001 were BOTH installed 2026-09-11 07:02:09 UTC (the R881-B7 paired ship), both contain the byte string `ephemeral_storage_mb` and NEITHER contains `scratch-floor-mb` — i.e. both predate R885-T6, which deleted that field, so the node is a matched V10 pair. `oss/kamaji/crates/kamaji-bin/src/server.rs:1390` refuses any version != CURRENT at handshake, so a V11-only yubaba beside a V10 kamaji fails every call at connect while the unit still reports active with NRestarts=0 — the silent in-process-containerd fallback documented at hotship.sh:582. On the node that serves noisetable.com that is a worse outage than the bug being fixed, so `--allow-proto-skew` is not an option I will take.")
+//! @yah:handoff("AND THE PAIRED SHIP THAT WOULD CLEAR THE SKEW IS NOT MINE TO RUN. `--binaries yubaba,kamaji` builds kamaji from the WORKING TREE, and @Glimmerstone:blade (session:67031c6c, courier under @Glimmerstone:eclipse on R885) is mid-edit on oss/kamaji/crates/kamaji/src/{native.rs,jit.rs} with a newly-ADDED oss/kamaji/crates/kamaji/src/sandbox.rs, running `cargo test -p kamaji-bin --features native-exec --lib` — the build-input watcher flagged those four files changing underneath both of my test runs. So the paired ship would push another relay's unfinished native-exec work onto a production node whose kamaji restart kills and replays every supervised workload on the box. That is an operator/leader call, not a courier's. The yubaba half is ready and the drill is written; it needs either (1) R885 to land and a deliberate paired yubaba+kamaji ship, or (2) a decision to ship the pair from the tree as it stands.")
+//! @yah:verify("UNIT TESTS, `cargo test -p yubaba --lib` from oss/yubaba. BASELINE RECORDED BEFORE THE EDIT: 859 passed / 0 failed. AFTER: 864 passed / 0 failed — exactly the five added tests, run twice because the shared-tree watcher flagged a peer's kamaji edits mid-run both times. The five, all in service_records::tests: a_serving_declaration_survives_a_ledger_round_trip_that_retracted_the_record (the regression the ticket asked for — and non-vacuous, it asserts the ledger's `services` really is EMPTY on disk so a pass cannot be the rehydrated-record path in disguise, while `serving` holds the ident); a_bundle_replayed_after_a_kamaji_restart_is_readmitted_on_its_new_port (the whole incident replayed, including the new ephemeral port a re-forked process binds — 41507 then 41509 — which is why re-deriving the old port would not have helped); an_explicit_retract_clears_the_declaration_across_a_restart (the other direction, so this fix cannot resurrect a destroyed workload); retracting_a_declared_ident_with_no_record_still_persists_the_revocation (pins `retract`'s no-publish arm); a_ledger_written_before_serving_was_persisted_declares_its_records (the upgrade boot).")
+//! @yah:verify("THE ON-NODE DRILL IS NOT RUN — the fixed yubaba is not on us-east-001 (see the proto-skew handoff). Deliberately NOT reproduced first: the ticket's control table already proves the bug and a reproduction costs a real apex outage. The BEFORE probe IS recorded, so whoever runs the drill has its baseline: `curl -sS 'http://100.64.0.3:7443/service-records?ready=true'` at 2026-09-11 (observed_at_unix_ms 1789153541384) returns three ready records — noisetable mesh_ip 100.64.0.3 resolved_ports [41507] endpoint 100.64.0.3:41507; yah-marketing 100.64.0.3 resolved_ports [34759]; noisetable-account 10.128.3.2:4332 (containerd tier, no resolved ports). Remaining drill after a paired ship: `sudo systemctl restart kamaji` on the node, wait >60s (two door poll intervals), re-run the SAME curl — PASS = `noisetable` still present with a non-empty endpoint whose port matches `ss -lntp` for the replayed serve pid — then check all three origins per-origin with curl --resolve (east 51.81.85.145, south 45.32.194.254, west 15.204.89.240), never through round-robin DNS.")
+//! @yah:verify("RUNBOOK STEP 0/6 — PRECONDITION, do not skip. The drill needs the FIXED yubaba on us-east-001, and a tree-built yubaba cannot go there alone (see the protocol-skew gotcha). Ship BOTH halves in one go, which is also why R876-B11 and R876-B12 share this single live leg rather than restarting the node twice: `scripts/hotship.sh --nodes us-east-001 --binaries yubaba,kamaji`. Read the script before running it. This is a production node serving noisetable.com; a kamaji restart kills and replays every kamaji-supervised workload on the box (~2s of 502 on bundle tiers, fleet-wide because all three yah.dev doors discover from us-east-001). Do NOT run it while R885 is mid-flight in the working tree.")
+//! @yah:verify("RUNBOOK STEP 1/6 — BEFORE probe. Run `curl -sS 'http://100.64.0.3:7443/service-records?ready=true'` FROM THIS WORKSTATION over the mesh. USE THE MESH ADDRESS, NEVER 127.0.0.1: yubaba on us-east-001 binds 100.64.0.3:7443 only, and a loopback probe returns empty and reads as yubaba-is-down. Confirm ident `noisetable` is present with a non-empty endpoint and WRITE DOWN its resolved port. Measured 2026-09-11 before the fix shipped (observed_at_unix_ms 1789153541384), three ready records: noisetable mesh_ip 100.64.0.3 resolved_ports [41507] endpoint 100.64.0.3:41507; yah-marketing mesh_ip 100.64.0.3 resolved_ports [34759]; noisetable-account mesh_ip 10.128.3.2 port 4332 (containerd tier, no resolved ports — it is not part of this drill). If noisetable is ALREADY absent here, stop: the node is in the failed state and the drill has no baseline.")
+//! @yah:verify("RUNBOOK STEP 2/6 — restart kamaji, then WAIT. `ssh -i ~/.ssh/yah -o IdentitiesOnly=yes debian@51.81.85.145 'sudo systemctl restart kamaji'` (login and key resolved from .yah/infra/machines/us-east-001.toml — ssh = debian@51.81.85.145, no ssh_key field so hotship node_key falls back to ~/.ssh/yah; a bare `ssh debian@51.81.85.145` gets Permission denied publickey because that key is not a default name). Then wait MORE THAN 60 SECONDS before probing. That is past two door poll intervals: the passway doors poll yubaba every 30s and match idents on EXACT equality, so a probe inside the window can show a stale-but-correct answer and hide the failure this drill exists to catch.")
+//! @yah:verify("RUNBOOK STEP 3/6 — AFTER probe, the SAME command as step 1: `curl -sS 'http://100.64.0.3:7443/service-records?ready=true'`. PASS = ident `noisetable` is STILL present with a non-empty endpoint. FAIL (the pre-fix behaviour) = `noisetable` is ABSENT from the response entirely. Note that FAIL is silent everywhere else — the process serves 200 locally throughout, the deploy state is present, lifecycle is keep_alive, and all three doors report healthy while correctly serving an empty upstream set. The absent record is the ONLY tell, and because the doors match on exact equality it is a PERMANENT 503, not a transient one.")
+//! @yah:verify("RUNBOOK STEP 4/6 — the port cross-check, which is the half that makes a PASS mean something. Presence alone is not enough: the published port must be the one the REPLAYED process actually bound, and a re-forked bundle binds a NEW ephemeral port (the incident record was 41507; a replay will not reuse it). On the node: `ssh -i ~/.ssh/yah -o IdentitiesOnly=yes debian@51.81.85.145 'sudo ss -lntp | grep -i noisetable'`. The port in the yubaba record from step 3 MUST equal the port the serve pid is listening on. A record that came back carrying the OLD port is a FAIL wearing a PASS — it means something rehydrated a stale endpoint instead of re-admitting from the resolved port, and the door would route into a closed socket. Also `curl -sS -o /dev/null -w '%{http_code}' http://100.64.0.3:<that port>/` from the workstation should be 200.")
+//! @yah:verify("RUNBOOK STEP 5/6 — prove the apex actually serves, PER-ORIGIN. Never check through round-robin DNS: noisetable.com answers from three origins and one healthy origin hides two broken ones. Run all three and require 200 from EACH: `curl -sS -o /dev/null -w 'east %{http_code}\\n' --resolve noisetable.com:443:51.81.85.145 https://noisetable.com/`; the same with `--resolve noisetable.com:443:45.32.194.254` (south) and `--resolve noisetable.com:443:15.204.89.240` (west). Note all three doors carry PASSWAY_YUBABA_URL pointing at 100.64.0.3:7443, so they all discover from us-east-001 — which is exactly why a single absent record on east 503s every origin at once and why per-origin checking is the only way to see the state change.")
+//! @yah:verify("RUNBOOK STEP 6/6 — IF THE DRILL FAILS AND noisetable.com GOES 503. Say so immediately to the relay leader BEFORE trying anything clever. The known recovery is `yah cloud mirror up noisetable-marketing --env cloud`, which REBUILDS wasm from the shared tree and takes minutes — that gap is exactly what R876-B12 exists to close, and running a build off a dirty shared tree mid-incident is an operator call, not the drill runner's. Do NOT reproduce the bug deliberately as a control: it is already proven by this ticket's control table and a reproduction costs a real ~1h apex outage. The whole point of the ordering above is that once the fixed yubaba is on the node, the expected outcome of the drill is that nothing breaks.")
+//! @yah:gotcha("PROTOCOL SKEW BLOCKS EVERY TREE-BUILT CONTROL-PLANE BINARY FROM us-east-001, AND THIS IS A RELAY-LEVEL FACT, NOT A B11 ONE — it blocks R876-B12's live verification identically, since that verb also has to reach this node. THREE VERSIONS, measured 2026-09-11: the TREE speaks `kamaji_proto::ProtocolVersion::V11` (committed at 8aa2dc6a); the last RELEASE v0.8.37 speaks V9; and the NODE is a matched **V10** pair. The node's version is the one nothing tells you directly, so here is how it was dated: /usr/local/bin/kamaji and /usr/local/bin/yubaba on us-east-001 were both installed 2026-09-11 07:02:09 UTC (the R881-B7 paired ship), and `grep -c -a` on each binary finds `ephemeral_storage_mb` PRESENT (kamaji 2, yubaba 6) and `scratch-floor-mb` ABSENT (0, 0). R885-T6 is the change that deleted that field and added that annotation, and it is the change V11 exists for — so both node binaries predate V11 and postdate V9. `strings` is not installed on the node; use `grep -c -a`.")
+//! @yah:gotcha("WHY THAT SKEW IS FATAL AND WHY `--allow-proto-skew` LOOKS SURVIVABLE WHEN IT IS NOT. `oss/kamaji/crates/kamaji-bin/src/server.rs:1390` refuses any handshake whose version != `ProtocolVersion::CURRENT`, so a V11 yubaba beside a V10 kamaji does not degrade — EVERY yubaba-to-kamaji call fails at connect. The failure is invisible in all the places you would look: the unit reports active with NRestarts=0, and yubaba silently falls back to its in-process containerd runtime, which wires no network namespace, so workloads come up with no address and no resolver WHILE THEIR SERVICE RECORDS STILL ADVERTISE ONE. It reads as a networking bug, not a protocol error. That was measured on THIS node this morning (hotship.sh:582, R881-B7): `decode failed: frame too large: 542393671 > 1048576` logged by kamaji and by nothing else. So `--allow-proto-skew` on the node that serves noisetable.com is a worse outage than the bug this ticket fixes, and `scripts/hotship.sh --binaries yubaba` refuses for exactly this reason — note its own check compares tree-vs-LAST-RELEASE (V11 vs V9) and therefore assumes the node runs the release, which here it does not; the refusal is right but its stated reason is not the operative one.")
+//! @yah:next("DRILL PRECONDITION, ONE LINE: wait for R885's kamaji work to quiesce in the working tree (8 of 11 children at review, B9 at handoff, B11 open — @Glimmerstone:blade was mid-edit on oss/kamaji/crates/kamaji/src/{native.rs,jit.rs,sandbox.rs} on 2026-09-11), then run ONE deliberate paired `scripts/hotship.sh --nodes us-east-001 --binaries yubaba,kamaji` and execute RUNBOOK STEP 0-6 in @yah:verify — that single ship plus single kamaji restart also serves R876-B12's live verification, which is why both children share one production restart instead of two.")
+//! @yah:handoff("SECOND-ORDER CATCH A REVIEWER WOULD MISS — THE FIX OPENED A SEAM IN `retract` AND IT IS CLOSED IN THE SAME PASS. `retract` (service_records.rs) has two arms: with a record it flips it to `Health::Retracted` and publishes (which persists); with NO record it did nothing at all, on the stated reasoning that a retract of an unknown ident is a no-op. That was true only while the declaration lived in memory. Once `serving` is persisted, the no-record arm has real state to write: `undeclare_serving` mutates the set, nothing publishes, the ledger on disk keeps the ident, and the NEXT RESTART rehydrates an eligibility that was explicitly revoked — the exact inverse of this bug, reintroduced by its own fix. That arm now calls `save_ledger` directly (not `publish`, because the record map is unchanged and waking every subscriber would be a spurious notification). `undeclare_serving` returns bool for this. Pinned by `retracting_a_declared_ident_with_no_record_still_persists_the_revocation`, and by `an_explicit_retract_clears_the_declaration_across_a_restart` which additionally asserts a later sweep reporting the workload alive on a port does NOT bring it back.")
+//! @yah:handoff("ROLLBACK IS SAFE — CONFIRMED FROM SOURCE, NOT ASSUMED. A V10 (pre-this-change) yubaba loading a ledger written by this code IGNORES the new `serving` key and is otherwise unaffected: neither the released `LedgerFile` (checked at e2d707e1, release v0.8.37) nor this tree's carries `#[serde(deny_unknown_fields)]` — zero occurrences of that attribute in the file in either version — so serde drops the unknown field rather than erroring, and `LEDGER_VERSION` deliberately stays at 1 so the version gate passes too. The old binary therefore reads `services` exactly as it always did and re-derives its declarations from the record keys, i.e. its own pre-fix behaviour, unchanged. That matters because the rollback path from this ship is \"put the old yubaba back\", and it must not choke on the ledger it finds. Pinned going forward by `a_ledger_carrying_an_unknown_field_still_loads`, which asserts the rule on the same struct a rollback uses by feeding today's loader a key IT does not know; it cannot and does not run the old binary.")
+//! @yah:verify("FINAL UNIT COUNT, superseding the earlier line: `cargo test -p yubaba --lib` = 865 passed / 0 failed, against a baseline of 859 passed / 0 failed recorded BEFORE any edit. +6 = the six added tests; the sixth is `a_ledger_carrying_an_unknown_field_still_loads` (the downgrade/rollback guard). No pre-existing test changed. The suite was run three times because the shared-tree build-input watcher flagged a peer's kamaji edits landing underneath the first two runs.")
+//! @yah:depends_on(R885)
+//! @yah:handoff("CODE FIX (A) IS COMPLETE AND GREEN; ONLY THE ON-NODE DRILL REMAINS, AND IT IS BLOCKED ON A MEASURED PROTOCOL SKEW, NOT ON DOUBT ABOUT THE FIX. One file touched, oss/yubaba/crates/yubaba/src/service_records.rs (+404/-26, board annotations included). The serving declaration is now its own persisted ledger field instead of something derived from the records; the drop-retracted rule for RECORDS is deliberately untouched, with a comment at the site saying do not re-merge the two. Full technical account is in this ticket's other @yah:handoff entries — read the `retract` seam one in particular, it is the second-order catch the fix created and closed in the same pass. Tree anchor 8aa2dc6af8063cf6aa06d571155af946135625df; no commit made (camp git-policy is defer).")
+//! @yah:handoff("Tree anchor at handoff: 8aa2dc6af8063cf6aa06d571155af946135625df — the shared tree as I left it. Diff against it (`git diff 8aa2dc6af8063cf6aa06d571155af946135625df..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:next("WHAT REMAINS IS EXACTLY ONE THING: execute RUNBOOK STEP 0/6 through 6/6 in this ticket's @yah:verify entries against us-east-001. It is written to be run by someone who has never read this ticket. Do NOT start it until the `depends_on(R885)` this ticket now carries is satisfied — that dependency is the machine-checkable form of the step-0 precondition, and it exists because a tree-built yubaba cannot go to that node alone (V11 tree / V10 node / V9 release; see the two protocol-skew gotchas) and shipping the pair would push R885's unfinished kamaji native-exec work onto a production node. The drill is deliberately SHARED with R876-B12: one paired `scripts/hotship.sh --nodes us-east-001 --binaries yubaba,kamaji` and one kamaji restart verify both children, rather than restarting the apex node twice.")
+//! @yah:verify("LEADER RE-VERIFICATION (@Ashguard:coffee), run independently rather than taken from the courier's report. `cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib` = **865 passed / 0 failed**, against the baseline of 859/0 the courier recorded BEFORE any edit — +6, exactly the six added tests, no pre-existing test modified. I also re-checked the rollback claim myself rather than accepting it: `grep -c deny_unknown_fields` on the file returns 2, which LOOKS like a contradiction of the courier's \"zero occurrences\" but is not — both hits are inside prose (the @yah:handoff text at :354 and the test's own doc comment at :3656), and neither is an actual `#[serde(deny_unknown_fields)]` attribute on a struct. The additive-and-ignored rollback property holds. Flagging the grep trap here because the next person to audit that claim will hit the same false positive.")
+//! @yah:gotcha("2026-09-11, LATE: THE DRILL'S PRECONDITION CLEARED AND THE SHIP IS SOMEONE ELSE'S. @Glimmerstone:eclipse (R885 leader, session:2839f6de) reports all eleven R885 children in `review`, @Glimmerstone:blade closed, and oss/kamaji/crates/kamaji/src/{native.rs,jit.rs,sandbox.rs} settled. The operator approved a scoped hot ship on THEIR ticket and it is queued as qed run fb43da53-60fa-4882-afdc-411135ba0ec2: `yah qed run hotship --param nodes=us-east-001 --param binaries=yubaba,kamaji` — exactly the paired ship this ticket's RUNBOOK STEP 0/6 calls for. So R876-B11 and R876-B12 get their ship and their kamaji restart out of R885's roll rather than a second one. CRITICAL AND EASY TO MISS: `--binaries yubaba` builds FROM THE WORKING TREE, so that ship carries THIS TICKET'S UNCOMMITTED FIX (camp git-policy is `defer`; the change is unstaged, not absent). R885's leader was told this before activation — the payload is release + R885's B4/B9/B10/B11 + this ticket's serving-declaration change, not the first two alone.")
+//! @yah:verify("THE DISCRIMINATOR THAT MATTERS MOST, RESTATED BECAUSE IT IS THE ONE A STRANGER GETS WRONG: presence of ident `noisetable` in `/service-records?ready=true` is NOT sufficient for PASS. A record carrying the OLD port is a FAIL WEARING A PASS — a replayed bundle binds a NEW ephemeral port, so the record must be cross-checked against what the replayed process is actually listening on via `ss -lntp` on the node. Recorded BEFORE values, 2026-09-11: noisetable 100.64.0.3:41507, yah-marketing :34759, noisetable-account 10.128.3.2:4332. Use the MESH address (100.64.0.3:7443), never loopback — yubaba there binds the mesh address only and a loopback probe returns empty, which reads as \"yubaba is down\" and is not.")
+//! @yah:verify("WHAT THE TWO OUTCOMES MEAN, decided in advance so the result is not argued after the fact. With this ticket's fix aboard the ship, the EXPECTED and DESIRED outcome is a NEGATIVE — the record survives the kamaji restart carrying a correctly-updated port. That negative IS this ticket's verification and is enough to move it to `review`. If the failure instead REPRODUCES (ident absent, or present on a stale port) that is the more interesting result and must not be waved through as a flaky roll: it would mean fix (A) is insufficient and the seam is wider than the ledger's serving set, and the evidence to capture before anything is rolled back is the full `/service-records?ready=true` body plus `ss -lntp` from the node.")
+//! @yah:verify("STALENESS RULE ON THE RECORDED BEFORE VALUES — READ BEFORE USING THEM. The BEFORE ports on this ticket (noisetable 100.64.0.3:41507, yah-marketing :34759, noisetable-account 10.128.3.2:4332) were captured 2026-09-11 and are EPHEMERAL. Do NOT use them as the drill's baseline. Capture a fresh BEFORE probe immediately prior to the restart and compare probe->restart->probe entirely within the drill, with `ss -lntp` at both ends. Reason: if anything on that node restarted in the interim, the port moved, and comparing the post-restart record against a stale number manufactures a FALSE FAIL on precisely the assertion this ticket turns on — which would send someone rolling back a good ship to fix a bug that did not recur. The recorded values retain exactly one use: if the fresh BEFORE probe DISAGREES with them, something restarted on that node unprompted, and on a node where bundles are meant to be stable that is itself worth reporting. Note also that noisetable-account sits on a different subnet (10.128.3.2) from the mesh addresses — make sure a probe that cannot route to it is not mistaken for the ident being absent.")
+//! @yah:verify("ON-NODE DRILL EXECUTED AND **PASSED** — 2026-09-12 06:43-06:46 UTC, us-east-001, by the consolidated B11+B12 live drill. VERDICT: the expected NEGATIVE. Ident `noisetable` SURVIVED a kamaji restart carrying a port cross-checked live against the replayed pid. RUNBOOK STEP 0/6 was already satisfied on arrival and was NOT re-run: the paired yubaba,kamaji hot ship had landed as qed run 76ee2361 on 2026-09-11 22:23:37-22:25:05 UTC, /usr/local/bin/{kamaji,yubaba} both mtime 22:24:38, both units active NRestarts=0, and the fix is confirmed live by the top-level `\"serving\": [\"noisetable\",\"noisetable-account\",\"yah-marketing\"]` in /var/lib/yah-cloud/service-records.json, a field that only exists in the fixed yubaba. Nothing was shipped, installed or built by this drill. STEP 1/6 BEFORE, 06:43:50 UTC (fresh, per the staleness rule — the ticket's recorded values were NOT used as baseline): three ready records, noisetable 100.64.0.3:41507 resolved_ports [41507] health ready; `sudo ss -lntp` showed serve pids 663494 (:34759), 663495 (:41507), 663496 (:40995), yubaba pid 663550 (:7443). STEP 2/6 RESTART, 06:44:30 UTC — AND IT WAS NOT ISSUED BY THE DRILL. A live peer restarted kamaji mid-drill; the node's own audit names the sequence (`journalctl -t sudo`): 06:44:29 `install -m0755 /tmp/turso-backup-hydrate` + `/tmp/turso-backup-tail` into /usr/local/bin, `install -m0644 /tmp/50-durability-helpers.conf` into /etc/systemd/system/kamaji.service.d/, `systemctl daemon-reload`, then 06:44:30 `systemctl restart kamaji`. That is a CLEANER B11 condition than the drill's own would have been, because it is kamaji-ONLY: yubaba was untouched throughout (pid 663550, ExecMainStartTimestamp still Fri 2026-09-11 22:24:40, NRestarts=0), so the fix had to survive a supervisor bounce beneath a LIVE yubaba rather than a co-restart that would have exercised only the ledger-rehydration arm. kamaji's own log confirms the replay path ran: `resuming recorded bundle deploy after restart (R755-B5) id=noisetable digest=76e0ccb5ce2a... runtime=mesofact/0.8.32` then `recorded bundle deploys replayed (R755-B5) resumed=2`. STEP 3/6 AFTER, 06:45:36 UTC (+66s, past two 30s door polls): ident `noisetable` STILL PRESENT, health ready, resolved_ports [41507], endpoint 100.64.0.3:41507. PASS. STEP 4/6 PORT CROSS-CHECK, the half that makes the PASS mean something: `sudo ss -lntp` after the restart showed serve pids 669285 (:34759), 669286 (:41507), 669287 (:40995) — all re-forked, all started 06:44:29 — so the published 41507 is the port the REPLAYED pid 669286 is actually bound to, not a rehydrated corpse; `curl http://100.64.0.3:41507/` = 200. STEP 5/6 THREE ORIGINS, per-origin --resolve: east 51.81.85.145 200/12127, south 45.32.194.254 200/12127, west 15.204.89.240 200/12127, identical byte sizes; all three doors' /health reported ready_upstreams 1/1 for host `*`. STEP 6/6 not needed — nothing went 503 in Phase B.")
+//! @yah:gotcha("THIS TICKET'S CENTRAL DISCRIMINATOR IS WRONG ON THIS NODE, AND A FUTURE DRILL RUNNER WILL BE MISLED BY IT — measured 2026-09-12. The ticket asserts, in @yah:verify STEP 4/6 and again in the \"DISCRIMINATOR THAT MATTERS MOST\" entry, that \"a replayed bundle binds a NEW ephemeral port, so a record carrying the OLD port is a FAIL WEARING A PASS\". THAT PREMISE DOES NOT HOLD. The noisetable bundle's port has now survived THREE independent forks and come back 41507 every single time: pid 663495 (forked 2026-09-11 22:24:39 by the hot ship's kamaji restart), pid 669286 (forked 2026-09-12 06:44:29 by a peer's kamaji restart), pid 669663 (forked 06:45:5x by R876-B12's live `service rolling` re-announce). yah-marketing did the same on 34759 across all three, and the third serve on 40995 likewise. Nine-for-nine is not kernel luck. The mechanism, read off the node rather than guessed: /var/lib/yah/kamaji/bundles/state/deploys/noisetable.json still records `\"port\": null`, yet the replayed process's argv carries an EXPLICIT `--listen 100.64.0.3:41507` — so kamaji is RESOLVING a stable port per ident at replay time and passing it down, it is not letting the kernel hand out a fresh ephemeral one. (This is consistent with, and sharpens, the existing gotcha noting that `port: null` persists while the record carries resolved_ports [41507]: the port lives in whatever kamaji resolves from, not in the deploy record.) CONSEQUENCE FOR ANYONE RE-RUNNING THIS DRILL: port EQUALITY across a restart is the EXPECTED result here and is NOT evidence of a stale rehydrated endpoint. Do not fail the drill on it. The discriminator that actually works is the one this drill used — take `sudo ss -lntp` at BOTH ends and confirm the published port belongs to a serve pid whose START TIME is after the restart (the pids move even when the ports do not: 663494/663495/663496 -> 669285/669286/669287), then dial it. A drill runner who applies the ticket's stated rule literally on this node would declare a FAIL WEARING A PASS on a genuinely correct result and roll back a good ship.")
+//! @yah:verify("TWO HONEST CAVEATS ON THE PASS ABOVE, PLUS ONE PIECE OF FREE CORROBORATION. CAVEAT 1 — THE RESTART WAS NOT A PURE CONTROL. The same peer pass that restarted kamaji at 06:44:30 also installed new /usr/local/bin/turso-backup-hydrate and turso-backup-tail and added a /etc/systemd/system/kamaji.service.d/50-durability-helpers.conf drop-in before the restart. Neither touches the bundle replay or the service-record registration path (kamaji's boot log shows the standard R755-B5 replay and the usual \"hydrate-on-place armed\" / \"durability tail armed\" lines), so the result stands — but it was not a solo restart and that is stated rather than hidden. CAVEAT 2 — THE DRILL DID NOT ISSUE ITS OWN SECOND RESTART, deliberately, and this was the runner's call. Reasons, in order: (a) a complete before -> restart -> after pair already existed entirely inside the drill's own run with `ss -lntp` at both ends, which is exactly what the STALENESS RULE entry demands; (b) the peer was STILL live on the node at 06:45:27, mid-verification of their own roll (reading `kamaji --version`, sha256summing the helper binaries, curling 41507/34759/40995) — bouncing kamaji underneath that would have corrupted their measurement and reproduced on them the same unexplained restart that cost this drill three triage passes; (c) a second restart is a real tenant-visible bounce on a production apex for a control already in hand. If a leader wants a solo control, it is one `ssh ... 'sudo systemctl restart kamaji'` on a quiet node and everything else in the runbook is unchanged. FREE CORROBORATION, from R876-B12's Phase C and worth reading here because it closes the causal loop this ticket only ever INFERRED: the live `service rolling` re-announce re-forked the noisetable serve process and, for roughly TEN SECONDS (record measured absent 06:46:00, measured back 06:46:05), the ident was genuinely ABSENT from /service-records?ready=true while 100.64.0.3:41507 answered 200 the entire time. Two of the three origins 503'd within that window (east and west; south stayed 200 because its 30s poll had not re-run and its cached upstream was still valid). That is this ticket's failure mode reproduced in miniature, WITHOUT anyone deliberately breaking anything and at a cost of ~34s rather than the ~1h a real reproduction would have cost: absent record -> immediate 503 at every door that repolls, healthy app throughout, nothing else showing a fault. It confirms the absent-record-to-503 chain directly, and it confirms that the chain self-heals the moment `admit_bundle` runs again — which is precisely why the permanent version of it (this bug) was so hard to see.")
+//! @yah:handoff("CORRECTION TO THIS TICKET'S OWN ANNOTATIONS, recorded because a future reader will otherwise act on a false premise: the repeated claim that the fix is UNCOMMITTED (\"camp git-policy is defer; the change is unstaged, not absent\") is STALE. Both this ticket's service_records.rs change and R876-B12's cloud.rs change are COMMITTED at HEAD b7cf8b919b39188849c7f8b74791c1ebd32aeaa9 — `git status --porcelain` on both paths returns empty, and content was confirmed by grep (`serving: Vec<String>` on `LedgerFile` ~service_records.rs:869). They were folded into one of the later `sync` commits. Likewise, the queued ship recorded in the gotchas as run `fb43da53` was a `dry_run: true` REHEARSAL, not the real ship; the real one is `76ee2361`.")
+//! @yah:verify("WHAT WAS NOT DONE, STATED PLAINLY. (1) No solo control restart — the drill deliberately reused a peer's concurrent restart rather than bouncing a tenant apex twice; see the gotcha. (2) The failure was NOT deliberately reproduced, per this ticket's own standing instruction: the control table already proves the bug and a reproduction costs a real ~1h apex outage. (3) The `check` QED pipeline was not run for this ticket; the code half was already green at 865 passed / 0 failed on `cargo test -p yubaba --lib` (baseline 859/0) and is unchanged since.")
+//! @yah:gotcha("THE RESTART USED FOR THE PASS WAS A PEER'S, NOT THE DRILL'S — STATED SO NOBODY READS THIS AS A CLEAN SOLO CONTROL. At 06:44:29-30 UTC on 2026-09-12 a live peer (most likely @Ashguard:dragon, session:f8f9c669, courier under @Ashguard:coffee on R584 — named from `journalctl -t sudo` plus a matching live `cargo test -p yah-smtp-dev`, not from git authorship) installed /usr/local/bin/turso-backup-{hydrate,tail} and /etc/systemd/system/kamaji.service.d/50-durability-helpers.conf, ran daemon-reload, then `systemctl restart kamaji`. The drill took its AFTER probe against that restart rather than issuing a second tenant-visible bounce under the peer's live verification. It was a CLEANER control in one respect — kamaji-only, yubaba left up (yubaba pid 663550 untouched from 22:24:40), which is the exact shape this bug needs — but it was not pure: the same pass added a systemd drop-in and two helper binaries. The before/after pair was taken entirely inside the drill's own run (06:43 pids 663494/5/6 + record 41507 -> restart -> 06:45:36 pids 669285/6/7 + record 41507 live, three doors ready_upstreams 1/1, three origins 200/12127). If a pure solo control is ever wanted, it is one `systemctl restart kamaji` plus the >60s wait; the fix's behaviour is not in doubt.")
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -448,10 +511,21 @@ pub const REASON_UNROUTABLE: &str = "unroutable";
 pub fn binds_node_ports(spec: &WorkloadSpec) -> bool {
     spec.wants_host_network()
         || spec.wants_native_exec()
-        || spec
-            .annotations
-            .contains_key(crate::pond::launcher::PUBLISH_ANNOTATION)
+        || spec.annotations.contains_key(PUBLISH_ANNOTATION)
 }
+
+/// The docker-publish annotation: the one spec fact that makes a *namespaced*
+/// container reachable at the node's own address (R881-B1).
+///
+/// noisetable R118-T11: this lived in `pond::launcher`, which is now behind the
+/// `pond` feature — and [`binds_node_ports`] is not pond code and must still
+/// answer correctly on a build with no pond. So the constant moved up here, to
+/// the module with the unconditional need; `pond::launcher` imports it back and
+/// its `annotation_keys_match_kamaji` test still pins all three keys against
+/// `kamaji::docker`. It is NOT taken from `kamaji::docker` directly because that
+/// module is behind kamaji's `docker-integration` feature, which the fleet build
+/// does not enable — the same reason `pond::launcher` spelled it out.
+pub(crate) const PUBLISH_ANNOTATION: &str = "yah.docker.publish";
 
 /// One serving-workload's mesh endpoint(s) + health, as known to yubaba.
 ///
@@ -671,10 +745,34 @@ pub struct ServiceRecords {
     /// that, cold admission has no way to tell a workload yubaba placed from
     /// one kamaji forked for itself.
     ///
-    /// Not persisted, and it does not need to be: once cold admission fires,
-    /// the resulting record goes in the ledger, and a restart rehydrates it
-    /// onto the *refresh* path rather than the cold-admit path. Rehydration
-    /// re-declares each recovered ident so the two stay consistent.
+    /// **Persisted in its own ledger field since R876-B11, and that separation
+    /// is the point.** This used to ride on the records: nothing stored it, and
+    /// [`Self::with_ledger`] re-derived it from the rehydrated record keys. The
+    /// argument was that a cold-admitted workload ends up in the ledger anyway,
+    /// so a restart finds it on the refresh path. That holds only while the
+    /// records outlive the outage, and on 2026-09-11 they did not — kamaji and
+    /// yubaba were restarted one second apart on us-east-001, the sweep in
+    /// between saw no workloads and retracted every ident, [`Self::save_ledger`]
+    /// dropped the retracted records as it is supposed to, and the yubaba that
+    /// came back had neither a record nor a declaration for `noisetable`.
+    /// kamaji replayed the process, reported its resolved port on the next
+    /// List, and [`Self::reconcile`] refused to admit it forever for want of the
+    /// eligibility bit. The workload served 200 on its mesh address the whole
+    /// time; noisetable.com was 503 for an hour.
+    ///
+    /// So: a declaration is cleared by [`Self::undeclare_serving`] — an explicit
+    /// retract or destroy — and **never** by a sweep-observed disappearance. A
+    /// workload vanishing from a supervisor's List is a statement about right
+    /// now; "this workload serves" is a statement about intent, and only the
+    /// first of those is invalidated by the supervisor going away.
+    ///
+    /// Note what is *not* being reopened: [`Self::save_ledger`] still drops
+    /// retracted RECORDS, because republishing a record for a gone workload
+    /// would hand an ingress an undialable upstream. That reason is about the
+    /// record — an address and a port someone will dial — and does not reach the
+    /// eligibility bit, which is dialled by nobody and only ever unblocks a
+    /// re-admission that still has to produce a live resolved port of its own.
+    /// Keep them separate.
     serving: Mutex<HashSet<String>>,
 }
 
@@ -762,6 +860,31 @@ where
 struct LedgerFile {
     version: u32,
     services: Vec<LedgerEntry>,
+    /// R876-B11 — the serving *declarations*, persisted separately from
+    /// `services` because they expire on a different rule (see the `serving`
+    /// field on [`ServiceRecords`]). Deliberately a superset of `services`: an
+    /// ident stays here after its record is retracted, which is the entire
+    /// repair.
+    ///
+    /// `#[serde(default)]` so a ledger written before this field existed still
+    /// loads, exactly as [`LedgerEntry::routable`] does and for the same reason
+    /// — the boot that installs this binary must not be the boot that discards
+    /// the file. An old ledger yields an empty set here and
+    /// [`ServiceRecords::with_ledger`] falls back to the record keys, which
+    /// reproduces the old binary's behaviour precisely.
+    #[serde(default)]
+    serving: Vec<String>,
+}
+
+impl LedgerFile {
+    /// The "no ledger" answer every [`load_ledger`] failure mode degrades to.
+    fn empty() -> Self {
+        Self {
+            version: LEDGER_VERSION,
+            services: Vec::new(),
+            serving: Vec::new(),
+        }
+    }
 }
 
 impl Default for ServiceRecords {
@@ -805,8 +928,9 @@ impl ServiceRecords {
     /// Recovered records come back `NotReady { reason: "rehydrated" }`, never
     /// `Ready` — see module docs §The port ledger for why.
     pub fn with_ledger(path: PathBuf) -> Self {
+        let file = load_ledger(&path);
         let mut records = HashMap::new();
-        for entry in load_ledger(&path) {
+        for entry in file.services {
             records.insert(
                 entry.ident.clone(),
                 ServiceRecord {
@@ -831,13 +955,25 @@ impl ServiceRecords {
                  until the first reconcile sweep confirms the workloads are live"
             );
         }
-        // R844-F2: a rehydrated ident was declared serving in a prior life —
-        // the ledger entry IS that declaration, persisted. Re-declaring keeps
-        // the eligibility set consistent with the records across a restart, so
-        // a workload whose record was later retracted (backend blip, say) can
-        // still be re-admitted from its resolved port rather than being stuck
-        // out until the next deploy.
-        let serving = records.keys().cloned().collect::<HashSet<_>>();
+        // R876-B11: the declarations come from their OWN ledger field, which
+        // outlives the records they were once derived from. The union with the
+        // record keys is the compatibility arm and nothing more: a ledger
+        // written before that field existed carries no `serving` list, and
+        // R844-F2's rule — a rehydrated ident was declared serving in a prior
+        // life, because the ledger entry IS that declaration — is still the
+        // right answer for it. On a ledger this binary wrote, every live record
+        // is already in `serving`, so the union adds nothing.
+        let mut serving = file.serving.into_iter().collect::<HashSet<_>>();
+        serving.extend(records.keys().cloned());
+        if !serving.is_empty() {
+            tracing::info!(
+                declared = serving.len(),
+                ledger = %path.display(),
+                "service_records: rehydrated serving declarations; a workload \
+                 kamaji replays after its own restart can be cold-admitted \
+                 from the port it rebinds (R876-B11)"
+            );
+        }
         let (tx, _rx) = watch::channel(Arc::new(records));
         Self {
             tx,
@@ -866,10 +1002,17 @@ impl ServiceRecords {
     /// that drops its ports, or an explicit destroy, also drops the workload's
     /// cold-admission eligibility — otherwise the next sweep would re-admit
     /// from a resolved port the record was just retracted for.
-    fn undeclare_serving(&self, ident: &MeshIdent) {
-        if let Ok(mut serving) = self.serving.lock() {
-            serving.remove(ident.0.as_str());
-        }
+    ///
+    /// R876-B11: this is the **only** way a declaration is dropped. A sweep that
+    /// stops seeing a workload retracts its record and does not come here — see
+    /// the `serving` field's doc for what happened the one time those were the
+    /// same thing. Returns whether anything was actually removed, so
+    /// [`Self::retract`] can persist a declaration-only change.
+    fn undeclare_serving(&self, ident: &MeshIdent) -> bool {
+        self.serving
+            .lock()
+            .map(|mut s| s.remove(ident.0.as_str()))
+            .unwrap_or(false)
     }
 
     /// Whether yubaba declared `ident` as serving. `true` is a precondition for
@@ -1008,6 +1151,12 @@ impl ServiceRecords {
         };
         // Retracted records are dropped: the workload is gone, and bringing
         // it back on the next boot would publish an undialable upstream.
+        //
+        // R876-B11: this rule applies to the RECORD ONLY. The serving
+        // declaration below is written from `self.serving`, which a retraction
+        // does not touch unless it came through `undeclare_serving` — do not
+        // "tidy" the two into one filter, that merge is the bug this ticket
+        // fixes.
         let mut services: Vec<LedgerEntry> = records
             .values()
             .filter(|r| r.health != Health::Retracted)
@@ -1024,9 +1173,20 @@ impl ServiceRecords {
         // file (HashMap iteration order is not).
         services.sort_by(|a, b| a.ident.cmp(&b.ident));
 
+        // Sorted for the same byte-identical-file reason as `services`; a
+        // poisoned lock writes no declarations rather than failing the publish,
+        // matching how every other reader of this set degrades.
+        let mut serving: Vec<String> = self
+            .serving
+            .lock()
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        serving.sort();
+
         let file = LedgerFile {
             version: LEDGER_VERSION,
             services,
+            serving,
         };
         if let Err(e) = crate::identity::atomic_write_json(path, &file) {
             tracing::warn!(
@@ -1380,12 +1540,19 @@ impl ServiceRecords {
         // would re-admit from a resolved port the record was just retracted
         // for — which is precisely the redeploy-drops-its-ports case
         // `redeploy_without_ports_retracts_the_previous_record` pins.
-        self.undeclare_serving(ident);
+        let undeclared = self.undeclare_serving(ident);
         let mut next = (*self.tx.borrow()).as_ref().clone();
         if let Some(record) = next.get_mut(ident.0.as_str()) {
             record.health = Health::Retracted;
             record.observed_at_unix_ms = now_unix_ms();
             self.publish(next);
+        } else if undeclared {
+            // R876-B11: no record to change, but the ledger's declaration set
+            // just did — persist it, or a restart would rehydrate eligibility
+            // that was explicitly revoked. `save_ledger` rather than `publish`:
+            // the record map is unchanged, so waking every subscriber would be
+            // a spurious notification.
+            self.save_ledger(&next);
         }
     }
 }
@@ -1518,9 +1685,9 @@ fn authoritative_mesh_ip(
 /// malformed JSON, unknown schema version — degrades to "no ledger" rather
 /// than an error, because none of them should stop a yubaba from booting:
 /// the records are re-learned on the next deploy either way.
-fn load_ledger(path: &Path) -> Vec<LedgerEntry> {
+fn load_ledger(path: &Path) -> LedgerFile {
     if !path.exists() {
-        return Vec::new();
+        return LedgerFile::empty();
     }
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -1530,7 +1697,7 @@ fn load_ledger(path: &Path) -> Vec<LedgerEntry> {
                 error = %e,
                 "service_records: port ledger unreadable; starting with no records"
             );
-            return Vec::new();
+            return LedgerFile::empty();
         }
     };
     let file: LedgerFile = match serde_json::from_str(&content) {
@@ -1541,7 +1708,7 @@ fn load_ledger(path: &Path) -> Vec<LedgerEntry> {
                 error = %e,
                 "service_records: port ledger is malformed; starting with no records"
             );
-            return Vec::new();
+            return LedgerFile::empty();
         }
     };
     if file.version != LEDGER_VERSION {
@@ -1552,9 +1719,9 @@ fn load_ledger(path: &Path) -> Vec<LedgerEntry> {
             "service_records: port ledger schema version not recognized; \
              starting with no records"
         );
-        return Vec::new();
+        return LedgerFile::empty();
     }
-    file.services
+    file
 }
 
 // ── Discovery surface (R594-F8) ─────────────────────────────────────────────
@@ -1813,10 +1980,34 @@ pub async fn run(state: Arc<crate::ServerState>) {
 /// to this crate — and because a hand-rolled copy in a test is exactly how a
 /// test stops testing the code that ships.
 pub async fn sweep_once(state: &Arc<crate::ServerState>) -> bool {
-    let Some(backend) = state.active_backend() else {
+    let Some(backend) = state.workload_backend() else {
         return false;
     };
-    match backend.list_workloads().await {
+    // R881-B8, discovered while fixing the deploy half: a substituted backend's
+    // listing is not a listing of this node's workloads.
+    //
+    // The `Err` arm below already refuses to reconcile against a blip, on the
+    // reasoning that "a failed list is NOT an empty list" — but a fleet node
+    // whose sibling went away does not get an `Err`. `workload_backend()` hands
+    // back the in-process runtime, which answers `Ok` with its own view of
+    // containerd: nothing it deployed, and ids derived a different way when it
+    // did (`forge.<uuid>` versus kamaji-bin's `forge-<uuid>`, R823-B4). A
+    // successful, wrong list walks straight through the guard that exists to
+    // stop exactly this, and `reconcile` retracts every record for a container
+    // kamaji is still happily running — yanking live upstreams out from under
+    // the ingress proxy during a `systemctl restart kamaji`.
+    //
+    // Skipping is the same conservative answer as the `Err` arm: a record goes
+    // stale rather than false, and the next tick with a real sibling corrects
+    // it.
+    if state.sibling_substituted(&backend) {
+        tracing::warn!(
+            "service_records: kamaji sibling unreachable; skipping refresh tick \
+             rather than reconciling against the in-process runtime's listing"
+        );
+        return false;
+    }
+    match backend.runtime().list_workloads().await {
         Ok(states) => {
             state
                 .service_records
@@ -1841,8 +2032,7 @@ pub async fn sweep_once(state: &Arc<crate::ServerState>) -> bool {
 mod tests {
     use super::*;
     use workload_spec::{
-        ExposeSpec, ImageRef, MeshExpose, Millis, ResourceLimits, RestartPolicy, SchemaVersion,
-        StopPolicy, TierTag,
+        ExposeSpec, ImageRef, MeshExpose, Millis, ResourceLimits, RestartPolicy,         StopPolicy, TierTag,
     };
 
     /// A minimal-but-real serving `WorkloadSpec` — configurable mesh identity
@@ -1875,7 +2065,6 @@ mod tests {
     /// `integration_single_node.rs`.
     fn isolated_spec(name: &str, ports: Vec<u16>) -> WorkloadSpec {
         WorkloadSpec {
-            schema_version: SchemaVersion::V1,
             name: name.to_string(),
             image: ImageRef {
                 registry: "docker.io".into(),
@@ -1897,7 +2086,10 @@ mod tests {
             resources: ResourceLimits {
                 memory_mb: 64,
                 cpu_millis: 128,
-                ephemeral_storage_mb: 128,
+                memory_request_mb: None,
+                cpu_limit_millis: None,
+                pids_max: None,
+                scratch_floor_mb: None,
             },
             depends_on: vec![],
             requires: vec![],
@@ -1918,6 +2110,7 @@ mod tests {
                 operator: None,
             },
             labels: Default::default(),
+            durability: None,
             annotations: Default::default(),
             files: Vec::new(),
         }
@@ -3289,6 +3482,236 @@ mod tests {
             .expect("record rehydrated");
         assert_eq!(record.port("wss"), Some(8443));
         assert_eq!(record.resolved_ports, named(&[("http", 8080), ("wss", 8443)]));
+    }
+
+    // ── R876-B11: the declaration outlives the record ───────────────────────
+
+    /// Read the ledger back as the struct that wrote it, so an assertion about
+    /// what is on disk is an assertion about the real shape rather than about a
+    /// hand-spelled JSON path that could drift away from it.
+    fn read_ledger(path: &std::path::Path) -> LedgerFile {
+        serde_json::from_str(&std::fs::read_to_string(path).expect("ledger written")).unwrap()
+    }
+
+    /// The regression, at its tightest. A sweep that stops seeing a workload
+    /// retracts its record, and [`ServiceRecords::save_ledger`] then drops that
+    /// record from disk — correctly, it would publish an undialable upstream.
+    /// The serving DECLARATION must survive that same round trip, because
+    /// nothing explicitly retracted it: a supervisor going quiet is a statement
+    /// about right now, not about intent.
+    #[test]
+    fn a_serving_declaration_survives_a_ledger_round_trip_that_retracted_the_record() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ledger = tmp.path().join(LEDGER_FILE_NAME);
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        let ident = MeshIdent("noisetable".into());
+
+        {
+            let records = ServiceRecords::with_ledger(ledger.clone());
+            // The live shape on us-east-001: a bundle with no declared port,
+            // cold-admitted once kamaji reported the port it bound.
+            records.admit_bundle(&ident, Some(node), None);
+            records.reconcile(
+                &[running_state_on_ports("noisetable", None, vec![41507])],
+                Some(node),
+            );
+            assert_eq!(records.ready().len(), 1);
+
+            // kamaji goes down. The sweep sees nothing and retracts.
+            records.reconcile(&[], Some(node));
+        }
+
+        // Non-vacuity: the record really is gone from disk, so a pass below
+        // cannot be the rehydrated-record path in disguise.
+        let file = read_ledger(&ledger);
+        assert!(
+            file.services.is_empty(),
+            "a retracted record must still be dropped from the ledger"
+        );
+        assert_eq!(
+            file.serving,
+            vec!["noisetable".to_string()],
+            "but the declaration it was derived from must persist on its own"
+        );
+
+        assert!(
+            restart(&ledger).is_declared_serving(&ident),
+            "a yubaba restarted while kamaji is down must still know this \
+             workload serves — that bit is what cold admission gates on"
+        );
+    }
+
+    /// The whole 2026-09-11 incident, replayed: both daemons restart, kamaji
+    /// forks the bundle's process again on a fresh ephemeral port, and the
+    /// workload must come back as a routable upstream with no redeploy. Before
+    /// this ticket the record never returned and noisetable.com served 503
+    /// behind a process that was answering 200 the entire time.
+    #[test]
+    fn a_bundle_replayed_after_a_kamaji_restart_is_readmitted_on_its_new_port() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ledger = tmp.path().join(LEDGER_FILE_NAME);
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        let ident = MeshIdent("noisetable".into());
+
+        {
+            let records = ServiceRecords::with_ledger(ledger.clone());
+            records.admit_bundle(&ident, Some(node), None);
+            records.reconcile(
+                &[running_state_on_ports("noisetable", None, vec![41507])],
+                Some(node),
+            );
+            // kamaji restarts; the sweep in the gap sees no workloads.
+            records.reconcile(&[], Some(node));
+        }
+
+        // yubaba restarts a second later — the paired hotship that triggered
+        // this — so nothing survives but the file.
+        let records = restart(&ledger);
+        // kamaji replays the bundle. A forked process binds a *new* ephemeral
+        // port, which is why re-deriving the old one would not have helped.
+        records.reconcile(
+            &[running_state_on_ports("noisetable", None, vec![41509])],
+            Some(node),
+        );
+
+        let record = records
+            .get(&ident)
+            .expect("the replayed process must be re-admitted from its resolved port");
+        assert!(record.is_ready());
+        assert_eq!(record.mesh_ip, node);
+        assert_eq!(record.dialable_ports(), &named(&[("http", 41509)]));
+        assert_eq!(records.ready().len(), 1);
+    }
+
+    /// The other direction, and the reason the eligibility set is cleared by
+    /// exactly one caller. An *explicit* retract is a statement of intent, so it
+    /// must survive a restart too — otherwise this fix would resurrect every
+    /// workload an operator ever destroyed.
+    #[test]
+    fn an_explicit_retract_clears_the_declaration_across_a_restart() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ledger = tmp.path().join(LEDGER_FILE_NAME);
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        let ident = MeshIdent("noisetable".into());
+
+        {
+            let records = ServiceRecords::with_ledger(ledger.clone());
+            records.admit_bundle(&ident, Some(node), None);
+            records.reconcile(
+                &[running_state_on_ports("noisetable", None, vec![41507])],
+                Some(node),
+            );
+            records.retract(&ident);
+        }
+
+        assert!(read_ledger(&ledger).serving.is_empty());
+
+        let records = restart(&ledger);
+        assert!(!records.is_declared_serving(&ident));
+        // And a sweep reporting the workload alive on a port does NOT bring it
+        // back: the declaration is gone, so cold admission still refuses.
+        records.reconcile(
+            &[running_state_on_ports("noisetable", None, vec![41509])],
+            Some(node),
+        );
+        assert!(records.get(&ident).is_none());
+    }
+
+    /// A retract of an ident with no record still has to reach the file. The
+    /// record map is unchanged, so `retract` takes its no-publish arm — and if
+    /// that arm skipped the ledger, a restart would rehydrate a declaration
+    /// that was explicitly revoked.
+    #[test]
+    fn retracting_a_declared_ident_with_no_record_still_persists_the_revocation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ledger = tmp.path().join(LEDGER_FILE_NAME);
+        let node = Ipv4Addr::new(100, 64, 0, 3);
+        let ident = MeshIdent("noisetable".into());
+
+        {
+            let records = ServiceRecords::with_ledger(ledger.clone());
+            // Admitted with no declared port: declared serving, no record yet.
+            assert!(!records.admit_bundle(&ident, Some(node), None));
+            records.retract(&ident);
+        }
+
+        assert!(read_ledger(&ledger).serving.is_empty());
+        assert!(!restart(&ledger).is_declared_serving(&ident));
+    }
+
+    /// The upgrade boot, again (compare
+    /// `a_ledger_written_before_port_names_still_rehydrates`). A ledger written
+    /// before `serving` existed carries no declarations, and the binary reading
+    /// it first is this one. Falling back to the record keys reproduces the old
+    /// behaviour exactly; an empty set would withdraw cold-admission
+    /// eligibility from every workload on precisely the boot that installs the
+    /// fix.
+    #[test]
+    fn a_ledger_written_before_serving_was_persisted_declares_its_records() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ledger = tmp.path().join(LEDGER_FILE_NAME);
+        std::fs::write(
+            &ledger,
+            serde_json::json!({
+                "version": LEDGER_VERSION,
+                "services": [{
+                    "ident": "api",
+                    "mesh_ip": "100.64.0.5",
+                    "ports": [8080],
+                    "resolved_ports": [43117],
+                    "container_id": "container-api",
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(ServiceRecords::with_ledger(ledger).is_declared_serving(&MeshIdent("api".into())));
+    }
+
+    /// The DOWNGRADE boot — the rollback path from the ship that installs this
+    /// change, which has to work or "put the old yubaba back" is not a recovery.
+    /// A pre-R876-B11 `LedgerFile` has no `serving` field at all, and neither
+    /// that struct nor this one carries `#[serde(deny_unknown_fields)]`, so the
+    /// key is ignored rather than fatal; [`LEDGER_VERSION`] deliberately does
+    /// not move, so the version gate passes too. The old binary therefore reads
+    /// `services` exactly as it always did and re-derives its declarations from
+    /// the record keys — its own pre-fix behaviour, unchanged.
+    ///
+    /// This asserts that rule on the type a rollback would use, by feeding
+    /// today's loader a key IT does not know: same struct, same absent
+    /// attribute, same serde behaviour. It does not (and cannot) run the old
+    /// binary.
+    #[test]
+    fn a_ledger_carrying_an_unknown_field_still_loads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ledger = tmp.path().join(LEDGER_FILE_NAME);
+        std::fs::write(
+            &ledger,
+            serde_json::json!({
+                "version": LEDGER_VERSION,
+                "services": [{
+                    "ident": "api",
+                    "mesh_ip": "100.64.0.5",
+                    "ports": {"http": 8080},
+                    "resolved_ports": {"http": 43117},
+                    "container_id": "container-api",
+                    "routable": true,
+                }],
+                "serving": ["api"],
+                "a_field_from_a_later_yubaba": {"anything": [1, 2, 3]},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let records = ServiceRecords::with_ledger(ledger);
+        assert!(
+            records.get(&MeshIdent("api".into())).is_some(),
+            "an unknown ledger field must be ignored, not fatal — a version \
+             skew in either direction otherwise loses every record on boot"
+        );
+        assert!(records.is_declared_serving(&MeshIdent("api".into())));
     }
 
     #[test]

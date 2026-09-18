@@ -65,7 +65,7 @@ fn node_id(idx: usize) -> u64 {
 
 /// GET `/raft/status` as JSON.
 async fn raft_status(base_url: &str) -> serde_json::Value {
-    reqwest::Client::new()
+    yubaba_test_harness::http()
         .get(format!("{base_url}/raft/status"))
         .send()
         .await
@@ -85,7 +85,7 @@ async fn current_term(base_url: &str) -> u64 {
 /// POST a `VoteRequest` to `path` (`/raft/vote` or `/raft/pre-vote`) and decode
 /// the `Result<VoteResponse, RaftError>` body the raft RPC handlers serialize.
 async fn post_vote(base_url: &str, path: &str, req: &VoteRequest<TC>) -> VoteResponse<TC> {
-    let resp = reqwest::Client::new()
+    let resp = yubaba_test_harness::http()
         .post(format!("{base_url}{path}"))
         .json(req)
         .send()

@@ -82,7 +82,7 @@ async fn spawn_node(id: u64, policy: ClusterPolicy) -> Node {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if reqwest::Client::new()
+        if yubaba_test_harness::http()
             .get(format!("{base_url}/health"))
             .send()
             .await
@@ -107,7 +107,7 @@ async fn spawn_node(id: u64, policy: ClusterPolicy) -> Node {
 }
 
 async fn raft_status(base_url: &str) -> serde_json::Value {
-    reqwest::Client::new()
+    yubaba_test_harness::http()
         .get(format!("{base_url}/raft/status"))
         .send()
         .await
@@ -118,7 +118,7 @@ async fn raft_status(base_url: &str) -> serde_json::Value {
 }
 
 async fn post_json(url: String, body: serde_json::Value) -> (reqwest::StatusCode, String) {
-    let resp = reqwest::Client::new()
+    let resp = yubaba_test_harness::http()
         .post(url)
         .json(&body)
         .send()

@@ -88,10 +88,11 @@
 //! @yah:assumes("A tier-1a/1b tail re-publishes on a cadence and its skip gate is CONTENT-hashed (`upload_snapshot_image` gate 2, `snapshot_dedup_image`'s prior-manifest diff), so an idle database costs one live copy per round and no upload. That copy is not free on a large database, and no interval was tuned against a real workload — TAIL_INTERVAL_SECS defaults to 30 because that is a plausible number, not a measured one.")
 //! @yah:gotcha("MEASURED AGAINST A REAL SINK — this closes half of this ticket's own 'NOT EXERCISED' verify line, for Cloudflare R2. Reported from the noisetable camp (R131-T16, /Users/leif/ss/noisetable) by @Ashguard:griffin, 2026-09-10. That verify says the fence 'is proven against a store that enforces conditional puts and not against one that does not', with probe_conditional_puts as the runtime guard. Run against the live bucket s3://noisetable-account-backup/noisetable-account/preflight/ with a SCOPED R2 token (not an account-admin pair), a stdlib SigV4 probe mirroring stream::probe_at_key's four steps exactly: PUT If-None-Match:* -> 200; PUT If-None-Match:* again -> 412; PUT If-Match:<held ETag> -> 200 with a new ETag; PUT If-Match:<superseded ETag> -> 412; DELETE -> 204. Verdict Honoured, i.e. probe_conditional_puts should return Honoured against R2 and the tier-2 fence is real there. Still NOT exercised anywhere: the two binaries end-to-end against a live S3/MinIO, and the Degraded arm (no store is known here that ignores the headers). R2 endpoint form is https://&lt;account&gt;.r2.cloudflarestorage.com with region 'auto'.")
 //! @yah:gotcha("PARSED BUT NOT DELIVERED: `yah.durability.rpo-seconds` never reaches turso-backup-tail. Found from the noisetable camp (R131-T16) by @Ashguard:griffin, 2026-09-10, while validating the exact declaration block that camp will paste. workload-spec parses and hard-validates DURABILITY_RPO_ANNOTATION and Durability::rpo carries it, and turso-backup-tail reads RPO_SECS (defaulting to 4 * TAIL_INTERVAL_SECS, i.e. 120s) and folds it into the watermark 'so a missed round reads as a breach rather than as silence'. But kamaji-bin/src/tail.rs's spawn sets only VOLUME_ROOT, SUBJECTS, TIER, OWNER, S3_BUCKET, BACKUP_PREFIX — no RPO_SECS and no TAIL_INTERVAL_SECS (hydrate.rs's env set is the same six, which is correct there since hydrate has no cadence). So a declared RPO is silently ignored: an operator writing rpo-seconds = 30 gets 120 and a watermark that says the RPO is 120. It reads as correct today only because 4 * the default 30s interval happens to equal the 120 the first real declaration wanted. Two-line fix at the .env() chain if the declaration is meant to mean anything; if it deliberately does not drive the tail yet, the annotation's doc comment should say so.")
+//! @yah:gotcha("DOWNSTREAM CONSUMER MEASUREMENT from the noisetable camp (R131-T16), taken 2026-09-11T06:02Z against us-east-001. The release is PARTIALLY out and it is worth knowing which half. The deployed kamaji's `--help` now matches `hydrate-helper` twice (it matched 0 on 2026-09-10), but `tail-helper` still matches 0. kamaji.service ExecStart is `/usr/local/bin/kamaji --socket /run/kamaji/kamaji.sock --containerd-socket /run/containerd/containerd.sock --native-exec-dir /var/lib/yah/kamaji/native` and passes NEITHER flag. /usr/local/bin holds only turso-backup-snapshot; turso-backup-tail and turso-backup-hydrate are both absent. The node has been redeployed (kamaji.rollback-20260910, yubaba.rollback-20260910 present), so this is a partial release rather than a stalled one. CONSEQUENCE FOR A REAL DOWNSTREAM SERVICE: noisetable-account is live, serving production passkey sign-in, and its only backup is a 10-minute-RPO snapshot timer with no fencing and a human-run restore. It cannot declare `yah.durability.*` until a kamaji release carries `--tail-helper` AND `--hydrate-helper` AND both helper binaries AND the S3_* credentials onto the node — declaring before that makes kamaji REFUSE the deploy, i.e. takes the account API down rather than backing it up. THE ASK, one line: sign off and commit R850-F1, then cut a kamaji release with BOTH durability helpers wired into ExecStart and both binaries placed. Nothing in the noisetable camp can produce that.")
 //!
 //! @yah:ticket(R850-T2, "Feed a measured restore time back to `yah cloud topology`, without making analyze do I/O")
-//! @yah:at(2026-09-10T08:06:35Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:at(2026-09-11T06:27:57Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:phase(P3b)
 //! @yah:parent(R850)
@@ -99,19 +100,40 @@
 //! @yah:gotcha("DO NOT MAKE `topology::analyze` DO I/O. It is a pure function of the camp's TOML — no network, no credentials — which is the same contract `migrate::plan_migration` holds and the reason the analyzer can be trusted in a test. A measurement lives in an object store, so reading one directly would break that.")
 //! @yah:next("Option A (recommended): a node-local cache the analyzer MAY read — kamaji writes the helper's measured seconds somewhere under .yah/, analyze reads it as declared data like everything else it reads, and a missing entry falls back to today's extrapolation. Keeps analyze pure over the local tree.")
 //! @yah:handoff("R850-F1 now produces the measurement this wants. `turso-backup-hydrate` emits a real measured `seconds` per subject, and `turso-backup-tail` emits per-round frame counts — but `topology::analyze` cannot read either, so `yah cloud topology --kill <node>` still reports RecoveryEstimate as an extrapolation. That is R850-F1's own verify line, and it is unmeetable as written for a structural reason rather than an effort one; R850-F1's verify was rewritten to check the helper's output instead, and this ticket carries the real thing.")
+//! @yah:handoff("LANDED. `topology::analyze` now reports a MEASURED restore where one exists, and it is still PURE — no I/O, no new argument, no Path, no clock. New module `oss/yubaba/crates/cloud/src/recovery_journal.rs` (registered in lib.rs next to asset_journal) is an append-only JSONL journal at `.yah/cloud/recovery.jsonl` via a new `paths::recovery_journal(workspace_root)` (paths.rs, beside `asset_status_journal`). Record shape is one JSON object per line: `{at, workload, node, tier?, subject, bytes, seconds, helper}`, `at` RFC3339. `CloudConfig::load` replays it into a new field `CloudConfig.recovery_measurements: BTreeMap<String, WorkloadRecovery>` keyed by workload; a missing file replays to empty and is NOT an error, exactly like an unsynced infra source in the same loader. `load_from_config_dir` gets an empty map for the same reason the sources overlay does not apply there (commented at the site). New `RecoveryEstimate::Measured { seconds, bytes, measured_at, age_days, node, basis }` at topology.rs, preferred inside the `DataLoss::Window` arm of `recovery()` over BOTH `Hydrate` and `UnknownStateSize` whenever a record exists for that workload. Provenance AND age both go into the JSON so a consumer can strip neither; `headline()` extended to match. Wiring is `node_loss` -> `workload_impact(w, dead, &cfg.recovery_measurements)` -> `recovery(w, loss, measurements)`.")
+//! @yah:handoff("DECLARATION-SURFACE ANSWERS, as implemented. (1) WHERE: `.yah/cloud/recovery.jsonl`, sibling of asset_journal's status.jsonl, read at CloudConfig::load time so analyze sees it as declared data. (2) WHO PRUNES: nobody. Append-only is the whole retention policy, same answer asset_journal gives; there is no pruner and one must not be built. `the_last_record_for_a_subject_wins_and_nothing_is_pruned` asserts both lines survive on disk while replay keeps only the latest. (3) STALE vs NONE: a stale measurement is REPORTED, never discarded. `recovery_journal::STALE_AFTER_DAYS = 30`; past that the estimate stays `Measured` and the headline gains \"measured N days ago; declared state may have grown since, so treat it as a floor rather than a forecast\". A real timed restore from 90 days ago still beats an extrapolation from one constant measured once on one unrelated host. Two derived decisions worth knowing: a workload's `measured_at` is the OLDEST component of the sum (a sum is only as fresh as its stalest part), and `age_days` is derived from `WorkloadRecovery.as_of` — the clock is read once at replay and captured as data, which is what lets `analyze` stay clockless as well as I/O-free.")
+//! @yah:handoff("WRITER SEAM: `yah cloud topology --record-hydrate <path|-> --workload <NAME> --node <MACHINE> [--tier <TIER>]` in app/yah/cli/src/cloud.rs. clap `requires_all` binds workload+node to the flag (a measurement nobody can attribute is worse than none); a redundant bail guards it anyway. New fn `record_hydrate_measurement` reads every non-empty line of the file or stdin, parses each through `RecoveryRecord::from_helper_json`, appends, and reports the count + summed seconds on STDERR so `--format json` keeps a clean stdout. Ingest happens BEFORE `load_cloud`, so the same invocation reports with the measurement it just filed — the flag verifies itself. A line reporting no restore (already_populated / nothing_in_the_store / refused) contributes zero records and is NOT an error, but it prints a loud \"nothing appended\" line rather than reading as success. `--tier` exists because the helper reads TIER from its own environment and does not print it; unattributed it stays None rather than being guessed. cloud.rs edits were confined to the Topology arg struct, its dispatch arm, handle_topology, and the one new fn — plus 3 mechanical one-line `recovery_measurements:` additions to pre-existing CloudConfig test-helper literals (16529/16674/17397), driven off compiler spans.")
+//! @yah:verify("BASELINE MEASURED BEFORE THE FIRST EDIT: `cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib` = 1173 passed, 0 failed, 4 ignored. AFTER: 1187 passed, 0 failed, 4 ignored (+14 new, zero regressions). `cargo check --manifest-path oss/yubaba/Cargo.toml -p yubaba --all-targets` clean. `cargo build -p yah --lib` and `cargo check -p yah --tests` both clean from the repo root (no errors; the warnings present are all pre-existing and in other agents' files). `cargo test --manifest-path oss/turso-backup/Cargo.toml --bin turso-backup-hydrate` = 5 passed, 0 failed. `./scripts/check-schema-drift.sh` = \"ok: .yah/schema is in sync with the Rust types\" — no regeneration needed, and workload-spec sources were not touched so its TS guard is not implicated (not run).")
+//! @yah:verify("ALL FOUR REQUIRED TESTS EXIST AND PASS. (a) `an_absent_recovery_journal_leaves_todays_answers_untouched` — asserts the journal file does not exist, then pins BOTH pre-existing answers unchanged (Hydrate at 100/32.6 s with state-mb declared, UnknownStateSize without). (b) `a_journalled_restore_replaces_the_extrapolation_with_the_measured_sum` — two subjects, 12.5s + 8.5s = 21.0s summed, 100 MiB summed, basis contains \"MEASURED, not extrapolated\" and does NOT contain R760-T10. (c) `a_stale_measurement_is_still_reported_and_says_so` — a 90-day-old entry stays `Measured` (explicitly NOT a fallback to Hydrate) and its headline says \"measured 90 days ago\"/\"may have grown since\". (d) `a_real_hydrate_line_parses_verbatim` in recovery_journal.rs. Plus `a_measurement_beats_an_undeclared_state_size` and `a_measurement_for_one_workload_does_not_leak_into_another` (a stray record must not invent state for a stateless workload), and 7 journal-level tests in recovery_journal.rs. Test fixtures go through the REAL journal writer and the real `CloudConfig::load` via the existing `Camp` harness (new `Camp::measured(...)` helper) — nothing hand-builds a CloudConfig.")
+//! @yah:verify("END-TO-END, against a staged fixture camp at /tmp/r850t2-camp with the real ./target/debug/yah binary, not just unit tests. BEFORE: `recovery: >= ~3.1s to pull 100 MiB (extrapolated from 32.6 MB/s measured once, R760-T10...)`. AFTER `--record-hydrate /tmp/r850t2-hydrate.json --workload db --node a --tier stream`: stderr \"recorded 2 measured subject restore(s) for workload 'db' on 'a' (21.0s total)\", two JSONL lines on disk, and the same invocation printed `recovery: 21.0s MEASURED — a real restore of 100.0 MiB timed on a, 0 day(s) ago`. `--format json` carries kind=measured with seconds/bytes/measured_at/age_days/node/basis all present. The `-` stdin path and the no-measurement outcome path were both exercised: `{\"outcome\":\"already_populated\"}` on stdin printed the loud \"nothing appended\" line and left the journal untouched.")
+//! @yah:gotcha("SCOPE HELD: the kamaji wire protocol was NOT widened. `kamaji::hydrate::run` still returns `HydrateResult::Proceed(Some(line))` and server.rs only `info!`s it; kamaji-proto/messages.rs and kamaji-bin/server.rs are untouched (both are uncommitted-modified by peers in this shared tree). The CLI ingest is the seam. LEADER CALL WORTH FILING: carrying the helper's line back through kamaji so a fleet-node restore journals itself with no operator step IS the right long-term shape — today a measurement only exists if somebody remembers to run `--record-hydrate`, which is exactly the kind of manual step that makes a measured figure permanently absent. Not built here by instruction. EDIT OUTSIDE THE PRIMARY BLAST RADIUS, DISCLOSED: `oss/turso-backup/src/bin/hydrate.rs` gained 17 lines — a full-line `assert_eq!` inside the EXISTING test `a_hydrated_outcome_reports_measured_bytes_and_seconds`, pinning its emitted format string byte-for-byte to `REAL_HYDRATE_LINE` in recovery_journal.rs. That is what makes the verify item \"build the fixture from hydrate.rs's own format string so the two cannot drift\" actually true: `cloud` deliberately takes no dependency on turso-backup, so the only way to stop the two drifting is an assertion on each side of the same literal. Changing `outcome_to_json` now fails in turso-backup FIRST, naming the cloud constant to update. @Ashguard:blade (session:8f7399ff) is live in oss/turso-backup/src/stream.rs on this same relay — different file, no overlap with this edit.")
+//! @yah:handoff("THE DECLARATION-SURFACE CALL THIS TICKET WAS FILED TO MAKE, made and shipped. Where the cache lives: an append-only JSONL journal at `.yah/cloud/recovery.jsonl`, reached by a new `paths::recovery_journal(workspace_root)` — deliberately the same shape as the `asset_journal` / `.yah/cloud/status.jsonl` precedent already in this crate (R470-T1), not a new mechanism. Who prunes it: nobody, which is the point of append-only plus last-wins replay, and is the same answer the asset journal already gives. Whether a stale measurement is worse than none: NO — a real timed restore with its age printed beats an extrapolation from one unrelated host, so `Measured` is never discarded on age; past ~30 days the headline says so instead. Provenance and age both ride into the JSON the way `Hydrate`'s basis already did, so a consumer cannot strip either.")
+//! @yah:handoff("ANALYZE STAYED PURE, which was the ticket's hard gotcha. `topology::analyze` gained no I/O, no `Path` argument, and no clock — the clock is captured as DATA at replay time, so the age is a value in the model rather than a call inside it. `CloudConfig::load` replays the journal into a new `recovery_measurements` field and analyze reads that, exactly as it already reads every other thing the loader pulled off the local tree. A missing journal file is not an error: it replays to empty and every existing verdict is unchanged.")
+//! @yah:verify("LEADER RE-RAN EVERY GATE INDEPENDENTLY (@Ashguard:eclipse), rather than accepting the courier's counts. `cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib`: 1187 passed / 0 failed / 4 ignored, exit 0 — matching the courier's post-change figure against its own pre-edit baseline of 1173/0, so +14. NOTE the invocation: yah-cloud is not a root workspace member and needs dev-deps, so a repo-root `cargo test -p yah-cloud` does NOT work. `cargo build -p yah --lib` from the repo root: Finished, exit 0 (25 pre-existing warnings, none new-file). `scripts/check-schema-drift.sh`: 'ok: .yah/schema is in sync with the Rust types'. `scripts/check-workload-spec-ts.sh`: 'ok: packages/yah/workload-spec/index.ts is in sync with the Rust schema'. Both drift gates green, so nothing is left red for the next reader.")
+//! @yah:verify("THE CROSS-CRATE SEAM WAS CHECKED AGAINST THE OTHER LIVE TICKET, not assumed. R850-T2 added a 17-line full-line `assert_eq!` in oss/turso-backup/src/bin/hydrate.rs pinning that binary's emitted format string to the cloud-side parser fixture, so the producer and consumer of the JSON cannot drift apart silently. @Ashguard:blade was concurrently editing the same crate for R850-T3; the leader's combined re-run of `cargo test --manifest-path oss/turso-backup/Cargo.toml` is 192 passed / 0 failed including that pin (bin/hydrate 5/5), so the two tickets' edits coexist.")
+//! @yah:gotcha("THE AUTOMATIC WRITER IS NOT IN THIS TICKET AND IS NOW FILED AS R850-T4. What shipped is the reader end plus a manual seam: `yah cloud topology --record-hydrate <path|-> --workload <w> --node <n>` ingests turso-backup-hydrate's JSON line from a file or stdin. Carrying the measurement back automatically means widening the kamaji wire (kamaji-proto/src/messages.rs, kamaji-bin/src/server.rs:2086, which already holds the line and only `info!`s it), and both files were uncommitted-dirty on the shared tree during this run — a scheduling reason, not a design objection. Until R850-T4 lands, a camp nobody feeds reports the extrapolation, correctly labelled.")
 //!
 //! @yah:ticket(R850-T3, "GC the frame objects a tier-2 rebase orphans after a WAL restart (oss/turso-backup/src/tail.rs)")
-//! @yah:at(2026-09-10T08:07:25Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:at(2026-09-11T06:27:23Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:phase(P4c)
 //! @yah:parent(R850)
 //! @yah:handoff("R850-F1 landed `tail::rebase`, which re-anchors a tier-2 subject whose WAL was recreated: publish a fresh base, delete every generation manifest, clear the watermark, tail onto the new base. Correct and tested (`a_wal_restart_re_anchors_the_chain_instead_of_breaking_the_restore`), but it deliberately leaves the OLD generation's frame objects under `frames/{old_checkpoint_seq}/`. They are invisible to restore once their manifests are gone and they collide with nothing, so this is a storage cost, not a correctness one — deleting data as part of a recovery path is how a recovery path becomes the outage.")
 //! @yah:gotcha("FILED HERE, LIVES THERE. The code is `oss/turso-backup/src/tail.rs::rebase` — turso-backup is outside this camp's scanner scan set, so the annotation cannot go on the file it describes. Do not go looking for a `@yah:` block in turso-backup.")
 //! @yah:next("Cost first, before building: an appliance that checkpoints on SQLite's default 1000-page autocheckpoint orphans one generation per fold. Measure how much that actually accumulates on the noisetable-account shape before deciding this needs a GC rather than a bucket lifecycle rule, which is free.")
+//! @yah:handoff("COST-FIRST GATE RUN BEFORE BUILDING, as this ticket demanded, and it changed the ticket. (1) The premise holds and understates the rate: `rebase`'s only call site is tail.rs:524 on `StreamOutcome::Restarted`, whose `restarted` flag (stream.rs:1288-1294, via `is_provably_same_as` stream.rs:319-324) is set because an ordinary in-process autocheckpoint increments BOTH salt1 and checkpoint_seq (measured: stream.rs:249-250, examples/foreign_checkpoint_probe.rs:35-37). So rebase runs on ordinary checkpoint folds, not only on process restart — bounded above by the tail round rate, default 30s (src/bin/tail.rs:67), with an `Empty` round not rebasing (stream.rs:1296-1298). (2) THE FREE OPTION IS NOT AVAILABLE: there is no bucket lifecycle rule anywhere in this tree, and a creation-time rule cannot express this job — at any moment the LIVE base snapshot is simply the most recent one, so a blanket 'expire older than N days' deletes the live base of any subject that has not folded in N days. (3) So: build the GC.")
+//! @yah:handoff("THE FRAMES ARE THE SMALL TERM — the ticket named the wrong leak as the main one, and the bigger one is covered here rather than filed. `rebase` (tail.rs:615) calls `snapshot::upload_base_snapshot` (tail.rs:635 -> snapshot.rs:216-231), the explicitly non-deduplicating one-shot variant, then deletes only manifests (tail.rs:636) and the watermark (tail.rs:637-643). Every rebase therefore stranded a COMPLETE COPY OF THE DATABASE, permanently, which exceeds the frame term (<= ~4.12 MB in <= 4 objects per rebase, at spill_buffer_frames=256 / 24+4096 B per frame) for any database over ~4 MB. `gc_stream` collects both classes. The doc comment at tail.rs:602-616 that asserted only the frames were left behind was WRONG about the leak it documented and is corrected in place ('Two things, not one'); lib.rs:16-19 now names both tiers' sweeps.")
+//! @yah:handoff("WHAT SHIPPED: `stream::gc_stream` (oss/turso-backup/src/stream.rs:3050) with `StreamGcConfig` (:2914), `StreamGcOutcome` (:2937), `DEFAULT_STREAM_GC_GRACE` = 24h (:2907), and two private helpers `delete_collected` (:3138, absent-is-success, the same posture rebase's own deletes hold) and `list_recursive` (:3156). Plus a `turso-backup-gc` bin (oss/turso-backup/src/bin/gc.rs, wired in Cargo.toml) emitting one JSON line, mirroring turso-backup-snapshot's shape. DRY RUN UNLESS `GC_APPLY` is an explicit 1/true/yes — GC_APPLY=0, a typo and an empty string all leave the dry run in place, because the failure mode of guessing wrong points at deleted objects. `GC_GRACE_SECS` overrides the grace. Shape follows the existing `dedup::gc_dedup` (dedup.rs:472-573) tier-1b sweep rather than minting a parallel vocabulary. `rebase` still deletes nothing — the ticket's standing judgment that a recovery path must not delete is intact; the sweep is explicitly invoked.")
+//! @yah:handoff("LIVENESS WAS DERIVED BY READING THE RESTORE PATH, NOT ASSUMED, and the two are pinned together. Restore makes two selections and the GC's live set is their union: `restore_stream_from_manifests` (stream.rs:2094-2101) takes the chain's `base_snapshot_key`, and with no generations `hydrate::restore_subject` (hydrate.rs:522-528) falls back to `snapshot::restore_latest`, which takes the lexically-greatest key (snapshot.rs:432-444). Frames are live iff a manifest names them, resolved through `BackupTarget::frame_objects_of` — the same function restore's replay and `WalPuller` use, so both epoch key shapes and both batch/legacy layouts come along by construction. `gc_liveness_is_the_complement_of_restore_selection` asserts both branches against the real selection functions so they cannot drift. DELIBERATE: every manifest's base key is treated as live, not `validate_generation_chain`'s single answer — a chain spanning a WAL restart does not validate at all, and refusing to guess keeps both bases rather than deleting the one the next rebase is about to adopt.")
+//! @yah:handoff("TWO JUDGMENT CALLS, both recorded at the code site. (1) GRACE WINDOW, default 24h (stream.rs:2907), documenting the three live windows it must cover: a serialized cold restore in flight, a tail between uploading batches and writing their manifest, and rebase's publish-before-delete gap where the NEW base is reachable from nothing — that third case is where grace is the only thing preventing a concurrent GC from deleting a base a recovery just published. (2) DISCOVERED GAP, CLOSED: `base_snapshots_skipped` (:2937). A `snapshots/` prefix with no chain over it is indistinguishable from a plain tier-1a sink, whose older snapshots are HISTORY, not garbage — unguarded, the sweep would have pruned all but the newest. It now skips the snapshot half entirely when there are no generation manifests and reports that it did. Frames still go: a `frames/` prefix under a chainless sink is unreachable by construction.")
+//! @yah:verify("BASELINE MEASURED BEFORE THE FIRST EDIT, then re-measured, and INDEPENDENTLY RE-RUN BY THE LEADER (@Ashguard:eclipse) rather than taken on the courier's word. `cargo test --manifest-path oss/turso-backup/Cargo.toml` (turso-backup is its own workspace, excluded from the yah root workspace — a root-level `-p` invocation does not work): baseline 180 passed / 0 failed; after 192 passed / 0 failed. Leader's independent re-run of the combined tree, after R850-T2's own edit to oss/turso-backup/src/bin/hydrate.rs landed: 167 + 4 + 5 + 4 + 5 + 7 = 192 passed / 0 failed, exit 0. `cargo clippy --all-targets -- --deny=warnings` clean; `cargo doc --no-deps` warning locations byte-identical to before the edits.")
+//! @yah:verify("TWELVE NEW TESTS — all four the ticket named, plus four more that came out of the liveness derivation. `gc_collects_a_superseded_base_snapshot_and_keeps_the_current_one` · `gc_collects_orphaned_frame_prefixes_and_keeps_the_live_generation` (both epoch layouts) · `gc_spares_everything_inside_the_grace_window` · `gc_dry_run_reports_without_deleting` (and asserts the wet sweep executes the dry proposal key-for-key) · `gc_liveness_is_the_complement_of_restore_selection` · `gc_keeps_both_bases_while_a_rebase_is_half_landed` · `gc_without_a_chain_keeps_snapshots_but_still_collects_frames` · `gc_on_an_empty_prefix_collects_nothing`, plus 4 in bin/gc.rs. NO LIVE MinIO NEEDED: these use `object_store::memory::InMemory`, the same route the existing `dedup` GC tests take — no new infrastructure was stood up.")
+//! @yah:gotcha("THIS TICKET'S ANNOTATION WAS WRITTEN BY THE LEADER, NOT THE IMPLEMENTER, on purpose. R850-T3's annotation lives in oss/yubaba/crates/cloud/src/topology.rs (turso-backup is outside the board scanner's scan set), and @Ashguard:polaris held that file dirty with ~9 uncommitted writes for R850-T2 for the whole of this ticket's run. @Ashguard:blade was steered off `board.update` mid-turn and reported its account back to the leader instead, which then wrote it here once polaris was out. Content is blade's; the keystrokes are the leader's.")
 
 use std::collections::BTreeMap;
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use workload_spec::sovereign::SovereignRole;
@@ -121,6 +143,7 @@ use workload_spec::{
 
 use crate::config::{CloudConfig, NodeAllocatable};
 use crate::migrate::{named_volume_path, VolumeDisposition};
+use crate::recovery_journal::{self, WorkloadRecovery};
 
 // ─── Measured constants the recovery estimate is built on ────────────────────
 
@@ -495,12 +518,22 @@ impl DataLoss {
 
 /// How long it takes to get the state back, and on what basis that is claimed.
 ///
-/// Every non-trivial variant here is an **extrapolation from two measured
+/// [`Hydrate`](Self::Hydrate) is an **extrapolation from two measured
 /// constants** ([`MEASURED_HYDRATE_MB_PER_S`], [`MEASURED_GET_RTT_MS`]) applied
-/// to a **declared** state size. Nothing in this module has ever timed a real
-/// restore. That is stated on the type rather than in a footnote because a
-/// recovery-time number without its provenance is the single easiest thing in
-/// a planning report to mistake for a measurement.
+/// to a **declared** state size — one measurement, on one host, against one
+/// backend, stretched over a number an operator typed. That is stated on the
+/// type rather than in a footnote because a recovery-time number without its
+/// provenance is the single easiest thing in a planning report to mistake for a
+/// measurement.
+///
+/// [`Measured`](Self::Measured) (R850-T2) is the exception and the thing to
+/// prefer: a restore that was actually timed, by
+/// `turso-backup-hydrate`, replayed out of `.yah/cloud/recovery.jsonl` by
+/// [`CloudConfig::load`] into [`CloudConfig::recovery_measurements`]. It carries
+/// its own provenance *and its age*, for the same reason — and it is never
+/// discarded for being old. A real restore from six weeks ago is a better
+/// answer than an extrapolation from an unrelated host; it is reported with
+/// "measured N days ago" attached so the reader can discount it themselves.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RecoveryEstimate {
@@ -515,6 +548,28 @@ pub enum RecoveryEstimate {
     Hydrate {
         state_mb: u32,
         seconds: f64,
+        /// Verbatim provenance, carried into JSON so a consumer cannot strip it.
+        basis: String,
+    },
+    /// A real restore of this workload, timed on a real host. Summed over the
+    /// workload's subjects, because the helper restores them one at a time and
+    /// a workload's recovery is all of them.
+    Measured {
+        /// Summed measured wall-clock seconds.
+        seconds: f64,
+        /// Summed bytes on disk after the restore. Not a declaration — this is
+        /// what actually landed.
+        bytes: u64,
+        /// When the oldest component of the sum was measured. A sum is only as
+        /// fresh as its stalest part.
+        measured_at: DateTime<Utc>,
+        /// Whole days from `measured_at` to when the journal was replayed.
+        /// Carried into JSON beside `basis` so a consumer can strip neither the
+        /// provenance nor the age.
+        age_days: i64,
+        /// The machine the most recent measurement was taken on. A restore time
+        /// is a property of a host as much as of a database.
+        node: String,
         /// Verbatim provenance, carried into JSON so a consumer cannot strip it.
         basis: String,
     },
@@ -536,6 +591,27 @@ impl RecoveryEstimate {
                  {MEASURED_HYDRATE_MB_PER_S} MB/s measured once, R760-T10; no restore was \
                  timed here, and WAL replay is on top)"
             ),
+            Self::Measured {
+                seconds,
+                bytes,
+                age_days,
+                node,
+                ..
+            } => {
+                let mib = *bytes as f64 / (1024.0 * 1024.0);
+                let base = format!(
+                    "{seconds:.1}s MEASURED — a real restore of {mib:.1} MiB timed on {node}, \
+                     {age_days} day(s) ago"
+                );
+                if *age_days > recovery_journal::STALE_AFTER_DAYS {
+                    format!(
+                        "{base} — measured {age_days} days ago; declared state may have grown \
+                         since, so treat it as a floor rather than a forecast"
+                    )
+                } else {
+                    base
+                }
+            }
         }
     }
 }
@@ -727,7 +803,7 @@ fn workload_node(cfg: &CloudConfig, spec: &WorkloadSpec) -> WorkloadNode {
         .collect();
 
     let durability = match spec.durability() {
-        Ok(Some(d)) => DurabilityView::Declared(d),
+        Ok(Some(d)) => DurabilityView::Declared(d.clone()),
         Ok(None) => DurabilityView::Undeclared,
         Err(e) => DurabilityView::Malformed {
             reason: e.to_string(),
@@ -796,7 +872,7 @@ fn node_loss(
     let impacts: Vec<WorkloadImpact> = workloads
         .iter()
         .filter(|w| w.placement.machine() == Some(dead))
-        .map(|w| workload_impact(w, dead))
+        .map(|w| workload_impact(w, dead, &cfg.recovery_measurements))
         .collect();
 
     let public_endpoints_lost = impacts
@@ -813,7 +889,11 @@ fn node_loss(
     }
 }
 
-fn workload_impact(w: &WorkloadNode, dead: &str) -> WorkloadImpact {
+fn workload_impact(
+    w: &WorkloadNode,
+    dead: &str,
+    measurements: &BTreeMap<String, WorkloadRecovery>,
+) -> WorkloadImpact {
     let alternates: Vec<String> = w
         .placement
         .alternates()
@@ -824,7 +904,7 @@ fn workload_impact(w: &WorkloadNode, dead: &str) -> WorkloadImpact {
 
     let data_loss = data_loss(w);
     let outcome = outcome(w, &alternates, dead);
-    let recovery = recovery(w, &data_loss);
+    let recovery = recovery(w, &data_loss, measurements);
 
     WorkloadImpact {
         workload: w.name.clone(),
@@ -896,7 +976,7 @@ fn data_loss(w: &WorkloadNode) -> DataLoss {
     match &w.durability {
         DurabilityView::Undeclared => DataLoss::Total {
             volumes: durable,
-            because: "no yah.durability.tier declared, so the yubaba-managed named volume \
+            because: "no durability.tier declared, so the yubaba-managed named volume \
                       at /var/lib/yah/kamaji/volumes/ is the only copy"
                 .to_string(),
         },
@@ -907,7 +987,7 @@ fn data_loss(w: &WorkloadNode) -> DataLoss {
         DurabilityView::Declared(d) => match d.tier {
             DurabilityTier::None => DataLoss::Total {
                 volumes: durable,
-                because: "yah.durability.tier = \"none\" — deliberately no second copy".to_string(),
+                because: "durability.tier = \"none\" — deliberately no second copy".to_string(),
             },
             DurabilityTier::Snapshot | DurabilityTier::Dedup => DataLoss::Window {
                 tier: d.tier,
@@ -925,18 +1005,32 @@ fn data_loss(w: &WorkloadNode) -> DataLoss {
     }
 }
 
-fn recovery(w: &WorkloadNode, loss: &DataLoss) -> RecoveryEstimate {
+/// R850-T2: `measurements` is [`CloudConfig::recovery_measurements`], already
+/// replayed off the local tree by [`CloudConfig::load`]. It reaches here as
+/// declared data, not as a path — `analyze` does no I/O, holds no clock, and
+/// keeps the same contract [`crate::migrate::plan_migration`] holds.
+fn recovery(
+    w: &WorkloadNode,
+    loss: &DataLoss,
+    measurements: &BTreeMap<String, WorkloadRecovery>,
+) -> RecoveryEstimate {
     match loss {
         DataLoss::None | DataLoss::EphemeralOnly => RecoveryEstimate::Immediate,
         DataLoss::Total { .. } | DataLoss::Unknown { .. } => RecoveryEstimate::NotRecoverable,
         DataLoss::Window { .. } => {
+            // A timed restore beats both the extrapolation and the "we can't
+            // say" — a measurement answers the question `state_mb` was only ever
+            // a proxy for. Age does not disqualify it; see `RecoveryEstimate`.
+            if let Some(m) = measurements.get(&w.name) {
+                return measured_recovery(m);
+            }
             let state_mb = match &w.durability {
                 DurabilityView::Declared(Durability {
                     state_mb: Some(mb), ..
                 }) => *mb,
                 _ => {
                     return RecoveryEstimate::UnknownStateSize {
-                        hint: workload_spec::DURABILITY_STATE_MB_ANNOTATION,
+                        hint: "durability.state_mb",
                     }
                 }
             };
@@ -957,6 +1051,32 @@ fn recovery(w: &WorkloadNode, loss: &DataLoss) -> RecoveryEstimate {
                 ),
             }
         }
+    }
+}
+
+/// Turn one workload's replayed measurements into the estimate, provenance and
+/// age included. Split out so the `basis` string lives next to the type that
+/// justifies it rather than inside a `match` arm.
+fn measured_recovery(m: &WorkloadRecovery) -> RecoveryEstimate {
+    let measured_at = m.measured_at();
+    RecoveryEstimate::Measured {
+        seconds: m.seconds(),
+        bytes: m.bytes(),
+        measured_at,
+        age_days: m.age_days(),
+        node: m.node.clone(),
+        basis: format!(
+            "MEASURED, not extrapolated: {} subject(s) summed from a real restore recorded by \
+             {} on {} at {}, replayed from `.yah/cloud/recovery.jsonl`. No \
+             {MEASURED_HYDRATE_MB_PER_S} MB/s constant and no declared state-mb is involved. \
+             Oldest component is {} day(s) old — the figure describes the state as it was then, \
+             not as it is declared now.",
+            m.subject_count(),
+            m.helper(),
+            m.node,
+            measured_at.to_rfc3339(),
+            m.age_days(),
+        ),
     }
 }
 
@@ -1324,7 +1444,6 @@ mod tests {
                      [image]\nregistry = \"cr.yah.dev\"\nrepository = \"{name}\"\n\
                      tag = \"v1\"\ndigest = \"sha256:abc\"\n\
                      [resources]\nmemory_mb = {memory_mb}\ncpu_millis = {cpu_millis}\n\
-                     ephemeral_storage_mb = 64\n\
                      [stop_policy]\nsignal = 15\ngrace_period = 10000\n\
                      [expose.mesh]\nidentity = \"{name}\"\nports = [8080]\nallow_from = []\n"
                 ),
@@ -1333,9 +1452,52 @@ mod tests {
             self
         }
 
+        /// Append a measured subject restore to `.yah/cloud/recovery.jsonl`
+        /// (R850-T2), dated `days_ago` before now. Goes through the real
+        /// journal writer so `analyze` sees exactly what `yah cloud topology
+        /// --record-hydrate` would have left behind.
+        fn measured(
+            self,
+            workload: &str,
+            subject: &str,
+            bytes: u64,
+            seconds: f64,
+            days_ago: i64,
+        ) -> Self {
+            crate::recovery_journal::RecoveryJournal::at_workspace(self.root())
+                .append(&[crate::recovery_journal::RecoveryRecord {
+                    at: Utc::now() - chrono::Duration::days(days_ago),
+                    workload: workload.to_string(),
+                    node: "a".to_string(),
+                    tier: Some("stream".to_string()),
+                    subject: subject.to_string(),
+                    bytes,
+                    seconds,
+                    helper: crate::recovery_journal::HELPER_TURSO_BACKUP_HYDRATE.to_string(),
+                }])
+                .unwrap();
+            self
+        }
+
         fn analyze(&self) -> Topology {
             super::analyze(&CloudConfig::load(self.root()).expect("fixture camp must load"))
         }
+    }
+
+    /// The `[annotations]` block for a stream-tier workload, with `state-mb`
+    /// declared unless `state_mb` is `None` — the two shapes that decide
+    /// between `Hydrate` and `UnknownStateSize` when nothing was measured.
+    fn stream_durability(state_mb: Option<u32>) -> String {
+        let mut s = "[durability]\n\
+                     tier = \"stream\"\n\
+                     engine = \"turso\"\n\
+                     store = \"s3://backups/db\"\n\
+                     subjects = [\"accounts.db\"]\n"
+            .to_string();
+        if let Some(mb) = state_mb {
+            s.push_str(&format!("state_mb = {mb}\n"));
+        }
+        s
     }
 
     const NAMED_VOLUME: &str = "[[volumes]]\nsource = { named = { name = \"accounts\" } }\n\
@@ -1398,7 +1560,7 @@ mod tests {
             panic!("expected Total, got {:?}", i.data_loss);
         };
         assert_eq!(volumes, &["accounts".to_string()]);
-        assert!(because.contains("yah.durability.tier"), "{because}");
+        assert!(because.contains("durability.tier"), "{because}");
         assert_eq!(i.recovery, RecoveryEstimate::NotRecoverable);
 
         // 4. And the operator-facing text says all three without a source dive.
@@ -1529,13 +1691,13 @@ mod tests {
                 "db",
                 &format!(
                     "replicas = 1\narchetype = \"appliance\"\n{NAMED_VOLUME}\n\
-                     [annotations]\n\
-                     \"yah.durability.tier\" = \"stream\"\n\
-                     \"yah.durability.engine\" = \"turso\"\n\
-                     \"yah.durability.store\" = \"s3://backups/db\"\n\
-                     \"yah.durability.subjects\" = \"accounts.db\"\n\
-                     \"yah.durability.rpo-seconds\" = \"30\"\n\
-                     \"yah.durability.state-mb\" = \"100\"\n"
+                     [durability]\n\
+                     tier = \"stream\"\n\
+                     engine = \"turso\"\n\
+                     store = \"s3://backups/db\"\n\
+                     subjects = [\"accounts.db\"]\n\
+                     rpo_seconds = 30\n\
+                     state_mb = 100\n"
                 ),
             )
             .analyze();
@@ -1569,6 +1731,199 @@ mod tests {
         assert!(basis.contains("FLOOR"), "{basis}");
     }
 
+    // ── Measured recovery (R850-T2) ──────────────────────────────────────────
+
+    /// The baseline this feature must not disturb: a camp that has never timed
+    /// a restore has no `.yah/cloud/recovery.jsonl`, that is not an error, and
+    /// both pre-existing answers come back exactly as before.
+    #[test]
+    fn an_absent_recovery_journal_leaves_todays_answers_untouched() {
+        for (state_mb, expected) in [
+            (
+                Some(100),
+                RecoveryEstimate::Hydrate {
+                    state_mb: 100,
+                    seconds: 100.0 / MEASURED_HYDRATE_MB_PER_S,
+                    // Compared field-wise below; `basis` is long and pinned by
+                    // `a_declared_stream_tier_turns_total_loss_into_a_bounded_window`.
+                    basis: String::new(),
+                },
+            ),
+            (
+                None,
+                RecoveryEstimate::UnknownStateSize {
+                    hint: "durability.state_mb",
+                },
+            ),
+        ] {
+            let camp = Camp::new().sized("a", 4096, 4000, "").workload(
+                "db",
+                &format!(
+                    "replicas = 1\narchetype = \"appliance\"\n{NAMED_VOLUME}\n{}",
+                    stream_durability(state_mb)
+                ),
+            );
+            assert!(
+                !crate::paths::recovery_journal(camp.root()).exists(),
+                "fixture must have no journal"
+            );
+
+            let topo = camp.analyze();
+            let got = &impact(&topo, "a", "db").recovery;
+            match (&expected, got) {
+                (
+                    RecoveryEstimate::Hydrate {
+                        state_mb: want_mb,
+                        seconds: want_s,
+                        ..
+                    },
+                    RecoveryEstimate::Hydrate {
+                        state_mb, seconds, ..
+                    },
+                ) => {
+                    assert_eq!(state_mb, want_mb);
+                    assert!((seconds - want_s).abs() < 1e-9, "{seconds}");
+                }
+                (a, b) => assert_eq!(a, b),
+            }
+        }
+    }
+
+    /// The point of the ticket: one journal entry turns the extrapolation into
+    /// a measurement, and the figure is the sum over the workload's subjects.
+    #[test]
+    fn a_journalled_restore_replaces_the_extrapolation_with_the_measured_sum() {
+        let topo = Camp::new()
+            .sized("a", 4096, 4000, "")
+            .workload(
+                "db",
+                &format!(
+                    "replicas = 1\narchetype = \"appliance\"\n{NAMED_VOLUME}\n{}",
+                    stream_durability(Some(100))
+                ),
+            )
+            // 100 MiB declared would extrapolate to ~3.07s; the real restore
+            // took 21s across two subjects, and that is what must be reported.
+            .measured("db", "accounts.db", 1024 * 1024 * 60, 12.5, 2)
+            .measured("db", "ledger.db", 1024 * 1024 * 40, 8.5, 2)
+            .analyze();
+
+        let i = impact(&topo, "a", "db");
+        let RecoveryEstimate::Measured {
+            seconds,
+            bytes,
+            age_days,
+            node,
+            basis,
+            ..
+        } = &i.recovery
+        else {
+            panic!("expected Measured, got {:?}", i.recovery);
+        };
+        assert!((*seconds - 21.0).abs() < 1e-9, "{seconds}");
+        assert_eq!(*bytes, 1024 * 1024 * 100);
+        assert_eq!(*age_days, 2);
+        assert_eq!(node, "a");
+        // Provenance survives into the structured output, not just the text —
+        // and it says which of the two kinds of number this is.
+        assert!(basis.contains("MEASURED, not extrapolated"), "{basis}");
+        assert!(basis.contains("recovery.jsonl"), "{basis}");
+        assert!(basis.contains("turso-backup-hydrate"), "{basis}");
+        // The extrapolation's constant must not appear as if it were involved.
+        assert!(!basis.contains("R760-T10"), "{basis}");
+
+        let headline = i.recovery.headline();
+        assert!(headline.contains("MEASURED"), "{headline}");
+        assert!(headline.contains("21.0s"), "{headline}");
+        assert!(!headline.contains("extrapolated"), "{headline}");
+    }
+
+    /// A measurement is never discarded for being old: an extrapolation from
+    /// one unrelated host is not an improvement on a real restore. The age goes
+    /// into the headline instead, so the reader discounts it themselves.
+    #[test]
+    fn a_stale_measurement_is_still_reported_and_says_so() {
+        let topo = Camp::new()
+            .sized("a", 4096, 4000, "")
+            .workload(
+                "db",
+                &format!(
+                    "replicas = 1\narchetype = \"appliance\"\n{NAMED_VOLUME}\n{}",
+                    stream_durability(Some(100))
+                ),
+            )
+            .measured("db", "accounts.db", 1024 * 1024 * 100, 41.0, 90)
+            .analyze();
+
+        let i = impact(&topo, "a", "db");
+        let RecoveryEstimate::Measured {
+            seconds, age_days, ..
+        } = &i.recovery
+        else {
+            panic!("stale must stay Measured, not fall back to Hydrate: {:?}", i.recovery);
+        };
+        assert!((*seconds - 41.0).abs() < 1e-9, "{seconds}");
+        assert_eq!(*age_days, 90);
+        assert!(*age_days > recovery_journal::STALE_AFTER_DAYS);
+
+        let headline = i.recovery.headline();
+        assert!(headline.contains("measured 90 days ago"), "{headline}");
+        assert!(headline.contains("may have grown since"), "{headline}");
+    }
+
+    /// A measurement answers the question `state-mb` was only ever a proxy for,
+    /// so it beats `UnknownStateSize` too — an undeclared size is no longer a
+    /// reason to refuse an answer once a real restore has been timed.
+    #[test]
+    fn a_measurement_beats_an_undeclared_state_size() {
+        let topo = Camp::new()
+            .sized("a", 4096, 4000, "")
+            .workload(
+                "db",
+                &format!(
+                    "replicas = 1\narchetype = \"appliance\"\n{NAMED_VOLUME}\n{}",
+                    stream_durability(None)
+                ),
+            )
+            .measured("db", "accounts.db", 4096, 1.5, 0)
+            .analyze();
+
+        assert!(matches!(
+            impact(&topo, "a", "db").recovery,
+            RecoveryEstimate::Measured { .. }
+        ));
+    }
+
+    /// Attribution is per workload. A measurement filed against one workload
+    /// must not leak into another's estimate, and must not turn a stateless
+    /// workload into a recoverable one.
+    #[test]
+    fn a_measurement_for_one_workload_does_not_leak_into_another() {
+        let topo = Camp::new()
+            .sized("a", 4096, 4000, "")
+            .workload(
+                "db",
+                &format!(
+                    "replicas = 1\narchetype = \"appliance\"\n{NAMED_VOLUME}\n{}",
+                    stream_durability(Some(100))
+                ),
+            )
+            .workload("web", "replicas = 1\narchetype = \"server\"")
+            .measured("web", "accounts.db", 4096, 99.0, 1)
+            .analyze();
+
+        // `db` has its own Window and no measurement of its own.
+        assert!(matches!(
+            impact(&topo, "a", "db").recovery,
+            RecoveryEstimate::Hydrate { .. }
+        ));
+        // `web` is stateless; a stray measurement does not invent state for it.
+        assert_eq!(
+            impact(&topo, "a", "web").recovery,
+            RecoveryEstimate::Immediate
+        );
+    }
+
     /// An undeclared RPO on a stream tier is the turso-backup default, and the
     /// report has to say which of the two it is printing — a number the
     /// operator believes they chose is worse than no number.
@@ -1580,11 +1935,11 @@ mod tests {
                 "db",
                 &format!(
                     "replicas = 1\narchetype = \"appliance\"\n{NAMED_VOLUME}\n\
-                     [annotations]\n\
-                     \"yah.durability.tier\" = \"stream\"\n\
-                     \"yah.durability.engine\" = \"turso\"\n\
-                     \"yah.durability.store\" = \"s3://backups/db\"\n\
-                     \"yah.durability.subjects\" = \"accounts.db\"\n"
+                     [durability]\n\
+                     tier = \"stream\"\n\
+                     engine = \"turso\"\n\
+                     store = \"s3://backups/db\"\n\
+                     subjects = [\"accounts.db\"]\n"
                 ),
             )
             .analyze();
@@ -1606,7 +1961,7 @@ mod tests {
         assert_eq!(
             i.recovery,
             RecoveryEstimate::UnknownStateSize {
-                hint: "yah.durability.state-mb"
+                hint: "durability.state_mb"
             }
         );
     }
@@ -1621,11 +1976,11 @@ mod tests {
                 "db",
                 &format!(
                     "replicas = 1\narchetype = \"appliance\"\n{NAMED_VOLUME}\n\
-                     [annotations]\n\
-                     \"yah.durability.tier\" = \"snapshot\"\n\
-                     \"yah.durability.engine\" = \"turso\"\n\
-                     \"yah.durability.store\" = \"s3://backups/db\"\n\
-                     \"yah.durability.subjects\" = \"accounts.db\"\n"
+                     [durability]\n\
+                     tier = \"snapshot\"\n\
+                     engine = \"turso\"\n\
+                     store = \"s3://backups/db\"\n\
+                     subjects = [\"accounts.db\"]\n"
                 ),
             )
             .analyze();
@@ -1646,7 +2001,7 @@ mod tests {
             "cache",
             &format!(
                 "replicas = 1\narchetype = \"appliance\"\n{NAMED_VOLUME}\n\
-                 [annotations]\n\"yah.durability.tier\" = \"none\"\n"
+                 [durability]\ntier = \"none\"\n"
             ),
         );
         let topo = camp.analyze();
@@ -1655,7 +2010,7 @@ mod tests {
         };
         assert!(because.contains("deliberately"), "{because}");
         assert!(
-            !because.contains("no yah.durability.tier declared"),
+            !because.contains("no durability.tier declared"),
             "{because}"
         );
     }
@@ -1845,11 +2200,11 @@ mod tests {
                 "backed-up",
                 &format!(
                     "replicas = 1\narchetype = \"appliance\"\n{NAMED_VOLUME}\n\
-                     [annotations]\n\
-                     \"yah.durability.tier\" = \"stream\"\n\
-                     \"yah.durability.engine\" = \"turso\"\n\
-                     \"yah.durability.store\" = \"s3://backups/db\"\n\
-                     \"yah.durability.subjects\" = \"accounts.db\"\n"
+                     [durability]\n\
+                     tier = \"stream\"\n\
+                     engine = \"turso\"\n\
+                     store = \"s3://backups/db\"\n\
+                     subjects = [\"accounts.db\"]\n"
                 ),
             )
             .analyze();

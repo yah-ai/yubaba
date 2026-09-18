@@ -33,7 +33,7 @@ use crate::config::{MirrorConfig, MirrorProviderSlot};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Capability {
     /// An S3-compatible object store. `local-s3-fs` at dev, `minio-container`
-    /// at sim, `cloudflare-r2` at cloud/ha.
+    /// at sim, `cloudflare-r2` at prod/ha.
     S3,
     /// A PostgreSQL server reachable over pgwire. `local-pg-dev` at dev
     /// (R584-F1).
@@ -43,6 +43,18 @@ pub enum Capability {
     /// this capability. `pg` is for non-rust services and rust services that
     /// specifically want the wire protocol.
     Pg,
+    /// An SMTP relay a service can hand outbound mail to. `local-mailcrab` at
+    /// dev and pond (R584-F2), where "delivery" means *capture*: the mail is
+    /// held in a browsable inbox and never leaves the machine.
+    ///
+    /// The fork this erases is the one every app grows otherwise — a
+    /// `if dev { log_the_email() } else { send_it() }` branch, and with it a
+    /// dev path whose rendering, headers and attachments are never exercised.
+    /// The app speaks SMTP at every tier; the mirror decides who answers.
+    ///
+    /// No cloud-tier driver binds this yet: a real relay needs credentials,
+    /// which is W265 §"Open follow-ups" P2 work.
+    Smtp,
 }
 
 impl Capability {
@@ -51,6 +63,7 @@ impl Capability {
         match self {
             Self::S3 => "s3",
             Self::Pg => "pg",
+            Self::Smtp => "smtp",
         }
     }
 
@@ -134,6 +147,62 @@ kind = "local-pg-dev"
     }
 
     #[test]
+    fn the_smtp_capability_binds_the_mailcrab_driver() {
+        let mirror = mirror_with(
+            r#"
+schema_version = 1
+shape = "local"
+
+[drivers.smtp]
+kind = "local-mailcrab"
+"#,
+        );
+        let slot = mirror.driver(Capability::Smtp).expect("smtp driver bound");
+        assert_eq!(slot.inline_kind(), Some(Provider::LocalMailcrab));
+        assert!(mirror.driver(Capability::Pg).is_none());
+    }
+
+    /// The binding the static-asset kinds imply. Unlike pg and smtp this one
+    /// is optional in practice — `reconciler::s3_driver` activates the dev
+    /// driver whether or not it is written down — but the key still has to
+    /// parse and resolve, because pond and cloud bind the *same* capability to
+    /// a different implementation and that is not optional.
+    #[test]
+    fn the_s3_capability_binds_the_dev_fs_driver() {
+        let mirror = mirror_with(
+            r#"
+schema_version = 1
+shape = "local"
+
+[drivers.s3]
+kind = "local-s3-fs"
+"#,
+        );
+        let slot = mirror.driver(Capability::S3).expect("s3 driver bound");
+        assert_eq!(slot.inline_kind(), Some(Provider::LocalS3Fs));
+        assert!(mirror.driver(Capability::Pg).is_none());
+    }
+
+    /// Every capability's wire name is the TOML key an author types, so a
+    /// duplicate would make two capabilities read the same `[drivers.<key>]`
+    /// table and silently share one binding.
+    #[test]
+    fn wire_names_are_distinct_and_toml_key_shaped() {
+        let all = [Capability::S3, Capability::Pg, Capability::Smtp];
+        let names: std::collections::BTreeSet<_> = all.iter().map(|c| c.wire_name()).collect();
+        assert_eq!(names.len(), all.len(), "duplicate wire_name: {names:?}");
+        for name in names {
+            assert!(
+                !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+                "{name} is not a bare lowercase TOML key"
+            );
+        }
+    }
+
+    #[test]
     fn a_mirror_with_no_drivers_table_is_unchanged() {
         let mirror = mirror_with(
             r#"
@@ -141,7 +210,7 @@ schema_version = 1
 shape = "local"
 
 [providers.static]
-kind = "local-static"
+kind = "miniflare-native"
 port = 4324
 "#,
         );

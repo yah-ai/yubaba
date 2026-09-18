@@ -197,6 +197,7 @@ mod tests {
             schema_version: 1,
             name: name.into(),
             domain: String::new(),
+            health_path: None,
             components,
             db: crate::DbCatalog::default(),
         }

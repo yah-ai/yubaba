@@ -86,9 +86,57 @@ use super::YubabaRaftConfig as TC;
 
 // ── Factory ───────────────────────────────────────────────────────────────────
 
-/// Creates one [`YubabaNetwork`] per peer.  Stateless; cheaply cloned.
-#[derive(Clone, Default)]
-pub struct YubabaNetworkFactory;
+/// Creates one [`YubabaNetwork`] per peer, all sharing ONE [`reqwest::Client`].
+///
+/// # Why the client is built once, here, and never in `new_client`
+///
+/// openraft calls [`RaftNetworkFactory::new_client`] far more often than "once
+/// per peer": every vote and pre-vote round, and every leader-lease check,
+/// builds a fresh network for each voter, and RaftCore *awaits* it inline
+/// before the RPC's own deadline even starts. Building a `reqwest::Client` is
+/// not cheap: this workspace's feature unification turns on reqwest's
+/// `rustls-tls-native-roots` (via object_store → turso-backup →
+/// tenant-streamer), so every build walks the OS trust store. On macOS that is
+/// one `trustd` IPC per root certificate, serialized through a single daemon.
+///
+/// R903 measured the bill: the yubaba `main` test binary at 15 test threads
+/// made 5,727 client builds whose `SecTrustSettingsCopyCertificates` calls
+/// averaged 393 ms each — 37 minutes of cumulative stall in a 129 s run — and
+/// 32–35 rig-timed tests (election 450–900 ms, vote soft-TTL 337 ms) never
+/// elected a leader, reporting `current_leader [None, None, None]` while the
+/// test process sat at 1.3 cores. Short-circuiting that one call made the same
+/// run 94/94. A client built once and cloned (an `Arc` bump) takes the trust
+/// store off the election path entirely, and lets peers reuse pooled
+/// connections instead of dialing fresh per round.
+///
+/// @yah:ticket(R903-T1, "Get rustls-tls-native-roots out of the yubaba workspace's reqwest feature set (object_store hard-wires it)")
+/// @yah:at(2026-09-15T18:29:00Z)
+/// @yah:status(open)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R903)
+/// @yah:next("Tier: Cleric — dependency-graph change with a possible upstream leg; needs judgment, not speed. Operator chose this over leaving it (2026-09-15). GROUNDED: object_store-0.13.2/Cargo.toml:173 declares its reqwest dep with features [rustls-tls-native-roots, http2] unconditionally, enabled by the shared `cloud` feature that aws/azure/gcp/http all imply. turso-backup/Cargo.toml:31 takes object_store features=[aws] for S3-compatible storage (the S3 protocol, not Amazon specifically). Cargo feature unification then puts native roots on every reqwest 0.12 user in oss/yubaba, raft's plain-http transport included. object_store also offers `tls-webpki-roots`, but features are additive, so enabling it does not remove native roots.")
+/// @yah:next("Options to weigh, cheapest first: (1) check whether a newer object_store release makes native roots opt-in — UNVERIFIED, read its changelog/Cargo.toml; (2) upstream PR to arrow-rs/object_store making native-roots a feature (keep default for compat); (3) a [patch.crates-io] fork until upstream lands (root Cargo.toml already carries patch bridges); (4) have S3 traffic bring its own client via object_store's HttpConnector so the dep can go reqwest-less. Pick one and remove native roots, don't just add webpki alongside.")
+/// @yah:verify("cargo tree --offline -p yubaba -e features -i reqwest@0.12.28 | grep rustls-tls-native-roots  # expect no hits")
+/// @yah:verify("R903's trust interpose (/tmp/r903/trust_interpose.c; /tmp is not durable, recreate from R903's description if gone) on the main test binary at --test-threads=15: SecTrustSettingsCopyCertificates calls=0")
+/// @yah:verify("turso-backup S3 upload/download still work against R2 (webpki roots cover R2's public CA chain — confirm, don't assume)")
+/// @yah:files(oss/turso-backup/Cargo.toml)
+/// @yah:files(Cargo.toml)
+#[derive(Clone)]
+pub struct YubabaNetworkFactory {
+    client: reqwest::Client,
+}
+
+impl YubabaNetworkFactory {
+    /// Build the shared peer client. Fails only if the TLS backend cannot
+    /// initialise — surfaced at raft open, not on the first election.
+    pub fn new() -> anyhow::Result<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| anyhow::anyhow!("building raft peer HTTP client: {e}"))?;
+        Ok(Self { client })
+    }
+}
 
 impl RaftNetworkFactory<TC> for YubabaNetworkFactory {
     type Network = YubabaNetwork;
@@ -97,10 +145,7 @@ impl RaftNetworkFactory<TC> for YubabaNetworkFactory {
         YubabaNetwork {
             target,
             base_url: format!("http://{}", node.addr),
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()
-                .expect("reqwest client"),
+            client: self.client.clone(),
         }
     }
 }
@@ -314,7 +359,8 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, router).await.ok();
         });
-        YubabaNetworkFactory
+        YubabaNetworkFactory::new()
+            .expect("raft peer client")
             .new_client(2, &BasicNode::new(addr.to_string()))
             .await
     }
@@ -387,7 +433,8 @@ mod tests {
                 .expect("bind loopback");
             listener.local_addr().expect("local addr")
         };
-        let mut net = YubabaNetworkFactory
+        let mut net = YubabaNetworkFactory::new()
+            .expect("raft peer client")
             .new_client(2, &BasicNode::new(addr.to_string()))
             .await;
 

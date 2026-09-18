@@ -431,6 +431,11 @@ pub struct CertPair {
 ///
 /// `mkcert -install` is never invoked from here: it writes the system keychain
 /// and the NSS stores and wants a password. Camp does not sudo.
+///
+/// R918-F5 — unix-only, because the privilege it reads off the process is.
+/// See [`is_root`]; [`ensure_pond_cert_as`] is the portable half and takes the
+/// same decision as an argument.
+#[cfg(unix)]
 pub fn ensure_pond_cert(state_dir: &Path, reissue: bool) -> Result<CertPair> {
     ensure_pond_cert_as(state_dir, reissue, is_root())
 }
@@ -530,6 +535,13 @@ pub fn ensure_pond_cert_as(
 
 /// True when this process is running with an effective uid of 0 — i.e. under
 /// `sudo`, which is the only way to bind `--port 443` on macOS.
+///
+/// R918-F5 — unix-only, and deliberately not given a non-unix counterpart.
+/// Windows elevation is a different concept (an integrity level and a token
+/// privilege), not a renamed euid, so answering `false` there would be a
+/// guess dressed as a fact. The pond door is a Unix dev affordance anyway: it
+/// shells to `mkcert` and runs `passway`.
+#[cfg(unix)]
 pub fn is_root() -> bool {
     // SAFETY: geteuid() is a pure read of the calling process's credentials.
     // It takes no arguments, touches no memory, and cannot fail.
@@ -976,7 +988,7 @@ mod tests {
         std::fs::write(
             mirrors.join("dev.toml"),
             "schema_version = 1\nshape = \"local\"\n\n[providers.static]\n\
-             kind = \"local-static\"\nport = 4321\n",
+             kind = \"miniflare-native\"\nport = 4321\n",
         )
         .unwrap();
         let cfg = CloudConfig::load(ws.path()).unwrap();

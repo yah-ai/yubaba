@@ -38,7 +38,7 @@ use yubaba_test_harness::{solo_node, SoloNode};
 
 /// POST `path` on `base_url`; return status + body.
 async fn post_json(base_url: &str, path: &str, body: serde_json::Value) -> (u16, String) {
-    let resp = reqwest::Client::new()
+    let resp = yubaba_test_harness::http()
         .post(format!("{base_url}{path}"))
         .json(&body)
         .send()
@@ -49,7 +49,7 @@ async fn post_json(base_url: &str, path: &str, body: serde_json::Value) -> (u16,
 }
 
 async fn raft_status(base_url: &str) -> serde_json::Value {
-    reqwest::Client::new()
+    yubaba_test_harness::http()
         .get(format!("{base_url}/raft/status"))
         .send()
         .await
@@ -132,14 +132,26 @@ async fn wait_for_agreed_leader(voters: &[&SoloNode], timeout: Duration) -> usiz
     let deadline = tokio::time::Instant::now() + timeout;
     let ids: Vec<u64> = voters.iter().map(|n| n.node_id).collect();
     loop {
-        let mut beliefs = Vec::with_capacity(voters.len());
+        let mut statuses = Vec::with_capacity(voters.len());
         for node in voters {
-            beliefs.push(raft_status(&node.base_url).await["current_leader"].as_u64());
+            statuses.push(raft_status(&node.base_url).await);
         }
+        let beliefs: Vec<Option<u64>> =
+            statuses.iter().map(|s| s["current_leader"].as_u64()).collect();
         if let Some(Some(leader)) = beliefs.first().copied() {
             if beliefs.iter().all(|b| *b == Some(leader)) {
                 if let Some(idx) = ids.iter().position(|id| *id == leader) {
-                    return idx;
+                    // R903: agreement is not readiness. Until the leader has
+                    // applied its membership entry, openraft refuses every
+                    // membership change ("already undergoing a configuration
+                    // change ... last committed membership log id: None") —
+                    // and every caller here changes membership next.
+                    let status = &statuses[idx];
+                    let membership = status["membership_config"]["log_id"]["index"].as_u64();
+                    let applied = status["last_applied"]["index"].as_u64();
+                    if matches!((membership, applied), (Some(m), Some(a)) if a >= m) {
+                        return idx;
+                    }
                 }
             }
         }

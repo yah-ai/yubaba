@@ -1,6 +1,6 @@
 //! Deliver the fleet-shared cert to a passway that systemd supervises (R600-F10).
 //!
-//! [`crate::acme_issuer`] issues the fleet cert once and `PutSecret`s the sealed
+//! `crate::acme_issuer` issues the fleet cert once and `PutSecret`s the sealed
 //! pair into raft; [`crate::secret_reload`] hands that pair to a *workload* by
 //! re-rendering its [`SecretMount`] and asking kamaji to graceful-upgrade it.
 //! That chain terminates at a consumer the live fleet does not have: the two
@@ -51,7 +51,7 @@
 //!
 //! ## What triggers a write
 //!
-//! The same watch `secret_reload` uses ([`YubabaStateMachine::subscribe_secrets`]),
+//! The same watch `secret_reload` uses (the fleet secret epoch, [`crate::secret_watch`]),
 //! with the same [`DEBOUNCE`] — the issuer writes key-first/cert-last, so an
 //! un-debounced pass would render a new-key/old-cert pair and hand the door a
 //! cert that does not match its key — and the same per-node
@@ -74,7 +74,7 @@ use std::sync::Arc;
 use workload_spec::secrets::{SecretConsumer, SecretError};
 use workload_spec::{SecretMount, SecretRef, SecretTarget};
 
-use crate::acme_issuer::{cert_secret_name, key_secret_name};
+use crate::secrets::{cert_secret_name, key_secret_name};
 use crate::secret_reload::{rolling_stagger, DEBOUNCE};
 use crate::secrets::{
     load_cluster_kek, resolve_secrets, ClusterResolver, LocalFileResolver, SECRET_STORE_ROOT,
@@ -272,7 +272,7 @@ pub enum PassOutcome {
 /// fails closed on the next renewal check, whereas a fresh key under a stale
 /// cert would be served.
 fn materialize_once(
-    sm: &crate::raft::YubabaStateMachine,
+    store: &crate::fleet_secrets::NodeSecretStore,
     kek_path: &Path,
     cfg: &MaterializeConfig,
     last: Option<u64>,
@@ -288,7 +288,7 @@ fn materialize_once(
         }
     };
     let resolver = ClusterResolver::new(
-        sm.clone(),
+        store.clone(),
         kek,
         LocalFileResolver::new(SECRET_STORE_ROOT),
         SecretConsumer::workload(&cfg.consumer),
@@ -307,6 +307,17 @@ fn materialize_once(
                 "cert_materialize: access rule denies this node's consumer identity — the \
                  fleet cert will never reach this door until {CONSUMER_ENV} matches the \
                  issuer's YUBABA_ACME_CONSUMERS"
+            );
+            return (PassOutcome::Skipped, last);
+        }
+        Err(e @ SecretError::ClusterUnavailable { .. }) => {
+            // R911-F1: not "not issued yet" — the store could not be read. Keep
+            // whatever pair is on disk and say so above debug level.
+            tracing::warn!(
+                error = %e,
+                domain = %cfg.domain,
+                "cert_materialize: the cluster secret store could not be read; the door keeps \
+                 its current cert and this retries on the next bump"
             );
             return (PassOutcome::Skipped, last);
         }
@@ -355,6 +366,19 @@ fn materialize_once(
     (PassOutcome::Wrote, Some(fresh))
 }
 
+/// [`materialize_once`] on the blocking pool (R911-F2): the store read is
+/// blocking HTTPS against the fleet object store, and the pair write is disk.
+async fn materialize_pass(
+    store: &crate::fleet_secrets::NodeSecretStore,
+    kek_path: &Path,
+    cfg: &MaterializeConfig,
+    last: Option<u64>,
+) -> (PassOutcome, Option<u64>) {
+    let (store, kek_path, cfg) = (store.clone(), kek_path.to_path_buf(), cfg.clone());
+    crate::fleet_secrets::off_runtime(move || materialize_once(&store, &kek_path, &cfg, last))
+        .await
+}
+
 /// Run the configured reload command, if any. Failure is logged, never fatal:
 /// the new pair is already on disk, and a door that did not reload is serving
 /// the *old* cert — degraded, not down — which is not worth killing yubaba over.
@@ -392,8 +416,9 @@ async fn run_reload(cfg: &MaterializeConfig) {
 }
 
 /// Watch cluster secrets and keep this node's cert files in step with the fleet
-/// cert. Returns immediately (logging why) when the module is not configured or
-/// the node has no raft state — there is nothing to follow in either case.
+/// cert. Returns immediately (logging why) when the module is not configured.
+/// A node with no fleet object store keeps running and fails every pass closed,
+/// by name.
 pub async fn run(state: Arc<ServerState>) {
     let cfg = match parse_config(|k| std::env::var(k).ok()) {
         Ok(Some(cfg)) => cfg,
@@ -406,15 +431,18 @@ pub async fn run(state: Arc<ServerState>) {
             return;
         }
     };
-    let Some(sm) = state.cluster_state.clone() else {
-        tracing::warn!(
-            "cert_materialize: configured but this node has no cluster state; nothing to follow"
-        );
-        return;
-    };
     let stagger = state.node_id.map(rolling_stagger).unwrap_or_default();
+    // R911-F1/F2: the fleet cert is read from the fleet object store, and the
+    // wake signal is the node's fleet secret watch over that same store.
+    let store = crate::fleet_secrets::FleetSecretStore::for_node(&state);
+    if let Err(rail) = &store {
+        tracing::error!(
+            "cert_materialize: configured but this node has {rail} — every pass will fail \
+             closed and the fleet cert will NOT reach this door"
+        );
+    }
 
-    let mut rx = sm.subscribe_secrets();
+    let mut rx = state.secret_epoch.subscribe();
     let _ = rx.borrow_and_update();
     tracing::info!(
         domain = %cfg.domain,
@@ -428,7 +456,7 @@ pub async fn run(state: Arc<ServerState>) {
     // reboots after an issuance would otherwise serve a stale cert for up to a
     // full renewal interval.
     let mut last = None;
-    let (outcome, digest) = materialize_once(&sm, &state.cluster_kek_path, &cfg, last);
+    let (outcome, digest) = materialize_pass(&store, &state.cluster_kek_path, &cfg, last).await;
     last = digest;
     if outcome == PassOutcome::Wrote {
         run_reload(&cfg).await;
@@ -447,7 +475,7 @@ pub async fn run(state: Arc<ServerState>) {
         }
         let _ = rx.borrow_and_update();
 
-        let (outcome, digest) = materialize_once(&sm, &state.cluster_kek_path, &cfg, last);
+        let (outcome, digest) = materialize_pass(&store, &state.cluster_kek_path, &cfg, last).await;
         last = digest;
         if outcome == PassOutcome::Wrote {
             run_reload(&cfg).await;
@@ -466,6 +494,57 @@ mod tests {
                 .find(|(pk, _)| *pk == k)
                 .map(|(_, v)| v.to_string())
         }
+    }
+
+    /// R911-F2: a pass against a real fleet store on a multi-thread runtime.
+    /// The store's debug tripwire panics if the read runs on a worker thread,
+    /// so this fails the moment `run` stops going through `materialize_pass`'s
+    /// blocking-pool hop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pass_resolves_off_the_runtime_and_writes_the_pair() {
+        use crate::fleet_secrets::FleetSecretStore;
+        use crate::secrets::seal_cluster_secret;
+        use workload_spec::secrets::SecretAccess;
+        use yah_object_store::{InMemoryObjectStore, ObjectStore as _};
+
+        const KEK: [u8; 32] = [6u8; 32];
+        let tmp = tempfile::tempdir().unwrap();
+        let kek_path = tmp.path().join("cluster.kek");
+        std::fs::write(&kek_path, KEK).unwrap();
+        let cert = tmp.path().join("cert.pem");
+        let key = tmp.path().join("key.pem");
+        let (cert_s, key_s) = (cert.display().to_string(), key.display().to_string());
+        let pairs = [
+            (DOMAIN_ENV, "yah.dev"),
+            (CERT_PATH_ENV, cert_s.as_str()),
+            (KEY_PATH_ENV, key_s.as_str()),
+            (CONSUMER_ENV, "ingress"),
+        ];
+        let cfg = parse_config(env(&pairs)).unwrap().unwrap();
+
+        let mem = Arc::new(InMemoryObjectStore::new());
+        let store = FleetSecretStore::new(mem.clone(), "le", "prod");
+        for (name, body) in [
+            ("tls/yah.dev/cert", b"CERTPEM".as_slice()),
+            ("tls/yah.dev/key", b"KEYPEM".as_slice()),
+        ] {
+            let rec =
+                seal_cluster_secret(&KEK, name, body, 1, SecretAccess::workloads(["ingress"]));
+            mem.put(
+                &store.object_key(name).unwrap(),
+                serde_json::to_vec(&rec).unwrap(),
+            )
+            .unwrap();
+        }
+        let store = Ok(store);
+
+        let (outcome, digest) = materialize_pass(&store, &kek_path, &cfg, None).await;
+        assert!(outcome == PassOutcome::Wrote, "the first pass writes the pair");
+        assert_eq!(std::fs::read(&cert).unwrap(), b"CERTPEM");
+        assert_eq!(std::fs::read(&key).unwrap(), b"KEYPEM");
+
+        let (again, _) = materialize_pass(&store, &kek_path, &cfg, digest).await;
+        assert!(again == PassOutcome::Unchanged, "an unchanged pair is not rewritten");
     }
 
     fn full() -> Vec<(&'static str, &'static str)> {

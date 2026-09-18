@@ -2268,11 +2268,13 @@ mod tests {
                 ingress_machines: Vec::new(),
                 drivers: Default::default(),
                 asset_aliases: BTreeMap::new(),
+                build: Default::default(),
             };
             let service = ServiceConfig {
                 schema_version: 1,
                 name: "yah-desktop".to_string(),
                 domain: "releases.yah.dev".to_string(),
+                health_path: None,
                 components: vec![],
                 db: crate::DbCatalog::default(),
             };
@@ -2852,7 +2854,7 @@ path    = "/run/yah/r2.json"
     #[tokio::test]
     async fn up_bails_on_unsupported_inline_slot_kind() {
         let slot = MirrorProviderSlot::Inline {
-            kind: Provider::LocalStatic,
+            kind: Provider::MiniflareNative,
             fields: BTreeMap::new(),
         };
         let fx = Fixture::new(slot);
@@ -2961,7 +2963,6 @@ path    = "/run/yah/r2.json"
         assert_ne!(real_hash, wrong_hash_for_real);
 
         let workload = StaticAssetWorkload {
-            schema_version: workload_spec::SchemaVersion::V1,
             assets: vec![AssetEntry {
                 filename: "model.bin".to_string(),
                 source: Some("model.bin".into()),
@@ -3004,7 +3005,6 @@ path    = "/run/yah/r2.json"
         fx.write_source_file("model.bin", body);
 
         let workload = StaticAssetWorkload {
-            schema_version: workload_spec::SchemaVersion::V1,
             assets: vec![AssetEntry {
                 filename: "model.bin".to_string(),
                 source: Some("model.bin".into()),
@@ -3126,7 +3126,6 @@ path    = "/run/yah/r2.json"
 
         // Workload only has "current.bin"; prior manifest also had "old.bin".
         let workload = StaticAssetWorkload {
-            schema_version: workload_spec::SchemaVersion::V1,
             assets: vec![AssetEntry {
                 filename: "current.bin".to_string(),
                 source: Some("current.bin".into()),

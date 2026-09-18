@@ -651,6 +651,10 @@ mod tests {
             tunnel_id: None,
             edge_provider_id: None,
             image: None,
+            auth: None,
+            via: None,
+            behind_tunnel: false,
+            tunnel_door: None,
         }
     }
 

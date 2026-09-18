@@ -6,12 +6,13 @@
 //! mirror. Selection: a [`ServiceComponent`](crate::ServiceComponent)'s
 //! `kind` field picks which reconciler runs; the reconciler then dispatches
 //! on the mirror's provider slot (e.g. `mesofact-static` →
-//! `providers.static` slot → `local-static` inline or `cloudflare` ref).
+//! `providers.static` slot → `miniflare-native` inline or `cloudflare` ref).
 //!
-//! T3 ships [`MesofactStaticReconciler`] with the `local-static` path
-//! wired (spawn `mesofact-dev` as a child process). The Cloudflare path is
-//! a stub — the production reconciler lands once `mesofact-publisher`
-//! integration is on the roadmap.
+//! [`MesofactStaticReconciler`] serves all four tiers through one door — the
+//! compiled Worker bundle — and varies only the object store beneath it:
+//! the `yah-s3-fs` driver at dev ([`dev_door`]), MinIO at pond ([`pond`]),
+//! R2 at cloud and ha. Which one a mirror binds is declared in
+//! `[drivers.s3]`, never branched on (W265, R584-F4).
 //!
 //!
 //! @yah:ticket(R419-F2, "Implement CloudflareWorkerReconciler (kind=cloudflare-worker)")
@@ -65,8 +66,8 @@
 //! @yah:verify("curl -sI https://cdn.yah.dev/yah-desktop/whisper/distil-large-v3-q5_1.bin  # HTTP/2 200, content-length 584567555")
 //!
 //! @yah:ticket(R870-B25, "The cloud-init template drift guard is vacuously green, and the canonical mirror.yml it should guard is 128 lines stale")
+//! @yah:status(review)
 //! @yah:at(2026-09-11T00:24:58Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R870)
 //! @yah:severity(high)
@@ -75,6 +76,32 @@
 //! @yah:gotcha("Found by independent verification of R870-F23 phase 2 (@Ashguard:dove, session:60d4f41f), confirming a claim from @Ashguard:blade's implementation pass. NOT caused by R870-F23 — pre-existing, and F23's own change is green and unaffected. Do not read this as a phase-2 regression.")
 //! @yah:next("THE DEFECT, read not inferred. `embedded_template_matches_workspace_canonical` exists to prove the mirror.yml compiled into the binary matches the canonical copy on disk. It resolves the workspace root by walking `CARGO_MANIFEST_DIR.ancestors()`, which lands on `oss/yubaba` — an independent Cargo workspace whose `.yah/` holds only a `.gitignore`. The canonical path therefore does not exist, the test takes its `canonical_path.exists()` bootstrap branch, and asserts NOTHING. It has been green for that reason, not because the files agree.")
 //! @yah:next("WHAT THE GUARD IS MISSING, measured: the repo-root `.yah/infra/cloud-init/mirror.yml` is 128 diff-lines behind `oss/yubaba/crates/cloud/templates/mirror.yml`. It is missing the ENTIRE R858-F17 turso-backup block, and the YAML-quoting fix R870-F23 landed in the embedded copy (the two runcmd entries whose bare `: ` made cloud-init parse them as a Mapping and skip them). THE FIX IS TWO PARTS AND THE ORDER MATTERS: first make the guard non-vacuous — resolve the canonical path against the REPO root rather than the enclosing cargo workspace, or fail loudly when it cannot be found, so the bootstrap branch can no longer swallow a real absence. Then reconcile the two files. Doing only the second leaves the guard still asleep for the next drift.")
+//! @yah:handoff("GUARD MADE NON-VACUOUS FIRST, then the files reconciled, and the intermediate RED was observed. New CanonicalHome enum + locate_canonical_home() in oss/yubaba/crates/cloud/src/cloud_init.rs (non-test code, since it is a real property of the layout): the ancestor walk is keyed on `.yah/infra/` instead of `.yah/`. The monorepo root has it; oss/yubaba, whose own .yah/ holds nothing but a .gitignore, does not, and neither does the standalone export where the repo root genuinely IS oss/yubaba. embedded_template_matches_workspace_canonical now matches on that: Monorepo(root) means the canonical file is REQUIRED (missing/unreadable panics with a message naming the path and saying provisioning reads it); StandaloneExport is the only branch allowed to skip. The old `if canonical_path.exists()` bootstrap branch that swallowed a real absence is gone.")
+//! @yah:handoff("THE RED, run after step 1 and before step 2 exactly as the ticket asked: `cargo test -p yah-cloud --lib cloud_init::tests` from oss/yubaba gave 29 passed / 1 FAILED, the single failure being embedded_template_matches_workspace_canonical asserting on /Users/leif/ss/yah/.yah/infra/cloud-init/mirror.yml with the full 128-line diff in its message. That is the proof it now compares something real; the post-fix green on its own would have been indistinguishable from today's vacuous green.")
+//! @yah:handoff("THE RECONCILE WAS NOT A ONE-WAY COPY, and this is the part worth reading. The canonical copy carried a DELIBERATE CORRECTION the embedded template never received: commit 45e39f0a (2026-08-03) changed `systemctl enable --now yubaba.slice` to `systemctl start yubaba.slice`, plus the comment explaining why - app/yah/cli/resources/yubaba.slice has no [Install] section, and systemctl enable on such a unit fails. Blindly overwriting canonical with embedded (which the ticket text reads like) would have regressed that fix into the file provisioning actually ships. So the fix went BOTH ways: the slice correction was applied to oss/yubaba/crates/cloud/templates/mirror.yml first, then that file was copied over .yah/infra/cloud-init/mirror.yml. The two are now byte-identical at 237 lines; canonical gained the whole R858-F17 turso-backup block, the R870-F23 YAML double-quoting of the two colon-space runcmd entries, the litestream 0.3.13 install, and the headscale 0.23.0 + litestream-headscale.service pre-stage.")
+//! @yah:handoff("WHICH TEMPLATE PROVISIONING ACTUALLY USES - THE CANONICAL ON-DISK ONE, read not guessed. cloud_init::load_template() returns the on-disk <workspace_root>/.yah/infra/cloud-init/mirror.yml whenever it exists and falls back to the include_str! embedded copy only when it does not. provision::build_request() (oss/yubaba/crates/cloud/src/provision.rs:88) is its sole non-test caller, and its sole caller in turn is handle_provision at app/yah/cli/src/cloud.rs:14524, whose workspace_root is the camp repo root - which has the file. So the embedded template is the FALLBACK, not the live path, and the stale copy is the one every `yah cloud machine provision` has been shipping. load_template's doc comment now says so.")
+//! @yah:handoff("FLEET CONSEQUENCE, dated from git so the window is bounded. NO node was touched - code, templates and tests only, per scope. Canonical was last updated 2026-08-03 (45e39f0a). The headscale 0.23.0 pre-stage, the litestream install and litestream-headscale.service staging landed in the EMBEDDED copy only on 2026-09-05 (4bed91fe), so any node provisioned between 2026-09-05 and today silently received none of them - that is the real damage this drift did. The turso-backup block landed in the embedded copy only TODAY (a8f0d501, 2026-09-10), so no node has ever received the durability helpers from either file; that gap is fleet-wide and predates this ticket rather than being caused by the drift. Remediating existing nodes is deliberately NOT done here.")
+//! @yah:handoff("DISCOVERED WORK, fixed in this pass: the SECOND stale twin is .yah/infra/cloud-init/stand-up-yubaba.sh, mirror.yml's documented SSH transcription for LAN nodes (W257 step 6). It installed yubaba/kamaji/units from the release tarball but never the turso-backup helpers or the KAMAJI_HYDRATE_HELPER/KAMAJI_TAIL_HELPER drop-in, so every LAN node stood up by it would refuse any durability-declaring workload. Added a present-checked, non-fatal block in the script's own idiom ($SUDO install from $D, tee for the drop-in, a WARNING to stderr when the tarball predates R858-F17), using Environment= in a drop-in rather than ExecStart= flags for the reason kamaji.service's own comment gives. Verified against scripts/publish-yubaba-release.sh:326-327, which hard-asserts both binaries at exactly $STAGE_NAME/turso-backup-{hydrate,tail} - the path the script looks in. bash -n clean.")
+//! @yah:verify("cargo test -p yah-cloud --lib, run from oss/yubaba (NOT the repo root - yah-cloud is not a root workspace member and needs dev-dependencies): 1166 passed / 0 failed / 4 ignored, against the 1163/0/4 baseline. The +3 are exactly the three tests added here; nothing regressed.")
+//! @yah:verify("INTERMEDIATE RED, the verification this ticket actually asked for: after step 1 and before step 2, cargo test -p yah-cloud --lib cloud_init::tests = 29 passed / 1 failed, the single failure being embedded_template_matches_workspace_canonical naming .yah/infra/cloud-init/mirror.yml. Green afterwards.")
+//! @yah:verify("Three new tests pin the guard against going vacuous again. locate_canonical_home_finds_monorepo_root_not_the_inner_workspace and locate_canonical_home_reports_standalone_export build both tree shapes in tempdirs (the monorepo one reproduces the inner oss/yubaba/.yah/.gitignore that caused the original miss). drift_guard_cannot_go_vacuous_in_the_monorepo keys off a signal INDEPENDENT of the .yah/infra/ marker - `git subtree split --prefix=oss/yubaba` strips that prefix, so a CARGO_MANIFEST_DIR still ending in oss/yubaba/crates/cloud proves we are in the monorepo - and panics if the guard resolved StandaloneExport there.")
+//! @yah:verify("diff -u between the two mirror.yml copies is empty; both are 237 lines.")
+//! @yah:verify("bash -n .yah/infra/cloud-init/stand-up-yubaba.sh clean.")
+//! @yah:verify("rendered_runcmd_entries_are_all_strings left untouched and still green, as instructed - a different test and a different gate.")
+//! @yah:gotcha("NOT FIXED, and deliberately left as an operator call rather than decided silently: stand-up-yubaba.sh still lacks the litestream 0.3.13 install and the headscale 0.23.0 / litestream-headscale.service pre-stage that mirror.yml now carries. Those exist because R858-T4 made EVERY node a coordinator candidate, and whether the LAN/appliance class (us-west-01x, mostly no-voter) belongs in that candidate set is a fleet-topology decision, not a transcription gap. The durability helpers WERE added because their consequence is unconditional - kamaji refuses the workload on any node - while these two only matter if the node can ever own the ingress role.")
+//! @yah:gotcha("Uncommitted: this camp's git policy is `defer`, so the four changed files (oss/yubaba/crates/cloud/src/cloud_init.rs, both mirror.yml copies, .yah/infra/cloud-init/stand-up-yubaba.sh) are in the working tree for the camp's git sweep. No commit SHA to cite.")
+//! @yah:verify("INDEPENDENTLY VERIFIED BY A SECOND COURIER (session:67d56cd3) who did not implement it. GUARD IS GENUINELY HONEST, confirmed by reading the branches: `locate_canonical_home` (cloud_init.rs:208) walks ancestors for `.yah/infra/`, and the Monorepo branch (cloud_init.rs:1013-1029) `read_to_string`-panics on a missing or unreadable canonical and `assert_eq`s full trimmed content against `DEFAULT_TEMPLATE` — so BOTH a deleted canonical AND a revert to its pre-fix state now fail hard. No skip branch survives. THE STANDALONE-EXPORT DISCRIMINATOR HOLDS: `.yah/infra/` exists only at the monorepo root and nowhere under `oss/` (oss/yubaba/.yah holds one tracked .gitignore), so the real subtree-split export takes the StandaloneExport branch legitimately; the only route to that branch from inside the monorepo is deleting `.yah/infra/`, which `drift_guard_cannot_go_vacuous_in_the_monorepo` catches off an INDEPENDENT path-suffix signal. Two residual holes, both benign in DIRECTION: a standalone clone placed under some `.yah/infra/` ancestor false-FAILS rather than skipping, and renaming the oss/yubaba path would disarm only the meta-guard, not the drift guard.")
+//! @yah:verify("THE RECONCILIATION WAS NOT A ONE-WAY COPY, and that was checked rather than taken on trust — a blind embedded-to-canonical copy would have silently destroyed someone else's fix. Both copies are byte-identical at 237 lines, sha256 6bc46731e030bae8a1970bcb06cf3132323eb454ab72496d6ef9b2c6177585af. At HEAD the CANONICAL carried the 45e39f0a fix (`systemctl start yubaba.slice`, since the slice has no [Install] section) while the EMBEDDED still had `enable --now`; the working diff applies that exact hunk embedded-ward (+5/-3) against the canonical's +109/-1, proving the flow went both directions. No `enable --now yubaba.slice` remains in either file. The canonical's single deleted line was only the `chmod 0644` superseded by the version adding litestream-headscale.service. R858-F17's turso-backup block and R870-F23's two double-quoted runcmd entries are present in both, necessarily so given byte-identity. THE INTERMEDIATE RED WAS STRUCTURALLY NECESSARY, not stage-managed: the Monorepo branch compares entire trimmed contents and the two HEAD copies differed by 112 insertions / 6 deletions, so the assert could not have passed. `cloud_init::tests` is 30 tests, making the reported 29-pass/1-fail arithmetically consistent. (The \"128-line diff\" figure is 118 changed lines by numstat — cosmetic, not a defect.) COUNTS: `cargo test -p yah-cloud --lib` from oss/yubaba = 1166 passed / 0 failed / 4 ignored, the +3 over baseline being exactly the three new tests.")
+//! @yah:verify("THE FLEET FACT, CONFIRMED WITH ONE DATE CORRECTED — this is the operationally consequential part and the correction matters. PROVISIONING READS THE CANONICAL ON-DISK COPY, not the embedded one: provision.rs:88 is `cloud_init::load_template(workspace_root)`, and `load_template` (cloud_init.rs:225-232) PREFERS `.yah/infra/cloud-init/mirror.yml`, falling back to the embedded copy only when absent; sole non-test caller chain is cloud.rs:14523 with the camp repo root. So every node was provisioned from the file that was 128 lines stale. CONSEQUENCE 1, date corrected: the headscale/litestream pre-stage entered the EMBEDDED copy on 2026-09-04 in b20a1e09 — NOT 2026-09-05, which was 4bed91fe merely refining it — and the canonical never carried it, so every node provisioned since 2026-09-04 missed that pre-stage. CONSEQUENCE 2 HOLDS AS STATED: no node has ever had the turso-backup helpers. `turso-backup-hydrate` first entered the embedded template today in a8f0d501 and the canonical only in this change; grep finds no other install path (only publish-yubaba-release.sh, kamaji's consumers, both mirror.yml copies, stand-up-yubaba.sh), and `.yah/infra/machines/us-west-001.toml:42` independently records \"NO prod node has them today\". NOT VERIFIED, stated rather than smoothed: no node was touched, so the actual SET of nodes provisioned since 2026-09-04 is unconfirmed.")
+//! @yah:handoff("THIRD TWIN CLOSED — .yah/infra/cloud-init/stand-up-yubaba.sh is now both LEVEL and GUARDED. GUARD SHAPE CHOSEN: the assertion test, not generate-from-one-source, and the reason is that the twin is not a pure transcription. The script deliberately diverges from mirror.yml in ways that are CORRECT and load-bearing (enable+restart instead of `enable --now`, which is the only reason it can call itself idempotent — see its own :162-176 comment measured on us-west-013/014; write-if-absent journald ceiling so a Pi's tighter 200M bound wins; cluster-KEK install; loopback bind for no-mesh nodes; status block reading /health rather than the on-disk --version). A generator would therefore have to model the divergences, which is the whole difficulty, and mirror.yml is itself a static `{{ }}`-substituted file rather than a Rust-rendered one — so single-sourcing would mean either making mirror.yml generated (large) or parsing YAML to emit bash (fragile). Not contained; see @yah:next for what it would actually take.")
+//! @yah:handoff("THE GUARD DERIVES ITS PINS FROM THE TEMPLATE rather than restating them, which is what stops it becoming the next thing that rots. `stand_up_script_carries_the_templates_install_steps` (oss/yubaba/crates/cloud/src/cloud_init.rs, next to the mirror.yml drift guard) reads the script via the new `paths::stand_up_script`, reusing `locate_canonical_home` so StandaloneExport is the same single permitted skip. Three assertion families: (1) STAND_UP_TWIN_ANCHORS, an explicit list of artifacts a node must end up carrying, each asserted against DEFAULT_TEMPLATE AS WELL so a stale anchor goes red on the template side instead of over-constraining the script; (2) every 64-char lowercase-hex sha256 pin extracted from DEFAULT_TEMPLATE must appear in the script (the four litestream/headscale amd64+arm64 checksums; `{{YAH_YUBABA_SHA256}}` is not hex so it is not picked up, and the extractor asserts it found >=4 so a broken extractor cannot make the guard vacuous); (3) every `https://github.com/OWNER/REPO/releases/download/TAG/` prefix in the template must appear in the script — owner/repo/tag pinned, arch-templated asset filename left free. Net effect: bumping litestream or headscale in mirror.yml alone now turns this red.")
+//! @yah:handoff("THREE REDS DEMONSTRATED, not one, because the anchor half fires first and would have masked the other two. (a) Test written BEFORE the script fix: `cargo test -p yah-cloud --lib cloud_init::tests::stand_up_script` = 0 passed / 1 FAILED, naming `no litestream-headscale.service`. (b) With the script level, one hex char mutated in the script's headscale arm64 HS_SHA: FAILED, naming the missing pin 99fa9b29...e9fe. (c) The litestream URL tag moved to v0.3.14 while the template stays v0.3.13: FAILED, naming the unfetched .../download/v0.3.13/. Both mutations were reverted by hand and re-verified. SCRIPT CONTENT ADDED, in the script's own idiom: present-checked non-fatal `$SUDO install -m0644 \"$D/litestream-headscale.service\"` alongside the other three units (verified it really ships in the tarball — publish-yubaba-release.sh:287 stages it from $RESOURCES); an arch-cased litestream 0.3.13 fetch+sha256+`tar -C /usr/local/bin`; an arch-cased headscale 0.23.0 fetch+sha256+`install -m0755` into /var/lib/yah-cloud/headscale/headscale. Every failure path is a stderr WARNING naming the operational consequence, never an exit — a node without these cannot hold the ingress role, which is not a failed stand-up.")
+//! @yah:handoff("DELIBERATE CHOICE WORTH REVIEWING: the two downloads are UNCONDITIONAL, not present-checked-skip. A re-run of this script is the documented upgrade path (W257 §8), and `if [ -x /usr/local/bin/litestream ]; then skip` would recreate exactly the stale-binary trap the script's own `restart`-not-`--now` comment was written for after us-west-013/014. Cost is re-downloading ~10MB litestream + ~51MB headscale on every re-run; both are sha-pinned so the repeat is idempotent, just not free. A version-checked skip was rejected because it would depend on `headscale version` / `litestream version` output formats I did not verify. Rationale is in the script's comments. VERIFIED: `bash -n` clean; both mirror.yml copies UNTOUCHED and still byte-identical at sha256 6bc46731e030bae8a1970bcb06cf3132323eb454ab72496d6ef9b2c6177585af; `cargo test -p yah-cloud --lib` from oss/yubaba = 1167 passed / 0 failed / 4 ignored, exactly +1 over the 1166 baseline and that +1 is the new test. rustfmt --check clean on cloud_init.rs (paths.rs has ONE pre-existing unformatted hunk in `infra_source_cache_dir`, not mine, left alone). NO FLEET CONTACT of any kind — script, test and one paths.rs helper only. Uncommitted: camp git policy is `defer`, so no SHA to cite.")
+//! @yah:next("WHAT GENERATE-FROM-ONE-SOURCE WOULD ACTUALLY TAKE, having rejected it as out of scope here. The contained 20% is the third-party PINS: litestream 0.3.13 + 2 sha256s and headscale 0.23.0 + 2 sha256s now live in five places (both mirror.yml copies, stand-up-yubaba.sh, and for headscale also `cloud::mesh::HEADSCALE_VERSION` and `yubaba::DEFAULT_HEADSCALE_VERSION`, which mirror.yml's own comment admits are kept in lockstep by convention with no dependency edge). Making those Rust constants the one source and rendering them into mirror.yml as `{{ LITESTREAM_BLOCK }}` / `{{ HEADSCALE_BLOCK }}` would collapse five to one, but it requires touching BOTH mirror.yml copies in lockstep and a matching emitter for the script. The remaining 80% — the install STEPS — is not contained: the script's correct divergences (idempotent enable+restart, write-if-absent ceilings, KEK, loopback bind) mean a generator must model divergence, and the script's real destination is the `yah cloud machine bootstrap` command W242 Phase 1 already plans, which would emit both from one Rust model. That is the right home for this, and it is a relay, not a hunk.")
+//! @yah:gotcha("SUPERSEDES the earlier gotcha beginning \"NOT FIXED, and deliberately left as an operator call\" — that entry is now STALE and should be read as history, not state. The litestream 0.3.13 install and the headscale 0.23.0 / litestream-headscale.service pre-stage ARE now in stand-up-yubaba.sh, added on the relay leader's explicit instruction in this follow-on pass. The fleet-topology question that entry deferred has therefore been ANSWERED IN THE AFFIRMATIVE BY DEFAULT: every LAN/appliance node stood up by this script from here on is provisioned as a coordinator candidate (headscale binary staged at /var/lib/yah-cloud/headscale/headscale, replication unit laid down, neither started — leader.rs still decides who runs it). If that is NOT wanted for the us-west-01x class, the lever is an opt-out env guard in the script, not reverting it, because reverting now goes red against `stand_up_script_carries_the_templates_install_steps`. Cost of the affirmative answer is bounded and staging-only: ~61MB fetched per run and two staged-but-inert artifacts.")
+//! @yah:verify("THIRD-TWIN GUARD: `cargo test -p yah-cloud --lib cloud_init::` from oss/yubaba = 31 passed / 0 failed (30 before, +1 = stand_up_script_carries_the_templates_install_steps). Full lib suite = 1167 passed / 0 failed / 4 ignored vs the 1166/0/4 baseline. bash -n .yah/infra/cloud-init/stand-up-yubaba.sh clean. Both mirror.yml copies still sha256 6bc46731e030bae8a1970bcb06cf3132323eb454ab72496d6ef9b2c6177585af — the guard on THEM was not disturbed and is still green.")
+//! @yah:handoff("ACCEPTED BY THE RELAY LEADER (@Ashguard:hydra, session:39386823). Both halves landed in the required order — guard made honest FIRST, then the two mirror.yml copies reconciled — plus a third twin (stand-up-yubaba.sh) closed that the fix itself exposed. Implemented by @Ashguard:polaris (session:9d2e59a3), independently verified by session:67d56cd3, third-twin follow-on by session:039a0f82. The operationally consequential finding is in the verify entries: provisioning reads the CANONICAL on-disk template, and that was the copy which had drifted.")
+//! @yah:verify("COLUMN MOVED VIA `yah board move R870-B25 review` AFTER BOTH `board.review` VERBS REFUSED — recorded because the next agent will hit it too and the error message actively misleads. The MCP verb and `yah board review` both fail with \"ticket 'R870-B25' not found — it may have been archived or may not exist in this camp\", which is false: the CLI's fresh scan saw it fine, anchored at oss/yubaba/crates/cloud/src/reconciler/mod.rs:67. ROOT CAUSE, grounded not guessed: `arch.review_ticket` is a daemon-only gated write with NO in-process fallback — already filed as R606-T3 and stated verbatim at app/yah/cli/src/camp.rs:975, \"Board reads/updates fall back in-process; review/move/etc do not — that asymmetry is the bug\" — and the daemon resolves transition targets from its IN-MEMORY store rather than from disk (crates/yah/camp-service/src/service.rs:4199-4216, which emits that exact string). So \"exists on disk\" and \"the daemon can transition it\" are independent facts. `yah board move` turns out to be on the falls-back side despite that note, which is why it works. Contributing: the daemon is version-skewed and degraded (0.8.36+74874f3e-dirty vs CLI 0.8.37+e896d28a-dirty) and refused read probes with EAGAIN, the signature R606-S2 pinned to the 500ms fast-path RPC floor under load. ALSO CONFIRMED, since it was the other candidate explanation: `oss/yubaba` is NOT a subcamp — only cheers, mesofact, turso-backup and xlb carry `.yah/camp.toml` — so no `--path` is needed and the filing location was never the problem.")
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -94,10 +121,23 @@ pub(crate) mod cf_creds;
 pub mod cloudflare_worker;
 pub mod container;
 pub mod derive_cache_prune;
+pub mod dev_door;
 pub mod domain;
 pub mod headscale;
 pub mod ingress;
 pub mod ingress_verify;
+// R918-F5 — the local-process reconciler is Unix-only *by design*, not by
+// accident of which syscalls it happened to reach for. Its contract is
+// "replace the predecessor": `kill(pid, 0)` liveness plus a SIGTERM-grace-
+// SIGKILL ladder. A build with that ladder removed would still spawn, and
+// would silently double-spawn instead of reaping — exactly the failure that
+// looks inert in a diff and strands processes on a node. So the module is
+// gated whole rather than half-ported. A non-unix `yah` is a client (it talks
+// to a camp and submits builds); it supervises no workloads, so it needs no
+// local-process reconciler. Reversing this means implementing
+// OpenProcess/TerminateProcess here, at the point someone actually wants a
+// Windows fleet node — see .yah/docs/working/W352-windows-and-macos-build-targets.md.
+#[cfg(unix)]
 pub mod local_process;
 pub mod mesofact_bundle;
 pub mod mesofact_static;
@@ -107,6 +147,8 @@ pub mod mesofact_static;
 // would be a second normalizer that can drift.
 pub(crate) mod native_support;
 pub mod pg_driver;
+pub mod s3_driver;
+pub mod smtp_driver;
 pub mod pond;
 pub mod pond_door;
 pub mod pond_publish;
@@ -143,21 +185,27 @@ pub use ingress::{
 };
 pub use ingress_verify::{
     apply_public_path, resolve_upstreams_reporting, verify_collation, BeaconFetch, DialOutcome,
-    EndpointCheck, PublicReadings, RuleResolution, RuleResolutions, RuleVerdict, VerifyFinding,
-    VerifyReport,
+    EndpointCheck, PublicReadings, RuleResolution, RuleResolutions, RuleVerdict,
+    UndeclaredDoorProbe, VerifyFinding, VerifyReport, undeclared_door_probes,
 };
+#[cfg(unix)]
 pub use local_process::LocalProcessReconciler;
 pub use mesofact_bundle::{
     resolve_bundle_machines, BundleSlot, MesofactBundleReconciler, RevalidateSlot,
     SLOT_ROLE as BUNDLE_SLOT_ROLE,
 };
-pub use mesofact_static::{LocalStaticOptions, MesofactStaticReconciler};
+pub use dev_door::{sync_dev_door, up_dev_door, DEFAULT_DEV_DOOR_PORT};
+pub use mesofact_static::MesofactStaticReconciler;
 pub use pond::{PondOptions, PondState};
 pub use pond_door::{
-    door_env, door_state_dir, ensure_pond_cert, ensure_pond_cert_as, is_root, plan_pond_door,
-    pond_hostname, resolve_passway_binary, spawn_pond_door, CertPair, PondDoorPlan,
-    DEFAULT_DOOR_PORT, POND_TLD,
+    door_env, door_state_dir, ensure_pond_cert_as, plan_pond_door, pond_hostname,
+    resolve_passway_binary, spawn_pond_door, CertPair, PondDoorPlan, DEFAULT_DOOR_PORT, POND_TLD,
 };
+// R918-F5 — `is_root` reads an effective uid; `ensure_pond_cert` is the wrapper
+// that folds it in. Both unix-only. `ensure_pond_cert_as` above is the portable
+// half, with the privilege decision injected.
+#[cfg(unix)]
+pub use pond_door::{ensure_pond_cert, is_root};
 pub use pond_publish::{derive_minio_key, publish_to_pond, PondPublishReport};
 pub use r2_publish::{
     publish_to_r2, R2PublishReport, R2PurgeOpts, R2_ACCESS_KEY_ENV, R2_ACCESS_KEY_SLOT,
@@ -357,10 +405,7 @@ impl<'a> ReconcileCtx<'a> {
     /// discriminator.
     ///
     /// Why this and not the strongly-typed [`workload_spec::Workload`]
-    /// parse: the on-disk `schema_version = 1` form predates the
-    /// `SchemaVersion::V1` enum and won't round-trip through the strong
-    /// types until B3 lands (see `crates/yah/cloud/src/config.rs` test
-    /// `web_workload_round_trips`). Reconcilers only need the kind to
+    /// parse: reconcilers only need the kind to
     /// dispatch; per-kind tooling (e.g. `mesofact-dev`'s
     /// `WatchOptions::from_workload`) does its own parsing for the
     /// build/out_dir fields it cares about.
@@ -381,11 +426,11 @@ impl<'a> ReconcileCtx<'a> {
     ///
     /// ```toml
     /// [providers."static:site"]
-    /// kind = "local-static"
+    /// kind = "miniflare-native"
     /// port = 4331
     ///
     /// [providers."static:app"]
-    /// kind = "local-static"
+    /// kind = "miniflare-native"
     /// port = 4332
     /// ```
     ///
@@ -397,6 +442,16 @@ impl<'a> ReconcileCtx<'a> {
             .providers
             .get(qualified.as_str())
             .or_else(|| self.mirror.providers.get(role))
+    }
+
+    /// This environment's `[build.<component id>]` override, if the mirror
+    /// declares one that changes anything (R905).
+    ///
+    /// Keyed by component id rather than by role: a build belongs to the
+    /// project that declares it, and two components sharing a role still build
+    /// with two different commands.
+    pub fn build_override(&self) -> Option<&'a crate::config::MirrorBuildOverride> {
+        self.mirror.build_override(&self.component.id)
     }
 }
 
@@ -781,6 +836,9 @@ pub(crate) fn into_running(
 /// the port came up within `timeout`, `false` otherwise. Useful for
 /// reconcilers that spawn a server and need to know when it's reachable
 /// before reporting success.
+///
+/// R918-F5 — unix-only: its only caller is [`local_process`], gated above.
+#[cfg(unix)]
 pub(crate) async fn wait_for_port(
     addr: std::net::SocketAddr,
     timeout: std::time::Duration,
@@ -876,6 +934,7 @@ mod source_seam_tests {
             schema_version: 1,
             name: "scrabcake".into(),
             domain: "scrabcake.example".into(),
+            health_path: None,
             components: vec![comp],
             db: crate::DbCatalog::default(),
         }
@@ -890,6 +949,7 @@ mod source_seam_tests {
             ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: BTreeMap::new(),
+            build: Default::default(),
         }
     }
 

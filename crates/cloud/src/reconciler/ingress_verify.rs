@@ -135,9 +135,13 @@
 //! @yah:next("RE-RUN THE ACCEPTANCE TEST ONCE R858 CLEARS — it is one command and it is the only thing outstanding on this ticket: `yah cloud ingress verify --path .` must exit 0 with both front doors' rules reporting the mesh dial open AND the public beacon matching the backend's. Until the mesh is reachable that run measures nothing about the fourth claim.")
 //! @yah:notify_on(R858, "The mesh is reachable again — run this ticket's outstanding acceptance test: `yah cloud ingress verify --path .` must exit 0 with BOTH front doors reporting the mesh dial open AND the public beacon digest matching the backend's. It could not be run at landing time because no 100.64.0.0/10 address answered. If it passes, that closes the last open item here; if it fails, read which of the two legs failed before touching the code — the mesh leg is R844-F16's and predates this change.")
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use anyhow::Result;
+
+use crate::config::{IngressProvider, MachineConfig};
+use crate::reconciler::domain::{public_origins, PasswayOrigin};
 use crate::reconciler::ingress::{Collation, IngressPlan, IngressRule};
 use crate::reconciler::service_discovery::ServiceRecordFanout;
 
@@ -804,12 +808,197 @@ where
     VerifyReport { verdicts }
 }
 
+// ── Undeclared front doors (R858-B27) ────────────────────────────────────────
+
+/// A public origin that is **not** a declared passway front door for
+/// `hostname`, and so should not be able to serve it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndeclaredDoorProbe {
+    pub hostname: String,
+    pub origin: PasswayOrigin,
+}
+
+impl UndeclaredDoorProbe {
+    /// The failure line for a probe whose origin answered with HTTP `status`
+    /// over a TLS handshake that verified a certificate for the hostname.
+    pub fn message(&self, status: u16) -> String {
+        format!(
+            "{} ({}) serves {} with a valid certificate (HTTP {status}) but no mirror declares \
+             it a front door for that hostname — DNS, rendered from the declared doors, will \
+             never send it traffic, and no other yah surface can see it. Declare it in the \
+             mirror's `ingress_machines`, or withdraw the enrollment on the box.",
+            self.origin.machine, self.origin.address, self.hostname
+        )
+    }
+}
+
+/// Every `(hostname, public origin)` pair where the origin is **not** a declared
+/// passway front door for the hostname — the pairs that must fail to serve.
+///
+/// ## Why this exists
+///
+/// On 2026-09-12 us-west-001 answered `yah.dev`, `noisetable.com` and
+/// `api.noisetable.com` with valid certificates while every declaration left it
+/// out: R870 had enrolled it as a third origin by hand, the mirror still had it
+/// commented out, and DNS — rendered from the mirror since R859-F1 — agreed with
+/// the mirror. Every probe in the camp dials the public hostname, so it can only
+/// ever sample the origins DNS hands it, and an undeclared door is invisible by
+/// construction: a spare nobody knows they have and an enrollment that outlived
+/// its reason read identically. The demux's route table is also its TLS
+/// allowlist (W267 Decision 2), which makes *who serves what* a security fact,
+/// not a capacity one.
+///
+/// So the caller dials each pair pinned to the origin's public address, and any
+/// pair that completes a verified TLS handshake is an undeclared door.
+///
+/// ## Scope
+///
+/// Only hostnames **this workspace's mirrors** collate, and only passway edges —
+/// a Cloudflare-tunnel hostname is not served off a node's public address, so
+/// probing one would measure nothing. Tenant hostnames enrolled from another
+/// camp (noisetable, scrabcake) are that camp's collation to check.
+///
+/// Candidates are every machine carrying the `public-ip` taint, resolved through
+/// [`public_origins`], so a tainted machine with no public address is the same
+/// hard error it is on the apex render.
+pub fn undeclared_door_probes(
+    collation: &Collation,
+    machines: &[MachineConfig],
+) -> Result<Vec<UndeclaredDoorProbe>> {
+    let names: Vec<String> = machines.iter().map(|m| m.name.clone()).collect();
+    let mut origins = public_origins(&names, machines, &[])?.origins;
+    origins.sort_by(|a, b| a.machine.cmp(&b.machine));
+
+    let mut declared: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for door in &collation.front_doors {
+        if door.provider != IngressProvider::Passway {
+            continue;
+        }
+        for rule in &door.rules {
+            declared
+                .entry(rule.hostname.as_str())
+                .or_default()
+                .insert(door.machine.as_str());
+        }
+    }
+
+    let mut probes = Vec::new();
+    for (hostname, doors) in &declared {
+        for origin in &origins {
+            if !doors.contains(origin.machine.as_str()) {
+                probes.push(UndeclaredDoorProbe {
+                    hostname: hostname.to_string(),
+                    origin: origin.clone(),
+                });
+            }
+        }
+    }
+    Ok(probes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::IngressProvider;
+    use crate::config::ConnectSpec;
     use crate::reconciler::ingress::{collate_front_doors, PlannedEdge};
     use crate::reconciler::service_discovery::{DiscoveredRecord, UnknownReason};
+
+    fn machine(name: &str, address: &str, taints: &[&str]) -> MachineConfig {
+        MachineConfig {
+            name: name.into(),
+            provider: "ovh".into(),
+            location: None,
+            server_type: None,
+            hosts_mirrors: vec![],
+            mesh_tags: vec![],
+            region: None,
+            zone: None,
+            arch: None,
+            bucket: None,
+            vendor: None,
+            nickname: None,
+            legacy_hostkey_fingerprint: None,
+            registration: Default::default(),
+            ssh_keys: vec![],
+            cloudflared: None,
+            hosts_operator_bridge: false,
+            connect: Some(ConnectSpec {
+                address: address.into(),
+                ssh: format!("root@{address}"),
+                identity_file: "~/.ssh/yah".into(),
+                yubaba_port: None,
+                yubaba: None,
+            }),
+            allocatable: None,
+            taints: taints.iter().map(|t| t.to_string()).collect(),
+            sovereign_group: None,
+            sovereign_role: None,
+            ingress_floating_ip: None,
+        }
+    }
+
+    /// The live fleet on 2026-09-14: three public doors and a mesh-only box.
+    fn fleet() -> Vec<MachineConfig> {
+        vec![
+            machine("us-east-001", "51.81.85.145", &["public-ip"]),
+            machine("us-south-001", "45.32.194.254", &["public-ip"]),
+            machine("us-west-001", "15.204.89.240", &["public-ip"]),
+            machine("us-west-011", "100.64.0.11", &[]),
+        ]
+    }
+
+    fn apex(front_doors: &[&str], provider: IngressProvider) -> Collation {
+        let mut p = plan(
+            vec![rule("yah.dev", Some(8080), &["us-east-001"])],
+            front_doors,
+        );
+        p.provider = provider;
+        collate_front_doors(&[PlannedEdge {
+            service: "yah-marketing".into(),
+            env: "prod".into(),
+            plan: p,
+        }])
+        .unwrap()
+    }
+
+    #[test]
+    fn a_public_origin_left_out_of_the_declared_doors_is_probed() {
+        let probes = undeclared_door_probes(
+            &apex(&["us-east-001", "us-south-001"], IngressProvider::Passway),
+            &fleet(),
+        )
+        .unwrap();
+
+        let got: Vec<_> = probes
+            .iter()
+            .map(|p| (p.hostname.as_str(), p.origin.machine.as_str()))
+            .collect();
+        assert_eq!(got, vec![("yah.dev", "us-west-001")]);
+        assert!(probes[0].message(200).contains("15.204.89.240"));
+    }
+
+    #[test]
+    fn declaring_the_door_leaves_nothing_to_probe() {
+        let probes = undeclared_door_probes(
+            &apex(
+                &["us-east-001", "us-south-001", "us-west-001"],
+                IngressProvider::Passway,
+            ),
+            &fleet(),
+        )
+        .unwrap();
+        assert!(probes.is_empty(), "{probes:#?}");
+    }
+
+    #[test]
+    fn a_tunnel_hostname_is_never_probed_against_public_origins() {
+        let probes = undeclared_door_probes(
+            &apex(&["us-east-001"], IngressProvider::CloudflareTunnel),
+            &fleet(),
+        )
+        .unwrap();
+        assert!(probes.is_empty(), "{probes:#?}");
+    }
 
     fn rule(hostname: &str, port: Option<u16>, machines: &[&str]) -> IngressRule {
         IngressRule {
@@ -830,6 +1019,10 @@ mod tests {
             tunnel_id: None,
             edge_provider_id: None,
             image: None,
+            auth: None,
+            via: None,
+            behind_tunnel: false,
+            tunnel_door: None,
         }
     }
 
@@ -880,7 +1073,7 @@ mod tests {
         let report = run(
             vec![(
                 "yah-marketing",
-                "cloud",
+                "prod",
                 plan(
                     vec![rule("yah.dev", Some(8080), &["us-east-001"])],
                     &["us-east-001"],
@@ -909,7 +1102,7 @@ mod tests {
         let report = run(
             vec![(
                 "yah-marketing",
-                "cloud",
+                "prod",
                 plan(
                     vec![rule("yah.dev", Some(4325), &["us-west-001"])],
                     &["us-west-001"],
@@ -948,7 +1141,7 @@ mod tests {
         let report = run(
             vec![(
                 "yah-marketing",
-                "cloud",
+                "prod",
                 plan(vec![pinned_rule], &["us-east-001"]),
             )],
             &fanout,
@@ -978,7 +1171,7 @@ mod tests {
         let report = run(
             vec![(
                 "yah-marketing",
-                "cloud",
+                "prod",
                 plan(
                     vec![rule("yah.dev", Some(8080), &["us-east-001", "us-west-001"])],
                     &["us-east-001"],
@@ -1012,7 +1205,7 @@ mod tests {
         let report = run(
             vec![(
                 "yah-marketing",
-                "cloud",
+                "prod",
                 plan(
                     vec![rule("yah.dev", Some(8080), &["us-east-001", "us-west-001"])],
                     &["us-east-001"],
@@ -1036,7 +1229,7 @@ mod tests {
         let report = run(
             vec![(
                 "yah-marketing",
-                "cloud",
+                "prod",
                 plan(
                     vec![rule("yah.dev", Some(8080), &["us-east-001"])],
                     &["us-east-001"],
@@ -1066,7 +1259,7 @@ mod tests {
         let report = run(
             vec![(
                 "yah-marketing",
-                "cloud",
+                "prod",
                 plan(
                     vec![rule("yah.dev", Some(8080), &["us-east-001"])],
                     &["us-east-001"],
@@ -1092,7 +1285,7 @@ mod tests {
         let report = run(
             vec![(
                 "yah-marketing",
-                "cloud",
+                "prod",
                 plan(vec![rule("yah.dev", None, &["us-east-001"])], &["us-east-001"]),
             )],
             &fanout,
@@ -1129,7 +1322,7 @@ mod tests {
         let report = run(
             vec![(
                 "yah-marketing",
-                "cloud",
+                "prod",
                 plan(vec![pinned_rule], &["us-east-001"]),
             )],
             &fanout,
@@ -1160,7 +1353,7 @@ mod tests {
         let report = run(
             vec![(
                 "yah-marketing",
-                "cloud",
+                "prod",
                 plan(
                     vec![rule("yah.dev", Some(8080), &["us-east-001"])],
                     &["us-east-001", "us-west-001"],
@@ -1195,7 +1388,7 @@ mod tests {
         let report = run(
             vec![(
                 "yah-marketing",
-                "cloud",
+                "prod",
                 plan(
                     vec![
                         rule("a.yah.dev", Some(9999), &["us-east-001"]),
@@ -1239,7 +1432,7 @@ mod tests {
         run(
             vec![(
                 "yah-marketing",
-                "cloud",
+                "prod",
                 plan(
                     vec![rule("yah.dev", Some(8080), &["us-east-001"])],
                     &["us-east-001"],
@@ -1453,7 +1646,7 @@ mod tests {
         let mut report = run(
             vec![(
                 "yah-marketing",
-                "cloud",
+                "prod",
                 plan(
                     vec![rule(
                         "yah.dev",

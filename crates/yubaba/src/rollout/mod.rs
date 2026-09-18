@@ -52,12 +52,11 @@ pub(crate) fn next_rollout_id() -> String {
     format!("rt-{t:x}-{seq:04x}")
 }
 
-pub(crate) fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+// noisetable R118-T11: the definition moved down into `yubaba-consensus`, because the
+// membership-ratchet loop stamps replicated records with it and that loop is
+// consensus, not rollout. Re-exported rather than duplicated so one node cannot
+// hold two answers to "what time is it".
+pub(crate) use yubaba_consensus::now_unix_secs;
 
 // ── Domain types ──────────────────────────────────────────────────────────────
 

@@ -273,7 +273,14 @@ pub async fn publish_to_r2(
         let s = Arc::clone(&store);
         let key_clone = key.clone();
         let cc = cache_control_for(stripped);
-        tokio::task::spawn_blocking(move || s.put_cached(&key_clone, body, cc))
+        tokio::task::spawn_blocking(move || {
+            // A site asset is fetched by a page, never saved by hand — no
+            // download name.
+            s.put_with(&key_clone, body, &yah_object_store::PutOptions {
+                cache_control: Some(cc),
+                download_name: None,
+            })
+        })
             .await
             .context("PUT task panicked")?
             .with_context(|| format!("PUT {key}"))?;
@@ -295,10 +302,13 @@ pub async fn publish_to_r2(
             // cosmetic — but a mutable pointer with no directive is exactly
             // the pattern being removed, and leaving one behind invites the
             // next reader to copy it.
-            s.put_cached(
+            s.put_with(
                 MANIFEST_KEY,
                 manifest_bytes,
-                yah_object_store::CACHE_CONTROL_NO_CACHE,
+                &yah_object_store::PutOptions {
+                    cache_control: Some(yah_object_store::CACHE_CONTROL_NO_CACHE),
+                    download_name: None,
+                },
             )
         })
         .await
@@ -345,7 +355,14 @@ pub async fn publish_to_r2(
         // makes a stale site verify green, which is worse than having no check.
         // Every other object now carries one too — see `cache_control_for`.
         tokio::task::spawn_blocking(move || {
-            s.put_cached(&key, bytes, yah_object_store::CACHE_CONTROL_NO_CACHE)
+            s.put_with(
+                &key,
+                bytes,
+                &yah_object_store::PutOptions {
+                    cache_control: Some(yah_object_store::CACHE_CONTROL_NO_CACHE),
+                    download_name: None,
+                },
+            )
         })
         .await
         .context("beacon PUT task panicked")?

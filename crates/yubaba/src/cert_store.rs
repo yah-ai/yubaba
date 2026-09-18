@@ -1,6 +1,6 @@
 //! Per-domain TLS material in an object store instead of raft (R779 / W267).
 //!
-//! [`crate::acme_issuer`] seals the fleet's wildcard cert under the node KEK and
+//! `crate::acme_issuer` seals the fleet's wildcard cert under the node KEK and
 //! `PutSecret`s it into raft. That is correct for *one* cert: `raft/store.rs:5`
 //! sizes the state machine as "tiny (KB-scale) so we can afford to rewrite the
 //! full file on every mutation", and `persist()` does exactly that —
@@ -96,13 +96,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// noisetable R118-T11: the ONLY `passway-acme` edge left in this module, and it
+// is confined to `acme_directory` below.
+#[cfg(feature = "acme")]
 use acme_engine::AcmeDirectory;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use yah_object_store::{Error as ObjectError, ObjectStore, Precondition};
 
 use crate::raft::SecretRecord;
-use crate::secrets::ClusterSecretStore;
 
 /// Top-level key prefix for every object this module writes.
 pub const CERT_PREFIX: &str = "certs";
@@ -171,6 +173,25 @@ pub enum CertStoreError {
     #[error("cert store: {domain} is already enrolled to {existing} (unenroll it first)")]
     AlreadyEnrolled { domain: String, existing: String },
 
+    /// R910-F2: [`ObjectCertStore::declare_enrollment`] would give `domain` a
+    /// `tls_backend` another enrolled domain already splices to on a machine
+    /// both records serve on. One held socket cannot be two tenants' door, and
+    /// the demux would route both SNIs into whichever passway won the bind.
+    #[error(
+        "cert store: {domain} cannot take {backend} — {holder} is already enrolled to it on a \
+         machine both records serve on"
+    )]
+    BackendTaken {
+        domain: String,
+        backend: String,
+        holder: String,
+    },
+
+    /// R910-F2: a record whose fields contradict each other — see
+    /// [`Enrollment::validate`].
+    #[error("cert store: enrollment for {domain} is invalid: {reason}")]
+    InvalidEnrollment { domain: String, reason: String },
+
     /// A holding-page name that could not survive the trip to a door — see
     /// [`is_safe_holding_name`]. Refused at the API, because the name is
     /// rendered into a map file every door parses and becomes a filename on
@@ -202,7 +223,7 @@ pub enum CertStoreError {
 /// Rejects the shapes that would address an object outside the domain's own
 /// prefix, or collapse two domains into one key.
 fn is_safe_domain(domain: &str) -> bool {
-    !domain.is_empty() && !domain.contains('/') && !domain.contains("..")
+    !domain.is_empty() && domain != "." && !domain.contains('/') && !domain.contains("..")
 }
 
 /// Derive the path segment for an ACME directory URL — its host, lowercased.
@@ -248,13 +269,14 @@ pub fn issuer_prefix(issuer: &str) -> String {
 /// Map a logical cluster-secret name onto its object key, or `None` if the name
 /// is not per-domain TLS material.
 ///
-/// Recognises exactly the two names [`crate::acme_issuer::cert_secret_name`] and
-/// [`crate::acme_issuer::key_secret_name`] produce — `tls/<domain>/cert` and
-/// `tls/<domain>/key`. **Everything else returns `None` on purpose**: this store
-/// is for certs, and a general cluster secret (a registry credential, a mesh
-/// pre-shared key) must never be looked for in an object store just because raft
-/// happened to miss. That would turn a fail-closed `ClusterNotFound` into a
-/// network round-trip whose answer an operator with bucket access controls.
+/// Recognises exactly the two names [`crate::secrets::cert_secret_name`] and
+/// [`crate::secrets::key_secret_name`] produce — `tls/<domain>/cert` and
+/// `tls/<domain>/key`. Everything else returns `None`: this function owns only
+/// the `certs/` layout. R911-F1 reversed the older doctrine that a general
+/// cluster secret must never be sought in the object store — every cluster
+/// secret now lives there, under `secrets/<group>/`, and
+/// [`FleetSecretStore`](crate::fleet_secrets::FleetSecretStore) is the one
+/// mapping that owns both halves (it calls this for `tls/` names).
 ///
 /// A domain containing `/` is rejected for the same reason a path traversal is:
 /// it would let a crafted secret name address an object outside its own domain's
@@ -278,7 +300,7 @@ pub fn object_key(issuer: &str, name: &str) -> Option<String> {
 /// Parsed from the daemon environment by [`CertStoreConfig::parse`] and turned
 /// into a live store by [`CertStoreConfig::connect`]. Kept separate from the
 /// store itself so config parsing stays a pure function over a `key -> value`
-/// lookup — the same shape [`crate::acme_issuer::parse_issuer_config`] uses, and
+/// lookup — the same shape `crate::acme_issuer::parse_issuer_config` uses, and
 /// for the same reason: it is unit-testable without a network or `std::env`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CertStoreConfig {
@@ -318,6 +340,17 @@ pub const DEFAULT_DIRECTORY: &str = "staging";
 /// Every caller that needs an issuer segment goes through this rather than
 /// reading [`DIRECTORY_ENV`] itself, so the default cannot drift between the
 /// node that writes a cert and the node that reads it.
+///
+/// noisetable R118-T11: `acme`-gated, and this is the one place the gate has a
+/// consequence worth stating. The directory URL is what [`issuer_key`] turns
+/// into the store's path segment, so resolving it *without* `passway-acme`
+/// would mean re-stating that crate's directory table here — exactly the
+/// four-way duplication R870-B20 collapsed into this function. A build with no
+/// ACME therefore connects no cert store at all (main.rs), which is the same
+/// state a node with no `YUBABA_CERT_STORE_BUCKET` has always been in: the
+/// reader modules (`cert_materialize`, `tenant_passway`, `demux_routes`) still
+/// compile and simply see `ServerState::cert_store == None`.
+#[cfg(feature = "acme")]
 pub fn acme_directory(get: impl Fn(&str) -> Option<String>) -> AcmeDirectory {
     AcmeDirectory::parse(&get(DIRECTORY_ENV).unwrap_or_else(|| DEFAULT_DIRECTORY.to_string()))
 }
@@ -481,6 +514,53 @@ pub struct Enrollment {
     /// whose *brand* the operator owns; see `passway::holding`.
     #[serde(default)]
     pub holding: Option<String>,
+    /// R910-F2: the machines this record is routed and armed on. **Empty means
+    /// every node** — the free tier's shape, and every record written before
+    /// this field existed.
+    ///
+    /// Non-empty is a door that exists on specific machines only, which a
+    /// loopback `tls_backend` always is: `127.0.0.1:8445` names a socket on one
+    /// box. Without the scope the bucket is fleet-wide — prod and dev share it
+    /// — so every publisher would render that route into its own demux and
+    /// splice the SNI to whatever holds `:8445` locally. The demux publisher
+    /// and the tenant-passway sweep both filter through [`Self::serves_on`].
+    ///
+    /// A node older than this field ignores it and routes the record
+    /// everywhere, so a scoped record must not be written until every
+    /// publisher in the fleet has rolled past it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub machines: Vec<String>,
+    /// R910-F2: issue this domain's certificate by DNS-01 against a zone this
+    /// record names, with the Cloudflare token held as a cluster secret —
+    /// instead of by challenge delegation into the fleet's zone.
+    ///
+    /// The issuer is the yubaba on a machine in [`machines`](Self::machines),
+    /// because the token secret is group-scoped (R911) and only a node in the
+    /// declaring group can open it. The cert is sealed into this store like any
+    /// other tenant pair, so the door stays a cold manual-TLS passway and a
+    /// renewal never depends on that passway being awake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acme: Option<EnrollmentAcme>,
+    /// R910-F2: where this domain's passway discovers its backends. `None` is
+    /// a door with no backend yet (it answers 503).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discover: Option<workload_spec::TenantPasswayDiscovery>,
+}
+
+/// The ACME inputs a self-declared enrollment carries (R910-F2). The directory
+/// is not here: it is the store's issuer segment, so it belongs to the node's
+/// cert-store config and cannot disagree with where the pair is read back.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnrollmentAcme {
+    /// ACME account contact.
+    pub contact_email: String,
+    /// Cloudflare zone id the `_acme-challenge` TXT records are written into.
+    pub zone_id: String,
+    /// Cluster secret holding a `Zone:DNS:Edit` token for that zone. Its access
+    /// rule must admit this domain's passway
+    /// (`crate::tenant_passway::workload_ident`), the identity the issuer
+    /// opens it as.
+    pub token_secret: String,
 }
 
 impl Enrollment {
@@ -491,9 +571,157 @@ impl Enrollment {
             http_backend: None,
             enrolled_at: unix_secs(now),
             holding: None,
+            machines: Vec::new(),
+            acme: None,
+            discover: None,
         }
     }
 
+    /// Whether `node` routes, arms and issues this record (R910-F2).
+    ///
+    /// A scoped record serves only on the machines it names — and on **no**
+    /// node that cannot name itself, because the failure direction of a wrong
+    /// guess is a route into someone else's socket. An unscoped record serves
+    /// only on a node that declared [`EnrollmentScope::Fleet`].
+    pub fn serves_on(&self, node: &ServingNode) -> bool {
+        if self.machines.is_empty() {
+            return node.scope == EnrollmentScope::Fleet;
+        }
+        node.machine
+            .as_deref()
+            .is_some_and(|m| self.machines.iter().any(|n| n == m))
+    }
+
+    /// Refuse a record that could not work as written (R910-F2).
+    ///
+    /// A self-issued record must be scoped: its issuer is a node in
+    /// [`machines`](Self::machines), and an unscoped one has no node that is
+    /// responsible for ordering its cert — every node or none would. A loopback
+    /// `tls_backend` must be scoped too, because on an unscoped record every
+    /// publisher in the fleet would route the SNI into its own local socket.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.acme.is_some() && self.machines.is_empty() {
+            return Err("`acme` needs `machines`: only a named node issues a self-declared \
+                        certificate"
+                .to_string());
+        }
+        if self.tls_backend.ip().is_loopback() && self.machines.is_empty() {
+            return Err(format!(
+                "tls_backend {} is a loopback address, which names a socket on one machine — \
+                 scope the record with `machines`",
+                self.tls_backend
+            ));
+        }
+        if let Some(acme) = &self.acme {
+            for (field, value) in [
+                ("contact_email", &acme.contact_email),
+                ("zone_id", &acme.zone_id),
+                ("token_secret", &acme.token_secret),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(format!("acme.{field} is empty"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every field but `enrolled_at`: two records that differ only in when they
+    /// were written are the same enrollment.
+    fn same_as(&self, other: &Enrollment) -> bool {
+        Enrollment {
+            enrolled_at: 0,
+            ..self.clone()
+        } == Enrollment {
+            enrolled_at: 0,
+            ..other.clone()
+        }
+    }
+
+    /// Whether this record and `other` can both be served on one machine.
+    fn overlaps(&self, other: &Enrollment) -> bool {
+        self.machines.is_empty()
+            || other.machines.is_empty()
+            || self.machines.iter().any(|m| other.machines.contains(m))
+    }
+}
+
+/// Env key choosing whether this node also acts on UNSCOPED enrollments
+/// (R910-F2): `fleet` or `named`, default `named`.
+pub const ENROLLMENT_SCOPE_ENV: &str = "YUBABA_ENROLLMENT_SCOPE";
+
+/// Which enrollments a node's demux publisher, tenant-passway sweep and declared
+/// issuer act on (R910-F2).
+///
+/// The default is `Named`, i.e. fail-closed. prod and dev share one bucket, and
+/// the first private node to arm the tenant-passway sweep under the old
+/// "unscoped serves everywhere" rule picked up every PROD tenant domain and set
+/// about materializing their key pairs onto a dev box (us-west-011,
+/// 2026-09-15). A public front door has to say so.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EnrollmentScope {
+    /// Unscoped records AND records naming this node — a public front door.
+    Fleet,
+    /// Only records naming this node.
+    #[default]
+    Named,
+}
+
+/// The node a scope filter is evaluated for: its machine name plus its
+/// [`EnrollmentScope`]. One value handed to every consumer, so a route, the
+/// passway behind it and the cert it serves cannot be scoped differently.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServingNode {
+    /// This node's machine name (`leader::derive_machine_name`). `None` serves
+    /// no scoped record.
+    pub machine: Option<String>,
+    pub scope: EnrollmentScope,
+}
+
+impl ServingNode {
+    /// Read [`ENROLLMENT_SCOPE_ENV`]; `machine` is supplied by `main`.
+    pub fn from_env(
+        get: impl Fn(&str) -> Option<String>,
+        machine: Option<String>,
+    ) -> Result<Self, String> {
+        let scope = match get(ENROLLMENT_SCOPE_ENV).as_deref().map(str::trim) {
+            None | Some("") | Some("named") => EnrollmentScope::Named,
+            Some("fleet") => EnrollmentScope::Fleet,
+            Some(other) => {
+                return Err(format!(
+                    "{ENROLLMENT_SCOPE_ENV}={other:?}: expected `fleet` (a public front door) \
+                     or `named`"
+                ))
+            }
+        };
+        Ok(Self { machine, scope })
+    }
+}
+
+/// The subset of `enrolled` that `node` acts on (R910-F2). The one filter the
+/// demux publisher, the tenant-passway sweep and the declared issuer apply.
+pub fn serving_on(
+    enrolled: Vec<(String, Enrollment)>,
+    node: &ServingNode,
+) -> Vec<(String, Enrollment)> {
+    enrolled
+        .into_iter()
+        .filter(|(_, e)| e.serves_on(node))
+        .collect()
+}
+
+/// What [`ObjectCertStore::declare_enrollment`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Declared {
+    /// No record existed; one was written.
+    Created,
+    /// An identical record (timestamp aside) was already in place.
+    Unchanged,
+    /// A different record was replaced; this was the previous one.
+    Replaced(Enrollment),
+}
+
+impl Enrollment {
     /// The same, also routing port 80 to `http_backend`.
     pub fn with_http_backend(mut self, http_backend: SocketAddr) -> Self {
         self.http_backend = Some(http_backend);
@@ -732,10 +960,10 @@ impl ObjectCertStore {
     /// Read and deserialise the [`SecretRecord`] at `name`, or `None` if the
     /// name is not TLS material or no object exists.
     ///
-    /// Separate from the [`ClusterSecretStore`] impl because that trait's
-    /// `Option` return cannot distinguish "absent" from "the bucket is
-    /// unreachable" — a caller that needs to tell those apart (the issuer
-    /// deciding whether to order) calls this and reads the error.
+    /// The issuer-side read (deciding whether to order). Nodes resolving a
+    /// cluster secret read through
+    /// [`FleetSecretStore`](crate::fleet_secrets::FleetSecretStore), which maps
+    /// `tls/` names onto these same keys.
     pub fn read_secret(&self, name: &str) -> Result<Option<SecretRecord>, CertStoreError> {
         let Some(key) = object_key(&self.issuer, name) else {
             return Ok(None);
@@ -771,7 +999,7 @@ impl ObjectCertStore {
     /// Write a freshly-issued sealed pair.
     ///
     /// **Key first, cert last** — the same ordering, for the same reason, as
-    /// [`crate::acme_issuer`]'s raft writes: renewal-due is gated off the *cert*
+    /// `crate::acme_issuer`'s raft writes: renewal-due is gated off the *cert*
     /// record's `updated_at`, so writing the gate record last means a partial
     /// failure leaves the cert stale and the next tick re-issues and heals. The
     /// reverse order can wedge the store with a fresh cert against a stale key,
@@ -1009,10 +1237,7 @@ impl ObjectCertStore {
             // would make `enroll --holding` silently do nothing on a domain that
             // is already registered. Changing the page is
             // [`Self::set_holding`], which does not touch routing.
-            if existing.tls_backend == enrollment.tls_backend
-                && existing.http_backend == enrollment.http_backend
-                && existing.holding == enrollment.holding
-            {
+            if existing.same_as(enrollment) {
                 return Ok(()); // same enrollment, different timestamp — a no-op
             }
             return Err(CertStoreError::AlreadyEnrolled {
@@ -1056,6 +1281,58 @@ impl ObjectCertStore {
         let key = Self::enrolled_key(domain)?;
         self.objects.delete(&key)?;
         Ok(())
+    }
+
+    /// Make `domain`'s record exactly `enrollment` — the declarative write
+    /// `yah cloud apply` reconciles a mirror through (R910-F2).
+    ///
+    /// Where [`Self::enroll`] refuses a differing record (an operator typing a
+    /// command must not re-point a live domain by accident), this replaces it
+    /// and says so: the mirror *is* the declaration, and a changed port or
+    /// machine list is the edit landing, not a collision. The caller reports
+    /// [`Declared::Replaced`] so the change is never silent.
+    ///
+    /// What it still refuses is a `tls_backend` another domain splices to on a
+    /// machine both records serve on ([`CertStoreError::BackendTaken`]). That
+    /// check lists the whole set, which is why it lives on this verb and not on
+    /// `enroll`: the free tier enrolls one domain at a time into a 10k set with
+    /// no declared ports to collide.
+    pub fn declare_enrollment(
+        &self,
+        domain: &str,
+        enrollment: &Enrollment,
+    ) -> Result<Declared, CertStoreError> {
+        let key = Self::enrolled_key(domain)?;
+        enrollment
+            .validate()
+            .map_err(|reason| CertStoreError::InvalidEnrollment {
+                domain: domain.to_string(),
+                reason,
+            })?;
+        let existing = self.enrollment(domain)?;
+        if let Some(existing) = &existing {
+            if existing.same_as(enrollment) {
+                return Ok(Declared::Unchanged);
+            }
+        }
+        if let Some((holder, _)) = self.enrolled()?.into_iter().find(|(d, e)| {
+            d != domain && e.tls_backend == enrollment.tls_backend && e.overlaps(enrollment)
+        }) {
+            return Err(CertStoreError::BackendTaken {
+                domain: domain.to_string(),
+                backend: enrollment.tls_backend.to_string(),
+                holder,
+            });
+        }
+        let body = serde_json::to_vec(enrollment).map_err(|source| CertStoreError::Malformed {
+            key: key.clone(),
+            source,
+        })?;
+        self.objects.put(&key, body)?;
+        Ok(match existing {
+            None => Declared::Created,
+            Some(previous) => Declared::Replaced(previous),
+        })
     }
 
     /// The whole enrollment set, sorted by domain.
@@ -1199,75 +1476,6 @@ impl ObjectCertStore {
     }
 }
 
-/// Reading a cert record fails **closed but quiet**: the resolver's trait can
-/// only say present-or-absent, so a backend error is logged here and reported as
-/// absent, which the resolver turns into a fail-closed `ClusterNotFound`. The
-/// log line is what tells an operator "the bucket is down" apart from "no cert
-/// for that domain" — do not remove it in favour of the silent `Option`.
-impl ClusterSecretStore for ObjectCertStore {
-    fn get_secret(&self, name: &str) -> Option<SecretRecord> {
-        match self.read_secret(name) {
-            Ok(rec) => rec,
-            Err(e) => {
-                tracing::warn!(
-                    secret = %name,
-                    issuer = %self.issuer,
-                    error = %e,
-                    "object cert store read failed; treating as absent (fail-closed)"
-                );
-                None
-            }
-        }
-    }
-}
-
-/// Read cluster secrets from `primary`, falling back to `fallback` on a miss.
-///
-/// Production shape is `LayeredSecretStore::new(state_machine, object_cert_store)`:
-/// raft answers everything it has — including the fleet-wide wildcard cert, which
-/// is one KB-scale record and exactly what raft was sized for — and per-domain
-/// TLS material, which raft deliberately never holds, comes from the object
-/// store. The order matters: raft is local and synchronous, so the common case
-/// costs no network at all, and a domain migrated *into* raft (an operator
-/// pinning one cert) shadows the object store rather than racing it.
-pub struct LayeredSecretStore<P, F> {
-    primary: P,
-    fallback: F,
-}
-
-impl<P, F> LayeredSecretStore<P, F> {
-    pub fn new(primary: P, fallback: F) -> Self {
-        Self { primary, fallback }
-    }
-}
-
-impl<P: ClusterSecretStore, F: ClusterSecretStore> ClusterSecretStore for LayeredSecretStore<P, F> {
-    fn get_secret(&self, name: &str) -> Option<SecretRecord> {
-        self.primary
-            .get_secret(name)
-            .or_else(|| self.fallback.get_secret(name))
-    }
-}
-
-impl<S: ClusterSecretStore + ?Sized> ClusterSecretStore for Arc<S> {
-    fn get_secret(&self, name: &str) -> Option<SecretRecord> {
-        (**self).get_secret(name)
-    }
-}
-
-/// An absent store is a store that holds nothing.
-///
-/// This is what lets the production call site layer unconditionally —
-/// `LayeredSecretStore::new(state_machine, state.cert_store.clone())` — instead
-/// of branching on `Option` and building two differently-typed resolvers. An
-/// unconfigured node then takes exactly the pre-R779 path, one `Option::is_none`
-/// short of it.
-impl<S: ClusterSecretStore> ClusterSecretStore for Option<S> {
-    fn get_secret(&self, name: &str) -> Option<SecretRecord> {
-        self.as_ref().and_then(|s| s.get_secret(name))
-    }
-}
-
 fn unix_secs(t: SystemTime) -> u64 {
     t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -1275,7 +1483,7 @@ fn unix_secs(t: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acme_issuer::{cert_secret_name, key_secret_name};
+    use crate::secrets::{cert_secret_name, key_secret_name};
     use std::sync::Mutex;
     use workload_spec::secrets::SecretAccess;
     use yah_object_store::InMemoryObjectStore;
@@ -1354,9 +1562,7 @@ mod tests {
         let name = cert_secret_name("a.example.com");
         let original = rec(b"sealed-chain");
         certs.write_secret(&name, &original).unwrap();
-        assert_eq!(certs.read_secret(&name).unwrap(), Some(original.clone()));
-        // And through the resolver's trait, which is how it is actually read.
-        assert_eq!(certs.get_secret(&name), Some(original));
+        assert_eq!(certs.read_secret(&name).unwrap(), Some(original));
     }
 
     #[test]
@@ -1498,6 +1704,11 @@ mod tests {
 
     /// R870-B20: one owner for the issuer segment. A door reading a different
     /// default from the issuer that wrote the cert would address an empty prefix.
+    ///
+    /// noisetable R118-T11: gated with the function it covers. This is a test
+    /// that legitimately does not exist in a `--no-default-features` build, and
+    /// it is the only one in this module that moves.
+    #[cfg(feature = "acme")]
     #[test]
     fn the_acme_directory_defaults_to_staging_and_is_overridable() {
         assert_eq!(acme_directory(|_: &str| None), AcmeDirectory::Staging);
@@ -1603,52 +1814,6 @@ mod tests {
         assert!(c.is_expired(2_600));
     }
 
-    struct FakeRaft(Vec<(String, SecretRecord)>);
-    impl ClusterSecretStore for FakeRaft {
-        fn get_secret(&self, name: &str) -> Option<SecretRecord> {
-            self.0.iter().find(|(n, _)| n == name).map(|(_, r)| r.clone())
-        }
-    }
-
-    #[test]
-    fn layered_prefers_raft_and_falls_back_to_the_object_store() {
-        let (_mem, certs) = store();
-        certs
-            .write_secret(&cert_secret_name("tenant.example.com"), &rec(b"from-r2"))
-            .unwrap();
-        let raft = FakeRaft(vec![(
-            cert_secret_name("yah.dev"),
-            rec(b"from-raft"),
-        )]);
-        let layered = LayeredSecretStore::new(raft, certs);
-
-        // The fleet wildcard still comes from raft, unchanged.
-        assert_eq!(
-            layered.get_secret(&cert_secret_name("yah.dev")).unwrap().ciphertext,
-            b"from-raft".to_vec()
-        );
-        // A per-domain cert raft never held comes from the object store.
-        assert_eq!(
-            layered
-                .get_secret(&cert_secret_name("tenant.example.com"))
-                .unwrap()
-                .ciphertext,
-            b"from-r2".to_vec()
-        );
-        // A miss in both stays a miss — the resolver turns it into a
-        // fail-closed ClusterNotFound.
-        assert_eq!(layered.get_secret(&cert_secret_name("nope.example.com")), None);
-    }
-
-    #[test]
-    fn raft_shadows_the_object_store_for_the_same_name() {
-        let (_mem, certs) = store();
-        let name = cert_secret_name("pinned.example.com");
-        certs.write_secret(&name, &rec(b"from-r2")).unwrap();
-        let layered = LayeredSecretStore::new(FakeRaft(vec![(name.clone(), rec(b"pinned"))]), certs);
-        assert_eq!(layered.get_secret(&name).unwrap().ciphertext, b"pinned".to_vec());
-    }
-
     // ── Enrollment ───────────────────────────────────────────────────────────
 
     fn backend(port: u16) -> SocketAddr {
@@ -1705,6 +1870,129 @@ mod tests {
             backend(8443),
             "a refused enroll must not have overwritten the live backend"
         );
+    }
+
+    fn scoped(port: u16, machines: &[&str]) -> Enrollment {
+        let mut e = enrollment(port);
+        e.machines = machines.iter().map(|m| m.to_string()).collect();
+        e
+    }
+
+    #[test]
+    fn declaring_creates_then_ignores_a_new_stamp_then_replaces_and_returns_the_old_record() {
+        let (_mem, certs) = store();
+        let first = scoped(8445, &["us-west-011"]);
+        assert_eq!(
+            certs.declare_enrollment("staging.example.com", &first).unwrap(),
+            Declared::Created
+        );
+        let mut restamped = first.clone();
+        restamped.enrolled_at += 60;
+        assert_eq!(
+            certs.declare_enrollment("staging.example.com", &restamped).unwrap(),
+            Declared::Unchanged
+        );
+        let moved = scoped(8446, &["us-west-011"]);
+        assert_eq!(
+            certs.declare_enrollment("staging.example.com", &moved).unwrap(),
+            Declared::Replaced(first)
+        );
+        assert_eq!(certs.enrollment("staging.example.com").unwrap(), Some(moved));
+    }
+
+    #[test]
+    fn declaring_a_backend_another_domain_splices_to_on_a_shared_machine_is_refused() {
+        let (_mem, certs) = store();
+        certs
+            .declare_enrollment("a.example.com", &scoped(8445, &["us-west-011"]))
+            .unwrap();
+        let err = certs
+            .declare_enrollment("b.example.com", &scoped(8445, &["us-west-011", "us-west-013"]))
+            .unwrap_err();
+        assert!(
+            matches!(&err, CertStoreError::BackendTaken { holder, .. } if holder == "a.example.com"),
+            "got {err:?}"
+        );
+        // The same port on a machine the other record does not serve on is a
+        // different socket.
+        assert_eq!(
+            certs
+                .declare_enrollment("b.example.com", &scoped(8445, &["us-west-013"]))
+                .unwrap(),
+            Declared::Created
+        );
+    }
+
+    #[test]
+    fn a_loopback_or_self_issued_record_must_name_its_machines() {
+        let (_mem, certs) = store();
+        let err = certs
+            .declare_enrollment("a.example.com", &enrollment(8445))
+            .unwrap_err();
+        assert!(matches!(err, CertStoreError::InvalidEnrollment { .. }), "got {err:?}");
+
+        let mut acme = scoped(8445, &["us-west-011"]);
+        acme.acme = Some(EnrollmentAcme {
+            contact_email: "ops@example.com".into(),
+            zone_id: " ".into(),
+            token_secret: "example/cf-dns".into(),
+        });
+        let err = certs.declare_enrollment("a.example.com", &acme).unwrap_err();
+        assert!(
+            matches!(&err, CertStoreError::InvalidEnrollment { reason, .. } if reason.contains("zone_id")),
+            "got {err:?}"
+        );
+        assert!(certs.enrolled().unwrap().is_empty(), "a refused declaration wrote nothing");
+    }
+
+    #[test]
+    fn a_scoped_record_serves_only_on_its_machines_and_never_on_a_nameless_node() {
+        let node = |machine: Option<&str>, scope| ServingNode {
+            machine: machine.map(str::to_string),
+            scope,
+        };
+        let e = scoped(8445, &["us-west-011"]);
+        for scope in [EnrollmentScope::Fleet, EnrollmentScope::Named] {
+            assert!(e.serves_on(&node(Some("us-west-011"), scope)));
+            assert!(!e.serves_on(&node(Some("us-south-001"), scope)));
+            assert!(!e.serves_on(&node(None, scope)));
+        }
+    }
+
+    #[test]
+    fn an_unscoped_record_serves_only_on_a_node_that_declared_fleet_scope() {
+        let unscoped = enrollment(8443);
+        let west = |scope| ServingNode {
+            machine: Some("us-west-011".into()),
+            scope,
+        };
+        assert!(unscoped.serves_on(&west(EnrollmentScope::Fleet)));
+        assert!(
+            !unscoped.serves_on(&west(EnrollmentScope::Named)),
+            "a private node must not pick up the fleet's tenant domains"
+        );
+        assert_eq!(ServingNode::default().scope, EnrollmentScope::Named, "fail-closed default");
+    }
+
+    #[test]
+    fn enrollment_scope_parses_fleet_and_named_and_refuses_anything_else() {
+        let parse = |v: Option<&str>| {
+            ServingNode::from_env(
+                |k| (k == ENROLLMENT_SCOPE_ENV).then(|| v.map(str::to_string)).flatten(),
+                None,
+            )
+        };
+        assert_eq!(parse(None).unwrap().scope, EnrollmentScope::Named);
+        assert_eq!(parse(Some("named")).unwrap().scope, EnrollmentScope::Named);
+        assert_eq!(parse(Some(" fleet ")).unwrap().scope, EnrollmentScope::Fleet);
+        assert!(parse(Some("everywhere")).is_err());
+    }
+
+    #[test]
+    fn a_record_written_before_the_scope_existed_still_loads_unscoped() {
+        let old = br#"{"tls_backend":"127.0.0.1:8443","http_backend":null,"enrolled_at":1,"holding":null}"#;
+        let e: Enrollment = serde_json::from_slice(old).unwrap();
+        assert!(e.machines.is_empty() && e.acme.is_none() && e.discover.is_none());
     }
 
     #[test]

@@ -331,7 +331,7 @@ use super::{into_running, slot_field_u16, LogBuffer, ReconcileCtx, RunningWorklo
 use crate::config::Provider;
 use crate::local_container_spec_from_provider;
 use crate::MirrorProviderSlot;
-use local_driver::pond_minio::{ensure_minio_running, MinioRunning, MinioSpec};
+use local_driver::pond_minio::{ensure_minio_running, MinioSpec};
 use local_driver::{canonical_label, canonical_name, LocalContainerSpec, LocalRuntime};
 // R408-T2: docker socket mount + permission model for the pond yubaba-container
 // is encoded as a builder in `local_driver::pond_warden`. The future
@@ -412,6 +412,17 @@ impl Default for PondOptions {
     }
 }
 
+/// The two JS files the miniflare door needs on disk, wherever a tier keeps
+/// its state (R584-F4). Split out of [`PondState`] so the dev tier can reuse
+/// [`spawn_miniflare_child`] without also inheriting pond's MinIO data dir.
+#[derive(Debug, Clone)]
+pub(super) struct DoorScripts {
+    /// Worker JS file written from the compile-time embedded bundle.
+    pub worker_js: PathBuf,
+    /// miniflare shim written from the compile-time embedded script.
+    pub miniflare_shim: PathBuf,
+}
+
 /// Per-bring-up state on disk.
 #[derive(Debug, Clone)]
 pub struct PondState {
@@ -437,6 +448,13 @@ impl PondState {
             minio_data: dir.join("minio-data"),
             credentials: dir.join("credentials"),
             dir,
+        }
+    }
+
+    fn scripts(&self) -> DoorScripts {
+        DoorScripts {
+            worker_js: self.worker_js.clone(),
+            miniflare_shim: self.miniflare_shim.clone(),
         }
     }
 }
@@ -601,20 +619,17 @@ pub async fn up_pond(
         );
     }
 
-    let (worker_mode_str, ssr_origin, ssr_prefixes) = worker_mode_triple(
-        &super::mesofact_static::parse_worker_mode(&ctx.component.kind, static_fields),
-    );
+    let worker_mode =
+        super::mesofact_static::parse_worker_mode(&ctx.component.kind, static_fields);
 
     let (child, log_buf) = spawn_miniflare_child(
         ctx,
         options,
         sim_port,
-        &state,
-        &minio_running,
+        &state.scripts(),
+        &format!("{}/{}", minio_running.endpoint, minio_running.bucket),
         worker_script,
-        &worker_mode_str,
-        &ssr_origin,
-        &ssr_prefixes,
+        &worker_mode,
     )
     .await
     .map_err(|e| {
@@ -830,10 +845,53 @@ fn prepare_state_dir(ctx: &ReconcileCtx<'_>, state: &PondState) -> Result<()> {
     Ok(())
 }
 
+/// The `ROUTE_TABLE` binding for a miniflare door configured by the
+/// [`worker_mode_triple`] shape rather than by a [`WorkerMode`]
+/// (super::mesofact_static::WorkerMode).
+///
+/// Camp's `build_miniflare_deploy_spec` lowers a mirror's slot fields to that
+/// triple and then MUTATES it — the SSR-runtime container overrides the origin,
+/// and the published manifest overrides the prefixes — so the table can only be
+/// composed after those mutations, from the triple that survived them. It is
+/// the same producer underneath ([`super::mesofact_static::worker_route_table_json`]);
+/// this is the lowering back to the typed mode, in the one place that needs it.
+///
+/// `/uploads/*` points at the asset origin at this tier, as the pond
+/// `UPLOAD_ORIGIN` binding did before R898-F3: upload keys resolve in-bucket
+/// once a writer exists.
+pub fn miniflare_route_table(
+    worker_mode: &str,
+    ssr_origin: &str,
+    ssr_prefixes: &[String],
+    asset_origin: &str,
+) -> Result<String> {
+    let mode = if worker_mode == "ssr" {
+        super::mesofact_static::WorkerMode::Ssr {
+            origin_url: ssr_origin.to_string(),
+            prefixes: ssr_prefixes.to_vec(),
+        }
+    } else if worker_mode == "spa" {
+        super::mesofact_static::WorkerMode::Spa
+    } else {
+        super::mesofact_static::WorkerMode::Static
+    };
+    super::mesofact_static::worker_route_table_json(
+        &mode,
+        crate::route_table::WorkerAssets::Deployed(asset_origin),
+        asset_origin,
+        &super::mesofact_static::BackendOrigins::default(),
+        None,
+    )
+}
+
 /// Lower a [`super::mesofact_static::WorkerMode`] to the three Worker
 /// binding strings (`WORKER_MODE`, `SSR_ORIGIN`, `SSR_PREFIXES` as a Vec for
 /// later JSON-encoding). Used by both the cloud-direct pond path and the
 /// yubaba-side miniflare spec builder.
+///
+/// R898-F3: the last two are no longer Worker bindings — the door walks
+/// `ROUTE_TABLE` — but they are still the shape camp's `MiniflareSpec` carries
+/// over the wire, and [`miniflare_route_table`] is what turns them into one.
 pub fn worker_mode_triple(
     mode: &super::mesofact_static::WorkerMode,
 ) -> (String, String, Vec<String>) {
@@ -850,16 +908,20 @@ pub fn worker_mode_triple(
 /// Write the worker JS + miniflare shim to the state dir, spawn the JS
 /// runtime, then wait for the `[miniflare-sim] ready` stdout line. Returns
 /// the live child + log buffer for the caller's supervisor.
-async fn spawn_miniflare_child(
+/// Spawn the miniflare door in front of an already-reachable object store.
+///
+/// Tier-agnostic on purpose (R584-F4): the door is the same compiled Worker
+/// bundle at dev, pond and cloud, so the only thing a caller varies is
+/// `asset_origin` — `<endpoint>/<bucket>` of whatever implements the `s3`
+/// capability at that tier.
+pub(super) async fn spawn_miniflare_child(
     ctx: &ReconcileCtx<'_>,
     options: &PondOptions,
     sim_port: u16,
-    state: &PondState,
-    minio_running: &MinioRunning,
+    state: &DoorScripts,
+    asset_origin: &str,
     worker_script: &str,
-    worker_mode: &str,
-    ssr_origin: &str,
-    ssr_prefixes: &[String],
+    mode: &super::mesofact_static::WorkerMode,
 ) -> Result<(tokio::process::Child, LogBuffer)> {
     // Fail fast (and self-heal our own orphans) on a squatted port — otherwise
     // a bind conflict hides behind a 30s "did not emit ready signal" timeout.
@@ -870,10 +932,10 @@ async fn spawn_miniflare_child(
     std::fs::write(&state.miniflare_shim, MINIFLARE_SIM_SCRIPT.as_bytes())
         .with_context(|| format!("writing {}", state.miniflare_shim.display()))?;
 
-    // ASSET_ORIGIN points miniflare at MinIO's HTTP endpoint — the Worker
-    // fetches assets over plain HTTP, mirroring the prod path (R2 custom
-    // domain).
-    let asset_origin = format!("{}/{}", minio_running.endpoint, minio_running.bucket);
+    // ASSET_ORIGIN points miniflare at the bound object store's HTTP endpoint
+    // — the Worker fetches assets over plain HTTP, mirroring the prod path (R2
+    // custom domain). Which store that is depends on the tier and is the
+    // caller's business: MinIO at pond, the `yah-s3-fs` driver at dev.
     let node_binary = resolve_js_binary(options.js_binary.as_deref());
     let miniflare_import =
         resolve_miniflare_import(ctx.workspace_root).unwrap_or_else(|| "miniflare".to_string());
@@ -881,14 +943,26 @@ async fn spawn_miniflare_child(
 
     info!(
         port = sim_port,
-        asset_origin = %asset_origin,
+        asset_origin,
         node_binary = %node_binary.display(),
         workerd_cached = workerd_binary.is_some(),
         "spawning miniflare (workerd)",
     );
 
-    let ssr_prefixes_json =
-        serde_json::to_string(ssr_prefixes).unwrap_or_else(|_| "[]".to_string());
+    // R898-F3: the door walks ONE table instead of four hardcoded prefixes.
+    // Pond points the `/uploads/*` entry at the same MinIO bucket as
+    // ASSET_ORIGIN, so upload keys resolve in-bucket once a writer exists —
+    // the reserved seam (R490-T8) is now an entry rather than a binding.
+    // `None` domain: the local tier has never carried the manifest's per-route
+    // response headers, and this change is not the place to start.
+    let route_table = super::mesofact_static::worker_route_table_json(
+        mode,
+        crate::route_table::WorkerAssets::Deployed(asset_origin),
+        asset_origin,
+        &super::mesofact_static::BackendOrigins::default(),
+        None,
+    )?;
+    let (worker_mode, _, _) = worker_mode_triple(mode);
     // `PORT` / `PORT_HTTP`, not the retired `MF_PORT` (R844-T13): the sim serves
     // the same Worker bundle a fleet node serves, so it must not be the one tier
     // that spells "what port did I get" its own way. `MF_SCRIPT` and the other
@@ -899,15 +973,9 @@ async fn spawn_miniflare_child(
         .envs(&port_env)
         .env("MF_SCRIPT", &state.worker_js)
         .env("MF_MINIFLARE_IMPORT", &miniflare_import)
-        .env("ASSET_ORIGIN", &asset_origin)
-        // Reserved upload seam (R490-T8): pond points UPLOAD_ORIGIN at the same
-        // MinIO bucket as ASSET_ORIGIN, so /uploads/* keys resolve in-bucket
-        // once a writer exists. No upload writer today — the binding just wires
-        // the seam so the dev path mirrors the prefix split.
-        .env("UPLOAD_ORIGIN", &asset_origin)
-        .env("WORKER_MODE", worker_mode)
-        .env("SSR_ORIGIN", ssr_origin)
-        .env("SSR_PREFIXES", &ssr_prefixes_json)
+        .env("ASSET_ORIGIN", asset_origin)
+        .env("WORKER_MODE", &worker_mode)
+        .env("ROUTE_TABLE", &route_table)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -1075,7 +1143,7 @@ fn supervise_miniflare_and_minio(
 /// Shared miniflare child supervision shape. SIGTERM lets the miniflare
 /// shim call `mf.dispose()` (which kills the workerd subprocess cleanly);
 /// falls back to SIGKILL after 5 s.
-async fn run_miniflare_supervisor(
+pub(super) async fn run_miniflare_supervisor(
     mut miniflare: tokio::process::Child,
     shutdown_rx: oneshot::Receiver<()>,
 ) {
@@ -1279,7 +1347,7 @@ fn signal_pid(pid: i32, sig: &str) {
 /// host-side sim orphan on that exact port and retries; if a foreign holder (a
 /// running container, an unrelated process) remains, bails with a crisp,
 /// actionable error rather than a silent 30s `ERR_RUNTIME_FAILURE`.
-async fn ensure_sim_port_free(sim_port: u16) -> Result<()> {
+pub(super) async fn ensure_sim_port_free(sim_port: u16) -> Result<()> {
     if !port_has_listener("127.0.0.1", sim_port) {
         return Ok(());
     }
@@ -1720,6 +1788,7 @@ mod tests {
             schema_version: 1,
             name: "dev-yah".into(),
             domain: "yah.dev".into(),
+            health_path: None,
             components: vec![],
             db: crate::DbCatalog::default(),
         };
@@ -1742,6 +1811,7 @@ mod tests {
             ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: Default::default(),
+            build: Default::default(),
         };
         let ctx = ReconcileCtx {
             workspace_root: tmp.path(),
@@ -1792,6 +1862,7 @@ mod tests {
             schema_version: 1,
             name: "test-svc".into(),
             domain: "test.dev".into(),
+            health_path: None,
             components: vec![],
             db: crate::DbCatalog::default(),
         };
@@ -1814,6 +1885,7 @@ mod tests {
             ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: Default::default(),
+            build: Default::default(),
         };
         let ctx = ReconcileCtx {
             workspace_root: tmp.path(),
@@ -1876,6 +1948,7 @@ mod tests {
             schema_version: 1,
             name: "test-svc".into(),
             domain: "test.dev".into(),
+            health_path: None,
             components: vec![],
             db: crate::DbCatalog::default(),
         };
@@ -1898,6 +1971,7 @@ mod tests {
             ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: Default::default(),
+            build: Default::default(),
         };
         let ctx = ReconcileCtx {
             workspace_root: tmp.path(),
@@ -1958,6 +2032,7 @@ mod tests {
             schema_version: 1,
             name: "test-svc".into(),
             domain: "test.dev".into(),
+            health_path: None,
             components: vec![],
             db: crate::DbCatalog::default(),
         };
@@ -1980,6 +2055,7 @@ mod tests {
             ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: Default::default(),
+            build: Default::default(),
         };
         let ctx = ReconcileCtx {
             workspace_root: tmp.path(),
@@ -2034,6 +2110,7 @@ mod tests {
             schema_version: 1,
             name: "test-svc".into(),
             domain: "test.dev".into(),
+            health_path: None,
             components: vec![],
             db: crate::DbCatalog::default(),
         };
@@ -2056,6 +2133,7 @@ mod tests {
             ingress_machines: Vec::new(),
             drivers: Default::default(),
             asset_aliases: Default::default(),
+            build: Default::default(),
         };
         let ctx = ReconcileCtx {
             workspace_root: tmp.path(),

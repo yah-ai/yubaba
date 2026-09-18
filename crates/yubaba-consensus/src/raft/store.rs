@@ -99,6 +99,33 @@
 //! @yah:handoff("DISCOVERED WHILE OPERATING THE FLEET, all three fixed in this pass — each is a doc that would have misled the next operator, and each was measured rather than inferred. (1) `.yah/infra/machines/us-west-001.toml` claimed in TWO separate comments that that box carries headscale. It does not: the unit reads disabled/inactive with no process there, while us-south-001 runs `headscale serve`. That is operationally load-bearing, because the fleet skill says to avoid a live leader step-down on the headscale host — a wrong name protects the wrong machine. Corrected, dated, and told the reader to re-derive with `pgrep -af headscale`. It also contradicts R858's own gotcha, which is annotation text on another ticket and was left alone; a note was filed on R858 instead. (2) `.yah/docs/guides/yubaba-total-loss-recovery.md` gained the preconditions that only exist now that prod is armed — above all that `prod` is the value a recovering operator MUST pass, because every `yubaba state` subcommand needs it and the machine being rebuilt is not in a cluster yet, so nothing on it can supply the name. A recovery blocked on not knowing the cluster name would be the worst possible failure of that document. (3) fleet.md — see the next entry, it is the significant one.")
 //! @yah:handoff("THE FLEET SKILL FORBADE THE MECHANISM THIS CAMP NOW USES, and that is the second time R869 has found this exact defect class in fleet.md (P4 found its raft flag-day section documenting a bare wipe). Its closing paragraph said \"Never hand-build a fleet binary… the answer is to cut a release, not to `scp` a binary — a hand-cut pair is invisible to every version check the fleet has (R746-T3)\". That predates scripts/hotship.sh, and the paragraph's stated objection is precisely what hotship SOLVES: hotship stamps a version via scripts/hotship-version.sh (`0.8.36-h16`, a prerelease of the next patch, ordering strictly after the last release and before the next), so a hot-shipped node is exactly NOT invisible to version checks — confirmed against the live fleet, which reports those stamps on all three voters. I nearly concluded hotship was forbidden BECAUSE of that paragraph, which is the evidence that it misled. Rewritten to keep its real teeth (never hand-install an UNSTAMPED binary; a RELEASE is what anything anyone else depends on must ride) while sanctioning hotship for putting an ITERATION on hardware, never writing the CDN, one node at a time with voters last. MEASURED, not assumed: fleet.md grew ~800 B and every resident-prompt row is byte-identical, so it is on-demand and does not count against the ceiling — no ceiling raised, no prose cut.")
 //! @yah:verify("RESIDENT-PROMPT CEILING RE-MEASURED BY THE LEADER, and the number in an earlier P4 handoff entry is now stale in the tightening direction — worth knowing before anyone adds to an always-on trait. `cargo test -p yah-party --lib resident_prompt -- --nocapture` = 1 passed / 0 failed, and prints `yubaba: 20888 B of 20900 B ceiling` — TWELVE bytes of headroom, not the 33 B P4 recorded, because peers have added to those surfaces since. Every other row also passes (leader 67214/67400, courier 38857/39200, relay 23794/24100 are the next tightest). The practical rule stands and is now sharper: growth belongs in an on-demand skill or in .yah/docs/guides/, never in the always-on cloud-ops trait — R869's fleet.md rewrite added ~800 B and moved no row precisely because fleet.md is on-demand.")
+//!
+//! @yah:ticket(R911-T7, "Delete the raft cluster-secret map, its apply arms, and the migration's legacy open path once both groups have rolled")
+//! @yah:status(review)
+//! @yah:at(2026-09-15T06:00:59Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R911)
+//! @yah:next("Tier: Warrior — raft state-machine and snapshot format change; log replay compatibility has to be kept exactly right.")
+//! @yah:next("Delete from the state machine: the secret map, cluster_secret, cluster_secret_index, subscribe_secrets, and the snapshot field (read-and-discard on load so older snapshots still install). YubabaRequest::PutSecret/DeleteSecret must still DESERIALIZE, because the raft log and snapshots on live nodes contain them; apply them as a no-op and say why in one comment. Delete the no-AAD legacy open path and the R911-F5 migration module.")
+//! @yah:next("Update W294 'What R706 shipped' and Decision 8 to the shipped shape: object store only, node-mediated writes, ETag watch, AAD binding.")
+//! @yah:verify("cargo test -p yubaba-consensus and cargo test -p yubaba --lib green vs baseline; a test replays a legacy PutSecret entry and installs a pre-R911 snapshot without error.")
+//! @yah:verify("Code-only grep for cluster_secret_index / subscribe_secrets finds nothing.")
+//! @yah:depends_on(R911-T6)
+//! @yah:files(oss/yubaba/crates/yubaba-consensus/src/raft/store.rs)
+//! @yah:files(oss/yubaba/crates/yubaba-consensus/src/raft/mod.rs)
+//! @yah:files(oss/yah-base/crates/workload-spec/src/secrets.rs)
+//! @yah:handoff("RAFT (oss/yubaba/crates/yubaba-consensus/src/raft/mod.rs): the `secrets: BTreeMap<String, SecretRecord>` field on YubabaState is DELETED, replaced by a comment saying why a pre-T7 snapshot still loads (no deny_unknown_fields, so the key is ignored and never written back). YubabaRequest::PutSecret and ::DeleteSecret keep their exact shapes and are marked RETIRED in one comment: live logs (prod last_log_index ~2.8M) and snapshots hold them. apply() now has a single arm, `PutSecret { .. } | DeleteSecret { .. } => YubabaResponse::Ok`, with a one-line why. SecretRecord stays; it is the fleet-object-store record type. The map-only tests (apply_put_overwrite_and_delete_secret, secrets_survive_snapshot_round_trip, digest_round_trips_through_the_state_machine, pre_f1_snapshot_without_secrets_field_loads) are deleted. ari_round_trips_through_the_state_machine became ari_and_digest_round_trip_through_a_secret_record (a SecretRecord serde round trip). a_pre_r853_f10_put_secret_still_applies_with_no_ari now asserts the parse plus a no-op apply.")
+//! @yah:handoff("STORE (raft/store.rs): DELETED `secrets_epoch`, `subscribe_secrets`, `cluster_secret`, `cluster_secret_index`, the apply-path and install_snapshot epoch bumps, the now-dead `hex_encode` helper, the `watch` import, and the epoch-bump test. YubabaRequest's import moved into the test module (only tests use it now). YUBABA (oss/yubaba/crates/yubaba): `secret_migrate.rs` deleted with its lib.rs `mod` and its main.rs startup call. main.rs `state show`/`state restore` no longer print a secrets count. tests/rebuild_drill.rs keeps its PutSecret fixture (with a note that it now applies as a no-op) and drops the two `secrets.len()` asserts that no longer compile. WORKLOAD-SPEC: `open_legacy_unbound` and its test deleted.")
+//! @yah:handoff("DELETIONS CONFIRMED code-only (comment lines stripped) with wc -l across oss/app/crates/xtask: subscribe_secrets 0, `.cluster_secret(` 0, `fn cluster_secret` 0, secret_migrate 0, open_legacy_unbound 0, secrets_epoch 0, `state.secrets` 0, and secret_migrate.rs is gone from disk. Two counts are non-zero and unrelated: `cluster_secret_index` = 2, both cloud-client test NAMES about ClusterSecretInfo (cluster_secret_index_has_no_field_for_bytes, cluster_secret_index_without_digest_field_decodes_to_none), not the removed accessor; `hex_encode` = 7, private helpers in mesofact-build, qed observation and yah mobile, none in yubaba.")
+//! @yah:handoff("CLUSTER EPOCHS: both axes drifted (raft/mod.rs and raft/store.rs moved; network.rs and the openraft pin did not). VERDICT: RE-RECORD ONLY on BOTH axes, cluster_protocol stays 7 and state_epoch stays 6, re-recorded with `cargo run -p xtask -- cluster-epochs --write`. Reasoning is in oss/yubaba/crates/yubaba/cluster-epochs.json surface_rerecords[2026-09-15]: no request/response variant, field or serde attribute changed; old snapshots, state files and log entries load and replay (four tests pin it); a T7 snapshot read by the pre-T7 R911 build defaults to an empty map it never reads. Residual risks recorded there: an unobservable mixed-state divergence (no live build can commit a PutSecret), and rollback below R911 is now permanently unsupported (already unsafe since F3).")
+//! @yah:handoff("W294 (.yah/docs/working/W294-service-group-vault.md): Decision 8 gained a 'Shipped as R911, migrated live 2026-09-15' block covering object store only (key layout, FleetSecretStore, ClusterUnavailable not absent, raft map and readers gone, PutSecret/DeleteSecret as no-op log entries), --sovereign-group required with no default, node-mediated PUT/DELETE /secrets with a tls/* refusal and 503-not-empty GET, the ETag watch, AAD binding (secret_aad v1), and the migration outcome (prod 7, dev 3, failed 0), all deleted by T7. 'What R706 shipped' now points the record row at raft/mod.rs (type) + fleet_secrets.rs (store) and the check row at AAD, and gained R911 rows for the routes and secret_watch. The runbook no longer says `secret put` must target the raft leader. NOT ROLLED, per instruction. Stayed out of the R911-F8 files (cloud/src/config.rs, cloud_secret.rs, cloud.rs); the cloud_secret.rs change the tool reported during this ticket is that courier's.")
+//! @yah:verify("BASELINES: yubaba-consensus (recorded before editing, `cargo test -p yubaba-consensus` from oss/yubaba) = 128 passed / 0 failed; yubaba lib 991/0; workload-spec 207+107 default and 214+107 with --features seal (operator-stated).")
+//! @yah:verify("AFTER: `cargo test -p yubaba-consensus` = 127 / 0 (-5 retired map tests incl. the epoch-bump test, +4 compat tests: raft::tests::a_legacy_put_or_delete_secret_entry_replays_as_a_no_op, raft::tests::a_pre_r911_t7_snapshot_with_a_secret_map_loads_and_drops_it, raft::store::tests::a_pre_r911_t7_state_file_loads_replays_legacy_secret_entries_and_drops_the_map, raft::store::tests::a_pre_r911_t7_snapshot_installs_and_drops_the_secret_map (the real install_snapshot on a fixture carrying `secrets`)), no warnings in yubaba-consensus. `cargo check -p yubaba --all-targets` EXIT=0 (log shows Checking yubaba). `cargo test -p yubaba --lib` = 983 / 0 (991 minus secret_migrate's 8 deleted tests). `cargo test -p yubaba --features testing --lib secret_reload` = 2 / 0. `cargo test -p yubaba --test main -- end_to_end_rebuild_restores_everything_but_locks_and_rollouts` = 1 / 0. workload-spec: 207+107 / 0 default, 213+107 / 0 with --features seal (-1: the legacy-door test). Root: `cargo run -p xtask -- cluster-epochs` EXIT=0 after the re-record; `cargo test -p xtask --test main -- cluster_epoch_drift` = 8 / 0.")
+//! @yah:gotcha("ROLL NOTE (not rolled): T7 is safe to roll voter by voter from 0.8.40-h13. A T7 node replays PutSecret/DeleteSecret entries and pre-T7 snapshots from h13 peers, and an h13 node reads a T7 snapshot as an empty secret map it never consults. Do NOT roll any node back below the R911 build after T7 has persisted state or shipped a snapshot: a pre-R911 binary resolves cluster secrets from raft and would find the map empty.")
+//! @yah:gotcha("yah build run still cannot open the camp daemon's TaskRun store (turso short read, page 24050) and now also reports build skew (client 0.8.39+39ab4dc3-dirty vs daemon 0.8.39+a2058d12), so every build here ran locally outside the camp queue.")
+//! @yah:handoff("T7 ROLL, DEV GROUP (session:3b2e5822), 2026-09-15. Build: hotship stamp 0.8.40-h14; aarch64 sha256 ff85549a34de78d4eb7c3d03ce52159102f2126a8e72731a791a11be422eb201, x86_64 sha256 1322416b1c78c6a5204afb93c2c3a2fcbc06657f32244fcef009d0da4b09436c. Both artifacts contain zero `secret migration: ` strings, and secret_migrate.rs is absent. Both dry runs EXIT=0. Before each restart, `systemctl show -p ExecStart` still ended `--sovereign-group dev`. Restarts: us-west-011 06:05:12Z, us-west-014 06:05:54Z, us-west-013 (leader) 06:06:34Z. Each node's node-reported sha256 matched the artifact, /health was ok (0.8.40-h14, cluster_protocol 7, state_epoch 6), sovereign_group was \"dev\" and last_log_index was 30, equal to the leader's. Zero ERROR/WARN matching snapshot/apply/decode/deserializ/secret/cert store since each restart (http_auth excluded). No snapshot log line at any level on any node, so each loaded its local raft state and none installed a snapshot. No election at any point, including the leader restart: term stayed 15, leader 13. GROUP CHECK: `yah cloud secret status` is unchanged by state for the T6 rows. BUT `yah cloud secret ls --json` through us-west-011 and us-west-013 is NOT byte-identical to the T6 dev after-state. The 3 dev records are identical (names, updated_at, access, digests), and two rows are ADDED: tls/yah.dev/cert and tls/yah.dev/key (access ingress, updated_at 1788580809, digest null), i.e. prod's fleet cert. Status shows them orphan-remote too (5, was 3). CAUSE (inference from code plus timestamps, not from a T7 diff): FleetSecretStore::index()/record_keys() (fleet_secrets.rs:247-299) lists every TLS pair under certs/<issuer>/ with no group segment. Dev derives the same issuer (secret_watch logs issuer acme-staging-v02.api.letsencrypt.org on dev). The T6 dev after-state was captured at 05:42:31Z, before prod's first-node migration wrote tls/yah.dev/* into certs/<issuer>/ at 05:44:07Z. T7 does not touch fleet_secrets.rs. PROD NOT ROLLED: it stays on 0.8.40-h13 pending the leader's call on the failed byte-identity gate.")
+//! @yah:gotcha("TLS IS FLEET-WIDE BY DESIGN, NOT GROUP-SCOPED (operator decision 2026-09-14, recorded in the R911 relay handoff and in W294 Decision 8). certs/<issuer>/ has no sovereign-group segment, so every group sharing a bucket and issuer lists, and under the `ingress` rule can resolve, the same tls/<domain>/* pairs. So a group's `yah cloud secret ls` shows the fleet TLS rows once any group's issuer has written them. dev began listing tls/yah.dev/{cert,key} at 05:44:07Z, when prod's T6 migration wrote them. A byte-identity check on a group covers its OWN secrets/<group>/ records only; tls/* rows are issuer-owned and excluded.")
+//! @yah:handoff("T7 ROLL, PROD GROUP (session:3b2e5822), 2026-09-15, one pass from 06:11:35Z to 06:14:00Z under the leader's call (A) after the dev ls question. Each ExecStart still ended in `--sovereign-group prod` before its restart. hotship --allow-proto-skew --version 0.8.40-h14. Restarts: us-west-001 06:11:35Z, us-east-001 06:13:16Z, us-south-001 (leader, headscale owner) 06:14:00Z. BYTES: prod runs x86_64 sha256 fc962043d83c91303f6794cd46d468f8a57f69033797bbcba16f5fbef1ba354b on all 3, NOT the 1322416b… hashed after the dry run. The ship rebuilt because raft/store.rs changed at 06:10:40Z, and that change was my own board.update on R911-T7 writing `//!` annotation lines at store.rs:127 (this ticket's source anchor). `cargo run -p xtask -- cluster-epochs` EXIT=0 with both surfaces matching. So prod differs from dev's ff85549a… build only by those comment lines; the bytes differ through line-number metadata (inference). The artifact still has zero `secret migration: ` strings. ROLL LESSON: a board write on a ticket anchored in a crate you are shipping changes the next build's bytes mid-roll. PER NODE: /health ok (0.8.40-h14, cluster_protocol 7, state_epoch 6), sovereign_group \"prod\", last_log_index equal to the leader's after each restart (2806160, 2806161, 2806162), zero ERROR/WARN matching snapshot/apply/decode/deserializ/secret/cert store (http_auth excluded), no snapshot line on any node (local state loaded, no snapshot installed). No election anywhere, including the leader restart: term 25, leader node 1 (us-south-001) throughout. GROUP: `yah cloud secret ls --json` through us-west-001 and us-south-001 is byte-identical to the T6 prod after-state (7 names, noise digest 502be984…); `yah cloud secret status` is unchanged by state. HEADSCALE: us-south-001 logged `adopted the appliance already running on this node — a restart is not a reason to move it (R858-T3)`; PID 2929861 before and after, /headscale/health running there and stopped on us-west-001 and us-east-001. DOORS: leaf SHA256 unchanged on all 3 (7F:0B:45:E7…, 4F:5D:87:60…, 53:01:DB:FD…). ACME: exactly one ACTIVE (us-south-001, 06:14:01Z); us-west-001 and us-east-001 on standby; zero PutSecret or `status 410` lines on all 3 since restart. FLEET STATE: all 6 voters on yubaba 0.8.40-h14 (not on the CDN), kamaji h9 (dev) / h11 (prod). Per this ticket's gotcha, never roll below the R911 build from here.")
 
 use std::collections::BTreeMap;
 use std::fmt::Display;
@@ -116,11 +143,10 @@ use openraft::type_config::alias::{
 };
 use openraft::{EntryPayload, OptionalSend, Snapshot, SnapshotMeta, StoredMembership};
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
 use tokio_stream::{Stream, StreamExt};
 
 use super::super::raft::apply;
-use super::{YubabaRaftConfig as TC, YubabaRequest, YubabaResponse, YubabaState};
+use super::{YubabaRaftConfig as TC, YubabaResponse, YubabaState};
 
 /// Snapshot payload handle. Yubaba state is KB-scale, so the whole snapshot is
 /// an in-memory JSON blob behind a cursor — the same on both the state machine
@@ -503,13 +529,6 @@ struct StateMachineInner {
     snapshot_meta: Option<SnapshotMetaOf<TC>>,
     snapshot_bytes: Option<Vec<u8>>,
     base_dir: PathBuf,
-    /// R600-F4 (W273): bumped on every applied cluster-secret change
-    /// (`PutSecret`/`DeleteSecret`) and on snapshot install, so a consumer task
-    /// (rotation → live reload) can re-render the affected tmpfs mounts and
-    /// graceful-upgrade the workload. Coarse epoch counter — a subscriber wakes
-    /// on any bump and re-reads the current secrets map (re-render is
-    /// idempotent), so coalesced bumps never lose a change.
-    secrets_epoch: watch::Sender<u64>,
 }
 
 impl StateMachineInner {
@@ -545,69 +564,8 @@ impl YubabaStateMachine {
                 snapshot_meta: None,
                 snapshot_bytes: None,
                 base_dir: dir,
-                secrets_epoch: watch::channel(0).0,
             })),
         })
-    }
-
-    /// Subscribe to cluster-secret changes (R600-F4 / W273). The receiver's
-    /// value is a coarse epoch counter bumped on every applied `PutSecret` /
-    /// `DeleteSecret` and on snapshot install. Wake on a change and re-read the
-    /// current state via [`Self::cluster_secret`] — the counter says *something*
-    /// changed, not what, which is all the (idempotent) re-render needs.
-    pub fn subscribe_secrets(&self) -> watch::Receiver<u64> {
-        self.inner.read().unwrap().secrets_epoch.subscribe()
-    }
-
-    /// Read a cluster secret's ciphertext record from the local applied state
-    /// (R600-F2 / W273). Returns a clone so the caller never holds the state
-    /// lock while decrypting. `None` if no secret is stored under `name`.
-    ///
-    /// The record is AES-256-GCM ciphertext only (see [`super::SecretRecord`]);
-    /// the state machine cannot itself read a secret's plaintext — decryption
-    /// happens in `secrets::ClusterResolver` with the node-local KEK.
-    pub fn cluster_secret(&self, name: &str) -> Option<super::SecretRecord> {
-        self.inner
-            .read()
-            .unwrap()
-            .data
-            .state
-            .secrets
-            .get(name)
-            .cloned()
-    }
-
-    /// Metadata for every cluster secret in the local replica, as
-    /// `(name, updated_at, access-rule summary, digest hex)` (R706 / R720-F1 /
-    /// W294).
-    ///
-    /// **Deliberately returns no bytes for ciphertext.** This backs
-    /// `GET /secrets` → `yah cloud secret ls`, whose job is to answer "what
-    /// exists, who may mount it, when did it last change, does it match what
-    /// the camp declares" — none of which needs the ciphertext, and the
-    /// ciphertext is the one thing an operator listing must never casually
-    /// hand out (it would put a KEK-compromise's whole decrypt corpus one
-    /// unauthenticated GET away). The digest is served hex-encoded — it is
-    /// already keyed (see `SecretRecord::digest`), so publishing it costs
-    /// nothing an attacker without the KEK can use; `None` becomes `None`
-    /// (pre-digest), never a stand-in hex value.
-    pub fn cluster_secret_index(&self) -> Vec<(String, u64, String, Option<String>)> {
-        self.inner
-            .read()
-            .unwrap()
-            .data
-            .state
-            .secrets
-            .iter()
-            .map(|(name, rec)| {
-                (
-                    name.clone(),
-                    rec.updated_at,
-                    rec.access.summary(),
-                    rec.digest.as_deref().map(hex_encode),
-                )
-            })
-            .collect()
     }
 
     // ── Locally-applied control-plane reads (R118-T1) ─────────────────────────
@@ -848,7 +806,7 @@ impl YubabaStateMachine {
     /// This is *not* the authority on who is in the cluster: raft membership is,
     /// and it is reachable from `Raft::metrics`. This map is the replicated
     /// *annotation* on those nodes, written by each node about itself
-    /// ([`member_registration`](crate::member_registration)), so a lag between
+    /// (`yubaba::member_registration`), so a lag between
     /// the two is normal — a node that has just joined is in membership and has
     /// no row here until its registration loop converges.
     pub fn members(&self) -> BTreeMap<super::YubabaNodeId, super::MemberInfo> {
@@ -875,8 +833,14 @@ impl YubabaStateMachine {
     /// way a router test can seed applied state — `apply` takes an openraft
     /// entry stream, which is a lot of scaffolding to assert that a handler
     /// reads the right field.
-    #[cfg(test)]
-    pub(crate) fn apply_for_test(&self, req: &super::YubabaRequest) -> super::YubabaResponse {
+    ///
+    /// noisetable R118-T11: `#[cfg(test)]` + `pub(crate)` is invisible across a crate
+    /// boundary, and the callers are `yubaba`'s router tests. So the seam is now
+    /// the `testing` cargo feature, which `yubaba` enables as a
+    /// **dev**-dependency only — a release build of either crate still does not
+    /// contain this function.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn apply_for_test(&self, req: &super::YubabaRequest) -> super::YubabaResponse {
         let mut guard = self.inner.write().unwrap();
         super::apply(&mut guard.data.state, req)
     }
@@ -958,7 +922,7 @@ impl YubabaStateMachine {
     /// consumer (`yah cloud apply`) gets that by reading
     /// `.yah/infra/machines/*.toml` — a tree no fleet node has. Each node
     /// publishing its own five declared facts into its member row
-    /// ([`member_registration`](crate::member_registration)) reassembles the
+    /// (`yubaba::member_registration`) reassembles the
     /// same list from the inside.
     ///
     /// # Rows with no machine name are skipped, deliberately
@@ -978,7 +942,7 @@ impl YubabaStateMachine {
     /// carries `/etc/hostname`, which is not reliably the
     /// `.yah/infra/machines/<name>.toml` name — **does not apply here**, and
     /// that is phase A's quiet win. Both strings come from one function
-    /// ([`derive_machine_name`](crate::leader::derive_machine_name)) on one
+    /// (`yubaba::leader::derive_machine_name`) on one
     /// box, so on the fleet path `resolve_ingress_owner` matches by
     /// construction rather than by luck.
     pub fn floating_ip_machines(&self) -> Vec<floating_ip::FloatingIpMachine> {
@@ -1044,7 +1008,7 @@ impl YubabaStateMachine {
     }
 
     /// The whole applied state, and the index it is true as of — the pair
-    /// [`crate::state_backup`] ships off-fleet (R869 / W339).
+    /// `yubaba::state_backup` ships off-fleet (R869 / W339).
     ///
     /// One read under one lock, deliberately: the accessors above each take the
     /// lock separately, so assembling a copy from them could interleave an
@@ -1103,13 +1067,6 @@ pub fn seed_state_machine(dir: &Path, state: &super::YubabaState) -> Result<(), 
     write_atomic(&dir.join("raft_state.json"), json.as_bytes())
 }
 
-/// Lower-case hex encoding. No `hex` crate dep in this crate; a digest is
-/// rendered a handful of times per `GET /secrets`, not a hot path, so a
-/// one-line encoder beats pulling in a dependency for it.
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 impl RaftSnapshotBuilder<TC> for YubabaStateMachine {
     type SnapshotData = SnapshotData;
 
@@ -1157,7 +1114,6 @@ impl RaftStateMachine<TC> for YubabaStateMachine {
         }
 
         let mut pending = Vec::with_capacity(items.len());
-        let mut secrets_changed = false;
         {
             let mut inner = self.inner.write().unwrap();
             for (entry, responder) in items {
@@ -1165,15 +1121,7 @@ impl RaftStateMachine<TC> for YubabaStateMachine {
                 inner.data.last_applied = Some(log_id);
                 let resp = match entry.payload {
                     EntryPayload::Blank => YubabaResponse::Ok,
-                    EntryPayload::Normal(req) => {
-                        if matches!(
-                            req,
-                            YubabaRequest::PutSecret { .. } | YubabaRequest::DeleteSecret { .. }
-                        ) {
-                            secrets_changed = true;
-                        }
-                        apply(&mut inner.data.state, &req)
-                    }
+                    EntryPayload::Normal(req) => apply(&mut inner.data.state, &req),
                     EntryPayload::Membership(membership) => {
                         inner.data.last_membership =
                             StoredMembership::new(Some(log_id), membership);
@@ -1184,11 +1132,6 @@ impl RaftStateMachine<TC> for YubabaStateMachine {
             }
 
             inner.persist()?;
-            // Notify AFTER persist so a woken consumer that re-reads observes
-            // durable state. Coalesced into one bump per batch.
-            if secrets_changed {
-                inner.secrets_epoch.send_modify(|e| *e = e.wrapping_add(1));
-            }
         }
 
         // Responders are notified after the lock is dropped.
@@ -1222,10 +1165,6 @@ impl RaftStateMachine<TC> for YubabaStateMachine {
         inner.snapshot_meta = Some(meta.clone());
         inner.snapshot_bytes = Some(bytes);
         inner.persist()?;
-        // A snapshot install can replace the secrets map wholesale (a follower
-        // catching up), so notify unconditionally — diffing isn't worth it at
-        // KB scale, and the subscriber's re-render is idempotent.
-        inner.secrets_epoch.send_modify(|e| *e = e.wrapping_add(1));
         Ok(())
     }
 
@@ -1246,6 +1185,7 @@ impl RaftStateMachine<TC> for YubabaStateMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::YubabaRequest;
     use openraft::testing::log_id;
 
     fn normal_entry(index: u64, req: YubabaRequest) -> EntryOf<TC> {
@@ -1255,16 +1195,27 @@ mod tests {
         }
     }
 
-    // R600-F4: the secrets-change watch fires for cluster-secret writes only.
+    /// R911-T7: a node restarting onto this build loads its pre-T7 on-disk
+    /// state, which still carries the old `secrets` map, then replays legacy
+    /// `PutSecret` / `DeleteSecret` entries from its log through the real apply
+    /// path without error, and persists state with no map in it.
     #[tokio::test]
-    async fn secret_writes_bump_the_epoch_but_other_writes_do_not() {
+    async fn a_pre_r911_t7_state_file_loads_replays_legacy_secret_entries_and_drops_the_map() {
         let tmp = tempfile::TempDir::new().unwrap();
+        let mut data = serde_json::to_value(StateMachineData::default()).unwrap();
+        data["state"]["secrets"] = serde_json::json!({
+            "tls/yah.dev/cert": {
+                "ciphertext": [1],
+                "nonce": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                "updated_at": 1,
+                "access": "allow_any"
+            }
+        });
+        std::fs::write(tmp.path().join("raft_state.json"), data.to_string()).unwrap();
+
         let mut sm = YubabaStateMachine::open(tmp.path().to_path_buf())
             .await
-            .unwrap();
-        let mut rx = sm.subscribe_secrets();
-        assert_eq!(*rx.borrow_and_update(), 0);
-
+            .expect("a pre-T7 state file must load");
         apply_one(
             &mut sm,
             normal_entry(
@@ -1273,7 +1224,7 @@ mod tests {
                     name: "tls/yah.dev/cert".into(),
                     ciphertext: vec![1, 2, 3],
                     nonce: vec![0; 12],
-                    updated_at: 1,
+                    updated_at: 2,
                     access: workload_spec::secrets::SecretAccess::AllowAny,
                     digest: None,
                     sans: None,
@@ -1282,37 +1233,76 @@ mod tests {
             ),
         )
         .await;
-        assert!(rx.has_changed().unwrap(), "PutSecret should notify");
-        assert_eq!(*rx.borrow_and_update(), 1);
-
-        // A non-secret write must not wake secret consumers.
         apply_one(
             &mut sm,
             normal_entry(
                 2,
-                YubabaRequest::SetIngressOwner {
-                    machine: "m1".into(),
-                },
-            ),
-        )
-        .await;
-        assert!(
-            !rx.has_changed().unwrap(),
-            "non-secret write must not notify"
-        );
-
-        apply_one(
-            &mut sm,
-            normal_entry(
-                3,
                 YubabaRequest::DeleteSecret {
                     name: "tls/yah.dev/cert".into(),
                 },
             ),
         )
         .await;
-        assert!(rx.has_changed().unwrap(), "DeleteSecret should notify");
-        assert_eq!(*rx.borrow_and_update(), 2);
+        apply_one(
+            &mut sm,
+            normal_entry(
+                3,
+                YubabaRequest::SetIngressOwner {
+                    machine: "m1".into(),
+                },
+            ),
+        )
+        .await;
+
+        let persisted: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("raft_state.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            persisted["state"].get("secrets").is_none(),
+            "the retired map must not be persisted: {persisted}"
+        );
+        assert_eq!(sm.ingress_owner().as_deref(), Some("m1"), "later entries still apply");
+    }
+
+    /// R911-T7: a leader that has not yet rolled onto this build ships a
+    /// snapshot still carrying the old `secrets` map. Installing it must
+    /// succeed, keep every other field, and persist no map.
+    #[tokio::test]
+    async fn a_pre_r911_t7_snapshot_installs_and_drops_the_secret_map() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut sm = YubabaStateMachine::open(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let mut data = serde_json::to_value(StateMachineData::default()).unwrap();
+        data["state"]["ingress_owner"] = serde_json::json!("m1");
+        data["state"]["secrets"] = serde_json::json!({
+            "cheers/cloud-admin/verify-key": {
+                "ciphertext": [1, 2, 3],
+                "nonce": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                "updated_at": 7,
+                "access": "allow_any",
+                "digest": [170]
+            }
+        });
+        let meta = SnapshotMetaOf::<TC> {
+            last_log_id: Some(log_id::<TC>(1, 1, 7)),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "pre-r911-t7".into(),
+        };
+        sm.install_snapshot(&meta, Cursor::new(serde_json::to_vec(&data).unwrap()))
+            .await
+            .expect("a pre-T7 snapshot must install");
+
+        assert_eq!(sm.ingress_owner().as_deref(), Some("m1"));
+        let persisted: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("raft_state.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            persisted["state"].get("secrets").is_none(),
+            "the retired map must not be persisted: {persisted}"
+        );
     }
 
     /// Apply a single entry through the 0.10 stream/responder `apply` API with
