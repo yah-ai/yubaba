@@ -653,8 +653,8 @@ mod tests {
         ServiceConfig {
             schema_version: 1,
             name: name.to_string(),
-            domain: format!("{name}.test"),
-            health_path: None,
+            address: crate::config::ServiceAddress::front_door(format!("{name}.test")),
+            description: None,
             components,
             db: Default::default(),
         }

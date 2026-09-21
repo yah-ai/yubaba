@@ -2021,7 +2021,7 @@ mod tests {
         std::fs::create_dir_all(svc.join("mirrors")).unwrap();
         std::fs::write(
             svc.join("service.toml"),
-            "schema_version = 1\nname = \"marketing\"\ndomain = \"yah.dev\"\n\
+            "schema_version = 1\nname = \"marketing\"\n[address]\nkind = \"front-door\"\ndomain = \"yah.dev\"\n\
              [[components]]\nid = \"site\"\nkind = \"static-asset\"\n\
              path = \"marketing/site\"\nrole = \"static\"\n",
         )
@@ -2085,7 +2085,7 @@ mod tests {
             std::fs::write(
                 svc.join("service.toml"),
                 format!(
-                    "schema_version = 1\nname = \"{svc_name}\"\ndomain = \"yah.dev\"\n\
+                    "schema_version = 1\nname = \"{svc_name}\"\n[address]\nkind = \"front-door\"\ndomain = \"yah.dev\"\n\
                      [[components]]\nid = \"site\"\nkind = \"static-asset\"\n\
                      path = \"{svc_name}/site\"\nrole = \"static\"\n"
                 ),
@@ -2137,7 +2137,7 @@ mod tests {
         std::fs::create_dir_all(svc.join("mirrors")).unwrap();
         std::fs::write(
             svc.join("service.toml"),
-            "schema_version = 1\nname = \"staging\"\ndomain = \"yah.dev\"\n\
+            "schema_version = 1\nname = \"staging\"\n[address]\nkind = \"front-door\"\ndomain = \"yah.dev\"\n\
              [[components]]\nid = \"site\"\nkind = \"static-asset\"\n\
              path = \"staging/site\"\nrole = \"static\"\n",
         )
@@ -2194,7 +2194,7 @@ mod tests {
         std::fs::create_dir_all(svc.join("mirrors")).unwrap();
         std::fs::write(
             svc.join("service.toml"),
-            "schema_version = 1\nname = \"marketing\"\ndomain = \"yah.dev\"\n\
+            "schema_version = 1\nname = \"marketing\"\n[address]\nkind = \"front-door\"\ndomain = \"yah.dev\"\n\
              [[components]]\nid = \"site\"\nkind = \"static-asset\"\n\
              path = \"marketing/site\"\nrole = \"static\"\n",
         )

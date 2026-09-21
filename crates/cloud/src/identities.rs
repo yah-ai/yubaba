@@ -35,8 +35,6 @@ pub struct LocalIdentity {
 /// Uses a write-tmp + rename so the file is never left in a partial state.
 pub fn register(cloud_dir: &Path, machine: &str, fingerprint: &str, algorithm: &str) -> Result<()> {
     let dir = cloud_dir.join("identities");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating identity dir {}", dir.display()))?;
 
     let id = LocalIdentity {
         machine: machine.to_string(),
@@ -47,12 +45,21 @@ pub fn register(cloud_dir: &Path, machine: &str, fingerprint: &str, algorithm: &
     };
 
     let path = dir.join(format!("{machine}.json"));
-    let tmp = path.with_extension("json.tmp");
     let content = serde_json::to_string_pretty(&id).context("serializing local identity")?;
-    std::fs::write(&tmp, &content).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
-        .with_context(|| format!("renaming {} → {}", tmp.display(), path.display()))?;
-    Ok(())
+    // R925: the staging path used to be `<machine>.json.tmp`, which every
+    // concurrent writer of this entry shares. `yah cloud bootstrap` and `yah
+    // cloud attach` both land here as SEPARATE PROCESSES against one
+    // `<cloud_dir>`, and a re-attach during provisioning routinely overlaps
+    // them on the same machine name — so two writes interleaved into one
+    // staging file and the rename published whichever fragment won. The
+    // registry is the source of truth for machine hostkeys and a malformed
+    // entry reads as "not provisioned" rather than as an error.
+    //
+    // Default permissions are deliberate: the payload is a public hostkey
+    // FINGERPRINT, not key material, so this does not need the hand-rolled 0600
+    // staging that `yubaba::tenant_passway::write_if_changed` keeps.
+    crate::atomic_write::write_atomic(&path, content.as_bytes())
+        .with_context(|| format!("registering local identity {}", path.display()))
 }
 
 /// Look up a machine's entry in the stub local registry. Returns `None` if
@@ -114,6 +121,21 @@ mod tests {
         register(cloud_dir, MACHINE, new_fp, ALGO).unwrap();
         let entry = lookup(cloud_dir, MACHINE).unwrap().unwrap();
         assert_eq!(entry.fingerprint, new_fp);
+
+        // R925: repeat writes must not accumulate staging files. Since the
+        // staging name carries a pid and a sequence number, no later write ever
+        // reuses one, so a missed cleanup grows this directory without bound.
+        // Scanned as "any `.tmp` entry" on purpose — the obvious spelling,
+        // `assert!(!path.with_extension("json.tmp").exists())`, passes VACUOUSLY
+        // now that nothing writes that fixed name, and would leave this test
+        // green while covering nothing.
+        let strays: Vec<_> = std::fs::read_dir(cloud_dir.join("identities"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "staging files leaked: {strays:?}");
     }
 
     #[test]

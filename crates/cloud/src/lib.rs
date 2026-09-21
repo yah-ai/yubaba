@@ -288,6 +288,7 @@ pub mod asset_journal;
 pub mod asset_status;
 #[cfg(test)]
 mod asset_status_tests;
+mod atomic_write;
 pub mod capability;
 pub mod cloud_init;
 pub mod config;

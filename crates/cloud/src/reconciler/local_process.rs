@@ -1337,8 +1337,8 @@ socket = "/tmp/mine.sock"
         crate::ServiceConfig {
             schema_version: 1,
             name: "noisy".into(),
-            domain: "noisy.example".into(),
-            health_path: None,
+            address: crate::config::ServiceAddress::front_door("noisy.example"),
+            description: None,
             components: vec![crate::ServiceComponent {
                 mount: None,
                 id: "gui".into(),

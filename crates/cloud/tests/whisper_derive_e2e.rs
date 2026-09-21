@@ -224,8 +224,8 @@ impl TestWorkspace {
             service: ServiceConfig {
                 schema_version: 1,
                 name: "test-svc".to_string(),
-                domain: "test.local".to_string(),
-                health_path: None,
+                address: cloud::config::ServiceAddress::front_door("test.local".to_string()),
+                description: None,
                 components: vec![],
                 db: cloud::DbCatalog::default(),
             },

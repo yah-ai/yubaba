@@ -1347,20 +1347,38 @@ async fn read_action_cache(ac_path: &Path) -> Option<String> {
 /// Record an action-cache entry (`derive_key → output hash`). Written
 /// atomically via tmp + rename so a crashed run never leaves a half-written
 /// entry a later run would trust.
+///
+/// R925: the staging path used to be `<derive_key>.out.tmp`, fixed and therefore
+/// shared. The cache root is `<workspace_root>/.yah/cache/derive/transform/`, a
+/// per-*workspace* directory that every `yah` process in that tree writes, so two
+/// concurrent runs of the same `derive_key` interleaved into one staging file.
+/// The damage is silent in both directions: [`read_action_cache`] reads an empty
+/// or truncated entry as a cache MISS rather than an error, and a torn hash that
+/// still looks well-formed points at a CAS entry that does not exist, poisoning
+/// the entry so every later run falls through to a full re-materialisation.
 async fn write_action_cache(ac_path: &Path, output_hash: &str) -> Result<()> {
-    if let Some(parent) = ac_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("creating action-cache dir {}", parent.display()))?;
+    crate::atomic_write::write_atomic_async(ac_path, format!("{output_hash}\n").as_bytes())
+        .await
+        .with_context(|| format!("recording action-cache entry {}", ac_path.display()))
+}
+
+/// Removes [`materialize_transform`]'s staging output when the call unwinds
+/// without publishing it (R925).
+///
+/// `Drop` rather than a cleanup call because the path between creating the file
+/// and the publishing rename has a dozen exits — the executor's error, the
+/// "recipe produced no output" bail, the BLAKE3 mismatch bail, every `?` on a
+/// read — and a cleanup that is only on the ones someone remembered is the same
+/// leak with more code. There is no async `Drop`; a blocking `unlink` of one
+/// file in a local cache directory is the right trade rather than a reason to
+/// keep a collidable fixed name.
+struct StagingOutput(PathBuf);
+
+impl Drop for StagingOutput {
+    fn drop(&mut self) {
+        // ENOENT on the success path: the rename already consumed it.
+        let _ = std::fs::remove_file(&self.0);
     }
-    let tmp = ac_path.with_extension("out.tmp");
-    tokio::fs::write(&tmp, format!("{output_hash}\n"))
-        .await
-        .with_context(|| format!("writing action-cache tmp {}", tmp.display()))?;
-    tokio::fs::rename(&tmp, ac_path)
-        .await
-        .with_context(|| format!("promoting action-cache entry {}", ac_path.display()))?;
-    Ok(())
 }
 
 async fn materialize_transform(
@@ -1448,9 +1466,23 @@ async fn materialize_transform(
         .canonicalize()
         .with_context(|| format!("canonicalizing transform cache dir {}", cache_dir.display()))?;
 
-    // Tmp output is named by the derivation key — unique per input set, so
-    // concurrent rows (and zero-sentinel bootstrap rows) never collide on it.
-    let tmp_output = cache_dir_abs.join(format!("{derive_key}.tmp"));
+    // The derivation key is unique per INPUT SET, which stops two different rows
+    // (and zero-sentinel bootstrap rows) colliding — but R925: it does NOT stop
+    // two concurrent runs of the SAME row. This cache dir hangs off
+    // `workspace_root`, so every `yah` process in the tree shares it, and
+    // `<derive_key>.tmp` handed the same path to two recipes at once as
+    // {{YAH_TRANSFORM_OUT}}. In strict mode the spliced bytes fail the BLAKE3
+    // check below, i.e. a hard failure on a run that did nothing wrong, possibly
+    // after hours of build. In BOOTSTRAP mode there is nothing to check against:
+    // the torn output is hashed, published to the CAS under that hash, and
+    // surfaced as the discovered pin. So: pid + sequence disambiguated.
+    let tmp_output =
+        crate::atomic_write::staging_path(&cache_dir_abs.join(format!("{derive_key}.out")));
+    // A unique staging name is never reused, so a leaked one accumulates forever
+    // in a long-lived cache dir. This unlinks it on every exit below — the `?`s,
+    // the `bail!`s, and a cancelled future alike — and no-ops (ENOENT) on the
+    // success path, where the publishing rename has already consumed it.
+    let _staging = StagingOutput(tmp_output.clone());
 
     let input_abs = input_path
         .canonicalize()
@@ -1749,13 +1781,14 @@ pub async fn seed_transform_derivation(
     // tmp+rename; idempotent when the entry already exists.
     let cas_path = cache_dir.join(format!("{output_blake3}.bin"));
     if !tokio::fs::try_exists(&cas_path).await.unwrap_or(false) {
-        let tmp = cache_dir.join(format!("{output_blake3}.seed.tmp"));
-        tokio::fs::write(&tmp, &bytes)
+        // R925: `<output_blake3>.seed.tmp` was fixed, and this cache dir is
+        // shared by every process in the workspace — two concurrent seeds of the
+        // same artifact spliced into one staging file and published the result.
+        // A CAS entry is trusted by hash, so a torn one is only caught later by
+        // the HIT-path verify, as a hard failure on a run that did nothing wrong.
+        crate::atomic_write::write_atomic_async(&cas_path, &bytes)
             .await
-            .with_context(|| format!("writing CAS tmp {}", tmp.display()))?;
-        tokio::fs::rename(&tmp, &cas_path)
-            .await
-            .with_context(|| format!("promoting CAS entry {}", cas_path.display()))?;
+            .with_context(|| format!("seeding CAS entry {}", cas_path.display()))?;
     }
 
     // Action cache: <cache_dir>/ac/<derive_key>.out = <output_blake3>. Reuses the
@@ -2273,8 +2306,8 @@ mod tests {
             let service = ServiceConfig {
                 schema_version: 1,
                 name: "yah-desktop".to_string(),
-                domain: "releases.yah.dev".to_string(),
-                health_path: None,
+                address: crate::config::ServiceAddress::front_door("releases.yah.dev".to_string()),
+                description: None,
                 components: vec![],
                 db: crate::DbCatalog::default(),
             };
@@ -2424,9 +2457,11 @@ kind = "static-asset"
                 ));
             };
             // The test recipes follow the W164 convention: argv contains the
-            // tmp output path verbatim. materialize_transform writes to
-            // `<cache_dir>/<output_blake3>.tmp` (then renames to .bin on hash
-            // match), so the output element is the one ending in `.tmp`.
+            // tmp output path verbatim. materialize_transform stages at
+            // `<cache_dir>/<derive_key>.out.<pid>.<seq>.tmp` (R925; then renames
+            // to `<hash>.bin` on hash match), so the output element is the one
+            // ending in `.tmp`. Any future change to that staging name must keep
+            // the `.tmp` suffix or this find() silently stops matching.
             let out_path = argv.iter().find(|a| a.ends_with(".tmp")).ok_or(
                 ForgeExecutorError::Unsupported("mock recipe must pass a .tmp output path"),
             )?;
@@ -4039,6 +4074,25 @@ params = {{ target = "x86_64-unknown-linux-musl" }}
         let msg = format!("{err:#}");
         assert!(msg.contains("BLAKE3"), "{msg}");
         assert!(msg.contains(pinned_hash), "{msg}");
+
+        // R925: this is the path the `StagingOutput` guard exists for — the mock
+        // DID write the staging output, and the mismatch bailed past the
+        // publishing rename, so the guard must have unlinked it. The staging
+        // name is `<derive_key>.out.<pid>.<seq>.tmp`, which no later run reuses,
+        // so a missed cleanup accumulates without bound.
+        //
+        // Deliberately a directory scan, not `assert!(!cache_dir.join(format!(
+        // "{derive_key}.tmp")).exists())`: an assertion naming one hard-coded
+        // staging filename passes VACUOUSLY once the name carries a pid, and the
+        // leak coverage disappears with the test still green.
+        let cache_dir = fx.workspace_root.join(".yah/cache/derive/transform");
+        let strays: Vec<_> = std::fs::read_dir(&cache_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "staging output leaked: {strays:?}");
     }
 
     #[tokio::test]

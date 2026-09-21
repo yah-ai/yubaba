@@ -249,7 +249,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("service.toml"),
-            format!("schema_version = 1\nname = \"{name}\"\ndomain = \"{name}.example\"\n"),
+            format!("schema_version = 1\nname = \"{name}\"\n[address]\nkind = \"front-door\"\ndomain = \"{name}.example\"\n"),
         )
         .unwrap();
     }

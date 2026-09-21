@@ -937,7 +937,7 @@ mod tests {
                     .join(".yah/services")
                     .join(svc)
                     .join("service.toml"),
-                format!("schema_version = 1\nname = \"{svc}\"\ndomain = \"{svc}.example\"\n"),
+                format!("schema_version = 1\nname = \"{svc}\"\n[address]\nkind = \"front-door\"\ndomain = \"{svc}.example\"\n"),
             )
             .unwrap();
             std::fs::write(
@@ -1013,7 +1013,7 @@ mod tests {
         std::fs::create_dir_all(svc.join("mirrors")).unwrap();
         std::fs::write(
             svc.join("service.toml"),
-            "schema_version = 1\nname = \"yah-admin\"\ndomain = \"admin.example\"\n\n\
+            "schema_version = 1\nname = \"yah-admin\"\n[address]\nkind = \"front-door\"\ndomain = \"admin.example\"\n\n\
              [[components]]\nid = \"admin\"\nkind = \"container\"\n\
              path = \"crates/admin\"\nrole = \"compute\"\n",
         )
@@ -1059,7 +1059,7 @@ mod tests {
         std::fs::create_dir_all(svc.join("mirrors")).unwrap();
         std::fs::write(
             svc.join("service.toml"),
-            "schema_version = 1\nname = \"yah-admin\"\ndomain = \"admin.example\"\n\n\
+            "schema_version = 1\nname = \"yah-admin\"\n[address]\nkind = \"front-door\"\ndomain = \"admin.example\"\n\n\
              [[components]]\nid = \"admin\"\nkind = \"container\"\n\
              path = \"crates/admin\"\nrole = \"compute\"\n",
         )

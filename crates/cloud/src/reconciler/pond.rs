@@ -1787,8 +1787,8 @@ mod tests {
         let svc = crate::ServiceConfig {
             schema_version: 1,
             name: "dev-yah".into(),
-            domain: "yah.dev".into(),
-            health_path: None,
+            address: crate::config::ServiceAddress::front_door("yah.dev"),
+            description: None,
             components: vec![],
             db: crate::DbCatalog::default(),
         };
@@ -1861,8 +1861,8 @@ mod tests {
         let svc = crate::ServiceConfig {
             schema_version: 1,
             name: "test-svc".into(),
-            domain: "test.dev".into(),
-            health_path: None,
+            address: crate::config::ServiceAddress::front_door("test.dev"),
+            description: None,
             components: vec![],
             db: crate::DbCatalog::default(),
         };
@@ -1947,8 +1947,8 @@ mod tests {
         let svc = crate::ServiceConfig {
             schema_version: 1,
             name: "test-svc".into(),
-            domain: "test.dev".into(),
-            health_path: None,
+            address: crate::config::ServiceAddress::front_door("test.dev"),
+            description: None,
             components: vec![],
             db: crate::DbCatalog::default(),
         };
@@ -2031,8 +2031,8 @@ mod tests {
         let svc = crate::ServiceConfig {
             schema_version: 1,
             name: "test-svc".into(),
-            domain: "test.dev".into(),
-            health_path: None,
+            address: crate::config::ServiceAddress::front_door("test.dev"),
+            description: None,
             components: vec![],
             db: crate::DbCatalog::default(),
         };
@@ -2109,8 +2109,8 @@ mod tests {
         let svc = crate::ServiceConfig {
             schema_version: 1,
             name: "test-svc".into(),
-            domain: "test.dev".into(),
-            health_path: None,
+            address: crate::config::ServiceAddress::front_door("test.dev"),
+            description: None,
             components: vec![],
             db: crate::DbCatalog::default(),
         };

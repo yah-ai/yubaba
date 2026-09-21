@@ -933,8 +933,8 @@ mod source_seam_tests {
         ServiceConfig {
             schema_version: 1,
             name: "scrabcake".into(),
-            domain: "scrabcake.example".into(),
-            health_path: None,
+            address: crate::config::ServiceAddress::front_door("scrabcake.example"),
+            description: None,
             components: vec![comp],
             db: crate::DbCatalog::default(),
         }

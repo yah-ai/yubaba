@@ -211,7 +211,15 @@ impl CellStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceStatus {
     pub name: String,
-    pub domain: String,
+    /// Display-only one-liner for the service's address — a domain, or
+    /// `node:<prefix>/<alpn>` for a node-addressed service (R926-F1).
+    ///
+    /// Renamed from `domain` when addressing became a sum type: this
+    /// consumer never dialled the string, it printed it, and printing a
+    /// placeholder domain for a service that has none is what
+    /// `unset.yah-cloud.invalid` is. [`crate::ServiceAddress::label`]
+    /// always has something true to say.
+    pub address: String,
     /// One cell per declared mirror, keyed by env. Tiers with no
     /// `mirrors/<env>.toml` are simply absent — the UI renders those as
     /// "undeclared" against its canonical tier list (dev/sim/prod/ha).
@@ -311,7 +319,7 @@ pub fn compute_service(
         .collect();
     ServiceStatus {
         name: svc.service.name.clone(),
-        domain: svc.service.domain.clone(),
+        address: svc.service.address.label(),
         cells,
     }
 }
@@ -687,8 +695,8 @@ mod tests {
             service: ServiceConfig {
                 schema_version: 1,
                 name: "yah-dev".into(),
-                domain: "yah.dev".into(),
-                health_path: None,
+                address: crate::config::ServiceAddress::front_door("yah.dev"),
+                description: None,
                 components: vec![],
                 db: crate::DbCatalog::default(),
             },

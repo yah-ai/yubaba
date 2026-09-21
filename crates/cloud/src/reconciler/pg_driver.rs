@@ -280,7 +280,7 @@ mod tests {
 
     fn service(name: &str, dev_mirror: Option<&str>) -> ServiceWithMirrors {
         let service: ServiceConfig = toml::from_str(&format!(
-            "schema_version = 1\nname = \"{name}\"\ndomain = \"{name}.example\"\n"
+            "schema_version = 1\nname = \"{name}\"\n[address]\nkind = \"front-door\"\ndomain = \"{name}.example\"\n"
         ))
         .expect("parse service");
         let mut mirrors = BTreeMap::new();

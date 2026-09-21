@@ -35,6 +35,8 @@ fn workspace_with_component_workload(workload_toml: &str) -> TempDir {
         root.join(".yah/services/demo/service.toml"),
         r#"schema_version = 1
 name = "demo"
+[address]
+kind = "front-door"
 domain = "demo.example"
 
 [[components]]

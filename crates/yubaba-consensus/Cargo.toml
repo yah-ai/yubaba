@@ -32,7 +32,7 @@ async-trait = "0.1"
 # list is anyhow + async-trait by design, so it costs a plinth nothing — and the
 # derivation genuinely is a read of raft state, which is why it is here and the
 # vendor HTTP adapters (`yah-floating-ip-adapters`) are not.
-floating_ip = { package = "yah-floating-ip", path = "../floating-ip", version = "0.8.40" }
+floating_ip = { package = "yah-floating-ip", path = "../floating-ip", version = "0.8.41" }
 openraft = { version = "=0.10.0-alpha.30", features = ["serde"] }
 # The raft transport itself is HTTP — `raft/network.rs` is a `RaftNetworkV2`
 # over reqwest. This is not an avoidable dependency of the consensus core; it
@@ -47,7 +47,7 @@ tracing = "0.1"
 # are replicated state — they are in `YubabaState`. Default features only: the
 # `seal` / `admission-verify` surfaces the fleet daemon enables are issuer-side
 # and never touch the state machine.
-workload-spec = { package = "yah-workload-spec", version = "0.8.40" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.41" }
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }

@@ -1073,7 +1073,7 @@ mod tests {
         let svc_dir = workspace.join(".yah/services").join(svc_name);
         std::fs::create_dir_all(&svc_dir).unwrap();
         let toml = format!(
-            "schema_version = 1\nname = \"{svc_name}\"\ndomain = \"{svc_name}.example.com\"\n\
+            "schema_version = 1\nname = \"{svc_name}\"\n[address]\nkind = \"front-door\"\ndomain = \"{svc_name}.example.com\"\n\
              [[components]]\nid = \"models\"\nkind = \"static-asset\"\n\
              path = \"{component_path}\"\nrole = \"static\"\n"
         );

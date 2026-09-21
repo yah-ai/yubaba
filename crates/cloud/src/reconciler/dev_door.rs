@@ -271,7 +271,7 @@ mod tests {
     }
 
     fn service() -> ServiceConfig {
-        toml::from_str("schema_version = 1\nname = \"yah-marketing\"\ndomain = \"yah.dev\"\n")
+        toml::from_str("schema_version = 1\nname = \"yah-marketing\"\n[address]\nkind = \"front-door\"\ndomain = \"yah.dev\"\n")
             .expect("parse service")
     }
 

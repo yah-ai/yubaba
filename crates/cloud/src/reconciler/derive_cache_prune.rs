@@ -196,8 +196,8 @@ mod tests {
         ServiceConfig {
             schema_version: 1,
             name: name.into(),
-            domain: String::new(),
-            health_path: None,
+            address: crate::config::ServiceAddress::front_door(String::new()),
+            description: None,
             components,
             db: crate::DbCatalog::default(),
         }

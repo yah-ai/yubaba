@@ -212,8 +212,8 @@
 //! @yah:cleanup("us-south-001 is the obvious second bundle-capable candidate — it already shares the passway demux pair with us-east-001 — and is deliberately left undeclared because nothing in-repo reads its kamaji flags either way. One `ps -o args= -C kamaji` on that box settles it; declaring it wrongly would route a bundle to a node that refuses it, which is the failure this axis exists to remove. Until then the fleet is genuinely single-node for bundle serving and exactly_one_machine_in_the_real_fleet_can_serve_a_bundle says so out loud.")
 //!
 //! @yah:relay(R926, "Register iroh relay + headscale as first-class camp services, with descriptions and HA-aware health checks")
-//! @yah:at(2026-09-18T03:47:41Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:at(2026-09-20T22:13:30Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @arch:see(.yah/docs/working/W122-yah-mobile.md)
 //! @yah:handoff("FILED 2026-09-17 from an operator request made during R726-S22's device run (@Ashguard:dove, session:639e7b78). THE ASK, in the operator's words: the iroh relay and headscale should be listed in the yah services with DESCRIPTIONS and HEALTH CHECKS, \"since they can move around in HA mode\". GROUNDED STATE OF THE WORLD AT FILING, read rather than assumed: (1) The service registry is .yah/services/&lt;name&gt;/service.toml. Exactly nine services are registered - scrabcake, yah-analytics, yah-chat, yah-cloud, yah-cloud-admin, yah-cr, yah-dashboard, yah-desktop, yah-marketing. NEITHER an iroh relay NOR headscale is among them, so the operator's observation is correct. (2) The generated schema .yah/schema/service.toml.schema.json has top-level properties [components, db, domain, health_path, name, schema_version], required [domain, name, schema_version]. So a health HOOK already exists in the shape of `health_path` - this is NOT greenfield - but there is NO `description` field at all, which is new schema surface. (3) .yah/infra/machines/*.toml are pure INVENTORY (name, [allocatable], [connect], [registration]); they are not where a service is declared, so do not add it there. (4) The Rust side of health_path lives in oss/yubaba/crates/cloud/src/config.rs and src/lib.rs (also mirrored in oss/mesofact/crates/mesofact/src/lib.rs).")
@@ -221,6 +221,20 @@
 //! @yah:next("Add a `description` field to the service schema (new surface - it does not exist), then REGENERATE the artifacts: `cargo run -p xtask -- emit-schemas` and the workload-spec export. They no longer regenerate on commit and schema-drift-guard in the `check` QED pipeline will fail the build otherwise.")
 //! @yah:next("HA is the actual hard part and deserves a design decision before code: `health_path` is a single path on a single declared domain, which cannot express \"this service currently lives on whichever of N machines won the election\". Decide whether a service gains a set of candidate endpoints with a liveness winner, or whether the registry queries the mesh's own service-records endpoint (the 100.64.0.3:7443/service-records?ready=true surface referenced in us-west-001.toml) as the source of truth. Do NOT bolt a second health mechanism beside health_path - see the repo's below-v1.0.0 rule; change the one that exists.")
 //! @yah:gotcha("HEADSCALE HAS A LOUD, DOCUMENTED FAILURE HISTORY AND THIS TICKET IS PARTLY A RESPONSE TO IT - read R858 before designing the health check. .yah/infra/machines/us-west-001.toml carries R858 (\"Mesh coordination outage: cloud.mesh.yah.dev refuses :443, so no camp machine can reach any 100.64.0.0/10 address\") plus a measured 2026-09-04 gotcha: tailscale reported \"fetch control key ... connect: connection refused\", port 22 answered while 80/443 were REFUSED, and consequently every mesh address stopped answering. THE PART THAT MATTERS FOR A HEALTH CHECK: the same gotcha records that THE PUBLIC SITE STAYED GREEN THROUGHOUT (yah.dev HTTP 200 in 0.81s) because the apex serves from us-east-001's own passway and never traverses the coordination server. So a naive HTTP health check against a public domain would have reported HEALTHY during a total mesh outage. Whatever check this ticket adds for headscale MUST probe the coordination path itself (the control-key fetch, or a mesh-address dial), not a public endpoint that is up for unrelated reasons. The repo's CLAUDE.md also warns that the headscale appliance already accumulated four half-owners of \"does this node have a config.yaml\" and that the seam between two of them took the mesh down twice - so give this ONE owner.")
+//! @yah:handoff("PHASE 1 LANDED — the `description` field exists and the artifacts are regenerated. oss/yubaba/crates/cloud/src/config.rs: ServiceConfig gains `description: Option<String>` (serde default + skip_serializing_if, so the nine pre-existing services still load). 28 struct-literal construction sites updated across config.rs(13), inner_door.rs, pond.rs(5), cloudflare_worker.rs, derive_cache_prune.rs, local_process.rs, mesofact_static.rs, static_asset.rs, static_asset_prune.rs, sync_status.rs, reconciler/mod.rs, tests/whisper_derive_e2e.rs. Two new tests: a_declared_description_survives_the_loader and a_service_without_a_description_still_loads. `cargo run -p xtask -- emit-schemas` re-run; .yah/schema/service.toml.schema.json now carries the field and scripts/check-schema-drift.sh exits 0 (\"ok: .yah/schema is in sync with the Rust types\"). packages/yah/workload-spec/index.ts was NOT regenerated because it did not change — this edit touches no workload-spec source.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib = 1255 passed / 0 failed / 4 ignored, EXIT=0 (/tmp/r926_full_e2.log). scripts/check-schema-drift.sh = exit 0.")
+//! @yah:gotcha("THE IROH-RELAY HALF OF THIS TICKET RESTS ON A THING THAT DOES NOT EXIST: yah OPERATES NO IROH RELAY. Measured 2026-09-20. (a) mshr's default is n0's PUBLIC relay — oss/mshr/crates/mshr/src/discovery.rs:82 default_relays() returns vec![N0_DNS_PKARR_RELAY_PROD], imported from iroh at discovery.rs:32. (b) The capability to self-host is BUILT AND UNUSED: `mshr::relay::Server` exists with a full ACME/TLS builder (oss/mshr/crates/mshr/src/relay.rs:258-398) and its own round-trip + pebble tests, and grep for `relay::Server|RelayServer|relay_server` across oss/ crates/ app/ returns 13 hits that are ALL the library itself or its own tests — zero production callers, and none at all in crates/yah/, app/yah/ or oss/yubaba/. (c) .yah/infra/workloads/ contains exactly ONE file, yah-cloud-admin.toml. (d) grep for a relay URL across .yah/ returns nothing. So R726-S22's phone \"falling back to relay\" fell back to n0's public infrastructure. Registering that in .yah/services/ — the registry `yah cloud apply` RECONCILES — would declare a domain yah does not own and components it does not deploy. That is a scope question, not a defensible default, which is why it is an operator call below.")
+//! @yah:gotcha("THE HA OPTION THIS TICKET'S OWN next() FAVOURED IS STRUCTURALLY BLOCKED, and the blocker is already documented in-tree. The filing said to consider \"querying the mesh's own service-records endpoint (100.64.0.3:7443/service-records?ready=true) as the source of truth\". SERVICE RECORDS ARE STRICTLY PER-NODE: app/yah/cli/src/mesh.rs:94 records the invariant from service_records.rs's module doc — \"A record's `mesh_ip` must equal the answering node's own mesh address\" (R844-B11) — and `reconcile` rebuilds the set from that node's OWN ContainerRuntime::list_workloads(). THERE IS NO CLUSTER-WIDE SERVICE VIEW. So asking any one node where headscale lives answers only \"on me\" or \"not on me\". Confirmed live in the record: on 2026-09-08 the coordinator MOVED from us-west-001 to us-south-001 (.yah/infra/machines/us-west-001.toml:36), which is exactly the event a health check must survive and exactly the one a per-node query cannot see. Corollary: the R858 gotcha's warning still governs — a check against a public domain reports HEALTHY during a total mesh outage, because yah.dev serves from us-east-001's own passway and never traverses the coordination server.")
+//! @yah:gotcha("TWO SMALL TRAPS FOR THE NEXT EDITOR OF THIS CRATE, both cost me a build. (1) `cargo check -p yah-cloud` FROM THE REPO ROOT reports `error[E0433]: cannot find module or crate serde_yaml` — this is NOT a missing dependency and NOT a vanished artifact. serde_yaml IS declared at oss/yubaba/crates/cloud/Cargo.toml:143 under [dev-dependencies]. oss/yubaba is an independent workspace excluded from the yah root (see CLAUDE.md \"Co-developed OSS repos\"), so from the root the crate is a non-member path dep via [patch.crates-io] and cargo applies no dev-dependencies to it; cargo says so plainly if you use `test` instead of `check` (\"package yah-cloud cannot be tested because it requires dev-dependencies and is not a member of the workspace\"). Correct invocation: `cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib`. Also note the package is `yah-cloud`, not `cloud` — `cloud` is the [lib] name only (Cargo.toml:6 vs :31). (2) A LITERAL `@yah:` INSIDE A RUST DOC COMMENT IS STRIPPED OUT OF THE GENERATED JSON SCHEMA, from the marker to the end of that paragraph. My first draft of ServiceConfig::description's doc said \"...whichever W### doc or `@yah:` annotation last touched the thing\", and emit-schemas produced a description truncated mid-sentence at the backtick. Spell it \"board annotation\" in prose on any type that feeds .yah/schema/.")
+//! @yah:handoff("PHASE 2 LANDED — headscale is registered, described, and probed on the coordination path. NEW FILE .yah/services/headscale/service.toml: name=\"headscale\" (matching the service-record ident leader.rs already upserts), domain=\"cloud.mesh.yah.dev\", description set, health_path=\"/key?v=138\". NO components and NO mirrors/ — deliberately: the appliance is placed by the mesh leader (app/yah/cli/src/mesh.rs start_headscale), not by `yah cloud apply`, so this file makes the service observable without claiming its deployment. Verified that shape cannot break the camp's config load by READING the loader: load_services gates mirrors on `if mirrors_dir.exists()` (config.rs:2909) so a missing dir yields an empty map, and both cross_ref_validate bail-loops iterate `&svc.mirrors` and `&svc.service.components` — empty, so zero iterations. The only service-level check is health_path.starts_with('/'), which the query string satisfies. Pinned with a new test, an_observability_only_service_loads_without_components_or_mirrors, so it stays true.")
+//! @yah:handoff("THE HA QUESTION IS ANSWERED FOR HEADSCALE, AND THE ANSWER IS \"health_path IS ALREADY THE RIGHT SHAPE\" — no second mechanism, per the below-v1.0.0 rule. The filing assumed one domain cannot express \"lives on whichever of N machines won the election\". For this service it can, because the thing that moves and the thing the registry names are different things: the appliance really did migrate us-west-001 -> us-south-001 on 2026-09-08 (R858 handoff), but cloud.mesh.yah.dev terminates at a passway front door on ALL THREE doors (R858-T1, mesh.rs:141), so placement is already abstracted behind one stable address and failover is the doors' job. THE PROBE PATH IS THE PART THAT HAD TO BE RIGHT, and all three measurements were taken 2026-09-20: cloud.mesh.yah.dev/key?v=138 -> 200 in 0.23s; cloud.mesh.yah.dev/ -> 404; yah.dev/ -> 200 in 0.38s. So BOTH obvious choices are wrong and each fails in the direction that hurts — the schema default of \"/\" reports headscale BROKEN while it is healthy, and any public yah domain reports it HEALTHY during a total mesh outage (the R858 false-green, still live: measurement three). /key?v=138 is the control-key fetch, the first call every tailscaled makes and the exact request whose failure opened R858, so nothing but the coordination path can serve it.")
+//! @yah:next("The iroh relay is UNBUILT pending an operator call — see the gotcha: yah operates no relay, so there is nothing to register until someone decides between registering a dependency on n0's public relay and standing up mshr::relay::Server as a real yah service.")
+//! @yah:next("SEPARABLE FOLLOWUP, deliberately not done here: the nine pre-existing services (scrabcake, yah-analytics, yah-chat, yah-cloud, yah-cloud-admin, yah-cr, yah-dashboard, yah-desktop, yah-marketing) still carry no `description`. The field is optional so they all load, but a registry where only headscale is described is half a feature. NOT attempted in this pass because writing nine descriptions for services I had not read would be fabrication — each needs its own service.toml and mirrors read first. Worth one ticket that does all nine at once.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib = 1256 passed / 0 failed / 4 ignored, EXIT=0 (/tmp/r926_full_h5.log), including all three new tests. Live probes 2026-09-20: cloud.mesh.yah.dev/key?v=138 = 200 (0.23s), cloud.mesh.yah.dev/ = 404, yah.dev/ = 200 (0.38s).")
+//! @yah:gotcha("CORRECTION TO THIS TICKET'S OWN RELAY GOTCHA, prompted by the operator (\"I thought we did serve a relay?\") — they were right and my framing was wrong. THERE ARE TWO DIFFERENT RELAYS and the filing conflated them. (1) The iroh/NAT-TRAVERSAL relay (`--xlb-relay` / $YAH_XLB_RELAY): we run none. oss/yubaba/crates/yubaba/src/main.rs:627 says plainly \"unset ships n0's production relays\", and mshr::relay::Server still has zero production callers. That part of the earlier gotcha stands. (2) THE PUSH RELAY: we absolutely do run one, it is ours, and it is a far better fit for this ticket than the iroh relay ever was. crates/yah/push-relay/ is a real crate with its own daemon (src/bin/yah-push-relay.rs), serving ALPN \"yah/push-relay/1\" (protocol.rs:32); yubaba takes --push-relay-node-id whose doc says \"this is normally the relay co-located on this machine\" (main.rs:544-548). It holds the FCM service-account credential and is what makes a phone buzz when a gate is raised (W122 §Push, R726-F7).")
+//! @yah:gotcha("THE PUSH RELAY IS THE CASE health_path GENUINELY CANNOT EXPRESS — and unlike headscale, here the registry really is the wrong shape. It has NO HTTP SURFACE AT ALL: src/bin/yah-push-relay.rs binds an iroh endpoint and serves the ALPN, and grep for health/healthz/axum/http across server.rs + the bin returns nothing but the `.bind()` call at :72. It is reached by hex NodeId over QUIC, so it has no domain and no path — while ServiceConfig REQUIRES `domain` and health_path is defined as \"relative to domain\". Registering it today would mean inventing a `.invalid` domain the way yah-cloud already had to (see .yah/services/yah-cloud/service.toml's note on the R546-S2 domain-requirement tension), and then having no way to probe it. THIS is the real \"a second health mechanism vs change the one that exists\" decision the filing was reaching for — it just belongs to the push relay, not to headscale. The honest shape is probably a dial-the-ALPN liveness check keyed on NodeId, which means `domain` stops being the only way to address a service. That is design work plus an operator call, not a config edit.")
+//! @yah:handoff("SCOPE DELIVERED, AND ONE HALF DELIBERATELY SPLIT OUT. Done: the `description` schema field (new surface, 28 call sites, 3 new tests, artifacts regenerated, drift guard green) and headscale registered at .yah/services/headscale/service.toml with a description and a health check that probes the coordination path itself. NOT done, and split to R926-F1: registering a relay. The filing asked for \"the iroh relay\", which yah does not run — but the operator corrected me that we DO serve a relay, and they are right: it is the PUSH relay (crates/yah/push-relay/), which is ours and is the thing that should be registered. It cannot be registered today because it has no HTTP surface and ServiceConfig requires a `domain` — the genuine schema-shape problem this ticket was reaching for, plus a live operator call on one-shared-relay vs one-per-camp. See the gotchas for both.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib = 1256 passed / 0 failed / 4 ignored, EXIT=0 (/tmp/r926_full_h5.log). scripts/check-schema-drift.sh = exit 0, \"ok: .yah/schema is in sync with the Rust types\". Live probes 2026-09-20 proving the health check discriminates: cloud.mesh.yah.dev/key?v=138 = 200 (0.23s), cloud.mesh.yah.dev/ = 404 (so the schema default of \"/\" would have reported a false RED), yah.dev/ = 200 (the R858 false-GREEN, still live).")
 
 use anyhow::{bail, Context, Result};
 // R870-F26: an `[[ingress]]` edge embeds the renderer's own auth type rather
@@ -1677,18 +1691,10 @@ impl CloudConfig {
         let provider_ids: std::collections::HashSet<&str> =
             providers.iter().map(|p| p.id.as_str()).collect();
         for (svc_name, svc) in services {
-            // A relative health path would be joined onto the origin as if it
-            // were absolute by one URL builder and dropped by the next, so the
-            // probe would silently ask a different question than the file
-            // reads. Refuse it at load instead.
-            if let Some(p) = &svc.service.health_path {
-                if !p.starts_with('/') {
-                    anyhow::bail!(
-                        "services/{svc_name}/service.toml: health_path = \"{p}\" \
-                         must be absolute — write \"/{p}\""
-                    );
-                }
-            }
+            // Addressing is checked here rather than at probe time: a
+            // truncated NodeId or a relative health path otherwise fails
+            // with an error naming neither the file nor the field.
+            svc.service.address.validate(svc_name)?;
             for (env, mirror) in &svc.mirrors {
                 for (slot, body) in &mirror.providers {
                     if let Some(id) = body.provider_id() {
@@ -3408,39 +3414,233 @@ impl ProviderConfig {
     }
 }
 
+/// Where a service answers, and therefore what a liveness probe asks
+/// (R926-F1).
+///
+/// # Why this replaced a bare `domain: String`
+///
+/// `domain` used to be required, and two of this camp's services have no
+/// honest value for it. `yah-cloud` is publish-only and carries
+/// `unset.yah-cloud.invalid` — RFC 2606's reserved TLD, chosen precisely
+/// because the field demanded a string and there was none (the R546-S2
+/// decision, recorded in that file's own header). The push relay is worse
+/// than awkward: it has no HTTP surface at all. It binds an iroh endpoint,
+/// serves ALPN `yah/push-relay/1`, and is addressed by hex `NodeId` over
+/// QUIC — so a `.invalid` domain there would not merely look wrong, it
+/// would leave the service permanently unprobeable, which is the exact
+/// hole R926 exists to close.
+///
+/// The alternative was a second health mechanism beside `health_path`.
+/// This repo is below v1.0.0 and its standing rule is to change the one
+/// mechanism rather than grow a parallel one, so addressing became a sum
+/// type: a service declares exactly one way to be reached, and the prober
+/// switches on it. A service cannot accidentally declare both, and the
+/// enum is what makes that unrepresentable rather than merely validated.
+///
+/// # TOML
+///
+/// ```toml
+/// [address]
+/// kind = "front-door"
+/// domain = "cloud.mesh.yah.dev"
+/// health_path = "/key?v=138"
+/// ```
+///
+/// ```toml
+/// [address]
+/// kind = "node"
+/// node_id = "8f2c…"          # 64 hex chars
+/// alpn = "yah/push-relay/1"
+/// ```
+///
+/// Tagged rather than untagged: an operator edits this file by hand, and
+/// serde's untagged errors name none of the variants it tried.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ServiceAddress {
+    /// An HTTPS front door on a public or mesh domain. What all ten
+    /// services registered in this camp today are.
+    FrontDoor {
+        domain: String,
+        /// Path the probe requests, relative to `domain`. `None` means
+        /// `/`.
+        ///
+        /// `/` is the right question for a service whose root serves a
+        /// site, and the wrong one for an API. An account/RPC origin that
+        /// versions its surface answers only under its prefix and 404s
+        /// everything else *on purpose* — so probing the root reported a
+        /// broken cell for a service that was behaving exactly as
+        /// designed, which is the failure mode the probe exists to remove
+        /// rather than add to. Naming the path here makes the probe ask a
+        /// question the service has agreed to answer.
+        ///
+        /// Service-scoped rather than per-component or per-mirror: one
+        /// domain has one front door and therefore one canonical liveness
+        /// URL, and that URL is a property of the service's own router —
+        /// it does not vary by environment, so repeating it per mirror
+        /// would only let the copies drift.
+        ///
+        /// Must be absolute (leading `/`); the loader refuses anything
+        /// else rather than silently joining it onto the origin.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        health_path: Option<String>,
+    },
+    /// An iroh endpoint: a stable `NodeId` speaking one ALPN. Probed by
+    /// dialling that ALPN and expecting an answer.
+    ///
+    /// There is no path and no port because there is no URL — QUIC
+    /// multiplexes on the ALPN, and the `NodeId` is the address. A
+    /// service reached this way is unreachable from a browser tab, so the
+    /// Services grid links nothing and renders the node id instead.
+    Node {
+        /// Hex-encoded `NodeId`, 64 characters. Not parsed here — this
+        /// crate does not depend on mshr — but the length and alphabet
+        /// are checked at load, because a truncated paste otherwise fails
+        /// at first dial with an error naming neither the file nor the
+        /// field.
+        node_id: String,
+        /// The ALPN to negotiate, e.g. `yah/push-relay/1`. Declared
+        /// rather than inferred from the service name: the protocol is
+        /// the thing being probed and it is versioned independently of
+        /// whatever the service is called.
+        alpn: String,
+    },
+}
+
+impl ServiceAddress {
+    /// Shorthand for the common case.
+    pub fn front_door(domain: impl Into<String>) -> Self {
+        Self::FrontDoor {
+            domain: domain.into(),
+            health_path: None,
+        }
+    }
+
+    /// A front door with a declared probe path.
+    pub fn front_door_at(domain: impl Into<String>, health_path: impl Into<String>) -> Self {
+        Self::FrontDoor {
+            domain: domain.into(),
+            health_path: Some(health_path.into()),
+        }
+    }
+
+    pub fn node(node_id: impl Into<String>, alpn: impl Into<String>) -> Self {
+        Self::Node {
+            node_id: node_id.into(),
+            alpn: alpn.into(),
+        }
+    }
+
+    /// The domain, for the callers that genuinely need one (DNS, zone
+    /// selection, a public URL). `None` for a node-addressed service —
+    /// and those callers must say so rather than substitute a
+    /// placeholder, which is how `unset.yah-cloud.invalid` happened.
+    pub fn domain(&self) -> Option<&str> {
+        match self {
+            Self::FrontDoor { domain, .. } => Some(domain),
+            Self::Node { .. } => None,
+        }
+    }
+
+    pub fn health_path(&self) -> Option<&str> {
+        match self {
+            Self::FrontDoor { health_path, .. } => health_path.as_deref(),
+            Self::Node { .. } => None,
+        }
+    }
+
+    /// One line for a status table or a log: the domain, or `node:<8 hex
+    /// prefix>/<alpn>`. Never a placeholder.
+    pub fn label(&self) -> String {
+        match self {
+            Self::FrontDoor { domain, .. } => domain.clone(),
+            Self::Node { node_id, alpn } => {
+                let short: String = node_id.chars().take(8).collect();
+                format!("node:{short}/{alpn}")
+            }
+        }
+    }
+
+    /// Reject what would otherwise fail at probe time with an error
+    /// naming neither the file nor the field.
+    fn validate(&self, svc_name: &str) -> Result<()> {
+        match self {
+            Self::FrontDoor { domain, health_path } => {
+                if domain.trim().is_empty() {
+                    anyhow::bail!(
+                        "services/{svc_name}/service.toml: address.domain must not be empty"
+                    );
+                }
+                // A relative health path would be joined onto the origin as
+                // if it were absolute by one URL builder and dropped by the
+                // next, so the probe would silently ask a different question
+                // than the file reads. Refuse it at load instead.
+                if let Some(p) = health_path {
+                    if !p.starts_with('/') {
+                        anyhow::bail!(
+                            "services/{svc_name}/service.toml: health_path = \"{p}\" \
+                             must be absolute — write \"/{p}\""
+                        );
+                    }
+                }
+            }
+            Self::Node { node_id, alpn } => {
+                let id = node_id.trim();
+                if id.len() != 64 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+                    anyhow::bail!(
+                        "services/{svc_name}/service.toml: address.node_id = \"{node_id}\" \
+                         is not a NodeId — want 64 hex characters, got {}",
+                        id.len()
+                    );
+                }
+                if alpn.trim().is_empty() {
+                    anyhow::bail!(
+                        "services/{svc_name}/service.toml: address.alpn must not be empty — \
+                         a NodeId with no ALPN names a process, not a service"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// An operator-facing service declaration from
 /// `.yah/services/<svc>/service.toml`.
 ///
 /// A service groups one or more components (a static surface, a containerized
-/// API, an almanac…) under a single domain. Mirrors project the service onto
-/// concrete infra; see [`MirrorConfig`].
+/// API, an almanac…) under a single [`address`](ServiceConfig::address).
+/// Mirrors project the service onto concrete infra; see [`MirrorConfig`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ServiceConfig {
     pub schema_version: u32,
     pub name: String,
-    pub domain: String,
-    /// Path the front-door health probe requests, relative to
-    /// [`domain`](Self::domain). `None` means `/`.
+    /// One-line operator-facing answer to "what is this and why does the
+    /// camp run it?", rendered beside the service wherever it is listed.
     ///
-    /// `/` is the right question for a service whose root serves a site, and
-    /// the wrong one for an API. An account/RPC origin that versions its
-    /// surface answers only under its prefix and 404s everything else *on
-    /// purpose* — so probing the root reported a broken cell for a service
-    /// that was behaving exactly as designed, which is the failure mode the
-    /// probe exists to remove rather than add to. Naming the path here makes
-    /// the probe ask a question the service has agreed to answer.
+    /// New surface in R926, and it exists because the registry had no
+    /// place to say what a service IS. A name and a domain identify a
+    /// service to someone who already knows the fleet; they tell a reader
+    /// who does not nothing at all, so the knowledge lived in whichever
+    /// working doc or board annotation last touched the thing. That is
+    /// exactly the knowledge a health check makes actionable — a red cell
+    /// is only useful next to what went red.
     ///
-    /// Service-scoped rather than per-component or per-mirror: one domain has
-    /// one front door and therefore one canonical liveness URL, and that URL
-    /// is a property of the service's own router — it does not vary by
-    /// environment, so repeating it per mirror would only let the copies
-    /// drift.
+    /// Deliberately not a free-form `[meta]` table: one field with one
+    /// meaning cannot accumulate a second half-owner, which is the
+    /// failure the headscale appliance already demonstrated four times
+    /// over (see this repo's CLAUDE.md on giving a thing ONE owner).
     ///
-    /// Must be absolute (leading `/`); [`validate`](Self::validate) refuses
-    /// anything else rather than silently joining it onto the origin.
+    /// Optional, because nine services predate it and a required field
+    /// would make every one of them fail to load. `None` renders as no
+    /// description rather than as an empty one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub health_path: Option<String>,
+    pub description: Option<String>,
+    /// How this service is reached, and therefore how its liveness is
+    /// probed. See [`ServiceAddress`].
+    pub address: ServiceAddress,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<ServiceComponent>,
     /// Databases this service exposes, grouped by environment (W241). Every
@@ -3453,6 +3653,32 @@ pub struct ServiceConfig {
 }
 
 impl ServiceConfig {
+    /// The service's domain, or `None` when it is node-addressed
+    /// (R926-F1). Callers that cannot proceed without one must say which
+    /// service and why — see [`ServiceAddress::domain`].
+    pub fn domain(&self) -> Option<&str> {
+        self.address.domain()
+    }
+
+    /// The domain, or an error naming this service and what the caller
+    /// wanted it for. The shape every `yah cloud apply` reader wants: a
+    /// node-addressed service is not deployed by the reconcilers at all,
+    /// so reaching one of them with a `Node` address is a config bug and
+    /// deserves a sentence, not an `unwrap`.
+    pub fn require_domain(&self, wanted_for: &str) -> Result<&str> {
+        self.address.domain().ok_or_else(|| {
+            anyhow::anyhow!(
+                "service {} is node-addressed ({}) and has no domain, but {wanted_for} needs one",
+                self.name,
+                self.address.label()
+            )
+        })
+    }
+
+    pub fn health_path(&self) -> Option<&str> {
+        self.address.health_path()
+    }
+
     /// Parse a single `services/<svc>/service.toml` file.
     pub fn load(path: &Path) -> Result<Self> {
         let src =
@@ -6709,6 +6935,8 @@ mesh_tags = ["tag:cloud-runner"]
         let toml_src = r#"
 schema_version = 1
 name = "scrabcake"
+[address]
+kind = "front-door"
 domain = "scrabcake.net.yah.dev"
 
 [[db.dev]]
@@ -6745,7 +6973,7 @@ auth_token_env = "SCRABCAKE_TURSO_TOKEN"
     #[test]
     fn service_without_db_table_has_empty_catalog() {
         let svc: ServiceConfig =
-            toml::from_str("schema_version = 1\nname = \"s\"\ndomain = \"s.dev\"\n").unwrap();
+            toml::from_str("schema_version = 1\nname = \"s\"\n[address]\nkind = \"front-door\"\ndomain = \"s.dev\"\n").unwrap();
         assert!(svc.db.is_empty());
         // And an empty [db] must not appear when re-serialized.
         let out = toml::to_string(&svc).unwrap();
@@ -8143,6 +8371,8 @@ kind = "fly-io"
         let src = r#"
 schema_version = 1
 name = "dev-yah"
+[address]
+kind = "front-door"
 domain = "yah.dev"
 
 [[components]]
@@ -8153,7 +8383,7 @@ role = "static"
 "#;
         let cfg: ServiceConfig = toml::from_str(src).unwrap();
         assert_eq!(cfg.name, "dev-yah");
-        assert_eq!(cfg.domain, "yah.dev");
+        assert_eq!(cfg.domain(), Some("yah.dev"));
         assert_eq!(cfg.components.len(), 1);
         let c = &cfg.components[0];
         assert_eq!(c.id, "site");
@@ -8790,6 +9020,8 @@ orbstack = "~/.orbstack/run/docker.sock"
             svc.join("service.toml"),
             r#"schema_version = 1
 name = "dev-yah"
+[address]
+kind = "front-door"
 domain = "yah.dev"
 
 [[components]]
@@ -8841,7 +9073,7 @@ use = "orbstack"
         assert!(cfg.provider("orbstack").is_some());
 
         let dev = cfg.service("dev-yah").expect("dev-yah service");
-        assert_eq!(dev.service.domain, "yah.dev");
+        assert_eq!(dev.service.domain(), Some("yah.dev"));
         assert_eq!(dev.service.components.len(), 1);
         assert_eq!(dev.mirrors.len(), 2);
         // Legacy file stems "cloud" and "local" are normalised to canonical tier names.
@@ -8864,7 +9096,7 @@ use = "orbstack"
         std::fs::create_dir_all(svc.join("mirrors")).unwrap();
         std::fs::write(
             svc.join("service.toml"),
-            "schema_version = 1\nname = \"dev-yah\"\ndomain = \"yah.dev\"\n",
+            "schema_version = 1\nname = \"dev-yah\"\n[address]\nkind = \"front-door\"\ndomain = \"yah.dev\"\n",
         )
         .unwrap();
         std::fs::write(
@@ -8896,7 +9128,7 @@ use = "orbstack"
         std::fs::create_dir_all(svc.join("mirrors")).unwrap();
         std::fs::write(
             svc.join("service.toml"),
-            "schema_version = 1\nname = \"dev-yah\"\ndomain = \"yah.dev\"\n\n\
+            "schema_version = 1\nname = \"dev-yah\"\n[address]\nkind = \"front-door\"\ndomain = \"yah.dev\"\n\n\
              [[components]]\nid = \"site\"\nkind = \"mesofact-spa\"\n\
              path = \"web/landing\"\nrole = \"static\"\n",
         )
@@ -8926,7 +9158,7 @@ use = "orbstack"
         std::fs::create_dir_all(svc.join("mirrors")).unwrap();
         std::fs::write(
             svc.join("service.toml"),
-            "schema_version = 1\nname = \"dev-yah\"\ndomain = \"yah.dev\"\n\n\
+            "schema_version = 1\nname = \"dev-yah\"\n[address]\nkind = \"front-door\"\ndomain = \"yah.dev\"\n\n\
              [[components]]\nid = \"site\"\nkind = \"mesofact-spa\"\n\
              path = \"web/landing\"\nrole = \"static\"\n\n\
              [[components]]\nid = \"app\"\nkind = \"mesofact-static\"\n\
@@ -8979,7 +9211,7 @@ use = "orbstack"
         std::fs::create_dir_all(svc.join("mirrors")).unwrap();
         std::fs::write(
             svc.join("service.toml"),
-            "schema_version = 1\nname = \"dev-yah\"\ndomain = \"yah.dev\"\n",
+            "schema_version = 1\nname = \"dev-yah\"\n[address]\nkind = \"front-door\"\ndomain = \"yah.dev\"\n",
         )
         .unwrap();
         std::fs::write(
@@ -9007,7 +9239,7 @@ use = "orbstack"
         std::fs::create_dir_all(svc.join("mirrors")).unwrap();
         std::fs::write(
             svc.join("service.toml"),
-            "schema_version = 1\nname = \"local-only\"\ndomain = \"local.test\"\n",
+            "schema_version = 1\nname = \"local-only\"\n[address]\nkind = \"front-door\"\ndomain = \"local.test\"\n",
         )
         .unwrap();
         std::fs::write(
@@ -9206,7 +9438,7 @@ use = "orbstack"
         std::fs::create_dir_all(svc.join("mirrors")).unwrap();
         std::fs::write(
             svc.join("service.toml"),
-            "schema_version = 1\nname = \"dev-yah\"\ndomain = \"yah.dev\"\n",
+            "schema_version = 1\nname = \"dev-yah\"\n[address]\nkind = \"front-door\"\ndomain = \"yah.dev\"\n",
         )
         .unwrap();
         std::fs::write(
@@ -9310,8 +9542,8 @@ out_dir = "dist"
         let svc = ServiceConfig {
             schema_version: 1,
             name: "dev-yah".into(),
-            domain: "yah.dev".into(),
-            health_path: None,
+            address: ServiceAddress::front_door("yah.dev"),
+            description: None,
             db: DbCatalog::default(),
             components: vec![ServiceComponent {
                 mount: None,
@@ -9338,7 +9570,7 @@ out_dir = "dist"
         // Reloads through the full CloudConfig loader (no mirrors yet).
         let cfg = CloudConfig::load(root).unwrap();
         let loaded = cfg.service("dev-yah").expect("dev-yah service");
-        assert_eq!(loaded.service.domain, "yah.dev");
+        assert_eq!(loaded.service.domain(), Some("yah.dev"));
         assert_eq!(loaded.service.components.len(), 1);
         assert_eq!(
             loaded.service.components[0].publishes.as_deref(),
@@ -9359,8 +9591,8 @@ out_dir = "dist"
         ServiceConfig {
             schema_version: 1,
             name: "api".into(),
-            domain: "api.noisetable.com".into(),
-            health_path: Some("/api/v1/status".into()),
+            address: ServiceAddress::front_door_at("api.noisetable.com", "/api/v1/status"),
+            description: None,
             components: vec![],
             db: DbCatalog::default(),
         }
@@ -9369,9 +9601,227 @@ out_dir = "dist"
 
         let cfg = CloudConfig::load(root).unwrap();
         assert_eq!(
-            cfg.service("api").unwrap().service.health_path.as_deref(),
+            cfg.service("api").unwrap().service.health_path(),
             Some("/api/v1/status")
         );
+    }
+
+    /// R926. Same reasoning as the health_path round-trip above, and the
+    /// same failure mode: `description` is `skip_serializing_if =
+    /// "Option::is_none"`, so a serde attribute that silently dropped it
+    /// would leave every service listed without one while the file on
+    /// disk still read correctly.
+    #[test]
+    fn a_declared_description_survives_the_loader() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        ServiceConfig {
+            schema_version: 1,
+            name: "api".into(),
+            address: ServiceAddress::front_door("api.noisetable.com"),
+            description: Some("Account and RPC origin for the noisetable app.".into()),
+            components: vec![],
+            db: DbCatalog::default(),
+        }
+        .save(root)
+        .unwrap();
+
+        let cfg = CloudConfig::load(root).unwrap();
+        assert_eq!(
+            cfg.service("api").unwrap().service.description.as_deref(),
+            Some("Account and RPC origin for the noisetable app.")
+        );
+    }
+
+    /// The nine services that predate R926 carry no `description`, so the
+    /// field has to be genuinely optional rather than optional-with-a-
+    /// default — a required field here would fail the whole camp's config
+    /// load, not just the service missing it.
+    #[test]
+    fn a_service_without_a_description_still_loads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let dir = root.join(".yah/services/api");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("service.toml"),
+            "schema_version = 1\nname = \"api\"\n[address]\nkind = \"front-door\"\ndomain = \"api.noisetable.com\"\n",
+        )
+        .unwrap();
+
+        let cfg = CloudConfig::load(root).unwrap();
+        assert_eq!(cfg.service("api").unwrap().service.description, None);
+    }
+
+    /// R926-F1. The push relay has no HTTP surface at all: it binds an
+    /// iroh endpoint and serves one ALPN, so a `domain` for it could only
+    /// ever be a placeholder, and a placeholder cannot be probed. This is
+    /// the shape that replaced that dead end.
+    #[test]
+    fn a_node_addressed_service_loads_and_reports_no_domain() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let dir = root.join(".yah/services/push-relay");
+        std::fs::create_dir_all(&dir).unwrap();
+        let node_id = "a".repeat(64);
+        std::fs::write(
+            dir.join("service.toml"),
+            format!(
+                "schema_version = 1\nname = \"push-relay\"\n\
+                 description = \"Mobile push fanout.\"\n\
+                 [address]\nkind = \"node\"\n\
+                 node_id = \"{node_id}\"\nalpn = \"yah/push-relay/1\"\n"
+            ),
+        )
+        .unwrap();
+
+        let cfg = CloudConfig::load(root).unwrap();
+        let svc = &cfg.service("push-relay").unwrap().service;
+        assert_eq!(svc.domain(), None, "a node has no domain, not a fake one");
+        assert_eq!(svc.health_path(), None);
+        assert_eq!(
+            svc.address,
+            ServiceAddress::node(&node_id, "yah/push-relay/1")
+        );
+        // The label is what a status table prints. It must never be blank
+        // and must never be a domain-shaped lie.
+        assert_eq!(svc.address.label(), "node:aaaaaaaa/yah/push-relay/1");
+    }
+
+    /// A caller that genuinely needs a domain gets a sentence naming the
+    /// service and what it wanted one for — not an `unwrap` panic and not
+    /// an empty string silently probing the wrong origin.
+    #[test]
+    fn require_domain_on_a_node_service_names_the_service_and_the_caller() {
+        let svc = ServiceConfig {
+            schema_version: 1,
+            name: "push-relay".into(),
+            description: None,
+            address: ServiceAddress::node("b".repeat(64), "yah/push-relay/1"),
+            components: vec![],
+            db: DbCatalog::default(),
+        };
+        let err = svc
+            .require_domain("a DNS record")
+            .expect_err("a node service has no domain");
+        let msg = err.to_string();
+        assert!(msg.contains("push-relay"), "{msg}");
+        assert!(msg.contains("a DNS record"), "{msg}");
+        assert!(msg.contains("node:bbbbbbbb"), "{msg}");
+    }
+
+    /// A truncated paste is the realistic way a `node_id` goes wrong, and
+    /// it would otherwise surface as a dial timeout naming neither the
+    /// file nor the field.
+    #[test]
+    fn a_truncated_node_id_is_refused_at_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let dir = root.join(".yah/services/push-relay");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("service.toml"),
+            "schema_version = 1\nname = \"push-relay\"\n\
+             [address]\nkind = \"node\"\n\
+             node_id = \"abc123\"\nalpn = \"yah/push-relay/1\"\n",
+        )
+        .unwrap();
+
+        let err = CloudConfig::load(root).expect_err("a short node_id must not load");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("node_id"), "{msg}");
+        assert!(msg.contains("64 hex"), "{msg}");
+    }
+
+    /// A NodeId with no ALPN names a process, not a service — there would
+    /// be nothing to dial.
+    #[test]
+    fn a_node_address_without_an_alpn_is_refused_at_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let dir = root.join(".yah/services/push-relay");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("service.toml"),
+            format!(
+                "schema_version = 1\nname = \"push-relay\"\n\
+                 [address]\nkind = \"node\"\n\
+                 node_id = \"{}\"\nalpn = \"\"\n",
+                "c".repeat(64)
+            ),
+        )
+        .unwrap();
+
+        let err = CloudConfig::load(root).expect_err("an empty alpn must not load");
+        assert!(format!("{err:#}").contains("alpn"), "{err:#}");
+    }
+
+    /// `save` writes TOML that `load` accepts, for both address kinds. The
+    /// ordering trap is real: an `[address]` table emitted before a scalar
+    /// field would produce a file `toml` cannot parse back.
+    #[test]
+    fn both_address_kinds_survive_a_save_load_round_trip() {
+        for address in [
+            ServiceAddress::front_door_at("api.example", "/healthz"),
+            ServiceAddress::node("d".repeat(64), "yah/push-relay/1"),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let root = tmp.path();
+            let svc = ServiceConfig {
+                schema_version: 1,
+                name: "round-trip".into(),
+                description: Some("described".into()),
+                address: address.clone(),
+                components: vec![],
+                db: DbCatalog::default(),
+            };
+            svc.save(root).unwrap();
+            let cfg = CloudConfig::load(root).unwrap();
+            let back = &cfg.service("round-trip").unwrap().service;
+            assert_eq!(back.address, address);
+            assert_eq!(back.description.as_deref(), Some("described"));
+        }
+    }
+
+    /// R926. `.yah/services/headscale/service.toml` is the first service in
+    /// the tree with NO components and NO `mirrors/` directory — it is
+    /// registered to be described and probed, not deployed (the mesh leader
+    /// places the appliance, not `yah cloud apply`). That shape has to load,
+    /// because the alternative is that adding an observability-only service
+    /// fails the config load for the whole camp.
+    ///
+    /// Also pins the query string: the coordination probe is `/key?v=138`,
+    /// and a validator that got stricter about what follows the leading `/`
+    /// would silently un-register the one service whose false-green took the
+    /// mesh down for 37 hours.
+    #[test]
+    fn an_observability_only_service_loads_without_components_or_mirrors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        let dir = root.join(".yah/services/headscale");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("service.toml"),
+            "schema_version = 1\n\
+             name = \"headscale\"\n\
+             description = \"Mesh coordination server.\"\n\
+             [address]\n\
+             kind = \"front-door\"\n\
+             domain = \"cloud.mesh.yah.dev\"\n\
+             health_path = \"/key?v=138\"\n",
+        )
+        .unwrap();
+
+        let cfg = CloudConfig::load(root).unwrap();
+        let svc = cfg.service("headscale").unwrap();
+        assert_eq!(svc.service.health_path(), Some("/key?v=138"));
+        assert_eq!(
+            svc.service.description.as_deref(),
+            Some("Mesh coordination server.")
+        );
+        assert!(svc.service.components.is_empty());
+        assert!(svc.mirrors.is_empty());
     }
 
     #[test]
@@ -9386,8 +9836,8 @@ out_dir = "dist"
         ServiceConfig {
             schema_version: 1,
             name: "api".into(),
-            domain: "api.noisetable.com".into(),
-            health_path: Some("api/v1/status".into()),
+            address: ServiceAddress::front_door_at("api.noisetable.com", "api/v1/status"),
+            description: None,
             components: vec![],
             db: DbCatalog::default(),
         }
@@ -9410,19 +9860,19 @@ out_dir = "dist"
         let mut svc = ServiceConfig {
             schema_version: 1,
             name: "dev-yah".into(),
-            domain: "yah.dev".into(),
-            health_path: None,
+            address: ServiceAddress::front_door("yah.dev"),
+            description: None,
             components: vec![],
             db: DbCatalog::default(),
         };
         svc.save(root).unwrap();
-        svc.domain = "yah.example".into();
+        svc.address = ServiceAddress::front_door("yah.example");
         svc.save(root).unwrap();
 
         let cfg = CloudConfig::load(root).unwrap();
         assert_eq!(
-            cfg.service("dev-yah").unwrap().service.domain,
-            "yah.example"
+            cfg.service("dev-yah").unwrap().service.domain(),
+            Some("yah.example")
         );
     }
 
@@ -9435,8 +9885,8 @@ out_dir = "dist"
         ServiceConfig {
             schema_version: 1,
             name: "dev-yah".into(),
-            domain: "yah.dev".into(),
-            health_path: None,
+            address: ServiceAddress::front_door("yah.dev"),
+            description: None,
             components: vec![],
             db: DbCatalog::default(),
         }
@@ -9514,8 +9964,8 @@ out_dir = "dist"
         let svc = ServiceConfig {
             schema_version: 1,
             name: "dev-yah".into(),
-            domain: "yah.dev".into(),
-            health_path: None,
+            address: ServiceAddress::front_door("yah.dev"),
+            description: None,
             components: vec![],
             db: DbCatalog::default(),
         };
@@ -9553,8 +10003,8 @@ out_dir = "dist"
         ServiceConfig {
             schema_version: 1,
             name: "dev-yah".into(),
-            domain: "yah.dev".into(),
-            health_path: None,
+            address: ServiceAddress::front_door("yah.dev"),
+            description: None,
             components: vec![],
             db: DbCatalog::default(),
         }
@@ -9593,8 +10043,8 @@ out_dir = "dist"
         let svc = ServiceConfig {
             schema_version: 1,
             name: "yah-marketing".into(),
-            domain: "yah.dev".into(),
-            health_path: None,
+            address: ServiceAddress::front_door("yah.dev"),
+            description: None,
             db: DbCatalog::default(),
             components: vec![ServiceComponent {
                 mount: None,
@@ -9898,8 +10348,8 @@ worker_bundle_path = ".yah/workers/cdn-yah-dev/"
         let svc = ServiceConfig {
             schema_version: 1,
             name: "yah-marketing".into(),
-            domain: "yah.dev".into(),
-            health_path: None,
+            address: ServiceAddress::front_door("yah.dev"),
+            description: None,
             db: DbCatalog::default(),
             components: vec![
                 ServiceComponent {
@@ -10203,8 +10653,8 @@ component = "yah-marketing/site"
         let svc = ServiceConfig {
             schema_version: 1,
             name: "noisetable-marketing".into(),
-            domain: "noisetable.com".into(),
-            health_path: None,
+            address: ServiceAddress::front_door("noisetable.com"),
+            description: None,
             db: DbCatalog::default(),
             components: vec![
                 ServiceComponent {
@@ -10249,8 +10699,8 @@ component = "yah-marketing/site"
         let svc = ServiceConfig {
             schema_version: 1,
             name: "noisetable-marketing".into(),
-            domain: "noisetable.com".into(),
-            health_path: None,
+            address: ServiceAddress::front_door("noisetable.com"),
+            description: None,
             db: DbCatalog::default(),
             components: vec![
                 ServiceComponent {
@@ -10296,8 +10746,8 @@ component = "yah-marketing/site"
         let svc = ServiceConfig {
             schema_version: 1,
             name: "noisetable".into(),
-            domain: "noisetable.com".into(),
-            health_path: None,
+            address: ServiceAddress::front_door("noisetable.com"),
+            description: None,
             db: DbCatalog::default(),
             components: vec![
                 ServiceComponent {
@@ -10341,8 +10791,8 @@ component = "yah-marketing/site"
         let svc = ServiceConfig {
             schema_version: 1,
             name: "noisetable".into(),
-            domain: "noisetable.com".into(),
-            health_path: None,
+            address: ServiceAddress::front_door("noisetable.com"),
+            description: None,
             db: DbCatalog::default(),
             components: vec![
                 ServiceComponent {

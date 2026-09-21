@@ -542,8 +542,8 @@ mod tests {
         ServiceConfig {
             schema_version: 1,
             name: name.into(),
-            domain: "releases.example".into(),
-            health_path: None,
+            address: crate::config::ServiceAddress::front_door("releases.example"),
+            description: None,
             components,
             db: crate::DbCatalog::default(),
         }

@@ -536,6 +536,27 @@ pub(crate) fn write_if_changed(path: &Path, content: &[u8]) -> std::io::Result<b
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "unnamed cert path"))?;
     // NOT `with_extension("tmp")` — that maps both `tls.crt` and `tls.key` onto
     // the same `tls.tmp`, so the two writes of one pair would race each other.
+    //
+    // R925 CLEARED — one writer per path, and it must stay hand-rolled anyway.
+    // Three call sites: `materialize_pair` writes `<cert_dir>/<ident>/tls.key`
+    // then `tls.crt`, sequentially, from the single reconcile loop
+    // [`spawn`] arms; `domain_issuer::materialize_token` writes
+    // `<token_dir>/<domain>.token` from the single declared-records loop. Those
+    // two loops are concurrent tasks in one process but their directories are
+    // disjoint (`cfg.cert_dir` vs `DECLARED_TOKEN_DIR`), and neither iterates
+    // its domains in parallel — so no two writers ever share a staging path.
+    //
+    // STAYS HAND-ROLLED regardless of the above: the staging file is opened at
+    // `PAIR_MODE` (0600) precisely so a tenant's private key is never briefly
+    // world-readable, and the generic `atomic_write` helpers added for R925
+    // elsewhere in this tree use default permissions. Routing this through one
+    // would be a silent privilege regression on key material. If this ever does
+    // need pid-disambiguation, add it to the `format!` below and keep the
+    // `.mode(PAIR_MODE)` open.
+    //
+    // RE-EXPOSED IF: either loop parallelises its per-domain work (a `join_all`
+    // over domains), a third caller writes one of these paths, or `cert_dir` and
+    // the token dir are ever pointed at the same directory.
     let tmp = path.with_file_name(format!("{name}.tmp"));
 
     let mut f = std::fs::OpenOptions::new()

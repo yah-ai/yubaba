@@ -146,6 +146,8 @@ mod tests {
             &root.join(".yah/services/dev-yah/service.toml"),
             r#"schema_version = 1
 name = "dev-yah"
+[address]
+kind = "front-door"
 domain = "yah.dev"
 
 [[components]]

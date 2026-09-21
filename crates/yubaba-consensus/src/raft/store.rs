@@ -171,14 +171,54 @@ fn io_other<E: Display>(e: E) -> io::Error {
 /// full disk) leaves a truncated JSON document that turns the daemon into a
 /// crash loop with nothing left to recover from. A rename is atomic, so a
 /// reader sees either the whole previous document or the whole new one.
+///
+/// # R925: why the staging name carries a pid
+///
+/// It used to be `path.with_extension("tmp")` — fixed, and therefore shared by
+/// every writer of that file. Inside one process that was safe: openraft drives
+/// each store behind `&mut self` on its own worker, `build_snapshot` never
+/// touches disk, and the four files have four distinct stems, so no two writers
+/// ever aimed at one staging path.
+///
+/// Across processes it is reachable. [`seed_state_machine`] (`yubaba state
+/// restore`) writes `raft_state.json` from a *second* process, and its guard is
+/// an `exists()` check over the four files — a TOCTOU window, not a lock. The
+/// case it does not cover is the one the guard's own error message sends the
+/// operator into: stop yubaba, remove all four, restore. With `Restart=always`
+/// the daemon comes back onto the now-empty dir and starts persisting while the
+/// restore is mid-write, and both are writing `raft_state.tmp`. The result of
+/// losing that race is not a retry — `YubabaStateMachine::open` `?`s on a parse
+/// failure, so the node is a crash loop with nothing left to recover from.
+///
+/// The staging file is removed when the rename fails. That cleanup did not exist
+/// before and did not need to: a fixed name was reused by the next write, so a
+/// leak was self-limiting. A pid+sequence name never is.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), io::Error> {
-    let tmp = path.with_extension("tmp");
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    // Kept ending in `.tmp` so `writes_land_atomically_and_leave_no_temp_file`
+    // still recognises a leak.
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
+        _ => PathBuf::from(name),
+    };
+
     {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     #[cfg(unix)]
     if let Some(dir) = path.parent() {
         std::fs::File::open(dir)?.sync_all()?;

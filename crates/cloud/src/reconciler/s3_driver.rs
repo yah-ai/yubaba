@@ -352,7 +352,7 @@ mod tests {
 
     fn service(mirrors: &[(&str, &str)]) -> ServiceWithMirrors {
         let service: ServiceConfig =
-            toml::from_str("schema_version = 1\nname = \"svc\"\ndomain = \"svc.example\"\n")
+            toml::from_str("schema_version = 1\nname = \"svc\"\n[address]\nkind = \"front-door\"\ndomain = \"svc.example\"\n")
                 .expect("parse service");
         ServiceWithMirrors {
             service,

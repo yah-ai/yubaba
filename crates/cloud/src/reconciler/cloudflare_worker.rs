@@ -470,8 +470,8 @@ account_id = "test-account"
             let service = ServiceConfig {
                 schema_version: 1,
                 name: "yah-cr".to_string(),
-                domain: "cr.yah.dev".to_string(),
-                health_path: None,
+                address: crate::config::ServiceAddress::front_door("cr.yah.dev".to_string()),
+                description: None,
                 components: vec![],
                 db: crate::DbCatalog::default(),
             };

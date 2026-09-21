@@ -50,59 +50,59 @@ json-schema = ["dep:schemars", "workload-spec/json-schema", "local-driver/json-s
 libc = "0.2"
 # WorkloadSpec — typed wire format for yubaba workloads. Used by WorkloadConfig
 # to validate workload TOML against the schema (R092-F1).
-workload-spec = { package = "yah-workload-spec", version = "0.8.40" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.41" }
 # Almanac feed configs + OnChangeConfig — dispatch_on_change maps on_change
 # to the correct reconciler (R330-F4). Cross-workspace since R746-T10 (it lives
 # in oss/mesofact now), so it drops the `path =` and resolves through this
 # workspace's `[patch.crates-io]` block like every other out-of-tree dep.
-yah-almanac = { version = "0.8.40" }
+yah-almanac = { version = "0.8.41" }
 
 # Shared credential vault — HetznerDriver::from_default_sources() reads
 # hetzner-api-token / hetzner-s3-access-key / hetzner-s3-secret-key
 # from this vault, falling back to HETZNER_* env vars (R040-F9).
-fob = { version = "0.8.40" }
+fob = { version = "0.8.41" }
 # Shared Hetzner Cloud API client — transport, bearer auth, and server/SSH-key
 # operations. Cloud crate adds S3 bucket ops and MachineProvider trait impl on top.
-yah-hetzner = { path = "../hetzner", version = "0.8.40" }
+yah-hetzner = { path = "../hetzner", version = "0.8.41" }
 
 # R859-F2: the floating-IP seam + the pure ingress-failover planner, which used
 # to live in this crate's `provider::floating_ip`. Extracted so `yubaba` can
 # depend on the planner without depending on `cloud` — the same carve-out
 # R374-F3 made for `yah-local-driver` below, and made again here by operator
 # decision (2026-09-08) rather than reversing it. Short extern name `floating_ip`.
-floating_ip = { package = "yah-floating-ip", path = "../floating-ip", version = "0.8.40" }
+floating_ip = { package = "yah-floating-ip", path = "../floating-ip", version = "0.8.41" }
 
 # R859-F3: the Hetzner/OVH/Vultr HTTP clients that used to be
 # `provider::{hetzner,ovh,vultr}_floating_ip`. Moved out for the same reason as
 # the seam above — the fleet daemon needs them to actually MOVE an IP, and it
 # must not link `cloud` to get them. What stayed here is the envoy verb layer
 # (`provider::floating_ip_envoy`) and the `fob` credential lookup.
-floating_ip_adapters = { package = "yah-floating-ip-adapters", path = "../floating-ip-adapters", version = "0.8.40" }
+floating_ip_adapters = { package = "yah-floating-ip-adapters", path = "../floating-ip-adapters", version = "0.8.41" }
 
 # Object-store trait + R2 impl — publish_to_r2 delegates PUT/GET ops here (R498-F5).
-yah-object-store = { version = "0.8.40" }
+yah-object-store = { version = "0.8.41" }
 
 # W272 mesofact bundle store (R599-F1) — content-addressed blob/manifest publish.
 # `store` feature pulls the ObjectStore-backed publish/materialize surface.
-yah-mesofact-bundle = { version = "0.8.40", features = ["store"] }
+yah-mesofact-bundle = { version = "0.8.41", features = ["store"] }
 
 # Local-tier infrastructure primitives (docker-CLI driver + S3 SigV4 helpers).
 # Both cloud and yubaba depend on this — moved out of cloud in R374-F3 so
 # yubaba could own MinIO lifecycle without a reverse yubaba→cloud dep.
-local-driver = { package = "yah-local-driver", version = "0.8.40" }
+local-driver = { package = "yah-local-driver", version = "0.8.41" }
 
 # Kamaji supervisor — the dev-tier capability drivers (yah-pg-dev,
 # yah-smtp-dev, yah-s3-fs) run as host binaries through the Native fork+exec
 # backend (R490-F2; W199's "ideal native-backend case"), so dev-tier workloads
 # share one supervision primitive instead of each calling Command::spawn.
-kamaji = { version = "0.8.40", features = ["native-integration"] }
+kamaji = { version = "0.8.41", features = ["native-integration"] }
 
 # Forge executor + transform recipe loader. Cloud's static-asset reconciler
 # materializes derived assets (W164) by lowering recipes → ForgeSpec and
 # handing them to a `dyn ForgeExecutor`. The dep edge intentionally stops
 # here: no cloud → qed edge, only cloud → task (R438-T13 architectural rule).
-velveteen = { version = "0.8.40" }
-velveteen-exec = { version = "0.8.40" }
+velveteen = { version = "0.8.41" }
+velveteen-exec = { version = "0.8.41" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

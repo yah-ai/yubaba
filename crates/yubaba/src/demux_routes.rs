@@ -784,6 +784,25 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
     }
+    // R925 CLEARED — one writer, because every caller reaches here from
+    // `publish_sweep`, and `publish_sweep` runs only inside the single publisher
+    // task [`spawn`] arms (one `demux_routes::spawn` call, in `main.rs`), one
+    // sweep at a time, on a `spawn_blocking` the loop awaits. Inside a sweep the
+    // `:443` table, the `:80` table and each holding page are written in
+    // sequence, never concurrently. The demux itself only ever reads these
+    // files. So no two writers share `path.with_extension("tmp")`.
+    //
+    // RE-EXPOSED IF: a second `spawn` is armed in one process; the three publish
+    // steps in `publish_sweep` are ever run concurrently (a `join!`, a
+    // per-page `spawn`); or a CLI subcommand gains the ability to publish a
+    // route table out of band, which would be a second *process* on one path.
+    //
+    // Note for whoever does any of those: this name also ALIASES ACROSS TARGETS.
+    // `with_extension` replaces the last component, so a `routes_file` and an
+    // `http_routes_file` that differ only in their final extension both stage at
+    // one path. The deployed pair does not (`demux.routes` -> `demux.tmp`,
+    // `http-router.routes` -> `http-router.tmp`), but both are operator-set env
+    // vars, and today only the sequencing above makes that safe.
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
