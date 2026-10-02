@@ -235,6 +235,18 @@
 //! @yah:gotcha("THE PUSH RELAY IS THE CASE health_path GENUINELY CANNOT EXPRESS — and unlike headscale, here the registry really is the wrong shape. It has NO HTTP SURFACE AT ALL: src/bin/yah-push-relay.rs binds an iroh endpoint and serves the ALPN, and grep for health/healthz/axum/http across server.rs + the bin returns nothing but the `.bind()` call at :72. It is reached by hex NodeId over QUIC, so it has no domain and no path — while ServiceConfig REQUIRES `domain` and health_path is defined as \"relative to domain\". Registering it today would mean inventing a `.invalid` domain the way yah-cloud already had to (see .yah/services/yah-cloud/service.toml's note on the R546-S2 domain-requirement tension), and then having no way to probe it. THIS is the real \"a second health mechanism vs change the one that exists\" decision the filing was reaching for — it just belongs to the push relay, not to headscale. The honest shape is probably a dial-the-ALPN liveness check keyed on NodeId, which means `domain` stops being the only way to address a service. That is design work plus an operator call, not a config edit.")
 //! @yah:handoff("SCOPE DELIVERED, AND ONE HALF DELIBERATELY SPLIT OUT. Done: the `description` schema field (new surface, 28 call sites, 3 new tests, artifacts regenerated, drift guard green) and headscale registered at .yah/services/headscale/service.toml with a description and a health check that probes the coordination path itself. NOT done, and split to R926-F1: registering a relay. The filing asked for \"the iroh relay\", which yah does not run — but the operator corrected me that we DO serve a relay, and they are right: it is the PUSH relay (crates/yah/push-relay/), which is ours and is the thing that should be registered. It cannot be registered today because it has no HTTP surface and ServiceConfig requires a `domain` — the genuine schema-shape problem this ticket was reaching for, plus a live operator call on one-shared-relay vs one-per-camp. See the gotchas for both.")
 //! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib = 1256 passed / 0 failed / 4 ignored, EXIT=0 (/tmp/r926_full_h5.log). scripts/check-schema-drift.sh = exit 0, \"ok: .yah/schema is in sync with the Rust types\". Live probes 2026-09-20 proving the health check discriminates: cloud.mesh.yah.dev/key?v=138 = 200 (0.23s), cloud.mesh.yah.dev/ = 404 (so the schema default of \"/\" would have reported a false RED), yah.dev/ = 200 (the R858 false-GREEN, still live).")
+//!
+//! @yah:ticket(R931-B2, "yah cloud validate is a false green for the component mount/route cross-check")
+//! @yah:status(review)
+//! @yah:at(2026-09-22T01:05:59Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R931)
+//! @yah:handoff("Tier: Cleric — a validator gap; the check exists, the surface does not run it. MUTATION-PROVED 2026-09-21, not inferred. ServiceComponent::mount's own doc says a component mounted at /app \"must be routed at /app or /app/*, because a disagreement means requests land on a prefix nothing published to — a 404 whose cause is two files apart\", and names CloudConfig::cross_ref_validate as enforcing it \"at config load\". THE TEST: with a component declaring mount = \"/issues\" and the domain manifest routing \"/issues\" + \"/issues/*\", the mount was mutated to \"/issuez\"; the mutation was confirmed PRESENT by grep (count 1) before the run; `yah cloud validate` still printed \"ok — no alias or port collisions, no inert taints, no retired arch tags, ...\" and exited 0. Reverted by hand, grep count 0 afterwards. So validate does cover alias/port/taint/arch/ingress collisions — it caught a genuine two-upstream ingress collision on the same hostname in the same session, loudly and correctly — but it does NOT run the mount/route cross-check. WHY IT MATTERS MORE THAN IT LOOKS: the failure mode the doc describes is a 404 on a prefix nothing published to, discovered in production, with the two disagreeing strings in different files. `validate` is the obvious place to catch it and currently reports clean. NOT ESTABLISHED: whether cross_ref_validate is simply not called by the validate subcommand, or is called and the mount arm is skipped — I did not read the validate entry point, only the field docs and the loop near config.rs:1773.")
+//! @yah:handoff("FIXED at oss/yubaba/crates/cloud/src/config.rs:1863 (CloudConfig::cross_ref_validate). Removed the `if !matches!(route.mode, RouteMode::Static { .. }) { continue; }` gate that silently skipped the mount/route cross-check for every mode except Static. The loop was already narrowed to component-referencing modes one screen up (`let Some(component_ref) = route.mode.component() else { continue }` — RouteMode::component() returns Some only for Static and Backend, None for StaticBucket and Redirect), so deleting the Static-only re-gate makes the check fire for Backend too while StaticBucket/Redirect remain correctly exempt (neither references a component at all).")
+//! @yah:verify("Baseline (pre-fix, gate reverted by hand via Edit, not git): `cargo test -p yah-cloud --lib` from oss/yubaba = 1266 passed, 0 failed, 4 ignored, exit 0. After fix + 2 new tests: 1268 passed, 0 failed, 4 ignored, exit 0 (the +2 are the new tests, confirmed by name in output: config::tests::a_backend_mode_mount_that_disagrees_with_its_route_path_is_rejected and config::tests::a_backend_mode_route_matching_its_mount_loads, both ok). `cargo build -p yah-cloud` from oss/yubaba: exit 0, no new warnings (one pre-existing unrelated warning in yah-object-store::parse_list_v2). Not committed — .yah/git-policy is `defer`, so the diff is left uncommitted at HEAD f7daeb07 for the camp's git sweep.")
+//! @yah:gotcha("Investigated whether widening to Backend could false-positive against a legitimate use: R898-F3's documented pattern of a Backend route proxying `/api/issues` to an origin's `/issues` via `origin_path` rewrite, where public path and origin path deliberately diverge. Traced route_table.rs::resolve_mode/backend_origin: Backend's resolved origin comes from `component_workload_ident` (direct mesh-address lookup), and any path rewrite is via `origin_path`/route.path — `mount` is never consulted there. So the widened check compares `component.mount` against `route.path`'s prefix (same as Static), which is orthogonal to `origin_path` and does not conflict with the rewrite pattern. Confirmed empirically: grepped the whole repo (`.yah/domains/*.toml`) and the whole yah-cloud test suite for `mode = \"backend\"` — zero hits anywhere, so no existing fixture or real config exercises this path today, and none broke.")
+//! @yah:assumes("Did not touch app/yah/cli/src/cloud.rs (owned by a sibling courier this relay) — handle_validate() already calls CloudConfig::load() correctly per the original diagnosis, so no change was needed there.")
+//! @yah:verify("INDEPENDENTLY RE-VERIFIED by a separate courier against the current tree (not the implementing courier's self-report). cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib = 1268 passed / 0 failed / 4 ignored, matching the claim exactly. Both new tests confirmed present and passing by name: config::tests::a_backend_mode_mount_that_disagrees_with_its_route_path_is_rejected and config::tests::a_backend_mode_route_matching_its_mount_loads. The Static-only re-gate is confirmed GONE from cross_ref_validate at config.rs:1863, with the loop now narrowing via RouteMode::component() upstream instead. cargo build -p yah exit 0.")
 
 use anyhow::{bail, Context, Result};
 // R870-F26: an `[[ingress]]` edge embeds the renderer's own auth type rather
@@ -1845,18 +1857,27 @@ impl CloudConfig {
                     );
                 };
 
-                // R746: a mounted component must be routed where it publishes.
-                // The publisher writes its bundle under the mount and the front
-                // door looks a request up by its own path, so a route path and
-                // a mount that disagree produce a 404 with its cause two files
-                // away. Checked in both directions, since either one alone is
-                // the same silent miss.
+                // R746 / R931-B2: a mounted component must be routed where it
+                // publishes. The publisher writes its bundle under the mount
+                // and the front door looks a request up by its own path, so a
+                // route path and a mount that disagree produce a 404 with its
+                // cause two files away. Checked in both directions, since
+                // either one alone is the same silent miss.
                 //
-                // Static routes only: `mount` is a *storage* prefix, and a
-                // backend route proxies to an origin that owns its own paths.
-                if !matches!(route.mode, RouteMode::Static { .. }) {
-                    continue;
-                }
+                // Every mode that names a component is in scope, not Static
+                // alone: [`RouteMode::component`] already narrowed the loop to
+                // Static and Backend above (`route.mode.component()` returns
+                // `None`, and `continue`s, for StaticBucket and Redirect,
+                // neither of which references a component at all). A prior
+                // version of this gate additionally required
+                // `RouteMode::Static` here on the theory that a backend route
+                // "proxies to an origin that owns its own paths" — but that
+                // reasoning was about `origin`/`origin_path`, a field this
+                // check never reads; it was silently skipping Backend
+                // entirely rather than narrowly exempting the one field that
+                // legitimately diverges (R931-B2, mutation-proved: a
+                // Backend-mode component's mount could disagree with its
+                // route path and `yah cloud validate` still exited 0).
                 let mount = component.mount.as_deref().map(normalize_mount);
                 let route_prefix = route_path_prefix(&route.path);
                 if let Some(mount) = mount {
@@ -3310,6 +3331,14 @@ pub enum Provider {
     /// "the machine you are sitting at" is not an account to point at.
     /// See `reconciler::local_process`.
     LocalProcess,
+    /// Dev-tier compute on an attached iOS device or simulator, or Android
+    /// device or emulator (R941). The slot's `target` names which
+    /// (`ios-simulator | ios-device | android-emulator | android-device`) and
+    /// optional `device` pins one by id or name; the component's
+    /// `workload.toml` `[device]` section names the app. Launched and
+    /// supervised through the host's own `simctl` / `devicectl` / `adb`.
+    /// Inline-only, like `local-process`. See `reconciler::device`.
+    Device,
     /// Containerized miniflare (workerd subprocess) fronting MinIO — the
     /// pond-tier stand-in for a CF Worker + R2 static surface. Inline-only;
     /// the reconciler spawns miniflare via the JS runtime and starts a MinIO
@@ -10627,6 +10656,67 @@ component = "yah-marketing/site"
         let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
         assert!(err.contains("no `mount`"), "{err}");
         assert!(err.contains("/docs"), "{err}");
+    }
+
+    /// R931-B2: the mount/route cross-check must fire for `mode = "backend"`
+    /// too, not just `mode = "static"` — [`RouteMode::component`] resolves a
+    /// component reference for both, and a mounted component routed under the
+    /// wrong prefix is the same silent-404 defect regardless of which mode
+    /// serves it. Mutation-proved before this fix: `yah cloud validate`
+    /// exited 0 against exactly this mismatch.
+    #[test]
+    fn a_backend_mode_mount_that_disagrees_with_its_route_path_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_two_component_service(root);
+        write_domain_toml(
+            root,
+            "yah-dev",
+            r#"
+schema_version = 1
+name = "yah-dev"
+domain = "yah.dev"
+front_door = "worker"
+cdn_bucket = "yah-dev"
+
+[[routes]]
+path = "/studio/*"
+mode = "backend"
+component = "yah-marketing/app"
+origin = "http://127.0.0.1:9000"
+"#,
+        );
+        let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
+        assert!(err.contains("mount = \"/app\""), "{err}");
+        assert!(err.contains("/studio/*"), "{err}");
+    }
+
+    /// The positive control for the same widening: a `backend` route at its
+    /// component's actual mount must still load cleanly.
+    #[test]
+    fn a_backend_mode_route_matching_its_mount_loads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_two_component_service(root);
+        write_domain_toml(
+            root,
+            "yah-dev",
+            r#"
+schema_version = 1
+name = "yah-dev"
+domain = "yah.dev"
+front_door = "worker"
+cdn_bucket = "yah-dev"
+
+[[routes]]
+path = "/app/*"
+mode = "backend"
+component = "yah-marketing/app"
+origin = "http://127.0.0.1:9000"
+"#,
+        );
+        let cfg = CloudConfig::load(root).unwrap();
+        assert_eq!(cfg.domain("yah-dev").unwrap().routes.len(), 1);
     }
 
     #[test]

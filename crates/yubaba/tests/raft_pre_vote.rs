@@ -28,21 +28,18 @@
 //! grant; an unreachable peer does not) are unit tests in
 //! `src/raft/network.rs`, where a fake HTTP peer can be posed exactly.
 //!
-//! # Pre-Vote is currently switched OFF (R734-T3), and this suite still passes
+//! # Pre-Vote is ON again (R734-T6)
 //!
-//! `RaftTiming::to_openraft_config` sets `enable_pre_vote: Some(false)`,
-//! because enabling it against `openraft = 0.10.0-alpha.30` can strand a node
-//! as leader-per-peers and not-leader-per-itself, permanently. The full
-//! measurement is in that function's doc comment.
+//! R734-T3 switched `enable_pre_vote` off because openraft 0.10.0-alpha.30 could
+//! strand a node as leader-per-peers and not-leader-per-itself; alpha.35 fixed
+//! that upstream and R734-T6 turned it back on. The measurement is in
+//! `RaftTiming::to_openraft_config`'s doc comment.
 //!
-//! Every test here still holds and still means something, because they exercise
-//! the *server and transport* halves — `POST /raft/pre-vote` answers correctly
-//! and persists nothing, `YubabaNetwork::pre_vote` maps its outcomes correctly —
-//! and those are the halves the flag does not touch. What they no longer prove
-//! is that openraft is *calling* any of it; the `a_dead_leader_is_still_replaced`
-//! test now demonstrates that ordinary elections work, which is a weaker claim
-//! than the one it made when the flag was on. Read the falsification note on
-//! that test for what changed.
+//! These tests exercise the *server and transport* halves: `POST /raft/pre-vote`
+//! answers correctly and persists nothing, and `YubabaNetwork::pre_vote` maps
+//! its outcomes correctly. Two callers now use that transport, openraft's own
+//! Pre-Vote round and the R936-B6 election gate, so a broken transport stalls
+//! elections through either one.
 //!
 //! ```bash
 //! cargo test -p yubaba --test main -- raft_pre_vote::
@@ -223,12 +220,13 @@ async fn a_pre_vote_against_a_healthy_leader_is_refused_and_moves_nothing() {
 /// genuinely live, since an election not running a Pre-Vote round could not
 /// have noticed.
 ///
-/// **That falsification no longer applies**, and saying so matters more than
-/// keeping the stronger-sounding claim: R734-T3 switched the flag off, so this
-/// test now shows only that ordinary elections work. Re-running the probe today
-/// would leave it green, because nothing calls `pre_vote` at all. Restore the
-/// flag and this paragraph together — see
-/// `RaftTiming::to_openraft_config` for why it is off.
+/// **Since R936-B6 the probe is weaker than it reads.** The election gate
+/// sends its own Pre-Vote probes over the same transport, so breaking
+/// `pre_vote` hangs this test through the gate even with openraft's flag off.
+/// That openraft itself calls `pre_vote` was shown separately (R734-T6): with
+/// the gate disabled and the flag on, instrumented runs of the `raft_*` suites
+/// logged 4-12 openraft-originated `pre_vote` calls each; with the flag off,
+/// zero.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dead_leader_is_still_replaced_with_pre_vote_gating_the_election() {
     let provider = HetznerDriver::new("unused-on-local-tier");

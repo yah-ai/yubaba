@@ -635,7 +635,7 @@ mod tests {
     fn a_wiped_raft_dir_cannot_overwrite_the_good_copy() {
         let (_mem, backup) = store();
         let mut good = state_with(&[("web", "m1"), ("api", "m2")]);
-        good.ingress_owner = Some("us-west-001".into());
+        good.ingress_owner = Some(crate::raft::IngressOwnerRecord::Node(1));
         backup.store(&good, 193_466, 1, 100).unwrap();
 
         // The wiped node re-forms and applies its own founding membership.
@@ -649,7 +649,7 @@ mod tests {
         let still = backup.read_latest().unwrap().unwrap();
         assert_eq!(still.applied_index, 193_466);
         assert_eq!(still.state.service_placement.len(), 2);
-        assert_eq!(still.state.ingress_owner.as_deref(), Some("us-west-001"));
+        assert_eq!(still.state.ingress_owner_node(), Some(1));
     }
 
     /// And the way out of that refusal: `adopt` archives the good copy where a
@@ -863,7 +863,7 @@ mod tests {
     #[test]
     fn restorable_drops_leases_and_in_flight_rollouts_and_keeps_the_rest() {
         let mut state = state_with(&[("web", "m1")]);
-        state.ingress_owner = Some("us-west-001".into());
+        state.ingress_owner = Some(crate::raft::IngressOwnerRecord::Node(1));
         state.locks = BTreeMap::from([(
             "acme-issuer/yah.dev".to_string(),
             LockEntry {
@@ -908,7 +908,7 @@ mod tests {
         );
         assert!(restored.rollouts.is_empty());
         assert_eq!(restored.service_placement["web"], "m1");
-        assert_eq!(restored.ingress_owner.as_deref(), Some("us-west-001"));
+        assert_eq!(restored.ingress_owner_node(), Some(1));
     }
 
     #[test]

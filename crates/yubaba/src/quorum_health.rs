@@ -126,6 +126,28 @@ impl QuorumVerdict {
         matches!(self, Self::Healthy { .. })
     }
 
+    /// Can the cluster still commit — are a strict majority of voters not
+    /// observed `Down`?
+    ///
+    /// Weaker than [`Self::permits_withdrawal`] on purpose (R936-B7). The door
+    /// DNS reconciler withdraws a dead door's record, and on a fleet whose
+    /// doors are its voters, one dead door is exactly the `Degraded`
+    /// "majority only because a voter went down" case — so gating that
+    /// withdrawal on `Healthy` would refuse it in the one situation it exists
+    /// for. What it must still refuse is a leader that has *lost* its
+    /// majority (a partitioned stale leader sees every peer as down and would
+    /// withdraw the live side of the fleet), and that is what this answers.
+    /// `Unknown` is `false`, for the same reason it is in `permits_withdrawal`.
+    pub fn quorate(&self) -> bool {
+        match self {
+            Self::Healthy { .. } => true,
+            Self::Degraded {
+                voters, available, ..
+            } => *available > voters / 2,
+            Self::Unknown { .. } => false,
+        }
+    }
+
     /// The operator-facing explanation, for a refusal message or a log line.
     pub fn reason(&self) -> String {
         match self {
@@ -253,6 +275,25 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// R936-B7: one dead voter of three is `Degraded` (no withdrawal under the
+    /// strict gate) yet still quorate; two dead is not; no voters is not.
+    #[test]
+    fn quorate_is_majority_available_not_healthy() {
+        let one_down = judge_quorum(
+            &[1, 2, 3],
+            &report(&[(1, NodeLiveness::Live), (2, NodeLiveness::Down)]),
+        );
+        assert!(!one_down.permits_withdrawal());
+        assert!(one_down.quorate(), "{one_down:?}");
+        let two_down = judge_quorum(
+            &[1, 2, 3],
+            &report(&[(2, NodeLiveness::Down), (3, NodeLiveness::Down)]),
+        );
+        assert!(!two_down.quorate(), "{two_down:?}");
+        assert!(!judge_quorum(&[], &report(&[])).quorate());
+        assert!(judge_quorum(&[1, 2, 3], &report(&[])).quorate());
     }
 
     #[test]

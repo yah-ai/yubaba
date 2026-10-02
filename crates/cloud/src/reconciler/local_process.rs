@@ -193,6 +193,7 @@
 //! @yah:gotcha("The reconciler unlinks the control socket path before spawning, because a leftover socket file makes bind fail with EADDRINUSE even with nobody listening. Consequence for anyone writing a test: a producer that binds BEFORE up() has its socket deleted out from under it. Bind after, which is the order a real child sees anyway.")
 //! @yah:gotcha("RESOLVED 2026-08-18 by R658-B1 (@Ashguard:libra): the red gate this ticket's gotcha flagged is now GREEN. app/yah/web/chat/workload.toml and oss/mesofact/examples/hello/workload.toml were migrated to put routes ABOVE [build], along with the other four files and the yah cloud site init scaffold. workload_spec::BuildConfig now carries serde(deny_unknown_fields) so the misplacement is a parse error naming routes. cargo test -p xtask --test workload_envelope passes. Nothing was pinned into KNOWN_GAPS - the four missing-field-routes entries were DELETED. No action needed here; this note exists so the gotcha is not read as still-true.")
 
+
 use std::collections::{BTreeMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -745,7 +746,7 @@ fn resolve_binary(spec: &ProcessSpec, workspace_root: &std::path::Path) -> Resul
 /// uses. Runs before `cargo_package`'s build (if any) so a failing pre_build
 /// step surfaces as its own error rather than as a confusing downstream
 /// build/spawn failure.
-async fn run_pre_build(
+pub(super) async fn run_pre_build(
     workspace_root: &std::path::Path,
     argv: &[String],
     log_buf: &LogBuffer,

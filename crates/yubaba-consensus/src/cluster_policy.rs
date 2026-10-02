@@ -81,6 +81,7 @@
 //! @yah:gotcha("RETRACTED CLAIM: the @yah:handoff entries beginning 'LANDED. Pre-Vote is on for every yubaba cluster' and 'DECISION 1' are from this ticket's first pass and are NO LONGER TRUE. Pre-Vote is built but SWITCHED OFF (enable_pre_vote: Some(false)) — enabling it against openraft 0.10.0-alpha.30 strands a node as leader-per-peers and not-leader-per-itself, permanently. Read the 'REOPENED FROM REVIEW' handoff entries, which supersede them, before acting on anything above.")
 //! @yah:gotcha("MEASURED 2026-08-28 (incidental, from R746-B11): with enable_pre_vote already OFF, `cd oss/yubaba && cargo test -p yubaba --test main` is RED. Two consecutive runs failed 10 then 8 tests across raft_member_registration / raft_membership_loop / raft_quorum_geography on 'nodes never agreed on a leader', with a DIFFERENT failing set each run. The same filter run serially -- `cargo test -p yubaba --test main raft_ -- --test-threads=1` -- passes 41/41 in 128s. That is this ticket's own timer-slippage signature, but under a condition its measurement table never covered: all ten raft suites are now mods of ONE test binary (oss/yubaba/crates/yubaba/tests/main.rs:32-41), so they spin their five-node clusters concurrently WITH EACH OTHER, not just within one suite. The machine was under heavy camp build load, so load-vs-structure is not separated by this measurement.")
 //! @yah:gotcha("STALE REPRO COMMAND in this ticket's @yah:next: `cargo test -p yubaba --test raft_membership_loop` no longer resolves -- there is no such [[test]] target in crates/yubaba/Cargo.toml (only main / testing / containerd / integration_smoke_filter). The suite is `mod raft_membership_loop` inside tests/main.rs, so the repro is now `cargo test -p yubaba --test main raft_membership_loop`.")
+//! @yah:gotcha("SUPERSEDED BY R734-T6 (2026-09-26): Pre-Vote is ON again, enable_pre_vote: Some(true), on openraft =0.10.0-alpha.35, which fixes the handle_pre_vote_resp/elect() race upstream. The 'SWITCHED OFF' retraction above now describes history. The tripwire test was replaced by every_preset_enables_pre_vote.")
 //!
 //! @yah:ticket(R736-T3, "Cell tagging: a yubaba raft group carries region + jurisdiction, and a second cell is stood up")
 //! @yah:status(review)
@@ -109,6 +110,34 @@
 //! @yah:gotcha("THE SECOND CELL STANDS UP IN THE TEST HARNESS, NOT ON HARDWARE, and that is a hardware fact rather than a code one. tests/raft_cell_tagging.rs founds a prod-us and a prod-eu cell side by side and asserts separate quorums, disjoint membership and mutual non-absorption. A real EU cell needs EU machines: every box in .yah/infra/machines/ is us-west / us-east / us-south as of 2026-09-01 (9 files, checked). Provisioning one is an operator call; nothing in the code blocks it now.")
 //! @yah:gotcha("PRE-EXISTING, NOT MINE: `cargo test -p yubaba --test main` fails 11 tests on a loaded machine (raft_member_registration, raft_membership_loop, raft_leader_pin, raft_tenant_placement, rig_singleton_ownership, raft_pre_vote, raft_quorum_geography, raft_transfer_leader, raft_promote_voter). Established by running the same target with `-- --skip raft_cell_tagging`: 11 failures with my tests excluded, the same 11. They are timeouts in multi-node cluster fixtures (`becomes_initialized` at 10s, leader-election polls) under five concurrent camp builds queued on the cargo lock, and every one of them passes when its own module is run alone.")
 //! @yah:assumes("yubaba is NOT clippy-clean at baseline, so the clippy gate was not run as a pass/fail here. `cargo clippy -p yubaba -p yubaba-test-harness --all-targets --no-deps -- -D warnings` reports 9 errors, all in files this ticket never touched (rollout/mod.rs, rollout/engine.rs, pond/minio.rs, cluster_epoch.rs, raft/store.rs, cluster_policy.rs:495). Zero diagnostics land in cell.rs, sovereign_group.rs, lib.rs, main.rs, solo_node.rs or raft_cell_tagging.rs — established from the diagnostic location list, not assumed.")
+//!
+//! @yah:ticket(R734-T6, "Bump openraft past 0.10.0-alpha.30, re-measure pre-vote under load, and re-enable it if clean (R734-T1 Option A)")
+//! @yah:status(review)
+//! @yah:at(2026-09-26T05:38:24Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R734)
+//! @yah:next("Tier: Warrior — consensus-library bump on a live 3-voter fleet; cluster_protocol-bumping; judged on repeated loaded runs, not one.")
+//! @yah:next("OPERATOR DECISION 2026-09-22: Option A on R734-T1 chosen. Motivation is live evidence from the R937 chaos test: when us-south-001 (prod member 1) rejoined after a ~9 min outage, the prod term went 31 -> 121 in ~2 min with no leader change and no user impact — the term inflation pre-vote exists to prevent.")
+//! @yah:next("Pinned today: `openraft = \"=0.10.0-alpha.30\"` in crates/yubaba/Cargo.toml:135 AND crates/yubaba-test-harness/Cargo.toml:26 (must match exactly). R734-T1 notes alpha.33 exists as a transitive dep. Step 1: check whether the target release fixes the guard asymmetry R734-T1 located — handle_pre_vote_resp calling elect() guarded only on pre_candidate.is_none(), not leader.is_none() (engine_impl.rs:543 in alpha.30). If no release fixes it, stop and report; do not flip the flag.")
+//! @yah:next("Step 2: re-run R734-T1's measurement table with the flag ON, ~8 debug + ~8 release runs of `cargo test -p yubaba --test main raft_membership_loop` under concurrent load (serial --test-threads=1 passes even with the bug; the failure needs timer slippage). Pass = 0 openraft debug_asserts and 0 stranded split-leader views. Step 3: flip enable_pre_vote to Some(true) and update the tripwire test every_preset_leaves_pre_vote_off_until_openraft_is_fixed together, and rewrite the Pre-Vote doc block in RaftTiming::to_openraft_config.")
+//! @yah:next("The bump is a cluster_protocol change (0.9->0.10 was history entry 2): re-record cluster-epochs.json, run xtask cluster_epoch_drift, and re-check R625-S1-style mixed-version interop before rolling. The mixed-roll pre-vote degradation (404 counts as grant) is already recorded as residual_risk on R734-T1.")
+//! @yah:verify("cargo test -p yubaba --lib cluster_policy")
+//! @yah:verify("cargo test -p yubaba --test main raft_pre_vote")
+//! @yah:verify("cargo test -p yubaba --test main raft_membership_loop  (x8 debug, x8 release, under load)")
+//! @yah:verify("cargo test -p xtask --test cluster_epoch_drift")
+//! @yah:handoff("LANDED: openraft =0.10.0-alpha.30 -> =0.10.0-alpha.35 in yubaba, yubaba-consensus and yubaba-test-harness (plus oss/yubaba and root Cargo.lock), and enable_pre_vote: Some(true). STEP-1 GATE PASSED FROM SOURCE: alpha.35 closes the race twice. establish_leader clears pre_candidate, with an upstream comment naming exactly this case, and do_elect returns early on leader.is_some(). store.rs follows two API removals: SnapshotMeta.snapshot_id and the unused begin_receiving_snapshot.")
+//! @yah:handoff("MEASURED, with a positive control. Focused stressor: raft_membership_ratchet, 6 processes at once, 4 burners, gate off so only openraft's own Pre-Vote runs. alpha.30 + Pre-Vote hit openraft's `relinquished` assert in 8 of 24 runs. alpha.35 + Pre-Vote, with openraft patched locally via --config to print at the new leader.is_some() early return, hit it in 0 of 24. The ticket's own recipe (raft_membership_loop) produced ZERO timer elections even at load average 20-30, so it could not have caught the bug; the stressor was widened.")
+//! @yah:handoff("SHIPPED-CONFIG COMPARISON (gate on, all raft_* suites, 2 processes, 4 burners, 8 runs each). Pre-Vote on vs off: debug 8/8 vs 8/8 runs failing the same two raft_membership_ratchet tests; release 2/8 vs 3/8 runs with failures. Those failures are LOAD-ONLY: 9/9 unloaded in both configs, and they occur at the same rate with Pre-Vote off. There was one 900s hang per side, in the same test. Filed as R936-B15 (gate-related by inference: 0 hangs in 48 gate-off runs).")
+//! @yah:handoff("WIRE/DISK INTEROP MEASURED, not read off a changelog. Two scratch binaries (/tmp/r734t6-interop; cargo refuses both alphas in one graph) dumped 18 payloads: vote, append-entries incl. Membership/joint/Blank, all append responses, the snapshot tuple, snapshot response, transfer-leader, and the on-disk vote/log/membership/meta. Dumps are byte-identical, and each version parses the other's exactly. Plus a unit test for an alpha.30 leader's non-empty snapshot_id.")
+//! @yah:handoff("EPOCHS: re-recorded, no bump (cluster_protocol 8, state_epoch 7), in a surface_rerecords entry. That entry ALSO covers pre-existing fn raft_* drift already at HEAD from R936-B4's raft_transfer_leader change (sync 8fb16523). I read that hunk and judged it handler-local, so it is not breaking.")
+//! @yah:handoff("DISCOVERED + FIXED: (1) raft_flapping_voter's control assumed Pre-Vote off and failed once it was on. The fixture now takes explicit gate/pre_vote switches, with arms for: no guard (1->9 storm), gate only, Pre-Vote only (1->1, no gate at all), both, cut leader as shipped, and probe cadence gate-only. 6/6 in 5 of 5 runs. (2) xtask cluster_epoch_drift hardcoded the literal '0.10.0-alpha.30', so every bump broke it; it now rewrites whichever pin is present. (3) Stale 'Pre-Vote is off' docs in tests/raft_pre_vote.rs and election_gate.rs corrected. R734-T1 got a supersession gotcha.")
+//! @yah:verify("cd oss/yubaba && cargo test -p yubaba-consensus  # lib 133/0 (incl every_preset_enables_pre_vote, an_alpha_30_snapshot_meta_with_a_real_snapshot_id_still_parses); raft_flapping_voter 6/0")
+//! @yah:verify("cd oss/yubaba && cargo test -p yubaba --lib  # 1069/0")
+//! @yah:verify("cd oss/yubaba && cargo test -p yubaba --test main raft_  # 62/0 unloaded")
+//! @yah:verify("cargo test -p xtask --test main cluster_epoch  # 8/0")
+//! @yah:verify("cargo check -p cloud-client --tests  # root workspace resolves openraft alpha.35 and builds")
+//! @yah:gotcha("ROLL NOT DONE: nothing is deployed and no fleet node runs alpha.35. The roll is a separate outward step. An un-rolled node keeps the pre-T6 behaviour behind the R936-B6 gate, and it still ANSWERS /raft/pre-vote.")
+//! @yah:gotcha("OPEN QUESTION, NOT DECIDED HERE: can the R936-B6 election gate now retire? Pre-Vote alone held a flapping voter to 1->1 in raft_flapping_voter, the same bound as the gate, and alpha.35 also makes a leader reject pre-votes while its quorum-ack lease holds, which covers the gate's discard-leader-grant rule. Both run today, doubling probe traffic. Retiring the gate is the 'one owner' move, but it wants the prod roll of T6 first and a live flap check.")
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -699,70 +728,57 @@ impl RaftTiming {
     /// so an invalid policy is rejected at node open rather than producing a
     /// cluster that campaigns continuously.
     ///
-    /// # Pre-Vote is OFF, deliberately and against our own preference (R734-T1/T3)
+    /// # Pre-Vote is ON (R734-T1 built it, R734-T3 turned it off, R734-T6 turned it back on)
     ///
-    /// `Some(false)` is written explicitly rather than left as openraft's
-    /// `None` — which it also reads as disabled — because the difference
-    /// between "nobody considered this" and "this was measured and turned off"
-    /// is the whole content of the next few paragraphs.
+    /// A follower whose election timer fires asks peers whether they *would*
+    /// grant it a vote at `term + 1` before it increments the cluster's term and
+    /// campaigns for real, so a node that cannot currently win — partitioned,
+    /// freshly restarted, log-behind — stops inflating the term every time it
+    /// reconnects. The transport is [`RaftNetworkV2::pre_vote`
+    /// ](crate::raft::YubabaNetwork) over `POST /raft/pre-vote`.
     ///
-    /// Pre-Vote is the right feature. A follower whose election timer fires
-    /// asks peers whether they *would* grant it a vote at `term + 1` before it
-    /// increments the cluster's term and campaigns for real, so a node that
-    /// cannot currently win — partitioned, freshly restarted, log-behind —
-    /// stops disrupting a healthy leader every time it reconnects. R734-T1
-    /// built the whole thing: the flag, the [`RaftNetworkV2::pre_vote`
-    /// transport](crate::raft::YubabaNetwork), `POST /raft/pre-vote`, and the
-    /// tests. All of that stays, and all of it is green.
+    /// **Why it was off, and why that no longer holds.** Against openraft
+    /// `0.10.0-alpha.30` it stranded a node as leader-per-peers and
+    /// not-leader-per-itself (`current_leader: [None, Some(1), Some(1)]`),
+    /// permanently. `handle_pre_vote_resp` called `elect()` on a delayed Pre-Vote
+    /// quorum without checking `leader.is_none()`, so a node that had meanwhile
+    /// won a real election campaigned again and left `leader.committed_vote` at
+    /// the old term. alpha.35 closes it twice: `establish_leader` clears
+    /// `pre_candidate` (the late responses then hit the `pre_candidate.is_none()`
+    /// guard), and `do_elect` returns early on `leader.is_some()`.
     ///
-    /// What it cannot stay is **on**, against the pinned
-    /// `openraft = 0.10.0-alpha.30`. Enabling it makes a node reachable that
-    /// is leader according to its peers and *not* leader according to itself
-    /// — `current_leader: [None, Some(1), Some(1)]` — and that state does not
-    /// heal. It was measured, not inferred, by running
-    /// `tests/raft_membership_loop.rs` (five concurrent five-node clusters, so
-    /// the machine is loaded enough for timers to slip):
+    /// Measured, not inferred (R734-T6, 2026-09-26). A focused stressor (the
+    /// `raft_membership_ratchet` suite, 6 processes at once plus CPU burners,
+    /// election gate off so openraft's own Pre-Vote path is the only one):
     ///
-    /// | build | Pre-Vote on | Pre-Vote off |
-    /// |---|---|---|
-    /// | debug | 5 of 8 runs hit openraft's own `debug_assert!` — `elect() requires leadership to be relinquished` | 0 of 8 |
-    /// | release | ~40% of runs strand a node in the split view above, still stuck after 75 s | 0 of 8 |
+    /// | openraft | Pre-Vote on: runs hitting the bug path |
+    /// |---|---|
+    /// | alpha.30 | 8 of 24 hit openraft's `elect() requires leadership to be relinquished` assert |
+    /// | alpha.35 | 0 of 24 even reached the new `leader.is_some()` early return (instrumented) |
     ///
-    /// The assert names the corruption: openraft's `handle_pre_vote_resp`
-    /// calls `elect()` when a Pre-Vote quorum lands, guarded only on
-    /// `pre_candidate.is_none()` and **not** on `leader.is_none()` — where the
-    /// real-vote path (`handle_vote_resp`) does guard, via `candidate_mut()`.
-    /// A leader that campaigns keeps `leader.committed_vote` at the old term
-    /// while `state.vote` moves to the new one, which is exactly the
-    /// inconsistency the release-mode split view shows once the assert is
-    /// compiled out. So the release behaviour is not a milder version of the
-    /// debug failure; it is the same failure with the alarm removed.
+    /// With the election gate on (as shipped), across every `raft_*` suite
+    /// under load, Pre-Vote on vs off showed the same load-only ratchet-test
+    /// failures and no additional ones; see R734-T6 for the full table.
     ///
-    /// A cluster in that state cannot accept writes — peers forward clients to
-    /// a node that will not act as leader — so this is outage-class, not
-    /// cosmetic. openraft's own docs call Pre-Vote "an optional refinement
-    /// rather than a correctness requirement" (the leader lease already
-    /// rejects a disruptive candidate's vote requests), which is what makes
-    /// switching it off the cheap side of this trade.
+    /// It composes with [`crate::raft::election_gate`] (R936-B6), which was
+    /// built as the out-of-engine substitute while this was off. Both enforce
+    /// "no term bump without a quorum that would elect you". Whether the gate
+    /// can now retire is its own question, since it also refuses to count a
+    /// live leader's grant, and it is not settled here.
     ///
-    /// **To turn it back on**, bump openraft first and re-run the table above;
-    /// alpha.33 exists. `every_preset_leaves_pre_vote_off_until_openraft_is_fixed`
-    /// fails the moment this flips, which is intentional — it is the tripwire
-    /// that makes a future flip read this note.
-    ///
-    /// Deliberately **not** a [`ClusterPolicy`] field. Per [the module
-    /// docs](self) a field earns its place by answering a question some
-    /// decision point asks, and no decision point asks this one: both networks
-    /// want Pre-Vote for the same reason (the WAN because transatlantic jitter
-    /// produces doomed candidates, the LAN because a rebooting peer is the same
-    /// shape at a shorter timescale), and neither wants the bug. A knob here
-    /// would let one deployment run the broken configuration.
+    /// `Some(true)` rather than openraft's default: the flag records a
+    /// decision, and `every_preset_enables_pre_vote` pins it. Deliberately
+    /// **not** a [`ClusterPolicy`] field. Per [the module docs](self) a field
+    /// earns its place by answering a question some decision point asks, and
+    /// no decision point asks this one: the WAN wants Pre-Vote because
+    /// transatlantic jitter produces doomed candidates, the LAN because a
+    /// rebooting peer is the same shape at a shorter timescale.
     pub fn to_openraft_config(self) -> Result<openraft::Config, openraft::ConfigError> {
         openraft::Config {
             heartbeat_interval: self.heartbeat_interval_ms,
             election_timeout_min: self.election_timeout_min_ms,
             election_timeout_max: self.election_timeout_max_ms,
-            enable_pre_vote: Some(false),
+            enable_pre_vote: Some(true),
             ..Default::default()
         }
         .validate()
@@ -1105,17 +1121,16 @@ mod tests {
         ));
     }
 
-    /// The tripwire for the R734-T1/T3 finding.
+    /// Pre-Vote is on for every preset (R734-T6).
     ///
-    /// This test exists to FAIL when someone re-enables Pre-Vote, so that the
-    /// flip is a deliberate act with `to_openraft_config`'s note read first
-    /// rather than a one-character change that looks obviously correct. Pre-Vote
-    /// against `openraft = 0.10.0-alpha.30` strands a node as leader-per-peers
-    /// and not-leader-per-itself, permanently; the measurements are in that
-    /// note. Bump openraft, re-run `tests/raft_membership_loop.rs` under load in
-    /// both profiles, then change this test and the flag together.
+    /// Before this it was the reverse tripwire, pinning Pre-Vote OFF while
+    /// openraft 0.10.0-alpha.30 could strand a node as leader-per-peers and
+    /// not-leader-per-itself. alpha.35 fixed that upstream; the measurement is in
+    /// `RaftTiming::to_openraft_config`'s note. If this fails because someone
+    /// turned it off, that note is what they have to answer. If it fails
+    /// because openraft was bumped again, re-run that measurement first.
     #[test]
-    fn every_preset_leaves_pre_vote_off_until_openraft_is_fixed() {
+    fn every_preset_enables_pre_vote() {
         for (name, policy) in [
             ("fleet", ClusterPolicy::fleet()),
             ("rig", ClusterPolicy::rig()),
@@ -1123,16 +1138,10 @@ mod tests {
             let cfg = policy.timing.to_openraft_config().expect("valid timing");
             assert_eq!(
                 cfg.enable_pre_vote,
-                Some(false),
-                "{name} must keep Pre-Vote OFF: openraft 0.10.0-alpha.30's Pre-Vote path can \
-                 call elect() on a node that is still leader, leaving it permanently unable \
-                 to act as one. Read RaftTiming::to_openraft_config before changing this."
-            );
-            // Explicitly Some(false), never None: openraft treats both as
-            // disabled, but only one of them says a human decided.
-            assert!(
-                cfg.enable_pre_vote.is_some(),
-                "{name} must state the decision rather than inherit openraft's default"
+                Some(true),
+                "{name} must run Pre-Vote: without it a voter returning from a partition \
+                 inflates the cluster term (prod, R937: 31 -> 121 in ~2 min). Read \
+                 RaftTiming::to_openraft_config before changing this."
             );
         }
     }

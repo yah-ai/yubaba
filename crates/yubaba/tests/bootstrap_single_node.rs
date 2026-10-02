@@ -83,9 +83,7 @@ async fn single_node_bootstrap_forms_a_live_one_voter_cluster() {
 
     // The cluster is genuinely live: a consensus write commits and applies.
     let resp = raft
-        .client_write(YubabaRequest::SetIngressOwner {
-            machine: "solo".into(),
-        })
+        .client_write(YubabaRequest::ClaimIngressOwner { node_id: 1 })
         .await
         .expect("client_write commits on a live single-node cluster");
     assert!(matches!(resp.data, YubabaResponse::Ok));

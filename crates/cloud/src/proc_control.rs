@@ -119,9 +119,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-// R918-F5 — only the unix-socket transport (and the tests that exercise it)
-// reads or writes a stream here; the HTTP arm goes through reqwest.
-#[cfg(unix)]
+// The newline-JSON transports (unix socket, and TCP since R941) read and write
+// a stream here; the HTTP arm goes through reqwest.
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Environment variable naming the control socket a supervised process should
@@ -259,6 +258,12 @@ pub enum ControlEndpoint {
     /// `GET <url>` returning the status document — for a process that already
     /// serves HTTP, including every cloud-tier workload.
     Http(String),
+    /// Newline-JSON over TCP — the same wire as [`Self::Socket`], carried by a
+    /// forwarded port. The device provider's Android rail (R941): the app binds
+    /// an abstract-namespace socket and `adb forward tcp:N localabstract:<name>`
+    /// exposes it to the host as `127.0.0.1:N`. Not an HTTP endpoint and not a
+    /// new protocol — nothing on the producer side knows it is being forwarded.
+    Tcp(std::net::SocketAddr),
 }
 
 impl std::fmt::Display for ControlEndpoint {
@@ -266,6 +271,7 @@ impl std::fmt::Display for ControlEndpoint {
         match self {
             ControlEndpoint::Socket(p) => write!(f, "unix:{}", p.display()),
             ControlEndpoint::Http(u) => write!(f, "{u}"),
+            ControlEndpoint::Tcp(a) => write!(f, "tcp:{a}"),
         }
     }
 }
@@ -294,6 +300,10 @@ pub async fn fetch_status(endpoint: &ControlEndpoint) -> anyhow::Result<ProcStat
              unix-only and this is a non-unix build",
             path.display()
         ),
+        ControlEndpoint::Tcp(addr) => {
+            let stream = tokio::net::TcpStream::connect(addr).await?;
+            newline_json_status(stream, &endpoint.to_string()).await
+        }
         ControlEndpoint::Http(url) => {
             let body = reqwest::Client::new()
                 .get(url)
@@ -315,7 +325,16 @@ pub async fn fetch_status(endpoint: &ControlEndpoint) -> anyhow::Result<ProcStat
 /// cannot poison later polls — worth far more here than the syscalls saved.
 #[cfg(unix)]
 async fn fetch_status_uds(path: &std::path::Path) -> anyhow::Result<ProcStatus> {
-    let mut stream = tokio::net::UnixStream::connect(path).await?;
+    let stream = tokio::net::UnixStream::connect(path).await?;
+    newline_json_status(stream, &format!("control socket {}", path.display())).await
+}
+
+/// The transport-independent half: one `status` request line out, one status
+/// document line back, on whatever stream reached the producer.
+async fn newline_json_status<S>(mut stream: S, what: &str) -> anyhow::Result<ProcStatus>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     stream.write_all(b"{\"cmd\":\"status\"}\n").await?;
     stream.flush().await?;
 
@@ -325,12 +344,9 @@ async fn fetch_status_uds(path: &std::path::Path) -> anyhow::Result<ProcStatus> 
         BufReader::new(stream).read_line(&mut line),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("control socket {} did not answer within 2s", path.display()))??;
+    .map_err(|_| anyhow::anyhow!("{what} did not answer within 2s"))??;
     if read == 0 {
-        anyhow::bail!(
-            "control socket {} closed without answering",
-            path.display()
-        );
+        anyhow::bail!("{what} closed without answering");
     }
     Ok(serde_json::from_str(line.trim())?)
 }
@@ -398,6 +414,33 @@ mod tests {
                 write_half.flush().await.ok();
             }
         })
+    }
+
+    /// The TCP arm speaks the unix socket's wire unchanged — the property the
+    /// adb-forward rail (R941) depends on, since the producer on the far side
+    /// is bound to a unix socket and cannot know it is being forwarded.
+    #[tokio::test]
+    async fn tcp_endpoint_speaks_the_same_newline_json() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = stream.into_split();
+            let mut line = String::new();
+            BufReader::new(read_half).read_line(&mut line).await.unwrap();
+            assert_eq!(line.trim(), r#"{"cmd":"status"}"#);
+            write_half
+                .write_all(b"{\"state\":\"running\",\"detail\":\"forwarded\"}\n")
+                .await
+                .unwrap();
+        });
+
+        let endpoint = ControlEndpoint::Tcp(addr);
+        assert_eq!(endpoint.to_string(), format!("tcp:{addr}"));
+        let got = fetch_status(&endpoint).await.unwrap();
+        assert_eq!(got.state, ProcState::Running);
+        assert_eq!(got.detail.as_deref(), Some("forwarded"));
+        server.await.unwrap();
     }
 
     #[test]

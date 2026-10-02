@@ -138,6 +138,8 @@ pub mod ingress_verify;
 // OpenProcess/TerminateProcess here, at the point someone actually wants a
 // Windows fleet node — see .yah/docs/working/W352-windows-and-macos-build-targets.md.
 #[cfg(unix)]
+pub mod device;
+#[cfg(unix)]
 pub mod local_process;
 pub mod mesofact_bundle;
 pub mod mesofact_static;
@@ -190,6 +192,8 @@ pub use ingress_verify::{
 };
 #[cfg(unix)]
 pub use local_process::LocalProcessReconciler;
+#[cfg(unix)]
+pub use device::DeviceReconciler;
 pub use mesofact_bundle::{
     resolve_bundle_machines, BundleSlot, MesofactBundleReconciler, RevalidateSlot,
     SLOT_ROLE as BUNDLE_SLOT_ROLE,

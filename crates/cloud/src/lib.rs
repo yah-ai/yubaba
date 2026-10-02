@@ -342,8 +342,8 @@ pub use provider::{
     FloatingIpState, FloatingIpTarget, GrantScope, HetznerDriver, HetznerEnvoy, HetznerFloatingIp,
     Location, MachineProvider, OvhFloatingIp, ProjectId, R2BucketInfo, R2CustomDomain, ServerId,
     ServerSpec, ServerStatus, ServerSummary, TokenGrant, TunnelConnState, TunnelDnsRecord,
-    TunnelDriftRow, TunnelDriftState, VultrFloatingIp, WorkerDeployResult, MESOFACT_STATIC_GRANTS,
-    TUNNEL_EDIT_GRANTS,
+    TunnelDriftRow, TunnelDriftState, VultrFloatingIp, WorkerDeployResult, DOOR_DNS_GRANTS,
+    MESOFACT_STATIC_GRANTS, TUNNEL_EDIT_GRANTS,
 };
 #[cfg(feature = "local-docker")]
 pub use provider::{LocalDockerEnvoy, LocalDockerProvider};

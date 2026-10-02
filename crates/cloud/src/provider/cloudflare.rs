@@ -470,6 +470,26 @@ pub const TUNNEL_EDIT_GRANTS: &[TokenGrant] = &[TokenGrant {
     fallback_id: "c07321b023e944ff818fec44d8203567",
 }];
 
+/// Zone-scoped DNS Read + DNS Write and nothing else (R936-B7): the token the
+/// three front doors hold so the raft leader's `yubaba::door_dns` reconciler
+/// can withdraw a dead door's A record and re-add it once the door is live,
+/// across every zone the doors front (minted with one `--zone` per zone). Same
+/// group names and fallback ids as the DNS pair in [`MESOFACT_STATIC_GRANTS`];
+/// deliberately none of that profile's Workers/R2/Transform grants, because
+/// this one lives on internet-facing boxes.
+pub const DOOR_DNS_GRANTS: &[TokenGrant] = &[
+    TokenGrant {
+        group_name: "DNS Read",
+        scope: GrantScope::Zone,
+        fallback_id: "82e64a83756745bbbb1c9c2701bf816b",
+    },
+    TokenGrant {
+        group_name: "DNS Write",
+        scope: GrantScope::Zone,
+        fallback_id: "4755a26eedb94da69e1066d98aa820be",
+    },
+];
+
 /// Result of minting an account-owned API token. `value` is the secret and is
 /// returned by Cloudflare exactly once — store it immediately.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1563,7 +1583,8 @@ impl CloudflareClient {
     }
 
     /// Mint an **account-owned** API token under `account_id` from `grants`
-    /// scoped to `account_id` + `zone_id`.
+    /// scoped to `account_id` + every zone in `zone_ids` (zone-scoped grants
+    /// apply to all of them; at least one is required).
     ///
     /// Resolves each grant's permission-group name against the live catalog
     /// (falling back to its baked-in ID), groups the IDs into account- and
@@ -1577,17 +1598,18 @@ impl CloudflareClient {
     pub async fn create_account_token(
         &self,
         account_id: &str,
-        zone_id: &str,
+        zone_ids: &[String],
         token_name: &str,
         grants: &[TokenGrant],
     ) -> Result<CreateTokenResult> {
+        anyhow::ensure!(!zone_ids.is_empty(), "token create: no zone given");
         // A catalog lookup failure is non-fatal: build_token_body falls back
         // to the baked-in IDs for any name the (empty) catalog can't resolve.
         let catalog = self
             .list_permission_group_ids(account_id)
             .await
             .unwrap_or_default();
-        let body = build_token_body(token_name, account_id, zone_id, grants, &catalog);
+        let body = build_token_body(token_name, account_id, zone_ids, grants, &catalog);
 
         let resp: CfSingle<CreateTokenResult> = self
             .cf_post(&format!("/accounts/{account_id}/tokens"), &body)
@@ -1808,7 +1830,7 @@ fn resolve_grant_id(
 fn build_token_body(
     token_name: &str,
     account_id: &str,
-    zone_id: &str,
+    zone_ids: &[String],
     grants: &[TokenGrant],
     catalog: &std::collections::BTreeMap<String, String>,
 ) -> serde_json::Value {
@@ -1819,12 +1841,16 @@ fn build_token_body(
             .map(|g| serde_json::json!({ "id": resolve_grant_id(g, catalog) }))
             .collect()
     };
-    let block = |resource: String, groups: Vec<serde_json::Value>| -> Option<serde_json::Value> {
-        if groups.is_empty() {
+    let block = |resource_keys: Vec<String>,
+                 groups: Vec<serde_json::Value>|
+     -> Option<serde_json::Value> {
+        if groups.is_empty() || resource_keys.is_empty() {
             return None;
         }
         let mut resources = serde_json::Map::new();
-        resources.insert(resource, serde_json::Value::String("*".into()));
+        for key in resource_keys {
+            resources.insert(key, serde_json::Value::String("*".into()));
+        }
         Some(serde_json::json!({
             "effect": "allow",
             "resources": serde_json::Value::Object(resources),
@@ -1834,11 +1860,14 @@ fn build_token_body(
 
     let policies: Vec<serde_json::Value> = [
         block(
-            format!("com.cloudflare.api.account.{account_id}"),
+            vec![format!("com.cloudflare.api.account.{account_id}")],
             ids_for(GrantScope::Account),
         ),
         block(
-            format!("com.cloudflare.api.account.zone.{zone_id}"),
+            zone_ids
+                .iter()
+                .map(|z| format!("com.cloudflare.api.account.zone.{z}"))
+                .collect(),
             ids_for(GrantScope::Zone),
         ),
     ]
@@ -2049,7 +2078,7 @@ mod tests {
         let mut catalog = BTreeMap::new();
         catalog.insert("Zone Read".to_string(), "CATALOG_ZONE_READ".to_string());
 
-        let body = build_token_body("t", "ACCT", "ZONE", MESOFACT_STATIC_GRANTS, &catalog);
+        let body = build_token_body("t", "ACCT", &["ZONE".into()], MESOFACT_STATIC_GRANTS, &catalog);
         let policies = body["policies"].as_array().unwrap();
         assert_eq!(policies.len(), 2, "one account block + one zone block");
 
@@ -2093,12 +2122,40 @@ mod tests {
             scope: GrantScope::Zone,
             fallback_id: "ZR",
         }];
-        let body = build_token_body("t", "A", "Z", only_zone, &BTreeMap::new());
+        let body = build_token_body("t", "A", &["Z".into()], only_zone, &BTreeMap::new());
         let policies = body["policies"].as_array().unwrap();
         assert_eq!(policies.len(), 1, "no account block when no account grants");
         assert_eq!(
             policies[0]["resources"]["com.cloudflare.api.account.zone.Z"],
             "*"
+        );
+    }
+
+    /// R936-B7: DOOR_DNS_GRANTS minted across several zones yields ONE zone
+    /// block naming every zone, carrying exactly DNS Read + DNS Write, and no
+    /// account block at all.
+    #[test]
+    fn door_dns_grants_cover_every_zone_and_nothing_else() {
+        use std::collections::BTreeMap;
+        let zones: Vec<String> = vec!["Z1".into(), "Z2".into(), "Z3".into()];
+        let body = build_token_body("t", "ACCT", &zones, DOOR_DNS_GRANTS, &BTreeMap::new());
+        let policies = body["policies"].as_array().unwrap();
+        assert_eq!(policies.len(), 1, "zone block only");
+        let res = policies[0]["resources"].as_object().unwrap();
+        assert_eq!(res.len(), 3);
+        for z in &zones {
+            assert_eq!(res[&format!("com.cloudflare.api.account.zone.{z}")], "*");
+        }
+        let mut ids: Vec<&str> = policies[0]["permission_groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["id"].as_str().unwrap())
+            .collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["4755a26eedb94da69e1066d98aa820be", "82e64a83756745bbbb1c9c2701bf816b"]
         );
     }
 
@@ -2108,7 +2165,7 @@ mod tests {
     #[test]
     fn tunnel_edit_grants_build_account_only_policy() {
         use std::collections::BTreeMap;
-        let body = build_token_body("t", "ACCT", "ZONE", TUNNEL_EDIT_GRANTS, &BTreeMap::new());
+        let body = build_token_body("t", "ACCT", &["ZONE".into()], TUNNEL_EDIT_GRANTS, &BTreeMap::new());
         let policies = body["policies"].as_array().unwrap();
         assert_eq!(policies.len(), 1, "no zone block for an account-only profile");
         assert_eq!(

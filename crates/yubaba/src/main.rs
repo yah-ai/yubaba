@@ -293,7 +293,15 @@ enum Cmd {
         /// to tell. Unset means untagged, which is normal for a `rig` (one
         /// failure domain) and works — but leaves a fleet node's row with no
         /// region for a peer to read.
-        #[arg(long)]
+        ///
+        /// R937-F4: `env = "YUBABA_REGION"` because the shipped
+        /// `yubaba.service` ExecStart is identical across every camp (see its
+        /// own comment) — a per-node region can only reach this flag via the
+        /// env fallback, written by cloud-init into a `yubaba.service.d`
+        /// drop-in (`oss/yubaba/crates/cloud/src/cloud_init.rs`,
+        /// `build_region_env_block`), same mechanism `--litestream-s3-url`
+        /// already uses for the same reason.
+        #[arg(long, env = "YUBABA_REGION")]
         region: Option<String>,
         /// R859-F2 phase A: which provider hosts this box — `hetzner`, `ovh`,
         /// `vultr`, `static`.
@@ -346,7 +354,12 @@ enum Cmd {
         /// This is the one fact the withdrawal path cannot work without, because
         /// a Cloudflare record delete is content-matched — see
         /// [`ingress_effector`](yubaba::ingress_effector). See `--provider`.
-        #[arg(long)]
+        ///
+        /// R936-B1: also what the passway-mesh front doors dial when THIS node
+        /// owns ingress (`GET /cluster/ingress-owner` serves it from the member
+        /// row). Env-settable so a node gains it with an `Environment=` drop-in
+        /// rather than a re-declared ExecStart.
+        #[arg(long, env = "YUBABA_PUBLIC_ADDRESS")]
         public_address: Option<String>,
         /// R742-F1 (W305 §F1): which sovereign group this node votes in, e.g.
         /// `prod` or `dev`.
@@ -1225,11 +1238,23 @@ async fn main() -> Result<()> {
             }
 
             // R858-B23: the ONE value the appliance spec is built with on this
-            // node. Set unconditionally rather than only when true, so the
-            // state carries the node's declared configuration either way —
-            // `false` here is "this node does not declare a durability tier",
+            // node. `None` is "this node does not declare a durability tier",
             // which is what lets kamaji start the coordinator at all.
-            server_state = server_state.with_headscale_durability(headscale_durability);
+            //
+            // R936-B2: the store is scoped by sovereign group, so the flag
+            // without a group is refused rather than defaulted — a default
+            // prefix is exactly how two clusters end up sharing one lineage.
+            let headscale_durability_store = match (headscale_durability, sovereign_group.as_deref())
+            {
+                (false, _) => None,
+                (true, Some(group)) => Some(yubaba::headscale_appliance::durability_store(group)),
+                (true, None) => anyhow::bail!(
+                    "--headscale-durability needs --sovereign-group: the headscale DB's store \
+                     prefix is scoped by group (R936-B2)"
+                ),
+            };
+            server_state =
+                server_state.with_headscale_durability_store(headscale_durability_store);
 
             // R858-T16: the coordinator's public base URL. Two readers, one
             // fact: the operator-bridge preauth path already used it, and
@@ -1630,12 +1655,10 @@ async fn main() -> Result<()> {
                     }
                 }
                 let shared_state = Arc::new(server_state);
-                // R859-F2 / R858-T3: ONE derivation, handed to both consumers.
-                // `ingress_owner` (written by the leadership watcher) and
-                // `MemberInfo::machine` (written by the registration loop) are
-                // only comparable — and `node_for_machine` only answers — if
-                // they are the same string. Two calls to the same function made
-                // that a convention; one value makes it a fact.
+                // The member row's machine tag. Since R936-B3 the ingress-owner
+                // record is a raft node id and no longer shares this string, so
+                // only the registration loop (and the floating-IP planner that
+                // reads its rows) consumes it.
                 let machine = yubaba::leader::derive_machine_name();
                 // Spawn leadership watcher before serving so Headscale starts
                 // immediately on the first leader election.
@@ -1643,7 +1666,6 @@ async fn main() -> Result<()> {
                     node_id,
                     raft_node.clone(),
                     Arc::clone(&shared_state),
-                    machine.clone(),
                 );
                 // R734-F5: publish this node's own member row (address + region)
                 // into replicated state, and keep it correct. Convergent and
@@ -1751,6 +1773,37 @@ async fn main() -> Result<()> {
                     Ok(None) => None,
                     Err(e) => anyhow::bail!("public-ingress effector configuration: {e}"),
                 };
+                // R936-B7: door DNS reconciler, armed by a config file named
+                // in YUBABA_DOOR_DNS_CONFIG. Fatal on misconfiguration for the
+                // same reason as the ingress effector above.
+                let door_dns = match std::env::var(yubaba::door_dns::CONFIG_ENV) {
+                    Ok(path) if !path.trim().is_empty() => {
+                        let text = std::fs::read_to_string(path.trim()).with_context(|| {
+                            format!("reading {} file {path}", yubaba::door_dns::CONFIG_ENV)
+                        })?;
+                        let cfg = yubaba::door_dns::parse_config(&text).map_err(|e| {
+                            anyhow::anyhow!("door DNS configuration ({path}): {e}")
+                        })?;
+                        let d = yubaba::door_dns::DoorDns::from_config(
+                            &cfg,
+                            yubaba::appliance_ownership::FenceTiming::from_thresholds(
+                                policy.liveness_thresholds(),
+                            ),
+                        )?;
+                        tracing::info!(
+                            hosts = %d
+                                .hosts()
+                                .iter()
+                                .map(|h| h.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(","),
+                            "door DNS armed: the raft leader keeps these hostnames' A records \
+                             equal to their live front doors"
+                        );
+                        Some(d)
+                    }
+                    _ => None,
+                };
                 // R737-F3: tenant placement scheduler. Started on every node
                 // for the same reason as the leader pin above — a follower's
                 // tick is a no-op. Unlike the pin, this has no operator flag
@@ -1776,6 +1829,8 @@ async fn main() -> Result<()> {
                         // doc for why the fleet is allowed to subtract from the
                         // apex and nothing else.
                         ingress: ingress_effector,
+                        // R936-B7: `None` unless YUBABA_DOOR_DNS_CONFIG is set.
+                        door_dns,
                     },
                     yubaba::scheduler::SchedulerConfig::new(
                         policy.timing,
@@ -1783,6 +1838,13 @@ async fn main() -> Result<()> {
                             policy.liveness_thresholds(),
                         ),
                     ),
+                );
+                // R936-B12: the floater effector — runs each recorded floater
+                // where the scheduler above places its tenant, stops it
+                // everywhere else. On every member, like the scheduler.
+                let _floaters = yubaba::floater::spawn(
+                    Arc::new(yubaba::NodeFloatHost::new(shared_state.clone())),
+                    shared_state.floater_records(),
                 );
                 // R118-F8: the membership ratchet. Unlike the scheduler above
                 // this one is NOT started unconditionally — under
@@ -2018,6 +2080,13 @@ async fn main() -> Result<()> {
                 // live Cloudflare token — or a vendor token file — reads like an
                 // armed failover. Both arms warn, because either alone is enough
                 // for an operator to believe this node will act (R859-F3).
+                if std::env::var(yubaba::door_dns::CONFIG_ENV).is_ok() {
+                    tracing::warn!(
+                        "{} has no effect without --raft-node-id: door DNS runs on the raft \
+                         leader, and there is no raft cluster here",
+                        yubaba::door_dns::CONFIG_ENV
+                    );
+                }
                 if let Ok(apex) = std::env::var(yubaba::ingress_effector::APEX_ENV) {
                     tracing::warn!(
                         %apex,
@@ -2287,7 +2356,7 @@ fn run_state_cmd(cmd: StateCmd) -> Result<()> {
             println!("service placement  {}", snap.state.service_placement.len());
             println!("tenants            {}", snap.state.tenants.len());
             println!("tenant placement   {}", snap.state.placement.len());
-            println!("ingress owner      {:?}", snap.state.ingress_owner);
+            println!("ingress owner      {:?}", snap.state.ingress_owner_node());
             println!(
                 "dropped on restore locks={} rollouts={}",
                 snap.state.locks.len(),

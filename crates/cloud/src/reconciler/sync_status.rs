@@ -439,6 +439,7 @@ fn provider_kind_label(kind: Provider) -> String {
         Provider::MiniflareNative => "miniflare-native",
         Provider::LocalContainer => "local-container",
         Provider::LocalProcess => "local-process",
+        Provider::Device => "device",
         Provider::MiniflareContainer => "miniflare-container",
         Provider::MinioContainer => "minio-container",
         Provider::LocalPgDev => "local-pg-dev",

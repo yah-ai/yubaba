@@ -23,19 +23,19 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 cloud = { package = "yah-cloud", path = "../cloud" }
 # openraft: needed to call raft.initialize(members) during multi-node bootstrap.
 # Version must match yubaba's openraft dependency exactly.
-openraft = { version = "=0.10.0-alpha.30", features = ["serde"] }
+openraft = { version = "=0.10.0-alpha.35", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1.0"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tracing = "0.1"
-workload-spec = { package = "yah-workload-spec", version = "0.8.41" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.42" }
 yubaba = { path = "../yubaba" }
 # R732-T4: the OwnershipSource trait the LocalOwnership adapter implements, so
 # a chaos test can drive the real tail loop in-process. No cycle — the streamer
 # crate depends on neither yubaba nor this harness, by design.
 yubaba-tenant-streamer = { path = "../tenant-streamer" }
-kamaji = { version = "0.8.41" }
+kamaji = { version = "0.8.42" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

@@ -281,6 +281,7 @@
 //! @yah:handoff("FOLLOW-UP LANDED after @Ashguard:blade's T4 report: SoloNode now exposes `pub raft: YubabaRaft` and `pub state_machine: YubabaStateMachine`, clones of exactly what the router and the registration loop are given. T4 had carried a private 40-line node builder in tests/raft_leader_pin.rs precisely because the harness returned neither handle, and had filed that as an @yah:cleanup rather than edit solo_node.rs while I was in it. Closing it here was five lines and keeps the third copy of that builder from setting. Re-verified after: raft_leader_pin 3/0, raft_member_registration 6/0, raft_quorum_geography 5/0, raft_membership_loop 5/0, raft_pre_vote 3/0, clippy clean on solo_node.rs.")
 //! @yah:handoff("CONSUMED, which is the real proof the harness change was the right shape: R734-T4's tests/raft_leader_pin.rs now runs on solo_node_in_region / solo_node_unregistered and reads peers' regions via node.state_machine.members(). Its private 40-line node builder, its Drop impl and its health-poll are deleted and its @yah:cleanup is dropped. Verified after the fold-back: raft_leader_pin 4/0, raft_member_registration 6/0, yubaba --lib 408/0.")
 
+pub mod election_gate;
 pub mod network;
 pub mod store;
 
@@ -393,10 +394,29 @@ pub enum YubabaRequest {
         key: String,
         owner: String,
     },
+    /// RETIRED by R936-B3 — no current code writes it, and it keeps its exact
+    /// shape because live logs and snapshots hold it (prod `last_log_index`
+    /// ~2.8M). It recorded the claimant's `/etc/hostname`, which on the two OVH
+    /// voters is a provider default (`vps-4c1efa56`) matching no fleet machine,
+    /// so nothing outside raft could resolve it. [`apply`] maps it onto a node
+    /// id through the member rows' machine tag where it can
+    /// ([`IngressOwnerRecord::LegacyMachine`] where it cannot).
     SetIngressOwner {
         machine: String,
     },
     ClearIngressOwner,
+    /// R936-B3: record `node_id` as the ingress (appliance) owner. The raft
+    /// node id is the one identity every node, every consumer and the member
+    /// table agree on; a display name is resolved from it at the edge
+    /// (`GET /cluster/singletons`, `yah mesh status`), never stored.
+    ///
+    /// A new variant on an externally-tagged enum: cluster_protocol 7 -> 8 and
+    /// state_epoch 6 -> 7 (see cluster-epochs.json). Roll the current owner
+    /// LAST — only an owner claim writes this, so an old binary never sees it
+    /// while the owner is stable.
+    ClaimIngressOwner {
+        node_id: YubabaNodeId,
+    },
     // R278-F3 defined these; R118-T5 (W138) gave them their producer. Rollout
     // state is now REPLICATED, not mirrored: `yubaba::rollout` reads and writes
     // `YubabaState::rollouts` through these two variants and holds no store of
@@ -814,7 +834,10 @@ pub struct YubabaState {
     /// service name → machine name
     pub service_placement: BTreeMap<String, String>,
     pub locks: BTreeMap<String, LockEntry>,
-    pub ingress_owner: Option<String>,
+    /// Who owns ingress (and with it the headscale appliance). Read it through
+    /// [`Self::ingress_owner_node`]; the legacy name form only exists because
+    /// pre-R936-B3 logs and snapshots carry it.
+    pub ingress_owner: Option<IngressOwnerRecord>,
     /// R278-F3 / R118-T5: rollout state, replicated so a new leader can resume
     /// a rollout the old one was driving when it lost power.
     ///
@@ -1104,6 +1127,33 @@ impl YubabaState {
             .find(|(_, m)| m.machine.as_deref() == Some(machine))
             .map(|(id, _)| *id)
     }
+
+    /// R936-B3: the ingress owner as a raft node id — the only form any
+    /// consumer should reason about. A legacy name record resolves through the
+    /// member rows; one that no row claims is `None` (fail closed: an owner
+    /// nobody can locate must not be dialed, fenced against, or withdrawn).
+    pub fn ingress_owner_node(&self) -> Option<YubabaNodeId> {
+        match self.ingress_owner.as_ref()? {
+            IngressOwnerRecord::Node(id) => Some(*id),
+            IngressOwnerRecord::LegacyMachine(machine) => self.node_for_machine(machine),
+        }
+    }
+}
+
+/// R936-B3: the ingress-owner record as raft stores it.
+///
+/// Untagged, so the on-disk shape is a bare JSON number for [`Self::Node`] —
+/// the only form new code writes — and a bare string for the legacy form a
+/// pre-R936-B3 snapshot or log entry carries (`"ingress_owner":"vps-4c1efa56"`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IngressOwnerRecord {
+    /// A raft node id.
+    Node(YubabaNodeId),
+    /// A machine name written by the retired `SetIngressOwner` that no member
+    /// row claimed when it applied. Resolved lazily by
+    /// [`YubabaState::ingress_owner_node`].
+    LegacyMachine(String),
 }
 
 /// One node's corroborated verdict about one peer, as `R118-F7`'s detector
@@ -1847,12 +1897,16 @@ pub struct MemberInfo {
     ///
     /// That comparability is the whole guarantee this field makes, and it is
     /// narrower than the field name suggests. `derive_machine_name()` reads
-    /// `/etc/hostname` (falling back to `$HOSTNAME`). On some boxes that
-    /// equals the declared machine name; on others it does not. R841's
-    /// incident record (`app/yah/cli/src/rollout/executor.rs`) has
-    /// `ingress_owner` holding `vps-4c1efa56` for the machine declared as
-    /// `us-west-001`, and `app/yah/cli/src/mesh.rs`'s R858-T3 gotcha says it
-    /// outright: this value is neither a mesh address nor a machine-TOML name.
+    /// `/etc/hostname` (falling back to `$HOSTNAME`). Cloud-init sets that to
+    /// the declared machine name (`hostname: {{MACHINE_NAME}}` in
+    /// `cloud/templates/mirror.yml`), but a box provisioned any other way keeps
+    /// whatever its provider gave it. R841's incident record
+    /// (`app/yah/cli/src/rollout/executor.rs`) has `ingress_owner` holding
+    /// `vps-4c1efa56` for the machine declared as `us-west-001`. R937-F3
+    /// (2026-09-27) renamed both hand-provisioned OVH voters to their inventory
+    /// names and pinned `preserve_hostname: true` so OVH metadata cannot
+    /// revert it on boot. Equality is now true on every prod voter, but it is
+    /// an operational fact, not something this field enforces.
     ///
     /// So a consumer that needs a `cloud::config::MachineConfig` must
     /// **resolve** this string against the declared fleet and refuse when it
@@ -2076,8 +2130,18 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
             }
             YubabaResponse::Ok
         }
+        // Resolved against the member rows at THIS log index, so every replica
+        // lands on the same answer. Unresolvable (a row that predates the
+        // machine tag) keeps the name rather than dropping the owner.
         YubabaRequest::SetIngressOwner { machine } => {
-            state.ingress_owner = Some(machine.clone());
+            state.ingress_owner = Some(match state.node_for_machine(machine) {
+                Some(id) => IngressOwnerRecord::Node(id),
+                None => IngressOwnerRecord::LegacyMachine(machine.clone()),
+            });
+            YubabaResponse::Ok
+        }
+        YubabaRequest::ClaimIngressOwner { node_id } => {
+            state.ingress_owner = Some(IngressOwnerRecord::Node(*node_id));
             YubabaResponse::Ok
         }
         YubabaRequest::ClearIngressOwner => {
@@ -2412,7 +2476,14 @@ pub async fn open_with_state_machine(
     let state_machine = YubabaStateMachine::open(raft_dir).await?;
     let network = YubabaNetworkFactory::new()?;
 
-    let raft = YubabaRaft::new(node_id, config, network, log_store, state_machine.clone()).await?;
+    let raft = YubabaRaft::new(node_id, config, network.clone(), log_store, state_machine.clone()).await?;
+
+    // R936-B6: no term bump without a quorum that would elect this node. A
+    // voter flapping on and off the mesh otherwise inflates its term while
+    // away and deposes the healthy leader every time it returns — see the
+    // module docs of `election_gate`.
+    election_gate::spawn_election_gate(raft.clone(), network, policy.timing);
+
     Ok((raft, state_machine))
 }
 
@@ -2882,24 +2953,62 @@ mod tests {
             },
         );
 
-        let owner = state.ingress_owner.clone().unwrap();
-        let owner_node = state
-            .members
-            .iter()
-            .find(|(_, m)| m.machine.as_deref() == Some(owner.as_str()))
-            .map(|(id, _)| *id);
+        // R936-B3: the retired name-keyed entry resolves to a node id at apply
+        // time, so the stored record is canonical, not the hostname.
+        assert_eq!(state.ingress_owner, Some(IngressOwnerRecord::Node(2)));
         assert_eq!(
-            owner_node,
+            state.ingress_owner_node(),
             Some(2),
             "the ingress owner must resolve back to the node that claimed it"
         );
 
-        // A machine no member row claims resolves to nothing rather than to an
-        // arbitrary node — the fail-closed direction.
-        assert!(state
-            .members
-            .values()
-            .all(|m| m.machine.as_deref() != Some("us-east-001")));
+        // A machine no member row claims keeps its name and resolves to
+        // nothing rather than to an arbitrary node — the fail-closed direction.
+        apply(
+            &mut state,
+            &YubabaRequest::SetIngressOwner {
+                machine: "us-east-001".into(),
+            },
+        );
+        assert_eq!(
+            state.ingress_owner,
+            Some(IngressOwnerRecord::LegacyMachine("us-east-001".into()))
+        );
+        assert_eq!(state.ingress_owner_node(), None);
+    }
+
+    /// R936-B3: new-reads-old for the record itself. A pre-B3 snapshot carries
+    /// `ingress_owner` as a hostname string; it must load, resolve through the
+    /// member rows, and write back as the canonical node-id number the next
+    /// time a claim lands. A post-B3 record is a bare number on disk.
+    #[test]
+    fn a_pre_r936_b3_name_record_loads_and_a_claim_writes_a_node_id() {
+        let legacy = r#"{"members":{"2":{"addr":"100.64.0.1:7443","machine":"vps-4c1efa56"}},"service_placement":{},"locks":{},"ingress_owner":"vps-4c1efa56"}"#;
+        let mut state: YubabaState = serde_json::from_str(legacy).expect("pre-B3 state loads");
+        assert_eq!(
+            state.ingress_owner,
+            Some(IngressOwnerRecord::LegacyMachine("vps-4c1efa56".into()))
+        );
+        assert_eq!(state.ingress_owner_node(), Some(2));
+
+        apply(&mut state, &YubabaRequest::ClaimIngressOwner { node_id: 2 });
+        let written = serde_json::to_value(&state).unwrap();
+        assert_eq!(written["ingress_owner"], serde_json::json!(2));
+        let reread: YubabaState = serde_json::from_value(written).unwrap();
+        assert_eq!(reread.ingress_owner, Some(IngressOwnerRecord::Node(2)));
+    }
+
+    /// R936-B3's wire half, stated as a test: `ClaimIngressOwner` is a new
+    /// variant, so a pre-B3 binary cannot decode it (the epoch bump), while the
+    /// retired `SetIngressOwner` keeps its exact encoding so live logs replay.
+    #[test]
+    fn claim_ingress_owner_is_new_bytes_and_the_retired_variant_keeps_its_shape() {
+        let claim = serde_json::to_value(YubabaRequest::ClaimIngressOwner { node_id: 3 }).unwrap();
+        assert_eq!(claim, serde_json::json!({"ClaimIngressOwner": {"node_id": 3}}));
+        let old: YubabaRequest =
+            serde_json::from_str(r#"{"SetIngressOwner":{"machine":"us-south-001"}}"#)
+                .expect("the retired variant must still decode from a live log");
+        assert!(matches!(old, YubabaRequest::SetIngressOwner { .. }));
     }
 
     /// R859-F2, the `state_epoch` half — same contract R734-F2's `region` test
@@ -2924,7 +3033,12 @@ mod tests {
             Some("us-west"),
             "the fields that were already there must survive the new one landing"
         );
-        assert_eq!(state.ingress_owner.as_deref(), Some("us-west-001"));
+        // No member row carries a machine tag here, so the legacy name stays a
+        // name (R936-B3) rather than being dropped.
+        assert_eq!(
+            state.ingress_owner,
+            Some(IngressOwnerRecord::LegacyMachine("us-west-001".into()))
+        );
 
         // Old reads new: stand in for a pre-R859-F2 binary's decoder and
         // confirm the extra key is ignored rather than fatal.
@@ -3037,13 +3151,8 @@ mod tests {
     fn apply_ingress_owner() {
         let mut state = YubabaState::default();
         assert!(state.ingress_owner.is_none());
-        apply(
-            &mut state,
-            &YubabaRequest::SetIngressOwner {
-                machine: "htz-pdx-1".into(),
-            },
-        );
-        assert_eq!(state.ingress_owner.as_deref(), Some("htz-pdx-1"));
+        apply(&mut state, &YubabaRequest::ClaimIngressOwner { node_id: 7 });
+        assert_eq!(state.ingress_owner_node(), Some(7));
         apply(&mut state, &YubabaRequest::ClearIngressOwner);
         assert!(state.ingress_owner.is_none());
     }
@@ -3101,7 +3210,10 @@ mod tests {
         let state: YubabaState =
             serde_json::from_str(legacy).expect("a pre-T7 snapshot must still load");
         assert!(state.members.contains_key(&1));
-        assert_eq!(state.ingress_owner.as_deref(), Some("m1"));
+        assert_eq!(
+            state.ingress_owner,
+            Some(IngressOwnerRecord::LegacyMachine("m1".into()))
+        );
         let written = serde_json::to_value(&state).unwrap();
         assert!(
             written.get("secrets").is_none(),

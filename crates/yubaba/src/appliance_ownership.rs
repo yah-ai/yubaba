@@ -414,6 +414,77 @@ pub fn decide_owner(
     }
 }
 
+// ─── R936-B10: every voter says whether it could take the appliance ─────────
+//
+// `decide_owner` only ever sees ONE live candidate: the node running it. Only
+// the raft leader may claim a vacancy, and it can only measure its own
+// native-exec capability, so a vacancy is filled by the leader or by nobody.
+// That is why us-south-001 "never bid" on 2026-09-22: it was a follower, and
+// followers are silent by design, while the leader (us-east-001, no
+// `config.yaml`) refused itself and declared the cluster coordinator-less for
+// 10m52s with an eligible voter sitting idle.
+//
+// Two changes close it without letting a follower claim anything:
+//
+// - every node publishes its own verdict ([`CandidacyReport`], served at
+//   `GET /cluster/appliance-candidacy`), so the answer is readable before an
+//   outage rather than discovered by killing the owner; and
+// - an ineligible leader facing a vacancy hands raft leadership to a voter that
+//   reports itself eligible ([`pick_handoff_target`]). The new leader then
+//   elects itself through the ordinary path. Ownership is still only ever
+//   claimed by a leader for itself, after a successful start (R858-T3).
+
+/// One node's answer to "could I take the appliance right now", as its own
+/// ownership tick last judged it. Served verbatim at
+/// `GET /cluster/appliance-candidacy` and read by `cloud.ha_diagnose` and by an
+/// ineligible leader looking for a handoff target.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CandidacyReport {
+    pub node_id: YubabaNodeId,
+    /// [`judge_appliance_candidate`] passed for this node.
+    pub eligible: bool,
+    /// [`ApplianceIneligible::as_str`] when `eligible` is false.
+    pub refusal: Option<String>,
+    /// `present` / `absent` / `unknown` — see [`NativeExecCapability`].
+    pub native_exec: String,
+    /// `<headscale_dir>/headscale` exists.
+    pub binary_present: bool,
+    /// `<headscale_dir>/config.yaml` exists.
+    pub config_present: bool,
+    /// `YUBABA_HEADSCALE_URL` is set, so a missing `config.yaml` can be rendered.
+    pub headscale_url_configured: bool,
+    pub backoff_until: Option<u64>,
+    pub is_leader: bool,
+}
+
+impl NativeExecCapability {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Present => "present",
+            Self::Absent => "absent",
+        }
+    }
+}
+
+/// Which voter an ineligible leader should hand raft leadership to, if any.
+///
+/// The first eligible voter by node id that is not `self_id`. Reports from
+/// non-voters are ignored, because `transfer_leader` to a learner cannot land.
+/// Deterministic, so every tick of one leader picks the same target and a
+/// cooldown in the caller is enough to stop churn.
+pub fn pick_handoff_target(
+    self_id: YubabaNodeId,
+    voters: &std::collections::BTreeSet<YubabaNodeId>,
+    reports: &[CandidacyReport],
+) -> Option<YubabaNodeId> {
+    reports
+        .iter()
+        .filter(|r| r.node_id != self_id && r.eligible && voters.contains(&r.node_id))
+        .map(|r| r.node_id)
+        .min()
+}
+
 // ─── R858-T7: ungraceful death — expiry and fencing ─────────────────────────
 //
 // Everything above answers "who should own the appliance", and every one of its
@@ -650,6 +721,28 @@ pub fn owner_lease_expired(silence: Option<Duration>, timing: FenceTiming) -> bo
 /// [`Raft::ensure_linearizable`]: https://docs.rs/openraft
 pub fn record_is_settled(leader_contact_for: Option<Duration>, timing: FenceTiming) -> bool {
     leader_contact_for.is_some_and(|d| d >= timing.settle_after)
+}
+
+/// R936-B5: is this node a leader a quorum is actually following?
+///
+/// `may_act_on_ownership`'s leader clause trusts a leader because "it has
+/// applied everything it committed". That holds for a leader that has
+/// committed something. It does not hold for a node whose `current_leader`
+/// names itself only because it restored its own vote from disk. That was
+/// us-west-001 on 2026-09-22 (drill 1): powered back on with no mesh, so no
+/// peer could reach it, it read as leader, skipped the settle gate, and adopted
+/// kamaji's boot-replayed coordinator at 22:40:50, 22:42:25, 22:44:01 and
+/// 22:45:36. The fence removed it at 22:46:16.
+///
+/// Proof is a quorum ack no older than [`FenceTiming::settle_after`]. openraft
+/// reports `last_quorum_acked` only for a leader whose committed vote a quorum
+/// has answered, so a vote-restored leader has none.
+pub fn leader_is_proven(
+    current_leader_is_self: bool,
+    quorum_ack_age: Option<Duration>,
+    timing: FenceTiming,
+) -> bool {
+    current_leader_is_self && quorum_ack_age.is_some_and(|age| age <= timing.settle_after)
 }
 
 /// **ACT.** May this node take an ownership action on this tick?
@@ -1809,5 +1902,78 @@ mod tests {
         let mut with = without.clone();
         with.insert(2, candidate(dead()));
         assert_eq!(decide_owner(owner, &with, 0), OwnershipDecision::ElectTo(1));
+    }
+
+    /// R936-B5: the rebooted, meshless us-west-001 of drill 1 read itself as
+    /// leader (restored vote) with no quorum ack and no leader contact. It must
+    /// not act, so its boot-replayed appliance is never adopted.
+    #[test]
+    fn a_vote_restored_leader_without_a_quorum_ack_may_not_adopt() {
+        let timing = FenceTiming::from_thresholds(
+            crate::cluster_policy::ClusterPolicy::fleet().liveness_thresholds(),
+        );
+        let proven = leader_is_proven(true, None, timing);
+        assert!(!proven);
+        assert!(!may_act_on_ownership(proven, Some(2), 2, false));
+        // A stale ack (partitioned since) is not proof either.
+        assert!(!leader_is_proven(true, Some(timing.settle_after * 2), timing));
+        // A leader a quorum answered within the settle window may act.
+        let proven = leader_is_proven(true, Some(Duration::from_millis(500)), timing);
+        assert!(proven);
+        assert!(may_act_on_ownership(proven, Some(2), 2, false));
+        // Not the leader at all: the settled-follower clause is the only path.
+        assert!(!leader_is_proven(false, Some(Duration::ZERO), timing));
+    }
+
+    fn report(node_id: YubabaNodeId, eligible: bool) -> CandidacyReport {
+        CandidacyReport {
+            node_id,
+            eligible,
+            refusal: (!eligible).then(|| "missing-native-exec".into()),
+            native_exec: "present".into(),
+            binary_present: true,
+            config_present: eligible,
+            headscale_url_configured: eligible,
+            backoff_until: None,
+            is_leader: false,
+        }
+    }
+
+    /// R936-B10, the 2026-09-22 drill: leader us-east-001 (3) cannot run the
+    /// appliance, us-south-001 (1) can. The leader must hand off to 1 rather
+    /// than declare the cluster coordinator-less.
+    #[test]
+    fn ineligible_leader_hands_off_to_an_eligible_voter() {
+        let voters = [1, 2, 3].into_iter().collect();
+        let reports = [report(1, true), report(3, false)];
+        assert_eq!(pick_handoff_target(3, &voters, &reports), Some(1));
+    }
+
+    #[test]
+    fn handoff_never_targets_self_an_ineligible_peer_or_a_non_voter() {
+        let voters = [1, 3].into_iter().collect();
+        // Self is eligible per a stale report: not a handoff.
+        assert_eq!(pick_handoff_target(3, &voters, &[report(3, true)]), None);
+        // The only eligible node is a learner.
+        assert_eq!(pick_handoff_target(3, &voters, &[report(2, true)]), None);
+        // Nobody eligible.
+        assert_eq!(pick_handoff_target(3, &voters, &[report(1, false)]), None);
+    }
+
+    #[test]
+    fn handoff_target_is_deterministic() {
+        let voters = [1, 2, 3].into_iter().collect();
+        let reports = [report(2, true), report(1, true)];
+        assert_eq!(pick_handoff_target(3, &voters, &reports), Some(1));
+    }
+
+    /// The wire shape `cloud.ha_diagnose` parses.
+    #[test]
+    fn candidacy_report_round_trips_as_json() {
+        let r = report(1, false);
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["refusal"], "missing-native-exec");
+        assert_eq!(v["headscale_url_configured"], false);
+        assert_eq!(serde_json::from_value::<CandidacyReport>(v).unwrap(), r);
     }
 }

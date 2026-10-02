@@ -51,6 +51,12 @@
 //! an apex. The moment it can add, the two writers are in a loop with each
 //! other and the apex's contents depend on which one ran last.
 //!
+//! R936-B7 added a third writer, [`crate::door_dns`], which *does* re-add, but
+//! only addresses of doors declared for that hostname in its own config and
+//! only once their lease is confirmed live. That bound is what this module
+//! lacks, so the rule above still stands here. Both modules share
+//! [`crate::cloudflare_dns::CloudflareDns`] as their wire client.
+//!
 //! # Why the withdrawal is content-matched
 //!
 //! A round-robin apex holds several A records under one name. "Delete the A
@@ -78,10 +84,6 @@ use async_trait::async_trait;
 use floating_ip::{
     FloatingIpMachine, FloatingIpProvider, IngressOwnerEffect, OwnerLiveness, FLOATING_IP_PROVIDERS,
 };
-use serde::Deserialize;
-
-/// Cloudflare's public API root. Overridden by tests against a local stub.
-const CLOUDFLARE_API: &str = "https://api.cloudflare.com/client/v4";
 
 /// Everything the effector is allowed to do, and the credentials that let it.
 ///
@@ -599,43 +601,26 @@ impl IngressEffector {
 /// [`ApexWithdrawal`] over Cloudflare's DNS API.
 ///
 /// Two calls, both zone-scoped: list the A records at the apex, then delete the
-/// ones whose content matches. That is the entire wire surface, which is the
-/// point — `cloud::provider::cloudflare::CloudflareClient` can do R2, Workers,
-/// tunnels and token minting, and none of that belongs on a fleet node.
+/// ones whose content matches. The wire client is the fleet's shared
+/// [`CloudflareDns`](crate::cloudflare_dns::CloudflareDns) (R936-B7), which the
+/// door reconciler uses too; the only-ever-delete policy is this type's.
 pub struct CloudflareApexWithdrawal {
-    http: reqwest::Client,
-    token: String,
+    dns: crate::cloudflare_dns::CloudflareDns,
     zone_id: String,
-    base_url: String,
 }
 
 impl CloudflareApexWithdrawal {
     /// Build from a config, reading the token out of its `fob`-injected file.
-    ///
-    /// The read happens once at construction rather than per call: a rotated
-    /// token takes effect on the next daemon restart, which is the same
-    /// contract the ACME issuer's token file has.
     pub fn from_config(config: &ApexConfig) -> Result<Self> {
-        let token = std::fs::read_to_string(&config.token_file)
-            .with_context(|| format!("reading Cloudflare token file {}", config.token_file))?
-            .trim()
-            .to_string();
-        anyhow::ensure!(
-            !token.is_empty(),
-            "Cloudflare token file {} is empty",
-            config.token_file
-        );
         Ok(Self {
-            http: reqwest::Client::new(),
-            token,
+            dns: crate::cloudflare_dns::CloudflareDns::from_token_file(&config.token_file)?,
             zone_id: config.zone_id.clone(),
-            base_url: CLOUDFLARE_API.to_string(),
         })
     }
 
     /// Point at a stub server instead of `api.cloudflare.com`.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
+        self.dns = self.dns.with_base_url(base_url);
         self
     }
 
@@ -643,78 +628,16 @@ impl CloudflareApexWithdrawal {
     /// the file read.
     pub fn new(token: impl Into<String>, zone_id: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
-            token: token.into(),
+            dns: crate::cloudflare_dns::CloudflareDns::new(token),
             zone_id: zone_id.into(),
-            base_url: CLOUDFLARE_API.to_string(),
         }
     }
-}
-
-#[derive(Deserialize)]
-struct CfPage<T> {
-    success: bool,
-    #[serde(default)]
-    errors: Vec<CfError>,
-    #[serde(default = "Vec::new")]
-    result: Vec<T>,
-}
-
-#[derive(Deserialize)]
-struct CfUnit {
-    success: bool,
-    #[serde(default)]
-    errors: Vec<CfError>,
-}
-
-#[derive(Deserialize)]
-struct CfError {
-    #[serde(default)]
-    code: i64,
-    #[serde(default)]
-    message: String,
-}
-
-#[derive(Deserialize)]
-struct CfDnsRecord {
-    id: String,
-    content: String,
-}
-
-fn cf_ok(success: bool, errors: &[CfError]) -> Result<()> {
-    anyhow::ensure!(
-        success,
-        "cloudflare API rejected the call: {}",
-        if errors.is_empty() {
-            "no error detail returned".to_string()
-        } else {
-            errors
-                .iter()
-                .map(|e| format!("[{}] {}", e.code, e.message))
-                .collect::<Vec<_>>()
-                .join("; ")
-        }
-    );
-    Ok(())
 }
 
 #[async_trait]
 impl ApexWithdrawal for CloudflareApexWithdrawal {
     async fn withdraw_a_record(&self, apex: &str, address: &str) -> Result<u32> {
-        let listed: CfPage<CfDnsRecord> = self
-            .http
-            .get(format!(
-                "{}/zones/{}/dns_records?name={apex}&type=A&per_page=100",
-                self.base_url, self.zone_id
-            ))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .with_context(|| format!("listing A records at {apex}"))?
-            .json()
-            .await
-            .with_context(|| format!("decoding the A records at {apex}"))?;
-        cf_ok(listed.success, &listed.errors)?;
+        let listed = self.dns.list_a(&self.zone_id, apex).await?;
 
         // The content match is the safety property, applied here rather than
         // trusted to the query string: Cloudflare's list endpoint filters on
@@ -723,7 +646,6 @@ impl ApexWithdrawal for CloudflareApexWithdrawal {
         // broken filter can do is return records this loop then declines to
         // touch.
         let doomed: Vec<String> = listed
-            .result
             .into_iter()
             .filter(|r| r.content == address)
             .map(|r| r.id)
@@ -731,20 +653,10 @@ impl ApexWithdrawal for CloudflareApexWithdrawal {
 
         let mut deleted = 0u32;
         for id in &doomed {
-            let resp: CfUnit = self
-                .http
-                .delete(format!(
-                    "{}/zones/{}/dns_records/{id}",
-                    self.base_url, self.zone_id
-                ))
-                .bearer_auth(&self.token)
-                .send()
+            self.dns
+                .delete_record(&self.zone_id, id)
                 .await
-                .with_context(|| format!("deleting A record {id} ({address}) at {apex}"))?
-                .json()
-                .await
-                .with_context(|| format!("decoding the delete of A record {id} at {apex}"))?;
-            cf_ok(resp.success, &resp.errors)?;
+                .with_context(|| format!("withdrawing A record {id} ({address}) at {apex}"))?;
             deleted += 1;
         }
         Ok(deleted)

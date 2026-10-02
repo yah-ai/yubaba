@@ -187,6 +187,25 @@ async fn every_node_registers_its_own_region_and_the_map_replicates() {
         "each row must carry the region THAT node was started with — a loop that wrote its \
          own region into every row would still produce three rows"
     );
+
+    // R937-F3: GET /raft/status must surface each row's `machine` name, not
+    // just `addr`/`region` — that name is the only way to say "us-south-001
+    // down" instead of "3 down" once the node is dead and can't answer
+    // /identity. The harness's own registration loop writes
+    // `harness-node-<id>` (yubaba-test-harness/src/solo_node.rs); asserting
+    // that string round-trips through the HTTP handler is what would have
+    // caught the JSON projection silently dropping the field.
+    let status = raft_status(&nodes[0].base_url).await;
+    let members = status["members"]
+        .as_object()
+        .expect("members section present");
+    for id in 1..=3u64 {
+        assert_eq!(
+            members[&id.to_string()]["machine"],
+            serde_json::json!(format!("harness-node-{id}")),
+            "GET /raft/status must name member {id} by machine, not leave it absent"
+        );
+    }
 }
 
 /// The loop converges and then does nothing.

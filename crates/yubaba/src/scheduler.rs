@@ -385,6 +385,14 @@ pub struct SchedulerDeps {
     /// could disagree with this one about any of them. `None` — every camp that
     /// has not set `YUBABA_INGRESS_APEX` — skips the ingress plan entirely.
     pub ingress: Option<crate::ingress_effector::IngressEffector>,
+    /// R936-B7: the door-DNS reconciler. Rides this loop for the same reason
+    /// `ingress` does — the leader check, the lease report and the quorum
+    /// verdict are all in hand here — but keeps its OWN leader-scoped tracker
+    /// behind a settle gate rather than reading `tracker` below, which a
+    /// follower keeps warm across leadership changes and which can therefore
+    /// hold a previous term's verdicts (see `door_dns` invariant 3). `None` —
+    /// every camp without `YUBABA_DOOR_DNS_CONFIG` — never touches DNS.
+    pub door_dns: Option<crate::door_dns::DoorDns>,
 }
 
 /// Spawn the scheduler loop.
@@ -416,6 +424,7 @@ async fn run(
         raft_detector,
         rpo_registry,
         ingress,
+        mut door_dns,
     } = deps;
     use crate::failure_detector::{FailureDetector, LivenessReport};
     use openraft::async_runtime::watch::WatchReceiver;
@@ -452,6 +461,9 @@ async fn run(
             None => LivenessReport::new(),
         };
         tracker.observe(&report, config.hysteresis, std::time::Instant::now());
+        if let Some(d) = door_dns.as_mut() {
+            d.observe(is_leader, std::time::Instant::now(), &report, config.hysteresis);
+        }
 
         if !is_leader {
             continue;
@@ -504,12 +516,25 @@ async fn run(
             debug!(node_id, verdict = %quorum.reason(), "quorum not healthy this tick");
         }
 
+        // R936-B7: door DNS follows door liveness. Withdrawals are gated on
+        // `quorate`, not `permits_withdrawal`: the doors are the voters, so one
+        // dead door is already `Degraded` and the stricter gate would refuse
+        // exactly the case this exists for.
+        if let Some(d) = door_dns.as_mut() {
+            d.reconcile_if_due(std::time::Instant::now(), &members, quorum.quorate())
+                .await;
+        }
+
         // R859-F2 phase B: public ingress follows placement. Everything this
         // needs is already in hand — the leader check above, the tracker, the
         // quorum verdict — which is why it lives in this tick and not a loop of
         // its own.
         if let Some(effector) = &ingress {
-            let current_owner = state_machine.ingress_owner();
+            // R936-B3: raft records the owner as a node id. The floating-IP
+            // planner below is keyed by the member row's machine tag (the same
+            // string `floating_ip_machines` carries), so translate at this edge.
+            let current_owner_node = state_machine.ingress_owner();
+            let current_owner = current_owner_node.and_then(|id| state_machine.machine_for_node(id));
             // Liveness may only ever VETO here (see
             // `plan_ingress_owner_effect`'s doc): an owner we cannot resolve to
             // a node id, or one the hysteresis has not committed either way, is
@@ -517,9 +542,7 @@ async fn run(
             // "dead" would withdraw a live origin on the strength of a missing
             // member row.
             let liveness = crate::ingress_effector::owner_liveness(
-                current_owner
-                    .as_deref()
-                    .and_then(|machine| state_machine.node_for_machine(machine)),
+                current_owner_node,
                 |id| tracker.committed(id),
             );
             // One snapshot of the declarations, used by both halves: the

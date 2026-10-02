@@ -82,6 +82,43 @@
 //! (`app/dist/<mount>/`) and because the domain manifest may give that path
 //! response headers the root does not have. So N bundle components produce N
 //! mounts and one unit, and it is the unit count that rule 1 keys on.
+//!
+//! @yah:ticket(R931-B4, "Inner door deploy is routed to kamaji's containerd backend and 500s on local/passway:inner-door@ (empty digest)")
+//! @yah:status(review)
+//! @yah:at(2026-09-22T01:09:31Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R931)
+//! @yah:handoff("Tier: Warrior — this blocks the whole inner-door feature on a real hostname; it is the first use of it outside yah and it does not work. MEASURED 2026-09-21 on prod. SYMPTOM: `yah cloud mirror up noisetable-marketing --env prod` reconciled both static components fine, then failed deploying passway-inner-noisetable-marketing with `yubaba returned 500: kamaji deploy_workload: BackendRefused: containerd: image not found in containerd: cr-less ref \"local/passway:inner-door@\" — pre-pull required`. NOTE THE EMPTY DIGEST after the @. WHY THAT IS WRONG RATHER THAN A MISSING IMAGE: InnerDoorPlan::workload (inner_door.rs:553) constructs exactly that ImageRef — registry \"local\", repository \"passway\", tag \"inner-door\", digest \"\" — and the comment at the site says \"Identity metadata only — the native backend pulls nothing\". The surrounding module doc adds that the route table travels as WorkloadSpec::files and that \"only kamaji's NATIVE backend materializes those; every other backend refuses the spec by name rather than starting the door against a file that is not there\", and deploy_inner_door (app/yah/cli/src/cloud.rs:12173) has a \"rejected\" arm whose message says the same. What happened is NEITHER: the spec reached containerd and came back as a 500 asking for a pull, so it never reached a native backend to be accepted or refused by name. WHAT I CHECKED: both us-east-001 and us-west-001 run kamaji with `--native-exec-dir /var/lib/yah/kamaji/native`, so the flag is present on both; both native dirs are effectively empty (west has only a `headscale` subdir), so nothing named passway is staged; /usr/local/bin/passway DOES exist on the node but as a systemd-managed host binary — passway, passway-demux and passway-http-router are all systemd units, so the OUTER door is not a container workload at all. HYPOTHESIS, NOT ESTABLISHED: kamaji's native supervisor is behind `#[cfg(feature = \"native-exec\")]` (seen in oss/kamaji/crates/kamaji-bin/src/server.rs), so a deployed kamaji built without that feature would behave exactly like this; I could not confirm the installed binary's feature set and stopped rather than guess. Start there. CLEANUP DONE: the half-created record was destroyed via POST /workloads/passway-inner-noisetable-marketing/destroy on us-east-001, so a retry starts clean; a leftover /run/netns/passway-inner-noisetable-marketing mount unit was still active on that node afterwards.")
+//! @yah:handoff("ITEM 1 (backend-selection site): oss/kamaji/crates/kamaji-bin/src/server.rs:2205 deploy_container_backend(). Predicate is spec.wants_native_exec() at line 2212 (falls to deploy_native_exec if true), then spec.wants_microvm() at 2216, then the #[cfg(feature=\"containerd-integration\")] containerd arm at 2220 if ctx.containerd is Some. wants_native_exec() (oss/yah-base/crates/workload-spec/src/lib.rs:3411) is purely annotation-based: annotations[\"yah.exec\"] == \"native\" (NATIVE_EXEC_ANNOTATION/NATIVE_EXEC_VALUE, lib.rs:4356/4361). Routing has nothing to do with runtime flags at this call site — it only reads the spec.")
+//! @yah:handoff("ITEM 2 (why it landed on containerd): CONFIRMED, and the prior hypothesis (kamaji built without the native-exec cargo feature) is KILLED, not just unconfirmed. Root cause: InnerDoorPlan::workload() (oss/yubaba/crates/cloud/src/inner_door.rs, was line 617) built its WorkloadSpec with `annotations: HashMap::new()` -- the native-exec marker was simply never set on the inner-door spec. Confirmed by contrast with the one other native-exec appliance in the tree, headscale_appliance.rs:356 appliance_spec(), which explicitly does `annotations.insert(NATIVE_EXEC_ANNOTATION, NATIVE_EXEC_VALUE)` with a comment naming exactly this routing. Since wants_native_exec() reads only spec.annotations, the inner-door spec would have fallen through to containerd regardless of whether the installed kamaji has --native-exec-dir configured or the native-exec cargo feature compiled in -- both of which were already confirmed present on both prod nodes by the prior courier, making the feature-flag theory moot even before this fix.")
+//! @yah:handoff("ITEM 3 (guard landed): Fixed at the true source -- oss/yubaba/crates/cloud/src/inner_door.rs InnerDoorPlan::workload(): added `annotations.insert(NATIVE_EXEC_ANNOTATION, NATIVE_EXEC_VALUE)` and wired `annotations` (was `HashMap::new()`) into the WorkloadSpec literal, plus a NATIVE_EXEC_ANNOTATION/NATIVE_EXEC_VALUE import. This makes the spec actually reach deploy_native_exec (server.rs:2429), which ALREADY HAD the exact diagnosable-refusal guard item 3 asked for and just never got exercised: if ctx.native is None it returns BackendRefused naming the missing capability verbatim -- \"native backend not configured -- start kamaji with --native-exec-dir\" (feature present, --native-exec-dir unset) or \"kamaji built without the native-exec feature\" (feature absent) -- rather than silently falling through to containerd. No change was needed in kamaji itself; the guard was already correct, just unreachable for this workload.")
+//! @yah:verify("Baseline BEFORE any edit, measured via revert-with-Edit (git stash is blocked in this camp) + `cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib inner_door -- --test-threads=1`: 21 passed, 0 failed (inner_door::tests + reconciler::ingress::tests::an_inner_door_overrides...).")
+//! @yah:verify("AFTER the fix, same command: 21 passed, 0 failed -- no regression, no new test needed since no assertion in this module reads spec.annotations.")
+//! @yah:verify("`cargo check --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --all-targets`: Finished clean (0 errors); the 3 warnings present are pre-existing and in files this change did not touch (app_manifest.rs:765 dead field, pond_door.rs:921 dead fn, reconciler/mod.rs:1092 non-snake-case test name).")
+//! @yah:gotcha("This fix has NOT been verified live on prod -- I do not have a way to redeploy noisetable-marketing from this session per the ticket's mandate (three things only, then stop). Whoever next runs `yah cloud mirror up noisetable-marketing --env prod` should expect one of two outcomes: the inner door now deploys via kamaji's native backend (success), or it now gets a clean BackendRefused naming the missing native-exec capability on that node (which would mean us-east-001/us-west-001's --native-exec-dir wiring needs a second look despite the prior courier's check) -- either is a real diagnostic improvement over the empty-digest containerd 500.")
+//! @yah:gotcha("Did not touch app/yah/cli/src/cloud.rs (owned by another courier) or oss/yubaba/crates/cloud/src/config.rs (dirty under @Miravel:eclipse) -- neither needed a change for this fix.")
+//! @yah:gotcha("git-policy is `defer` in this camp right now, so the fix is left as an uncommitted working-tree edit for the operator/git-sweep to commit -- commit_sha is null by design, not an omission.")
+//! @yah:handoff("FOLLOW-UP (same session, warm context): landed the guard the operator asked for, at a DIFFERENT and more precise invariant than item 3's first pass argued for. Q1 (construction sites): grepped every non-empty `WorkloadSpec{files:...}` literal and every real (non-test) `NATIVE_EXEC_ANNOTATION`/`MICROVM_EXEC_VALUE` write in oss/+app/+crates/. Found THREE production construction/mutation sites, not two: (a) oss/yubaba/crates/yubaba/src/headscale_appliance.rs:356 appliance_spec() -- builds from scratch, sets the annotation correctly. (b) oss/yubaba/crates/cloud/src/inner_door.rs InnerDoorPlan::workload() -- built from scratch, annotation MISSING, now fixed this session. (c) oss/qed/crates/velveteen-exec/src/remote.rs:989/1025 mark_native_exec()/mark_microvm() -- MUTATES an already-built container-shaped forge spec into native/microvm form and correctly sets the annotation, but that spec keeps a REAL non-empty digest (a resolved build image), so it was never exposed to this bug class regardless. Every other NATIVE_EXEC_ANNOTATION/MICROVM_EXEC_VALUE hit in the tree (oss/yubaba/crates/yubaba/src/service_records.rs, oss/yubaba/crates/cloud/src/config.rs, several kamaji test files) is inside #[cfg(test)] -- test fixtures, not deploy-path construction. So: 2 from-scratch sites total, exactly matching the ticket's original count, one of which was the bug.")
+//! @yah:handoff("Q1 ALSO SURFACED A STALE DOC CLAIM WORTH RECORDING: inner_door.rs's own module doc says 'every other backend refuses the spec by name rather than starting the door against a file that is not there' about WorkloadSpec::files. That is FALSE as of R870-F27 (oss/kamaji/crates/kamaji-containerd-core/src/lib.rs plan_spec_files/stage_spec_files, wired into containerd's deploy path at oss/kamaji/crates/kamaji/src/containerd.rs:425): containerd now materializes files too (bind-mounts them into the container), and a real container spec CAN legitimately carry files -- proved by oss/yubaba/crates/yubaba/src/spec_redact.rs's own redaction test building a plain container_spec with files. Only the DOCKER backend still has no file-staging code at all. This means 'files present + no native annotation' is NOT a safe general invariant (it would reject legitimate containerd config-injection workloads) -- I did not write that check. Did not edit the stale doc comment itself since it lives in inner_door.rs's module header, outside what this follow-up touched; flagging it here rather than silently leaving a wrong claim uncorrected.")
+//! @yah:handoff("Q2/DECISION (guard landed): the real, general invariant is about `image.digest`, not `files`: an empty digest is only valid on a spec whose exec_substrate() is Native or MicroVm (both backends document image as 'identity metadata only, nothing is pulled' -- wants_native_exec/wants_microvm doc comments in oss/yah-base/crates/workload-spec/src/lib.rs). A Container-substrate spec with an empty digest has no backend that can serve it: containerd/docker both resolve-by-digest before anything else runs (confirmed by reading oss/kamaji/crates/kamaji/src/containerd.rs:389's resolve_image_target_digest call, which is exactly where the original prod 500 fired). Landed the check in oss/yah-base/crates/workload-spec/src/validate.rs shape() -- the ONE shape gate both POST /workloads/deploy and POST /workloads/validate run via check_deploy_body() in oss/yubaba/crates/yubaba/src/lib.rs:5866 (read-only; not edited, and not one of the two restricted files), before admission or any backend selection. This is a shared crate (yah-base/workload-spec), not kamaji internals and not cloud.rs/config.rs -- in blast radius. I did NOT reach into kamaji-bin/src/server.rs's deploy_container_backend (server.rs:2205) or wants_native_exec's caller (server.rs:2212) even though the operator listed it as an option: that file is a 9000+ line hot spot with multiple concurrently-referenced live tickets (R850-F1, R870-F27, R881-T3, R908-T1 all cited in the very functions this ticket touches) and editing it as a one-shot courier without live-peer context felt like exactly the case CLAUDE.md's shared-tree doctrine says to yield on rather than force -- naming it here per the operator's own fallback instruction. New Err: ShapeError::Field{path: FieldPath::Image, reason: names both missing-annotation values and the unpullable ref}. Added one bad-fixture regression test (tests/fixtures/bad/image_digest_empty_no_native_marker.json, a copy of the actual inner-door shape pre-fix) and one valid-fixture regression test (tests/fixtures/valid/native_exec_empty_digest.json, the same shape WITH the annotation, to prove the check does not over-fire) -- both wired into the existing table-driven tests in tests/shape_fixtures.rs.")
+//! @yah:verify("OPEN QUESTION FOR THE REVIEWER — the second-pass guard reports 108 passed / 0 failed BEFORE and AFTER, while also claiming \"regression fixtures for both the rejected and accepted shape\" were added. An unchanged test count is consistent with fixtures added INSIDE an existing table-driven test (coverage rises, count does not), but it is equally consistent with fixtures that no assertion actually reads. Confirm by reading oss/yah-base/crates/workload-spec/src/validate.rs: check that the empty-digest-requires-Native/MicroVm rule is asserted by a test that FAILS when the check is removed. A guard that cannot fail is not a guard. The leader did not re-run any of this — see the relay-level note on R931.")
+//! @yah:verify("OPEN QUESTION ABOVE IS NOW ANSWERED — THE GUARD IS REAL. A separate verifying courier mutation-tested it rather than trusting the unchanged count: disabling the check in validate.rs (`if false && spec.image.digest.is_empty() && ...`) via Edit made shape_fixtures::bad_fixtures_produce_expected_shape_error FAIL with \"expected ShapeError for fixture image_digest_empty_no_native_marker but got Ok([])\". The guard was then restored by hand with Edit (never git) and the suite returned to green; git diff on validate.rs afterwards shows only the implementing courier's own added lines, so the round-trip left no residue. So the 108/108-before-and-after count was the benign case — fixtures folded into an existing table-driven test, coverage genuinely added. Also independently confirmed: InnerDoorPlan::workload() sets NATIVE_EXEC_ANNOTATION/NATIVE_EXEC_VALUE at inner_door.rs:583-584 with imports at :114-115. Note on the \"108\": that is the tests/main.rs integration suite; the crate also runs 207 lib tests, green in the same runs. cargo build -p yah exit 0.")
+//!
+//! @yah:ticket(R931-B8, "SSR self-fetch to own public hostname (noisetable.com/api/issues) 500s from inside mesofact-spa even though the same URL succeeds externally")
+//! @yah:status(review)
+//! @yah:at(2026-09-22T16:17:38Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R931)
+//! @yah:severity(medium)
+//! @yah:next("Get SSR-side logs/stderr for the site (mesofact-spa) component on us-east-001 for a request to /issues to see what fetch('https://noisetable.com/api/issues') actually throws or returns from inside the container.")
+//! @yah:next("Confirm whether other mesofact-spa routes that self-fetch their own public origin have the same failure, or if this is specific to issues.tsx's URL construction.")
+//! @yah:next("Once root-caused, the fix likely belongs in mesofact/passway (egress/hairpin routing for self-referential fetches) or in a documented convention for SSR handlers to use an internal mesh address instead of the public hostname.")
+//! @yah:handoff("DIAGNOSED 2026-09-22 by noisetable R733-T26: NOT a hairpin/egress defect, and the page never fetched https://noisetable.com at all. mesofact's SSR dispatch strips Host and synthesizes req.url = \"http://dev{path_and_query}\" (oss/mesofact/crates/mesofact/src/server.rs:1006, dispatch_to_ssr). noisetable's web/landing/src/issues.tsx built its API URL as new URL(\"/api/issues\", new URL(request.url).origin), i.e. http://dev/api/issues, which resolves nowhere -> caught -> 500 'Unable to load issues'. Fixed on the noisetable side (base = SITE_ORIGIN = https://noisetable.com) and redeployed; live /issues now 200 listing the fixture, so a self-fetch to the site's own public hostname from inside mesofact-spa WORKS. Recommend closing this bug, or re-scoping it to a mesofact docs/API gap: SSR fetch handlers get a synthetic origin with no documented way to learn the public host (no Host / X-Forwarded-Host passthrough), which is a trap for any handler that reads request.url's origin.")
+//! @yah:handoff("Re-scoped per the R733-T26 diagnosis (not a hairpin/egress bug; the SSR request URL had a fake origin) and fixed in mesofact: dispatch_to_ssr no longer hardcodes http://dev. The new public_origin() (oss/mesofact/crates/mesofact/src/server.rs, beside should_retry_status) builds request.url from X-Forwarded-Host, falling back to Host. The scheme comes from X-Forwarded-Proto (https only), otherwise http. A host value that is not authority-shaped, or is missing, becomes http://localhost. So new URL(request.url).origin is now the site's own public origin. Test fixtures in ssr.rs / mesofact-ssr that use http://dev/... were left alone: they are hand-built DispatchRequests, not the server path.")
+//! @yah:verify("cd oss/mesofact && cargo test -p mesofact --features ssr --lib server:: — 72 passed, including the new ssr_request_url_carries_public_origin, which covers 4 cases: plain Host; XFH+XFP overriding an internal Host; an injection-shaped Host rejected; no Host.")
+//! @yah:gotcha("Not deployed. Prod picks this up only after a mesofact release and a noisetable site redeploy. Passway does not set X-Forwarded-Proto (grep found none in oss/yubaba), so behind a TLS edge the origin reads http://noisetable.com. That is right for host-based self-fetch, but it is not the https origin. noisetable's SITE_ORIGIN workaround stays valid either way.")
+//! @yah:handoff("HOTSHIPPED 2026-09-22 (operator call A). Runtime `mesofact/0.8.41-r931b8` was built from the yah tree by `yah qed run mesofact-musl` (run dbce5363, no CDN publish). It went out through `yah cloud bundle publish-runtime`: x86_64-musl (blake3 f62bba56…) to bucket noisetable-marketing, aarch64-musl (5505a05b…) to noisetable-staging. The noisetable mirrors now pin 0.8.41-r931b8: prod.toml was 0.8.32 (rollback note inline), staging.toml was 0.8.40. PROD: `yah cloud apply --env prod --service noisetable-marketing` EXIT=0, bundle 2aae406a…, us-east-001 Running. Live after the apply: / 200, /issues 200 (lists issues), /api/issues 200, /app/ 200; COOP/COEP present on / and /app/. STAGING (canary) apply EXIT=1, for a reason unrelated to the runtime: the inner door refused because staging's `issues` component (kind=binary) has no resolved address. The bundle is Running on us-west-011 on the new runtime, / and /app/ serve with COOP/COEP, and /issues renders its 'Unable to load issues' fallback because staging /api/issues is 404.")
+//! @yah:cleanup("noisetable's prod.toml and staging.toml pin the prerelease runtime `0.8.41-r931b8`, which exists only in the noisetable-marketing and noisetable-staging buckets. After the next real mesofact release, move both pins to it; x86_64 and aarch64 runtime assets must be published to those buckets first. Staging's `issues` workload component has no address, so the staging inner door refuses; this is in the inner-door area the R931 parent covers.")
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -91,7 +128,8 @@ use serde::Serialize;
 use workload_spec::{
     EnvValue, EnvVar, ExposeSpec, HealthProbe, Healthcheck, ImageRef, InlineFile,
     LifecycleArchetype, MeshExpose, MeshIdent, Millis, NamespaceId, ResourceLimits, RestartPolicy,
-    StopPolicy, TenantId, TierTag, Workload, WorkloadSpec,
+    StopPolicy, TenantId, TierTag, Workload, WorkloadSpec, NATIVE_EXEC_ANNOTATION,
+    NATIVE_EXEC_VALUE, RESUME_AFTER_RESTART_ANNOTATION, RESUME_AFTER_RESTART_VALUE,
 };
 
 use crate::config::{
@@ -259,7 +297,7 @@ pub fn plan(
 /// ## Why this takes a `DomainConfig` and not a compiled `RouteTable`
 ///
 /// It would be circular. `CdnPlacement::backend_origin` resolves a route's
-/// origin out of [`InnerDoorPlan::resolve_addresses`]' output (R898-F1), so no
+/// origin out of the plan's resolved unit addresses (R898-F1), so no
 /// table can be compiled until the plan this function is helping build exists.
 /// [`DomainConfig::route_for_path`] is the placement-free half of that same
 /// table, in exactly the relationship `route_headers_json` already has to
@@ -292,11 +330,37 @@ struct RoutesFile<'a> {
 #[derive(Debug, Serialize)]
 struct RouteEntry<'a> {
     mount: &'a str,
-    upstreams: Vec<String>,
+    discover: RouteDiscover<'a>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     headers: &'a BTreeMap<String, String>,
 }
 
+/// Mirror of passway's `path_routes_file::MountDiscovery` (R936-B12).
+#[derive(Debug, Serialize)]
+struct RouteDiscover<'a> {
+    ident: String,
+    yubaba: &'a [String],
+}
+
+/// How often an inner door re-reads its units' service records, in seconds.
+/// See [`InnerDoorPlan::workload`].
+pub const DISCOVERY_INTERVAL_SECS: u64 = 2;
+
+/// @yah:ticket(R931-B6, "Inner-door render refuses noisetable-marketing route table: Bundle mount has no resolved address yet")
+/// @yah:status(review)
+/// @yah:at(2026-09-22T05:45:52Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R931)
+/// @yah:severity(high)
+/// @yah:gotcha("FOUND BY THE NOISETABLE CAMP (R733-T26, @Miravel:libra) while re-running `yah cloud mirror up noisetable-marketing --env prod` after yah R931-B5's kamaji.service fix (StateDirectory/ReadWritePaths for passway/routes) was rolled to us-east-001 and kamaji restarted (2026-09-22). R931-B5 IS CONFIRMED WORKING for its own scope — the read-only-filesystem EROFS on /var/lib/passway/routes/*.routes.json is GONE. This is the next layer down, not a regression of B5.")
+/// @yah:assumes("The `site`/`app` mesofact-spa/mesofact-static components published and went Running cleanly (bundle digest 8e77c1b448fafabe172bf774f931c1426cace9fe1f0f8f5eebee658c1af21dd6, build_id 9481d540db93867ce8727ce2b7bffd8b, runtime mesofact/0.8.32) throughout this run; only the `issues` (binary/inner-door) component failed.")
+/// @yah:next("Gate for R733-T26: once this reaches review, re-run `yah cloud mirror up noisetable-marketing --env prod` and redo the five-point verification (root 200+title, /app/ 200, GET /api/issues 200 body-free projection, POST tests/fixtures/chloro_edit_failure_post.json -> 201+ULID, /issues renders the list).")
+/// @yah:gotcha("Exact error from `yah cloud mirror up noisetable-marketing --env prod` (run 2026-09-22, ready service records [\"us-east-001\", \"us-south-001\", \"us-west-001\"]): `Error: rendering the inner door for noisetable-marketing/prod from the ready service records of [\"us-east-001\", \"us-south-001\", \"us-west-001\"]: service noisetable-marketing: mount \"\" is served by Bundle, which has no resolved address yet. Refusing to write a partial route table -- a missing mount does not 503, it falls through to the root mount and serves the wrong component with a 200.` Source: oss/yubaba/crates/cloud/src/inner_door.rs:348-349. Live verification after the failed attempt: https://noisetable.com/ 200 (title correct), /app/ 200, GET /api/issues 404 (body is the marketing SPA HTML shell, not the issues service's body-free projection), GET /issues 500 (F25's client error page). No rollback needed -- / and /app/ never left 200.")
+/// @yah:handoff("FIXED in app/yah/cli/src/cloud.rs. Root cause is R931-B7 defect (2), not an ident or config fault: deploy_inner_door read ready service records ONCE right after the deploy phase (re)deployed the bundle, so the bundle ident had no record yet and InnerDoorPlan::workload refused the table. B7's own measurements show the identical error passing on a re-run a minute later. FIX: ReadyRecordWait gained a generic `resolve_with<T>(read, attempt, idle)` loop (resolve_plan is now a thin wrapper over it — one loop, two consumers), and deploy_inner_door runs resolve_addresses + workload() inside it under ReadyRecordWait::APPLY (90s budget, 5s interval), with a one-time stderr notice. The refusal in inner_door.rs:349 is unchanged — a partial table is still never written; it is now retried rather than surfaced on the first read. This also closes B7's defect (2); B7 keeps only defect (1), the needless re-fork.")
+/// @yah:verify("LIVE GATE (not run by me, prod-facing): re-run `yah cloud mirror up noisetable-marketing --env prod`, then the five-point check in this ticket's next — R733-T26's gate.")
+/// @yah:assumes("resolve_workload_ident(mirror, 'noisetable-marketing', 'prod') yields the ident the bundle actually registers ('noisetable' per the west passway log in B7). Inferred from B7's 'next run a minute later succeeded', not re-read against the mirror toml.")
+/// @yah:verify("`cargo test -p yah --lib ready_record_wait` = 5 passed / 0 failed, EXIT 0 (new: the_inner_door_waits_for_the_bundle_record_instead_of_refusing_the_table). Log /tmp/r931b6-t2.log.")
+/// @yah:verify("LIVE, 2026-09-22, CLI installed via `cargo xtask install`: five `yah cloud mirror up noisetable-marketing --env prod` runs from ~/ss/noisetable, all EXIT 0. Each rendered the inner door (/ and /app → 100.64.0.3:41507, /api/issues → 10.128.1.2:4333) and ended 'noisetable.com is serving this bundle'. Not one hit the 'no resolved address yet' refusal, including the runs where the bundle was re-forked just before.")
 impl InnerDoorPlan {
     /// Every distinct unit this door proxies to, in a stable order. What a
     /// caller resolving addresses has to answer for.
@@ -306,34 +370,35 @@ impl InnerDoorPlan {
         set.into_iter().collect()
     }
 
-    /// Render the JSON passway reads, resolving each unit to its address.
+    /// Render the JSON passway reads: each mount names its unit's mesh ident
+    /// and every yubaba that could hold that unit's service record.
     ///
-    /// `address` is placement-time knowledge — which node the unit landed on
-    /// and which port kamaji gave it — so it arrives as a closure rather than
-    /// as config. Returning `None` from it is refused rather than skipped: a
-    /// mount whose upstream could not be resolved would be dropped from the
-    /// table, and the door would then serve that path from whichever *shorter*
-    /// mount matched — the root, usually — which is a wrong answer wearing a
-    /// 200.
-    pub fn routes_file(
-        &self,
-        address: impl Fn(&DeployedUnit) -> Option<String>,
-    ) -> Result<String> {
+    /// No addresses (R936-B12). The table used to bake each unit's
+    /// `host:port` in at deploy time, so it pointed at whichever node ran the
+    /// unit THEN, and a unit the cluster later moved — or a node that died —
+    /// left every door routing to an address nothing answered. noisetable.com
+    /// went 503 on all three doors that way when us-east-001 was powered off.
+    /// Discovering by ident makes the door follow the unit on its next poll.
+    ///
+    /// `yubaba` must name every node a unit may run on: a unit is only found
+    /// where it is polled for. An empty list is refused, since every mount
+    /// would then discover nothing and 503.
+    pub fn routes_file(&self, bundle_ident: &str, yubaba: &[String]) -> Result<String> {
+        if yubaba.is_empty() {
+            bail!(
+                "service {}: an inner door needs at least one yubaba to discover its units \
+                 from, and was given none",
+                self.service
+            );
+        }
         let mut routes = Vec::with_capacity(self.mounts.len());
         for m in &self.mounts {
-            let Some(addr) = address(&m.unit) else {
-                bail!(
-                    "service {}: mount {:?} is served by {:?}, which has no resolved address yet. \
-                     Refusing to write a partial route table — a missing mount does not 503, it \
-                     falls through to the root mount and serves the wrong component with a 200.",
-                    self.service,
-                    m.mount,
-                    m.unit,
-                );
-            };
             routes.push(RouteEntry {
                 mount: &m.mount,
-                upstreams: vec![addr],
+                discover: RouteDiscover {
+                    ident: self.unit_ident(&m.unit, bundle_ident),
+                    yubaba,
+                },
                 headers: &m.headers,
             });
         }
@@ -461,33 +526,6 @@ impl InnerDoorPlan {
         }
     }
 
-    /// Resolve every unit to a `host:port`, given a way to look an address up
-    /// by mesh identity.
-    ///
-    /// The step between [`units`](Self::units) and the `address` closure
-    /// [`routes_file`](Self::routes_file) and [`workload`](Self::workload)
-    /// take: those two ask "where is this unit", this answers it from a
-    /// discovery read. Split out rather than folded in so the identity mapping
-    /// stays testable without a fleet.
-    ///
-    /// A unit with no answer is simply absent from the map — the refusal lives
-    /// in `routes_file`, which is the single place a missing address is
-    /// reported and which already explains why a dropped mount is worse than a
-    /// failed apply.
-    pub fn resolve_addresses(
-        &self,
-        bundle_ident: &str,
-        lookup: impl Fn(&str) -> Option<String>,
-    ) -> BTreeMap<DeployedUnit, String> {
-        self.units()
-            .into_iter()
-            .filter_map(|unit| {
-                let addr = lookup(&self.unit_ident(&unit, bundle_ident))?;
-                Some((unit, addr))
-            })
-            .collect()
-    }
-
     /// Render the supervisable workload: a passway process serving this
     /// service's mount table on loopback.
     ///
@@ -532,7 +570,8 @@ impl InnerDoorPlan {
     pub fn workload(
         &self,
         listen_port: u16,
-        address: impl Fn(&DeployedUnit) -> Option<String>,
+        bundle_ident: &str,
+        yubaba: &[String],
     ) -> Result<Workload> {
         let routes_path = self.routes_path();
         let name = self.workload_name();
@@ -545,7 +584,41 @@ impl InnerDoorPlan {
                 "PASSWAY_PATH_ROUTES_FILE",
                 routes_path.display().to_string(),
             ),
+            // R936-B12: every mount discovers its unit, so how fast the door
+            // notices a unit moving IS this interval. passway's 30s default
+            // would spend half of a one-minute re-home budget on noticing.
+            literal_env("PASSWAY_UPDATE_INTERVAL_SECS", DISCOVERY_INTERVAL_SECS.to_string()),
+            literal_env(
+                "PASSWAY_HEALTH_CHECK_INTERVAL_SECS",
+                DISCOVERY_INTERVAL_SECS.to_string(),
+            ),
         ];
+
+        let mut annotations = HashMap::new();
+        // R931-B4: the marker kamaji's `deploy_container_backend` actually
+        // routes on (`WorkloadSpec::wants_native_exec`). Without it the spec
+        // above's empty-digest `ImageRef` — deliberately unpullable, per the
+        // comment below — falls through to the containerd arm instead of ever
+        // reaching kamaji's native backend, and containerd 500s asking to
+        // pre-pull an image that was never meant to exist. A kamaji with no
+        // native backend configured now refuses this by name
+        // (`deploy_native_exec`'s "native backend not configured" /
+        // "built without the native-exec feature" `BackendRefused`) instead of
+        // silently mis-routing to containerd.
+        annotations.insert(
+            NATIVE_EXEC_ANNOTATION.to_string(),
+            NATIVE_EXEC_VALUE.to_string(),
+        );
+        // R936-B11: survive a reboot. A native workload dies with every kamaji
+        // restart and nothing else on the node remembers a direct deploy, so
+        // until this the door was simply gone after one — and its outer door
+        // 503'd with it. Safe to replay here because an inner door is pinned
+        // to its front door by construction; see the annotation's docs for
+        // why a yubaba-placed appliance must never set it.
+        annotations.insert(
+            RESUME_AFTER_RESTART_ANNOTATION.to_string(),
+            RESUME_AFTER_RESTART_VALUE.to_string(),
+        );
 
         let spec = WorkloadSpec {
             name: name.clone(),
@@ -610,10 +683,10 @@ impl InnerDoorPlan {
             },
             labels: HashMap::new(),
             durability: None,
-            annotations: HashMap::new(),
+            annotations,
             files: vec![InlineFile {
                 path: routes_path,
-                content: self.routes_file(address)?,
+                content: self.routes_file(bundle_ident, yubaba)?,
                 mode: Some(0o600),
             }],
         };
@@ -850,27 +923,25 @@ mod tests {
         );
         let plan = plan(&svc, &domains).unwrap().unwrap();
 
-        let json = plan
-            .routes_file(|unit| match unit {
-                DeployedUnit::Bundle => Some("127.0.0.1:8081".to_string()),
-                DeployedUnit::Component(id) if id == "account" => {
-                    Some("127.0.0.1:8082".to_string())
-                }
-                DeployedUnit::Component(_) => None,
-            })
-            .unwrap();
+        let yubaba = vec![
+            "http://100.64.0.1:7443".to_string(),
+            "http://100.64.0.3:7443".to_string(),
+        ];
+        let json = plan.routes_file("noisetable", &yubaba).unwrap();
+        let account = plan.unit_ident(&DeployedUnit::Component("account".into()), "noisetable");
 
         assert_eq!(
             json,
-            r#"{"schema_version":1,"routes":[{"mount":"","upstreams":["127.0.0.1:8081"]},{"mount":"/app","upstreams":["127.0.0.1:8082"],"headers":{"cross-origin-opener-policy":"same-origin"}}]}"#
+            format!(
+                r#"{{"schema_version":1,"routes":[{{"mount":"","discover":{{"ident":"noisetable","yubaba":["http://100.64.0.1:7443","http://100.64.0.3:7443"]}}}},{{"mount":"/app","discover":{{"ident":"{account}","yubaba":["http://100.64.0.1:7443","http://100.64.0.3:7443"]}},"headers":{{"cross-origin-opener-policy":"same-origin"}}}}]}}"#
+            )
         );
+        assert!(!json.contains("upstreams"), "R936-B12: no baked addresses: {json}");
     }
 
-    /// An unresolved address must stop the write. Dropping the mount would
-    /// leave the door serving `/app` from the ROOT mount with a 200 — the
-    /// silent wrong answer, not a 503.
+    /// With nowhere to discover from, every mount would 503; refuse instead.
     #[test]
-    fn an_unresolved_upstream_refuses_the_whole_table() {
+    fn a_table_with_no_yubaba_to_poll_is_refused() {
         let svc = service(
             "noisetable",
             vec![
@@ -879,15 +950,9 @@ mod tests {
             ],
         );
         let plan = plan(&svc, &BTreeMap::new()).unwrap().unwrap();
-        let err = plan
-            .routes_file(|unit| match unit {
-                DeployedUnit::Bundle => Some("127.0.0.1:8081".to_string()),
-                DeployedUnit::Component(_) => None,
-            })
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no resolved address"), "{err}");
-        assert!(err.contains("account"), "{err}");
+        let err = plan.routes_file("noisetable", &[]).unwrap_err().to_string();
+        assert!(err.contains("at least one yubaba"), "{err}");
+        assert!(plan.workload(8443, "noisetable", &[]).is_err());
     }
 
     /// The rendered door, pinned on the four properties that are not
@@ -904,10 +969,7 @@ mod tests {
         );
         let plan = plan(&svc, &BTreeMap::new()).unwrap().unwrap();
         let workload = plan
-            .workload(8443, |unit| match unit {
-                DeployedUnit::Bundle => Some("127.0.0.1:8081".to_string()),
-                DeployedUnit::Component(_) => Some("127.0.0.1:8082".to_string()),
-            })
+            .workload(8443, "noisetable", &["http://100.64.0.3:7443".to_string()])
             .unwrap();
         let spec = workload.container_spec().expect("container-shaped");
 
@@ -933,15 +995,17 @@ mod tests {
             Some(file.path.display().to_string())
         );
         assert!(file.content.contains("\"schema_version\":1"), "{}", file.content);
-        assert!(file.content.contains("127.0.0.1:8082"), "{}", file.content);
+        assert!(file.content.contains("http://100.64.0.3:7443"), "{}", file.content);
         assert_eq!(spec.command.as_deref(), Some(&[INNER_DOOR_BINARY.to_string()][..]));
+        // R936-B12: the door notices a unit move within one short poll.
+        assert_eq!(env.get("PASSWAY_UPDATE_INTERVAL_SECS"), Some(&"2"));
     }
 
-    /// A door whose table cannot be rendered is not rendered at all — the
-    /// refusal propagates out of `workload`, so there is no spec that deploys
-    /// a door pointing at nothing.
+    /// R936-B11: the door is native AND asks its node's kamaji to replay it
+    /// after a restart. Without the second marker a reboot of a front door
+    /// took the door down for good and the outer door 503'd.
     #[test]
-    fn an_unresolvable_unit_stops_the_workload_being_built() {
+    fn the_rendered_door_is_native_and_survives_a_kamaji_restart() {
         let svc = service(
             "noisetable",
             vec![
@@ -950,7 +1014,13 @@ mod tests {
             ],
         );
         let plan = plan(&svc, &BTreeMap::new()).unwrap().unwrap();
-        assert!(plan.workload(8443, |_| None).is_err());
+        let workload = plan
+            .workload(8443, "noisetable", &["http://100.64.0.3:7443".to_string()])
+            .unwrap();
+        let spec = workload.container_spec().expect("container-shaped");
+        assert!(spec.wants_native_exec());
+        assert!(spec.wants_resume_after_restart());
+        assert!(!spec.wants_float(), "a door is pinned to its front door, never a floater");
     }
 
     #[test]
@@ -1057,15 +1127,8 @@ mod tests {
         );
         let plan = plan(&svc, &domains).unwrap().unwrap();
 
-        let addresses = plan.resolve_addresses("noisetable", |ident| match ident {
-            "noisetable" => Some("100.64.0.3:8080".to_string()),
-            "noisetable-account" => Some("100.64.0.3:14001".to_string()),
-            _ => None,
-        });
-        assert_eq!(addresses.len(), 2);
-
         let workload = plan
-            .workload(plan.listen_port(), |unit| addresses.get(unit).cloned())
+            .workload(plan.listen_port(), "noisetable", &["http://100.64.0.3:7443".to_string()])
             .unwrap();
         let spec = workload.container_spec().expect("container-shaped");
         let listen = spec
@@ -1080,32 +1143,9 @@ mod tests {
         assert_eq!(listen, format!("127.0.0.1:{}", listen_port("noisetable")));
 
         let table = &spec.files[0].content;
-        assert!(table.contains("100.64.0.3:8080"), "{table}");
-        assert!(table.contains("100.64.0.3:14001"), "{table}");
+        assert!(table.contains(r#""ident":"noisetable""#), "{table}");
+        assert!(table.contains(r#""ident":"noisetable-account""#), "{table}");
         assert!(table.contains("cross-origin-embedder-policy"), "{table}");
-    }
-
-    /// A unit that resolved to nothing is ABSENT from the map rather than
-    /// present-and-empty — which is what makes `routes_file`'s refusal the
-    /// single place a missing address is reported.
-    #[test]
-    fn an_unresolvable_unit_is_absent_rather_than_defaulted() {
-        let svc = service(
-            "noisetable",
-            vec![
-                component("site", None, DeployTier::Bundle),
-                component("account", Some("app"), DeployTier::Workload),
-            ],
-        );
-        let plan = plan(&svc, &BTreeMap::new()).unwrap().unwrap();
-        let addresses = plan.resolve_addresses("noisetable", |ident| {
-            (ident == "noisetable").then(|| "100.64.0.3:8080".to_string())
-        });
-        assert_eq!(addresses.len(), 1);
-        assert!(!addresses.contains_key(&DeployedUnit::Component("account".into())));
-        assert!(plan
-            .workload(plan.listen_port(), |unit| addresses.get(unit).cloned())
-            .is_err());
     }
 
     // ── R898-F2: the inner door and the compiled table are one join ──────────

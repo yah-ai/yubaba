@@ -571,11 +571,21 @@ pub mod deploy;
 /// The "is that node still there?" port and its default raft-heartbeat impl
 /// (R118-T9). Deployments with a second evidence channel supply their own.
 pub mod failure_detector;
+/// R936-B12: cluster floaters — the effector that runs a floater where the
+/// raft tenant layer places it, and nowhere else.
+pub mod floater;
 /// R859-F2 phase B: the fleet's half of public-ingress failover — a targeted,
 /// content-matched withdrawal of a dead origin's A record from the apex, driven
 /// by `floating_ip::plan_ingress_owner_effect` off the scheduler's leader tick.
 /// Subtract-only by design; `yah cloud apply` owns every addition.
 pub mod ingress_effector;
+/// R936-B7: the fleet's shared, zone-scoped Cloudflare DNS client (list,
+/// create, delete) used by `ingress_effector` and `door_dns`.
+pub mod cloudflare_dns;
+/// R936-B7: leader-driven reconciler keeping each managed public hostname's A
+/// records equal to its live front doors — withdraws a door whose lease
+/// expired, re-adds it once live, never empties a set.
+pub mod door_dns;
 /// N+1 (N+2 across regions) warm-spare headroom accounting, and the
 /// leader-only background loop that watches it (R737-T4, W253 §8).
 pub mod headroom;
@@ -1090,6 +1100,14 @@ pub struct ServerState {
     /// Each workload gets a `<root>/<ident>/` subdir, reaped on destroy.
     pub secret_mount_root: PathBuf,
 
+    /// R931-B7: per bundle workload name, the digest of the revalidate
+    /// receiver's secret FILES as last materialized for an accepted deploy.
+    /// The envelope names secrets and never carries values, so this is what
+    /// lets an unchanged re-POST skip the re-fork without also swallowing a
+    /// rotation. In memory on purpose: after a yubaba restart there is no
+    /// entry, and no entry means redeploy.
+    pub bundle_secret_digests: std::sync::Mutex<HashMap<String, u64>>,
+
     /// Root of the per-machine yubaba secret store a `SecretRef::LocalFile`
     /// resolves against (default [`secrets::SECRET_STORE_ROOT`]).
     ///
@@ -1139,7 +1157,7 @@ pub struct ServerState {
     /// One field rather than two computations: R858-T4's placement probe and
     /// the deploy both read the appliance spec through this node's state, so
     /// they cannot disagree about what is being placed (R858-B9's lesson).
-    pub headscale_durability: bool,
+    pub headscale_durability_store: Option<String>,
     /// Unique ID for this daemon session. Generated once at startup;
     /// stamped on every tracing span by the correlation-ID middleware so log
     /// lines from the same yubaba process can be correlated across restarts.
@@ -1195,6 +1213,12 @@ pub struct ServerState {
     /// - `deploy_workload_spec` rejects a second deploy of the same ident when
     ///   the existing entry is `Appliance` (single live instance invariant).
     pub archetype_registry: Mutex<HashMap<String, LifecycleArchetype>>,
+
+    /// R931-B7: per ident, [`request_spec_digest`] of the spec its live deploy
+    /// was POSTed with. Same lifecycle as [`Self::archetype_registry`]; read
+    /// only by the appliance single-instance guard, to tell a re-POST of the
+    /// running spec from a genuine second instance.
+    pub appliance_spec_digests: Mutex<HashMap<String, u64>>,
 
     /// R880: mesh idents currently mid-deploy or mid-destroy on THIS node.
     ///
@@ -1273,6 +1297,18 @@ pub struct ServerState {
     /// client's poll interval doubles as its CPU measurement window — see
     /// [`node::NodeProbe`].
     pub node_probe: node::NodeProbe,
+
+    /// R936-B1: this node's own per-tick judgement about the ingress record,
+    /// published by the leadership watcher's ownership tick and read by
+    /// `GET /cluster/ingress-owner`, so a front door can tell a record it may
+    /// route on from one it must not (see [`leader::IngressLocalView`]).
+    pub ingress_local_view: std::sync::RwLock<Option<leader::IngressLocalView>>,
+
+    /// R936-B10: this node's own "could I take the appliance right now",
+    /// published by every ownership tick and served at
+    /// `GET /cluster/appliance-candidacy`.
+    pub appliance_candidacy:
+        std::sync::RwLock<Option<appliance_ownership::CandidacyReport>>,
 
     /// THIS machine's own node enrollment — the mshr NodeId it enrolled
     /// and the cheers ownership-row id backing it (R593-F4, W268 §"The
@@ -1609,6 +1645,420 @@ impl ServerState {
             ident: ident.to_string(),
         })
     }
+
+    /// R936-B12: this node's floater specs, beside its identity state.
+    pub fn floater_records(&self) -> floater::FloaterRecords {
+        let base = self
+            .state_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        floater::FloaterRecords::new(base.join("floaters"))
+    }
+
+    /// `http://<addr>` for every raft member but this one.
+    fn peer_base_urls(&self) -> Vec<(raft::YubabaNodeId, String)> {
+        let (Some(sm), Some(me)) = (self.cluster_state.as_ref(), self.node_id) else {
+            return Vec::new();
+        };
+        sm.members()
+            .into_iter()
+            .filter(|(id, _)| *id != me)
+            .map(|(id, m)| (id, format!("http://{}", m.addr)))
+            .collect()
+    }
+}
+
+/// How long one floater replication call to a peer may take. A dead peer must
+/// not stall an admission or an effector tick for long.
+const FLOATER_PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Admit a floater through the API (R936-B12). The tenant's owner (claiming it
+/// for this node when it is vacant) records the spec on every member and
+/// deploys it locally; any other node forwards the whole deploy to the owner,
+/// so an operator can deploy through any member and get one running copy.
+async fn admit_floater(
+    s: &Arc<ServerState>,
+    spec: &workload_spec::WorkloadSpec,
+    req: WorkloadDeployBody,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let ident = spec.expose.mesh.identity.0.clone();
+    let refuse = |status: StatusCode, error: String| {
+        (
+            status,
+            Json(serde_json::json!({ "status": "rejected", "ident": ident, "error": error })),
+        )
+            .into_response()
+    };
+    let (Some(raft), Some(sm), Some(me)) = (s.raft.as_ref(), s.cluster_state.as_ref(), s.node_id)
+    else {
+        return refuse(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "{}={} asks the cluster to place this workload, and this node is not a raft \
+                 member. Deploy it through a member, or drop the annotation to pin it here.",
+                workload_spec::FLOAT_ANNOTATION,
+                workload_spec::FLOAT_VALUE
+            ),
+        );
+    };
+    let now = floater::unix_now_secs();
+    let tenant = floater::tenant_for(&ident);
+
+    // Only a LIVE lease counts. A lapsed record naming this node is claimable
+    // by every peer the moment the spec reaches it, so admitting on it without
+    // re-claiming handed the tenant to whichever peer ticked first (measured
+    // 2026-09-23: south took noisetable-marketing-issues off west that way).
+    let owner = match sm.tenants().get(&tenant).cloned() {
+        Some(o) if o.is_live(now) => o.owner,
+        _ => {
+            let claim = raft::YubabaRequest::ClaimTenant {
+                tenant: tenant.clone(),
+                node: me,
+                lease_secs: floater::FLOATER_LEASE_SECS,
+                now,
+            };
+            match raft::client_write_forwarded(raft, &s.http, claim).await {
+                Ok(raft::YubabaResponse::Tenant(raft::TenantOutcome::Granted { .. })) => me,
+                Ok(raft::YubabaResponse::Tenant(raft::TenantOutcome::Fenced {
+                    current_owner: Some(n),
+                    ..
+                })) => n,
+                Ok(other) => {
+                    return refuse(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("claiming the floater's placement returned {other:?}; retry"),
+                    )
+                }
+                Err(e) => {
+                    return refuse(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("claiming the floater's placement failed: {e}; retry"),
+                    )
+                }
+            }
+        }
+    };
+
+    if owner != me {
+        if req.float_forwarded {
+            return refuse(
+                StatusCode::CONFLICT,
+                format!(
+                    "this deploy was forwarded here as the floater's owner, but this node now \
+                     sees node {owner} as the owner — placement moved mid-deploy; retry"
+                ),
+            );
+        }
+        let Some(member) = sm.member(owner) else {
+            return refuse(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("the floater's owner, node {owner}, has no member row on this node; retry"),
+            );
+        };
+        tracing::info!(ident = %ident, owner, "floater deploy: forwarding to the owner");
+        let body = serde_json::json!({
+            "spec": req.spec,
+            "requesting_camp_id": req.requesting_camp_id,
+            "on_behalf_of_user": req.on_behalf_of_user,
+            "id": req.id,
+            "float_forwarded": true,
+        });
+        let url = format!("http://{}/workloads/deploy", member.addr);
+        return match s.http.post(&url).json(&body).send().await {
+            Ok(resp) => {
+                let status = StatusCode::from_u16(resp.status().as_u16())
+                    .unwrap_or(StatusCode::BAD_GATEWAY);
+                let json: serde_json::Value = resp.json().await.unwrap_or_else(
+                    |e| serde_json::json!({ "status": "rejected", "error": format!("unreadable reply from the owner: {e}") }),
+                );
+                (status, Json(json)).into_response()
+            }
+            Err(e) => refuse(
+                StatusCode::BAD_GATEWAY,
+                format!("forwarding to the floater's owner, node {owner} at {url}, failed: {e}"),
+            ),
+        };
+    }
+
+    let record = floater::FloaterRecord {
+        ident: ident.clone(),
+        spec: req.spec.clone(),
+        admitted_at: now,
+    };
+    if let Err(e) = s.floater_records().save(&record) {
+        return refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("recording the floater spec failed: {e}"),
+        );
+    }
+    let unreached = publish_floater(s, &record).await;
+    if !unreached.is_empty() {
+        tracing::warn!(
+            ident = %ident,
+            ?unreached,
+            "floater admitted, but these members did not take the spec yet; the owner \
+             re-publishes it every minute"
+        );
+    }
+    // The scheduler bin-packs a re-home against this demand. Best effort: a
+    // missing intent reads as zero demand, which still places.
+    let intent = raft::YubabaRequest::SetTenantPlacement {
+        tenant,
+        placement: raft::TenantPlacement {
+            region: None,
+            tier: raft::SlaTier::ColdHydrate,
+            demand: raft::TenantDemand {
+                memory_mb: spec.resources.memory_mb,
+                cpu_millis: spec.resources.cpu_millis,
+            },
+            rpo_bound: None,
+        },
+    };
+    if let Err(e) = raft::client_write_forwarded(raft, &s.http, intent).await {
+        tracing::warn!(ident = %ident, "floater: recording placement demand failed: {e}");
+    }
+    let local = WorkloadDeployBody {
+        float_forwarded: false,
+        ..req
+    };
+    Box::pin(deploy_workload_spec_as(s.clone(), local, DeployOrigin::Floater)).await
+}
+
+/// Push `record` to every other member. Returns the members that did not
+/// accept it.
+async fn publish_floater(s: &Arc<ServerState>, record: &floater::FloaterRecord) -> Vec<String> {
+    let mut unreached = Vec::new();
+    let body = floater::FloaterRecord {
+        admitted_at: 0,
+        ..record.clone()
+    };
+    for (id, base) in s.peer_base_urls() {
+        let ok = s
+            .http
+            .post(format!("{base}/workloads/floaters"))
+            .timeout(FLOATER_PEER_TIMEOUT)
+            .json(&body)
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success());
+        if !ok {
+            unreached.push(format!("{id}@{base}"));
+        }
+    }
+    unreached
+}
+
+/// Forget a floater everywhere and stop its copy on the owner (R936-B12). The
+/// local copy, if any, is the caller's destroy.
+async fn forget_floater(s: &Arc<ServerState>, ident: &str) {
+    if let Err(e) = s.floater_records().remove(ident) {
+        tracing::warn!(ident, "floater: forgetting the local record failed: {e}");
+    }
+    for (id, base) in s.peer_base_urls() {
+        let res = s
+            .http
+            .post(format!("{base}/workloads/floaters/{ident}/forget"))
+            .timeout(FLOATER_PEER_TIMEOUT)
+            .send()
+            .await;
+        if !res.as_ref().is_ok_and(|r| r.status().is_success()) {
+            tracing::warn!(ident, peer = id, "floater: a member did not forget the spec: {res:?}");
+        }
+    }
+    let (Some(sm), Some(me)) = (s.cluster_state.as_ref(), s.node_id) else {
+        return;
+    };
+    let now = floater::unix_now_secs();
+    if let Some(o) = sm.tenants().get(&floater::tenant_for(ident)) {
+        if o.owner != me && o.is_live(now) {
+            if let Some(m) = sm.member(o.owner) {
+                let url = format!("http://{}/workloads/{ident}/destroy?float_forwarded=true", m.addr);
+                match s.http.post(&url).send().await {
+                    Ok(r) if r.status().is_success() => {}
+                    other => tracing::warn!(
+                        ident,
+                        owner = o.owner,
+                        "floater: stopping the owner's copy failed: {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// `POST /workloads/floaters` — a peer replicating a floater spec here.
+async fn record_floater(
+    State(s): State<Arc<ServerState>>,
+    Json(record): Json<floater::FloaterRecord>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let record = floater::FloaterRecord {
+        admitted_at: 0,
+        ..record
+    };
+    match s.floater_records().save(&record) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "recorded", "ident": record.ident })))
+            .into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "status": "rejected", "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /workloads/floaters/{ident}/forget` — a peer forgetting a floater.
+async fn forget_floater_record(
+    State(s): State<Arc<ServerState>>,
+    axum::extract::Path(ident): axum::extract::Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match s.floater_records().remove(&ident) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "forgotten", "ident": ident })))
+            .into_response(),
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "status": "rejected", "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /workloads/floaters` — this node's floater records and where the
+/// cluster places each. Idents and placement only, never specs.
+async fn list_floaters(State(s): State<Arc<ServerState>>) -> Json<serde_json::Value> {
+    let tenants = s.cluster_state.as_ref().map(|sm| sm.tenants()).unwrap_or_default();
+    let rows: Vec<serde_json::Value> = s
+        .floater_records()
+        .list()
+        .into_iter()
+        .map(|r| {
+            let o = tenants.get(&floater::tenant_for(&r.ident));
+            serde_json::json!({
+                "ident": r.ident,
+                "owner": o.map(|o| o.owner),
+                "epoch": o.map(|o| o.epoch),
+                "lease_expires": o.map(|o| o.lease_expires),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "node_id": s.node_id, "floaters": rows }))
+}
+
+/// The live [`floater::FloatHost`]: this node's own deploy/destroy paths, its
+/// kamaji listing, and its raft handle.
+pub struct NodeFloatHost {
+    state: Arc<ServerState>,
+}
+
+impl NodeFloatHost {
+    pub fn new(state: Arc<ServerState>) -> Self {
+        Self { state }
+    }
+}
+
+async fn response_error(resp: axum::response::Response) -> anyhow::Error {
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    anyhow::anyhow!("{status}: {body}")
+}
+
+#[async_trait::async_trait]
+impl floater::FloatHost for NodeFloatHost {
+    fn node_id(&self) -> raft::YubabaNodeId {
+        self.state.node_id.unwrap_or_default()
+    }
+
+    fn ownership(&self, tenant: &workload_spec::TenantId) -> Option<raft::TenantOwnership> {
+        self.state.cluster_state.as_ref()?.tenants().get(tenant).cloned()
+    }
+
+    async fn local_workloads(&self) -> anyhow::Result<std::collections::BTreeMap<String, bool>> {
+        let resp = list_workloads(State(self.state.clone())).await;
+        if !resp.status().is_success() {
+            return Err(response_error(resp).await);
+        }
+        let bytes = axum::body::to_bytes(resp.into_body(), 16 * 1024 * 1024).await?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let rows = v
+            .get("workloads")
+            .and_then(|w| w.as_array())
+            .ok_or_else(|| anyhow::anyhow!("GET /workloads carried no workloads array"))?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let ident = r
+                    .get("id")
+                    .or_else(|| r.get("mesh_ident"))
+                    .and_then(|i| i.as_str())?;
+                // kamaji's spelling; a `Pending` container with no task (the
+                // post-reboot state) is present but not serving.
+                let running = r.get("state").and_then(|s| s.as_str()) == Some("Running");
+                Some((ident.to_string(), running))
+            })
+            .collect())
+    }
+
+    fn busy(&self, ident: &str) -> bool {
+        self.state.deploy_locks.lock().unwrap().contains(ident)
+    }
+
+    async fn run(&self, record: &floater::FloaterRecord) -> anyhow::Result<()> {
+        // The effector only starts a copy that is not Running, so anything
+        // local under this ident is residue: a Pending container left by a
+        // reboot, or yubaba's in-memory appliance registry still naming a copy
+        // kamaji itself tore down (measured 2026-09-23: kamaji stopped a fenced
+        // noisetable-account on south and every restart then 409'd "appliance
+        // already live"). Clear it first; an absent ident answers not_found.
+        let cleared =
+            destroy_workload_as(self.state.clone(), record.ident.clone(), DeployOrigin::Floater).await;
+        if !cleared.status().is_success() {
+            return Err(response_error(cleared).await.context("clearing local residue before start"));
+        }
+        let body = WorkloadDeployBody {
+            spec: record.spec.clone(),
+            requesting_camp_id: None,
+            on_behalf_of_user: None,
+            id: None,
+            float_forwarded: false,
+        };
+        let resp = deploy_workload_spec_as(self.state.clone(), body, DeployOrigin::Floater).await;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(response_error(resp).await)
+        }
+    }
+
+    async fn stop(&self, ident: &str) -> anyhow::Result<()> {
+        let resp = destroy_workload_as(self.state.clone(), ident.to_string(), DeployOrigin::Floater).await;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(response_error(resp).await)
+        }
+    }
+
+    async fn write(&self, req: raft::YubabaRequest) -> anyhow::Result<raft::YubabaResponse> {
+        let raft = self
+            .state
+            .raft
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("this node has no raft handle"))?;
+        raft::client_write_forwarded(raft, &self.state.http, req).await
+    }
+
+    async fn publish(&self, record: &floater::FloaterRecord) {
+        let unreached = publish_floater(&self.state, record).await;
+        if !unreached.is_empty() {
+            tracing::debug!(ident = %record.ident, ?unreached, "floater re-publish: members unreached");
+        }
+    }
 }
 
 impl std::fmt::Debug for ServerState {
@@ -1766,6 +2216,7 @@ impl ServerState {
             public_ingress: Vec::new(),
             domain_delegate_zone: None,
             secret_mount_root: PathBuf::from(deploy::secret_mount::DEFAULT_SECRET_MOUNT_ROOT),
+            bundle_secret_digests: Default::default(),
             local_secret_store_root: PathBuf::from(secrets::SECRET_STORE_ROOT),
             secret_workloads: Default::default(),
             secret_epoch: tokio::sync::watch::channel(0).0,
@@ -1773,18 +2224,21 @@ impl ServerState {
             litestream_s3_url: None,
             // R858-B23: off until a node is provisioned with the store
             // credential kamaji's hydrate needs.
-            headscale_durability: false,
+            headscale_durability_store: None,
             session_id: new_session_id(),
             runtime: None,
             constable_client: None,
             cheers_client: None,
             ownership_rows: Mutex::new(HashMap::new()),
             archetype_registry: Mutex::new(HashMap::new()),
+            appliance_spec_digests: Mutex::new(HashMap::new()),
             deploy_locks: Mutex::new(std::collections::HashSet::new()),
             requirement_graph: Mutex::new(HashMap::new()),
             workload_resources: Default::default(),
             workload_health: Default::default(),
             node_probe: node::NodeProbe::new(),
+            ingress_local_view: std::sync::RwLock::new(None),
+            appliance_candidacy: std::sync::RwLock::new(None),
             node_enrollment: Mutex::new(None),
             bootstrap_tokens: identity::bootstrap::BootstrapTokenRegistry::new(),
             headscale_url: None,
@@ -2533,8 +2987,11 @@ impl ServerState {
     /// durability tier. See [`ServerState::headscale_durability`] — turning
     /// this on without the store credential in kamaji's environment stops the
     /// mesh coordinator from starting at all.
-    pub fn with_headscale_durability(mut self, on: bool) -> Self {
-        self.headscale_durability = on;
+    ///
+    /// R936-B2: carried as the store URL, scoped by sovereign group
+    /// ([`headscale_appliance::durability_store`]), not as a bool.
+    pub fn with_headscale_durability_store(mut self, store: Option<String>) -> Self {
+        self.headscale_durability_store = store;
         self
     }
 
@@ -2696,6 +3153,8 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         // R118-T1 (W138): singleton-role ownership, served from locally-applied
         // state so a realtime sibling process never awaits a raft commit.
         .route("/cluster/singletons", get(cluster_singletons))
+        .route("/cluster/ingress-owner", get(cluster_ingress_owner))
+        .route("/cluster/appliance-candidacy", get(cluster_appliance_candidacy))
         // R732-T4 (W245): the epoch transport. Read-only, served from this
         // node's LOCAL applied state — no leader round-trip. There is
         // deliberately no matching write route: ClaimTenant / TransferTenant /
@@ -2823,6 +3282,12 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         // R427-F1: explicit destroy endpoint — tears down via runtime +
         // revokes cheers ownership row (if one was registered at deploy).
         .route("/workloads/{ident}/destroy", post(destroy_workload))
+        // R936-B12: floater spec replication between raft members, plus a
+        // read of this node's records and their placement. Same class as
+        // deploy/destroy: a record here is a deploy the effector will act on.
+        .route("/workloads/floaters", get(list_floaters))
+        .route("/workloads/floaters", post(record_floater))
+        .route("/workloads/floaters/{ident}/forget", post(forget_floater_record))
         // R092-F3: cloud-init log tail for `yah cloud machine provision`
         // failure surfacing. Reads /var/log/cloud-init{,-output}.log.
         .route("/diagnostics", get(get_diagnostics))
@@ -4468,6 +4933,12 @@ struct WorkloadDeployBody {
     /// would chase a moving target). The caller names the workload instead.
     #[serde(default)]
     id: Option<String>,
+    /// R936-B12: set when a non-owner forwarded this floater deploy to its
+    /// owner. A forwarded deploy that finds the owner has moved again is
+    /// refused rather than forwarded a second time, so two nodes with briefly
+    /// disagreeing views can never bounce it between them.
+    #[serde(default)]
+    float_forwarded: bool,
 }
 
 /// `POST /workloads/deploy` — accept a `WorkloadSpec` for deployment.
@@ -4612,6 +5083,11 @@ async fn deploy_non_container(
     // reaches the same answer through `ServerState::workload_bind_ip`.
     let mesh = s.node_mesh_ip.map(crate::mesh::MeshAssignment::stub);
 
+    // R931-B7: digest of the receiver's secret files as materialized below —
+    // `0` when it mounts none. What lets the unchanged-envelope skip further
+    // down tell a rotation from a re-POST.
+    let mut secrets_digest: u64 = 0;
+
     // R876-B16: materialize the revalidate receiver's File-target secrets
     // straight to their declared host paths before the process forks. This
     // branch has no container namespace (see the doc comment at the top of
@@ -4638,11 +5114,14 @@ async fn deploy_non_container(
                 })
                 .await;
                 match placed {
-                    Ok(paths) => crate::deploy::secret_mount::write_native_secret_manifest(
-                        &s.secret_mount_root,
-                        &name,
-                        &paths,
-                    ),
+                    Ok(paths) => {
+                        secrets_digest = native_secret_files_digest(&paths);
+                        crate::deploy::secret_mount::write_native_secret_manifest(
+                            &s.secret_mount_root,
+                            &name,
+                            &paths,
+                        )
+                    }
                     Err(e) => {
                         return (
                             StatusCode::UNPROCESSABLE_ENTITY,
@@ -4659,11 +5138,56 @@ async fn deploy_non_container(
         }
     }
 
+    // R931-B7: an envelope kamaji is already serving, Running, is not a
+    // redeploy. `mirror up` re-POSTs the bundle on every run — publish is
+    // idempotent, so an unchanged tree yields the byte-identical envelope — and
+    // kamaji re-forked the serve process each time: on noisetable.com that was
+    // ~27s of public 503 while the new process came up and re-registered. Same
+    // spec-digest rule tenant_passway's sweep uses (R852-B4), plus the secret
+    // files' digest, since the envelope names secrets but never their values
+    // and the receiver only reads them at start — a rotation must still re-fork.
+    //
+    // A List that fails is "unknown", which deploys: skipping is only ever
+    // earned by kamaji positively reporting the same spec Running.
+    let secrets_match = secrets_digest == 0
+        || s.bundle_secret_digests
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&name).copied())
+            == Some(secrets_digest);
+    if secrets_match {
+        if let Ok(live) = kamaji.list().await {
+            if bundle_redeploy_is_noop(&live, &id, &workload) {
+                tracing::info!(
+                    ident = %ident,
+                    name = %name,
+                    "bundle workload unchanged — kamaji already serves this envelope Running \
+                     with the same secrets; not re-forked"
+                );
+                s.service_records
+                    .declare_serving(&workload_spec::MeshIdent(name.clone()));
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "status": "accepted",
+                        "ident": ident,
+                        "runtime": "kamaji",
+                        "unchanged": true,
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     match kamaji.deploy_envelope(&id, &workload, mesh.as_ref()).await {
         // R850-T4: `None` by construction on this path — hydrate-on-place runs
         // on kamaji's container-deploy path only, and a bundle's content is
         // content-addressed and fetched, not restored from a durability store.
         Ok(_hydrate) => {
+            if let Ok(mut m) = s.bundle_secret_digests.lock() {
+                m.insert(name.clone(), secrets_digest);
+            }
             tracing::info!(
                 ident = %ident,
                 bind_ip = ?s.node_mesh_ip,
@@ -4719,6 +5243,79 @@ async fn deploy_non_container(
         )
             .into_response(),
     }
+}
+
+/// Whether a bundle deploy may be answered without re-forking (R931-B7): kamaji
+/// reports `id` Running AND deployed with this exact envelope.
+///
+/// Pure over the listing so the rule is testable without a sibling. Every
+/// other answer — absent, not Running, no digest recorded (a kamaji restart
+/// clears them), a spec that will not encode — means deploy, which is the
+/// behaviour this replaces.
+fn bundle_redeploy_is_noop(
+    live: &[kamaji_proto::WorkloadEntry],
+    id: &kamaji_proto::WorkloadId,
+    workload: &workload_spec::Workload,
+) -> bool {
+    let Some(wanted) = kamaji_proto::spec_digest(workload) else {
+        return false;
+    };
+    live.iter().any(|entry| {
+        &entry.id == id
+            && entry.state == kamaji_proto::WorkloadState::Running
+            && entry.spec_digest == Some(wanted)
+    })
+}
+
+/// Digest of a deploy request's spec as POSTed (R931-B7). In-process only —
+/// `DefaultHasher` is not stable across releases, and nothing persists it.
+fn request_spec_digest(spec: &workload_spec::WorkloadSpec) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_vec(spec).unwrap_or_default().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Whether a re-POST of a live appliance is the spec it already runs
+/// (R931-B7): the recorded request digest matches AND kamaji reports the ident
+/// Running. No kamaji, a failed List, no record — all answer `false`, which
+/// keeps R572-F4's 409.
+async fn appliance_redeploy_is_noop(s: &ServerState, ident: &str, request_digest: u64) -> bool {
+    let recorded = s.appliance_spec_digests.lock().unwrap().get(ident).copied();
+    if recorded != Some(request_digest) {
+        return false;
+    }
+    let Some(kamaji) = s.constable_client.as_ref().and_then(KamajiSibling::current) else {
+        return false;
+    };
+    let Ok(live) = kamaji.list().await else {
+        return false;
+    };
+    live.iter().any(|e| {
+        (e.id.0 == ident || e.mesh_ident.as_deref() == Some(ident))
+            && e.state == kamaji_proto::WorkloadState::Running
+    })
+}
+
+/// Digest of the secret files a bundle deploy just materialized (R931-B7) —
+/// read back off disk, so it is exactly what the receiver will read at start.
+///
+/// Never `0` for a non-empty set (that value means "mounts no secrets"), and a
+/// file that cannot be read hashes as absent rather than failing the deploy:
+/// the worst it can do is make two digests differ, which redeploys.
+fn native_secret_files_digest(paths: &[std::path::PathBuf]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    if paths.is_empty() {
+        return 0;
+    }
+    let mut sorted: Vec<&std::path::PathBuf> = paths.iter().collect();
+    sorted.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for path in sorted {
+        path.hash(&mut hasher);
+        std::fs::read(path).ok().hash(&mut hasher);
+    }
+    hasher.finish().max(1)
 }
 
 /// What [`materialize_spec_secrets`] hands back: the (rewritten) spec, the
@@ -4919,7 +5516,7 @@ fn destroy_workload_boxed(
     s: Arc<ServerState>,
     ident: String,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = axum::response::Response> + Send>> {
-    Box::pin(destroy_workload(State(s), axum::extract::Path(ident)))
+    Box::pin(destroy_workload_as(s, ident, DeployOrigin::Floater))
 }
 
 /// Tear down the providers a requirer stood up before its own deploy failed
@@ -5036,6 +5633,25 @@ async fn deploy_workload_spec(
     State(s): State<Arc<ServerState>>,
     Json(req): Json<WorkloadDeployBody>,
 ) -> axum::response::Response {
+    deploy_workload_spec_as(s, req, DeployOrigin::Api).await
+}
+
+/// Who is asking for a deploy or destroy (R936-B12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeployOrigin {
+    /// An operator or CLI through the HTTP API. A floater spec is admitted
+    /// cluster-wide first; see [`admit_floater`].
+    Api,
+    /// This node's own floater effector acting on a placement the cluster
+    /// already decided. Runs locally, never re-admits.
+    Floater,
+}
+
+async fn deploy_workload_spec_as(
+    s: Arc<ServerState>,
+    req: WorkloadDeployBody,
+    origin: DeployOrigin,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
 
     // Reject writes when raft quorum is unavailable.
@@ -5043,9 +5659,19 @@ async fn deploy_workload_spec(
         return err_resp;
     }
 
+    // R936-B12: kept verbatim for a floater, whose record must carry the spec
+    // as posted (secret references, not materialized values).
+    let raw_spec = req.spec.clone();
     // R892-B1: parse, shape and admission are shared verbatim with
     // `POST /workloads/validate` — see `check_deploy_body`.
     let (mut spec, admitted_grant) = match check_deploy_body(req.spec) {
+        SpecCheck::Container { spec, .. } if origin == DeployOrigin::Api && spec.wants_float() => {
+            let body = WorkloadDeployBody {
+                spec: raw_spec,
+                ..req
+            };
+            return admit_floater(&s, &spec, body).await;
+        }
         SpecCheck::Container { spec, grant } => (*spec, grant),
         // Bundle-serving workloads take a short, dedicated path: kamaji
         // materializes the content-addressed bundle and forks its serve binary,
@@ -5058,6 +5684,10 @@ async fn deploy_workload_spec(
     // R876-B15: the caller check that used to live here (and only warned) is
     // now `http_auth::AuthClass::Operator` on this route in `build_router`.
     let ident = spec.expose.mesh.identity.0.clone();
+    // R931-B7: taken from the spec AS POSTED, before any of the rewrites below
+    // (mesh IP, secret materialization), so an identical re-POST digests
+    // identically.
+    let request_digest = request_spec_digest(&spec);
 
     // R880: refuse a second concurrent deploy/destroy of this ident rather
     // than let two backend calls (two image pulls, two teardown-then-deploy
@@ -5083,6 +5713,24 @@ async fn deploy_workload_spec(
     if s.archetype_registry.lock().unwrap().get(&ident).copied()
         == Some(LifecycleArchetype::Appliance)
     {
+        // R931-B7: …unless it is the SAME appliance. A re-POST of the spec
+        // this node already runs is not a second instance, and answering it
+        // 409 made the CLI destroy + redeploy the inner door on every `mirror
+        // up` — ~6s of public 502/503 for a change of nothing. Earned only by
+        // a positive answer: the recorded digest matches AND kamaji reports
+        // the ident Running. Anything else keeps the 409.
+        if appliance_redeploy_is_noop(&s, &ident, request_digest).await {
+            tracing::info!(ident = %ident, "appliance unchanged — already Running with this spec");
+            return (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "status": "accepted",
+                    "ident": ident,
+                    "unchanged": true,
+                })),
+            )
+                .into_response();
+        }
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -5390,6 +6038,7 @@ async fn deploy_workload_spec(
                     requesting_camp_id: req.requesting_camp_id.clone(),
                     on_behalf_of_user: req.on_behalf_of_user.clone(),
                     id: None,
+                    float_forwarded: false,
                 },
                 Err(e) => {
                     return self_supply_refusal(
@@ -5715,6 +6364,11 @@ async fn deploy_workload_spec(
                     .lock()
                     .unwrap()
                     .insert(ident.clone(), authored_archetype);
+                // R931-B7: same lifecycle as the archetype.
+                s.appliance_spec_digests
+                    .lock()
+                    .unwrap()
+                    .insert(ident.clone(), request_digest);
                 // R860-T6: record this workload's requirement edges beside its
                 // archetype, same lifecycle. Destroy reads `self_supplied` to
                 // cascade along `self` edges; drain reads `group` to answer the
@@ -6011,6 +6665,46 @@ fn check_deploy_body(spec_json: serde_json::Value) -> SpecCheck {
 /// @yah:verify("Hermetic: `cargo test -p yubaba --lib` 905/905 pass post-fixes, including the 3 R892-B1 validate tests and all 7 http_auth::router_tests.")
 /// @yah:verify("Live, real fleet: `POST /workloads/validate` on us-west-013 (100.64.0.8) returns 422 for an unparseable body. Deployed a real throwaway native container workload (r892-t2-livebar) to us-west-013, then ran `yah cloud workload rolling r892-t2-livebar` for real — it refused with exit 1, destroyed nothing (incumbent's pid was unchanged in GET /workloads afterward), and named us-east-001 by name as the reason: that node still predates R892-B1 and answers 404 on /workloads/validate. This is the live bar the ticket asked for, encountered organically rather than staged — proof the destructive step is now genuinely gated on a real, currently-mixed fleet. Cleaned up: POST .../destroy on the throwaway workload, deleted its .yah/infra/workloads/ file, confirmed GET /workloads empty on us-west-013 again.")
 /// @yah:gotcha("us-east-001 (and us-south-001, us-west-001/002/003, us-west-015) still run pre-R892-B1 yubaba and 404 on /workloads/validate — `rolling` will refuse on any of them today unless `--allow-unvalidated` is passed. us-east-001's yubaba+kamaji ship is deliberately BATCHED with R876-B16 per that ticket's own operator-decision gotcha (paired `hotship.sh --nodes us-east-001 --binaries yubaba,kamaji`, tenant-visible restart on noisetable.com) — that batch is what will close the gap on the remaining nodes, not a repeat of this ticket.")
+/// The `VolumeSource::Bind` host paths this spec declares that do not exist on
+/// this node, as one operator-readable sentence — or `None` when every one of
+/// them is present (R932-B1).
+///
+/// `runc` `stat(2)`s a bind mount's source when it creates the container and
+/// refuses if it is missing, so this is a real refusal the node can make early
+/// rather than a guess. `Path::exists` follows symlinks for the same reason
+/// `stat` does; a dangling symlink is as fatal as an absent file, and a socket
+/// (the R932-B1 case) exists like any other inode.
+///
+/// **This is the half of the answer yubaba can give by itself.** kamaji injects
+/// mounts of its own — the node's `yah-scryer` ingestion socket above all,
+/// which is what actually failed on 2026-09-22 — and their sources come from
+/// kamaji's command line, which yubaba does not read. Those are checked by
+/// kamaji's own preflight (`kamaji_containerd_core::check_bind_sources`, run
+/// before it tears the incumbent down), so the class is covered; it is just not
+/// covered *here*, and a `validated` answer does not promise it.
+fn missing_bind_volume_sources(spec: &workload_spec::WorkloadSpec) -> Option<String> {
+    let missing: Vec<String> = spec
+        .volumes
+        .iter()
+        .filter_map(|v| match &v.source {
+            workload_spec::VolumeSource::Bind { host_path } => {
+                (!host_path.exists()).then(|| {
+                    format!("{} (for {})", host_path.display(), v.target.display())
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "bind mount source missing on this node: {}. The container runtime stats every \
+             bind source when it creates the container, so this spec cannot be deployed here \
+             until the path exists",
+            missing.join(", ")
+        )
+    })
+}
+
 async fn validate_workload_spec(
     State(s): State<Arc<ServerState>>,
     Json(req): Json<WorkloadDeployBody>,
@@ -6022,16 +6716,36 @@ async fn validate_workload_spec(
     }
 
     match check_deploy_body(req.spec) {
-        SpecCheck::Container { spec, .. } => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "validated",
-                "ident": spec.expose.mesh.identity.0,
-                "kind": "container",
-                "runtime": s.workload_backend().map_or("stub", |b| b.name()),
-            })),
-        )
-            .into_response(),
+        SpecCheck::Container { spec, .. } => {
+            // R932-B1: the first host-state check this route makes. Everything
+            // above it is a pure function of the body — which is why a spec
+            // that parsed, shape-validated and cleared admission still took
+            // `noisetable-account` down on 2026-09-22: its bind source was
+            // missing on the node, and nothing here had ever looked at the
+            // node.
+            if let Some(error) = missing_bind_volume_sources(&spec) {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "status": "rejected",
+                        "ident": spec.expose.mesh.identity.0,
+                        "runtime": s.workload_backend().map_or("stub", |b| b.name()),
+                        "error": error,
+                    })),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "validated",
+                    "ident": spec.expose.mesh.identity.0,
+                    "kind": "container",
+                    "runtime": s.workload_backend().map_or("stub", |b| b.name()),
+                })),
+            )
+                .into_response()
+        }
         SpecCheck::NonContainer(other) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -6064,11 +6778,41 @@ async fn validate_workload_spec(
 async fn destroy_workload(
     State(s): State<Arc<ServerState>>,
     axum::extract::Path(ident): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<DestroyQuery>,
+) -> axum::response::Response {
+    let origin = if q.float_forwarded {
+        DeployOrigin::Floater
+    } else {
+        DeployOrigin::Api
+    };
+    destroy_workload_as(s, ident, origin).await
+}
+
+/// `POST /workloads/{ident}/destroy` query (R936-B12).
+#[derive(Debug, Default, Deserialize)]
+struct DestroyQuery {
+    /// Set when a peer forwarded an operator's destroy of a floater to this
+    /// node, its owner: tear down the local copy only.
+    #[serde(default)]
+    float_forwarded: bool,
+}
+
+async fn destroy_workload_as(
+    s: Arc<ServerState>,
+    ident: String,
+    origin: DeployOrigin,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
     if let Some(err_resp) = quorum_write_guard(&s) {
         return err_resp;
+    }
+
+    // R936-B12: an operator destroying a floater means "stop it everywhere and
+    // stop placing it", so the spec is forgotten cluster-wide first. Otherwise
+    // the effector would restart it on the next tick.
+    if origin == DeployOrigin::Api && s.floater_records().get(&ident).is_some() {
+        forget_floater(&s, &ident).await;
     }
 
     // R880: same per-ident lock deploy takes — a destroy racing a deploy (or
@@ -6171,6 +6915,7 @@ async fn destroy_workload(
     s.secret_workloads.lock().unwrap().remove(&ident);
     // R572-F4: clear the archetype so a fresh deploy of the same ident is accepted.
     s.archetype_registry.lock().unwrap().remove(&ident);
+    s.appliance_spec_digests.lock().unwrap().remove(&ident);
     // R860-T6 (W338 §"Placement consequences" 4): take this workload's
     // requirement edges out of the graph. Removed BEFORE the cascade below runs,
     // so a graph that somehow described a cycle closes instead of recursing
@@ -8138,13 +8883,71 @@ async fn cluster_singletons(State(s): State<Arc<ServerState>>) -> impl IntoRespo
         })
         .collect();
 
+    // R936-B3: `ingress_owner` is a raft node id; the name and mesh address
+    // beside it are resolved from the owner's member row for display only.
+    let owner = sm.ingress_owner();
+    let owner_row = owner.and_then(|id| sm.member(id));
     Json(serde_json::json!({
         "node_id": s.node_id,
         "applied_index": sm.applied_index(),
         "roles": roles,
-        "ingress_owner": sm.ingress_owner(),
+        "ingress_owner": owner,
+        "ingress_owner_machine": owner_row.as_ref().and_then(|m| m.machine.clone()),
+        "ingress_owner_addr": owner_row.as_ref().map(|m| m.addr.clone()),
     }))
     .into_response()
+}
+
+/// `GET /cluster/ingress-owner` — R936-B1: the one question a passway-mesh front
+/// door asks, answered from THIS node's applied raft state.
+///
+/// Shape (consumed by `passway::owner::OwnerView`):
+/// `{node_id, settled, serving_here, owner: {node_id, machine, addr, public_address} | null}`.
+///
+/// `settled` and `serving_here` are this node's ownership tick's own judgement
+/// ([`leader::IngressLocalView`]); both read `false` until the first tick has
+/// run, which is the direction a door must fail: a just-booted node's record is
+/// its pre-failover memory, not a fact (R858-B20, R936-B5).
+async fn cluster_ingress_owner(State(s): State<Arc<ServerState>>) -> impl IntoResponse {
+    let Some(sm) = s.cluster_state.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "this yubaba runs no raft state machine"})),
+        )
+            .into_response();
+    };
+    let local = s.ingress_local_view.read().unwrap().clone().unwrap_or_default();
+    let owner = sm.ingress_owner().map(|id| {
+        let row = sm.member(id);
+        serde_json::json!({
+            "node_id": id,
+            "machine": row.as_ref().and_then(|m| m.machine.clone()),
+            "addr": row.as_ref().map(|m| m.addr.clone()),
+            "public_address": row.as_ref().and_then(|m| m.public_address.clone()),
+        })
+    });
+    Json(serde_json::json!({
+        "node_id": s.node_id,
+        "settled": local.settled,
+        "serving_here": local.serving_here,
+        "owner": owner,
+    }))
+    .into_response()
+}
+
+/// `GET /cluster/appliance-candidacy` — R936-B10: this node's own verdict on
+/// whether it could take the headscale appliance right now
+/// ([`appliance_ownership::CandidacyReport`]). 503 until the first ownership
+/// tick has run, so "not yet judged" never reads as "eligible".
+async fn cluster_appliance_candidacy(State(s): State<Arc<ServerState>>) -> impl IntoResponse {
+    match s.appliance_candidacy.read().unwrap().clone() {
+        Some(report) => Json(report).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "no ownership tick has judged this node yet"})),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /tenants/{id}` query. `node` is the id asking, so this node can answer
@@ -8339,6 +9142,12 @@ async fn raft_status(
                     serde_json::json!({
                         "addr": info.addr,
                         "region": info.region,
+                        // R937-F3: without this, a dead voter is nameable only
+                        // by raft id — the machine name is exactly the fact a
+                        // caller diagnosing a chaos test needs and the ONLY
+                        // place it survives a dead node (replicated state, not
+                        // /identity, which a dead node cannot answer).
+                        "machine": info.machine,
                     }),
                 )
             })
@@ -9174,6 +9983,10 @@ struct TransferLeaderBody {
 /// How long [`raft_transfer_leader`] waits for leadership to actually move to
 /// the target before giving up. Covers a couple of election cycles
 /// (`election_timeout_max` is 3s — see [`raft::open`]).
+///
+/// Callers must wait LONGER than this for the response. `yah mesh failover`
+/// used a 10s HTTP timeout against this 10s window, so every slow transfer
+/// surfaced as "transport error contacting yubaba" (R936-B4).
 const TRANSFER_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Outcome of validating a transfer-leader request against the receiving node's
@@ -9200,14 +10013,24 @@ enum TransferPlan {
 ///   a 409, never a silent success);
 /// - `to` must be a current voter (never hand leadership to a learner/unknown).
 ///
-/// Catch-up is deliberately NOT gated here: openraft's transfer_leader targets a
-/// sufficiently up-to-date node, and if leadership fails to move the confirm
-/// timeout in [`raft_transfer_leader`] surfaces it — so there is no lag check.
+/// - `to` must have acked this leader within `max_silence` (R936-B4). The
+///   trigger is not a request the target can refuse: it disables this leader's
+///   lease and broadcasts to EVERY voter, and the non-targets drop their lease
+///   on us too. If the TimeoutNow never reaches `to`, whichever other voter's
+///   election timer fires first wins — measured on prod 2026-09-22, where a
+///   transfer to an off-mesh node 1 handed leadership to 3, then to 2. So an
+///   unreachable target is refused before anything is triggered.
+///
+/// Log catch-up is deliberately NOT gated: the target itself waits for the
+/// leader's log to flush before campaigning (openraft's
+/// `ensure_log_flushed_for_transfer_leader`).
 fn plan_transfer(
     my_id: raft::YubabaNodeId,
     current_leader: Option<raft::YubabaNodeId>,
     to: raft::YubabaNodeId,
     is_voter: bool,
+    target_silence: Option<std::time::Duration>,
+    max_silence: std::time::Duration,
 ) -> TransferPlan {
     if current_leader == Some(to) {
         return TransferPlan::NoopAlreadyLeader;
@@ -9227,7 +10050,21 @@ fn plan_transfer(
             format!("transfer-leader target {to} is not a voter in the current membership"),
         );
     }
-    TransferPlan::Proceed
+    match target_silence {
+        Some(silent) if silent <= max_silence => TransferPlan::Proceed,
+        silent => TransferPlan::Reject(
+            StatusCode::CONFLICT,
+            format!(
+                "transfer-leader target {to} is not reachable from this leader (last ack: {}; \
+                 limit {max_silence:?}); refusing to trigger, because a TimeoutNow it never \
+                 receives would still unseat this leader and hand leadership to another voter",
+                match silent {
+                    Some(d) => format!("{d:?} ago"),
+                    None => "never".to_string(),
+                }
+            ),
+        ),
+    }
 }
 
 /// `POST /raft/transfer-leader` — perform a controlled leadership handoff to `to`.
@@ -9258,8 +10095,16 @@ async fn raft_transfer_leader(
         .membership()
         .voter_ids()
         .any(|v| v == to);
+    // Leader-only metric: when this node last heard from `to`. One election
+    // timeout of silence is when a follower would itself give up on a leader.
+    let target_silence = m
+        .heartbeat
+        .as_ref()
+        .and_then(|hb| hb.get(&to).cloned().flatten())
+        .map(|acked| openraft::Instant::elapsed(&*acked));
+    let max_silence = std::time::Duration::from_millis(raft.config().election_timeout_min);
 
-    match plan_transfer(m.id, m.current_leader, to, is_voter) {
+    match plan_transfer(m.id, m.current_leader, to, is_voter, target_silence, max_silence) {
         TransferPlan::NoopAlreadyLeader => return Ok(StatusCode::ACCEPTED),
         TransferPlan::Reject(code, msg) => return Err((code, msg)),
         TransferPlan::Proceed => {}
@@ -9278,8 +10123,22 @@ async fn raft_transfer_leader(
     // the rollout proceed to drain a node that is still leader.
     let deadline = std::time::Instant::now() + TRANSFER_CONFIRM_TIMEOUT;
     loop {
-        if raft.metrics().borrow_watched().current_leader == Some(to) {
+        let seen = raft.metrics().borrow_watched().current_leader;
+        if seen == Some(to) {
             return Ok(StatusCode::ACCEPTED);
+        }
+        // Another voter won the election the trigger opened (R936-B4). That is
+        // final for this request, so say so now instead of waiting out the
+        // deadline and letting the caller's own timeout report it as a
+        // transport failure.
+        if let Some(other) = seen.filter(|l| *l != m.id) {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "transfer-leader: leadership moved to node {other}, not to {to}; \
+                     the target did not win the election"
+                ),
+            ));
         }
         if std::time::Instant::now() >= deadline {
             let seen = raft.metrics().borrow_watched().current_leader;
@@ -10228,6 +11087,105 @@ mod tests {
             .unwrap()
             .with_cluster_state(sm.clone());
         (tmp, Arc::new(state), sm)
+    }
+
+    /// R936-B10: "not yet judged" must never read as "eligible" — 503 until
+    /// the first ownership tick, then the tick's report verbatim.
+    #[tokio::test]
+    async fn appliance_candidacy_is_503_until_judged_then_the_report() {
+        let (_tmp, state, _sm) = state_with_cluster().await;
+        let resp = build_router(state.clone())
+            .oneshot(Request::get("/cluster/appliance-candidacy").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        *state.appliance_candidacy.write().unwrap() = Some(appliance_ownership::CandidacyReport {
+            node_id: 3,
+            eligible: false,
+            refusal: Some("missing-native-exec".into()),
+            native_exec: "absent".into(),
+            binary_present: true,
+            config_present: false,
+            headscale_url_configured: false,
+            backoff_until: None,
+            is_leader: true,
+        });
+        let v = body_json(
+            build_router(state)
+                .oneshot(Request::get("/cluster/appliance-candidacy").body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["node_id"], 3);
+        assert_eq!(v["eligible"], false);
+        assert_eq!(v["refusal"], "missing-native-exec");
+        assert_eq!(v["config_present"], false);
+    }
+
+    /// R936-B1: before the ownership tick has run, a door must be told
+    /// "unsettled, not serving" — the direction that routes it to its peers.
+    #[tokio::test]
+    async fn ingress_owner_fails_closed_before_the_first_tick() {
+        let (_tmp, state, _sm) = state_with_cluster().await;
+        let v = body_json(
+            build_router(state)
+                .oneshot(Request::get("/cluster/ingress-owner").body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["owner"], serde_json::Value::Null);
+        assert_eq!(v["settled"], false);
+        assert_eq!(v["serving_here"], false);
+    }
+
+    /// R936-B1/B3: the owner is a node id, and the door gets that node's PUBLIC
+    /// address from its member row (never its hostname); `/cluster/singletons`
+    /// carries the same id with the display fields beside it.
+    #[tokio::test]
+    async fn ingress_owner_names_the_node_and_its_public_address() {
+        let (_tmp, state, sm) = state_with_cluster().await;
+        sm.apply_for_test(&raft::YubabaRequest::SetMember {
+            node_id: 2,
+            addr: "100.64.0.1:7443".into(),
+            region: None,
+            capacity: None,
+            machine: Some("vps-4c1efa56".into()),
+            provider: None,
+            location: None,
+            ingress_floating_ip: None,
+            public_address: Some("15.204.89.240".into()),
+        });
+        sm.apply_for_test(&raft::YubabaRequest::ClaimIngressOwner { node_id: 2 });
+        *state.ingress_local_view.write().unwrap() = Some(leader::IngressLocalView {
+            settled: true,
+            serving_here: false,
+        });
+        let app = build_router(state);
+
+        let v = body_json(
+            app.clone()
+                .oneshot(Request::get("/cluster/ingress-owner").body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(v["settled"], true);
+        assert_eq!(v["owner"]["node_id"], 2);
+        assert_eq!(v["owner"]["public_address"], "15.204.89.240");
+        assert_eq!(v["owner"]["machine"], "vps-4c1efa56");
+
+        let singletons = body_json(
+            app.oneshot(Request::get("/cluster/singletons").body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(singletons["ingress_owner"], 2);
+        assert_eq!(singletons["ingress_owner_machine"], "vps-4c1efa56");
+        assert_eq!(singletons["ingress_owner_addr"], "100.64.0.1:7443");
     }
 
     /// An unknown tenant is a 404, not a 200 with nulls. "No record" and
@@ -13194,17 +14152,21 @@ mod tests {
 
     // ── R608-B11: transfer-leader precondition logic ──────────────────────────
 
+    /// A target the leader heard from 100ms ago, against a 1.5s limit.
+    const LIVE: Option<std::time::Duration> = Some(std::time::Duration::from_millis(100));
+    const LIMIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
     #[test]
     fn plan_transfer_proceeds_when_leader_and_target_is_voter() {
         // Leader is node 1, cluster {1,2,3}, target is voter 2 → hand off.
-        assert_eq!(plan_transfer(1, Some(1), 2, true), TransferPlan::Proceed);
+        assert_eq!(plan_transfer(1, Some(1), 2, true, LIVE, LIMIT), TransferPlan::Proceed);
     }
 
     #[test]
     fn plan_transfer_noop_when_target_already_leader() {
         // `to` (2) already leads → idempotent success, no handoff triggered.
         assert_eq!(
-            plan_transfer(1, Some(2), 2, true),
+            plan_transfer(1, Some(2), 2, true, LIVE, LIMIT),
             TransferPlan::NoopAlreadyLeader
         );
     }
@@ -13212,7 +14174,7 @@ mod tests {
     #[test]
     fn plan_transfer_rejects_when_this_node_is_not_leader() {
         // This node (1) thinks node 3 leads → misdirected; caller's view is stale.
-        match plan_transfer(1, Some(3), 2, true) {
+        match plan_transfer(1, Some(3), 2, true, LIVE, LIMIT) {
             TransferPlan::Reject(code, _) => assert_eq!(code, StatusCode::CONFLICT),
             other => panic!("expected Reject(CONFLICT), got {other:?}"),
         }
@@ -13222,7 +14184,7 @@ mod tests {
     fn plan_transfer_rejects_when_no_leader_known() {
         // Mid-election, current_leader is None → not the leader here.
         assert!(matches!(
-            plan_transfer(1, None, 2, true),
+            plan_transfer(1, None, 2, true, LIVE, LIMIT),
             TransferPlan::Reject(StatusCode::CONFLICT, _)
         ));
     }
@@ -13230,10 +14192,45 @@ mod tests {
     #[test]
     fn plan_transfer_rejects_non_voter_target() {
         // Target 4 is a learner / unknown, not a voter.
-        match plan_transfer(1, Some(1), 4, false) {
+        match plan_transfer(1, Some(1), 4, false, LIVE, LIMIT) {
             TransferPlan::Reject(code, _) => assert_eq!(code, StatusCode::BAD_REQUEST),
             other => panic!("expected Reject(BAD_REQUEST), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn plan_transfer_rejects_a_target_the_leader_has_not_heard_from() {
+        // R936-B4: target 2 last acked 5s ago against a 1.5s limit. Triggering
+        // would unseat this leader and let another voter win, so refuse first.
+        let silent = Some(std::time::Duration::from_secs(5));
+        match plan_transfer(1, Some(1), 2, true, silent, LIMIT) {
+            TransferPlan::Reject(code, msg) => {
+                assert_eq!(code, StatusCode::CONFLICT);
+                assert!(msg.contains("not reachable"), "{msg}");
+            }
+            other => panic!("expected Reject(CONFLICT), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_transfer_rejects_a_target_that_never_acked() {
+        // No heartbeat entry at all for the target reads as unreachable too.
+        match plan_transfer(1, Some(1), 2, true, None, LIMIT) {
+            TransferPlan::Reject(code, msg) => {
+                assert_eq!(code, StatusCode::CONFLICT);
+                assert!(msg.contains("never"), "{msg}");
+            }
+            other => panic!("expected Reject(CONFLICT), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_transfer_noop_beats_the_reachability_gate() {
+        // Transfer to the sitting leader stays idempotent even with no ack data.
+        assert_eq!(
+            plan_transfer(1, Some(2), 2, true, None, LIMIT),
+            TransferPlan::NoopAlreadyLeader
+        );
     }
 
     // ── R572-F4: archetype-aware drain + single-instance guard ────────────────
@@ -13254,6 +14251,74 @@ mod tests {
         spec.expose.mesh.identity = MeshIdent(ident.into());
         spec.archetype = Some(LifecycleArchetype::Appliance);
         serde_json::json!({ "spec": serde_json::to_value(&spec).unwrap() })
+    }
+
+    /// R936-B12: a floater asks the CLUSTER to place it, so a node with no
+    /// raft refuses it by name instead of silently pinning it locally, and
+    /// records nothing.
+    #[tokio::test]
+    async fn a_floater_deploy_on_a_node_with_no_raft_is_refused_and_not_recorded() {
+        let (_tmp, state) = fresh_state();
+        let mut body = appliance_spec("floaty");
+        body["spec"]["annotations"] = serde_json::json!({
+            (workload_spec::FLOAT_ANNOTATION): workload_spec::FLOAT_VALUE
+        });
+        let resp = build_router(state.clone())
+            .oneshot(
+                Request::post("/workloads/deploy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let b = body_json(resp).await;
+        assert!(b["error"].as_str().unwrap().contains("yah.float=cluster"), "{b}");
+        assert!(state.floater_records().list().is_empty());
+    }
+
+    /// R936-B12: the replication surface a peer uses — record, list (idents
+    /// and placement only, never the spec), forget.
+    #[tokio::test]
+    async fn floater_records_replicate_list_without_specs_and_forget() {
+        let (_tmp, state) = fresh_state();
+        let record = serde_json::json!({
+            "ident": "noisetable-account",
+            "spec": { "secret_ref": "noisetable/account/session-key" },
+            "admitted_at": 99,
+        });
+        let resp = build_router(state.clone())
+            .oneshot(
+                Request::post("/workloads/floaters")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&record).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let stored = state.floater_records().get("noisetable-account").unwrap();
+        assert_eq!(stored.admitted_at, 0, "a peer's record never carries admission grace");
+
+        let resp = build_router(state.clone())
+            .oneshot(Request::get("/workloads/floaters").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let b = body_json(resp).await;
+        assert_eq!(b["floaters"][0]["ident"], "noisetable-account");
+        assert!(!b.to_string().contains("secret_ref"), "the list must not echo specs: {b}");
+
+        let resp = build_router(state.clone())
+            .oneshot(
+                Request::post("/workloads/floaters/noisetable-account/forget")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(state.floater_records().list().is_empty());
     }
 
     #[tokio::test]
@@ -13572,6 +14637,70 @@ mod tests {
             StatusCode::UNPROCESSABLE_ENTITY,
             "deploy accepted a body validate refused"
         );
+    }
+
+    // ── R932-B1: validate also has to look at the node ──────────────────────
+    //
+    // Every check above validate is a pure function of the request body, which
+    // is exactly why a body that passed all of them still took
+    // `noisetable-account` down on 2026-09-22: its bind mount's source did not
+    // exist on the host, and `runc` is the first thing in the chain that ever
+    // stats it — after the incumbent has been destroyed.
+
+    #[tokio::test]
+    async fn validate_refuses_a_spec_whose_bind_source_is_missing_on_this_node() {
+        let (_tmp, state, runtime) = state_with_recording_runtime();
+        let mut spec = mesh_spec("validate-bind", 8080);
+        spec.volumes = vec![workload_spec::VolumeMount {
+            source: workload_spec::VolumeSource::Bind {
+                host_path: "/nonexistent/r932b1/ingest.sock".into(),
+            },
+            target: "/run/yah/scryer.sock".into(),
+            read_only: false,
+            from_secret_mount: false,
+        }];
+
+        let resp = post_validate(Arc::clone(&state), serde_json::to_value(&spec).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body = body_json(resp).await;
+        assert_eq!(body["status"], "rejected");
+        let error = body["error"].as_str().unwrap();
+        assert!(
+            error.contains("/nonexistent/r932b1/ingest.sock"),
+            "the refusal must name the host path, got: {error}"
+        );
+        assert!(
+            error.contains("/run/yah/scryer.sock"),
+            "and the mount it was for, got: {error}"
+        );
+        assert!(
+            runtime.specs().is_empty() && runtime.teardown_order().is_empty(),
+            "a refused validate must still touch nothing"
+        );
+    }
+
+    /// Non-vacuity: the same spec validates the moment the path is there, so
+    /// the refusal above is about the host and not about declaring a bind at
+    /// all. A tempdir stands in for the socket — `exists()` is what runc's
+    /// `stat` answers, and a directory answers it the same way.
+    #[tokio::test]
+    async fn validate_accepts_a_bind_whose_source_is_present() {
+        let (_tmp, state, _runtime) = state_with_recording_runtime();
+        let present = tempfile::tempdir().unwrap();
+        let mut spec = mesh_spec("validate-bind-ok", 8080);
+        spec.volumes = vec![workload_spec::VolumeMount {
+            source: workload_spec::VolumeSource::Bind {
+                host_path: present.path().to_path_buf(),
+            },
+            target: "/data".into(),
+            read_only: false,
+            from_secret_mount: false,
+        }];
+
+        let resp = post_validate(Arc::clone(&state), serde_json::to_value(&spec).unwrap()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["status"], "validated");
     }
 
     // ── R858-B11: the health field must read the shape yubaba deploys ────────
@@ -14779,6 +15908,98 @@ mod bundle_deploy_tests {
             .await
             .unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn live(
+        id: &str,
+        state: kamaji_proto::WorkloadState,
+        deployed_with: Option<&workload_spec::Workload>,
+    ) -> kamaji_proto::WorkloadEntry {
+        kamaji_proto::WorkloadEntry {
+            id: kamaji_proto::WorkloadId::new(id),
+            state,
+            pid: Some(41507),
+            mesh_ident: Some(id.to_string()),
+            ports: vec![41507],
+            named_ports: Default::default(),
+            spec_digest: deployed_with.and_then(kamaji_proto::spec_digest),
+        }
+    }
+
+    /// R931-B7 — the measured case: `mirror up` of an unchanged tree re-POSTs
+    /// the byte-identical envelope, and a Running workload deployed with it
+    /// must not be re-forked.
+    #[test]
+    fn an_unchanged_running_bundle_is_not_redeployed() {
+        let wl = bundle_workload("aa11");
+        let id = kamaji_proto::WorkloadId::new("noisetable");
+        let running = [live("noisetable", kamaji_proto::WorkloadState::Running, Some(&wl))];
+        assert!(bundle_redeploy_is_noop(&running, &id, &wl));
+    }
+
+    /// Every other answer deploys — the skip is earned only by a positive match.
+    #[test]
+    fn anything_short_of_same_spec_running_still_redeploys() {
+        let wl = bundle_workload("aa11");
+        let id = kamaji_proto::WorkloadId::new("noisetable");
+        let changed = bundle_workload("bb22");
+        use kamaji_proto::WorkloadState::{Failed, Running, Starting};
+
+        // A new digest is a new bundle.
+        assert!(!bundle_redeploy_is_noop(
+            &[live("noisetable", Running, Some(&changed))],
+            &id,
+            &wl
+        ));
+        // Not Running: a Failed/Starting workload is exactly what a redeploy fixes.
+        for state in [Failed, Starting] {
+            assert!(!bundle_redeploy_is_noop(&[live("noisetable", state, Some(&wl))], &id, &wl));
+        }
+        // No digest recorded — a kamaji restart forgets them — is unknown.
+        assert!(!bundle_redeploy_is_noop(&[live("noisetable", Running, None)], &id, &wl));
+        // Another workload's match says nothing about this one.
+        assert!(!bundle_redeploy_is_noop(&[live("yah-marketing", Running, Some(&wl))], &id, &wl));
+        assert!(!bundle_redeploy_is_noop(&[], &id, &wl));
+    }
+
+    /// R931-B7 — the appliance guard keeps R572-F4's 409 on anything short of
+    /// positive evidence: no record, a different spec, or no kamaji to ask.
+    #[tokio::test]
+    async fn an_appliance_re_post_is_unchanged_only_on_positive_evidence() {
+        let (_tmp, s) = state();
+        let ident = "passway-inner-noisetable-marketing";
+        assert!(!appliance_redeploy_is_noop(&s, ident, 7).await, "no record");
+        s.appliance_spec_digests
+            .lock()
+            .unwrap()
+            .insert(ident.to_string(), 7);
+        assert!(!appliance_redeploy_is_noop(&s, ident, 8).await, "a different spec");
+        assert!(
+            !appliance_redeploy_is_noop(&s, ident, 7).await,
+            "same spec but no kamaji to confirm it is Running"
+        );
+    }
+
+    /// The rotation half: same envelope, new secret bytes must read as a
+    /// different digest, so the skip cannot swallow a rotation.
+    #[test]
+    fn a_rotated_secret_file_changes_the_digest_and_an_unrotated_one_does_not() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = tmp.path().join("r2-access-key-id");
+        let b = tmp.path().join("cloudflare-api-token");
+        std::fs::write(&a, b"old").unwrap();
+        std::fs::write(&b, b"tok").unwrap();
+        let before = native_secret_files_digest(&[a.clone(), b.clone()]);
+
+        assert_ne!(before, 0, "0 is reserved for 'mounts no secrets'");
+        assert_eq!(
+            before,
+            native_secret_files_digest(&[b.clone(), a.clone()]),
+            "order of materialization must not matter"
+        );
+        std::fs::write(&a, b"new").unwrap();
+        assert_ne!(before, native_secret_files_digest(&[a, b]));
+        assert_eq!(native_secret_files_digest(&[]), 0);
     }
 
     /// The envelope shape a bundle deploy must send. Pinned here because it is

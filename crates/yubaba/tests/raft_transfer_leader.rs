@@ -90,9 +90,9 @@ async fn transfer_leader_moves_leadership_and_keeps_membership() {
     );
 
     // (2) Happy path: hand leadership from the leader to follower f0. Retry on
-    // 409 — right after election the leader's replication metrics for the target
-    // may not yet show it caught up (plan_transfer bails with CONFLICT until it
-    // is), which is the documented retry contract.
+    // 409 — right after election the leader's heartbeat metrics may not yet
+    // hold a recent ack from the target (plan_transfer's R936-B4 reachability
+    // gate bails with CONFLICT until they do), which is the retry contract.
     let mut moved = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while tokio::time::Instant::now() < deadline {

@@ -992,7 +992,7 @@ impl ServiceRecords {
     /// **not** require the declaration to name a port — that is the whole
     /// point. "This workload serves" and "we know where" are separate facts,
     /// and only the first one is knowable at admission.
-    fn declare_serving(&self, ident: &MeshIdent) {
+    pub(crate) fn declare_serving(&self, ident: &MeshIdent) {
         if let Ok(mut serving) = self.serving.lock() {
             serving.insert(ident.0.clone());
         }

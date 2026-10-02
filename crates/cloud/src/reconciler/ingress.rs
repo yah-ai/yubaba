@@ -1561,34 +1561,50 @@ pub fn collate_front_doors(planned: &[PlannedEdge]) -> Result<Collation> {
                 tunnel_id: edge.plan.tunnel_id.clone(),
                 rules: Vec::new(),
                 sources: Vec::new(),
-                auth: edge.plan.auth.clone(),
+                auth: None,
                 stacked: Vec::new(),
             });
-            // Conflict 3 (R870-F26): one passway process, one auth policy.
-            // `PASSWAY_AUTH_REQUIRED_PREFIXES` has no hostname dimension, so
-            // two services fronting through this node cannot each get their
-            // own — whichever applied last would decide whether the door
-            // demands a bearer, for BOTH of them. Same last-apply-wins hazard
-            // as the upstream conflict above, except its two outcomes are "a
-            // public service starts 401ing" and "a confidential one goes
-            // public", so it is caught here rather than observed on the box.
-            if door.auth != edge.plan.auth {
-                let describe = |a: &Option<PasswayAuth>| match a {
-                    Some(auth) => format!("auth (aud {:?})", auth.aud),
-                    None => "no auth".to_string(),
-                };
-                bail!(
-                    "front door on {machine} is declared with two different auth policies — {} \
-                     declares {} and {} declares {}. passway's auth policy is per-PROCESS with \
-                     no hostname dimension, so one appliance cannot serve both: whichever \
-                     service applies last decides whether every hostname on this box needs a \
-                     bearer. Make the `[ingress.auth]` declarations identical, or give one of \
-                     them its own front-door node.",
-                    door.sources.join(", "),
-                    describe(&door.auth),
-                    edge.label(),
-                    describe(&edge.plan.auth),
-                );
+            // Conflict 3 (R870-F26, reshaped by R556-F6): one passway process
+            // holds ONE verifier, but its protected prefixes are host-scoped —
+            // `PASSWAY_AUTH_REQUIRED_PREFIXES` takes `<hostname>=<prefix>`. So
+            // each authed edge contributes its prefixes scoped to its OWN
+            // hostnames, an anonymous edge contributes nothing, and a public
+            // site and a confidential tenant share the appliance. What still
+            // cannot be merged is two different verifiers (key/kid/iss/aud):
+            // whichever applied last would decide which tokens the other
+            // service's door accepts.
+            if let Some(edge_auth) = &edge.plan.auth {
+                let scoped =
+                    edge_auth.scoped_to(edge.plan.rules.iter().map(|r| r.hostname.as_str()));
+                match &mut door.auth {
+                    None => {
+                        door.auth = Some(PasswayAuth {
+                            require_prefixes: scoped,
+                            ..edge_auth.clone()
+                        });
+                    }
+                    Some(existing) if existing.same_verifier(edge_auth) => {
+                        existing.require_prefixes.extend(scoped);
+                        existing.require_prefixes.sort();
+                        existing.require_prefixes.dedup();
+                    }
+                    Some(existing) => bail!(
+                        "front door on {machine} is declared with two different bearer \
+                         verifiers — {} declares aud {:?} (kid {:?}, iss {:?}) and {} declares \
+                         aud {:?} (kid {:?}, iss {:?}). passway holds ONE verifier per process; \
+                         protected prefixes are per-hostname but key/kid/iss/aud are not. Make \
+                         the four agree across `[ingress.auth]` tables, or give one service its \
+                         own front-door node.",
+                        door.sources.join(", "),
+                        existing.aud,
+                        existing.kid,
+                        existing.iss,
+                        edge.label(),
+                        edge_auth.aud,
+                        edge_auth.kid,
+                        edge_auth.iss,
+                    ),
+                }
             }
             for rule in &edge.plan.rules {
                 // The same (service, env) can reach one node through several
@@ -3206,46 +3222,76 @@ mod tests {
         assert_eq!(door.auth, None, "neither edge declared any");
     }
 
-    /// R870-F26 conflict 3. Two services fronting one node, ONE declaring
-    /// `[ingress.auth]` — refused, because passway's auth policy is
-    /// per-process with no hostname dimension, so the appliance this collates
-    /// into cannot exist. Left unchecked it is last-apply-wins over whether a
-    /// confidential surface is public.
-    #[test]
-    fn one_node_cannot_front_two_services_with_disagreeing_auth() {
-        let mut authed = plan(IngressProvider::Passway, &["us-east-001"], "analytics.yah.dev", 8444);
-        authed.auth = Some(PasswayAuth {
+    fn analytics_auth() -> PasswayAuth {
+        PasswayAuth {
             key_secret: "cheers/yah-camp/verify".into(),
             kid: "YOHV4Riq-g8fX4uYl8rTjQ".into(),
             iss: "yah-camp".into(),
             aud: "analytics.yah.dev".into(),
             require_prefixes: vec!["/".into()],
-        });
+        }
+    }
+
+    /// R556-F6: the shape R870-F26 had to refuse. A confidential tenant and a
+    /// public site share one node's door; the authed edge's prefixes are
+    /// scoped to ITS hostnames, so the public site stays anonymous.
+    #[test]
+    fn an_authed_and_an_anonymous_service_share_one_door_host_scoped() {
+        let mut authed = plan(IngressProvider::Passway, &["us-east-001"], "analytics.yah.dev", 8444);
+        authed.auth = Some(analytics_auth());
         let anonymous = plan(IngressProvider::Passway, &["us-east-001"], "yah.dev", 8080);
 
-        let err = collate_front_doors(&[
-            planned("yah-analytics", authed.clone()),
-            planned("yah-marketing", anonymous),
-        ])
-        .expect_err("one passway process cannot hold two auth policies")
-        .to_string();
-        assert!(err.contains("us-east-001"), "names the node: {err}");
-        assert!(
-            err.contains("yah-analytics/prod") && err.contains("yah-marketing/prod"),
-            "names both declarations: {err}"
-        );
+        for order in [
+            [planned("yah-analytics", authed.clone()), planned("yah-marketing", anonymous.clone())],
+            [planned("yah-marketing", anonymous.clone()), planned("yah-analytics", authed.clone())],
+        ] {
+            let c = collate_front_doors(&order).expect("host-scoped auth shares the appliance");
+            assert_eq!(c.front_doors.len(), 1);
+            let auth = c.front_doors[0].auth.as_ref().expect("the authed edge's auth survives");
+            assert_eq!(
+                auth.require_prefixes,
+                vec!["analytics.yah.dev=/".to_string()],
+                "scoped to analytics only — never a bare `/` that would cover yah.dev"
+            );
+            assert_eq!(auth.aud, "analytics.yah.dev");
+        }
+    }
 
-        // Identical declarations collate fine — the rule is agreement, not
-        // "at most one service may declare auth".
+    /// Two authed services with the same verifier merge their host-scoped
+    /// prefixes; two DIFFERENT verifiers are still refused — passway holds one
+    /// `CheersAuth` per process.
+    #[test]
+    fn one_node_cannot_front_two_services_with_different_verifiers() {
+        let mut authed = plan(IngressProvider::Passway, &["us-east-001"], "analytics.yah.dev", 8444);
+        authed.auth = Some(analytics_auth());
+
         let mut same = authed.clone();
         same.rules[0].hostname = "reports.yah.dev".into();
         let c = collate_front_doors(&[
             planned("yah-analytics", authed.clone()),
             planned("yah-reports", same),
         ])
-        .expect("agreeing declarations are one appliance");
+        .expect("same verifier is one appliance");
         assert_eq!(c.front_doors.len(), 1);
-        assert_eq!(c.front_doors[0].auth, authed.auth);
+        assert_eq!(
+            c.front_doors[0].auth.as_ref().unwrap().require_prefixes,
+            vec!["analytics.yah.dev=/".to_string(), "reports.yah.dev=/".to_string()]
+        );
+
+        let mut other = authed.clone();
+        other.rules[0].hostname = "reports.yah.dev".into();
+        other.auth.as_mut().unwrap().aud = "reports.yah.dev".into();
+        let err = collate_front_doors(&[
+            planned("yah-analytics", authed),
+            planned("yah-reports", other),
+        ])
+        .expect_err("one passway process cannot hold two verifiers")
+        .to_string();
+        assert!(err.contains("us-east-001"), "names the node: {err}");
+        assert!(
+            err.contains("yah-analytics/prod") && err.contains("yah-reports/prod"),
+            "names both declarations: {err}"
+        );
     }
 
     #[test]

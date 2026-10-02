@@ -25,6 +25,13 @@
 #                                  against a pinned GitHub-OIDC identity-regexp when
 #                                  yubaba_cosign_identity_regexp is set (R330-F19/F20); empty
 #                                  string otherwise (sha256 verify stays as the trust gate)
+#   {{ REGION_ENV_BLOCK }}       — writes YUBABA_REGION=<machine.region> into the same
+#                                  yubaba.service.d drop-in as YUBABA_CHANNEL (R937-F4) when
+#                                  machine.region is set; empty otherwise. yubaba's `--region`
+#                                  flag carries a clap `env =` fallback for exactly this — the
+#                                  unit's ExecStart ships verbatim across every camp, so a
+#                                  per-node region can only reach the daemon via env, never a
+#                                  baked-in flag.
 #
 # The yubaba tarball is curl-fetched at boot (not base64-embedded) because Hetzner caps
 # user_data at 32 KiB (R040-F11). The runcmd verifies sha256, extracts, and installs
@@ -204,6 +211,7 @@ runcmd:
   # the channel is operator-tunable per node).
   - mkdir -p /etc/systemd/system/yubaba.service.d
   - sh -c 'printf "[Service]\nEnvironment=YUBABA_CHANNEL={{YUBABA_CHANNEL}}\n" > /etc/systemd/system/yubaba.service.d/channel.conf'
+{{REGION_ENV_BLOCK}}
   # Cloudflare Tunnel — public ingress (when machine.cloudflared is set)
 {{CLOUDFLARED_BLOCK}}
   # Operator-bridge — Tailscale mesh access (when machine.hosts_operator_bridge = true)

@@ -30,10 +30,13 @@
 //! `membership_config.membership().get_node(...)` raft already carries no
 //! extra discovery needed.
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::async_runtime::watch::WatchReceiver;
+use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::lease_detector::LeaseFailureDetector;
@@ -137,6 +140,7 @@ async fn run(
         }
     };
     let watch = raft.metrics();
+    let mut inflight: HashMap<String, JoinHandle<()>> = HashMap::new();
 
     loop {
         tokio::time::sleep(interval).await;
@@ -153,50 +157,95 @@ async fn run(
 
         match plan_renewal(node_id, &members) {
             RenewalPlan::Broadcast { peers } => {
-                // Local first, and unconditionally: this node's own detector is
-                // the one a scheduler reads the instant this node wins an
-                // election, and it must not have a hole where its own row goes.
-                if let Some(detector) = &lease_detector {
-                    detector.renew(node_id);
-                }
-                for addr in peers {
-                    let url = format!("http://{addr}/mesh/lease-renew");
-                    match client
-                        .post(&url)
-                        .json(&serde_json::json!({ "node_id": node_id }))
-                        .send()
-                        .await
-                    {
-                        Ok(resp) if resp.status().is_success() => {
-                            debug!(node_id, %addr, "lease renewal: renewed against peer");
-                        }
-                        Ok(resp) => {
-                            // `debug`, not `warn`: with a broadcast this fires
-                            // once per unreachable peer per tick, and a fleet
-                            // with one node down would otherwise emit a warning
-                            // every heartbeat from every survivor. The signal
-                            // that a peer is unreachable is the peer's own
-                            // silence, which is what this channel measures.
-                            debug!(
-                                node_id,
-                                %addr,
-                                status = %resp.status(),
-                                "lease renewal: peer refused the renewal — will retry next tick"
-                            );
-                        }
-                        Err(e) => {
-                            debug!(
-                                node_id,
-                                %addr,
-                                "lease renewal: POST failed, will retry next tick: {e}"
-                            );
-                        }
-                    }
-                }
+                dispatch_tick(node_id, lease_detector.as_deref(), peers, &mut inflight, |addr| {
+                    post_renewal(client.clone(), node_id, addr)
+                });
             }
             RenewalPlan::NoPeersYet => {
                 debug!(node_id, "lease renewal: no membership known yet, waiting");
             }
+        }
+    }
+}
+
+/// One tick of the broadcast: renew locally, then launch a POST to every peer
+/// that does not already have one in flight. Never awaits a peer.
+///
+/// # The bug this shape fixes (R937-S2)
+///
+/// The loop used to `await` each peer's POST in turn, inside the tick. With
+/// every peer up that costs a round trip or two and nobody notices. Kill one
+/// voter and each tick now waits out that dead peer's connect failure — up to
+/// [`RENEW_TIMEOUT`] — before it reaches the next peer, *and before the next
+/// tick's local renewal*. On the WAN timings (heartbeat 500 ms, so `Suspect`
+/// after 1.5 s) that stretched every survivor's renewal period past its own
+/// suspect threshold: in the 2026-09-22 us-south-001 chaos test the healthy
+/// voter us-east-001 read `suspect` on the leader's detector, on its own
+/// detector for itself, and the leader read `suspect` on it, for the whole
+/// nine-minute outage — while raft's heartbeat channel, which openraft drives
+/// per-target, said `live` at ~500 ms. A lease channel that degrades every
+/// healthy node whenever one node dies is blind in exactly the situation it
+/// exists for.
+///
+/// So each peer gets its own task, and at most one per peer is outstanding: a
+/// dead peer holds one slot for up to `RENEW_TIMEOUT` and costs every other
+/// peer nothing, and the number of connections parked on it stays bounded at
+/// one rather than growing by one per tick.
+fn dispatch_tick<F, Fut>(
+    node_id: YubabaNodeId,
+    lease_detector: Option<&LeaseFailureDetector>,
+    peers: Vec<String>,
+    inflight: &mut HashMap<String, JoinHandle<()>>,
+    send: F,
+) where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    // Local first, and unconditionally: this node's own detector is the one a
+    // scheduler reads the instant this node wins an election, and it must not
+    // have a hole where its own row goes.
+    if let Some(detector) = lease_detector {
+        detector.renew(node_id);
+    }
+    // A member that left the config is no longer renewed against; its last
+    // attempt, if any, is left to finish on its own timeout.
+    inflight.retain(|addr, _| peers.contains(addr));
+    for addr in peers {
+        if inflight.get(&addr).is_some_and(|h| !h.is_finished()) {
+            debug!(node_id, %addr, "lease renewal: previous POST still in flight, skipping this tick");
+            continue;
+        }
+        let handle = tokio::spawn(send(addr.clone()));
+        inflight.insert(addr, handle);
+    }
+}
+
+async fn post_renewal(client: reqwest::Client, node_id: YubabaNodeId, addr: String) {
+    let url = format!("http://{addr}/mesh/lease-renew");
+    match client
+        .post(&url)
+        .json(&serde_json::json!({ "node_id": node_id }))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            debug!(node_id, %addr, "lease renewal: renewed against peer");
+        }
+        Ok(resp) => {
+            // `debug`, not `warn`: with a broadcast this fires once per
+            // unreachable peer per tick, and a fleet with one node down would
+            // otherwise emit a warning every heartbeat from every survivor. The
+            // signal that a peer is unreachable is the peer's own silence,
+            // which is what this channel measures.
+            debug!(
+                node_id,
+                %addr,
+                status = %resp.status(),
+                "lease renewal: peer refused the renewal — will retry next tick"
+            );
+        }
+        Err(e) => {
+            debug!(node_id, %addr, "lease renewal: POST failed, will retry next tick: {e}");
         }
     }
 }
@@ -267,5 +316,89 @@ mod tests {
     #[test]
     fn an_empty_membership_waits() {
         assert_eq!(plan_renewal(2, &[]), RenewalPlan::NoPeersYet);
+    }
+
+    const DEAD: &str = "100.64.0.2:7443";
+    const LIVE: &str = "100.64.0.1:7443";
+
+    /// A `send` whose POST to [`DEAD`] never completes — a blackholed peer, as
+    /// a killed tailnet node is — and to anything else completes at once.
+    /// Counts attempts per address.
+    fn blackhole_send(
+        attempts: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    ) -> impl Fn(String) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+        move |addr: String| {
+            *attempts.lock().unwrap().entry(addr.clone()).or_default() += 1;
+            if addr == DEAD {
+                Box::pin(std::future::pending())
+            } else {
+                Box::pin(async {})
+            }
+        }
+    }
+
+    fn detector() -> LeaseFailureDetector {
+        use crate::cluster_policy::{LivenessThresholds, RaftTiming};
+        LeaseFailureDetector::new(LivenessThresholds::from_timing(RaftTiming::wan()))
+    }
+
+    /// R937-S2: one dead peer must not slow the renewals to anyone else, nor
+    /// this node's renewal of itself. Under the old serialized loop the first
+    /// tick would still be parked on `DEAD` here, `LIVE` would have one attempt
+    /// at most, and the local row would age with it.
+    #[tokio::test]
+    async fn a_dead_peer_does_not_stall_renewals_to_live_peers_or_to_self() {
+        let det = detector();
+        let attempts = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let send = blackhole_send(attempts.clone());
+        let mut inflight = HashMap::new();
+        let peers = vec![DEAD.to_string(), LIVE.to_string()];
+
+        for _ in 0..5 {
+            dispatch_tick(3, Some(&det), peers.clone(), &mut inflight, &send);
+            // Let the spawned POSTs run, as the real loop's sleep would.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert!(
+                det.silence(3).expect("a tick always renews locally") < Duration::from_millis(100),
+                "own lease must renew every tick"
+            );
+        }
+
+        let attempts = attempts.lock().unwrap();
+        assert_eq!(attempts[LIVE], 5, "a live peer is renewed every tick: {attempts:?}");
+        assert_eq!(
+            attempts[DEAD], 1,
+            "a hung peer keeps exactly one POST outstanding, not one per tick: {attempts:?}"
+        );
+    }
+
+    /// Once the stuck attempt to a peer resolves (its timeout fires, or the
+    /// peer comes back), the next tick tries it again.
+    #[tokio::test]
+    async fn a_peer_is_retried_once_its_previous_attempt_finishes() {
+        let attempts = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let send = blackhole_send(attempts.clone());
+        let mut inflight = HashMap::new();
+        let peers = vec![DEAD.to_string()];
+
+        dispatch_tick(3, None, peers.clone(), &mut inflight, &send);
+        dispatch_tick(3, None, peers.clone(), &mut inflight, &send);
+        assert_eq!(attempts.lock().unwrap()[DEAD], 1);
+
+        inflight[DEAD].abort();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        dispatch_tick(3, None, peers, &mut inflight, &send);
+        assert_eq!(attempts.lock().unwrap()[DEAD], 2);
+    }
+
+    /// A member removed from the config drops out of the in-flight table, so
+    /// the table cannot grow without bound across membership churn.
+    #[tokio::test]
+    async fn a_departed_member_is_forgotten() {
+        let send = blackhole_send(Arc::default());
+        let mut inflight = HashMap::new();
+        dispatch_tick(3, None, vec![DEAD.to_string(), LIVE.to_string()], &mut inflight, &send);
+        dispatch_tick(3, None, vec![LIVE.to_string()], &mut inflight, &send);
+        assert_eq!(inflight.keys().collect::<Vec<_>>(), vec![LIVE]);
     }
 }

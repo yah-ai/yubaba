@@ -251,7 +251,8 @@ use kamaji_proto::NodeCapabilities;
 use crate::appliance_ownership::{
     decide_owner, judge_appliance_candidate, judge_self_fence, may_act_on_ownership,
     owner_lease_expired, owner_status, record_is_settled, ApplianceCandidate, ApplianceHealth,
-    FenceTiming, NativeExecCapability, OwnerElection, OwnerStatus, OwnershipDecision, SelfFence,
+    leader_is_proven, pick_handoff_target, CandidacyReport, FenceTiming, NativeExecCapability,
+    OwnerElection, OwnerStatus, OwnershipDecision, SelfFence,
 };
 use crate::lease_detector::Confirmed;
 use crate::raft::{YubabaNodeId, YubabaRaft, YubabaRequest};
@@ -281,19 +282,13 @@ pub fn spawn(
     node_id: YubabaNodeId,
     raft: YubabaRaft,
     state: Arc<ServerState>,
-    machine: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        run(node_id, raft, state, machine).await;
+        run(node_id, raft, state).await;
     })
 }
 
-async fn run(
-    node_id: YubabaNodeId,
-    raft: YubabaRaft,
-    state: Arc<ServerState>,
-    machine: Option<String>,
-) {
+async fn run(node_id: YubabaNodeId, raft: YubabaRaft, state: Arc<ServerState>) {
     let mut watch = raft.metrics();
     let mut prev_is_leader = false;
     let mut watcher = ApplianceWatcher::new();
@@ -331,6 +326,10 @@ async fn run(
             RaftView {
                 is_leader: metrics.current_leader == Some(node_id),
                 has_leader: metrics.current_leader.is_some(),
+                quorum_ack_age: metrics
+                    .last_quorum_acked
+                    .as_ref()
+                    .map(|at| openraft::Instant::elapsed(&**at)),
             }
         };
         // R858-B20: folded here, on the metrics watch, not inside the
@@ -357,7 +356,7 @@ async fn run(
                     // ownership it did not previously hold and the record write
                     // is load-bearing (R858-B20).
                     if let Err(e) =
-                        on_became_leader(node_id, &raft, &state, machine.clone(), true).await
+                        on_became_leader(node_id, &raft, &state, true).await
                     {
                         error!(node_id, "appliance did not start on the new leader: {e}");
                         watcher
@@ -372,13 +371,7 @@ async fn run(
             } else if ownership.elects_from_eligibility_set() {
                 // The only edge-shaped half; everything else is the tick below.
                 if !is_leader {
-                    on_leadership_loss_under_election(
-                        node_id,
-                        &state,
-                        &watcher,
-                        machine.as_deref(),
-                    )
-                    .await;
+                    on_leadership_loss_under_election(node_id, &state, &watcher).await;
                 }
             } else {
                 info!(
@@ -411,15 +404,7 @@ async fn run(
                 .ingress_ownership
                 .elects_from_eligibility_set()
         {
-            reconcile_appliance_ownership(
-                node_id,
-                view,
-                &raft,
-                &state,
-                &mut watcher,
-                machine.clone(),
-            )
-            .await;
+            reconcile_appliance_ownership(node_id, view, &raft, &state, &mut watcher).await;
         }
         reconcile_due = false;
 
@@ -469,6 +454,10 @@ const RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1
 struct RaftView {
     is_leader: bool,
     has_leader: bool,
+    /// R936-B5: how long ago a quorum last acknowledged this node as leader;
+    /// `None` when it is not a leader or no quorum has answered it yet. See
+    /// [`appliance_ownership::leader_is_proven`].
+    quorum_ack_age: Option<std::time::Duration>,
 }
 
 /// The leadership watcher's own state, held for the life of the process.
@@ -528,6 +517,10 @@ struct ApplianceWatcher {
     /// that is R858-T3's follower-restarts-what-it-owns path and it must stay
     /// prompt.
     start_awaiting_proof: bool,
+    /// R936-B10: when this node, as an ineligible leader facing a vacancy, last
+    /// tried to hand raft leadership to an eligible voter. Paces
+    /// [`hand_off_to_eligible_voter`] to one attempt per [`HANDOFF_COOLDOWN`].
+    last_handoff_at: Option<std::time::Instant>,
 }
 
 impl ApplianceWatcher {
@@ -537,6 +530,7 @@ impl ApplianceWatcher {
             ownership_confirmed_at: std::time::Instant::now(),
             leader_contact_since: None,
             start_awaiting_proof: false,
+            last_handoff_at: None,
         }
     }
 
@@ -586,10 +580,9 @@ async fn on_leadership_loss_under_election(
     node_id: YubabaNodeId,
     state: &Arc<ServerState>,
     watcher: &ApplianceWatcher,
-    machine: Option<&str>,
 ) {
     let election = &watcher.election;
-    let recorded = recorded_owner(state, node_id, machine);
+    let recorded = recorded_owner(state);
     let running_here = observe_local_appliance(state).await.is_some();
     let owner = owner_status(recorded, node_id, running_here, election.health());
 
@@ -760,18 +753,22 @@ async fn reconcile_appliance_ownership(
     raft: &YubabaRaft,
     state: &Arc<ServerState>,
     watcher: &mut ApplianceWatcher,
-    machine: Option<String>,
 ) {
     let RaftView {
         is_leader,
         has_leader,
+        quorum_ack_age,
     } = view;
+    let timing = FenceTiming::from_thresholds(state.cluster_policy.liveness_thresholds());
+    // R936-B5: every ownership decision below reads "leader" as a leader a
+    // quorum is following, never a vote restored from disk. See
+    // `leader_is_proven`.
+    let is_leader = leader_is_proven(is_leader, quorum_ack_age, timing);
     // The record survives this process; `election.health()` does not. Ask the
     // supervisor as well, since a record naming *this* node is the one case
     // with local evidence available.
-    let recorded = recorded_owner(state, node_id, machine.as_deref());
+    let recorded = recorded_owner(state);
     let running_here = observe_local_appliance(state).await;
-    let timing = FenceTiming::from_thresholds(state.cluster_policy.liveness_thresholds());
 
     // ── R858-T7, FENCE ───────────────────────────────────────────────────────
     //
@@ -797,6 +794,12 @@ async fn reconcile_appliance_ownership(
     // struct; both values are plain `Copy` snapshots of this tick.
     let leader_contact = watcher.leader_contact_for();
     let settled = record_is_settled(leader_contact, timing);
+    // R936-B1: publish this tick's judgement for the front doors. Before the
+    // fence below on purpose — a fenced node must still say "not serving".
+    *state.ingress_local_view.write().unwrap() = Some(IngressLocalView {
+        settled: has_leader && settled,
+        serving_here: running_here.is_some(),
+    });
     let confirmed_now = has_leader && settled && recorded == Some(node_id);
     if confirmed_now {
         watcher.ownership_confirmed_at = std::time::Instant::now();
@@ -851,11 +854,34 @@ async fn reconcile_appliance_ownership(
         );
     }
 
+    // ── R936-B10, PUBLISH CANDIDACY ──────────────────────────────────────────
+    //
+    // On EVERY node, before `may_act`. The probe used to run only on a node
+    // allowed to act, so a follower's eligibility was unknowable until the
+    // owner died and a leader tried — and a follower that could not render its
+    // `config.yaml` stayed that way until it was the last hope. Hydrating here
+    // also makes every follower candidate-ready ahead of time.
+    //
+    // R858-T5: hydrate BEFORE the probe, not after. See
+    // `hydrate_config_before_probe`.
+    hydrate_config_before_probe(&state.headscale_dir, state.headscale_url.as_deref());
+    let self_candidate = watcher.election.candidate(
+        node_id,
+        self_eligibility(),
+        // R858-T4: a real probe of this node's kamaji and the appliance
+        // binary, replacing the permissive `Unknown` placeholder T3 left.
+        probe_native_exec(state).await,
+    );
+    let now = unix_now_secs();
+    *state.appliance_candidacy.write().unwrap() =
+        Some(candidacy_report(node_id, is_leader, &self_candidate, state, now));
+
     // Destructured rather than `&mut watcher.election`, because the arms below
     // need both fields at once and one whole-struct borrow would not allow it.
     let ApplianceWatcher {
         election,
         start_awaiting_proof,
+        last_handoff_at,
         ..
     } = watcher;
     let owner = owner_status(recorded, node_id, running_here.is_some(), election.health());
@@ -889,19 +915,7 @@ async fn reconcile_appliance_ownership(
         return;
     }
 
-    let now = unix_now_secs();
-    // R858-T5: BEFORE the probe, not after. See `hydrate_config_before_probe`.
-    hydrate_config_before_probe(&state.headscale_dir, state.headscale_url.as_deref());
-    let mut candidates = BTreeMap::from([(
-        node_id,
-        election.candidate(
-            node_id,
-            self_eligibility(),
-            // R858-T4: a real probe of this node's kamaji and the appliance
-            // binary, replacing the permissive `Unknown` placeholder T3 left.
-            probe_native_exec(state).await,
-        ),
-    )]);
+    let mut candidates = BTreeMap::from([(node_id, self_candidate)]);
 
     // ── R858-T7, EXPIRE ──────────────────────────────────────────────────────
     //
@@ -985,7 +999,7 @@ async fn reconcile_appliance_ownership(
             if let Some(observed) = running_here {
                 let spec = headscale_appliance::appliance_spec(
                     &state.headscale_dir,
-                    state.headscale_durability,
+                    state.headscale_durability_store.as_deref(),
                 );
                 // A native workload has no namespace of its own, so the
                 // supervisor may report no per-workload address; the node's own
@@ -1063,7 +1077,7 @@ async fn reconcile_appliance_ownership(
                 // reports it gone, which is how this arm was reached.
                 return;
             }
-            match on_became_leader(node_id, raft, state, machine, recorded != Some(node_id)).await {
+            match on_became_leader(node_id, raft, state, recorded != Some(node_id)).await {
                 Ok(()) => {
                     // NOT `record_success` — deliberately, and this is the whole
                     // of R858-B13's second half. `on_became_leader` returning
@@ -1146,7 +1160,108 @@ async fn reconcile_appliance_ownership(
                     ),
                 }
             }
+
+            // R936-B10: "no eligible candidate" only ever meant "the LEADER is
+            // not eligible" — it is the only live candidate this node can
+            // measure. Hand leadership to a voter that says it could take the
+            // appliance; it then elects itself through the ordinary path.
+            if is_leader {
+                hand_off_to_eligible_voter(node_id, raft, last_handoff_at).await;
+            }
         }
+    }
+}
+
+/// R936-B10: minimum spacing between two leadership handoffs by one node. Long
+/// enough for the target to win, settle and start the appliance; short against
+/// the 10m52s outage it replaces.
+const HANDOFF_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Per-peer timeout for `GET /cluster/appliance-candidacy`.
+const CANDIDACY_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// This node's [`CandidacyReport`] for this tick.
+fn candidacy_report(
+    node_id: YubabaNodeId,
+    is_leader: bool,
+    cand: &ApplianceCandidate,
+    state: &ServerState,
+    now: u64,
+) -> CandidacyReport {
+    let verdict = judge_appliance_candidate(cand, now);
+    CandidacyReport {
+        node_id,
+        eligible: verdict.is_ok(),
+        refusal: verdict.err().map(|r| r.as_str().to_string()),
+        native_exec: cand.capability.as_str().to_string(),
+        binary_present: headscale_appliance::binary_path(&state.headscale_dir).exists(),
+        config_present: headscale_appliance::config_path(&state.headscale_dir).exists(),
+        headscale_url_configured: state.headscale_url.is_some(),
+        backoff_until: cand.backoff_until,
+        is_leader,
+    }
+}
+
+/// Ask every other voter for its [`CandidacyReport`] and transfer raft
+/// leadership to the one [`pick_handoff_target`] names. Loud on purpose: this
+/// runs only while the cluster has no coordinator.
+async fn hand_off_to_eligible_voter(
+    node_id: YubabaNodeId,
+    raft: &YubabaRaft,
+    last_handoff_at: &mut Option<std::time::Instant>,
+) {
+    if last_handoff_at.is_some_and(|t| t.elapsed() < HANDOFF_COOLDOWN) {
+        return;
+    }
+    let (voters, peers): (std::collections::BTreeSet<YubabaNodeId>, Vec<(YubabaNodeId, String)>) = {
+        let watch = raft.metrics();
+        let metrics = watch.borrow_watched();
+        let membership = metrics.membership_config.membership();
+        (
+            membership.voter_ids().collect(),
+            membership
+                .nodes()
+                .filter(|(id, _)| **id != node_id)
+                .map(|(id, n)| (*id, n.addr.clone()))
+                .collect(),
+        )
+    };
+    let client = match reqwest::Client::builder().timeout(CANDIDACY_FETCH_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(node_id, "appliance handoff: could not build HTTP client: {e}");
+            return;
+        }
+    };
+    // Sequential: at most a handful of voters, each capped at
+    // `CANDIDACY_FETCH_TIMEOUT`, on a path that runs once per cooldown.
+    let mut reports: Vec<CandidacyReport> = Vec::new();
+    for (id, addr) in &peers {
+        let url = format!("http://{addr}/cluster/appliance-candidacy");
+        let got = async { client.get(&url).send().await?.error_for_status()?.json().await }.await;
+        match got {
+            Ok(report) => reports.push(report),
+            Err(e) => warn!(node_id, peer = id, %url, "appliance handoff: no candidacy report: {e}"),
+        }
+    }
+    let Some(target) = pick_handoff_target(node_id, &voters, &reports) else {
+        error!(
+            node_id,
+            reports = ?reports.iter().map(|r| (r.node_id, r.refusal.clone())).collect::<Vec<_>>(),
+            "APPLIANCE UNHEALTHY: no voter reports it could take the appliance either — nothing to \
+             hand leadership to (R936-B10)"
+        );
+        return;
+    };
+    *last_handoff_at = Some(std::time::Instant::now());
+    error!(
+        node_id,
+        target,
+        "this leader cannot run the appliance and the cluster has no coordinator — handing raft \
+         leadership to a voter that reports it can (R936-B10)"
+    );
+    if let Err(e) = raft.trigger().transfer_leader(target).await {
+        warn!(node_id, target, "appliance handoff: transfer_leader failed: {e}");
     }
 }
 
@@ -1313,42 +1428,34 @@ where
     NativeExecCapability::Present
 }
 
+/// R936-B1: one node's own view of the ingress record, as its ownership tick
+/// last judged it. Read by `GET /cluster/ingress-owner`.
+///
+/// `Default` is the fail-closed answer (unsettled, not serving): a door that
+/// asks before the first tick has run must route to its peers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IngressLocalView {
+    /// A raft leader is known and has been in contact long enough for this
+    /// node's applied record to be current (R858-B20's `record_is_settled`).
+    pub settled: bool,
+    /// The appliance is running on this node per its own supervisor.
+    pub serving_here: bool,
+}
+
 /// Which node the **replicated** record says owns the appliance, if any.
 ///
-/// `ingress_owner` holds a machine name and every decision here is keyed by
-/// [`YubabaNodeId`], so this is R859-F2's identity bridge
-/// ([`node_for_machine`](crate::raft::YubabaStateMachine::node_for_machine))
-/// used in the direction it was built for.
+/// R936-B3: the record IS a raft node id, so there is no identity bridge to
+/// cross and no "is that string me?" comparison to get wrong. Before B3 it held
+/// `/etc/hostname`, which on two of the three prod voters is a provider default
+/// matching no fleet machine; every decision here is keyed by [`YubabaNodeId`]
+/// and had to translate through the member rows, which a just-restarted daemon
+/// may not have republished yet.
 ///
-/// # "Is it me?" is answered without the member map, on purpose
-///
-/// The map is the *only* way to turn the record into some **other** node's id,
-/// but it is a needless dependency for this node's own name — which the caller
-/// already holds, since it is the same string this node writes into the record.
-/// Comparing directly matters because of exactly when it is asked: a
-/// just-restarted daemon may re-win leadership before `member_registration` has
-/// republished its row, and going through the map there yields `None`, which
-/// degrades to "vacant", which redeploys a coordinator that is running fine.
-/// Every fleet roll restarts the owner, so that race is not a corner case — it
-/// is the last step of every roll.
-///
-/// `None` still covers the cases where nothing can be concluded: no raft state,
-/// no owner claimed, or an owner whose row is absent, unreplicated, or predates
-/// [`MemberInfo::machine`](crate::raft::MemberInfo::machine). Those degrade to
-/// this process's own [`ApplianceHealth`] via [`owner_status`] — the
-/// pre-R858-T3 behaviour, so a fleet mid-roll is never worse off than it was,
-/// only better once both halves are present.
-fn recorded_owner(
-    state: &Arc<ServerState>,
-    node_id: YubabaNodeId,
-    machine: Option<&str>,
-) -> Option<YubabaNodeId> {
-    let sm = state.cluster_state.as_ref()?;
-    let owner = sm.ingress_owner()?;
-    if machine.is_some_and(|m| m == owner) {
-        return Some(node_id);
-    }
-    sm.node_for_machine(&owner)
+/// `None` covers the cases where nothing can be concluded: no raft state, no
+/// owner claimed, or a legacy name record no member row claims. Those degrade
+/// to this process's own [`ApplianceHealth`] via [`owner_status`].
+fn recorded_owner(state: &Arc<ServerState>) -> Option<YubabaNodeId> {
+    state.cluster_state.as_ref()?.ingress_owner()
 }
 
 /// Ask this node's own supervisor whether the appliance is running **here**.
@@ -1465,8 +1572,7 @@ async fn on_became_leader(
     node_id: YubabaNodeId,
     raft: &YubabaRaft,
     state: &Arc<ServerState>,
-    machine: Option<String>,
-    // R858-B20: is the `SetIngressOwner` write below load-bearing, or a
+    // R858-B20: is the `ClaimIngressOwner` write below load-bearing, or a
     // redundant re-assertion of a record that already names this node? Only the
     // first makes a `ForwardToLeader` refusal fatal. Passed in rather than
     // re-derived here, because the caller has already read `recorded` for this
@@ -1521,8 +1627,12 @@ async fn on_became_leader(
     //    start — a node that could not serve must never appear as the owner,
     //    because "the record says west owns it" is what an operator reads
     //    during an outage and it has to be true.
-    if let Some(machine) = machine {
-        let req = YubabaRequest::SetIngressOwner { machine };
+    //
+    //    R936-B3: claimed by raft node id, unconditionally. It used to write
+    //    this node's hostname, and a node with no derivable hostname wrote
+    //    nothing at all.
+    {
+        let req = YubabaRequest::ClaimIngressOwner { node_id };
         match raft.client_write(req).await {
             Ok(_) => info!("ingress owner set in raft state"),
             // ── R858-B20, THE BACKSTOP ───────────────────────────────────────
@@ -1671,7 +1781,10 @@ async fn on_lost_leader(state: &Arc<ServerState>) {
 /// this value.
 async fn start_headscale(state: &Arc<ServerState>) -> Result<(), ApplianceStartError> {
     let spec =
-        headscale_appliance::appliance_spec(&state.headscale_dir, state.headscale_durability);
+        headscale_appliance::appliance_spec(
+            &state.headscale_dir,
+            state.headscale_durability_store.as_deref(),
+        );
 
     // R858-T2: place the coordinator's noise identity BEFORE either start path
     // below. `headscale serve` mints a fresh key when the file is absent, and
@@ -2287,7 +2400,8 @@ mod tests {
         let dir = std::path::PathBuf::from("/var/lib/yah-cloud/headscale");
         // R858-B23: both settings of the durability gate, because probe and
         // deploy must agree whichever one the node is provisioned with.
-        for durability in [false, true] {
+        let store = headscale_appliance::durability_store("prod");
+        for durability in [None, Some(store.as_str())] {
             let spec = headscale_appliance::appliance_spec(&dir, durability);
             let argv = spec.command.clone().unwrap_or_default();
             for probed in argv_paths(&dir) {

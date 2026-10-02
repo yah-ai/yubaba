@@ -216,7 +216,7 @@ impl Loops {
         }
         self.0.push((
             idx,
-            yubaba::leader::spawn(node_id, raft.clone(), Arc::clone(&state), Some(machine)),
+            yubaba::leader::spawn(node_id, raft.clone(), Arc::clone(&state)),
         ));
     }
 }
@@ -231,8 +231,11 @@ fn appliance_running(runtime: &FakeRuntime) -> bool {
 }
 
 /// The `ingress_owner` any node has applied, if the record has replicated there.
+///
+/// R936-B3: raft records a node id; this test file names nodes by
+/// [`machine_name`], so translate here and keep every assertion below readable.
 fn recorded_owner(cluster: &Cluster, idx: usize) -> Option<String> {
-    cluster.cluster_state(idx)?.ingress_owner()
+    cluster.cluster_state(idx)?.ingress_owner().map(machine_name)
 }
 
 /// Poll until `cond`, or panic with `what` after `budget`.

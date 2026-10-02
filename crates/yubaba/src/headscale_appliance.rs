@@ -265,7 +265,19 @@ pub const HEADSCALE_LISTEN_PORT: u16 = 8080;
 /// cannot collide; litestream's replicate leg keeps running on its own prefix
 /// until a live-cluster-gated ticket retires it (see `crate::litestream`'s
 /// module docs).
-const HEADSCALE_DURABILITY_STORE: &str = "s3://yah-headscale/appliance/headscale";
+///
+/// R936-B2: scoped by sovereign group, `appliance/<group>/headscale`. Before
+/// B2 it was one constant for every cluster, so the dev group's rehearsal
+/// appliance and prod's coordinator would have streamed into ONE lineage and
+/// each hydrated the other's mesh. Also a fresh lineage for prod: the old
+/// `appliance/headscale` prefix's claims carry `kamaji-pid-<pid>` owner labels
+/// (turso-backup's stale-volume check cannot match those against a node), and
+/// its last writer was us-south-001 before 2026-09-22 18:13Z while us-west-001
+/// has served the live mesh since without replicating, so hydrating from it
+/// would roll the mesh back. The old prefix stays in the bucket, untouched.
+pub fn durability_store(sovereign_group: &str) -> String {
+    format!("s3://yah-headscale/appliance/{sovereign_group}/headscale")
+}
 
 /// Graceful-stop budget. `headscale serve` closes its listeners and exits 0 on
 /// SIGTERM well inside this; the window exists so an in-flight node
@@ -353,7 +365,7 @@ pub fn config_path(headscale_dir: &Path) -> PathBuf {
 /// same provisioning step that writes the store credential kamaji's hydrate
 /// inherits from its own environment — the declaration must follow the
 /// credential, never precede it.
-pub fn appliance_spec(headscale_dir: &Path, durability: bool) -> WorkloadSpec {
+pub fn appliance_spec(headscale_dir: &Path, durability_store: Option<&str>) -> WorkloadSpec {
     let bin = binary_path(headscale_dir);
     let config = config_path(headscale_dir);
 
@@ -404,10 +416,10 @@ pub fn appliance_spec(headscale_dir: &Path, durability: bool) -> WorkloadSpec {
     // no "the credentials look absent, so quietly drop the tier" branch — a
     // prerequisite turned into an unread log line is the shape that produced
     // the 2026-09-11 outage in the first place.
-    let durability = durability.then(|| workload_spec::Durability {
+    let durability = durability_store.map(|store| workload_spec::Durability {
         tier: workload_spec::DurabilityTier::Stream,
         engine: Some(workload_spec::DurabilityEngine::Turso),
-        store: Some(HEADSCALE_DURABILITY_STORE.to_string()),
+        store: Some(store.to_string()),
         subjects: vec!["headscale.db".to_string()],
         rpo_seconds: None,
         state_mb: None,
@@ -523,13 +535,13 @@ mod tests {
 
     /// The production default: durability OFF (R858-B23).
     fn spec() -> WorkloadSpec {
-        appliance_spec(&PathBuf::from(STATE_DIR), false)
+        appliance_spec(&PathBuf::from(STATE_DIR), None)
     }
 
     /// The opt-in shape, as a node provisioned with the store credential
     /// deploys it.
     fn durable_spec() -> WorkloadSpec {
-        appliance_spec(&PathBuf::from(STATE_DIR), true)
+        appliance_spec(&PathBuf::from(STATE_DIR), Some(&durability_store("prod")))
     }
 
     /// R885-B11: the appliance declares its own state dir as writable, so
@@ -543,7 +555,7 @@ mod tests {
     #[test]
     fn the_appliance_declares_its_state_dir_as_writable() {
         let dir = PathBuf::from(STATE_DIR);
-        let declared = appliance_spec(&dir, false)
+        let declared = appliance_spec(&dir, None)
             .writable_paths()
             .expect("declaration must parse");
         assert_eq!(declared, vec![dir.clone()]);
@@ -619,7 +631,7 @@ mod tests {
         assert_eq!(args.tier, workload_spec::DurabilityTier::Stream);
         assert_eq!(args.bucket, "yah-headscale");
         assert_eq!(
-            args.prefix, "appliance/headscale",
+            args.prefix, "appliance/prod/headscale",
             "must not be litestream's own s3://yah-headscale/headscale prefix"
         );
     }
@@ -770,7 +782,7 @@ mod tests {
     /// about the path.
     #[test]
     fn the_state_dir_is_not_hardcoded() {
-        let s = appliance_spec(&PathBuf::from("/tmp/rig/hs"), false);
+        let s = appliance_spec(&PathBuf::from("/tmp/rig/hs"), None);
         assert_eq!(
             s.command.as_ref().unwrap()[0],
             "/tmp/rig/hs/headscale".to_string()

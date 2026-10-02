@@ -60,7 +60,6 @@
 //! @yah:assignee(agent:bundle-anthropic-glimmerstone)
 //! @yah:next("DOCTRINE (operator, 2026-08-02, emphatic): a full disk brings the best software to its knees, and apps - Docker especially - love to eat all the space. Every single process that ever runs on a yah box must be explicitly forbidden from unbounded growth. A default that happens to be a fraction of the disk is NOT a bound. This relay makes that auditable rather than aspirational.")
 //! @yah:next("DONE ALREADY, not part of the remaining children: journald bounded on all three cloud nodes via /etc/systemd/journald.conf.d/10-yah-disk-bounds.conf (SystemMaxUse=500M, SystemKeepFree=1G, SystemMaxFileSize=50M, RuntimeMaxUse=64M) and the same block added to the TOP of runcmd in BOTH twin cloud-init templates (oss/yubaba/crates/cloud/templates/mirror.yml + .yah/infra/cloud-init/mirror.yml) so it lands before anything else on the box starts writing. us-south-001 went 755.5M -> 483M on restart. RuntimeMaxUse matters twice over: /run is tmpfs, so it bounds RAM too.")
-//! @yah:next("Children to file as work begins: (F) kamaji bundle-cache budget - THE live unbounded one, see gotcha; (T) containerd image/snapshot GC policy; (T) apt archive + old-kernel retention; (T) surface per-node disk headroom in yubaba node status so pressure is visible before it is fatal; (D) a W doc carrying the doctrine plus a review checklist item - every new on-disk writer declares its ceiling at the same time it declares the path.")
 //! @yah:gotcha("LIVE UNBOUNDED CACHE IN OUR OWN CODE, RIGHT NOW. kamaji's mesofact bundle cache has working, unit-tested LRU eviction (BundleCache::evict_to_budget, oss/yah-base/crates/mesofact-bundle/src/store.rs:243) that is DISABLED in production: BundleBackend::cache_budget defaults to 0 (oss/kamaji/crates/kamaji-bin/src/server.rs:297) and 0 explicitly means 'unbounded, eviction off' (store.rs:207). There is no --bundle-cache-budget CLI flag in kamaji-bin/src/main.rs, and the live drop-in /etc/systemd/system/kamaji.service.d/20-bundle.conf on us-east-001 passes only --bundle-cache-dir and --bundle-origin. Net effect: every release wave materializes a new digest-keyed tree under /var/lib/yah/kamaji/bundles/ and NOTHING ever removes the old one. Only 6.3M on east today because there have been few waves - it grows monotonically with release count, forever.")
 //! @yah:gotcha("Fix shape for that child: add the flag, and make the DEFAULT non-zero rather than shipping another opt-in bound (an opt-in ceiling is how this happened). If 0-means-unbounded stays as an escape hatch it should require passing 0 explicitly, so the default path is always bounded.")
 //! @yah:gotcha("Measured baseline 2026-08-02 for whoever picks this up. us-south-001 (30G disk, 1 vCPU / 961MB): 7.2G used, /var 1.4G of which journal 755M, /var/lib/apt 295M, /var/cache 177M. us-east-001 (99G): 2.0G used, /usr 1.1G, /var 786M, containerd 154M, kamaji bundles 6.3M. us-west-001 (99G): 1.9G used. Nothing is near full today - this relay is about the derivative, not the current level.")
@@ -82,6 +81,49 @@
 //! @yah:verify("Cheap de-risk available before touching hardware: boot the built ISO in QEMU against a scratch qcow2 and let the unattended install run to completion. That proves the recipe, the initrd inject and the late_command without burning a USB or a trip to the box.")
 //! @yah:handoff("RENUMBERED (operator correction, 2026-08-02): the GEEKOM mini PC is us-west-003, NOT us-west-012 — the 01x block is reserved for the small LAN/appliance class and another Pi is taking 012. The convention is by HARDWARE CLASS, not arrival order: 00x = PC/server (001 OVH VPS, 002 WSL2 gamer box, 003 GEEKOM), 01x = small LAN boxes (011-014 Pis, 015 arm64 Mac). Recorded at the top of us-west-003.toml and in W257, because it is not derivable from the existing files and it is what tells a reader which of the two provisioning paths a node took. The us-west-012.toml scaffold was untracked and never committed, so it was removed rather than renamed; no stale refs remain (grep clean, `yah cloud validate` ok).")
 //! @yah:gotcha("LAN IP for us-west-003 is ASSUMED, not confirmed. W257's convention is us-west-0NN -> 192.168.10.NN and it holds for every 01x node, but the only existing 00x LAN box breaks it: us-west-002 sits at 192.168.10.30, not .2. The scaffold uses .3 with a CONFIRM-BEFORE-BRING-UP note inline. If the 00x block actually lives in the .3x range on the router, .3 is wrong and both [connect].address and [connect].ssh need correcting before step 4.")
+//! @yah:next("Filed 2026-09-21: R702-B2 (kamaji bundle-cache budget, bug/high), R702-T3 (containerd GC), R702-T4 (apt/kernel retention), R702-T5 (disk-headroom surfacing), R702-T6 (doctrine W-doc). All open, ready to claim.")
+//!
+//! @yah:ticket(R702-T3, "containerd image/snapshot GC policy for cloud nodes — no eviction, root-filesystem growth is unbounded")
+//! @yah:at(2026-09-22T05:26:57Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R702)
+//! @yah:next("Tier: Thief -- config/policy addition (containerd GC settings), no novel design.")
+//! @yah:next("Add a containerd config.toml GC policy (image/snapshot retention, analogous to the docker builder.gc block already baked for the Pi fleet in .yah/infra/pi-image/layer/yah-build-worker.yaml) to both cloud-init templates (oss/yubaba/crates/cloud/templates/mirror.yml + .yah/infra/cloud-init/mirror.yml, kept as twins per the drift guard test in this file) and to stand-up-yubaba.sh as a retrofit for already-provisioned nodes, same write-if-absent pattern used for the docker daemon.json ceiling.")
+//! @yah:next("Verify: containerd disk usage on a cloud node stays bounded across a week of image pulls, same standard as the journald 500M check R702 already established.")
+//! @yah:gotcha("The cloud nodes (us-east-001 etc) run bare containerd (`ctr -n yah`) on the root filesystem with no GC/eviction policy configured -- 154M on us-east-001 as of 2026-08-02 baseline, not urgent today but unbounded by design. us-west-014's docker install is already safe by placement (data-root bind-mounted to a 234G NVMe at 4%) -- don't let that make this child look optional; the cloud nodes have no equivalent bind.")
+//!
+//! @yah:ticket(R702-T4, "apt archive + old-kernel retention policy for the fleet")
+//! @yah:at(2026-09-22T05:27:16Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R702)
+//! @yah:next("Tier: Thief -- standard apt hygiene config (APT::Clean-Interval / apt-get autoremove --purge cron, kernel retention count), no novel design.")
+//! @yah:next("Add an apt cleanup policy to both cloud-init templates and stand-up-yubaba.sh (same write-if-absent, twin-template pattern used for journald and docker/containerd ceilings): periodic `apt-get clean` + `apt-get autoremove --purge`, and a bounded old-kernel retention count so unattended-upgrades doesn't accumulate every kernel version forever.")
+//! @yah:next("Size it per-filesystem, not copied from the cloud nodes: us-west-014's /var/cache sits on the 2.5G SD root, not the NVMe, so its retention count needs to be tighter than the 99G cloud nodes'.")
+//! @yah:gotcha("Measured 2026-08-02 baselines: us-south-001 /var/lib/apt 295M + /var/cache 177M on a 30G disk; us-west-014 /var/cache apt 170M on the tightest filesystem in the fleet (2.5G SD root). Nothing near full today -- this is about the derivative (apt archives + old kernels accumulate forever across unattended-upgrades runs), not the current level.")
+//!
+//! @yah:ticket(R702-T5, "surface per-node disk headroom in yubaba node status so pressure is visible before it is fatal")
+//! @yah:at(2026-09-22T05:27:36Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R702)
+//! @yah:next("Tier: Cleric -- needs to pick the right existing status/reporting surface to extend and reason about what 'before it's fatal' means as a threshold, but no deep architecture change.")
+//! @yah:next("Add per-filesystem free-space (or percent-full) to whatever struct/RPC yubaba already uses for node status, threading it through to wherever `yah cloud` surfaces node health.")
+//! @yah:next("Pick a threshold and surfacing mechanism (warn in `yah cloud status` output at minimum; consider whether it belongs in the same channel as existing node-health alerts, if one exists).")
+//! @yah:next("us-west-014 is the concrete motivating case (two filesystems, the tighter one is the SD root, not the NVMe) -- make sure whatever ships reports per-filesystem, not just per-node, or it would have missed exactly the failure that prompted this ticket.")
+//! @yah:gotcha("This relay's whole premise is that a full disk takes a node down silently -- the SD-card failure recorded on R702-B1 (us-west-014, 2026-09) is the concrete case: nothing surfaced the disk pressure building up before the card died. Every ceiling filed under R702 bounds growth, but none of them make the CURRENT headroom visible to an operator before it's fatal.")
+//! @yah:gotcha("Implementation likely lands in yubaba's node status/reporting path (oss/yubaba/crates/yubaba/src/lib.rs and/or wherever `yah cloud` node status is assembled), NOT in this file -- oss/yubaba/crates/yubaba/src/lib.rs is dirty (uncommitted) as of 2026-09-21, check for a live peer there before editing. This ticket is filed here per board-filing convention (one annotation per ID, homed at the parent relay's own file) -- the real edit target is named in this gotcha, not this file.")
+//!
+//! @yah:ticket(R702-T6, "write a W-doc: bounded-disk doctrine + review checklist for every new on-disk writer")
+//! @yah:at(2026-09-22T05:27:53Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R702)
+//! @yah:next("Tier: Thief -- writing up doctrine + checklist that already exists in R702's ticket history, not deriving anything new.")
+//! @yah:next("Write .yah/docs/working/W###-bounded-disk-doctrine.md: the doctrine paragraph above, plus a concrete example table like the one this relay produced (journald, docker daemon.json, containerd GC, apt retention, kamaji bundle-cache) as a worked reference.")
+//! @yah:next("Add a review-checklist line: every new on-disk writer declares its ceiling (unit test, systemd directive, or config) at the same time it declares the path -- and say where that checklist item should live (PR template? CLAUDE.md? code-review skill?) so it's actually seen at review time, not just written down.")
+//! @yah:gotcha("Operator doctrine (2026-08-02, emphatic, recorded on R702 itself): a full disk brings the best software to its knees, and apps -- Docker especially -- love to eat all the space. Every single process that ever runs on a yah box must be explicitly forbidden from unbounded growth. A default that happens to be a fraction of the disk is NOT a bound. This ticket is what makes that auditable rather than aspirational -- right now the doctrine lives only in R702's own ticket prose, nowhere a future PR reviewer would find it.")
 
 use crate::config::MachineConfig;
 use crate::release_manifest::ReleaseTrust;
@@ -298,6 +340,19 @@ pub fn render(template: &str, input: &RenderInput) -> Result<String> {
         None => String::new(),
     };
 
+    // R937-F4: the shipped yubaba.service ExecStart never carries `--region`
+    // (it ships byte-identical across every camp, so nothing per-node can
+    // live there — same reasoning as the channel drop-in above). Reach the
+    // daemon via the env fallback on `--region` instead (`YUBABA_REGION`,
+    // oss/yubaba/crates/yubaba/src/main.rs), written into the same
+    // yubaba.service.d drop-in as YUBABA_CHANNEL. A machine with no declared
+    // region emits nothing, matching this daemon's existing "unset means
+    // untagged" contract for `--region`.
+    let region_env_block = match &input.machine.region {
+        Some(region) => build_region_env_block(region),
+        None => String::new(),
+    };
+
     let rendered = template
         .replace("{{MACHINE_NAME}}", &input.machine.name)
         .replace("{{YAH_YUBABA_URL}}", &input.yubaba_url)
@@ -316,7 +371,8 @@ pub fn render(template: &str, input: &RenderInput) -> Result<String> {
             "{{COORDINATOR_PRESTAGE_BLOCK}}",
             &coordinator_prestage_block,
         )
-        .replace("{{COSIGN_VERIFY_BLOCK}}", &cosign_verify_block);
+        .replace("{{COSIGN_VERIFY_BLOCK}}", &cosign_verify_block)
+        .replace("{{REGION_ENV_BLOCK}}", &region_env_block);
 
     if let Some(remnant) = find_unsubstituted(&rendered) {
         bail!("cloud-init template has unsubstituted placeholder: {remnant}");
@@ -362,6 +418,22 @@ fn build_cloudflared_block(token: &str) -> String {
         "  - systemctl enable --now cloudflared".to_string(),
     ]
     .join("\n")
+}
+
+/// Build the `runcmd` line that writes `YUBABA_REGION=<region>` into the same
+/// `yubaba.service.d/channel.conf` drop-in the channel line above writes
+/// (R937-F4). One line, valid cloud-init sequence entry (two-space indent +
+/// `- `); when the machine has no declared region the caller substitutes an
+/// empty string instead of calling this, matching the CLOUDFLARED_BLOCK /
+/// COSIGN_VERIFY_BLOCK convention of "empty means this axis is unset here".
+fn build_region_env_block(region: &str) -> String {
+    // Appended (`>>`, no repeated `[Service]` header) to the same drop-in the
+    // channel line above just created with `>` — the file already ends inside
+    // a `[Service]` section, and systemd reads further `Environment=` lines in
+    // that same section without needing the header repeated.
+    format!(
+        "  - sh -c 'printf \"Environment=YUBABA_REGION={region}\\n\" >> /etc/systemd/system/yubaba.service.d/channel.conf'"
+    )
 }
 
 /// Build the cosign install + `cosign verify-blob` block for `runcmd`. Each
@@ -613,6 +685,30 @@ mod tests {
         // Without a mesh_url the MESH_LOGIN_SERVER_ARG substitutes to empty string,
         // so the tailscale up line should not contain a --login-server=https:// arg.
         assert!(!out.contains("--login-server https://"));
+        assert!(find_unsubstituted(&out).is_none());
+    }
+
+    #[test]
+    fn render_without_region_omits_region_env_block() {
+        let machine = sample_machine();
+        let input = minimal_input(&machine);
+        let out = render(DEFAULT_TEMPLATE, &input).unwrap();
+        // The doc-comment header names YUBABA_REGION unconditionally (it
+        // documents the placeholder), so assert on the actual drop-in write
+        // rather than the bare env-var name.
+        assert!(!out.contains("Environment=YUBABA_REGION"));
+        assert!(find_unsubstituted(&out).is_none());
+    }
+
+    #[test]
+    fn render_with_region_appends_env_drop_in() {
+        let mut machine = sample_machine();
+        machine.region = Some("us-west".into());
+        let input = minimal_input(&machine);
+        let out = render(DEFAULT_TEMPLATE, &input).unwrap();
+        assert!(out.contains(
+            "printf \"Environment=YUBABA_REGION=us-west\\n\" >> /etc/systemd/system/yubaba.service.d/channel.conf"
+        ));
         assert!(find_unsubstituted(&out).is_none());
     }
 

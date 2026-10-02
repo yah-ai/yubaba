@@ -890,9 +890,13 @@ impl YubabaStateMachine {
     /// Always `None` under [`IngressOwnership::Unmanaged`][io] — the rig preset
     /// — because no node claims it from the raft-leader path there.
     ///
+    /// R936-B3: a raft node id. Resolve it to something human-readable only at
+    /// a display edge (`GET /cluster/singletons`, `yah mesh status`) — see
+    /// [`YubabaState::ingress_owner_node`](super::YubabaState::ingress_owner_node).
+    ///
     /// [io]: crate::cluster_policy::IngressOwnership::Unmanaged
-    pub fn ingress_owner(&self) -> Option<String> {
-        self.inner.read().unwrap().data.state.ingress_owner.clone()
+    pub fn ingress_owner(&self) -> Option<super::YubabaNodeId> {
+        self.inner.read().unwrap().data.state.ingress_owner_node()
     }
 
     /// R859-F2: the machine name `node_id` runs on, per its replicated member
@@ -1113,15 +1117,12 @@ impl RaftSnapshotBuilder<TC> for YubabaStateMachine {
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<TC, SnapshotData>, io::Error> {
         let inner = self.inner.read().unwrap();
         let bytes = serde_json::to_vec(&inner.data).map_err(io_other)?;
-        let snapshot_id = inner
-            .data
-            .last_applied
-            .map(|id| format!("{}-{}", id.leader_id, id.index))
-            .unwrap_or_else(|| "empty".to_string());
+        // openraft 0.10.0-alpha.35 dropped `snapshot_id` from the struct; it
+        // still serializes an empty slot, so 0.9/alpha.30 peers and persisted
+        // `raft_state` snapshots stay readable in both directions (R734-T6).
         let meta = SnapshotMeta {
             last_log_id: inner.data.last_applied,
             last_membership: inner.data.last_membership.clone(),
-            snapshot_id,
         };
         Ok(Snapshot {
             meta,
@@ -1186,11 +1187,6 @@ impl RaftStateMachine<TC> for YubabaStateMachine {
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.clone()
     }
-
-    async fn begin_receiving_snapshot(&mut self) -> Result<SnapshotData, io::Error> {
-        Ok(Cursor::new(Vec::new()))
-    }
-
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMetaOf<TC>,
@@ -1302,7 +1298,13 @@ mod tests {
             persisted["state"].get("secrets").is_none(),
             "the retired map must not be persisted: {persisted}"
         );
-        assert_eq!(sm.ingress_owner().as_deref(), Some("m1"), "later entries still apply");
+        // No member row claims "m1", so the legacy entry applies as a name that
+        // resolves to no node (R936-B3) — still proof the entry applied.
+        assert_eq!(
+            sm.inner.read().unwrap().data.state.ingress_owner,
+            Some(crate::raft::IngressOwnerRecord::LegacyMachine("m1".into())),
+            "later entries still apply"
+        );
     }
 
     /// R911-T7: a leader that has not yet rolled onto this build ships a
@@ -1328,13 +1330,15 @@ mod tests {
         let meta = SnapshotMetaOf::<TC> {
             last_log_id: Some(log_id::<TC>(1, 1, 7)),
             last_membership: StoredMembership::default(),
-            snapshot_id: "pre-r911-t7".into(),
         };
         sm.install_snapshot(&meta, Cursor::new(serde_json::to_vec(&data).unwrap()))
             .await
             .expect("a pre-T7 snapshot must install");
 
-        assert_eq!(sm.ingress_owner().as_deref(), Some("m1"));
+        assert_eq!(
+            sm.inner.read().unwrap().data.state.ingress_owner,
+            Some(crate::raft::IngressOwnerRecord::LegacyMachine("m1".into()))
+        );
         let persisted: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(tmp.path().join("raft_state.json")).unwrap(),
         )
@@ -1342,6 +1346,32 @@ mod tests {
         assert!(
             persisted["state"].get("secrets").is_none(),
             "the retired map must not be persisted: {persisted}"
+        );
+    }
+
+    /// R734-T6: openraft alpha.35 dropped `SnapshotMeta::snapshot_id` from the
+    /// struct but keeps its serialized slot. An alpha.30 leader mid-roll still
+    /// sends the id this file used to mint (`"<leader_id>-<index>"`, never
+    /// empty) on `POST /raft/snapshot`; it must parse with every other field
+    /// intact, and what we send back must still carry the slot alpha.30
+    /// requires.
+    #[test]
+    fn an_alpha_30_snapshot_meta_with_a_real_snapshot_id_still_parses() {
+        let meta = SnapshotMetaOf::<TC> {
+            last_log_id: Some(log_id::<TC>(3, 1, 42)),
+            last_membership: StoredMembership::default(),
+        };
+        let mut from_alpha_30 = serde_json::to_value(&meta).unwrap();
+        from_alpha_30["snapshot_id"] = serde_json::json!("T3-N1-42");
+
+        let parsed: SnapshotMetaOf<TC> = serde_json::from_value(from_alpha_30).unwrap();
+        assert_eq!(parsed, meta);
+
+        let sent = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(
+            sent.get("snapshot_id"),
+            Some(&serde_json::json!("")),
+            "alpha.30 peers require the field; it must stay on the wire: {sent}"
         );
     }
 

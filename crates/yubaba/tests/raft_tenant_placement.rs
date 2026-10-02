@@ -174,6 +174,8 @@ fn start_schedulers(cluster: &Cluster, policy: ClusterPolicy) -> Schedulers {
                 // withdraw from, which is exactly the `None` production
                 // default.
                 ingress: None,
+                // R936-B7: no door DNS on a rig fixture either.
+                door_dns: None,
             },
             SchedulerConfig::new(
                 policy.timing,
