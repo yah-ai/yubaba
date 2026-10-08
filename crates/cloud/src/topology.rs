@@ -136,12 +136,11 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use workload_spec::sovereign::SovereignRole;
 use workload_spec::{
     Durability, DurabilityTier, LifecycleArchetype, RestartPolicy, VolumeSource, WorkloadSpec,
 };
 
-use crate::config::{CloudConfig, NodeAllocatable};
+use crate::config::{CloudConfig, MachineConfig, NodeAllocatable};
 use crate::migrate::{named_volume_path, VolumeDisposition};
 use crate::recovery_journal::{self, WorkloadRecovery};
 
@@ -193,13 +192,55 @@ pub struct Topology {
     pub oversubscribed: Vec<Oversubscription>,
 }
 
+/// Where a machine sits in its sovereign group's raft, read off the three
+/// declarations that decide it — group stamp, participation, and the group's
+/// voter list (R605-F35). The same reading a raft leader applies, so the
+/// picture can never seat a node the cluster would leave a learner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RaftSeat {
+    /// No `sovereign_group`: in no raft at all.
+    NoGroup,
+    /// A participant its group's `.yah/infra/sovereign-groups/<group>.toml`
+    /// lists: holds a quorum seat.
+    Voter,
+    /// A participant the group does not list: replicates, never votes.
+    Learner,
+    /// `sovereign_participation = "out"`: in the blast radius, outside the
+    /// raft.
+    Out,
+}
+
+impl RaftSeat {
+    /// Read a machine's seat off the camp's declarations.
+    pub fn of(cfg: &CloudConfig, m: &MachineConfig) -> Self {
+        match (&m.sovereign_group, cfg.voting_group(m)) {
+            (None, _) => Self::NoGroup,
+            (Some(_), Some(_)) => Self::Voter,
+            (Some(_), None) if !m.sovereign_participation.is_in() => Self::Out,
+            (Some(_), None) => Self::Learner,
+        }
+    }
+
+    /// The label a render shows.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NoGroup => "no group",
+            Self::Voter => "voter",
+            Self::Learner => "learner",
+            Self::Out => "out of raft",
+        }
+    }
+}
+
 /// A declared machine, plus what the admission seam projects onto it.
 #[derive(Debug, Clone, Serialize)]
 pub struct MachineNode {
     pub name: String,
     pub region: Option<String>,
     pub sovereign_group: Option<String>,
-    pub sovereign_role: SovereignRole,
+    /// Where it sits in its group's raft, by declaration (R605-F35).
+    pub raft_seat: RaftSeat,
     pub taints: Vec<String>,
     pub allocatable: Option<NodeAllocatable>,
     /// Workloads whose projected placement lands here, in declaration order.
@@ -622,8 +663,9 @@ impl RecoveryEstimate {
 pub enum QuorumEffect {
     /// The machine declares no `sovereign_group`, so it votes in nothing.
     NotInAGroup,
-    /// `sovereign_role = "non-voter"` — in the group's blast radius, holds no
-    /// seat. Its absence from `/raft/status` is correct, not drift.
+    /// In the group but holding no quorum seat — a participant its voter list
+    /// does not name (a learner), or `sovereign_participation = "out"`
+    /// (R605-F35). Its absence from the voter set is correct, not drift.
     NonVoter { group: String },
     /// A voter is lost and the survivors still make a majority.
     QuorumHolds {
@@ -649,7 +691,7 @@ impl QuorumEffect {
         match self {
             Self::NotInAGroup => "no sovereign group — votes in nothing".to_string(),
             Self::NonVoter { group } => {
-                format!("non-voter in '{group}' — no quorum seat to lose")
+                format!("no quorum seat in '{group}' (a learner, or out of its raft) — none to lose")
             }
             Self::QuorumHolds {
                 group,
@@ -712,7 +754,7 @@ pub fn analyze(cfg: &CloudConfig) -> Topology {
             name: m.name.clone(),
             region: m.region.clone(),
             sovereign_group: m.sovereign_group.clone(),
-            sovereign_role: m.sovereign_role.unwrap_or_default(),
+            raft_seat: RaftSeat::of(cfg, m),
             taints: m.taints.clone(),
             allocatable: m.allocatable.clone(),
             placed: Vec::new(),
@@ -1087,15 +1129,13 @@ fn quorum_effect(cfg: &CloudConfig, machines: &[MachineNode], dead: &str) -> Quo
     let Some(group) = m.sovereign_group.clone() else {
         return QuorumEffect::NotInAGroup;
     };
-    if !m.sovereign_role.is_voter() {
+    if m.raft_seat != RaftSeat::Voter {
         return QuorumEffect::NonVoter { group };
     }
 
-    let voters_before = cfg
-        .machines_in_group(&group)
-        .into_iter()
-        .filter(|m| m.sovereign_role.unwrap_or_default().is_voter())
-        .count();
+    // R605-F35: the denominator is the group's listed voters, not its
+    // members — co-located learners raise neither side of the arithmetic.
+    let voters_before = cfg.seated_voters(&group);
     let voters_after = voters_before.saturating_sub(1);
     // Raft majority is over the *configured* membership, which the loss of a
     // box does not shrink — a dead voter still counts in the denominator until
@@ -1154,14 +1194,10 @@ impl Topology {
                 sanitize(label)
             ));
             for m in members {
-                // `sovereign_role` defaults to Voter, so a box that declares no
-                // group would otherwise render as "voter" — a seat in a quorum
-                // it is not in. Match what `QuorumEffect::NotInAGroup` says.
-                let role = match (group, m.sovereign_role.is_voter()) {
-                    (None, _) => "no group",
-                    (Some(_), true) => "voter",
-                    (Some(_), false) => "non-voter",
-                };
+                // R605-F35: the seat as the group's voter list decides it, so
+                // a box in no group renders "no group" and a co-located VM
+                // renders "learner", never "voter".
+                let role = m.raft_seat.label();
                 let cap = match &m.allocatable {
                     Some(a) => format!(
                         "<br/>{}/{} MiB · {}/{} mCPU",
@@ -1412,6 +1448,24 @@ mod tests {
                      identity_file = \"~/.ssh/yah\"\n\
                      yubaba = \"http://{name}:7443\"\n"
                 ),
+            )
+            .unwrap();
+            self
+        }
+
+        /// `.yah/infra/sovereign-groups/<name>.toml` seating `voters`
+        /// (R605-F35) — the declaration a quorum calculation counts.
+        fn sovereign_group(self, name: &str, voters: &[&str]) -> Self {
+            let dir = self.root().join(".yah/infra/sovereign-groups");
+            std::fs::create_dir_all(&dir).unwrap();
+            let seats: String = voters
+                .iter()
+                .enumerate()
+                .map(|(i, m)| format!("[[voters]]\nmachine = \"{m}\"\nraft_node_id = {}\n", i + 1))
+                .collect();
+            std::fs::write(
+                dir.join(format!("{name}.toml")),
+                format!("name = \"{name}\"\n{seats}"),
             )
             .unwrap();
             self
@@ -2108,16 +2162,17 @@ mod tests {
         let topo = Camp::new()
             .machine(
                 "a",
-                "sovereign_group = \"prod\"\nsovereign_role = \"voter\"",
+                "sovereign_group = \"prod\"",
             )
             .machine(
                 "b",
-                "sovereign_group = \"prod\"\nsovereign_role = \"voter\"",
+                "sovereign_group = \"prod\"",
             )
             .machine(
                 "c",
-                "sovereign_group = \"prod\"\nsovereign_role = \"voter\"",
+                "sovereign_group = \"prod\"",
             )
+            .sovereign_group("prod", &["a", "b", "c"])
             .analyze();
 
         let q = &topo.node_losses[0].quorum;
@@ -2140,12 +2195,13 @@ mod tests {
         let topo = Camp::new()
             .machine(
                 "a",
-                "sovereign_group = \"prod\"\nsovereign_role = \"voter\"",
+                "sovereign_group = \"prod\"",
             )
             .machine(
                 "b",
-                "sovereign_group = \"prod\"\nsovereign_role = \"voter\"",
+                "sovereign_group = \"prod\"",
             )
+            .sovereign_group("prod", &["a", "b"])
             .analyze();
 
         let q = &topo.node_losses[0].quorum;
@@ -2155,19 +2211,20 @@ mod tests {
         assert!(headline.contains("secrets"), "{headline}");
     }
 
-    /// A non-voter's absence from `/raft/status` is correct, not drift
+    /// An `out` member's absence from `/raft/status` is correct, not drift
     /// (`workload_spec::sovereign`), so losing one costs no seat.
     #[test]
-    fn a_non_voter_has_no_seat_to_lose() {
+    fn an_out_member_has_no_seat_to_lose() {
         let topo = Camp::new()
             .machine(
                 "a",
-                "sovereign_group = \"prod\"\nsovereign_role = \"voter\"",
+                "sovereign_group = \"prod\"",
             )
             .machine(
                 "w",
-                "sovereign_group = \"prod\"\nsovereign_role = \"non-voter\"",
+                "sovereign_group = \"prod\"\nsovereign_participation = \"out\"",
             )
+            .sovereign_group("prod", &["a"])
             .analyze();
 
         let q = &topo
@@ -2178,6 +2235,65 @@ mod tests {
             .quorum;
         assert_eq!(
             *q,
+            QuorumEffect::NonVoter {
+                group: "prod".to_string()
+            }
+        );
+        let w = topo.machines.iter().find(|m| m.name == "w").unwrap();
+        assert_eq!(w.raft_seat, RaftSeat::Out);
+    }
+
+    /// R605-F35: a participant the group does not list is a learner. Losing
+    /// it costs no seat, and it is not counted in the denominator — so a dev
+    /// group of 3 listed Pis plus co-located VM learners still loses quorum
+    /// only on its second Pi, not sooner.
+    #[test]
+    fn an_unlisted_participant_is_a_learner_and_not_in_the_denominator() {
+        let topo = Camp::new()
+            .machine("pi1", "sovereign_group = \"dev\"")
+            .machine("pi2", "sovereign_group = \"dev\"")
+            .machine("pi3", "sovereign_group = \"dev\"")
+            .machine("vm1", "sovereign_group = \"dev\"\nhost_machine = \"pi1\"")
+            .machine("vm2", "sovereign_group = \"dev\"\nhost_machine = \"pi2\"")
+            .sovereign_group("dev", &["pi1", "pi2", "pi3"])
+            .analyze();
+
+        let quorum_of = |name: &str| {
+            topo.node_losses
+                .iter()
+                .find(|l| l.machine == name)
+                .unwrap()
+                .quorum
+                .clone()
+        };
+        assert_eq!(
+            quorum_of("vm1"),
+            QuorumEffect::NonVoter {
+                group: "dev".to_string()
+            }
+        );
+        assert_eq!(
+            quorum_of("pi1"),
+            QuorumEffect::QuorumHolds {
+                group: "dev".to_string(),
+                voters_before: 3,
+                voters_after: 2,
+                majority_needed: 2,
+            }
+        );
+        let mermaid = topo.to_mermaid();
+        assert!(mermaid.contains("<i>learner</i>"), "{mermaid}");
+    }
+
+    /// A group stamp with no `.yah/infra/sovereign-groups/` file seats nobody:
+    /// the camp never reads a voter the cluster would not promote.
+    #[test]
+    fn a_group_with_no_declaration_seats_nobody() {
+        let topo = Camp::new()
+            .machine("a", "sovereign_group = \"prod\"")
+            .analyze();
+        assert_eq!(
+            topo.node_losses[0].quorum,
             QuorumEffect::NonVoter {
                 group: "prod".to_string()
             }
@@ -2272,10 +2388,10 @@ mod tests {
             .contains("public endpoints lost: app.example.com"));
     }
 
-    /// `sovereign_role` defaults to `Voter`, so a box that declares no group
-    /// renders as one unless the label is suppressed — a quorum seat in a
-    /// quorum that does not exist. Caught against the live camp, where
-    /// us-west-002 and us-west-015 declare no group.
+    /// A box that declares no group must not render as a voter — a quorum
+    /// seat in a quorum that does not exist. Caught against the live camp
+    /// (under R605-F12's defaulted role), where us-west-002 and us-west-015
+    /// declare no group.
     #[test]
     fn an_ungrouped_machine_is_not_labelled_a_voter() {
         let mermaid = Camp::new()

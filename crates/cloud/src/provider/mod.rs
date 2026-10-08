@@ -1,6 +1,5 @@
 //! @yah:relay(R409, "Envoy — providers and internal verb catalog (W144)")
 //! @yah:at(2026-06-02T20:58:35Z)
-//! @yah:status(open)
 //! @arch:see(.yah/docs/working/W144-envoy-providers-and-tiering.md)
 //!
 //!

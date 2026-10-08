@@ -121,6 +121,8 @@ fn isolated_spec(name: &str, ports: Vec<u16>) -> WorkloadSpec {
         },
         labels: Default::default(),
         durability: None,
+        db: Vec::new(),
+        capabilities: Vec::new(),
         annotations: Default::default(),
         files: Vec::new(),
     }

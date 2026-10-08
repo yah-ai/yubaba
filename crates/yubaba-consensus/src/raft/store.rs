@@ -1581,7 +1581,12 @@ mod tests {
         // &self.snapshot.flushed()(None)`, validit via io_state.rs:181. So only
         // driving init distinguishes the two states, which is why this test
         // pays for a real raft node.
-        let raft = crate::raft::open(1, dir, &crate::cluster_policy::ClusterPolicy::default())
+        let raft = crate::raft::open(
+            1,
+            dir,
+            &crate::cluster_policy::ClusterPolicy::default(),
+            yubaba_auth_token::PeerSigner::unsigned(),
+        )
             .await
             .unwrap();
         crate::raft::bootstrap_single_node(&raft, 1, "127.0.0.1:1")

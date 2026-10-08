@@ -26,7 +26,6 @@
 //!
 //! @yah:relay(R222, "Service/infra manifest reshape — phases B2–B4")
 //! @yah:at(2026-05-18T02:19:27Z)
-//! @yah:status(handoff)
 //! @yah:assignee(agent:claude)
 //! @arch:see(.yah/docs/architecture/A031-yah-cloud-config-shape.md)
 //! @yah:verify("cargo check -p cloud && cargo test -p cloud")
@@ -134,6 +133,12 @@ pub fn machines_dir(workspace_root: &Path) -> PathBuf {
 
 pub fn providers_dir(workspace_root: &Path) -> PathBuf {
     infra_dir(workspace_root).join("providers")
+}
+
+/// `.yah/infra/sovereign-groups/` — one `<group>.toml` per sovereign group,
+/// declaring which of its participants hold quorum seats (R605-F35).
+pub fn sovereign_groups_dir(workspace_root: &Path) -> PathBuf {
+    infra_dir(workspace_root).join("sovereign-groups")
 }
 
 pub fn cloud_init_dir(workspace_root: &Path) -> PathBuf {

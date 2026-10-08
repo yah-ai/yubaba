@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use yubaba::cluster_policy::ClusterPolicy;
 use yubaba::runtime::DummyRuntime;
-use yubaba::SovereignRole;
+use yubaba::Participation;
 
 /// A solo yubaba node bound on a loopback port. Dropping it aborts the server
 /// task and removes the state directory.
@@ -133,25 +133,49 @@ pub async fn solo_node_in_sovereign_group(
     .await
 }
 
-/// [`solo_node_in_sovereign_group`], with this node's quorum eligibility said
-/// out loud — the harness equivalent of `yubaba serve --sovereign-group <label>
-/// --sovereign-role non-voter` (R605-F12).
+/// [`solo_node_in_sovereign_group`], with whether this node takes part in its
+/// group's raft said out loud — the harness equivalent of `yubaba serve
+/// --sovereign-group <label> --sovereign-participation out` (R605-F35).
 ///
 /// Separate from the constructor above rather than a fourth parameter on it
-/// because [`SovereignRole::Voter`] is what every existing gate test means and
-/// what a bare `--sovereign-group` gives a real node; only a test of the
-/// non-voting refusal needs to say otherwise.
-pub async fn solo_node_with_sovereign_role(
+/// because [`Participation::In`] is what every existing gate test means and
+/// what a bare `--sovereign-group` gives a real node; only a test of the `out`
+/// refusal needs to say otherwise.
+pub async fn solo_node_with_sovereign_participation(
     node_id: u64,
     policy: ClusterPolicy,
     sovereign_group: Option<&str>,
-    sovereign_role: SovereignRole,
+    sovereign_participation: Participation,
 ) -> Result<SoloNode> {
     build(Spec {
         node_id,
         policy,
         sovereign_group,
-        sovereign_role,
+        sovereign_participation,
+        ..Spec::default()
+    })
+    .await
+}
+
+/// [`solo_node_in_sovereign_group`], with this daemon holding its group's
+/// voter list — the harness equivalent of `yubaba serve --sovereign-group
+/// <label> --sovereign-voters <ids>` (R605-F35).
+///
+/// The list only matters on the node that *leads*: it is what decides whether
+/// a learner joining through this node is promoted. A test of "the leader's
+/// view wins" gives the joiner a different list on purpose, so this is a
+/// constructor of its own rather than a default every group member shares.
+pub async fn solo_node_listing_voters(
+    node_id: u64,
+    policy: ClusterPolicy,
+    sovereign_group: &str,
+    sovereign_voters: &[u64],
+) -> Result<SoloNode> {
+    build(Spec {
+        node_id,
+        policy,
+        sovereign_group: Some(sovereign_group),
+        sovereign_voters,
         ..Spec::default()
     })
     .await
@@ -225,9 +249,12 @@ struct Spec<'a> {
     /// R736-T3. Only meaningful with a `sovereign_group` — that pair is what a
     /// cell is — which is why no public constructor sets it alone.
     jurisdiction: Option<&'a str>,
-    /// R605-F12. Not an `Option`: a real node's flag defaults to `voter`, so
+    /// R605-F35. Not an `Option`: a real node's flag defaults to `in`, so
     /// there is no unset state for the harness to reproduce.
-    sovereign_role: SovereignRole,
+    sovereign_participation: Participation,
+    /// R605-F35: `--sovereign-voters`. Empty is what a real daemon started
+    /// without the flag holds, which promotes nobody once a group is declared.
+    sovereign_voters: &'a [u64],
     /// Run the R734-F5 member-registration loop, as the daemon does.
     register: bool,
 }
@@ -240,7 +267,8 @@ impl Default for Spec<'_> {
             region: None,
             sovereign_group: None,
             jurisdiction: None,
-            sovereign_role: SovereignRole::Voter,
+            sovereign_participation: Participation::In,
+            sovereign_voters: &[],
             register: true,
         }
     }
@@ -253,7 +281,8 @@ async fn build(
         region,
         sovereign_group,
         jurisdiction,
-        sovereign_role,
+        sovereign_participation,
+        sovereign_voters,
         register,
     }: Spec<'_>,
 ) -> Result<SoloNode> {
@@ -272,7 +301,7 @@ async fn build(
     let addr = format!("127.0.0.1:{}", addr.port());
     let base_url = format!("http://{addr}");
 
-    let (raft, state_machine) = yubaba::raft::open_with_state_machine(node_id, raft_dir, &policy)
+    let (raft, state_machine) = yubaba::raft::open_with_state_machine(node_id, raft_dir, &policy, yubaba_auth_token::PeerSigner::unsigned())
         .await
         .with_context(|| format!("open raft for solo node {node_id}"))?;
 
@@ -294,7 +323,9 @@ async fn build(
     if let Some(jurisdiction) = &jurisdiction {
         state = state.with_jurisdiction(jurisdiction.clone());
     }
-    state = state.with_sovereign_role(sovereign_role);
+    state = state
+        .with_sovereign_participation(sovereign_participation)
+        .with_sovereign_voters(sovereign_voters.iter().copied());
     let registration = if register {
         yubaba::member_registration::spawn(
             node_id,
@@ -315,6 +346,7 @@ async fn build(
                 // withdrawal that could never happen on a real box.
                 ..Default::default()
             },
+            state.http.signer().clone(),
         )
     } else {
         tokio::spawn(async {})

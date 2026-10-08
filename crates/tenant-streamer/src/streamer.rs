@@ -323,6 +323,7 @@ mod tests {
         StreamerConfig {
             node_id: 7,
             yubaba_url: "http://127.0.0.1:1".into(),
+            cluster_key_file: None,
             data_root: PathBuf::from("/tmp"),
             sink: SinkConfig {
                 bucket: "b".into(),

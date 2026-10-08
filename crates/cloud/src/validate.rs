@@ -15,9 +15,10 @@
 //!   (W305/R742-T4).
 //! - **retired arch tag** ([`check_retired_arch_tags`]) — a machine still
 //!   carrying the `tier:<arch>` build-worker mesh tag R763 renamed.
-//! - **unroled sovereign member**
-//!   ([`check_unroled_sovereign_members`]) — a machine naming a
-//!   `sovereign_group` without saying whether it votes in it (R605-F12).
+//! - **sovereign group** ([`check_sovereign_groups`]) — a group's voter list
+//!   (`.yah/infra/sovereign-groups/<group>.toml`) naming a non-participant,
+//!   seating two voters on one physical host, or missing for a group machines
+//!   stamp (R605-F35; replaced R605-F12's per-machine role lint).
 //! - **LAN dial target** ([`check_lan_dial_targets`]) — a machine whose
 //!   `[connect].yubaba` is an RFC1918 literal, i.e. a break-glass address
 //!   sitting in the field every automated path dials (R605-T10).
@@ -60,9 +61,9 @@ use anyhow::Context as _;
 
 use crate::config::{
     live_taint_keys, private_ipv4_from_url, MachineConfig, MirrorConfig, MirrorProviderSlot,
-    Provider, ServiceConfig,
+    Provider, ServiceConfig, SovereignGroupConfig,
 };
-use crate::paths::{machines_dir, services_dir};
+use crate::paths::{machines_dir, services_dir, sovereign_groups_dir};
 
 /// Where an alias is declared — points the operator at the source row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -515,68 +516,310 @@ pub fn check_retired_arch_tags(workspace_root: &Path) -> anyhow::Result<Vec<Reti
     Ok(found)
 }
 
-// ── R605-F12: a group stamp with no role beside it ─────────────────────────
+// ── R605-F35: a sovereign group's voter list ───────────────────────────────
 
-/// A machine declaring `sovereign_group` without an explicit `sovereign_role`.
+/// What is wrong with one sovereign group's declared quorum composition.
+///
+/// Every variant is a way for `.yah/infra/sovereign-groups/<group>.toml` to
+/// grant, or appear to grant, a seat the cluster would not — or to put two
+/// seats where one box's loss takes both.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnroledSovereignMember {
-    pub machine: String,
-    pub machine_toml: PathBuf,
-    /// The group it declares — named in the message because the answer to
-    /// "voter or not" depends on which blast radius is being joined.
-    pub group: String,
+pub enum SovereignGroupProblem {
+    /// Machines stamp `group`, but no group file declares it — so its raft
+    /// has no voter list and its leader promotes nobody.
+    Undeclared { group: String, members: Vec<String> },
+    /// The group file does not parse as a [`SovereignGroupConfig`].
+    Unparseable { error: String },
+    /// The file's `name` is not its file stem.
+    NameMismatch { group: String, stem: String },
+    /// A listed voter names no declared machine.
+    UnknownVoter { group: String, machine: String },
+    /// A listed voter is a machine stamped with another group, or none.
+    VoterNotInGroup {
+        group: String,
+        machine: String,
+        declares: Option<String>,
+    },
+    /// A listed voter declares `sovereign_participation = "out"`.
+    VoterOutOfRaft { group: String, machine: String },
+    /// One machine, or one raft id, is listed for two seats.
+    DuplicateSeat { group: String, seat: String },
+    /// Two or more listed voters run on one physical host.
+    VotersShareAHost {
+        group: String,
+        host: String,
+        voters: Vec<String>,
+    },
+    /// A machine's `host_machine` names no declared machine, which would make
+    /// the shared-host rule vacuous for it.
+    UnknownHost { machine: String, host: String },
 }
 
-impl UnroledSovereignMember {
+/// One [`SovereignGroupProblem`], with the file the fix goes in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SovereignGroupFinding {
+    /// The group file — or, for [`SovereignGroupProblem::Undeclared`] and
+    /// [`SovereignGroupProblem::UnknownHost`], the machine file that carries
+    /// the stamp.
+    pub file: PathBuf,
+    pub problem: SovereignGroupProblem,
+}
+
+impl SovereignGroupFinding {
     pub fn message(&self) -> String {
-        format!(
-            "machine {:?} declares `sovereign_group = {:?}` but no `sovereign_role`\n\
-             \u{2192} membership and quorum eligibility are separate axes (R605-F12): a node can \
-             be inside a group's blast radius — its secrets, its upgrade cadence, its \
-             destruction — and still never hold a seat in its quorum.\n\
-             \u{2192} an absent role reads as `\"voter\"`, so this box is quorum-eligible today. \
-             That is the pre-R605-F12 meaning and is often right; the complaint is that nothing \
-             records whether anyone decided it.\n\
-             \u{2192} add `sovereign_role = \"voter\"` or `sovereign_role = \"non-voter\"` as a \
-             TOP-LEVEL key (below a `[table]` header TOML makes it a field of that table, and \
-             every consumer reads it as absent).\n  {}",
-            self.machine,
-            self.group,
-            self.machine_toml.display(),
-        )
+        use SovereignGroupProblem as P;
+        let why = "\u{2192} quorum composition is the group's declaration (R605-F35): every \
+                   participant joins its group's raft as a learner, and the leader promotes \
+                   only the voters this file lists.";
+        let body = match &self.problem {
+            P::Undeclared { group, members } => format!(
+                "sovereign group {group:?} is stamped on {members:?} but has no \
+                 .yah/infra/sovereign-groups/{group}.toml\n{why}\n\
+                 \u{2192} with no file the group has no voter list: its leader promotes nobody and \
+                 nothing can check where its voters sit. Declare its voters (`[[voters]]` with \
+                 `machine` and `raft_node_id`)."
+            ),
+            P::Unparseable { error } => format!(
+                "sovereign group file does not parse: {error}\n{why}\n\
+                 \u{2192} an unreadable declaration grants no seats, so every member of this group \
+                 reads as a learner."
+            ),
+            P::NameMismatch { group, stem } => format!(
+                "sovereign group file {stem}.toml declares `name = {group:?}` — the file stem and \
+                 the name must agree, or a lookup by either finds a different group"
+            ),
+            P::UnknownVoter { group, machine } => format!(
+                "sovereign group {group:?} lists voter {machine:?}, which no \
+                 .yah/infra/machines/*.toml declares\n{why}\n\
+                 \u{2192} a seat for a machine that does not exist is a seat nobody can take — fix \
+                 the name or remove the entry."
+            ),
+            P::VoterNotInGroup {
+                group,
+                machine,
+                declares,
+            } => format!(
+                "sovereign group {group:?} lists voter {machine:?}, which is not a member of it \
+                 (its machine file declares sovereign_group = {declares:?})\n{why}\n\
+                 \u{2192} a voter list may only name participants of its own group; stamp \
+                 `sovereign_group = {group:?}` on the machine or drop it from the list."
+            ),
+            P::VoterOutOfRaft { group, machine } => format!(
+                "sovereign group {group:?} lists voter {machine:?}, which declares \
+                 `sovereign_participation = \"out\"`\n{why}\n\
+                 \u{2192} an `out` machine is never joined to the raft, so this seat can never be \
+                 taken — the group would run one voter short of what it declares. Either it \
+                 participates (`\"in\"`) or it is not a voter."
+            ),
+            P::DuplicateSeat { group, seat } => format!(
+                "sovereign group {group:?} lists {seat} more than once — one machine, one raft id, \
+                 one seat"
+            ),
+            P::VotersShareAHost {
+                group,
+                host,
+                voters,
+            } => format!(
+                "sovereign group {group:?} lists {} voters on one physical host {host:?}: {voters:?}\n\
+                 {why}\n\
+                 \u{2192} losing that one box takes all of their seats at once, so the group's quorum \
+                 survives fewer failures than its voter count claims. Seat at most one voter per \
+                 host; co-located members stay learners.",
+                voters.len()
+            ),
+            P::UnknownHost { machine, host } => format!(
+                "machine {machine:?} declares `host_machine = {host:?}`, which no \
+                 .yah/infra/machines/*.toml declares\n\
+                 \u{2192} the one-voter-per-host rule groups voters by their host, so an unknown \
+                 host makes the check silently pass for this machine. Name the metal machine it \
+                 runs on."
+            ),
+        };
+        format!("{body}\n  {}", self.file.display())
     }
 }
 
-/// Flag every machine that names a sovereign group without saying whether it
-/// votes in it (R605-F12).
+/// Every `.yah/infra/sovereign-groups/*.toml` in this camp, sorted by file
+/// name, each parsed or carrying its parse error — R605-F35.
 ///
-/// Same lint family and the same camp-local-only scoping as
-/// [`check_inert_taints`], for a failure one step quieter than either of the
-/// others: an inert taint changes no decision and a stale arch tag changes it
-/// to "no candidate node", but an unwritten role changes nothing *visible* and
-/// silently grants a quorum seat. That is exactly the shape this ticket was
-/// opened about — a guarantee resting on which fields happen to be absent — so
-/// closing it by making the *other* absence load-bearing would have been the
-/// same bug with the sign flipped.
-///
-/// Why a lint rather than a required field: [`MachineConfig`] is deserialized
-/// from foreign trees too (`.yah/infra/sources.toml` overlays another camp's
-/// machines, which may predate this field entirely), and a hard parse error
-/// there is unfixable from here. The judgement is made where the operator asks
-/// for it, against machines this camp can actually edit.
-pub fn check_unroled_sovereign_members(
+/// A parse failure is returned, not skipped. That is the opposite of
+/// [`load_camp_local_machine_tomls`], deliberately: an unreadable machine file
+/// is a bigger problem than any one lint and surfaces on the load path, but an
+/// unreadable group file silently grants no seats, which is precisely the
+/// class of quiet wrong answer [`check_sovereign_groups`] exists to say out
+/// loud.
+fn load_camp_local_sovereign_group_tomls(
     workspace_root: &Path,
-) -> anyhow::Result<Vec<UnroledSovereignMember>> {
+) -> anyhow::Result<Vec<(PathBuf, Result<SovereignGroupConfig, String>)>> {
+    let dir = sovereign_groups_dir(workspace_root);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |x| x == "toml"))
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let path = entry.path();
+        let parsed = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|src| toml::from_str::<SovereignGroupConfig>(&src).map_err(|e| e.to_string()));
+        out.push((path, parsed));
+    }
+    Ok(out)
+}
+
+/// Judge every sovereign group's voter list against the machines that claim
+/// to be in it — R605-F35.
+///
+/// The rules, each one a seat granted on paper that the fleet cannot honour:
+///
+/// - a group stamped on any machine must have a group file;
+/// - a listed voter must be a declared machine, stamped with this group, and
+///   `sovereign_participation = "in"` — a voter list naming a non-participant
+///   is an error;
+/// - no machine and no raft id may hold two seats;
+/// - **no two listed voters may share a physical host**
+///   ([`MachineConfig::physical_host`]: `host_machine` for a VM, the machine
+///   itself for metal), because one box's loss would take both seats;
+/// - and a `host_machine` must name a declared machine, or the rule above is
+///   vacuous for it.
+///
+/// Same camp-local scoping as [`check_inert_taints`]: a borrowed fleet's
+/// groups are declared, and fixable, in its own tree.
+pub fn check_sovereign_groups(
+    workspace_root: &Path,
+) -> anyhow::Result<Vec<SovereignGroupFinding>> {
+    use SovereignGroupProblem as P;
+
+    let machines = load_camp_local_machine_tomls(workspace_root)?;
+    let by_name: BTreeMap<&str, (&PathBuf, &MachineConfig)> = machines
+        .iter()
+        .map(|(path, m)| (m.name.as_str(), (path, m)))
+        .collect();
     let mut found = Vec::new();
-    for (path, machine) in load_camp_local_machine_tomls(workspace_root)? {
-        if let (Some(group), None) = (&machine.sovereign_group, &machine.sovereign_role) {
-            found.push(UnroledSovereignMember {
-                machine: machine.name.clone(),
-                machine_toml: path.clone(),
-                group: group.clone(),
-            });
+
+    for (path, m) in &machines {
+        if let Some(host) = &m.host_machine {
+            if !by_name.contains_key(host.as_str()) {
+                found.push(SovereignGroupFinding {
+                    file: path.clone(),
+                    problem: P::UnknownHost {
+                        machine: m.name.clone(),
+                        host: host.clone(),
+                    },
+                });
+            }
         }
     }
+
+    let mut declared: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (path, parsed) in load_camp_local_sovereign_group_tomls(workspace_root)? {
+        let group = match parsed {
+            Ok(g) => g,
+            Err(error) => {
+                found.push(SovereignGroupFinding {
+                    file: path,
+                    problem: P::Unparseable { error },
+                });
+                continue;
+            }
+        };
+        let finding = |problem| SovereignGroupFinding {
+            file: path.clone(),
+            problem,
+        };
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if group.name != stem {
+            found.push(finding(P::NameMismatch {
+                group: group.name.clone(),
+                stem,
+            }));
+        }
+        declared.insert(group.name.clone());
+
+        let mut seen_machines = std::collections::BTreeSet::new();
+        let mut seen_ids = std::collections::BTreeSet::new();
+        let mut by_host: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for voter in &group.voters {
+            if !seen_ids.insert(voter.raft_node_id) {
+                found.push(finding(P::DuplicateSeat {
+                    group: group.name.clone(),
+                    seat: format!("raft_node_id {}", voter.raft_node_id),
+                }));
+            }
+            if !seen_machines.insert(voter.machine.as_str()) {
+                found.push(finding(P::DuplicateSeat {
+                    group: group.name.clone(),
+                    seat: format!("machine {:?}", voter.machine),
+                }));
+                continue;
+            }
+            let Some((_, m)) = by_name.get(voter.machine.as_str()) else {
+                found.push(finding(P::UnknownVoter {
+                    group: group.name.clone(),
+                    machine: voter.machine.clone(),
+                }));
+                continue;
+            };
+            if m.sovereign_group.as_deref() != Some(group.name.as_str()) {
+                found.push(finding(P::VoterNotInGroup {
+                    group: group.name.clone(),
+                    machine: voter.machine.clone(),
+                    declares: m.sovereign_group.clone(),
+                }));
+            } else if !m.sovereign_participation.is_in() {
+                found.push(finding(P::VoterOutOfRaft {
+                    group: group.name.clone(),
+                    machine: voter.machine.clone(),
+                }));
+            }
+            by_host
+                .entry(m.physical_host())
+                .or_default()
+                .push(voter.machine.clone());
+        }
+        for (host, voters) in by_host {
+            if voters.len() > 1 {
+                found.push(finding(P::VotersShareAHost {
+                    group: group.name.clone(),
+                    host: host.to_string(),
+                    voters,
+                }));
+            }
+        }
+    }
+
+    // Groups stamped on machines with no declaration. Reported once per group,
+    // against its first member's file, naming every member.
+    let mut undeclared: BTreeMap<&str, (&PathBuf, Vec<String>)> = BTreeMap::new();
+    for (path, m) in &machines {
+        if let Some(g) = m.sovereign_group.as_deref() {
+            if !declared.contains(g) {
+                undeclared
+                    .entry(g)
+                    .or_insert_with(|| (path, Vec::new()))
+                    .1
+                    .push(m.name.clone());
+            }
+        }
+    }
+    for (group, (path, members)) in undeclared {
+        found.push(SovereignGroupFinding {
+            file: path.clone(),
+            problem: P::Undeclared {
+                group: group.to_string(),
+                members,
+            },
+        });
+    }
+
     Ok(found)
 }
 
@@ -1413,7 +1656,7 @@ mod tests {
         assert!(check_retired_arch_tags(dir.path()).unwrap().is_empty());
     }
 
-    // ── R605-F12: sovereign members with no stated role ────────────────────
+    // ── R605-F35: sovereign group members ─────────────────────────────────
 
     /// `stamp` is the sovereign declaration under test; everything else is the
     /// minimum a `MachineConfig` deserializes from. `assert_machine_toml_parses`
@@ -1575,68 +1818,241 @@ mod tests {
         assert!(check_ingress_floating_ip(dir.path()).unwrap().is_empty());
     }
 
+    // ── R605-F35: sovereign group voter lists ──────────────────────────────
+
+    fn write_group(workspace: &Path, file_stem: &str, body: &str) {
+        let dir = workspace.join(".yah/infra/sovereign-groups");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{file_stem}.toml")), body).unwrap();
+    }
+
+    fn seats(voters: &[(&str, u64)]) -> String {
+        voters
+            .iter()
+            .map(|(m, id)| format!("[[voters]]\nmachine = \"{m}\"\nraft_node_id = {id}\n"))
+            .collect()
+    }
+
+    /// The dev rig as F16 will build it: three listed metal Pis plus VM
+    /// learners co-located on them. Clean — co-location is only a problem for
+    /// *voters*.
     #[test]
-    fn a_group_with_no_role_is_reported_with_the_declaring_file() {
+    fn three_voters_on_three_hosts_plus_colocated_learners_is_clean() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        for pi in ["us-west-011", "us-west-013", "us-west-014"] {
+            write_sovereign_machine(root, pi, "sovereign_group = \"dev\"");
+        }
+        write_sovereign_machine(
+            root,
+            "dev-vm-1",
+            "sovereign_group = \"dev\"\nhost_machine = \"us-west-011\"",
+        );
+        write_sovereign_machine(
+            root,
+            "dev-vm-2",
+            "sovereign_group = \"dev\"\nhost_machine = \"us-west-011\"",
+        );
+        write_group(
+            root,
+            "dev",
+            &format!(
+                "name = \"dev\"\n{}",
+                seats(&[("us-west-011", 11), ("us-west-013", 13), ("us-west-014", 14)])
+            ),
+        );
+        let found = check_sovereign_groups(root).unwrap();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// The rule the host field exists for: a VM voter on the same Pi as a
+    /// metal voter means one box's loss takes two seats.
+    #[test]
+    fn two_listed_voters_on_one_physical_host_is_an_error() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_sovereign_machine(root, "us-west-011", "sovereign_group = \"dev\"");
+        write_sovereign_machine(root, "us-west-013", "sovereign_group = \"dev\"");
+        write_sovereign_machine(
+            root,
+            "dev-vm-1",
+            "sovereign_group = \"dev\"\nhost_machine = \"us-west-011\"",
+        );
+        write_group(
+            root,
+            "dev",
+            &format!(
+                "name = \"dev\"\n{}",
+                seats(&[("us-west-011", 11), ("us-west-013", 13), ("dev-vm-1", 21)])
+            ),
+        );
+        let found = check_sovereign_groups(root).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].problem,
+            SovereignGroupProblem::VotersShareAHost {
+                group: "dev".into(),
+                host: "us-west-011".into(),
+                voters: vec!["us-west-011".into(), "dev-vm-1".into()],
+            }
+        );
+        assert!(found[0].file.ends_with("sovereign-groups/dev.toml"));
+        let msg = found[0].message();
+        assert!(msg.contains("one physical host") && msg.contains("us-west-011"), "{msg}");
+    }
+
+    /// Two VMs on one Pi, both listed, with the Pi itself not a voter — still
+    /// one host, still an error.
+    #[test]
+    fn two_vm_voters_on_one_host_is_an_error_even_when_the_host_is_not_a_voter() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_sovereign_machine(root, "pi", "taints = []");
+        for vm in ["vm-a", "vm-b"] {
+            write_sovereign_machine(root, vm, "sovereign_group = \"dev\"\nhost_machine = \"pi\"");
+        }
+        write_group(
+            root,
+            "dev",
+            &format!("name = \"dev\"\n{}", seats(&[("vm-a", 1), ("vm-b", 2)])),
+        );
+        let found = check_sovereign_groups(root).unwrap();
+        assert!(
+            matches!(&found[..], [f] if matches!(&f.problem,
+                SovereignGroupProblem::VotersShareAHost { host, .. } if host == "pi")),
+            "{found:?}"
+        );
+    }
+
+    /// A voter list naming a non-participant is an error, in all three
+    /// shapes: no such machine, a machine in another group, and an `out` one.
+    #[test]
+    fn a_voter_list_naming_a_non_participant_is_an_error() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         write_sovereign_machine(root, "us-west-001", "sovereign_group = \"prod\"");
-        let found = check_unroled_sovereign_members(root).unwrap();
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].machine, "us-west-001");
-        assert_eq!(found[0].group, "prod");
-        assert!(found[0].machine_toml.ends_with("us-west-001.toml"));
-        let msg = found[0].message();
-        // The message has to say what the silence currently means, or the
-        // operator reads it as pedantry and adds the line without deciding.
-        assert!(msg.contains("voter") && msg.contains("non-voter"), "{msg}");
-        assert!(msg.contains("TOP-LEVEL"), "{msg}");
-    }
-
-    #[test]
-    fn either_stated_role_is_clean() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        write_sovereign_machine(
-            root,
-            "us-west-001",
-            "sovereign_group = \"prod\"\nsovereign_role = \"voter\"",
-        );
         write_sovereign_machine(
             root,
             "us-west-003",
-            "sovereign_group = \"prod\"\nsovereign_role = \"non-voter\"",
+            "sovereign_group = \"prod\"\nsovereign_participation = \"out\"",
         );
-        assert!(check_unroled_sovereign_members(root).unwrap().is_empty());
+        write_sovereign_machine(root, "us-west-011", "sovereign_group = \"dev\"");
+        write_sovereign_machine(root, "us-west-002", "taints = []");
+        write_group(root, "dev", &format!("name = \"dev\"\n{}", seats(&[("us-west-011", 11)])));
+        write_group(
+            root,
+            "prod",
+            &format!(
+                "name = \"prod\"\n{}",
+                seats(&[
+                    ("us-west-001", 1),
+                    ("us-west-003", 3),
+                    ("us-west-011", 11),
+                    ("us-west-002", 2),
+                    ("us-west-999", 9),
+                ])
+            ),
+        );
+        let found: Vec<SovereignGroupProblem> = check_sovereign_groups(root)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.problem)
+            .collect();
+        assert!(found.contains(&SovereignGroupProblem::VoterOutOfRaft {
+            group: "prod".into(),
+            machine: "us-west-003".into(),
+        }));
+        assert!(found.contains(&SovereignGroupProblem::VoterNotInGroup {
+            group: "prod".into(),
+            machine: "us-west-011".into(),
+            declares: Some("dev".into()),
+        }));
+        assert!(found.contains(&SovereignGroupProblem::VoterNotInGroup {
+            group: "prod".into(),
+            machine: "us-west-002".into(),
+            declares: None,
+        }));
+        assert!(found.contains(&SovereignGroupProblem::UnknownVoter {
+            group: "prod".into(),
+            machine: "us-west-999".into(),
+        }));
+        assert_eq!(found.len(), 4, "{found:?}");
     }
 
-    /// A standalone box has no quorum to be eligible for, so demanding a role
-    /// of it would be noise — and noise is what trains an operator to stop
-    /// reading the check that matters.
+    /// A group machines stamp must have a file — otherwise its leader holds
+    /// no list and promotes nobody, which is silent.
     #[test]
-    fn a_machine_in_no_group_is_not_asked_for_a_role() {
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        write_sovereign_machine(root, "us-west-002", "taints = [\"no-appliance\"]");
-        assert!(check_unroled_sovereign_members(root).unwrap().is_empty());
-    }
-
-    #[test]
-    fn unroled_findings_are_ordered_by_file_so_output_is_stable() {
+    fn a_stamped_group_with_no_file_is_reported_once_naming_every_member() {
         let dir = tempdir().unwrap();
         let root = dir.path();
         write_sovereign_machine(root, "b-node", "sovereign_group = \"dev\"");
-        write_sovereign_machine(root, "a-node", "sovereign_group = \"prod\"");
-        let found = check_unroled_sovereign_members(root).unwrap();
-        let names: Vec<&str> = found.iter().map(|f| f.machine.as_str()).collect();
-        assert_eq!(names, vec!["a-node", "b-node"]);
+        write_sovereign_machine(root, "a-node", "sovereign_group = \"dev\"");
+        let found = check_sovereign_groups(root).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].problem,
+            SovereignGroupProblem::Undeclared {
+                group: "dev".into(),
+                members: vec!["a-node".into(), "b-node".into()],
+            }
+        );
+        assert!(found[0].message().contains("sovereign-groups/dev.toml"));
     }
 
     #[test]
-    fn missing_machines_dir_is_not_error_for_unroled_members() {
+    fn duplicate_seats_a_name_mismatch_and_a_bad_file_are_each_reported() {
         let dir = tempdir().unwrap();
-        assert!(check_unroled_sovereign_members(dir.path())
+        let root = dir.path();
+        write_sovereign_machine(root, "a", "sovereign_group = \"dev\"");
+        write_sovereign_machine(root, "b", "sovereign_group = \"dev\"");
+        write_group(
+            root,
+            "dev",
+            &format!("name = \"Dev\"\n{}", seats(&[("a", 1), ("a", 2), ("b", 1)])),
+        );
+        write_group(root, "prod", "name = \"prod\"\n[[voters]]\nmachine = \"x\"\nraft_id = 1\n");
+        let found: Vec<SovereignGroupProblem> = check_sovereign_groups(root)
             .unwrap()
-            .is_empty());
+            .into_iter()
+            .map(|f| f.problem)
+            .collect();
+        assert!(found.contains(&SovereignGroupProblem::NameMismatch {
+            group: "Dev".into(),
+            stem: "dev".into(),
+        }));
+        assert!(found.contains(&SovereignGroupProblem::DuplicateSeat {
+            group: "Dev".into(),
+            seat: "machine \"a\"".into(),
+        }));
+        assert!(found.contains(&SovereignGroupProblem::DuplicateSeat {
+            group: "Dev".into(),
+            seat: "raft_node_id 1".into(),
+        }));
+        assert!(found
+            .iter()
+            .any(|p| matches!(p, SovereignGroupProblem::Unparseable { .. })));
+    }
+
+    /// A typo in `host_machine` would make the shared-host rule pass
+    /// vacuously for that machine, so it is reported against the machine file.
+    #[test]
+    fn an_unknown_host_machine_is_reported() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_sovereign_machine(root, "vm", "host_machine = \"us-west-0111\"");
+        let found = check_sovereign_groups(root).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].file.ends_with("machines/vm.toml"));
+        assert!(matches!(
+            &found[0].problem,
+            SovereignGroupProblem::UnknownHost { host, .. } if host == "us-west-0111"
+        ));
+    }
+
+    #[test]
+    fn missing_dirs_are_not_an_error_for_sovereign_groups() {
+        let dir = tempdir().unwrap();
+        assert!(check_sovereign_groups(dir.path()).unwrap().is_empty());
     }
 
     // ── R605-T10: LAN dial targets ─────────────────────────────────────────

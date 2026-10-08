@@ -473,7 +473,6 @@ account_id = "test-account"
                 address: crate::config::ServiceAddress::front_door("cr.yah.dev".to_string()),
                 description: None,
                 components: vec![],
-                db: crate::DbCatalog::default(),
             };
             let component = ServiceComponent {
                 mount: None,

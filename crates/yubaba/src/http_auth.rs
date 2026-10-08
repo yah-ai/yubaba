@@ -70,59 +70,54 @@
 //! to `Require` is a no-op for everything already talking.
 //!
 //! @yah:ticket(R876-T18, "Finish the R876-B15 roll: sign the remaining yubaba callers, distribute the keys, then flip auth-mode to require and delete Warn")
-//! @yah:at(2026-09-12T08:27:35Z)
-//! @yah:status(open)
+//! @yah:at(2026-10-03T19:27:27Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R876)
 //! @yah:depends_on(R876-B15)
-//! @yah:next("STEP 1 — SIGN THE CALLERS THAT STILL SEND NOTHING. R876-B15 wired exactly one: cloud-client attaches `Authorization: Bearer <token>` as a reqwest DEFAULT HEADER (crates/yah/cloud-client/src/lib.rs, `CloudClient::build`), sourced from `YUBABA_OPERATOR_TOKEN_FILE` then `YUBABA_OPERATOR_TOKEN`, or passed explicitly via the new `CloudClient::with_token`. That covers the `yah` CLI, yah-agent-tools and rollout apply, because all three go through that client. STILL UNSIGNED, each needing a PEER-tier token minted from the cluster key: (a) oss/yubaba/crates/yubaba-consensus/src/raft/network.rs — its `request`/`post` helpers hit /raft/append-entries, /raft/vote, /raft/pre-vote, /raft/snapshot, /raft/transfer-leader-msg, and raft/mod.rs:2549 hand-rolls `format!(\"http://{}/raft/write\", leader.addr)` on ForwardToLeader; (b) oss/passway/crates/passway/src/discovery.rs — the door's poll of yubaba's service-records path; (c) oss/yubaba/crates/tenant-streamer/src/rpo_report.rs — POST /mesh/rpo-report; (d) yubaba's own in-process loops that dial a peer (lease_renewal.rs, member_registration.rs, headroom.rs, state_backup.rs). Each of these is AuthClass::Peer, so one cluster key opens all of them.")
-//! @yah:next("STEP 2 — GET THE KEYS ONTO THE FLEET BEFORE ANY FLIP. `yubaba auth cluster-keygen --out <path>` once, then the SAME hex file on every node in the cluster at /etc/yah-cloud/cluster.key (0600), named by `--cluster-key-file` / `YUBABA_CLUSTER_KEY_FILE` in a systemd drop-in — the same delivery shape R881 used for --container-net. `yubaba auth keygen --secret-out <path>` once per operator; the PUBLIC hex goes on every node as `--operator-key` / `YUBABA_OPERATOR_KEYS` (comma-separated), the secret half into the operator's keys vault. Distribution is the whole cost of this step and it is a live-fleet change: a node with keys configured and mode=warn behaves identically to one with none, so the keys can go out well ahead of the flip and be soaked.")
-//! @yah:next("STEP 3 — FLIP AND DELETE. Set `--auth-mode require` on one node, verify the fleet still elects and serves, then roll. Once every node is on require: delete `AuthMode::Warn`, delete the `--auth-mode` flag, make `HttpAuthPolicy::new` require a trust root unconditionally, and delete the anonymous branch of `http_auth::decide`. That is the pre-1.0 rule applied — the mode is a roll sequencer that earns its keep exactly once.")
 //! @yah:gotcha("THE ORDER IS NOT NEGOTIABLE AND STEP 3 IS THE ONLY DANGEROUS ONE. `--auth-mode require` on a node whose PEERS do not yet send a peer token 401s every /raft/append-entries and /raft/vote that node receives, which takes it out of the quorum while systemd still reports it active — the same shape as the R876 protocol-skew gotcha, reached by a different mechanism. Steps 1 and 2 are individually safe to land and roll in any order: a signed caller against a warn-mode node is served (the token is verified, and a VALID token is accepted in both modes), and a keyed node with no signed callers behaves exactly like an unkeyed one.")
 //! @yah:gotcha("WARN MODE IS NOT AUTH-OFF, AND THAT IS LOAD-BEARING FOR STEP 1. A credential that is PRESENT AND BAD — bad signature, expired, wrong audience, missing scope, peer token on an operator route — is refused with 401/403 in BOTH modes; only ABSENCE is tolerated under warn. So each caller wired in step 1 gets real verification the moment it starts signing, against nodes still in warn. That is what makes step 3 a no-op for everything already talking, and it is also the trap: a step-1 caller that mints with the wrong audience or the wrong tier breaks IMMEDIATELY rather than at the flip. Test each caller against a require-mode node locally first — `http_auth::router_tests` and cloud-client's `an_enforcing_yubaba_refuses_a_tokenless_client_and_serves_a_tokened_one` are both worked examples of that setup.")
 //! @yah:gotcha("MAX_TOKEN_TTL_SECS IS 24h AND IT IS CHECKED AGAINST *NOW*, NOT AGAINST `iat`. A long-lived token pasted into a systemd unit will start 401ing a day later with `token exp is Ns out, beyond the ceiling` or `token is expired`. Peer-side callers must MINT PER PROCESS-START AT MINIMUM, and really should re-mint on a timer — `mint_peer_token` is pure and cheap (no I/O, no round-trip), so a fresh token per request is affordable and is the shape to prefer over caching one.")
+//! @yah:handoff("STEP 1, IN-PROCESS HALF — LANDED (uncommitted; git-policy defer). New yubaba-consensus/src/peer_auth.rs: PeerSigner (mints one token per request via an injected closure, so consensus stays crypto-free) + PeerClient (reqwest::Client + signer; get/post/delete sign, raw() for an unsigned builder). Re-exported as yubaba::peer_auth. HttpAuthPolicy::peer_signer(subject) in http_auth.rs mints peer tokens under the node's own cluster key, DEFAULT_TOKEN_TTL_SECS each; unkeyed means unsigned, which is byte-identical to the old behaviour.")
+//! @yah:handoff("THREADED THROUGH: YubabaNetworkFactory::new(signer), so all raft RPC is signed; raft::open/open_with_state_machine(.., signer); client_write_forwarded takes &PeerClient; membership_ratchet::spawn/run_once; lease_renewal / member_registration / mesh_directory / acme_issuer spawn(.., signer); leader.rs hand_off_to_eligible_voter now uses state.http; rollout::commit_guarded forward_with is now Option<&PeerClient>. ServerState.http is a PeerClient. with_http_auth and with_node_id both re-key it through rekey_peer_http, so boot order does not matter. main.rs passes server_state.http_auth.peer_signer(node:<id>) to raft and shared_state.http.signer() to every loop. headroom.rs and state_backup.rs dial no peer over HTTP (checked by grep), so they needed no change.")
+//! @yah:handoff("DISCOVERED AND FIXED, the trap named in this ticket's own gotcha: floater replication (R936-B12) dialled OPERATOR-class routes node to node, so a peer token would have been a 403 in BOTH modes, failing immediately rather than at the flip. (1) GET/POST /workloads/floaters and POST /workloads/floaters/{ident}/forget moved to the PEER sub-router in build_router. Reason: they are node-to-node, including the owner's once-a-minute re-publish with no operator in the loop, and a cluster-key holder can already make the same writes through /raft/write. (2) The forwarded floater deploy (admit_floater) and the owner destroy (forget_floater) now pass through the operator's OWN Authorization header via the new authorization_of / forward_as_operator in lib.rs. WorkloadDeployBody gained #[serde(skip)] forward_auth, and destroy_workload_as gained a forward_auth param. deploy_workload_spec_boxed now calls deploy_workload_spec_as directly.")
+//! @yah:handoff("HARNESS: yubaba-test-harness gains test_cluster_enforcing(runtime, nodes, policy, cluster_key_hex). Every node runs require mode under one key and signs raft; ClusterNode keeps the key so restart_node rebinds under the same policy.")
+//! @yah:handoff("CLUSTER EPOCHS: network.rs, raft/mod.rs and store.rs moved. All three diffs are this change only (verified against HEAD). Re-recorded as NOT BREAKING on both axes (cluster_protocol stays 8, state_epoch stays 7), with a dated surface_rerecords entry giving the reasoning: header-only change, and a mixed cluster interoperates in every combination except require-receiver + unsigned-sender, which is chosen by config and owned by step 3's roll order. The file was edited textually from HEAD so its mixed escaping is preserved; the diff is 16+/6-.")
+//! @yah:handoff("Tree anchor at handoff: 2cbdc7963bfc28a81446a243fcc0f8d2ff19ab04 — the shared tree as I left it. Diff against it (`git diff 2cbdc7963bfc28a81446a243fcc0f8d2ff19ab04..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:gotcha("\"SIGNATURE CHURN FOR PEERS: raft::open / open_with_state_machine gained a 4th PeerSigner arg, client_write_forwarded takes &PeerClient, and five spawn fns gained a trailing signer. Any in-flight branch calling them needs PeerSigner::unsigned() or state.http.signer().clone().\"")
+//! @yah:next("STEP 3 — FLIP AND DELETE. Set `--auth-mode require` on one node, verify the fleet still elects and serves AND that its passway doors and tenant-streamer keep working (both now sign), then roll. Once every node is on require: delete AuthMode::Warn, delete the --auth-mode flag, make HttpAuthPolicy::new require a trust root unconditionally, delete the anonymous branch of http_auth::decide, and consider making the out-of-process key file REQUIRED (delete the unsigned path in tenant-streamer/passway).")
+//! @yah:handoff("CLUSTER EPOCHS re-recorded NOT BREAKING on both axes (cluster_protocol 8, state_epoch 7) with a second dated 2026-10-03 surface_rerecords entry: raft/mod.rs, network.rs, store.rs changed only by the import-path rename; diffed all three against 2cbdc7963bfc28a81446a243fcc0f8d2ff19ab04 and every hunk is R876-T18 work.")
+//! @yah:verify("cargo test -p yubaba-auth-token -p yubaba-consensus -p yubaba-tenant-streamer --lib = 6 + 134 + 36 passed (consensus was 137; its 3 peer_auth tests moved into yubaba-auth-token)")
+//! @yah:verify("cargo test -p passway = 236 + 45 + 41 passed, then +2 new: discovery::tests::a_keyed_poll_carries_a_peer_token_under_the_cluster_key (captures the request head off a real socket, decrypts the token under the cluster key, validate_claims(PEER_SCOPE) = svc:passway) and a_named_but_unreadable_key_file_is_a_boot_failure. cargo test -p cloud-client an_enforcing_yubaba = 1 passed. cargo run -p xtask -- cluster-epochs = surfaces match; cargo test -p xtask cluster_epoch = 18 + 8 passed")
+//! @yah:gotcha("PASSWAY `cargo deny check` (run 2026-10-03 from oss/passway) FAILS advisories on RUSTSEC-2026-0285 — rustls 0.23.41, fix >=0.23.45 (`cargo update -p rustls`). PRE-EXISTING: rustls was already in the graph via pingora/reqwest; yubaba-auth-token adds no TLS crate. bans/licenses/sources all pass with the new dep. Not fixed here (outside this ticket; passway's Cargo.lock is untracked).")
+//! @yah:next("STEP 2 — KEYS ONTO THE FLEET (live-fleet; operator must authorize). `yubaba auth cluster-keygen --out <path>` once; SAME hex file on every node at /etc/yah-cloud/cluster.key (0600). Three consumers per node now read it: yubaba (YUBABA_CLUSTER_KEY_FILE in a systemd drop-in, R881 --container-net shape), tenant-streamer (`cluster_key_file = \"/etc/yah-cloud/cluster.key\"` in its TOML), each passway door (PASSWAY_YUBABA_CLUSTER_KEY_FILE in its env). The passway line belongs in app/yah/cli/src/cloud.rs passway_discovery_env (~5427) AND for ingress-owner doors — but render it ONLY once the file is on the node: a named-but-missing key file is a deliberate boot failure, so rendering it early crash-loops the door. Operator keys: `yubaba auth keygen --secret-out <path>` per operator, public hex as YUBABA_OPERATOR_KEYS. Keys with mode=warn change nothing observable, so soak before step 3.")
+//! @yah:handoff("TENANT-STREAMER: StreamerConfig gained optional `cluster_key_file` (path); HttpOwnership::new and RpoReporter::new take a PeerSigner; main.rs builds one via PeerSigner::from_key_file (subject svc:tenant-streamer@node:<id>) — an unreadable NAMED file fails startup, absent warns and runs unsigned. PASSWAY: new env PASSWAY_YUBABA_CLUSTER_KEY_FILE (discovery::CLUSTER_KEY_FILE_ENV, yubaba_peer_signer()); YubabaDiscoveryConfig and OwnerRouteConfig gained `signer`; path_routes_file::into_mount_sources takes &PeerSigner. DISCOVERED: passway::owner (GET /cluster/ingress-owner, Peer-class) was a THIRD unsigned passway caller the previous next-list missed — now signed too. Every call-site route was confirmed Peer-class in build_router.")
+//! @yah:handoff("STEP 1 IS CODE-COMPLETE: every yubaba caller in the tree signs Peer-class calls when keyed (in-process half last session; tenant-streamer + passway discovery/ingress-owner/inner-door this session via the new oss/yubaba/crates/yubaba-auth-token). What remains (steps 2 and 3) is live-fleet and needs operator authorization; nothing further is codeable before keys exist on nodes.")
+//! @yah:handoff("Tree anchor at handoff: 2cbdc7963bfc28a81446a243fcc0f8d2ff19ab04 — the shared tree as I left it. Diff against it (`git diff 2cbdc7963bfc28a81446a243fcc0f8d2ff19ab04..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:handoff("OPERATOR DECISION 2026-10-03: step 2 AUTHORIZED NOW (option A), not deferred to the R876-B11/B12 paired hotship. Scope of the authorization: generate ONE cluster key, install it at /etc/yah-cloud/cluster.key (0600) on every node, wire YUBABA_CLUSTER_KEY_FILE via a systemd drop-in, auth-mode stays WARN. NOT authorized by this answer: step 3 (any --auth-mode require), and any yubaba/kamaji binary ship (the V10-node protocol-skew gotcha on R876 still applies — do not hotship a tree build to us-east-001 to get the new key-file code there).")
+//! @yah:gotcha("BEFORE STEP 2 ON A NODE, CHECK THE RUNNING yubaba ACTUALLY READS YUBABA_CLUSTER_KEY_FILE. HttpAuthPolicy (R876-B15) may not be in the deployed binary — us-east-001 was measured at 0.8.38-h5. On a binary that predates it the drop-in is inert (harmless, but not 'keyed'); record per node which case it is rather than assuming. Restarting yubaba to pick up the drop-in is a live restart on the node serving noisetable.com: check apex per-origin with --resolve afterwards (see R876 next).")
+//! @yah:handoff("STEP 2 DONE ON THE FLEET 2026-10-03 (auth-mode stays WARN everywhere). OPERATOR CALL (ask_user, this session): ONE KEY PER SOVEREIGN GROUP, not one fleet-wide — the binary's own help defines the cluster key per cluster, and a shared key would let a dev box mint prod peer tokens. PROD key (sha256 prefix 6d2f1fbb7250, generated on us-west-001) on us-west-001, us-east-001, us-south-001 and standalone us-west-003. DEV key (prefix 45b35a5550b7, generated on us-west-011) on us-west-011/013/014 and standalone us-west-002. Each: /etc/yah-cloud/cluster.key 0600 root, piped node-to-node (never on the laptop), plus drop-in /etc/systemd/system/yubaba.service.d/85-cluster-key.conf setting YUBABA_CLUSTER_KEY_FILE, then a restart — standalones, then dev followers 11, 13, leader 14, then prod followers 001 (node 2), east-001 (node 3), leader south-001 (node 1). Every node logged `http control-plane auth policy mode=warn cluster_key=true`; both quorums stayed whole (prod leader 1 term 135, dev leader 14 term 542); noisetable.com and yah.dev 200 via all three prod origins with --resolve before and after. Every deployed yubaba (0.8.42 / 0.8.42-h8 / 0.8.41-h1) READS the key file but does NOT sign (grep -c -a: `peer token presented but this node has no cluster key`=1, `node:unregistered`=0), so this is verify-only until the tree's step-1 code ships. NOT KEYED: us-west-015 — its mesh IP 100.64.0.7 and LAN 192.168.10.15 both answer as `leifs-MacBook-Air.local` (yubaba 0.8.20, no systemd), so the declared box is not reachable at its declared addresses; inventory drift, not touched.")
+//! @yah:verify("LIVE 2026-10-03: a peer token minted under the prod key against http://100.64.0.3:7443/cluster/ingress-owner = 200; a dev-key token against the same = 401 `invalid credential` (per-group separation holds); no token = 200 (warn); dev token against 100.64.0.10 = 200.")
+//! @yah:handoff("FYI FROM R605-F16, 2026-10-07: the whole DEV group now runs a tree build with step-1 signing, hot-shipped as 0.8.43-h4. That covers voters us-west-011/013/014 and the four new learners us-west-111/112/141/142, which are microVMs. This is a dev-only binary ship, still in auth-mode WARN. Each learner got the dev cluster key (sha256 prefix 45b35a5550b7), piped voter-to-guest into /etc/yah-cloud/cluster.key, plus 85-cluster-key.conf. dev-raft-node.sh's JOIN mode now requires and installs that key, because an unkeyed node refuses a signed append-entries. Measured on us-west-013's journal (UTC): before the roll it logged about 14.5k `unauthenticated request served` warnings per 10 min. After the roll it logged 11 in 15 min, and none of them were raft RPCs. So the signing path works node to node on real hardware in the dev group. Prod is untouched.")
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use pasetors::keys::{AsymmetricPublicKey, AsymmetricSecretKey, SymmetricKey};
+use pasetors::keys::{AsymmetricPublicKey, SymmetricKey};
 use pasetors::token::{Local, Public, UntrustedToken};
 use pasetors::version4::{LocalToken, PublicToken, V4};
 
 use crate::ServerState;
 
-/// `aud` every yubaba control-plane token must carry.
-///
-/// Present so a token minted for a *different* verifier that happens to
-/// share a key — yubaba already mints cheers-audience tokens with its own
-/// service-principal key, see [`crate::cheers_client`] — cannot be replayed
-/// here. Audience separation is the cheap half of not reusing keys; the
-/// expensive half is not reusing keys, which is why the operator trust set
-/// is configured separately from the cheers principal.
-pub const AUDIENCE: &str = "yubaba:control-plane";
-
-/// `scope` entry an operator-tier token must carry.
-pub const OPERATOR_SCOPE: &str = "yubaba:operator";
-
-/// `scope` entry a peer-tier token must carry.
-pub const PEER_SCOPE: &str = "yubaba:peer";
-
-/// Default lifetime for a freshly minted token.
-pub const DEFAULT_TOKEN_TTL_SECS: i64 = 300;
-
-/// Longest `exp` this node will honour, measured from *now* rather than
-/// from the token's `iat`.
-///
-/// Without a ceiling, a bearer token is a standing credential: mint one
-/// with `exp` ten years out, paste it into a script, and the tier's whole
-/// point (a short-lived, revocable-by-expiry grant) is gone. Measuring from
-/// now rather than from `iat` means a minter cannot dodge it by backdating,
-/// and it needs no clock agreement beyond the one `exp` already assumes.
-pub const MAX_TOKEN_TTL_SECS: i64 = 24 * 60 * 60;
+// R876-T18: the token FORMAT — audience, scopes, TTLs, claims, key hex — lives
+// in `yubaba-auth-token`, shared with every out-of-process caller that mints.
+// This module owns verification and the route policy only.
+use yubaba_auth_token::{
+    cluster_key_from_hex, now_unix, operator_public_from_hex, validate_claims, PeerSigner,
+    OPERATOR_SCOPE, PEER_SCOPE,
+};
 
 /// Which credential a route demands.
 ///
@@ -250,21 +245,13 @@ impl HttpAuthPolicy {
     ) -> Result<Self, String> {
         let mut parsed_operator = Vec::with_capacity(operator_keys.len());
         for raw in operator_keys {
-            let bytes = decode_hex32(raw.trim())
-                .map_err(|e| format!("operator key {raw:?} is not a 64-char hex key: {e}"))?;
             parsed_operator.push(
-                AsymmetricPublicKey::<V4>::from(&bytes)
-                    .map_err(|e| format!("operator key {raw:?} is not a valid v4 key: {e:?}"))?,
+                operator_public_from_hex(raw).map_err(|e| format!("operator key {raw:?}: {e}"))?,
             );
         }
         let parsed_cluster = match cluster_key {
             Some(raw) => {
-                let bytes = decode_hex32(raw.trim())
-                    .map_err(|e| format!("cluster key is not a 64-char hex key: {e}"))?;
-                Some(
-                    SymmetricKey::<V4>::from(&bytes)
-                        .map_err(|e| format!("cluster key is not a valid v4 key: {e:?}"))?,
-                )
+                Some(cluster_key_from_hex(raw).map_err(|e| format!("cluster key: {e}"))?)
             }
             None => None,
         };
@@ -307,7 +294,7 @@ impl HttpAuthPolicy {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        let cluster_key = match std::env::var("YUBABA_CLUSTER_KEY_FILE") {
+        let cluster_key = match std::env::var(yubaba_auth_token::CLUSTER_KEY_FILE_ENV) {
             Ok(path) if !path.trim().is_empty() => Some(
                 std::fs::read_to_string(path.trim())
                     .map_err(|e| format!("reading YUBABA_CLUSTER_KEY_FILE {path:?}: {e}"))?
@@ -327,6 +314,23 @@ impl HttpAuthPolicy {
     /// Does this node hold any trust root at all?
     pub fn has_trust_root(&self) -> bool {
         !self.operator_keys.is_empty() || self.cluster_key.is_some()
+    }
+
+    /// The signer this node's own peer-dialing callers attach (R876-T18) —
+    /// raft RPC, forward-to-leader, lease renewal, floater replication.
+    ///
+    /// The cluster key that verifies inbound peer tokens is the same key that
+    /// mints outbound ones, so a node needs no second piece of config to start
+    /// signing. Unkeyed, the signer attaches nothing, which is exactly what
+    /// these callers sent before. Each token is minted per request with
+    /// [`yubaba_auth_token::DEFAULT_TOKEN_TTL_SECS`]: see
+    /// [`yubaba_auth_token::MAX_TOKEN_TTL_SECS`] for why a token
+    /// minted once at boot would stop working a day later.
+    pub fn peer_signer(&self, subject: String) -> PeerSigner {
+        match self.cluster_key.clone() {
+            Some(key) => PeerSigner::for_cluster_key(key, subject),
+            None => PeerSigner::unsigned(),
+        }
     }
 }
 
@@ -361,7 +365,7 @@ pub fn authenticate(policy: &HttpAuthPolicy, header: Option<&str>, now: i64) -> 
         return AuthOutcome::Invalid("token is neither v4.public nor v4.local".into());
     };
 
-    match validate_claims(&payload, tier, now) {
+    match validate_claims(&payload, tier.required_scope(), now) {
         Ok(subject) => AuthOutcome::Allowed(Principal { subject, tier }),
         Err(e) => AuthOutcome::Invalid(e),
     }
@@ -390,48 +394,6 @@ fn verify_peer(policy: &HttpAuthPolicy, token: &str) -> Result<String, String> {
     let trusted = LocalToken::decrypt(key, &untrusted, None, None)
         .map_err(|_| "v4.local token did not decrypt under the cluster key".to_string())?;
     Ok(trusted.payload().to_string())
-}
-
-/// Check `aud`, `exp` and `scope` on a token whose signature already
-/// verified, and return its `sub`.
-fn validate_claims(payload: &str, tier: Tier, now: i64) -> Result<String, String> {
-    let claims: serde_json::Value =
-        serde_json::from_str(payload).map_err(|e| format!("token payload is not JSON: {e}"))?;
-
-    match claims.get("aud").and_then(|v| v.as_str()) {
-        Some(AUDIENCE) => {}
-        Some(other) => return Err(format!("token audience {other:?} is not {AUDIENCE:?}")),
-        None => return Err("token carries no aud".into()),
-    }
-
-    let exp = claims
-        .get("exp")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| "token carries no numeric exp".to_string())?;
-    if exp <= now {
-        return Err("token is expired".into());
-    }
-    if exp - now > MAX_TOKEN_TTL_SECS {
-        return Err(format!(
-            "token exp is {}s out, beyond the {MAX_TOKEN_TTL_SECS}s ceiling",
-            exp - now
-        ));
-    }
-
-    let wanted = tier.required_scope();
-    let has_scope = claims
-        .get("scope")
-        .and_then(|v| v.as_array())
-        .is_some_and(|entries| entries.iter().any(|e| e.as_str() == Some(wanted)));
-    if !has_scope {
-        return Err(format!("token does not carry scope {wanted:?}"));
-    }
-
-    claims
-        .get("sub")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "token carries no sub".to_string())
 }
 
 /// The verdict the middleware acts on. `Ok` carries the principal (`None`
@@ -507,137 +469,13 @@ pub async fn auth_layer(
     }
 }
 
-// ── Minting ──────────────────────────────────────────────────────────────────
-
-/// Mint an operator-tier token. The secret half never leaves the operator's
-/// key store; nodes hold only the public half.
-pub fn mint_operator_token(
-    secret: &AsymmetricSecretKey<V4>,
-    subject: &str,
-    ttl_secs: i64,
-    now: i64,
-) -> Result<String, String> {
-    let payload = claims_json(subject, OPERATOR_SCOPE, ttl_secs, now)?;
-    PublicToken::sign(secret, payload.as_bytes(), None, None)
-        .map_err(|e| format!("signing operator token: {e:?}"))
-}
-
-/// Mint a peer-tier token under the cluster key.
-pub fn mint_peer_token(
-    key: &SymmetricKey<V4>,
-    subject: &str,
-    ttl_secs: i64,
-    now: i64,
-) -> Result<String, String> {
-    let payload = claims_json(subject, PEER_SCOPE, ttl_secs, now)?;
-    LocalToken::encrypt(key, payload.as_bytes(), None, None)
-        .map_err(|e| format!("encrypting peer token: {e:?}"))
-}
-
-fn claims_json(subject: &str, scope: &str, ttl_secs: i64, now: i64) -> Result<String, String> {
-    if ttl_secs <= 0 || ttl_secs > MAX_TOKEN_TTL_SECS {
-        return Err(format!(
-            "ttl {ttl_secs}s is outside (0, {MAX_TOKEN_TTL_SECS}]"
-        ));
-    }
-    serde_json::to_string(&serde_json::json!({
-        "aud": AUDIENCE,
-        "sub": subject,
-        "iat": now,
-        "exp": now + ttl_secs,
-        "scope": [scope],
-    }))
-    .map_err(|e| format!("serializing claims: {e}"))
-}
-
-// ── Key material helpers ─────────────────────────────────────────────────────
-
-/// Generate an operator keypair, hex-encoded as `(public, secret)`.
-///
-/// The public half is what goes on each node as `--operator-key`; the secret
-/// half is what mints. Returned as hex rather than as key objects so callers
-/// outside this crate — `yubaba auth keygen`, cloud-client's round-trip test
-/// — need no crypto dependency of their own.
-pub fn generate_operator_keypair_hex() -> Result<(String, String), String> {
-    use pasetors::keys::{AsymmetricKeyPair, Generate};
-    let kp = AsymmetricKeyPair::<V4>::generate()
-        .map_err(|e| format!("generating operator keypair: {e:?}"))?;
-    Ok((
-        encode_hex(kp.public.as_bytes()),
-        encode_hex(kp.secret.as_bytes()),
-    ))
-}
-
-/// Generate a cluster key, hex-encoded. One per cluster, held by every node.
-pub fn generate_cluster_key_hex() -> Result<String, String> {
-    use pasetors::keys::Generate;
-    let key =
-        SymmetricKey::<V4>::generate().map_err(|e| format!("generating cluster key: {e:?}"))?;
-    Ok(encode_hex(key.as_bytes()))
-}
-
-/// Parse a 128-char hex v4 asymmetric secret key (64 bytes: seed + pubkey).
-pub fn operator_secret_from_hex(raw: &str) -> Result<AsymmetricSecretKey<V4>, String> {
-    let bytes = decode_hex(raw.trim(), 64)?;
-    AsymmetricSecretKey::<V4>::from(&bytes)
-        .map_err(|e| format!("not a valid v4 secret key: {e:?}"))
-}
-
-/// Parse a 64-char hex 32-byte cluster key.
-pub fn cluster_key_from_hex(raw: &str) -> Result<SymmetricKey<V4>, String> {
-    let bytes = decode_hex32(raw.trim())?;
-    SymmetricKey::<V4>::from(&bytes).map_err(|e| format!("not a valid v4 symmetric key: {e:?}"))
-}
-
-/// Lowercase hex, the spelling `--control-plane-allow` already uses.
-pub fn encode_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn decode_hex32(raw: &str) -> Result<[u8; 32], String> {
-    let v = decode_hex(raw, 32)?;
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&v);
-    Ok(out)
-}
-
-fn decode_hex(raw: &str, want_bytes: usize) -> Result<Vec<u8>, String> {
-    if raw.len() != want_bytes * 2 {
-        return Err(format!(
-            "expected {} hex chars, got {}",
-            want_bytes * 2,
-            raw.len()
-        ));
-    }
-    let bytes = raw.as_bytes();
-    let mut out = Vec::with_capacity(want_bytes);
-    for pair in bytes.chunks(2) {
-        let hi = hex_nibble(pair[0])?;
-        let lo = hex_nibble(pair[1])?;
-        out.push((hi << 4) | lo);
-    }
-    Ok(out)
-}
-
-fn hex_nibble(c: u8) -> Result<u8, String> {
-    match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        other => Err(format!("{:?} is not a hex digit", other as char)),
-    }
-}
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pasetors::keys::AsymmetricSecretKey;
+    use yubaba_auth_token::{
+        encode_hex, mint_operator_token, mint_peer_token, AUDIENCE, MAX_TOKEN_TTL_SECS,
+    };
     use pasetors::keys::{AsymmetricKeyPair, Generate};
 
     /// A policy holding one operator key and one cluster key, plus the
@@ -852,13 +690,6 @@ mod tests {
         assert!(!state.http_auth.has_trust_root());
     }
 
-    #[test]
-    fn hex_round_trips_and_rejects_the_wrong_length() {
-        let raw = [0xab_u8; 32];
-        assert_eq!(decode_hex32(&encode_hex(&raw)).unwrap(), raw);
-        assert!(decode_hex32("abcd").is_err());
-        assert!(decode_hex32(&"z".repeat(64)).is_err());
-    }
 }
 
 /// R876-B15's verify bar: the refusal asserted through the **real**
@@ -868,6 +699,8 @@ mod tests {
 #[cfg(test)]
 mod router_tests {
     use super::*;
+    use pasetors::keys::AsymmetricSecretKey;
+    use yubaba_auth_token::{encode_hex, mint_operator_token, mint_peer_token};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use pasetors::keys::{AsymmetricKeyPair, Generate};

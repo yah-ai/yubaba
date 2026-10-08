@@ -1790,7 +1790,6 @@ mod tests {
                 git: None,
                 deploy: Default::default(),
             }],
-            db: crate::DbCatalog::default(),
         }
     }
 

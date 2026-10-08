@@ -18,7 +18,10 @@
 //! - **quorum is unchanged**: membership stays a single uniform 3-*voter* config
 //!   and node 4 appears only as a non-voting node (never promoted). This is the
 //!   deliberate design — a home-lab Mac node can never endanger the cloud
-//!   voters' quorum.
+//!   voters' quorum. Since R605-F35 the 200 body says so outright: every join
+//!   is learner-first, and this cluster declares no sovereign group, so no
+//!   voter list names node 4 (`voter_listed: false`, `promoted: false`). The
+//!   listed-voter promotion half is pinned in `raft_sovereign_group`.
 //! - a *follower* rejects the call with 421 Misdirected (only the leader can
 //!   change membership).
 //!
@@ -82,7 +85,7 @@ async fn spawn_joiner(id: u64) -> Joiner {
 
     // Open the raft node but never initialise it — it comes up as a lone,
     // uninitialised member waiting to be established by a leader's AppendEntries.
-    let raft = yubaba::raft::open(id, raft_dir, &ClusterPolicy::fleet())
+    let raft = yubaba::raft::open(id, raft_dir, &ClusterPolicy::fleet(), yubaba_auth_token::PeerSigner::unsigned())
         .await
         .expect("open joiner raft node");
 
@@ -196,12 +199,18 @@ async fn add_learner_joins_running_quorum_without_changing_voters() {
         .send()
         .await
         .expect("POST /raft/add-learner to leader");
+    let code = resp.status();
+    let text = resp.text().await.unwrap_or_default();
     assert_eq!(
-        resp.status(),
+        code,
         reqwest::StatusCode::OK,
-        "leader must accept add-learner (body: {:?})",
-        resp.text().await
+        "leader must accept add-learner (body: {text:?})"
     );
+    // R605-F35: learner-first, and nothing lists node 4 — an ungrouped cluster
+    // has no voter list, so a join never promotes on its own.
+    let body: serde_json::Value = serde_json::from_str(&text).expect("add-learner json");
+    assert_eq!(body["voter_listed"], serde_json::json!(false), "{body}");
+    assert_eq!(body["promoted"], serde_json::json!(false), "{body}");
 
     // (3) Quorum invariant: voters are still exactly {1,2,3}; node 4 is present
     // in membership but NOT a voter (it joined as a non-voting learner).

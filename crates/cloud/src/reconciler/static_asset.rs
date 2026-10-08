@@ -2309,7 +2309,6 @@ mod tests {
                 address: crate::config::ServiceAddress::front_door("releases.yah.dev".to_string()),
                 description: None,
                 components: vec![],
-                db: crate::DbCatalog::default(),
             };
             let component = ServiceComponent {
                 mount: None,

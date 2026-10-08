@@ -66,7 +66,6 @@
 //!
 //! @yah:ticket(R936-B15, "Under load with the election gate on, raft_member_registration lopsided-removal test hangs past 900s")
 //! @yah:at(2026-09-26T05:37:58Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R936)
 //! @yah:severity(medium)

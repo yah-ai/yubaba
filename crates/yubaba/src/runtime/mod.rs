@@ -11,10 +11,7 @@
 //!   annotations would orphan the cards. They stay until each ticket is
 //!   archived through the normal SDLC.
 //!
-//! @yah:ticket(R091-F1, "ContainerRuntime trait + runtime::containerd impl: replace yubaba's shell-out path; JSON tracing + correlation IDs")
-//! @yah:at(2026-06-08T21:47:23Z)
-//! @yah:status(review)
-//! @yah:see(.yah/docs/architecture/A053-yah-yubaba-integration-testing.md)
+//! archived: R091 — history: `yah board history oss/yubaba/crates/yubaba/src/runtime/mod.rs`
 //!
 //! @yah:relay(R276, "Tier 3 — Real yubaba workload runtime (single-node deploy)")
 //! @yah:assignee(bundle-anthropic-miravel)
@@ -103,7 +100,6 @@
 //!
 //! @yah:relay(R484, "Kamaji library crate carve-out — runtime/ out of yubaba, shared by binary + desktop-inlined")
 //! @yah:at(2026-06-08T02:30:36Z)
-//! @yah:status(open)
 //! @yah:phase(P1)
 //! @yah:parent(Q405)
 //! @arch:see(.yah/docs/working/W199-kamaji-universal-supervisor.md)

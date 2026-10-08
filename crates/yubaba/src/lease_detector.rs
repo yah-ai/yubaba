@@ -52,7 +52,6 @@
 //!
 //! @yah:relay(R937, "Chaos test 2026-09-22 (us-south-001 killed): prod-raft liveness + operator-observability findings")
 //! @yah:at(2026-09-22T19:13:23Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-glimmerstone)
 //! @yah:next("Umbrella for findings from the scheduled us-south-001 kill on 2026-09-22, as observed from the noisetable camp. Outcome was good: prod raft (members 1=100.64.0.2 [us-south-001], 2=100.64.0.1 [leader], 3=100.64.0.3 [us-east-001]) kept quorum, member 2 never lost leadership, noisetable endpoints stayed 200 throughout, and us-south-001 rejoined caught-up at ~11:22 (~9 min after the kill). The children are the rough edges seen while watching. Timeline: ~11:13 kill; 11:16 term 29, m1 down; 11:20 term 31 (two elections, leader unchanged); 11:22 term 121, all live; stable through ~11:46.")
 //! @yah:next("Term inflation 31->121 on rejoin (~90 terms in ~2 min from one reconnecting voter, no leader change, no user impact) is the known pre-vote-off consequence; the operator chose R734-T1's Option A on 2026-09-22 and it is filed as R734-T6 (bump openraft, re-measure, re-enable pre-vote).")

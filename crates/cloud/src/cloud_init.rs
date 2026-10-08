@@ -12,29 +12,9 @@
 //! sha256 against the archive, extracts, and installs `/usr/local/bin/yubaba`
 //! before the systemd hand-off.
 //!
-//! @yah:ticket(R040-F11, "yah-yubaba delivery: fetch from URL instead of base64 (Hetzner 32KiB user_data cap)")
-//! @yah:at(2026-05-05T00:00:42Z)
-//! @yah:status(review)
-//! @yah:assignee(agent:claude)
-//! @yah:parent(R040)
+//! archived: R040 — history: `yah board history oss/yubaba/crates/cloud/src/cloud_init.rs`
 //! @arch:see(architecture/PHASE_1_MIRROR_BOOTSTRAP.md)
-//! @yah:verify("cargo test -p cloud")
-//! @yah:verify("cargo test -p yah --bin yah cloud::")
-//! @yah:verify("yah cloud machine provision noisetable-pdx-1 --path /Users/user/ss/noisetable --dry-run --yubaba-url https://example.com/yubaba --yubaba /tmp/yubaba — renders curl + sha256sum runcmd lines, computes sha from local file")
-//! @yah:handoff("Cloud-init now fetches yah-yubaba via URL + sha256 verify instead of base64 inline (Hetzner 32KiB user_data cap). RenderInput swapped warden_base64 for warden_url + warden_sha256; template runcmd does curl -o + chmod +x + 'echo SHA bin | sha256sum -c -'. CLI provision flags: --yubaba-url <URL> required for live; --yubaba-sha256 <HEX> and/or --yubaba <PATH> (compute or assert sha); --dry-run falls back to placeholders. New helper resolve_warden_delivery() in app/yah/cli/src/cloud.rs covers all five flag combos with 7 unit tests. Cumulative: 30 cloud-crate tests pass (incl. new render_stays_under_hetzner_user_data_cap which fails the build if rendering ever blows past 32 KiB), 17 yah cloud:: tests pass. PHASE_1_MIRROR_BOOTSTRAP.md updated. Side fix: status.rs FakeProvider needed a one-line delete_bucket stub to compile (R040-F12 has the real impl in review).")
-//! @yah:next("Operator runbook (R040-T6) is now unblocked: publish yah-yubaba Linux musl binary at a stable URL (GitHub release artifact for the workspace.package version), then run `yah cloud machine provision noisetable-$region-1 --yubaba-url <URL> --yubaba <local-copy> --path /Users/user/ss/noisetable` for region in pdx iad fsn.")
-//! @yah:next("Optional polish: derive a default --yubaba-url from workspace.package.version + a hardcoded GitHub repo so operators don't have to retype the URL per region. Skip until release-plz (R038-F3) is wired so the artifact actually exists at a predictable path.")
 //!
-//! @yah:ticket(R040-F15, "Cloudflare Tunnel in cloud-init: cloudflared install + token, no public ports needed")
-//! @yah:at(2026-05-05T00:00:42Z)
-//! @yah:assignee(agent:claude)
-//! @yah:status(review)
-//! @yah:parent(R040)
-//! @yah:handoff("Architecture decision (this session, recorded so future-self doesn't re-litigate): public ingress for yah-cloud nodes is Cloudflare Tunnels — `cloudflared` runs on each origin, makes an OUTBOUND connection to CF edge, CF proxies inbound traffic through the tunnel. Origin needs zero inbound exposure (no port 80/443 open, no stable IPv4, no floating IP plumbing). DNS records point at `<tunnel-id>.cfargotunnel.com` and never churn when boxes are replaced. Inter-node TCP (Postgres replication, gRPC streams, NATS) goes over Headscale mesh — see R040-F16. Combined effect: Hetzner inline IPs are fine forever, IPv6-only is even an option (saves ~€0.50/mo per box; needs validating that tailscale install + apt mirrors work over v6).")
-//! @yah:next("cloud-init template: add `cloudflared service install --token {{CLOUDFLARED_TOKEN}}` + `systemctl enable --now cloudflared` to runcmd, parallel to the existing tailscale install. Token comes from RenderInput.cloudflared_token, sourced from `keys::KeysStore::open().get(\"cloudflare-tunnel-token\")` in cli/src/cloud.rs::handle_provision.")
-//! @yah:next("MachineConfig.cloudflared: Option<String> — tunnel-id this machine joins. Empty/None means \"no tunnel\" (mesh-only nodes that don't need public ingress). When set, the cloud-init renderer wires the right token in.")
-//! @yah:next("Optional: `yah cloud tunnel {create,list,destroy}` subcommand against the CF API. Lower-priority — operators can use cloudflared CLI directly until this matters at fleet scale.")
-//! @yah:next("Caveat to flag in handoff: Free + Pro tier CF Tunnels is HTTP/WebSocket/gRPC only. Raw TCP/UDP ingress (rare for yah, but possible — e.g. a public Postgres for some integration) needs CF Spectrum (paid) OR a primary IP for that one service. Don't pre-build the second path; design records this as a known constraint.")
 //! @arch:see(architecture/PHASE_1_MIRROR_BOOTSTRAP.md)
 //!
 //! @yah:ticket(R441-B3, "cloud_init mirror.yml drift between cloud/templates and .yah/infra/cloud-init")
@@ -56,7 +36,6 @@
 //!
 //! @yah:relay(R702, "Bounded disk everywhere — no process on a yah box grows without an explicit ceiling")
 //! @yah:at(2026-08-03T01:29:40Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-glimmerstone)
 //! @yah:next("DOCTRINE (operator, 2026-08-02, emphatic): a full disk brings the best software to its knees, and apps - Docker especially - love to eat all the space. Every single process that ever runs on a yah box must be explicitly forbidden from unbounded growth. A default that happens to be a fraction of the disk is NOT a bound. This relay makes that auditable rather than aspirational.")
 //! @yah:next("DONE ALREADY, not part of the remaining children: journald bounded on all three cloud nodes via /etc/systemd/journald.conf.d/10-yah-disk-bounds.conf (SystemMaxUse=500M, SystemKeepFree=1G, SystemMaxFileSize=50M, RuntimeMaxUse=64M) and the same block added to the TOP of runcmd in BOTH twin cloud-init templates (oss/yubaba/crates/cloud/templates/mirror.yml + .yah/infra/cloud-init/mirror.yml) so it lands before anything else on the box starts writing. us-south-001 went 755.5M -> 483M on restart. RuntimeMaxUse matters twice over: /run is tmpfs, so it bounds RAM too.")
@@ -85,7 +64,6 @@
 //!
 //! @yah:ticket(R702-T3, "containerd image/snapshot GC policy for cloud nodes — no eviction, root-filesystem growth is unbounded")
 //! @yah:at(2026-09-22T05:26:57Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-miravel)
 //! @yah:parent(R702)
 //! @yah:next("Tier: Thief -- config/policy addition (containerd GC settings), no novel design.")
@@ -95,7 +73,6 @@
 //!
 //! @yah:ticket(R702-T4, "apt archive + old-kernel retention policy for the fleet")
 //! @yah:at(2026-09-22T05:27:16Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-miravel)
 //! @yah:parent(R702)
 //! @yah:next("Tier: Thief -- standard apt hygiene config (APT::Clean-Interval / apt-get autoremove --purge cron, kernel retention count), no novel design.")
@@ -105,10 +82,9 @@
 //!
 //! @yah:ticket(R702-T5, "surface per-node disk headroom in yubaba node status so pressure is visible before it is fatal")
 //! @yah:at(2026-09-22T05:27:36Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-miravel)
 //! @yah:parent(R702)
-//! @yah:next("Tier: Cleric -- needs to pick the right existing status/reporting surface to extend and reason about what 'before it's fatal' means as a threshold, but no deep architecture change.")
+//! @yah:next("Tier: Warrior -- needs to pick the right existing status/reporting surface to extend and reason about what 'before it's fatal' means as a threshold, but no deep architecture change.")
 //! @yah:next("Add per-filesystem free-space (or percent-full) to whatever struct/RPC yubaba already uses for node status, threading it through to wherever `yah cloud` surfaces node health.")
 //! @yah:next("Pick a threshold and surfacing mechanism (warn in `yah cloud status` output at minimum; consider whether it belongs in the same channel as existing node-health alerts, if one exists).")
 //! @yah:next("us-west-014 is the concrete motivating case (two filesystems, the tighter one is the SD root, not the NVMe) -- make sure whatever ships reports per-filesystem, not just per-node, or it would have missed exactly the failure that prompted this ticket.")
@@ -117,7 +93,6 @@
 //!
 //! @yah:ticket(R702-T6, "write a W-doc: bounded-disk doctrine + review checklist for every new on-disk writer")
 //! @yah:at(2026-09-22T05:27:53Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-miravel)
 //! @yah:parent(R702)
 //! @yah:next("Tier: Thief -- writing up doctrine + checklist that already exists in R702's ticket history, not deriving anything new.")
@@ -626,7 +601,8 @@ mod tests {
             allocatable: None,
             taints: vec![],
             sovereign_group: None,
-            sovereign_role: None,
+            sovereign_participation: Default::default(),
+            host_machine: None,
             ingress_floating_ip: None,
         }
     }

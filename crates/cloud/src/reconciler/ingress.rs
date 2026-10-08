@@ -59,7 +59,6 @@
 //!
 //! @yah:relay(R910, "Declare a cloudflare-tunnel edge that fronts the node's own passway (tunnel → sni-demux → passway, W348 §1.3 stacked shape)")
 //! @yah:at(2026-09-14T23:04:08Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @arch:see(.yah/docs/working/W348-ingress-topology-modes-and-per-route-mixing.md)
 //!

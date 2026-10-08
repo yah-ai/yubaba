@@ -501,6 +501,8 @@ pub fn appliance_spec(headscale_dir: &Path, durability_store: Option<&str>) -> W
         },
         labels: HashMap::new(),
         durability,
+        db: Vec::new(),
+        capabilities: Vec::new(),
         annotations,
         files: Vec::new(),
     }

@@ -1582,7 +1582,8 @@ mod tests {
             allocatable: None,
             taints: vec![],
             sovereign_group: None,
-            sovereign_role: None,
+            sovereign_participation: Default::default(),
+            host_machine: None,
             ingress_floating_ip: None,
         }
     }
@@ -1592,6 +1593,7 @@ mod tests {
             workspace_root: PathBuf::new(),
             machines,
             providers: vec![],
+            sovereign_groups: vec![],
             machine_origins: BTreeMap::new(),
             provider_origins: BTreeMap::new(),
             recovery_measurements: BTreeMap::new(),

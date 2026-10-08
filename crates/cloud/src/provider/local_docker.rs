@@ -43,11 +43,7 @@
 //!
 //! Example: `YAH_LOCAL_FAIL_INJECT=create_server:once|mesh_join:random:0.1`
 //!
-//! @yah:ticket(R091-F3, "provider::local_docker: containerd-in-containers MachineProvider")
-//! @yah:status(review)
-//! @yah:at(2026-05-12T18:24:04Z)
-//! @yah:see(.yah/docs/architecture/A053-yah-yubaba-integration-testing.md)
-//!
+//! archived: R091 — history: `yah board history oss/yubaba/crates/cloud/src/provider/local_docker.rs`
 
 #![cfg(feature = "local-docker")]
 

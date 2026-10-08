@@ -31,7 +31,6 @@
 //!
 //! @yah:relay(R591, "Headscale HA: exactly-one appliance whose external identity follows placement (W242 P4)")
 //! @yah:at(2026-07-02T17:34:43Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-glimmerstone)
 //! @yah:depends_on(R570)
 //! @yah:next("Reframe from 'leader election' to an EXACTLY-ONE appliance workload (R572 archetype): the reconciler places headscale on some node per the cluster's agreed state; leader.rs already implements the follow-the-placement half (on-become: litestream restore → start headscale → replicate; on-lose: stop).")
@@ -1166,7 +1165,7 @@ async fn reconcile_appliance_ownership(
             // measure. Hand leadership to a voter that says it could take the
             // appliance; it then elects itself through the ordinary path.
             if is_leader {
-                hand_off_to_eligible_voter(node_id, raft, last_handoff_at).await;
+                hand_off_to_eligible_voter(node_id, raft, &state.http, last_handoff_at).await;
             }
         }
     }
@@ -1208,6 +1207,7 @@ fn candidacy_report(
 async fn hand_off_to_eligible_voter(
     node_id: YubabaNodeId,
     raft: &YubabaRaft,
+    peers_http: &yubaba_auth_token::PeerClient,
     last_handoff_at: &mut Option<std::time::Instant>,
 ) {
     if last_handoff_at.is_some_and(|t| t.elapsed() < HANDOFF_COOLDOWN) {
@@ -1226,19 +1226,22 @@ async fn hand_off_to_eligible_voter(
                 .collect(),
         )
     };
-    let client = match reqwest::Client::builder().timeout(CANDIDACY_FETCH_TIMEOUT).build() {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(node_id, "appliance handoff: could not build HTTP client: {e}");
-            return;
-        }
-    };
     // Sequential: at most a handful of voters, each capped at
     // `CANDIDACY_FETCH_TIMEOUT`, on a path that runs once per cooldown.
     let mut reports: Vec<CandidacyReport> = Vec::new();
     for (id, addr) in &peers {
         let url = format!("http://{addr}/cluster/appliance-candidacy");
-        let got = async { client.get(&url).send().await?.error_for_status()?.json().await }.await;
+        let got = async {
+            peers_http
+                .get(&url)
+                .timeout(CANDIDACY_FETCH_TIMEOUT)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await
+        }
+        .await;
         match got {
             Ok(report) => reports.push(report),
             Err(e) => warn!(node_id, peer = id, %url, "appliance handoff: no candidacy report: {e}"),
@@ -2168,6 +2171,7 @@ mod tests {
                 kvm_ok: None,
                 detail: None,
             },
+            log_stream: false,
         }
     }
 

@@ -42,7 +42,6 @@
 //! not a heuristic an operator would ever want to override.
 //!
 //! @yah:ticket(R330-F17, "Nearest-first service-to-service routing: mesh discovery surfaces region, callers prefer same-region target")
-//! @yah:status(active)
 //! @yah:at(2026-09-13T19:56:57Z)
 //! @yah:assignee(agent:bundle-anthropic-miravel)
 //! @yah:parent(R523)

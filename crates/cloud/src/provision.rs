@@ -161,7 +161,8 @@ mod tests {
             allocatable: None,
             taints: vec![],
             sovereign_group: None,
-            sovereign_role: None,
+            sovereign_participation: Default::default(),
+            host_machine: None,
             ingress_floating_ip: None,
         }
     }

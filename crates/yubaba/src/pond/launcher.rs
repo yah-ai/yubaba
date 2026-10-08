@@ -218,6 +218,8 @@ pub fn lower_run_spec(spec: &ContainerRunSpec) -> Result<WorkloadSpec> {
         },
         labels,
         durability: None,
+        db: Vec::new(),
+        capabilities: Vec::new(),
         annotations,
         files: Vec::new(),
     })

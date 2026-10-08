@@ -61,7 +61,7 @@ async fn spawn_node(id: u64, policy: ClusterPolicy) -> Node {
     let addr = format!("127.0.0.1:{port}");
     let base_url = format!("http://{addr}");
 
-    let raft = yubaba::raft::open(id, raft_dir, &policy)
+    let raft = yubaba::raft::open(id, raft_dir, &policy, yubaba_auth_token::PeerSigner::unsigned())
         .await
         .expect("open raft node");
 

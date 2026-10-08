@@ -129,7 +129,6 @@
 //!
 //! @yah:relay(R715, "local-process compute provider: a dev tier that runs the binary, not a container")
 //! @yah:at(2026-08-03T22:21:13Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:next("T1 (landed): LocalProcessReconciler + Provider::LocalProcess + native_support dedup + both dispatchers + the yah-cloud-admin dev/pond split. See the T1 handoff.")
 //! @yah:next("Follow-on: mesofact-dev's local-static arm and this reconciler now differ only in argv construction. W265 already plans to retire local-static when local-s3-fs lands - that is the moment to consider collapsing them.")
@@ -192,6 +191,25 @@
 //! @yah:gotcha("PRE-EXISTING RED GATE, not from this ticket: `cargo test -p xtask --test workload_envelope` fails on app/yah/web/chat/workload.toml and oss/mesofact/examples/hello/workload.toml, both `missing field routes`. That is R658-B1's known bug (routes written after [build], so TOML scopes it into build.routes) spread to two more files that were never added to KNOWN_GAPS. Both files are committed and untouched by this ticket. Deliberately NOT pinned into KNOWN_GAPS - silently widening the pin is what R658-B1 exists to stop; noted on that ticket instead.")
 //! @yah:gotcha("The reconciler unlinks the control socket path before spawning, because a leftover socket file makes bind fail with EADDRINUSE even with nobody listening. Consequence for anyone writing a test: a producer that binds BEFORE up() has its socket deleted out from under it. Bind after, which is the order a real child sees anyway.")
 //! @yah:gotcha("RESOLVED 2026-08-18 by R658-B1 (@Ashguard:libra): the red gate this ticket's gotcha flagged is now GREEN. app/yah/web/chat/workload.toml and oss/mesofact/examples/hello/workload.toml were migrated to put routes ABOVE [build], along with the other four files and the yah cloud site init scaffold. workload_spec::BuildConfig now carries serde(deny_unknown_fields) so the misplacement is a parse error naming routes. cargo test -p xtask --test workload_envelope passes. Nothing was pinned into KNOWN_GAPS - the four missing-field-routes entries were DELETED. No action needed here; this note exists so the gotcha is not read as still-true.")
+//!
+//! @yah:ticket(R715-F5, "Ephemeral service fixtures for QED runs: local kamaji brings a camp's declared services up per run with generated secrets, a run-allocated port on a chosen bind address, and teardown")
+//! @yah:at(2026-10-03T02:25:42Z)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:parent(R715)
+//! @yah:next("FILED FROM noisetable R743-F37 (account-backed multi-device étude). Operator direction: a QED run that needs a service (noisetable's account server today, cheers when it splits out) should have a LOCAL kamaji bring every needed service up for the run and tear it down after - the real server in an ephemeral capacity, not a stub.")
+//! @yah:next("MISSING TODAY (read, not assumed): (1) local-process ProcessSpec (this file) has a STATIC [process.env] and a fixed optional port - no per-run generated values, no run-allocated port, no bind-address parameter; (2) `yah cloud mirror` has show/status/up and no down; (3) QED has background sidecars (background = true, reaped at run end) and finally, but no 'this pipeline needs service X mirror Y' that kamaji provisions and reaps; (4) no secret-generation vocabulary in mirror declarations - a test run's keys, DB paths and mail spool must be generated, non-sensitive and non-overlapping per run.")
+//! @yah:next("WHAT NOISETABLE DID MEANWHILE, so the shape can be lifted: noisetable tools/etude/src/account.rs + `etude account serve` - keys via the service's own `noisetable-account --generate-keys <dir>`, ephemeral turso stores and a per-run mail spool under an exclusively-created run dir, inherited NOISETABLE_ACCOUNT_* env stripped, binds the host's LAN address (default-route source if RFC1918, else explicit --host-ip) on a free port, waits on /api/v1/status, prints a Ready JSON line, tears down on SIGTERM; runs as a QED background step. A service-specific harness doing kamaji's job - the ask is the general primitive.")
+//! @yah:next("SUGGESTED SHAPE: an ephemeral mirror shape whose provider is local-process, with declared generators (a run-the-service's-own-keygen form, or typed generators), {run_dir}/{bind_ip}/{port} substitutions, and a QED pipeline key like services = [\"noisetable-api@ephemeral\"] brought up before step 1 and reaped like sidecars, exporting each service's coords as step env. Include a shared bind-address policy (physical test devices cannot reach 127.0.0.1): default-route RFC1918 source, explicit override, refuse a VPN-only route.")
+//!
+//! @yah:ticket(R715-B6, "No `yah cloud mirror down`: a local-process mirror can be started but not stopped")
+//! @yah:at(2026-10-06T00:53:12Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R715)
+//! @yah:severity(medium)
+//! @yah:next("Add `yah cloud mirror down <service> --env <env>`: for local-process components, read owner.json and reap the child (and process group) the same way a re-run `mirror up` reaps the previous one, then remove owner.json + control.sock.")
+//! @yah:next("Decide semantics for non-local providers (container / R2 static) — at minimum a clear 'not supported for <kind>' error rather than an unknown-subcommand.")
+//! @yah:verify("`mirror up noisetable-desktop --env dev` then `mirror down` leaves no `target/*/noisetable-desktop` process and no owner.json.")
+//! @yah:gotcha("Found 2026-10-05 while verifying R940-B1: its own check 2 says '`mirror down` leaves no orphaned process', but the CLI only has show/status/up, so the check was unrunnable and the child had to be stopped with kill. CLAUDE.md in noisetable also documents only re-up reaping.")
 
 
 use std::collections::{BTreeMap, VecDeque};
@@ -346,6 +364,11 @@ struct ProcessSpec {
     /// Cargo profile used for both the build and the default binary path.
     #[serde(default = "default_profile")]
     profile: String,
+    /// Cargo features passed to `cargo build -p` as `--features a,b`. Lets a
+    /// workload opt into non-default features (e.g. a device permission path)
+    /// without a separate package.
+    #[serde(default)]
+    features: Vec<String>,
     /// Opt in to the process-control channel ([`crate::proc_control`]) — the
     /// house default for anything long-running. When present, the process's
     /// own report decides readiness, which is strictly better than both other
@@ -432,7 +455,7 @@ impl Reconciler for LocalProcessReconciler {
 
         let mut build_log_end = None;
         if let Some(pkg) = &spec.cargo_package {
-            cargo_build(ctx.workspace_root, pkg, &spec.profile, &log_buf).await?;
+            cargo_build(ctx.workspace_root, pkg, &spec.profile, &spec.features, &log_buf).await?;
             let cursor = log_buf.cursor().await;
             build_log_end = Some(cursor);
             if let Some(sink) = &self.build_log_end_sink {
@@ -786,10 +809,14 @@ async fn cargo_build(
     workspace_root: &std::path::Path,
     pkg: &str,
     profile: &str,
+    features: &[String],
     log_buf: &LogBuffer,
 ) -> Result<()> {
     let mut cmd = tokio::process::Command::new("cargo");
     cmd.arg("build").arg("-p").arg(pkg);
+    if !features.is_empty() {
+        cmd.arg("--features").arg(features.join(","));
+    }
     if profile == "release" {
         cmd.arg("--release");
     } else if profile != "debug" {
@@ -1031,6 +1058,7 @@ mod tests {
             port: Some(4325),
             env: BTreeMap::new(),
             profile: "debug".to_string(),
+            features: vec![],
             control: None,
         }
     }
@@ -1351,7 +1379,6 @@ socket = "/tmp/mine.sock"
                 git: None,
                 deploy: Default::default(),
             }],
-            db: crate::DbCatalog::default(),
         }
     }
 

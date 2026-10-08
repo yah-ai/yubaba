@@ -61,12 +61,14 @@
 use std::time::Duration;
 
 use tracing::{debug, warn};
+use yubaba_auth_token::{PeerClient, PeerSigner};
 use workload_spec::TenantId;
 
 /// Discovers, and pushes to, the current raft leader's `POST
 /// /mesh/rpo-report`, starting from this node's own node-local yubaba URL.
 pub struct RpoReporter {
-    client: reqwest::Client,
+    /// R876-T18: `/raft/status` and `/mesh/rpo-report` are both Peer-class.
+    client: PeerClient,
     base_url: String,
     node_id: u64,
 }
@@ -84,9 +86,9 @@ struct MemberView {
 }
 
 impl RpoReporter {
-    pub fn new(base_url: impl Into<String>, node_id: u64) -> Self {
+    pub fn new(base_url: impl Into<String>, node_id: u64, signer: PeerSigner) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: PeerClient::new(reqwest::Client::new(), signer),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             node_id,
         }

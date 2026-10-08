@@ -545,7 +545,6 @@ mod tests {
             address: crate::config::ServiceAddress::front_door("releases.example"),
             description: None,
             components,
-            db: crate::DbCatalog::default(),
         }
     }
 

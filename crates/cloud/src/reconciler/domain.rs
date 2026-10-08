@@ -21,7 +21,6 @@
 //!
 //! @yah:relay(R859, "Sovereign-edge automation ring: DNS reconciled from declared intent, public addressing follows placement (W267 audit followups)")
 //! @yah:at(2026-09-04T19:06:24Z)
-//! @yah:status(handoff)
 //! @yah:assignee(agent:user-custom-char-gul2)
 //! @arch:see(.yah/docs/working/W267-sovereign-public-ingress.md)
 //! @yah:next("Filed from the 2026-09-04 HA/ingress audit (chat session, operator-reviewed). The grey door is live but the automation ring around it is manual: DNS flips ride scripts/cf-apex-mode.sh by hand, and node loss leaves a dead A record taking ~half the round-robin traffic until a human edits DNS.")
@@ -1820,7 +1819,8 @@ mod tests {
             allocatable: None,
             taints: taints.iter().map(|t| t.to_string()).collect(),
             sovereign_group: None,
-            sovereign_role: None,
+            sovereign_participation: Default::default(),
+            host_machine: None,
             ingress_floating_ip: None,
         }
     }
@@ -2027,7 +2027,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            svc.join("mirrors/cloud.toml"),
+            svc.join("mirrors/prod.toml"),
             "schema_version = 1\nshape = \"single-machine\"\n\
              ingress = \"passway\"\ningress_machines = [\"us-east-001\"]\n\
              [providers.compute]\nuse = \"hetzner\"\nzone = \"yah.dev\"\n\
@@ -2200,7 +2200,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
-            svc.join("mirrors/cloud.toml"),
+            svc.join("mirrors/prod.toml"),
             "schema_version = 1\nshape = \"single-machine\"\n\
              ingress = \"passway\"\ningress_machines = [\"us-east-001\"]\n\
              [providers.compute]\nuse = \"hetzner\"\nzone = \"yah.dev\"\n\

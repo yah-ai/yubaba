@@ -103,7 +103,7 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
-use crate::cluster_policy::{ClusterPolicy, PromotionVerdict};
+use crate::cluster_policy::{ClusterPolicy, PromotionVerdict, VoterSeats};
 #[allow(unused_imports)] // referenced from doc comments only.
 use crate::cluster_policy::MembershipRatchet;
 use crate::raft::{
@@ -450,6 +450,13 @@ impl RehydratePlan {
 ///    least able to afford it — and the shrink half is about to act on that
 ///    voter anyway. Shed before you admit; [`run_once`] runs the halves in that
 ///    order for the same reason.
+/// 2b. **The sovereign group must list it** (R605-F35, [`VoterSeats`]). A
+///    learner the group does not seat is never a candidate, whatever its
+///    liveness — this is what keeps R605-F16's co-located VM members learners
+///    on the `rig`-profile dev group, where every other gate here would
+///    otherwise promote them within one hold-down. Checked before the
+///    hold-down so a hold names the list rather than a clock nobody is waiting
+///    on.
 /// 3. **Hold-down, per candidate.** A learner qualifies only if every fresh
 ///    observer has called it `Alive` **continuously** for
 ///    [`MembershipRatchet::promote_hold_down`]. The clock is
@@ -474,6 +481,7 @@ impl RehydratePlan {
 ///    `ChangeMembers::AddVoterIds`, and holds when it cannot.
 pub fn plan_rehydrate(
     policy: &ClusterPolicy,
+    seats: &VoterSeats,
     voters: &BTreeMap<YubabaNodeId, VoterEvidence>,
     learners: &BTreeMap<YubabaNodeId, LearnerEvidence>,
     now: u64,
@@ -497,9 +505,29 @@ pub fn plan_rehydrate(
         return RehydratePlan::hold("no learners to promote");
     }
 
-    let mut ready: Vec<YubabaNodeId> = Vec::new();
+    // Gate 2b (R605-F35): only learners the sovereign group seats are
+    // candidates at all.
     let mut refusals: Vec<String> = Vec::new();
+    let mut seated: Vec<(&YubabaNodeId, &LearnerEvidence)> = Vec::new();
     for (id, e) in learners {
+        match seats.refusal(*id) {
+            None => seated.push((id, e)),
+            Some(_) => refusals.push(format!("{id}=not-a-listed-voter")),
+        }
+    }
+    if seated.is_empty() {
+        let why = learners
+            .keys()
+            .find_map(|id| seats.refusal(*id))
+            .unwrap_or_default();
+        return RehydratePlan::hold(format!(
+            "no learner is a listed voter of this node's sovereign group ({}): {why}",
+            refusals.join(" ")
+        ));
+    }
+
+    let mut ready: Vec<YubabaNodeId> = Vec::new();
+    for (id, e) in seated {
         let Some(alive_since) = e.alive_since else {
             refusals.push(format!("{id}=not-corroborated-alive({})", e.verdict.as_str()));
             continue;
@@ -860,7 +888,8 @@ pub async fn run_once(
     raft: &YubabaRaft,
     state_machine: &YubabaStateMachine,
     policy: &ClusterPolicy,
-    http: &reqwest::Client,
+    seats: &VoterSeats,
+    http: &yubaba_auth_token::PeerClient,
     now: u64,
     epochs: BuildEpochs,
 ) -> RatchetOutcome {
@@ -928,7 +957,7 @@ pub async fn run_once(
             reason,
         } => (demote, after, reason),
         RatchetPlan::Hold { reason: shrink_held } => {
-            return match plan_rehydrate(policy, &evidence, &learners, now) {
+            return match plan_rehydrate(policy, seats, &evidence, &learners, now) {
                 RehydratePlan::Promote {
                     promote,
                     after,
@@ -1058,15 +1087,17 @@ pub fn spawn(
     raft: YubabaRaft,
     state_machine: YubabaStateMachine,
     policy: ClusterPolicy,
+    seats: VoterSeats,
     config: RatchetConfig,
     epochs: BuildEpochs,
+    signer: yubaba_auth_token::PeerSigner,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let http = match reqwest::Client::builder()
             .timeout(crate::raft::FORWARD_TIMEOUT)
             .build()
         {
-            Ok(c) => c,
+            Ok(c) => yubaba_auth_token::PeerClient::new(c, signer),
             Err(e) => {
                 warn!(node_id, error = %e, "membership ratchet: no HTTP client, loop not started");
                 return;
@@ -1081,7 +1112,7 @@ pub fn spawn(
         loop {
             tokio::time::sleep(config.evaluate_every).await;
             let now = crate::now_unix_secs();
-            match run_once(node_id, &raft, &state_machine, &policy, &http, now, epochs).await {
+            match run_once(node_id, &raft, &state_machine, &policy, &seats, &http, now, epochs).await {
                 RatchetOutcome::Shrank { demoted, after } => {
                     info!(node_id, ?demoted, ?after, "membership ratchet: voter set shrank");
                 }
@@ -1342,7 +1373,7 @@ mod tests {
     fn the_fleet_never_rehydrates() {
         let voters = evidence([(1, ev(PeerLivenessVerdict::Alive))]);
         let l = learners([(2, learner(Some(0))), (3, learner(Some(0)))]);
-        let reason = rehydrate_held(plan_rehydrate(&ClusterPolicy::fleet(), &voters, &l, HOLD * 10));
+        let reason = rehydrate_held(plan_rehydrate(&ClusterPolicy::fleet(), &VoterSeats::NoGroup, &voters, &l, HOLD * 10));
         assert!(reason.contains("freezes the voter set"), "{reason}");
     }
 
@@ -1353,6 +1384,7 @@ mod tests {
         let l = learners([(2, learner(Some(1_000))), (3, learner(Some(1_000)))]);
         let reason = rehydrate_held(plan_rehydrate(
             &ClusterPolicy::rig(),
+            &VoterSeats::NoGroup,
             &voters,
             &l,
             1_000 + HOLD - 1,
@@ -1364,12 +1396,61 @@ mod tests {
         // One second later, exactly at the boundary, both clear it.
         let (promote, after) = promoted(plan_rehydrate(
             &ClusterPolicy::rig(),
+            &VoterSeats::NoGroup,
             &voters,
             &l,
             1_000 + HOLD,
         ));
         assert_eq!(promote, BTreeSet::from([2, 3]));
         assert_eq!(after, BTreeSet::from([1, 2, 3]));
+    }
+
+    /// R605-F35: the dev rig with VM members. Every gate but the group's list
+    /// would promote the stable, caught-up VM learners (21, 22) — `rig` allows
+    /// five voters — so the list is the only thing that keeps them learners,
+    /// and it must also let the listed Pis (13, 14) back in.
+    #[test]
+    fn only_learners_the_group_lists_are_rehydrated() {
+        let voters = evidence([(11, ev(PeerLivenessVerdict::Alive))]);
+        let l = learners([
+            (13, learner(Some(0))),
+            (14, learner(Some(0))),
+            (21, learner(Some(0))),
+            (22, learner(Some(0))),
+        ]);
+        let seats = VoterSeats::listed("dev", [11, 13, 14]);
+        let (promote, after) = promoted(plan_rehydrate(
+            &ClusterPolicy::rig(),
+            &seats,
+            &voters,
+            &l,
+            HOLD * 10,
+        ));
+        assert_eq!(promote, BTreeSet::from([13, 14]));
+        assert_eq!(after, BTreeSet::from([11, 13, 14]));
+
+        // Only VMs left as learners: nothing is promoted, and the hold names
+        // the list rather than a hold-down clock.
+        let vms = learners([(21, learner(Some(0))), (22, learner(Some(0)))]);
+        let reason = rehydrate_held(plan_rehydrate(
+            &ClusterPolicy::rig(),
+            &seats,
+            &voters,
+            &vms,
+            HOLD * 10,
+        ));
+        assert!(reason.contains("not-a-listed-voter"), "{reason}");
+        assert!(reason.contains("sovereign-groups/dev.toml"), "{reason}");
+
+        // A declared group with no list on this daemon promotes nobody.
+        let reason = rehydrate_held(plan_rehydrate(
+            &ClusterPolicy::rig(),
+            &VoterSeats::listed("dev", []),
+            &voters,
+            &l,
+            HOLD * 10,
+        ));
+        assert!(reason.contains("--sovereign-voters"), "{reason}");
     }
 
     /// **The test the whole feature exists for.**
@@ -1391,6 +1472,7 @@ mod tests {
             let up = learners([(2, learner(Some(came_up_at)))]);
             let reason = rehydrate_held(plan_rehydrate(
                 &ClusterPolicy::rig(),
+                &VoterSeats::NoGroup,
                 &voters,
                 &up,
                 came_up_at + HOLD - 1,
@@ -1403,7 +1485,7 @@ mod tests {
 
             // It drops. `alive_since` is gone; the fold is not Alive.
             let down = learners([(2, learner(None))]);
-            let reason = rehydrate_held(plan_rehydrate(&ClusterPolicy::rig(), &voters, &down, now));
+            let reason = rehydrate_held(plan_rehydrate(&ClusterPolicy::rig(), &VoterSeats::NoGroup, &voters, &down, now));
             assert!(
                 reason.contains("not-corroborated-alive"),
                 "cycle {cycle}: a node that is down is not a candidate at all: {reason}"
@@ -1427,7 +1509,7 @@ mod tests {
              testing anything: {total_elapsed}s elapsed against a {HOLD}s hold-down"
         );
         let up_again = learners([(2, learner(Some(now)))]);
-        let reason = rehydrate_held(plan_rehydrate(&ClusterPolicy::rig(), &voters, &up_again, now));
+        let reason = rehydrate_held(plan_rehydrate(&ClusterPolicy::rig(), &VoterSeats::NoGroup, &voters, &up_again, now));
         assert!(
             reason.contains(&format!("2=alive-only-0s-of-{HOLD}s")),
             "after {total_elapsed}s of flapping the node's CONTINUOUS presence is still zero, and \
@@ -1442,7 +1524,7 @@ mod tests {
     fn one_ready_learner_does_not_take_a_lone_voter_to_two() {
         let voters = evidence([(1, ev(PeerLivenessVerdict::Alive))]);
         let l = learners([(2, learner(Some(0))), (3, learner(None))]);
-        let reason = rehydrate_held(plan_rehydrate(&ClusterPolicy::rig(), &voters, &l, HOLD * 10));
+        let reason = rehydrate_held(plan_rehydrate(&ClusterPolicy::rig(), &VoterSeats::NoGroup, &voters, &l, HOLD * 10));
         assert!(
             reason.contains("tolerates zero further losses"),
             "resting at 2 is the state the shrink half cannot repair, and the refusal must say \
@@ -1461,6 +1543,7 @@ mod tests {
         let l = learners([(3, learner(Some(0)))]);
         let (promote, after) = promoted(plan_rehydrate(
             &ClusterPolicy::rig(),
+            &VoterSeats::NoGroup,
             &voters,
             &l,
             HOLD * 10,
@@ -1474,7 +1557,7 @@ mod tests {
         let voters = evidence([(1, ev(PeerLivenessVerdict::Alive))]);
         let mut l = learners([(2, learner(Some(0))), (3, learner(Some(0)))]);
         l.get_mut(&3).unwrap().caught_up = false;
-        let reason = rehydrate_held(plan_rehydrate(&ClusterPolicy::rig(), &voters, &l, HOLD * 10));
+        let reason = rehydrate_held(plan_rehydrate(&ClusterPolicy::rig(), &VoterSeats::NoGroup, &voters, &l, HOLD * 10));
         assert!(
             reason.contains("3=not-caught-up"),
             "the refusal must name the node and the gate it failed: {reason}"
@@ -1494,7 +1577,7 @@ mod tests {
         let mut voters = all(5, PeerLivenessVerdict::Alive);
         voters.insert(5, ev(PeerLivenessVerdict::Alive));
         let l = learners([(6, learner(Some(0))), (7, learner(Some(0)))]);
-        let reason = rehydrate_held(plan_rehydrate(&ClusterPolicy::rig(), &voters, &l, HOLD * 10));
+        let reason = rehydrate_held(plan_rehydrate(&ClusterPolicy::rig(), &VoterSeats::NoGroup, &voters, &l, HOLD * 10));
         assert!(
             reason.contains("caps the voter set at 5"),
             "the refusal must be the cluster policy's own words, so there is one rule and not \
@@ -1507,7 +1590,7 @@ mod tests {
         let mut voters = all(3, PeerLivenessVerdict::Alive);
         voters.insert(3, ev(PeerLivenessVerdict::Dark));
         let l = learners([(4, learner(Some(0))), (5, learner(Some(0)))]);
-        let reason = rehydrate_held(plan_rehydrate(&ClusterPolicy::rig(), &voters, &l, HOLD * 10));
+        let reason = rehydrate_held(plan_rehydrate(&ClusterPolicy::rig(), &VoterSeats::NoGroup, &voters, &l, HOLD * 10));
         assert!(
             reason.contains("voter 3 is `dark`"),
             "promotion raises quorum, so a degraded voter set must be shed before it is grown: \

@@ -24,6 +24,12 @@
 //! - that an **unstamped** cluster still grows, and says out loud that it judged
 //!   nothing — the pond/rig/BYO case, which must not have been broken by this.
 //!
+//! R605-F35 added the second half of the join: every permitted join is a
+//! **learner** join, and the leader then promotes the joiner only if its own
+//! `--sovereign-voters` list names it. These tests pin that a listed joiner is
+//! promoted, an unlisted one stays a learner, the leader's list beats anything
+//! the joiner believes about itself, and a group with no list promotes nobody.
+//!
 //! ```bash
 //! cargo test -p yubaba --test main -- raft_sovereign_group::
 //! ```
@@ -32,8 +38,11 @@ use std::time::Duration;
 
 use serde_json::json;
 use yubaba::cluster_policy::ClusterPolicy;
-use yubaba::SovereignRole;
-use yubaba_test_harness::{solo_node_in_sovereign_group, solo_node_with_sovereign_role, SoloNode};
+use yubaba::Participation;
+use yubaba_test_harness::{
+    solo_node_in_sovereign_group, solo_node_listing_voters, solo_node_with_sovereign_participation,
+    SoloNode,
+};
 
 /// Every node here is founded as a cluster-of-one, so `rig` is the honest
 /// policy: `fleet`'s quorum-geography gate (R734-F2) refuses an untagged
@@ -150,32 +159,35 @@ async fn a_cross_group_join_is_refused_without_touching_membership() {
     );
 }
 
-/// R605-F12, end to end: same group, still refused, and the refusal has to be
-/// about the *role* rather than the group.
+/// R605-F35 (formerly R605-F12's non-voter refusal), end to end: same group,
+/// still refused, and the refusal has to be about *participation* rather than
+/// the group.
 ///
 /// This is us-west-003. It is a member of prod — same secrets, same upgrade
-/// cadence, same destruction — on a residential uplink that must never be able
-/// to stall the prod raft. Until the role axis existed, the only thing refusing
-/// it here was the fact that nobody had written its group down.
+/// cadence, same destruction — on a residential uplink that must never hold a
+/// prod raft node id, not even as a learner. Under R605-F12 this test refused a
+/// `non-voter`; R605-F35 moved who-votes onto the group, so what remains on the
+/// node is `out`, and it still keeps the box out of the raft entirely.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_non_voting_member_of_the_same_group_is_refused() {
+async fn an_out_member_of_the_same_group_is_refused() {
     let leader = solo_node_in_sovereign_group(1, policy(), Some("prod"))
         .await
         .expect("prod leader");
-    let joiner = solo_node_with_sovereign_role(2, policy(), Some("prod"), SovereignRole::NonVoter)
-        .await
-        .expect("non-voting prod member");
+    let joiner =
+        solo_node_with_sovereign_participation(2, policy(), Some("prod"), Participation::Out)
+            .await
+            .expect("out-of-raft prod member");
     found(&leader).await;
 
     let (code, body) = add_learner(&leader, joiner.node_id, &joiner.addr, json!({})).await;
     assert_eq!(
         code,
         reqwest::StatusCode::CONFLICT,
-        "a non-voting prod member joining the prod quorum must be refused 409: {body}"
+        "an `out` prod member joining the prod raft must be refused 409: {body}"
     );
     assert!(
-        body.contains("NON-VOTING"),
-        "the refusal must name the role, which is the only thing that differs: {body}"
+        body.contains("OUT of"),
+        "the refusal must name participation, which is the only thing that differs: {body}"
     );
     assert!(
         !body.contains("cross-group"),
@@ -188,59 +200,204 @@ async fn a_non_voting_member_of_the_same_group_is_refused() {
     );
 }
 
-/// The role is read off the joiner over the wire, exactly as the group is — so
-/// `/raft/status` has to publish it, and the leader has to believe that rather
-/// than the request body.
+/// Participation is read off the joiner over the wire, exactly as the group is
+/// — so `/raft/status` has to publish it, and the leader has to believe that
+/// rather than the request body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_node_publishes_its_role_and_the_leader_reads_it_there() {
-    let voter = solo_node_in_sovereign_group(1, policy(), Some("prod"))
+async fn a_node_publishes_its_participation_and_the_leader_reads_it_there() {
+    let member = solo_node_in_sovereign_group(1, policy(), Some("prod"))
         .await
-        .expect("prod voter");
-    let non_voter =
-        solo_node_with_sovereign_role(2, policy(), Some("prod"), SovereignRole::NonVoter)
+        .expect("prod member");
+    let outsider =
+        solo_node_with_sovereign_participation(2, policy(), Some("prod"), Participation::Out)
             .await
-            .expect("non-voting prod member");
+            .expect("out-of-raft prod member");
 
-    assert_eq!(status(&voter).await["sovereign_role"], json!("voter"));
-    assert_eq!(status(&non_voter).await["sovereign_role"], json!("non-voter"));
+    assert_eq!(status(&member).await["sovereign_participation"], json!("in"));
+    assert_eq!(status(&outsider).await["sovereign_participation"], json!("out"));
+    // R605-F12's key is gone from the wire, not kept beside the new one.
+    assert!(status(&member).await.get("sovereign_role").is_none());
 
-    found(&voter).await;
-    // Claiming voter in the body changes nothing: the leader dials the joiner.
+    found(&member).await;
+    // Claiming `in` in the body changes nothing: the leader dials the joiner.
     let (code, body) = add_learner(
-        &voter,
-        non_voter.node_id,
-        &non_voter.addr,
-        json!({ "sovereign_role": "voter" }),
+        &member,
+        outsider.node_id,
+        &outsider.addr,
+        json!({ "sovereign_participation": "in" }),
     )
     .await;
     assert_eq!(
         code,
         reqwest::StatusCode::CONFLICT,
-        "the request body must not be able to vote a non-voter in: {body}"
+        "the request body must not be able to bring an `out` node into the raft: {body}"
     );
 }
 
-/// The other end of the assertion: a node that declares itself non-voting and
-/// nonetheless holds a raft seat refuses to grow the quorum from it, because it
-/// is already in the state its own declaration says is impossible.
+/// The other end of the assertion: a node that declares itself out of its
+/// group's raft and nonetheless holds a raft seat refuses to grow the raft from
+/// it, because it is already in the state its own declaration says is
+/// impossible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_non_voting_leader_refuses_to_grow_its_quorum() {
-    let leader = solo_node_with_sovereign_role(1, policy(), Some("prod"), SovereignRole::NonVoter)
-        .await
-        .expect("non-voting leader");
+async fn an_out_leader_refuses_to_grow_its_raft() {
+    let leader =
+        solo_node_with_sovereign_participation(1, policy(), Some("prod"), Participation::Out)
+            .await
+            .expect("out-of-raft leader");
     let joiner = solo_node_in_sovereign_group(2, policy(), Some("prod"))
         .await
-        .expect("prod voter");
+        .expect("prod member");
     found(&leader).await;
 
     let (code, body) = add_learner(&leader, joiner.node_id, &joiner.addr, json!({})).await;
     assert_eq!(
         code,
         reqwest::StatusCode::CONFLICT,
-        "a non-voting cluster must not add members: {body}"
+        "an `out` cluster must not add members: {body}"
     );
     assert!(body.contains("--raft-node-id"), "{body}");
     assert_eq!(membership_ids(&leader).await, vec![leader.node_id]);
+}
+
+/// Voter ids in the leader's current membership config.
+async fn voter_ids(node: &SoloNode) -> Vec<u64> {
+    let s = status(node).await;
+    let mut ids: Vec<u64> = s["membership_config"]["membership"]["configs"]
+        .as_array()
+        .expect("membership.configs array")
+        .iter()
+        .flat_map(|c| c.as_array().expect("voter set array").iter())
+        .map(|v| v.as_u64().expect("voter id u64"))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// The JSON body of a 200 `add-learner`, asserting the 200 on the way.
+async fn joined(leader: &SoloNode, joiner: &SoloNode) -> serde_json::Value {
+    let (code, body) = add_learner(leader, joiner.node_id, &joiner.addr, json!({})).await;
+    assert_eq!(code, reqwest::StatusCode::OK, "same-group join: {body}");
+    serde_json::from_str(&body).expect("add-learner json")
+}
+
+/// R605-F35, the case the ticket names: two participants of one group join the
+/// same leader. The one the group lists is promoted; the one it does not stays
+/// a learner — and stays one when an operator asks for it by hand.
+///
+/// This is the dev rig's shape in miniature: three listed Pi voters plus VM
+/// members nobody listed. `rig` permits promotion up to five voters, so the
+/// only thing keeping the unlisted member a learner here is the list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_listed_participant_is_promoted_and_an_unlisted_one_stays_a_learner() {
+    let leader = solo_node_listing_voters(1, policy(), "dev", &[1, 2])
+        .await
+        .expect("dev leader listing 1,2");
+    let listed = solo_node_in_sovereign_group(2, policy(), Some("dev"))
+        .await
+        .expect("listed dev member");
+    let unlisted = solo_node_in_sovereign_group(3, policy(), Some("dev"))
+        .await
+        .expect("unlisted dev member");
+    found(&leader).await;
+
+    let body = joined(&leader, &listed).await;
+    assert_eq!(body["voter_listed"], json!(true), "{body}");
+    assert_eq!(body["promoted"], json!(true), "a listed joiner is promoted: {body}");
+
+    let body = joined(&leader, &unlisted).await;
+    assert_eq!(body["voter_listed"], json!(false), "{body}");
+    assert_eq!(
+        body["promoted"],
+        json!(false),
+        "an unlisted joiner stays a learner: {body}"
+    );
+
+    assert_eq!(voter_ids(&leader).await, vec![1, 2]);
+    let mut members = membership_ids(&leader).await;
+    members.sort_unstable();
+    assert_eq!(members, vec![1, 2, 3], "3 is in membership — as a learner");
+
+    // The operator verb is gated by the same list: asking by hand does not get
+    // an unlisted learner a seat.
+    let resp = yubaba_test_harness::http()
+        .post(format!("{}/raft/promote-voter", leader.base_url))
+        .json(&json!({ "node_id": 3 }))
+        .send()
+        .await
+        .expect("POST /raft/promote-voter");
+    let code = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert_eq!(code, reqwest::StatusCode::FORBIDDEN, "{text}");
+    assert!(
+        text.contains("not a listed voter") && text.contains("dev"),
+        "the refusal must name the list and the group: {text}"
+    );
+    assert_eq!(voter_ids(&leader).await, vec![1, 2]);
+}
+
+/// The disagreement case, pinned both ways: only the LEADER's list is read.
+///
+/// The joiner is never asked whether it should vote — "asked, never believed"
+/// covers the joiner's group and participation, and a seat is not something the
+/// joiner gets to declare at all. So a joiner whose own daemon lists itself is
+/// still a learner under a leader that does not list it, and a joiner whose own
+/// list omits itself is still promoted under a leader that does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_leaders_voter_list_decides_and_the_joiners_own_list_does_not() {
+    let leader = solo_node_listing_voters(1, policy(), "dev", &[1, 2])
+        .await
+        .expect("dev leader listing 1,2");
+    // Believes it is NOT a voter — the leader says it is.
+    let modest = solo_node_listing_voters(2, policy(), "dev", &[1])
+        .await
+        .expect("joiner listing only 1");
+    // Believes it IS a voter — the leader says it is not.
+    let presumptuous = solo_node_listing_voters(3, policy(), "dev", &[1, 2, 3])
+        .await
+        .expect("joiner listing itself");
+    found(&leader).await;
+
+    assert_eq!(status(&presumptuous).await["sovereign_voters"], json!([1, 2, 3]));
+
+    let body = joined(&leader, &modest).await;
+    assert_eq!(body["promoted"], json!(true), "the leader lists 2: {body}");
+    let body = joined(&leader, &presumptuous).await;
+    assert_eq!(
+        body["promoted"],
+        json!(false),
+        "the leader does not list 3, whatever 3's own flag says: {body}"
+    );
+    assert_eq!(voter_ids(&leader).await, vec![1, 2]);
+}
+
+/// A daemon that declares a group but was given no voter list promotes nobody
+/// — the fail-closed direction. A participant still joins (as a learner), but
+/// no path hands it a seat until `--sovereign-voters` names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_with_no_voter_list_promotes_nobody() {
+    let leader = solo_node_in_sovereign_group(1, policy(), Some("dev"))
+        .await
+        .expect("dev leader with no list");
+    let joiner = solo_node_in_sovereign_group(2, policy(), Some("dev"))
+        .await
+        .expect("dev member");
+    found(&leader).await;
+
+    let body = joined(&leader, &joiner).await;
+    assert_eq!(body["promoted"], json!(false), "{body}");
+
+    let resp = yubaba_test_harness::http()
+        .post(format!("{}/raft/promote-voter", leader.base_url))
+        .json(&json!({ "node_id": 2 }))
+        .send()
+        .await
+        .expect("POST /raft/promote-voter");
+    let code = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert_eq!(code, reqwest::StatusCode::FORBIDDEN, "{text}");
+    assert!(text.contains("--sovereign-voters"), "{text}");
+    assert_eq!(voter_ids(&leader).await, vec![1]);
 }
 
 /// The teeth. The scenario the gate exists for is a command typed against the

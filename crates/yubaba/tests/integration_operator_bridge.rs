@@ -105,6 +105,8 @@ fn operator_workload_spec(name: &str, tag: &str, port: u16) -> WorkloadSpec {
         },
         labels: Default::default(),
         durability: None,
+        db: Vec::new(),
+        capabilities: Vec::new(),
         annotations: Default::default(),
         files: Vec::new(),
     }

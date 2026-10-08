@@ -227,7 +227,6 @@ impl TestWorkspace {
                 address: cloud::config::ServiceAddress::front_door("test.local".to_string()),
                 description: None,
                 components: vec![],
-                db: cloud::DbCatalog::default(),
             },
             component: ServiceComponent {
                 mount: None,

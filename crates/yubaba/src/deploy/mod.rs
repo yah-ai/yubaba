@@ -1,7 +1,6 @@
 //! @yah:relay(R278, "Cross-cutter — Rollout API + gate evaluator (yubaba /v1/rollouts)")
 //! @yah:assignee(bundle-anthropic-miravel)
 //! @yah:at(2026-06-01T02:26:21Z)
-//! @yah:status(in-progress)
 //! @yah:parent(Q273)
 //! @yah:next("F1: POST /v1/rollouts with linear strategy + staging→prod (v1 slice per yah-yubaba-ci-cd.md)")
 //! @yah:next("F2: Prometheus gate evaluator — http_5xx_rate + p95_latency_ms gates")

@@ -77,7 +77,6 @@
 #
 # @yah:relay(R587, "Desktop auto-update: QED desktop-release publishes signed bundles + latest.json to R2; app checks cdn.yah.dev")
 # @yah:at(2026-07-01T06:46:23Z)
-# @yah:status(open)
 # @yah:assignee(agent:bundle-anthropic-glimmerstone)
 # @yah:handoff("R703-T5 re-scope (2026-08-05): T3 is DONE — app/yah/desktop/tauri.conf.json:52 already reads https://cdn.yah.dev/yah-desktop/latest.json.")
 # @yah:handoff("T1/T2 described a cdn.yah.dev/desktop/<version>/<triple>/ layout that never shipped. What DID ship is the yah-desktop/ prefix written by scripts/publish-desktop.sh, called from .yah/qed/desktop-release.toml's terminal publish step.")

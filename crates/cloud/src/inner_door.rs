@@ -336,6 +336,24 @@ struct RouteEntry<'a> {
 }
 
 /// Mirror of passway's `path_routes_file::MountDiscovery` (R936-B12).
+///
+/// @yah:ticket(R876-B20, "yubaba 0.8.43 writes `discover` into passway's path-routes file under schema_version 1, so any node with an older passway crash-loops its inner door; rollouts ship yubaba without the passway that can read its output")
+/// @yah:at(2026-10-08T07:05:09Z)
+/// @yah:assignee(agent:bundle-anthropic-glimmerstone)
+/// @yah:parent(R876)
+/// @yah:severity(high)
+/// @yah:next("Bump the path-routes schema for the `discover` shape: oss/passway/crates/passway/src/path_routes_file.rs SCHEMA_VERSION 1 -> 2, so a reader that cannot parse it fails at boot naming both numbers (the mechanism that module documents) instead of 'unknown field `discover`'.")
+/// @yah:next("Producer side (inner_door.rs): never write a routes schema the node's installed passway cannot read. The node has to advertise which schema its passway reads (e.g. passway reports it via a flag or its health, and yubaba reads it before writing). On a mismatch yubaba should refuse with a named error in its own log/health, not hand passway a file it will panic on.")
+/// @yah:next("Rollout side: scripts/hotship.sh and roll-node.sh already refuse kamaji/yubaba protocol skew (--allow-proto-skew). Give passway the same pairing with yubaba: refuse to ship yubaba alone onto a node whose passway reads an older routes schema than the new yubaba writes. The 0.8.43-h3..h6 dev rolls shipped kamaji+yubaba only, and nothing objected.")
+/// @yah:verify("Old passway (v1) + new yubaba (v2): yubaba reports the schema mismatch by name and leaves the existing routes file alone. No passway panic, no 503 for a door that was serving.")
+/// @yah:verify("`scripts/hotship.sh --nodes <n> --binaries yubaba` onto a node whose passway reads v1 refuses and names the passway that also has to ship (with an explicit override flag).")
+/// @yah:verify("path_routes_file.rs: a v1 file and a v2 file each parse in the binary that claims them; a v2 file in a v1-only reader fails at boot naming both numbers.")
+/// @yah:gotcha("Measured 2026-10-08 on dev (us-west-011, which hosts staging.noisetable.com): yubaba+kamaji 0.8.43-h6 came from /data/yah-bin/0.8.43-h6, which contains ONLY kamaji and yubaba (installed 2026-10-07 23:52 local), while /usr/local/bin/passway dated from 2026-09-22. passway-inner-noisetable-marketing panicked 1,526 times: 'invalid PASSWAY_PATH_ROUTES_FILE ... unknown field `discover`, expected one of `mount`, `upstreams`, `headers`'. staging.noisetable.com returned 503 'no ready upstreams' until working-tree passway 0.8.44-h2 was hotshipped to 011 around 06:59Z (013/014 got 0.8.44-h3). These are hotship bytes, not a release.")
+/// @yah:gotcha("Prod (us-west-001, us-east-001, us-south-001) runs a passway dated 2026-10-02 whose routes already carry `discover` and serve fine, so prod is not exposed today. Any node that skips a passway update is.")
+/// @yah:gotcha("path_routes_file.rs's own design note: schema_version exists because 'producer and consumer are separately released, so a rolling upgrade genuinely sees two versions at once'. Adding `discover` while keeping v1 bypassed the one mechanism built for this case.")
+/// @yah:files(oss/yubaba/crates/cloud/src/inner_door.rs)
+/// @yah:files(oss/passway/crates/passway/src/path_routes_file.rs)
+/// @yah:files(scripts/hotship.sh)
 #[derive(Debug, Serialize)]
 struct RouteDiscover<'a> {
     ident: String,
@@ -683,6 +701,8 @@ impl InnerDoorPlan {
             },
             labels: HashMap::new(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations,
             files: vec![InlineFile {
                 path: routes_path,
@@ -729,7 +749,6 @@ mod tests {
             address: crate::config::ServiceAddress::front_door(format!("{name}.test")),
             description: None,
             components,
-            db: Default::default(),
         }
     }
 

@@ -80,6 +80,8 @@ use openraft::raft::{
 use openraft::type_config::alias::{SnapshotOf, VoteOf};
 use openraft::{BasicNode, OptionalSend};
 use serde::de::DeserializeOwned;
+
+use yubaba_auth_token::{PeerClient, PeerSigner};
 use serde::Serialize;
 
 use super::YubabaRaftConfig as TC;
@@ -110,8 +112,8 @@ use super::YubabaRaftConfig as TC;
 /// connections instead of dialing fresh per round.
 ///
 /// @yah:ticket(R903-T1, "Get rustls-tls-native-roots out of the yubaba workspace's reqwest feature set (object_store hard-wires it)")
-/// @yah:at(2026-09-15T18:29:00Z)
-/// @yah:status(open)
+/// @yah:status(review)
+/// @yah:at(2026-10-07T16:31:26Z)
 /// @yah:assignee(agent:bundle-anthropic-ashguard)
 /// @yah:parent(R903)
 /// @yah:next("Tier: Cleric — dependency-graph change with a possible upstream leg; needs judgment, not speed. Operator chose this over leaving it (2026-09-15). GROUNDED: object_store-0.13.2/Cargo.toml:173 declares its reqwest dep with features [rustls-tls-native-roots, http2] unconditionally, enabled by the shared `cloud` feature that aws/azure/gcp/http all imply. turso-backup/Cargo.toml:31 takes object_store features=[aws] for S3-compatible storage (the S3 protocol, not Amazon specifically). Cargo feature unification then puts native roots on every reqwest 0.12 user in oss/yubaba, raft's plain-http transport included. object_store also offers `tls-webpki-roots`, but features are additive, so enabling it does not remove native roots.")
@@ -121,20 +123,34 @@ use super::YubabaRaftConfig as TC;
 /// @yah:verify("turso-backup S3 upload/download still work against R2 (webpki roots cover R2's public CA chain — confirm, don't assume)")
 /// @yah:files(oss/turso-backup/Cargo.toml)
 /// @yah:files(Cargo.toml)
+/// @yah:handoff("Option (1) won: object_store 0.14 (crates.io 0.14.0-0.14.2) dropped the hard-wired reqwest `rustls-tls-native-roots` — it moved to reqwest 0.13 with `rustls` (rustls-platform-verifier, read from reqwest-0.13.4/Cargo.toml:169). Bumped 0.13 -> 0.14 in lockstep: oss/turso-backup/Cargo.toml:31 (with the why), oss/yubaba/crates/tenant-streamer/Cargo.toml:51, oss/yubaba/crates/yubaba/Cargo.toml:224 (dev-dep), oss/roadcase/Cargo.toml:172. No source changes needed in turso-backup/yubaba. S3 traffic now rides a separate reqwest 0.13, so reqwest 0.12 (raft transport, test clients) carries no root-store feature at all.")
+/// @yah:verify("cargo tree --offline -p yubaba -e features -i reqwest@0.12.28 | grep -c native-roots -> 0 (measured 2026-10-07)")
+/// @yah:verify("cd oss/turso-backup && cargo check --all-targets -> EXIT 0")
+/// @yah:verify("Recreated interpose at /tmp/r903t1/trust_interpose.c (counts SecTrustSettingsCopyCertificates, writes /tmp/r903t1/calls.txt); main test binary at --test-threads=15: 99 passed / 0 failed in 38.6 s, calls=0")
+/// @yah:gotcha("NOT VERIFIED: (a) live R2 upload/download — no creds run; R2 now validates via the OS platform verifier (system trust store per handshake), which trusts R2's public CA chain on macOS/Linux by inference, not by test. (b) roadcase compile: its workspace fails to resolve before my change (`cheers-core = ^0.8.42` vs in-tree 0.8.43-pre.1, cheers pre-release bump); roadcase's object_store surface (signer::Signer uses http::Method in both 0.13 and 0.14, ClientOptions, RetryConfig, InMemory, LocalFileSystem) was read against 0.14.2 source only.")
+/// @yah:gotcha("yubaba workspace `--all-targets` check has 2 E0061 in tests/raft_appliance_ownership.rs:195/208 (member_registration/lease_renewal::spawn now take a PeerSigner) — a peer's in-flight change, unrelated to this bump.")
+/// @yah:gotcha("rustls-native-certs is still linked via hyper-rustls (instant-acme/passway-acme); it is not called on reqwest 0.12 client builds (calls=0 measured).")
 #[derive(Clone)]
 pub struct YubabaNetworkFactory {
-    client: reqwest::Client,
+    client: PeerClient,
 }
 
 impl YubabaNetworkFactory {
     /// Build the shared peer client. Fails only if the TLS backend cannot
     /// initialise — surfaced at raft open, not on the first election.
-    pub fn new() -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
+    ///
+    /// `signer` attaches a peer-tier token to every raft RPC (R876-T18): each
+    /// route this transport dials is `AuthClass::Peer` on the receiver, so a
+    /// node enforcing `--auth-mode require` drops an unsigned voter out of
+    /// its quorum.
+    pub fn new(signer: PeerSigner) -> anyhow::Result<Self> {
+        let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .map_err(|e| anyhow::anyhow!("building raft peer HTTP client: {e}"))?;
-        Ok(Self { client })
+        Ok(Self {
+            client: PeerClient::new(http, signer),
+        })
     }
 }
 
@@ -156,7 +172,7 @@ pub struct YubabaNetwork {
     #[allow(dead_code)]
     target: u64,
     base_url: String,
-    client: reqwest::Client,
+    client: PeerClient,
 }
 
 impl YubabaNetwork {
@@ -352,6 +368,10 @@ mod tests {
     /// Serve `router` on loopback and return a [`YubabaNetwork`] pointed at it.
     /// The server task is detached; it dies with the test runtime.
     async fn network_against(router: Router) -> YubabaNetwork {
+        signed_network_against(router, PeerSigner::unsigned()).await
+    }
+
+    async fn signed_network_against(router: Router, signer: PeerSigner) -> YubabaNetwork {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback");
@@ -359,10 +379,43 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, router).await.ok();
         });
-        YubabaNetworkFactory::new()
+        YubabaNetworkFactory::new(signer)
             .expect("raft peer client")
             .new_client(2, &BasicNode::new(addr.to_string()))
             .await
+    }
+
+    /// R876-T18: every raft RPC carries a peer token once the node has a
+    /// cluster key. Driven through pre-vote because its 404 arm needs no
+    /// well-formed raft reply, so the only thing under test is the header.
+    #[tokio::test]
+    async fn a_keyed_transport_signs_every_raft_rpc() {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let sink = seen.clone();
+        let router = Router::new().fallback(move |headers: axum::http::HeaderMap| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap().push(
+                    headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string),
+                );
+                axum::http::StatusCode::NOT_FOUND
+            }
+        });
+        let mut net =
+            signed_network_against(router, PeerSigner::from_fn(|| Ok("peer-tok".into()))).await;
+
+        net.pre_vote(
+            VoteRequest::new(candidate_vote(), None),
+            RPCOption::new(Duration::from_secs(5)),
+        )
+        .await
+        .expect("404 degrades to a grant");
+
+        assert_eq!(*seen.lock().unwrap(), vec![Some("Bearer peer-tok".to_string())]);
     }
 
     /// A peer whose build predates `/raft/pre-vote` answers 404 — and that must
@@ -433,7 +486,7 @@ mod tests {
                 .expect("bind loopback");
             listener.local_addr().expect("local addr")
         };
-        let mut net = YubabaNetworkFactory::new()
+        let mut net = YubabaNetworkFactory::new(PeerSigner::unsigned())
             .expect("raft peer client")
             .new_client(2, &BasicNode::new(addr.to_string()))
             .await;

@@ -246,16 +246,18 @@ pub fn parse_config(
 
 /// The declaration for one enrolled domain.
 ///
-/// `upstreams` is left empty: this module knows *where the tenant's TLS
-/// terminates*, not where their app runs. A passway with no backend answers 503
-/// rather than refusing to start, so a domain is routable and issuable before
-/// placement — which is the order onboarding actually happens in.
+/// `upstreams` is the record's own, usually empty: this module knows *where the
+/// tenant's TLS terminates*, not where their app runs. A passway with no backend
+/// answers 503 rather than refusing to start, so a domain is routable and
+/// issuable before placement — which is the order onboarding actually happens
+/// in. A record that states its backends (an inner door, R931-B12) or names
+/// where to discover them carries that through unchanged.
 pub fn declare(domain: &str, enrollment: &Enrollment, cfg: &TenantPasswayConfig) -> Workload {
     Workload::TenantPassway(TenantPasswayWorkload {
         domain: domain.to_string(),
         // The enrollment's own address, rendered once. See the module doc.
         listen: enrollment.tls_backend.to_string(),
-        upstreams: Vec::new(),
+        upstreams: enrollment.upstreams.clone(),
         tls: tls_paths(&cfg.cert_dir, domain),
         idle_ttl: cfg.idle_ttl,
         command: None,
@@ -1130,6 +1132,21 @@ mod tests {
         e.discover = Some(d.clone());
         match declare("staging.example.com", &e, &cfg()) {
             Workload::TenantPassway(w) => assert_eq!(w.discover, Some(d)),
+            _ => panic!("declare must produce a tenant passway"),
+        }
+    }
+
+    /// R931-B12: a door fronting an inner door is TOLD its backend — the
+    /// record's static set becomes the door's, with no discovery.
+    #[test]
+    fn declare_carries_the_records_static_upstreams_onto_the_door() {
+        let mut e = enrollment("127.0.0.1:8445");
+        e.upstreams = vec!["127.0.0.1:19123".into()];
+        match declare("staging.example.com", &e, &cfg()) {
+            Workload::TenantPassway(w) => {
+                assert_eq!(w.upstreams, vec!["127.0.0.1:19123".to_string()]);
+                assert_eq!(w.discover, None);
+            }
             _ => panic!("declare must produce a tenant passway"),
         }
     }

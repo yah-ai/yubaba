@@ -69,7 +69,7 @@ use std::sync::Arc;
 use yubaba::cluster_policy::ClusterPolicy;
 use yubaba::failure_detector::RaftHeartbeatDetector;
 use yubaba::lease_detector::{LeaseFailureDetector, RpoWatermarkRegistry};
-use yubaba::{identity, serve, ServerState, SovereignRole, DEFAULT_BIND, DEFAULT_STATE_PATH};
+use yubaba::{identity, serve, Participation, ServerState, DEFAULT_BIND, DEFAULT_STATE_PATH};
 
 /// Which [`ClusterPolicy`] this daemon runs under — the operator's one-time
 /// deployment choice (R118-T9).
@@ -124,8 +124,12 @@ const CONSTABLE_CONNECT_TIMEOUT_SECS: u64 = 5;
 /// per-box shim or a kamaji-side `Type=notify` change.
 const KAMAJI_CONNECT_BUDGET_SECS: u64 = 30;
 
+// `version = yubaba::VERSION`, not bare `version` (which is CARGO_PKG_VERSION):
+// a hot-shipped binary must not print a published release's version — the
+// same rule kamaji's `--version` follows. R605-F16 found a 0.8.43-h3 build
+// printing `yubaba 0.8.42` while its /health said 0.8.43-h3.
 #[derive(Parser)]
-#[command(version, about = "yah per-machine infrastructure daemon")]
+#[command(version = yubaba::VERSION, about = "yah per-machine infrastructure daemon")]
 struct Cli {
     /// Subcommand; defaults to `serve` so bare `yah-yubaba` boots the daemon.
     ///
@@ -235,27 +239,12 @@ enum Cmd {
         /// exit 2).
         #[arg(long = "kamaji-socket")]
         kamaji_socket: Option<PathBuf>,
-        /// R556-F6 gate (b) / A049 §federation: advertised endpoint of the
-        /// node-local scryer (`http://<mesh-ip>:6543`). When set, `GET
-        /// /services` carries the kamaji-managed scryer entry
-        /// (`ServerState::with_scryer_endpoint`) so consumers — hub Mode-1
-        /// federation, peers, tower — can locate it; unset, the node
-        /// advertises no scryer, which is correct for an opted-out box
-        /// (the mesh tolerates absence, A049 §"What scryer is not"). The
-        /// value names THIS node's own mesh IP so it is per-node config:
-        /// production sets it via a yubaba.service drop-in.
-        ///
-        /// `env =` FOR THE SAME REASON `--container-net` HAS ONE (R881-T5,
-        /// above): on a raft voter, `30-raft.conf` already re-declares this
-        /// unit's whole `ExecStart=` line, so a flag-only knob forces a THIRD
-        /// copy of that line into a later drop-in — and a copy is exactly how
-        /// a flag gets silently dropped when someone edits one of the other
-        /// two. `Environment=YUBABA_SCRYER_ENDPOINT=http://<mesh-ip>:6543`
-        /// composes instead. Added 2026-09-10 while wiring us-east-001
-        /// (R556-F6 gate (b)); that node runs 0.8.37-h1, which predates this,
-        /// so it carries the ExecStart re-declaration as a stated interim and
-        /// its drop-in names the `Environment=` line that replaces it.
-        #[arg(long, env = "YUBABA_SCRYER_ENDPOINT")]
+        /// RETIRED by R960-F8: `GET /services` is derived from the capabilities
+        /// the workloads on this node declare, and scryer is one of them. Still
+        /// parsed, and ignored with a warning, only so a node whose unit file
+        /// re-declares `ExecStart=` with this flag (us-east-001, R881-T5) still
+        /// boots across the roll. Delete once no unit passes it (R960 cleanup).
+        #[arg(long, env = "YUBABA_SCRYER_ENDPOINT", hide = true)]
         scryer_endpoint: Option<String>,
         /// Phase 2: this node's raft node ID (u64, unique per yubaba instance).
         /// When set, the raft coordination layer is started and `/raft/*`
@@ -384,32 +373,59 @@ enum Cmd {
         ///
         /// Requires `--raft-node-id`; without a cluster there is no join to
         /// refuse.
-        #[arg(long)]
-        sovereign_group: Option<String>,
-        /// R605-F12: whether this node may hold a seat in its sovereign group's
-        /// quorum — `voter` (default) or `non-voter`.
         ///
-        /// Copy it from the `sovereign_role` this machine declares in
+        /// R605-F37: on fleet nodes this arrives as `YUBABA_SOVEREIGN_GROUP`
+        /// from the rendered `90-sovereign.conf` drop-in
+        /// (`cloud::sovereign_unit`), never as a literal flag in an
+        /// `ExecStart=` — see that module for why. Same for the two below.
+        #[arg(long, env = "YUBABA_SOVEREIGN_GROUP")]
+        sovereign_group: Option<String>,
+        /// R605-F35: whether this node takes part in its sovereign group's
+        /// raft at all — `in` (default) or `out`.
+        ///
+        /// Copy it from the `sovereign_participation` this machine declares in
         /// `.yah/infra/machines/<name>.toml`, alongside `--sovereign-group`.
         /// Editing the TOML alone changes nothing on a running box.
         ///
-        /// `--sovereign-group` says WHICH blast radius this node is in;
-        /// this says whether it votes in it. The two are separate because a box
-        /// can legitimately share a group's secrets, upgrade cadence and
-        /// destruction without being fit to hold a quorum seat — us-west-003 is
-        /// prod's x86 build worker on a residential uplink, and a home-internet
-        /// partition must never be able to stall the prod raft.
+        /// `--sovereign-group` says WHICH blast radius this node is in; this
+        /// says whether it is in that group's raft. A box can legitimately share
+        /// a group's secrets, upgrade cadence and destruction without holding a
+        /// raft node id — us-west-003 is prod's x86 build worker on a
+        /// residential uplink, and it is `out`.
         ///
-        /// Passing `non-voter` makes `POST /raft/add-learner` refuse in both
-        /// directions: this node will not be joined into its group's quorum,
-        /// and if it somehow holds a raft seat already it refuses to grow the
-        /// quorum from it. Unset means `voter`, which is what declaring a group
-        /// alone meant before this flag existed.
+        /// It does NOT say whether this node votes: every `in` node joins as a
+        /// learner, and is promoted only if the group's voter list names it
+        /// (`--sovereign-voters`, on the leader). That replaced R605-F12's
+        /// per-node `--sovereign-role`.
         ///
-        /// Has no effect without `--sovereign-group`: a node in no group has no
-        /// quorum to be eligible for.
-        #[arg(long, default_value = "voter")]
-        sovereign_role: SovereignRole,
+        /// Passing `out` makes `POST /raft/add-learner` refuse in both
+        /// directions: this node will not be joined into its group's raft, and
+        /// if it somehow holds a raft seat already it refuses to grow the raft
+        /// from it.
+        ///
+        /// Has no effect without `--sovereign-group`.
+        #[arg(long, env = "YUBABA_SOVEREIGN_PARTICIPATION", default_value = "in")]
+        sovereign_participation: Participation,
+        /// R605-F35: the raft node ids this node's sovereign group seats as
+        /// voters, comma-separated — e.g. `--sovereign-voters 11,13,14`.
+        ///
+        /// Copy it from `.yah/infra/sovereign-groups/<group>.toml` (the
+        /// `raft_node_id` of each `[[voters]]` entry); every member of the
+        /// group should carry the same list, because whichever of them leads
+        /// is the one that reads it.
+        ///
+        /// It is consulted by every path that can hand out a vote —
+        /// `POST /raft/promote-voter`, the promotion `POST /raft/add-learner`
+        /// performs for a listed joiner, and the membership ratchet's
+        /// rehydrate — and a node not on it stays a learner. With
+        /// `--sovereign-group` set and this flag absent the list is EMPTY and
+        /// this node promotes nobody: the fail-closed reading, because a wrong
+        /// default here hands out a quorum seat.
+        ///
+        /// Has no effect without `--sovereign-group`. Not consulted by
+        /// `raft init`: the founding set is the operator naming every voter.
+        #[arg(long, env = "YUBABA_SOVEREIGN_VOTERS", value_delimiter = ',')]
+        sovereign_voters: Vec<u64>,
         /// R736-T3 (W250): the legal jurisdiction this node's data is bound to,
         /// e.g. `us` or `eu`.
         ///
@@ -771,8 +787,8 @@ enum AuthCmd {
         #[arg(long, default_value = "user:unknown")]
         subject: String,
         /// Lifetime in seconds. Capped by the node at
-        /// [`yubaba::http_auth::MAX_TOKEN_TTL_SECS`].
-        #[arg(long, default_value_t = yubaba::http_auth::DEFAULT_TOKEN_TTL_SECS)]
+        /// [`yubaba_auth_token::MAX_TOKEN_TTL_SECS`].
+        #[arg(long, default_value_t = yubaba_auth_token::DEFAULT_TOKEN_TTL_SECS)]
         ttl: i64,
     },
 }
@@ -1038,7 +1054,8 @@ fn default_serve() -> Cmd {
         ingress_floating_ip: None,
         public_address: None,
         sovereign_group: None,
-        sovereign_role: SovereignRole::default(),
+        sovereign_participation: Participation::default(),
+        sovereign_voters: Vec::new(),
         jurisdiction: None,
         leader_anchor: None,
         transit_cost_file: None,
@@ -1092,7 +1109,8 @@ async fn main() -> Result<()> {
             ingress_floating_ip,
             public_address,
             sovereign_group,
-            sovereign_role,
+            sovereign_participation,
+            sovereign_voters,
             jurisdiction,
             leader_anchor,
             transit_cost_file,
@@ -1224,12 +1242,13 @@ async fn main() -> Result<()> {
                 );
             }
 
-            // R556-F6 gate (b): make the /services scryer advertisement
-            // reachable from the daemon. `with_scryer_endpoint` existed since
-            // R556-T10 but nothing in the serve path called it, so a node
-            // running a scryer still answered `/services -> []`.
             if let Some(endpoint) = scryer_endpoint {
-                server_state = server_state.with_scryer_endpoint(endpoint);
+                tracing::warn!(
+                    %endpoint,
+                    "--scryer-endpoint / YUBABA_SCRYER_ENDPOINT is retired (R960-F8) and \
+                     ignored: /services now advertises scryer only when a deployed \
+                     scryer workload declares its capabilities"
+                );
             }
 
             #[cfg(feature = "litestream")]
@@ -1561,7 +1580,15 @@ async fn main() -> Result<()> {
             if let Some(node_id) = raft_node_id {
                 tracing::info!(node_id, dir = ?raft_dir, "starting raft coordination layer");
                 let (raft_node, state_machine) =
-                    yubaba::raft::open_with_state_machine(node_id, raft_dir, &policy).await?;
+                    yubaba::raft::open_with_state_machine(
+                        node_id,
+                        raft_dir,
+                        &policy,
+                        // R876-T18: raft RPC is signed with the cluster key
+                        // `with_http_auth` installed above (unsigned if none).
+                        server_state.http_auth.peer_signer(format!("node:{node_id}")),
+                    )
+                    .await?;
                 server_state = server_state
                     .with_raft(raft_node.clone())
                     .with_node_id(node_id)
@@ -1614,25 +1641,48 @@ async fn main() -> Result<()> {
                 if let Some(jurisdiction) = jurisdiction.clone() {
                     server_state = server_state.with_jurisdiction(jurisdiction);
                 }
-                // R605-F12: set unconditionally — it defaults to `voter`, so
-                // there is no "unset" to preserve, and the gate reads it only
-                // when a group is declared above.
-                server_state = server_state.with_sovereign_role(sovereign_role);
-                if !sovereign_role.is_voter() {
+                // R605-F35: set unconditionally — it defaults to `in`, so there
+                // is no "unset" to preserve, and the gate reads it only when a
+                // group is declared above.
+                server_state = server_state
+                    .with_sovereign_participation(sovereign_participation)
+                    .with_sovereign_voters(sovereign_voters.iter().copied());
+                if !sovereign_participation.is_in() {
                     // This branch has a --raft-node-id, so the node holds a
                     // raft seat while declaring it must not. Both halves came
                     // from the operator, so neither can be silently preferred —
                     // and the add-learner gate refuses every join here, which
                     // is a confusing symptom without this line above it.
                     tracing::warn!(
-                        role = %sovereign_role,
+                        participation = %sovereign_participation,
                         node_id,
-                        "--sovereign-role non-voter with a --raft-node-id: this node is holding \
-                         a raft seat its own declaration says it should not have. Joins through \
-                         it will be refused. Drop --raft-node-id (the us-west-003 shape: `mode: \
-                         standalone`), or correct sovereign_role in \
-                         .yah/infra/machines/<name>.toml and restart with --sovereign-role voter"
+                        "--sovereign-participation out with a --raft-node-id: this node is \
+                         holding a raft seat its own declaration says it should not have. Joins \
+                         through it will be refused. Drop --raft-node-id (the us-west-003 shape: \
+                         `mode: standalone`), or correct sovereign_participation in \
+                         .yah/infra/machines/<name>.toml and restart with \
+                         --sovereign-participation in"
                     );
+                }
+                match (&sovereign_group, sovereign_voters.is_empty()) {
+                    // R605-F35: the fail-closed case, said out loud at boot —
+                    // otherwise the symptom is a promote-voter 403 or a ratchet
+                    // that never rehydrates, with nothing pointing at the flag.
+                    (Some(group), true) => tracing::warn!(
+                        %group,
+                        node_id,
+                        "--sovereign-group without --sovereign-voters: this node holds no voter \
+                         list for its group, so while it leads it promotes NOBODY (promote-voter, \
+                         add-learner and the membership ratchet all refuse). Copy the raft ids \
+                         from .yah/infra/sovereign-groups/<group>.toml into --sovereign-voters"
+                    ),
+                    (None, false) => tracing::warn!(
+                        voters = ?sovereign_voters,
+                        "--sovereign-voters has no effect without --sovereign-group: a voter \
+                         list belongs to a group, and promotion here is the cluster policy's \
+                         alone"
+                    ),
+                    _ => {}
                 }
                 // W197 §"Single-node raft" (R482-T3): the BYO-VPS bootstrap
                 // path self-initialises a cluster-of-one so the node comes up
@@ -1710,6 +1760,7 @@ async fn main() -> Result<()> {
                         ingress_floating_ip,
                         public_address,
                     },
+                    shared_state.http.signer().clone(),
                 );
                 // R330-F17: fleet-wide service-record directory — polls every
                 // other member's `?ready=true` records and merges them,
@@ -1722,6 +1773,7 @@ async fn main() -> Result<()> {
                     state_machine.clone(),
                     Arc::clone(&shared_state.service_records),
                     Arc::clone(&shared_state.mesh_directory),
+                    shared_state.http.signer().clone(),
                 );
                 // R734-T4: soft leader pin. Started on every node, not just the
                 // leader — a follower's loop reaches `NotLeader` and does
@@ -1858,11 +1910,16 @@ async fn main() -> Result<()> {
                         raft_node.clone(),
                         state_machine.clone(),
                         policy,
+                        // R605-F35: the rehydrate half hands out votes with no
+                        // operator present, so it is the path the group's
+                        // voter list matters most on.
+                        shared_state.voter_seats(),
                         yubaba::membership_ratchet::RatchetConfig::default(),
                         // noisetable R118-T11: the epochs are this build's compile-time
                         // constants, handed to consensus as data — that crate
                         // does not read `cluster-epochs.json`, this one does.
                         yubaba::origin_source::build_epochs(),
+                        shared_state.http.signer().clone(),
                     )
                 });
                 // R118-T5: the rollout supervisor. Started on every node for
@@ -1889,6 +1946,7 @@ async fn main() -> Result<()> {
                     raft_node.clone(),
                     shared_state.lease_detector.clone(),
                     std::time::Duration::from_millis(policy.timing.heartbeat_interval_ms.max(1)),
+                    shared_state.http.signer().clone(),
                 );
                 // R737-T4: N+1 headroom accounting. Started on every node like
                 // the scheduler above; only the leader has real liveness
@@ -1978,6 +2036,7 @@ async fn main() -> Result<()> {
                                 raft_node,
                                 issuer_cfg,
                                 store,
+                                shared_state.http.signer().clone(),
                             );
                         }
                         None => tracing::error!(
@@ -2028,18 +2087,25 @@ async fn main() -> Result<()> {
                          group, and there is no raft cluster here to bind to a jurisdiction"
                     );
                 }
-                if !sovereign_role.is_voter() {
-                    // R605-F12. Not an error: this is the *expected* shape for
-                    // us-west-003 — a non-voting member runs standalone, with
-                    // no raft node id, which is exactly what the role declares.
-                    // Logged at info so the box's own logs record the claim,
-                    // because the only other place it appears is a TOML in a
-                    // camp this process cannot see.
+                if !sovereign_participation.is_in() {
+                    // R605-F35. Not an error: this is the *expected* shape for
+                    // us-west-003 — an `out` member runs standalone, with no
+                    // raft node id, which is exactly what it declares. Logged
+                    // at info so the box's own logs record the claim, because
+                    // the only other place it appears is a TOML in a camp this
+                    // process cannot see.
                     tracing::info!(
-                        role = %sovereign_role,
-                        "declared non-voting and running without --raft-node-id, which is the \
-                         consistent pair: this node holds no raft seat and asserts it should \
-                         not"
+                        participation = %sovereign_participation,
+                        "declared out of its group's raft and running without --raft-node-id, \
+                         which is the consistent pair: this node holds no raft seat and asserts \
+                         it should not"
+                    );
+                }
+                if !sovereign_voters.is_empty() {
+                    tracing::warn!(
+                        voters = ?sovereign_voters,
+                        "--sovereign-voters has no effect without --raft-node-id: there is no \
+                         raft cluster here for this node to promote anyone into"
                     );
                 }
                 if let Some(anchor) = &leader_anchor {
@@ -2992,8 +3058,6 @@ fn build_http_auth_policy(
 /// R876-B15: `yubaba auth …` — generate the keys `serve` trusts and mint the
 /// tokens a caller presents.
 fn run_auth_cmd(cmd: AuthCmd) -> Result<()> {
-    use yubaba::http_auth;
-
     /// Secrets land at 0600 or not at all — a key file the rest of the box
     /// can read is not a key.
     fn write_secret(path: &std::path::Path, contents: &str) -> Result<()> {
@@ -3011,7 +3075,7 @@ fn run_auth_cmd(cmd: AuthCmd) -> Result<()> {
     match cmd {
         AuthCmd::Keygen { secret_out } => {
             let (public, secret) =
-                http_auth::generate_operator_keypair_hex().map_err(|e| anyhow!(e))?;
+                yubaba_auth_token::generate_operator_keypair_hex().map_err(|e| anyhow!(e))?;
             // The public half on stdout unconditionally: it is what the
             // operator copies onto every node, and it is not a secret.
             println!("public {public}");
@@ -3025,7 +3089,7 @@ fn run_auth_cmd(cmd: AuthCmd) -> Result<()> {
             Ok(())
         }
         AuthCmd::ClusterKeygen { out } => {
-            let hex = http_auth::generate_cluster_key_hex().map_err(|e| anyhow!(e))?;
+            let hex = yubaba_auth_token::generate_cluster_key_hex().map_err(|e| anyhow!(e))?;
             match out {
                 Some(path) => {
                     write_secret(&path, &hex)?;
@@ -3053,16 +3117,16 @@ fn run_auth_cmd(cmd: AuthCmd) -> Result<()> {
                     let raw = std::fs::read_to_string(&path)
                         .with_context(|| format!("reading {}", path.display()))?;
                     let secret =
-                        http_auth::operator_secret_from_hex(raw.trim()).map_err(|e| anyhow!(e))?;
-                    http_auth::mint_operator_token(&secret, &subject, ttl, now)
+                        yubaba_auth_token::operator_secret_from_hex(raw.trim()).map_err(|e| anyhow!(e))?;
+                    yubaba_auth_token::mint_operator_token(&secret, &subject, ttl, now)
                         .map_err(|e| anyhow!(e))?
                 }
                 (None, Some(path)) => {
                     let raw = std::fs::read_to_string(&path)
                         .with_context(|| format!("reading {}", path.display()))?;
                     let key =
-                        http_auth::cluster_key_from_hex(raw.trim()).map_err(|e| anyhow!(e))?;
-                    http_auth::mint_peer_token(&key, &subject, ttl, now).map_err(|e| anyhow!(e))?
+                        yubaba_auth_token::cluster_key_from_hex(raw.trim()).map_err(|e| anyhow!(e))?;
+                    yubaba_auth_token::mint_peer_token(&key, &subject, ttl, now).map_err(|e| anyhow!(e))?
                 }
                 (None, None) => {
                     bail!("pass --secret-file (operator token) or --cluster-key-file (peer token)")

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use openraft::async_runtime::watch::WatchReceiver;
 use yubaba::cluster_policy::ClusterPolicy;
+use yubaba_auth_token::PeerSigner;
 use yubaba::raft::{self, YubabaRaft, YubabaRequest, YubabaResponse};
 
 /// Poll the raft metrics until `node_id` is the current leader, or panic after
@@ -58,7 +59,7 @@ fn voter_count(raft: &YubabaRaft) -> usize {
 #[tokio::test]
 async fn single_node_bootstrap_forms_a_live_one_voter_cluster() {
     let dir = tempfile::tempdir().unwrap();
-    let raft = raft::open(1, dir.path().to_path_buf(), &ClusterPolicy::fleet())
+    let raft = raft::open(1, dir.path().to_path_buf(), &ClusterPolicy::fleet(), PeerSigner::unsigned())
         .await
         .unwrap();
 
@@ -108,7 +109,7 @@ async fn bootstrap_is_idempotent_across_restart() {
 
     // First boot: initialise, elect, then shut down cleanly.
     {
-        let raft = raft::open(7, dir.path().to_path_buf(), &ClusterPolicy::fleet())
+        let raft = raft::open(7, dir.path().to_path_buf(), &ClusterPolicy::fleet(), PeerSigner::unsigned())
             .await
             .unwrap();
         assert!(
@@ -123,7 +124,7 @@ async fn bootstrap_is_idempotent_across_restart() {
 
     // Restart from the same state dir: vote/log state persisted, so bootstrap
     // is a no-op and the node picks its leadership back up.
-    let raft = raft::open(7, dir.path().to_path_buf(), &ClusterPolicy::fleet())
+    let raft = raft::open(7, dir.path().to_path_buf(), &ClusterPolicy::fleet(), PeerSigner::unsigned())
         .await
         .unwrap();
     let performed = raft::bootstrap_single_node(&raft, 7, "100.64.0.7:7443")

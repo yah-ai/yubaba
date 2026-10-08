@@ -51,6 +51,7 @@ mod raft_member_registration;
 mod raft_membership_loop;
 mod raft_membership_ratchet;
 mod raft_partition;
+mod raft_peer_auth;
 mod raft_pre_vote;
 mod raft_promote_voter;
 mod raft_quorum_geography;

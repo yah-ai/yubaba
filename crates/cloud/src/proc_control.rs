@@ -177,7 +177,6 @@ impl ProcState {
 ///
 /// @yah:relay(R866, "Deployed-credential drift: apply-time value fingerprints reported back over the ProcStatus rail")
 /// @yah:at(2026-09-05T08:47:33Z)
-/// @yah:status(open)
 /// @yah:assignee(agent:bundle-anthropic-ashguard)
 /// @arch:see(.yah/docs/working/W337-credential-health-and-rotation.md)
 /// @yah:depends_on(R556-F6)

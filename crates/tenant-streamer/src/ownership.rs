@@ -37,6 +37,7 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde::Deserialize;
 use workload_spec::TenantId;
+use yubaba_auth_token::{PeerClient, PeerSigner};
 
 /// yubaba's `TenantOutcome`, as it comes back over `POST /raft/write`.
 ///
@@ -112,15 +113,17 @@ pub trait OwnershipSource: Send + Sync {
 /// `POST /raft/write` that already carries every `YubabaRequest`, so renewing a
 /// lease needs no bespoke route.
 pub struct HttpOwnership {
-    client: reqwest::Client,
+    /// R876-T18: both routes are Peer-class on yubaba, so every request
+    /// carries a peer token when a cluster key is configured.
+    client: PeerClient,
     base_url: String,
     node_id: u64,
 }
 
 impl HttpOwnership {
-    pub fn new(base_url: impl Into<String>, node_id: u64) -> Self {
+    pub fn new(base_url: impl Into<String>, node_id: u64, signer: PeerSigner) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: PeerClient::new(reqwest::Client::new(), signer),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             node_id,
         }

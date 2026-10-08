@@ -63,9 +63,10 @@ pub fn spawn(
     raft: YubabaRaft,
     lease_detector: Option<Arc<LeaseFailureDetector>>,
     interval: Duration,
+    signer: yubaba_auth_token::PeerSigner,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        run(node_id, raft, lease_detector, interval).await;
+        run(node_id, raft, lease_detector, interval, signer).await;
     })
 }
 
@@ -129,9 +130,10 @@ async fn run(
     raft: YubabaRaft,
     lease_detector: Option<Arc<LeaseFailureDetector>>,
     interval: Duration,
+    signer: yubaba_auth_token::PeerSigner,
 ) {
     let client = match reqwest::Client::builder().timeout(RENEW_TIMEOUT).build() {
-        Ok(client) => client,
+        Ok(client) => yubaba_auth_token::PeerClient::new(client, signer),
         Err(e) => {
             // Same posture as member_registration: optional liveness metadata,
             // never worth taking the process down over a TLS backend failure.
@@ -220,7 +222,7 @@ fn dispatch_tick<F, Fut>(
     }
 }
 
-async fn post_renewal(client: reqwest::Client, node_id: YubabaNodeId, addr: String) {
+async fn post_renewal(client: yubaba_auth_token::PeerClient, node_id: YubabaNodeId, addr: String) {
     let url = format!("http://{addr}/mesh/lease-renew");
     match client
         .post(&url)

@@ -57,7 +57,6 @@
 //! assumption to build a new transport against now.
 //!
 //! @yah:ticket(R330-F17, "Nearest-first service-to-service routing: mesh discovery surfaces region, callers prefer same-region target")
-//! @yah:status(active)
 //! @yah:at(2026-09-13T19:56:57Z)
 //! @yah:assignee(agent:bundle-anthropic-miravel)
 //! @yah:parent(R523)
@@ -263,7 +262,7 @@ fn candidates_from_wire(
 /// every case [`run`] treats identically (keep the peer's last-known-good
 /// entry and try again next tick).
 async fn fetch_peer(
-    client: &reqwest::Client,
+    client: &yubaba_auth_token::PeerClient,
     addr: &str,
     locality: &NodeLocality,
 ) -> Result<HashMap<String, Vec<PeerCandidate>>, String> {
@@ -296,9 +295,10 @@ pub fn spawn(
     state_machine: YubabaStateMachine,
     service_records: Arc<ServiceRecords>,
     directory: Arc<MeshDirectory>,
+    signer: yubaba_auth_token::PeerSigner,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        run(node_id, state_machine, service_records, directory).await;
+        run(node_id, state_machine, service_records, directory, signer).await;
     })
 }
 
@@ -307,9 +307,10 @@ async fn run(
     state_machine: YubabaStateMachine,
     service_records: Arc<ServiceRecords>,
     directory: Arc<MeshDirectory>,
+    signer: yubaba_auth_token::PeerSigner,
 ) {
     let client = match reqwest::Client::builder().timeout(FETCH_TIMEOUT).build() {
-        Ok(c) => c,
+        Ok(c) => yubaba_auth_token::PeerClient::new(c, signer),
         Err(e) => {
             warn!("mesh directory: could not build HTTP client, not polling: {e}");
             return;

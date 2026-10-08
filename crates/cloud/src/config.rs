@@ -1,15 +1,4 @@
-//! @yah:ticket(R040-F16, "pg-on-mesh service recipe: bind tailscale0 + pg_hba.conf snippet + ufw rules")
-//! @yah:at(2026-05-05T00:32:34Z)
-//! @yah:assignee(agent:claude)
-//! @yah:status(review)
-//! @yah:parent(R040)
-//! @yah:handoff("Companion to R040-F15. Inter-node TCP (Postgres primary↔replica, NATS clusters, anything raw-protocol) lives on the Headscale mesh, not on Hetzner public IPs. Each node has a stable 100.64.x.x mesh IP that survives replacement of the underlying box, so DNS / config / pg_hba never churn when a CPX-11 is rebuilt. WireGuard already encrypts the wire — TLS becomes defense-in-depth, not load-bearing. This ticket carries the concrete pg-shaped recipe so the first stateful service deploy doesn't have to re-derive the pattern; subsequent services (redis, NATS, etc.) cargo-cult from it.")
-//! @yah:next("ServiceConfig gains a `bind_interface: Option<String>` field (e.g. `Some(\"tailscale0\")` for mesh-only services). The cloud-init/podman compose renderer translates this into either `--network host` + `pg listen_addresses = '<mesh-ip>'` OR a podman macvlan/host-binding pattern that achieves the same.")
-//! @yah:next("Generated pg_hba.conf snippet: allow the mesh subnet (100.64.0.0/10) for replication + app users. Postgres binds to the node's tailscale0 mesh IP only — `listen_addresses` is templated from the node's `tailscale ip --4` at first boot.")
-//! @yah:next("Generated ufw rules: `ufw allow in on tailscale0 to any port 5432; ufw deny 5432` — mirrors the existing yah-yubaba 7443 pattern in mirror.yml. Same shape works for any mesh-only port.")
-//! @yah:next("Replica connection string uses primary's mesh IP, NOT its public IP. Stable across box replacement.")
-//! @yah:next("Out of scope: pg_basebackup orchestration, failover, WAL archiving — those belong in noisetable's domain; this ticket only standardizes the binding/firewall/auth shape so noisetable's pg deployment doesn't reinvent it.")
-//!
+//! archived: R040 — history: `yah board history oss/yubaba/crates/cloud/src/config.rs`
 //!
 //! @yah:ticket(R323-F9, "Add sync-wave ordering to ServiceComponent (deploy-panel wave order)")
 //! @yah:assignee(agent:claude)
@@ -30,7 +19,6 @@
 //!
 //! @yah:relay(R615, "Linked infra sources: sources.toml overlay so a camp can borrow another camp's substrate")
 //! @yah:at(2026-07-20T18:18:05Z)
-//! @yah:status(open)
 //! @arch:see(.yah/docs/working/W274-linked-infra-sources.md)
 //!
 //! @yah:ticket(R615-F1, "InfraSource types + SourcesConfig::load(infra_dir) parsing .yah/infra/sources.toml")
@@ -258,8 +246,8 @@ use std::path::Path;
 use thiserror::Error;
 use workload_spec::secrets::SecretAccess;
 use workload_spec::sovereign::Membership;
-pub use workload_spec::sovereign::SovereignRole;
-use workload_spec::{validate, LifecycleArchetype, Locality, WorkloadSpec};
+pub use workload_spec::sovereign::Participation;
+use workload_spec::{validate, LifecycleArchetype, Locality, WorkbenchKind, WorkloadSpec};
 
 /// Static node capacity declaration on `machine.toml` (R572-F3).
 ///
@@ -581,9 +569,11 @@ pub struct MachineConfig {
     /// Which consensus group this node belongs to — W305/R742-F1. `None` means
     /// standalone: in no group at all, which is us-west-002 and us-west-015.
     ///
-    /// Membership is not by itself quorum eligibility; that is
-    /// [`sovereign_role`](Self::sovereign_role), added by R605-F12 because
-    /// us-west-003 is in prod's blast radius *and* must never vote in it.
+    /// Membership is not by itself raft participation, and neither is a quorum
+    /// seat: whether the node is in the group's raft at all is
+    /// [`sovereign_participation`](Self::sovereign_participation), and which
+    /// participants vote is the *group's* declaration,
+    /// [`SovereignGroupConfig`] (R605-F35).
     ///
     /// **Not a placement input.** It is deliberately absent from
     /// [`RequiredSpec::matches`], and adding it there would be a category
@@ -613,30 +603,42 @@ pub struct MachineConfig {
     /// carries structure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sovereign_group: Option<String>,
-    /// Whether this node may hold a seat in its group's quorum — R605-F12.
-    /// Meaningless without [`sovereign_group`](Self::sovereign_group): a
-    /// standalone box has no quorum to be eligible for.
+    /// Whether this node takes part in its group's raft at all — R605-F35,
+    /// replacing R605-F12's per-node `sovereign_role`. Meaningless without
+    /// [`sovereign_group`](Self::sovereign_group): a standalone box has no
+    /// group raft to take part in.
     ///
-    /// **`None` is "not written", not a third role.** Read it through
-    /// [`sovereign_membership`](Self::sovereign_membership), which resolves the
-    /// absence to [`SovereignRole::Voter`] — what declaring a group has always
-    /// meant, so the six nodes stamped before this field keep their seats
-    /// without an edit. The distinction is kept only so
-    /// [`crate::validate::check_unroled_sovereign_members`] can tell an
-    /// operator who *chose* voter from one who never considered the question;
-    /// no join decision reads the `Option` directly.
+    /// `in` (the default, and what declaring a group has always meant) joins
+    /// the raft **as a learner**; it gets a vote only if the group's
+    /// [`SovereignGroupConfig`] lists it. `out` stays out entirely — us-west-003,
+    /// prod's build worker on a residential uplink, which must never hold a
+    /// raft node id. Who votes is deliberately *not* expressible here: a
+    /// per-node voter flag spreads quorum composition across N files and can
+    /// say nothing about where the voters sit (operator, 2026-10-06).
+    ///
+    /// A silent default is safe here in a way the role it replaces was not:
+    /// the worst an unwritten `in` can grant is a learner seat, never a vote.
     ///
     /// # Why this is not a taint
     ///
-    /// It was, once: `no-voter` sat in [`taints`](Self::taints) on three nodes
-    /// for months, read by nothing, and R742-T4 removed it because the taint
-    /// list is a *placement* vocabulary and this is not a placement input (see
-    /// [`taint_effect`]). Nor is it a second group label. It is a modifier on
-    /// the membership this node already declares, which is why it lives beside
-    /// the group and is judged with it in one predicate,
+    /// R605-F12's role was one, once: `no-voter` sat in [`taints`](Self::taints)
+    /// on three nodes for months, read by nothing, and R742-T4 removed it
+    /// because the taint list is a *placement* vocabulary and this is not a
+    /// placement input (see [`taint_effect`]). It is a modifier on the
+    /// membership this node already declares, judged with it in one predicate,
     /// [`workload_spec::sovereign::join_permitted`].
+    #[serde(default, skip_serializing_if = "Participation::is_in")]
+    pub sovereign_participation: Participation,
+    /// The physical machine this one runs on, when this one is a VM — R605-F35.
+    /// `None` means metal: the machine is its own host.
+    ///
+    /// Read by exactly one rule: two voters a sovereign group lists may not
+    /// share a physical host (`yah cloud validate`,
+    /// [`crate::validate::check_sovereign_groups`]), because one box's loss
+    /// would then take two seats. The co-located dev members R605-F16 runs on
+    /// the three Pis name their Pi here. Not a placement input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sovereign_role: Option<SovereignRole>,
+    pub host_machine: Option<String>,
     /// `[registration]` — the observed half (R707-T1). Empty until the box has
     /// been attached / mesh-joined. See [`MachineRegistration`].
     #[serde(default, skip_serializing_if = "MachineRegistration::is_empty")]
@@ -736,12 +738,15 @@ pub enum JoinVerdict {
     Refuse(String),
 }
 
-/// May `joiner` join the cluster `target` belongs to? — W305/R742-F1.
+/// May `joiner` join — as a learner — the cluster `target` belongs to? —
+/// W305/R742-F1.
 ///
 /// **A join is permitted iff both nodes declare the same non-`None`
-/// [`sovereign_group`](MachineConfig::sovereign_group) and both are
-/// [`SovereignRole::Voter`].** One rule, no special cases, and it makes the
-/// declaration mandatory before any quorum grows.
+/// [`sovereign_group`](MachineConfig::sovereign_group) and both participate
+/// ([`Participation::In`]).** One rule, no special cases, and it makes the
+/// declaration mandatory before any raft grows. A permit grants a learner
+/// join; whether the joiner then votes is the group's voter list
+/// ([`CloudConfig::voting_group`]), not this function (R605-F35).
 ///
 /// The case this exists for is two *different* declared groups: joining a dev
 /// Pi into prod is refused rather than trusted, where today the only guard is
@@ -756,22 +761,23 @@ pub enum JoinVerdict {
 /// and us-west-002/015 are deliberately in no group at all. Adding a real
 /// member means declaring it first, which is the point.
 ///
-/// # The non-voting refusal (R605-F12)
+/// # The `out` refusal (R605-F12, reshaped by R605-F35)
 ///
 /// Same group and still refused, when either side declares
-/// [`SovereignRole::NonVoter`]. This is the case a group label alone could not
+/// [`Participation::Out`]. This is the case a group label alone could not
 /// express. us-west-003 is a residential-uplink build box the operator counts
 /// as part of prod — same secrets, same upgrade cadence, same destruction — and
-/// which must never hold a prod raft seat, because a home-internet partition
-/// should not be able to stall the quorum. Until R605-F12 the only thing
+/// which must never hold a prod raft node id. Until R605-F12 the only thing
 /// refusing it was its *absent* stamp, so recording the operator's real intent
 /// (`sovereign_group = "prod"`) would have removed the guard. Now the intent
-/// and the guard are the same two lines.
+/// and the guard are the same two lines. (R605-F12 spelled this
+/// `sovereign_role = "non-voter"`; R605-F35 moved who-votes onto the group, and
+/// what stayed on the node is only whether it is in the raft.)
 ///
-/// Note what this is not: the refusal here is about *voting*, and it says
+/// Note what this is not: the refusal here is about the *raft*, and it says
 /// nothing about the mesh. One mesh spans the whole fleet regardless of group
-/// or role (operator, 2026-08-19); a non-voter is reachable, schedulable and
-/// rollable like any other node.
+/// or participation (operator, 2026-08-19); an `out` node is reachable,
+/// schedulable and rollable like any other node.
 ///
 /// This is the **camp-side** rendering of the rule. The predicate itself lives
 /// in [`workload_spec::sovereign::join_permitted`] because yubaba's
@@ -793,9 +799,9 @@ pub fn judge_join(joiner: &MachineConfig, target: &MachineConfig) -> JoinVerdict
             m.name
         )
     };
-    let role_hint = |m: &MachineConfig| {
+    let participation_hint = |m: &MachineConfig| {
         format!(
-            "set `sovereign_role = \"voter\"` in .yah/infra/machines/{}.toml",
+            "set `sovereign_participation = \"in\"` in .yah/infra/machines/{}.toml",
             m.name
         )
     };
@@ -811,34 +817,35 @@ pub fn judge_join(joiner: &MachineConfig, target: &MachineConfig) -> JoinVerdict
     );
     // Everything below is a refusal; the only permitted shape returned above.
     //
-    // R605-F12: when both sides name the SAME group, the role is the only thing
-    // left that can have refused, and it gets its own message. Falling through
-    // to the arms below would print "cross-group join refused: 'us-west-003' is
-    // in "prod" and 'us-west-001' is in "prod"" — a message that reads as a bug
-    // in the check rather than a decision about the fleet.
+    // R605-F35: when both sides name the SAME group, participation is the only
+    // thing left that can have refused, and it gets its own message. Falling
+    // through to the arms below would print "cross-group join refused:
+    // 'us-west-003' is in "prod" and 'us-west-001' is in "prod"" — a message
+    // that reads as a bug in the check rather than a decision about the fleet.
     //
-    // Deliberately not hoisted above the group comparison. A non-voting joiner
-    // whose target is standalone is refused for *both* reasons, and naming the
-    // role there would send the operator to fix a field that would not have
-    // made the join legal anyway.
+    // Deliberately not hoisted above the group comparison. An `out` joiner
+    // whose target is standalone is refused for *both* reasons, and naming
+    // participation there would send the operator to fix a field that would
+    // not have made the join legal anyway.
     if let (Some(a), Some(b)) = (j, t) {
         if a == b {
             for (m, side, other) in [
                 (joiner, "the joiner", &target.name),
                 (target, "the target", &joiner.name),
             ] {
-                if m.sovereign_membership().role.is_voter() {
+                if m.sovereign_participation.is_in() {
                     continue;
                 }
                 return JoinVerdict::Refuse(format!(
-                    "join refused: {side} '{}' is a NON-VOTING member of sovereign group {a:?}, \
-                     the same group as '{other}'. It is inside that blast radius — same secrets, \
-                     same upgrade cadence, same destruction — but declares itself ineligible for \
-                     the quorum, so this is refused by declaration rather than by omission. If it \
-                     should genuinely vote, {}; if it should not, this refusal is the field doing \
-                     its job and the join is the thing to reconsider.",
+                    "join refused: {side} '{}' declares itself OUT of sovereign group {a:?}'s \
+                     raft, the same group as '{other}'. It is inside that blast radius — same \
+                     secrets, same upgrade cadence, same destruction — but takes no part in its \
+                     raft, so this is refused by declaration rather than by omission. If it \
+                     should genuinely join, {} (it joins as a learner; a vote additionally needs \
+                     .yah/infra/sovereign-groups/{a}.toml to list it); if it should not, this \
+                     refusal is the field doing its job and the join is the thing to reconsider.",
                     m.name,
-                    role_hint(m),
+                    participation_hint(m),
                 ));
             }
         }
@@ -884,20 +891,85 @@ pub fn judge_join(joiner: &MachineConfig, target: &MachineConfig) -> JoinVerdict
     }
 }
 
+/// `.yah/infra/sovereign-groups/<group>.toml` — a sovereign group's quorum
+/// composition (R605-F35).
+///
+/// Membership in a group is each machine's own
+/// [`sovereign_group`](MachineConfig::sovereign_group) stamp, and whether a
+/// member is in the group's raft at all is its
+/// [`sovereign_participation`](MachineConfig::sovereign_participation). This
+/// file owns the third fact and only that one: **which participants hold a
+/// quorum seat.** Every participant joins as a learner; the leader promotes it
+/// only if it is listed here.
+///
+/// The list lives on the group rather than on each machine because that is the
+/// only place it can be checked whole (operator, 2026-10-06): a per-node voter
+/// flag cannot say "three voters, on three different hosts", and once several
+/// members share one box (R605-F16's VMs on the dev Pis) where the voters sit
+/// decides whether one box's loss loses consensus.
+/// [`crate::validate::check_sovereign_groups`] holds it to that.
+///
+/// The daemon never reads this file. Its voter ids reach a node as
+/// `yubaba serve --sovereign-voters`, the same way a machine's group stamp
+/// reaches it as `--sovereign-group`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SovereignGroupConfig {
+    /// The group's label — what members write as `sovereign_group`. Must equal
+    /// the file stem.
+    pub name: String,
+    /// The quorum seats, one `[[voters]]` table each. Order is not
+    /// significant.
+    #[serde(default)]
+    pub voters: Vec<SovereignVoter>,
+}
+
+/// One quorum seat in a [`SovereignGroupConfig`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SovereignVoter {
+    /// The machine holding the seat — a `.yah/infra/machines/<name>.toml` that
+    /// declares this group and `sovereign_participation = "in"`.
+    pub machine: String,
+    /// The seat's identity on the wire: the `--raft-node-id` that machine's
+    /// yubaba runs with. A leader judges promotion by raft id, never by name —
+    /// a daemon does not know its machine file's name — so this is the value
+    /// `yubaba serve --sovereign-voters` carries.
+    pub raft_node_id: u64,
+}
+
+impl SovereignGroupConfig {
+    /// Does this group seat `machine`?
+    pub fn lists(&self, machine: &str) -> bool {
+        self.voters.iter().any(|v| v.machine == machine)
+    }
+
+    /// The `--sovereign-voters` value for this group's daemons: raft ids,
+    /// sorted, comma-separated.
+    pub fn voters_flag(&self) -> String {
+        let mut ids: Vec<u64> = self.voters.iter().map(|v| v.raft_node_id).collect();
+        ids.sort_unstable();
+        ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
+    }
+}
+
 impl MachineConfig {
     /// This node's declared place in a sovereign group, as the shared join rule
-    /// wants it — R605-F12.
-    ///
-    /// The one place `sovereign_role`'s `None` is resolved. Absence means
-    /// [`SovereignRole::Voter`], which is what declaring a group meant before
-    /// the role existed; resolving it here rather than at each call site is what
-    /// keeps the camp-side and node-side gates from disagreeing about a node
-    /// that never wrote the field.
+    /// wants it — R605-F35. Says nothing about a quorum seat: that is
+    /// [`CloudConfig::voting_group`].
     pub fn sovereign_membership(&self) -> Membership<'_> {
         Membership {
             group: self.sovereign_group.as_deref(),
-            role: self.sovereign_role.unwrap_or_default(),
+            participation: self.sovereign_participation,
         }
+    }
+
+    /// The physical machine this one runs on: [`host_machine`](Self::host_machine)
+    /// for a VM, the machine itself for metal (R605-F35).
+    pub fn physical_host(&self) -> &str {
+        self.host_machine.as_deref().unwrap_or(&self.name)
     }
 
     /// Provider DC code, or `""` when omitted (static nodes). Most readers want
@@ -1480,6 +1552,11 @@ pub struct CloudConfig {
     pub machines: Vec<MachineConfig>,
     /// `.yah/infra/providers/<id>.toml`
     pub providers: Vec<ProviderConfig>,
+    /// `.yah/infra/sovereign-groups/<group>.toml` — each sovereign group's
+    /// quorum composition (R605-F35). Camp-local only, like the lints that
+    /// judge it: a borrowed fleet's groups are declared, and fixed, in its own
+    /// tree.
+    pub sovereign_groups: Vec<SovereignGroupConfig>,
     /// Provenance for every entry in `machines` that came from a linked
     /// `.yah/infra/sources.toml` source rather than this camp's own
     /// `.yah/infra/machines/` (R615-F2 / W274). Keyed by
@@ -1620,6 +1697,9 @@ impl CloudConfig {
             workspace_root: workspace_root.to_path_buf(),
             machines: fleet.machines,
             providers,
+            sovereign_groups: load_dir::<SovereignGroupConfig>(
+                crate::paths::sovereign_groups_dir(workspace_root),
+            )?,
             machine_origins: fleet.origins,
             provider_origins,
             // Local, offline, and absent in most camps — the journal replays to
@@ -1670,11 +1750,14 @@ impl CloudConfig {
         Self::cross_ref_validate(&providers, &services, &domains)?;
 
         let machines = load_dir::<MachineConfig>(config_dir.join("infra").join("machines"))?;
+        let sovereign_groups =
+            load_dir::<SovereignGroupConfig>(config_dir.join("infra").join("sovereign-groups"))?;
 
         Ok(Self {
             workspace_root: workspace_root.to_path_buf(),
             machines,
             providers,
+            sovereign_groups,
             machine_origins: BTreeMap::new(),
             provider_origins: BTreeMap::new(),
             // Same reasoning as the sources overlay above: the recovery journal
@@ -1961,6 +2044,38 @@ impl CloudConfig {
             .iter()
             .filter(|m| m.sovereign_group.as_deref() == Some(group))
             .collect()
+    }
+
+    /// The declaration for sovereign group `group`
+    /// (`.yah/infra/sovereign-groups/<group>.toml`), if one exists — R605-F35.
+    pub fn sovereign_group_decl(&self, group: &str) -> Option<&SovereignGroupConfig> {
+        self.sovereign_groups.iter().find(|g| g.name == group)
+    }
+
+    /// The group `m` holds a **quorum seat** in, if any — R605-F35.
+    ///
+    /// `Some(group)` only when all three declarations agree: `m` stamps
+    /// `group`, takes part in its raft, and the group's file lists it. Anything
+    /// less is no seat — an unlisted participant is a learner, an `out` member
+    /// is outside the raft, and a group with no file seats nobody — which is
+    /// the reading the leader applies on the wire, so the camp's picture of who
+    /// votes cannot be more generous than the cluster's. (A listed voter that
+    /// is not a participant is a `yah cloud validate` error, not a seat.)
+    pub fn voting_group<'a>(&'a self, m: &'a MachineConfig) -> Option<&'a str> {
+        let group = m.sovereign_group.as_deref()?;
+        let listed = self.sovereign_group_decl(group)?.lists(&m.name);
+        (listed && m.sovereign_participation.is_in()).then_some(group)
+    }
+
+    /// How many quorum seats `group` holds by declaration — the denominator a
+    /// lost-voter quorum calculation needs (R605-F35). Counts listed voters
+    /// that are participating members of the group, i.e. exactly the machines
+    /// [`Self::voting_group`] answers `Some(group)` for.
+    pub fn seated_voters(&self, group: &str) -> usize {
+        self.machines_in_group(group)
+            .into_iter()
+            .filter(|m| self.voting_group(m).is_some())
+            .count()
     }
 
     /// Every distinct `sovereign_group` declared by any machine, sorted.
@@ -2884,17 +2999,16 @@ fn load_providers(dir: &Path) -> Result<Vec<ProviderConfig>> {
 ///
 /// Canonical tiers: `dev` / `pond` / `prod` / `ha`.
 /// Legacy stems pre-R362: `local` (dev tier), `local-sim` / `sim` (pond tier).
-/// Legacy stem `cloud` (prod tier) — renamed 2026-09-14: "cloud" named the
-/// deployment mechanism, not the environment, and every operator-facing
-/// surface already said "prod" (`yah cloud apply --env prod`, `mirror up ...
-/// for prod`, the mirror files themselves are `prod.toml`) while only this
-/// loader's internal key disagreed.
 /// Both forms are accepted; canonical names are preferred for new files.
+///
+/// `cloud` is NOT a legacy alias for `prod` any more. It was renamed
+/// 2026-09-14 ("cloud" named the deployment mechanism, not the environment)
+/// and the alias was deleted 2026-10-07 once no camp on the machine carried a
+/// `mirrors/cloud.toml`. A `cloud.toml` now loads as an unknown `cloud` tier.
 pub fn canonical_tier(stem: &str) -> &str {
     match stem {
         "local" => "dev",
         "local-sim" | "sim" => "pond",
-        "cloud" => "prod",
         other => other,
     }
 }
@@ -3033,6 +3147,35 @@ pub(crate) fn load_domains(dir: &Path) -> Result<BTreeMap<String, DomainConfig>>
 }
 
 /// Load and shape-validate all `*.toml` files in `dir` as [`WorkloadConfig`].
+///
+/// @yah:relay(R959, "Lower .yah/services/<svc> + mirror into the WorkloadSpec: one owner of what runs, retire the hand-written duplicates")
+/// @yah:phase(P1)
+/// @yah:at(2026-10-08T06:32:15Z)
+/// @yah:assignee(bundle-anthropic-ashguard)
+/// @yah:next("Operator priority, 2026-10-07: raised while settling W358 decision 7. Today a fleet service is declared twice and nothing derives one declaration from the other. `.yah/services/<svc>/service.toml` + `mirrors/*.toml` own the components, providers and ingress doors. The runtime `WorkloadSpec` is a hand-written `.yah/infra/workloads/*.toml` read by `load_workloads`. Live examples: `yah-cloud-admin` (service dir + workloads/yah-cloud-admin.toml); in the noisetable camp, `noisetable-api` (service whose staging mirror's ingress fronts the workload) + `noisetable-account(-staging).toml`.")
+/// @yah:next("Goal: the service + mirror lowers into the WorkloadSpec, so the hand-written TOML is generated, not authored. Per the pre-1.0 rule the generated form replaces the hand-written one; no reading both. W358 puts `[[db]]` on the WorkloadSpec beside `durability` and `expose.mesh`, so that block has to round-trip through this lowering. Sequence the cutover as a roll (live workloads on the fleet), not a flag day.")
+/// @yah:next("First phase is design, not code: write the W-doc (or extend W257/W338 if one already owns 'what runs') that names the mapping from service/mirror fields to WorkloadSpec fields, which fields have no service-side source today, and the migration of existing workload TOMLs in BOTH camps.")
+/// @yah:assumes("No lowering exists. Measured 2026-10-07 by searching app/yah/cli/src and oss/yubaba/crates/cloud/src for any function that constructs a WorkloadSpec from ServiceConfig/mirror config; none outside tests. Re-verify before designing; a search can miss a builder spelled differently.")
+/// @arch:see(.yah/docs/working/W358-data-connections-remote-dbs-through-the-vault.md)
+/// @arch:see(.yah/docs/working/W257-camp-as-placeable-workload-fleet.md)
+/// @arch:see(.yah/docs/working/W338-workload-dependencies-and-appliance-composition.md)
+/// @yah:handoff("P1 DESIGN DONE: .yah/docs/working/W361-service-lowers-to-workload-spec.md. It holds the field mapping (service/mirror -> WorkloadSpec), the fields with no service-side source (image, resources, env/secrets/volumes, durability, [[db]], stop policy, requires), which now move into two layers (service.toml [components.workload] base + mirrors/<env>.toml [workload.<component>] overlay), and the per-workload no-op migration for both camps (17 files; only 4 have a service today).")
+/// @yah:handoff("Assumption re-verified: no production code builds a WorkloadSpec from ServiceConfig/MirrorConfig. The only precedents are self-synthesised: native_support::native_spec via smtp_driver, headscale_appliance::appliance_spec, and the pond SSR lowering. Today the mirror and its workload are joined only by agreeing strings: resolve_workload_ident (cloud.rs:9688), inner_door::component_workload_ident, plus hand-restated ports/hostnames/health paths.")
+/// @yah:handoff("OPERATOR DECISIONS (form F4334, recorded in W361): all serviceless workloads become services (noisetable compiler/coordinator/seed/relay; a yah `dev-rig` service for the vm-us-west-* guests); the env-invariant body lives in service.toml; the lowered spec is in-memory only, and .yah/infra/workloads/ gets deleted, not generated.")
+/// @yah:handoff("Filed children: R959-F1 (lower() + types), F2 (readers + `workload lower --diff` + double-declaration refusal + image scripts), T3 (migrate yah camp), T4 (migrate noisetable camp, which needs a release first), T5 (delete the disk reader + schema/TS regen). Dependencies are wired.")
+/// @yah:handoff("GIT (policy defer, NOT run): git add .yah/docs/working/W361-service-lowers-to-workload-spec.md oss/yubaba/crates/cloud/src/config.rs && git commit -m 'R959 P1: W361 service->WorkloadSpec lowering design; file F1-T5'")
+/// @yah:handoff("Tree anchor at handoff: 1dfbb17b4c078b509a11d26896e5214c48f5b67d — the shared tree as I left it. Diff against it (`git diff 1dfbb17b4c078b509a11d26896e5214c48f5b67d..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+/// @yah:next("Claim R959-F1 next. Read its gotchas first: the field addition touches about 100 struct literals across 20 files, and R960 peers are editing config.rs.")
+/// The camp's own spec for one workload, by name, through [`load_workloads`]
+/// (same files the camp deploys, same shape validation).
+pub fn load_workload(camp_root: &Path, name: &str) -> Result<WorkloadSpec> {
+    load_workloads(crate::paths::workloads_dir(camp_root))?
+        .into_iter()
+        .map(|w| w.spec)
+        .find(|s| s.name == name)
+        .with_context(|| format!("no workload `{name}` under {}", crate::paths::workloads_dir(camp_root).display()))
+}
+
 fn load_workloads(dir: std::path::PathBuf) -> Result<Vec<WorkloadConfig>> {
     if !dir.exists() {
         return Ok(vec![]);
@@ -3672,13 +3815,6 @@ pub struct ServiceConfig {
     pub address: ServiceAddress,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<ServiceComponent>,
-    /// Databases this service exposes, grouped by environment (W241). Every
-    /// entry becomes a data-workbench / `sql_*` catalog id of the shape
-    /// `<env>:<service>:<name>` (e.g. `pond:scrabcake:main`). Optional and
-    /// default-empty — services without databases omit the `[db]` table
-    /// entirely.
-    #[serde(default, skip_serializing_if = "DbCatalog::is_empty")]
-    pub db: DbCatalog,
 }
 
 impl ServiceConfig {
@@ -4349,129 +4485,392 @@ fn is_zero_u32(n: &u32) -> bool {
     *n == 0
 }
 
-/// A service's declared databases, grouped by environment (W241 §Sections).
-/// Parsed from the `[db]` table of `service.toml`; each `[[db.<env>]]` array
-/// entry names one database. The environment tag drives backend selection at
-/// query time (see the data-workbench's `db.query` / the `sql_*` MCP tools):
-/// `dev` = local file, `pond` = a DB inside the running pond container stack
-/// (reached on a declared localhost port), `cloud` = a remote libSQL/Turso or
-/// Postgres endpoint whose auth comes from an env var (never stored in TOML).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-pub struct DbCatalog {
-    /// Local-file SQLite databases used in dev mode.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub dev: Vec<DevDb>,
-    /// Databases running inside the pond container stack.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pond: Vec<PondDb>,
-    /// Remote cloud databases (Turso, Postgres).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cloud: Vec<CloudDb>,
-}
-
-impl DbCatalog {
-    /// True when no database is declared in any environment. Lets
-    /// [`ServiceConfig`] skip serializing an empty `[db]` table.
-    pub fn is_empty(&self) -> bool {
-        self.dev.is_empty() && self.pond.is_empty() && self.cloud.is_empty()
-    }
-}
-
-/// A dev-mode local SQLite database (`[[db.dev]]`). `path` is resolved
-/// relative to the workspace root and opened as a local file — read/write, no
-/// network, no auth.
+/// One data connection the workbench lists and `sql.open` opens (W358
+/// §"One noun: a connection"). Parsed from
+/// `.yah/infra/connections/<name>.toml`; addressed as `<group>:<name>`.
+///
+/// Four independent answers, one owner each: [`source`](Self::source) (what
+/// database), [`channel`](Self::channel) (which network path),
+/// [`auth`](Self::auth) (which credential, read from where) and
+/// [`policy`](Self::policy) (what the caller may do). The credential is never
+/// part of the source URL — [`Connection::validate`] refuses one that carries
+/// it — and is named only as a `secrets_bridge` reference in `auth.secret`.
+///
+/// @yah:ticket(R960-F1, "Connection type + .yah/infra/connections/*.toml loader + schema; delete DbCatalog env buckets, CampCloudDbs, auth_token_env")
+/// @yah:status(review)
+/// @yah:at(2026-10-08T00:13:48Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:phase(P1)
+/// @yah:parent(R960)
+/// @yah:next("One `Connection` struct (name, group, engine, source, channel, auth, policy) in oss/yubaba/crates/cloud beside ServiceConfig, shape per W358 section Manifest. Loader reads `.yah/infra/connections/*.toml`; register in xtask/src/schemas.rs so emit-schemas writes connection.toml.schema.json (#:schema-headed like secrets/).")
+/// @yah:next("Loader REJECTS a source URL with userinfo or an auth_token query param, and `auth.kind = none` on any channel but loopback/local/snapshot. `policy` absent = deny for both fields. `auth.secret` uses the secrets_bridge grammar (vault:/env:/pipe), parsed by the existing bridge, not a new one.")
+/// @yah:next("Delete DevDb/PondDb/CloudDb/DbCatalog env buckets + CampCloudDbs + auth_token_env (config.rs ~4487-4600) and .yah/db/cloud.toml support; fix callers (sql.rs resolve_db_id/cloud_url, desktop db_catalog_for_camp at commands.rs:5661) so the catalog lists connections by `group`; `camp` stays the auto-discovered .yah/db/*.turso section.")
+/// @yah:gotcha("This annotation sits on DbCatalog, which this ticket deletes - move it onto the new Connection type in the same edit.")
+/// @yah:gotcha("Schema regen is manual (pre-commit hook disabled 2026-08-15): run `cargo run -p xtask -- emit-schemas` when the camp build is quiet; schema-drift-guard in yah-check fails otherwise.")
+/// @arch:see(.yah/docs/working/W358-data-connections-remote-dbs-through-the-vault.md)
+/// @yah:files(oss/yubaba/crates/cloud/src/config.rs)
+/// @yah:files(xtask/src/schemas.rs)
+/// @yah:files(.yah/schema/connection.toml.schema.json)
+/// @yah:files(app/yah/desktop/src/commands.rs)
+/// @yah:files(app/yah/cli/src/sql.rs)
+/// @yah:handoff("Landed: cloud::Connection (+ ConnectionEngine/Source/Channel/Auth/AuthKind/Policy, WritePolicy, AgentPolicy) in oss/yubaba/crates/cloud/src/config.rs where DbCatalog was; annotation moved onto Connection. Connection::load/load_dir(camp_root) reads .yah/infra/connections/*.toml (missing dir = empty, duplicate <group>:<name> = error). validate() refuses: schema_version != 1, empty/colon name|group, reserved groups camp/fleet, direct URL with userinfo or auth_token query param (errors never echo the URL), auth none unless channel=loopback or source=local|snapshot, token/password/sealed-return without auth.secret. policy absent = deny/deny. deny_unknown_fields throughout.")
+/// @yah:handoff("Deleted DbCatalog/DevDb/PondDb/PondDbKind/CloudDb/CampCloudDbs/auth_token_env, ServiceConfig.db field, every `db: DbCatalog::default()` initializer (cloud crate, yah cli camp.rs x3, cloud.rs x2, inner_door.rs), and .yah/db/cloud.toml support. sql.rs resolve_db_id: camp:<name> unchanged; <group>:<name> looks up a Connection - local source -> sqlite path, direct+auth none -> URL, credentialed -> error pointing at R960-F2, service/snapshot -> error pointing at F11/F7. cloud_url/pond_url/load_service/split_service_name/probe_localhost deleted.")
+/// @yah:handoff("Wire change OUTSIDE expected files: WireDbCatalog is now {camp, groups: WireDbGroup{name, entries}}; entry read_only = policy.write == deny. Updated packages/yah/ui/src/env/types.ts, env/browser.ts, components/data/WorkbenchView.tsx (dbSections() replaces DB_SECTIONS) to match - otherwise the desktop picker breaks.")
+/// @yah:gotcha("MCP sql_query/sql_exec descriptions in app/yah/cli/src/mcp/tools.rs may still document dev:/pond:/cloud: ids and env-var auth - left for R960-F3 which owns that rewrite.")
+/// @yah:assumes("auth.secret is stored opaquely in cloud: yah-cloud must not depend on yah-qed (Cargo.toml R438-T13 rule: no cloud -> qed edge), so the secrets_bridge grammar is resolved by the daemon (R960-F2 via yah_qed::secrets_bridge::resolve_source); the loader only requires it non-empty for credentialed kinds. Note resolve_source accepts a bare literal as escape hatch, so a literal token in auth.secret is not refused at load.")
+/// @yah:assumes("workbench_query's camp-only write gate is left as-is; policy.write enforcement is R960-F2's next item.")
+/// @yah:verify("cargo test -p yah-cloud --lib connection_ : 9 passed / 0 failed (loader rejections: userinfo, auth_token param, auth none on public/mesh/ssh/tunnel and absent [auth], credential kinds w/o secret, reserved groups, duplicates; policy absent and partial = deny).")
+/// @yah:verify("cargo check -p yah -p desktop --tests: EXIT=0. cargo test -p yah --lib sql:: 30/0. cargo test -p desktop --lib catalog 17/0 (db_catalog_tests 4/4 incl. enumerates_connections_by_group, invalid_connection_dir_is_skipped_not_fatal). tsc --noEmit: no errors in WorkbenchView/browser.ts/types.ts.")
+/// @yah:verify("cargo run -p xtask -- emit-schemas EXIT=0 wrote .yah/schema/connection.toml.schema.json (service.toml schema also regenerated: db property gone); scripts/check-schema-drift.sh EXIT=0.")
+/// @yah:verify("Sweep (comment lines stripped, wc -l) for DbCatalog|CampCloudDbs|DevDb|PondDb|CloudDb|auth_token_env|db/cloud.toml|svc.db. over app crates oss xtask packages: 3 code hits, all React setDbCatalog state setters (unrelated); remaining hits are this ticket's own annotation text. No .yah/services/*/service.toml or .yah/db declared [db] tables. Camp build-skew advisories flagged peer edits (cloud_cheers.rs, config.rs) during runs - re-verify before trusting green.")
+/// @yah:handoff("Leader (Fable session:62240105) re-verified 2026-10-07 after courier Ashguard session:1b26c454 returned: yah-cloud connection_ 9/0, yah sql:: 30/0, desktop catalog 17/0, scripts/check-schema-drift.sh ok. The TS wire change (WireDbCatalog groups) outside expected files is accepted as part of this ticket; the MCP tool-description residual is R960-F3's.")
+/// @yah:verify("Leader re-run: cd oss/yubaba && cargo test -p yah-cloud --lib connection_ -> 9 passed; cargo test -p yah --lib sql:: -> 30 passed; cargo test -p desktop --lib catalog -> 17 passed; scripts/check-schema-drift.sh -> EXIT=0 'in sync'.")
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-pub struct DevDb {
-    /// Logical name, unique within the service's `dev` list. Forms the `name`
-    /// segment of the catalog id `dev:<service>:<name>`.
+#[serde(deny_unknown_fields)]
+pub struct Connection {
+    pub schema_version: u32,
+    /// Unique within the camp; the `name` segment of the id `<group>:<name>`.
     pub name: String,
-    /// On-disk SQLite path, relative to the workspace root (or absolute).
-    pub path: String,
-}
-
-/// A database running inside the pond container stack (`[[db.pond]]`). The
-/// pond publishes the DB on a localhost TCP port; the hub connects to
-/// `127.0.0.1:<port>` when the pond is up and returns a clear error when it is
-/// not. Either `port` (defaulting to a libSQL/`sqld` HTTP endpoint) or a full
-/// `url` must be given.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-pub struct PondDb {
-    /// Logical name, unique within the service's `pond` list.
-    pub name: String,
-    /// Localhost TCP port the pond publishes the DB on. Interpreted per
-    /// [`kind`](Self::kind). Mutually complete with `url` (provide one).
+    /// Picker section, same vocabulary as secrets' `groups` (`prod`,
+    /// `staging`, `pond`, …). `camp` and `fleet` are reserved: `camp` is the
+    /// auto-discovered `.yah/db/*.turso` section, `fleet` the workload-derived
+    /// one.
+    pub group: String,
+    pub engine: ConnectionEngine,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
-    /// Full connection URL, overriding `port` when set (e.g. a non-localhost
-    /// host or an explicit scheme).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    /// Wire protocol the pond DB speaks. Selects how a bare `port` becomes a
-    /// URL: `turso` → `http://127.0.0.1:<port>` (libSQL/`sqld` over Hrana),
-    /// `postgres` → `postgres://127.0.0.1:<port>`.
+    pub description: Option<String>,
+    pub source: ConnectionSource,
+    pub channel: ConnectionChannel,
+    /// Absent = `kind = "none"`, which is only accepted on a `loopback`
+    /// channel or a `local` / `snapshot` source.
     #[serde(default)]
-    pub kind: PondDbKind,
+    pub auth: ConnectionAuth,
+    /// Absent = deny for both fields (W358 §Policy).
+    #[serde(default)]
+    pub policy: ConnectionPolicy,
 }
 
-/// Wire protocol of a [`PondDb`].
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// Wire engine a [`Connection`] speaks.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
-pub enum PondDbKind {
-    /// libSQL / `sqld` over Hrana HTTP — the default.
-    #[default]
+pub enum ConnectionEngine {
     Turso,
-    /// PostgreSQL wire protocol.
+    Libsql,
     Postgres,
 }
 
-/// A remote cloud database (`[[db.cloud]]`). The connection `url` is stored in
-/// TOML but the credential never is — `auth_token_env` names an environment
-/// variable the daemon reads at connect time, so the same declaration works
-/// whether the token is provisioned service-locally or camp-shared (W241;
-/// operator confirmed both scopes are needed). A camp-wide cloud DB not owned
-/// by any single service is declared identically in `.yah/db/cloud.toml`.
+/// What database a [`Connection`] reaches, found how (W358 §Source).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-pub struct CloudDb {
-    /// Logical name, unique within its `cloud` list.
-    pub name: String,
-    /// Connection URL: `libsql://…` / `http(s)://…` (Turso, `sqld`) or
-    /// `postgres://…`.
-    pub url: String,
-    /// Name of the environment variable holding the auth token. Resolved in
-    /// the daemon at connect time (value never stored on disk). For a libSQL
-    /// URL the token is threaded as `?auth_token=…`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_token_env: Option<String>,
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ConnectionSource {
+    /// A declared URL. Never carries a credential.
+    Direct { url: String },
+    /// A file under the camp root.
+    Local { path: String },
+    /// A workload's `sql.hrana` service record, matched on `(workload, db)`
+    /// across every fleet node's `GET /services` (R960-F11). `workload` is the
+    /// workload's mesh identity (`expose.mesh.identity`), which is what those
+    /// rows are named by and what the camp-token audience `<workload>/<db>`
+    /// names; it equals the workload name unless the spec overrides it.
+    /// Reached over the mesh, never `public` (refused at load).
+    Service { workload: String, db: String },
+    /// The latest backup of a workload's `[[db]]` subject, opened read-only.
+    Snapshot { workload: String, db: String },
 }
 
-/// A camp-shared cloud database catalog, parsed from `.yah/db/cloud.toml`.
-/// These are cloud DBs not owned by any single service — declared once at camp
-/// scope and addressed as `cloud:<name>` (two-segment id), distinct from a
-/// service-local `cloud:<service>:<name>`.
+/// Which network path reaches a [`Connection`] (W358 §Channel). One per
+/// connection, never raced.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ConnectionChannel {
+    Public,
+    Mesh,
+    /// A per-connection `ssh -L` forward through `machine`'s `[connect].ssh`
+    /// target (.yah/infra/machines/<machine>.toml), the bootstrap path for a
+    /// node off the tailnet or during a mesh outage (R960-F17). The source's
+    /// host:port is dialled FROM that machine, so `127.0.0.1` there means the
+    /// node's own loopback.
+    Ssh { machine: String },
+    Tunnel,
+    Loopback,
+}
+
+/// Which credential proves the caller (W358 §Auth).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-pub struct CampCloudDbs {
-    #[serde(default, rename = "cloud", skip_serializing_if = "Vec::is_empty")]
-    pub cloud: Vec<CloudDb>,
+#[serde(deny_unknown_fields)]
+pub struct ConnectionAuth {
+    #[serde(default)]
+    pub kind: ConnectionAuthKind,
+    /// Where the credential is read from, in the `secrets_bridge` source
+    /// grammar (`vault:<slot>`, `env:<VAR>`, pipe-joined fallback). Resolved
+    /// by the daemon at connect time; this crate stores it opaquely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
 }
 
-impl CampCloudDbs {
-    /// Load `<camp_root>/.yah/db/cloud.toml`, or an empty catalog if the file
-    /// is absent (the common case — most camps declare no shared cloud DBs).
-    pub fn load(camp_root: &Path) -> Result<Self> {
-        let path = camp_root.join(".yah/db/cloud.toml");
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let src = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum ConnectionAuthKind {
+    #[default]
+    None,
+    Token,
+    Password,
+    CampToken,
+    SealedReturn,
+}
+
+/// What the caller may do once connected (W358 §Policy). Every default is
+/// deny.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ConnectionPolicy {
+    #[serde(default)]
+    pub write: WritePolicy,
+    #[serde(default)]
+    pub agents: AgentPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum WritePolicy {
+    #[default]
+    Deny,
+    Confirm,
+    Allow,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentPolicy {
+    #[default]
+    Deny,
+    Read,
+    Write,
+}
+
+impl Connection {
+    /// The catalog id, `<group>:<name>`.
+    pub fn id(&self) -> String {
+        format!("{}:{}", self.group, self.name)
     }
+
+    /// Parse and validate one `.yah/infra/connections/<name>.toml`.
+    pub fn load(path: &Path) -> Result<Self> {
+        let src =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let cfg: Self =
+            toml::from_str(&src).with_context(|| format!("parsing {}", path.display()))?;
+        cfg.validate()
+            .with_context(|| format!("validating {}", path.display()))?;
+        Ok(cfg)
+    }
+
+    /// Load every manifest under `<camp_root>/.yah/infra/connections/`, sorted
+    /// by id. A missing directory is an empty list. Two manifests with the same
+    /// id are a hard error.
+    pub fn load_dir(camp_root: &Path) -> Result<Vec<Self>> {
+        let dir = camp_root.join(".yah/infra/connections");
+        let mut out: BTreeMap<String, Self> = BTreeMap::new();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+            let path = entry?.path();
+            if path.extension().is_none_or(|e| e != "toml") {
+                continue;
+            }
+            let conn = Self::load(&path)?;
+            let id = conn.id();
+            if out.insert(id.clone(), conn).is_some() {
+                bail!("connection `{id}` is declared twice under {}", dir.display());
+            }
+        }
+        Ok(out.into_values().collect())
+    }
+
+    /// The `fleet:<workload>:<name>` connections the camp's own workload specs
+    /// declare through `[[db]]` (W358 decision 7), sorted by id. Reads
+    /// `.yah/infra/workloads/*.toml` through [`load_workloads`] — the files the
+    /// camp deploys — so listing makes no fleet call. A missing directory is an
+    /// empty list; a workload that fails shape validation (including a bad
+    /// `[[db]]` row) fails the whole derivation, naming its file.
+    pub fn derive_fleet(camp_root: &Path) -> Result<Vec<Self>> {
+        let loaded = load_workloads(crate::paths::workloads_dir(camp_root))?;
+        let specs: Vec<&WorkloadSpec> = loaded.iter().map(|w| &w.spec).collect();
+        let mut out = Self::fleet_from_specs(specs);
+        out.sort_by_key(Self::id);
+        Ok(out)
+    }
+
+    /// One [`Connection`] per `[[db]]` row with `workbench != none`.
+    ///
+    /// **Constructed, never parsed**, so it bypasses [`Self::validate`]'s
+    /// reservation of the `fleet` group and its no-`:` rule on `name`: the
+    /// derived `name` is `<workload>:<db>`, which is what makes [`Self::id`]
+    /// read `fleet:<workload>:<db>`. Policy is the default (deny / deny); a
+    /// derived connection never widens what a hand-written one would get.
+    pub fn fleet_from_specs<'a>(specs: impl IntoIterator<Item = &'a WorkloadSpec>) -> Vec<Self> {
+        let mut out = Vec::new();
+        for spec in specs {
+            for row in &spec.db {
+                let (source, channel, kind) = match row.workbench {
+                    WorkbenchKind::None => continue,
+                    // The R2 pair is resolved by the snapshot opener (R960-F7)
+                    // from the spec's `durability.store`; nothing to name here.
+                    WorkbenchKind::Snapshot => (
+                        ConnectionSource::Snapshot {
+                            workload: spec.name.clone(),
+                            db: row.name.clone(),
+                        },
+                        ConnectionChannel::Public,
+                        ConnectionAuthKind::None,
+                    ),
+                    // Keyed by mesh identity: that is what the node's
+                    // `/services` row carries (see `ConnectionSource::Service`).
+                    WorkbenchKind::Vend => (
+                        ConnectionSource::Service {
+                            workload: spec.expose.mesh.identity.0.clone(),
+                            db: row.name.clone(),
+                        },
+                        ConnectionChannel::Mesh,
+                        ConnectionAuthKind::CampToken,
+                    ),
+                };
+                out.push(Self {
+                    schema_version: 1,
+                    name: format!("{}:{}", spec.name, row.name),
+                    group: "fleet".to_string(),
+                    engine: ConnectionEngine::Turso,
+                    description: None,
+                    source,
+                    channel,
+                    auth: ConnectionAuth { kind, secret: None },
+                    policy: ConnectionPolicy::default(),
+                });
+            }
+        }
+        out
+    }
+
+    /// The loader's refusals (W358 §Manifest, §Auth).
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != 1 {
+            bail!("unsupported schema_version {} (expected 1)", self.schema_version);
+        }
+        for (field, v) in [("name", &self.name), ("group", &self.group)] {
+            if v.is_empty() || v.contains(':') {
+                bail!("`{field}` must be non-empty and contain no `:` (got {v:?})");
+            }
+        }
+        if matches!(self.group.as_str(), "camp" | "fleet") {
+            bail!("group `{}` is reserved for derived connections", self.group);
+        }
+        if let ConnectionSource::Direct { url } = &self.source {
+            reject_credential_in_url(url)?;
+            // R960-F17: the ssh forward rehosts the endpoint to 127.0.0.1, so
+            // a TLS certificate's hostname check can never pass over it.
+            let scheme = url.split_once("://").map_or("", |(s, _)| s).to_ascii_lowercase();
+            if matches!(self.channel, ConnectionChannel::Ssh { .. })
+                && matches!(scheme.as_str(), "https" | "libsql" | "wss")
+            {
+                bail!(
+                    "a `{scheme}://` (TLS) source cannot ride channel = \"ssh\": the forward rehosts \
+                     it to 127.0.0.1, so the certificate hostname check cannot pass (use the node's \
+                     plain http:// listener)"
+                );
+            }
+        }
+        // W358 §Channel: a vend listener binds the mesh address, so a service
+        // source has no public path to take. Refused here rather than warned
+        // about, so a manual manifest cannot opt into the internet.
+        if matches!(self.source, ConnectionSource::Service { .. })
+            && self.channel == ConnectionChannel::Public
+        {
+            bail!(
+                "a `service` source is reached over the mesh: channel = \"public\" is refused \
+                 (declare channel = \"mesh\")"
+            );
+        }
+        // The camp-token audience is `<workload>/<db>`, which only a service
+        // source names.
+        if self.auth.kind == ConnectionAuthKind::CampToken
+            && !matches!(self.source, ConnectionSource::Service { .. })
+        {
+            bail!("auth.kind = \"camp-token\" requires a `service` source (its audience is <workload>/<db>)");
+        }
+        // W358 §Auth: the SSH key already proves the path; letting it also
+        // stand for the caller would make the two factors one.
+        if matches!(self.channel, ConnectionChannel::Ssh { .. })
+            && self.auth.kind == ConnectionAuthKind::None
+        {
+            bail!(
+                "auth.kind = \"none\" is refused on channel = \"ssh\": the SSH key proves the \
+                 path, so the database still needs its own credential (token, password or camp-token)"
+            );
+        }
+        let credential_free = matches!(self.channel, ConnectionChannel::Loopback)
+            || matches!(
+                self.source,
+                ConnectionSource::Local { .. } | ConnectionSource::Snapshot { .. }
+            );
+        let secret = self.auth.secret.as_deref().map(str::trim);
+        match self.auth.kind {
+            ConnectionAuthKind::None => {
+                if !credential_free {
+                    bail!(
+                        "auth.kind = \"none\" is refused on a {:?} channel: only loopback, \
+                         local and snapshot connections may go without a credential",
+                        self.channel
+                    );
+                }
+                if secret.is_some() {
+                    bail!("auth.secret is set but auth.kind = \"none\"");
+                }
+            }
+            ConnectionAuthKind::Token
+            | ConnectionAuthKind::Password
+            | ConnectionAuthKind::SealedReturn => {
+                if secret.is_none_or(str::is_empty) {
+                    bail!("auth.kind = {:?} requires auth.secret", self.auth.kind);
+                }
+            }
+            // The camp's vend key signs the token (R960-F9); nothing to name here.
+            ConnectionAuthKind::CampToken => {}
+        }
+        Ok(())
+    }
+}
+
+/// Refuse a URL that carries a credential: userinfo in the authority, or an
+/// `auth_token` query parameter.
+fn reject_credential_in_url(url: &str) -> Result<()> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if authority.contains('@') {
+        bail!("source url must not carry userinfo; name the credential in auth.secret");
+    }
+    if let Some((_, query)) = after_scheme.split_once('?') {
+        let query = query.split('#').next().unwrap_or_default();
+        if query
+            .split('&')
+            .any(|kv| kv.split('=').next().unwrap_or_default().eq_ignore_ascii_case("auth_token"))
+        {
+            bail!("source url must not carry an auth_token parameter; name it in auth.secret");
+        }
+    }
+    Ok(())
 }
 
 /// Topological shape of a mirror — how its providers sit relative to each other.
@@ -6904,7 +7303,8 @@ mod tests {
             allocatable: None,
             taints: vec![],
             sovereign_group: None,
-            sovereign_role: None,
+            sovereign_participation: Default::default(),
+            host_machine: None,
             ingress_floating_ip: None,
         }
     }
@@ -6929,6 +7329,7 @@ mod tests {
             workspace_root: PathBuf::new(),
             machines,
             providers: vec![],
+            sovereign_groups: vec![],
             machine_origins: BTreeMap::new(),
             provider_origins: BTreeMap::new(),
             recovery_measurements: BTreeMap::new(),
@@ -6958,70 +7359,289 @@ mesh_tags = ["tag:cloud-runner"]
         assert!(slot.required().is_none());
     }
 
-    #[test]
-    fn db_catalog_parses_all_env_blocks() {
-        // W241 / R571-F8: a service.toml [db] table with dev/pond/cloud.
-        let toml_src = r#"
+    const CONN_PROD: &str = r#"
 schema_version = 1
-name = "scrabcake"
-[address]
-kind = "front-door"
-domain = "scrabcake.net.yah.dev"
-
-[[db.dev]]
-name = "main"
-path = "data/dev.sqlite"
-
-[[db.pond]]
-name = "main"
-port = 5433
-
-[[db.pond]]
-name = "pg"
-port = 5432
-kind = "postgres"
-
-[[db.cloud]]
-name = "main"
-url = "libsql://scrabcake.turso.io"
-auth_token_env = "SCRABCAKE_TURSO_TOKEN"
+name = "noisetable-prod"
+group = "prod"
+engine = "libsql"
+[source]
+kind = "direct"
+url = "libsql://noisetable-prod.turso.io"
+[channel]
+kind = "public"
+[auth]
+kind = "token"
+secret = "vault:turso-noisetable-prod"
 "#;
-        let svc: ServiceConfig = toml::from_str(toml_src).unwrap();
-        assert_eq!(svc.db.dev.len(), 1);
-        assert_eq!(svc.db.dev[0].path, "data/dev.sqlite");
-        assert_eq!(svc.db.pond.len(), 2);
-        assert_eq!(svc.db.pond[0].port, Some(5433));
-        assert_eq!(svc.db.pond[0].kind, PondDbKind::Turso); // default
-        assert_eq!(svc.db.pond[1].kind, PondDbKind::Postgres);
+
+    fn conn(src: &str) -> Result<Connection> {
+        let c: Connection = toml::from_str(src)?;
+        c.validate()?;
+        Ok(c)
+    }
+
+    #[test]
+    fn connection_manifest_parses_with_deny_policy_when_absent() {
+        let c = conn(CONN_PROD).unwrap();
+        assert_eq!(c.id(), "prod:noisetable-prod");
+        assert_eq!(c.channel, ConnectionChannel::Public);
+        assert_eq!(c.auth.secret.as_deref(), Some("vault:turso-noisetable-prod"));
+        assert_eq!(c.policy.write, WritePolicy::Deny);
+        assert_eq!(c.policy.agents, AgentPolicy::Deny);
+    }
+
+    #[test]
+    fn connection_partial_policy_defaults_missing_field_to_deny() {
+        let c = conn(&format!("{CONN_PROD}[policy]\nwrite = \"confirm\"\n")).unwrap();
+        assert_eq!(c.policy.write, WritePolicy::Confirm);
+        assert_eq!(c.policy.agents, AgentPolicy::Deny);
+    }
+
+    #[test]
+    fn connection_rejects_userinfo_in_url() {
+        let src = CONN_PROD.replace(
+            "libsql://noisetable-prod.turso.io",
+            "postgres://admin:hunter2@db.example.com/app",
+        );
+        let err = conn(&src).unwrap_err().to_string();
+        assert!(err.contains("userinfo"), "{err}");
+        assert!(!err.contains("hunter2"), "error echoed the credential: {err}");
+    }
+
+    #[test]
+    fn connection_rejects_auth_token_query_param() {
+        let src = CONN_PROD.replace(
+            "libsql://noisetable-prod.turso.io",
+            "libsql://noisetable-prod.turso.io?tls=1&AUTH_TOKEN=s3cret",
+        );
+        let err = conn(&src).unwrap_err().to_string();
+        assert!(err.contains("auth_token"), "{err}");
+        assert!(!err.contains("s3cret"), "error echoed the credential: {err}");
+    }
+
+    #[test]
+    fn connection_rejects_auth_none_off_loopback() {
+        for channel in ["public", "mesh", "ssh", "tunnel"] {
+            let src = CONN_PROD
+                .replace("kind = \"public\"", &format!("kind = \"{channel}\""))
+                .replace("kind = \"token\"\nsecret = \"vault:turso-noisetable-prod\"\n", "kind = \"none\"\n");
+            assert!(conn(&src).is_err(), "auth none accepted on {channel}");
+        }
+        // Omitting [auth] entirely is the same refusal.
+        let src = CONN_PROD.replace("[auth]\nkind = \"token\"\nsecret = \"vault:turso-noisetable-prod\"\n", "");
+        assert!(conn(&src).is_err());
+    }
+
+    #[test]
+    fn connection_allows_auth_none_on_loopback_local_and_snapshot() {
+        let loopback = r#"
+schema_version = 1
+name = "pond-main"
+group = "pond"
+engine = "turso"
+[source]
+kind = "direct"
+url = "http://127.0.0.1:5433"
+[channel]
+kind = "loopback"
+"#;
+        conn(loopback).unwrap();
+        let local = loopback
+            .replace("kind = \"direct\"\nurl = \"http://127.0.0.1:5433\"", "kind = \"local\"\npath = \"data/dev.sqlite\"")
+            .replace("kind = \"loopback\"", "kind = \"public\"");
+        conn(&local).unwrap();
+        let snapshot = loopback
+            .replace("kind = \"direct\"\nurl = \"http://127.0.0.1:5433\"", "kind = \"snapshot\"\nworkload = \"noisetable-account\"\ndb = \"account\"")
+            .replace("kind = \"loopback\"", "kind = \"public\"");
+        conn(&snapshot).unwrap();
+    }
+
+    #[test]
+    fn connection_credential_kinds_require_secret() {
+        let src = CONN_PROD.replace("secret = \"vault:turso-noisetable-prod\"\n", "");
+        assert!(conn(&src).is_err());
+    }
+
+    #[test]
+    fn connection_reserved_group_rejected() {
+        assert!(conn(&CONN_PROD.replace("group = \"prod\"", "group = \"camp\"")).is_err());
+        assert!(conn(&CONN_PROD.replace("group = \"prod\"", "group = \"fleet\"")).is_err());
+    }
+
+    #[test]
+    fn connection_load_dir_reads_manifests_and_rejects_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(Connection::load_dir(tmp.path()).unwrap().is_empty());
+        let dir = tmp.path().join(".yah/infra/connections");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.toml"), CONN_PROD).unwrap();
+        std::fs::write(dir.join("README.md"), "ignored").unwrap();
+        let all = Connection::load_dir(tmp.path()).unwrap();
+        assert_eq!(all.len(), 1);
+        std::fs::write(dir.join("b.toml"), CONN_PROD).unwrap();
+        assert!(Connection::load_dir(tmp.path()).is_err());
+    }
+
+    const DB_WORKLOAD_TOML: &str = r#"
+name = "acct"
+tier = "infra"
+archetype = "server"
+replicas = 1
+restart_policy = "always"
+
+[image]
+registry = "cr.yah.dev"
+repository = "acct"
+tag = "t"
+digest = "sha256:efaa7824ebf1654b226e4bf9cf4f86f1ce39b17900895b1f9d83e4d987f58733"
+
+[resources]
+memory_mb = 256
+cpu_millis = 250
+
+[expose.mesh]
+identity = "acct"
+ports = [4325]
+allow_from = []
+
+[stop_policy]
+signal = 15
+grace_period = 10000
+
+[[volumes]]
+source = { named = { name = "acct-data" } }
+target = "/data"
+read_only = false
+
+[durability]
+tier = "stream"
+engine = "turso"
+store = "s3://bucket/acct"
+subjects = ["account.db"]
+
+[[db]]
+name = "hidden"
+subject = "other.db"
+
+[[db]]
+name = "account"
+subject = "account.db"
+workbench = "snapshot"
+"#;
+
+    #[test]
+    fn fleet_derivation_lists_only_non_none_db_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".yah/infra/workloads");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("acct.toml"), DB_WORKLOAD_TOML).unwrap();
+        let fleet = Connection::derive_fleet(tmp.path()).unwrap();
+        assert_eq!(fleet.len(), 1, "the `none` row must not be listed");
+        let c = &fleet[0];
+        assert_eq!(c.id(), "fleet:acct:account");
+        assert_eq!(c.group, "fleet");
         assert_eq!(
-            svc.db.cloud[0].auth_token_env.as_deref(),
-            Some("SCRABCAKE_TURSO_TOKEN")
+            c.source,
+            ConnectionSource::Snapshot { workload: "acct".into(), db: "account".into() }
         );
+        assert_eq!(c.policy.write, WritePolicy::Deny);
+        // No camp, no fleet: an empty directory derives nothing.
+        assert!(Connection::derive_fleet(tempfile::tempdir().unwrap().path())
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
-    fn service_without_db_table_has_empty_catalog() {
-        let svc: ServiceConfig =
-            toml::from_str("schema_version = 1\nname = \"s\"\n[address]\nkind = \"front-door\"\ndomain = \"s.dev\"\n").unwrap();
-        assert!(svc.db.is_empty());
-        // And an empty [db] must not appear when re-serialized.
-        let out = toml::to_string(&svc).unwrap();
-        assert!(
-            !out.contains("[db"),
-            "empty db table should be skipped: {out}"
-        );
+    fn fleet_derivation_refuses_a_snapshot_row_outside_durability_subjects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".yah/infra/workloads");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = DB_WORKLOAD_TOML.replace("subject = \"account.db\"\nworkbench", "subject = \"nope.db\"\nworkbench");
+        std::fs::write(dir.join("acct.toml"), bad).unwrap();
+        let err = format!("{:#}", Connection::derive_fleet(tmp.path()).unwrap_err());
+        assert!(err.contains("durability.subjects"), "{err}");
     }
 
-    #[test]
-    fn camp_shared_cloud_toml_parses() {
-        let src = r#"
-[[cloud]]
-name = "analytics"
-url = "postgres://shared/analytics"
+    const CONN_SERVICE: &str = r#"
+schema_version = 1
+name = "noisetable-account"
+group = "prod"
+engine = "turso"
+[source]
+kind = "service"
+workload = "noisetable-account"
+db = "account"
+[channel]
+kind = "mesh"
+[auth]
+kind = "camp-token"
 "#;
-        let shared: CampCloudDbs = toml::from_str(src).unwrap();
-        assert_eq!(shared.cloud.len(), 1);
-        assert_eq!(shared.cloud[0].name, "analytics");
+
+    #[test]
+    fn connection_service_source_parses_on_mesh_and_refuses_public() {
+        let c = conn(CONN_SERVICE).unwrap();
+        assert_eq!(
+            c.source,
+            ConnectionSource::Service { workload: "noisetable-account".into(), db: "account".into() }
+        );
+        let public = CONN_SERVICE.replace("kind = \"mesh\"", "kind = \"public\"");
+        let err = conn(&public).unwrap_err().to_string();
+        assert!(err.contains("channel = \"public\" is refused"), "{err}");
+    }
+
+    #[test]
+    fn connection_ssh_channel_names_a_machine_and_refuses_auth_none() {
+        let ssh = CONN_SERVICE.replace("kind = \"mesh\"", "kind = \"ssh\"\nmachine = \"us-east-001\"");
+        let c = conn(&ssh).unwrap();
+        assert_eq!(c.channel, ConnectionChannel::Ssh { machine: "us-east-001".into() });
+        let bare = CONN_SERVICE.replace("kind = \"mesh\"", "kind = \"ssh\"");
+        assert!(conn(&bare).is_err(), "ssh channel without a machine must not parse");
+        let none = CONN_PROD
+            .replace("libsql://noisetable-prod.turso.io", "http://127.0.0.1:8080")
+            .replace("kind = \"public\"", "kind = \"ssh\"\nmachine = \"us-east-001\"")
+            .replace("kind = \"token\"\nsecret = \"vault:turso-noisetable-prod\"\n", "kind = \"none\"\n");
+        let err = conn(&none).unwrap_err().to_string();
+        assert!(err.contains("refused on channel = \"ssh\""), "{err}");
+    }
+
+    #[test]
+    fn connection_ssh_channel_refuses_a_static_tls_source() {
+        let tls = CONN_PROD.replace("kind = \"public\"", "kind = \"ssh\"\nmachine = \"us-east-001\"");
+        let err = conn(&tls).unwrap_err().to_string();
+        assert!(err.contains("`libsql://` (TLS) source cannot ride channel = \"ssh\""), "{err}");
+        let plain = tls.replace("libsql://noisetable-prod.turso.io", "http://127.0.0.1:8080");
+        conn(&plain).unwrap();
+    }
+
+    #[test]
+    fn connection_camp_token_requires_a_service_source() {
+        let direct = CONN_PROD.replace(
+            "kind = \"token\"\nsecret = \"vault:turso-noisetable-prod\"\n",
+            "kind = \"camp-token\"\n",
+        );
+        let err = conn(&direct).unwrap_err().to_string();
+        assert!(err.contains("requires a `service` source"), "{err}");
+    }
+
+    /// A vend row derives the same struct a manual `kind = "service"` manifest
+    /// parses to: mesh channel, camp-token auth, keyed by the MESH IDENTITY
+    /// (what `/services` rows are named by), not the workload name.
+    #[test]
+    fn fleet_derivation_of_a_vend_row_is_mesh_camp_token_keyed_by_identity() {
+        let mut spec: WorkloadSpec = toml::from_str(DB_WORKLOAD_TOML).unwrap();
+        spec.expose.mesh.identity = workload_spec::MeshIdent("acct-mesh".into());
+        spec.db[1].workbench = WorkbenchKind::Vend;
+        let fleet = Connection::fleet_from_specs([&spec]);
+        assert_eq!(fleet.len(), 1);
+        let c = &fleet[0];
+        assert_eq!(c.id(), "fleet:acct:account");
+        assert_eq!(
+            c.source,
+            ConnectionSource::Service { workload: "acct-mesh".into(), db: "account".into() }
+        );
+        assert_eq!(c.channel, ConnectionChannel::Mesh);
+        assert_eq!(c.auth.kind, ConnectionAuthKind::CampToken);
+        assert_eq!(c.policy.write, WritePolicy::Deny);
     }
 
     #[test]
@@ -7641,7 +8261,8 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             allocatable: None,
             taints: vec![],
             sovereign_group: None,
-            sovereign_role: None,
+            sovereign_participation: Default::default(),
+            host_machine: None,
             ingress_floating_ip: None,
         };
         let s = toml::to_string(&cfg).unwrap();
@@ -7781,7 +8402,8 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             allocatable: None,
             taints: vec![],
             sovereign_group: None,
-            sovereign_role: None,
+            sovereign_participation: Default::default(),
+            host_machine: None,
             ingress_floating_ip: None,
         };
         // Land in the legacy tree so the legacy machine loader picks it up.
@@ -7943,6 +8565,8 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             namespace: NamespaceId::singleton(),
             labels: Default::default(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: Default::default(),
             files: Vec::new(),
         };
@@ -8012,6 +8636,8 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             namespace: NamespaceId::singleton(),
             labels: Default::default(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: Default::default(),
             files: Vec::new(),
         }
@@ -8153,6 +8779,8 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             namespace: NamespaceId::singleton(),
             labels: Default::default(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: Default::default(),
             files: Vec::new(),
         };
@@ -8234,6 +8862,8 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             namespace: NamespaceId::singleton(),
             labels: Default::default(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: Default::default(),
             files: Vec::new(),
         };
@@ -8275,7 +8905,8 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             allocatable: None,
             taints: vec![],
             sovereign_group: None,
-            sovereign_role: None,
+            sovereign_participation: Default::default(),
+            host_machine: None,
             ingress_floating_ip: None,
         };
         machine.save(root).unwrap();
@@ -9062,7 +9693,7 @@ role = "static"
         )
         .unwrap();
         std::fs::write(
-            svc.join("mirrors/cloud.toml"),
+            svc.join("mirrors/prod.toml"),
             r#"schema_version = 1
 shape = "single-machine"
 
@@ -9105,8 +9736,8 @@ use = "orbstack"
         assert_eq!(dev.service.domain(), Some("yah.dev"));
         assert_eq!(dev.service.components.len(), 1);
         assert_eq!(dev.mirrors.len(), 2);
-        // Legacy file stems "cloud" and "local" are normalised to canonical tier names.
-        assert!(dev.mirrors.contains_key("prod"), "cloud.toml → prod tier");
+        // Legacy file stem "local" is normalised to its canonical tier name.
+        assert!(dev.mirrors.contains_key("prod"), "prod.toml → prod tier");
         assert!(dev.mirrors.contains_key("dev"), "local.toml → dev tier");
         assert_eq!(dev.mirrors["prod"].shape, MirrorShape::SingleMachine);
         assert_eq!(dev.mirrors["dev"].shape, MirrorShape::Local);
@@ -9573,7 +10204,6 @@ out_dir = "dist"
             name: "dev-yah".into(),
             address: ServiceAddress::front_door("yah.dev"),
             description: None,
-            db: DbCatalog::default(),
             components: vec![ServiceComponent {
                 mount: None,
                 id: "site".into(),
@@ -9623,7 +10253,6 @@ out_dir = "dist"
             address: ServiceAddress::front_door_at("api.noisetable.com", "/api/v1/status"),
             description: None,
             components: vec![],
-            db: DbCatalog::default(),
         }
         .save(root)
         .unwrap();
@@ -9651,7 +10280,6 @@ out_dir = "dist"
             address: ServiceAddress::front_door("api.noisetable.com"),
             description: Some("Account and RPC origin for the noisetable app.".into()),
             components: vec![],
-            db: DbCatalog::default(),
         }
         .save(root)
         .unwrap();
@@ -9729,7 +10357,6 @@ out_dir = "dist"
             description: None,
             address: ServiceAddress::node("b".repeat(64), "yah/push-relay/1"),
             components: vec![],
-            db: DbCatalog::default(),
         };
         let err = svc
             .require_domain("a DNS record")
@@ -9803,7 +10430,6 @@ out_dir = "dist"
                 description: Some("described".into()),
                 address: address.clone(),
                 components: vec![],
-                db: DbCatalog::default(),
             };
             svc.save(root).unwrap();
             let cfg = CloudConfig::load(root).unwrap();
@@ -9868,7 +10494,6 @@ out_dir = "dist"
             address: ServiceAddress::front_door_at("api.noisetable.com", "api/v1/status"),
             description: None,
             components: vec![],
-            db: DbCatalog::default(),
         }
         .save(root)
         .unwrap();
@@ -9892,7 +10517,6 @@ out_dir = "dist"
             address: ServiceAddress::front_door("yah.dev"),
             description: None,
             components: vec![],
-            db: DbCatalog::default(),
         };
         svc.save(root).unwrap();
         svc.address = ServiceAddress::front_door("yah.example");
@@ -9917,7 +10541,6 @@ out_dir = "dist"
             address: ServiceAddress::front_door("yah.dev"),
             description: None,
             components: vec![],
-            db: DbCatalog::default(),
         }
         .save(root)
         .unwrap();
@@ -9996,7 +10619,6 @@ out_dir = "dist"
             address: ServiceAddress::front_door("yah.dev"),
             description: None,
             components: vec![],
-            db: DbCatalog::default(),
         };
         svc.save(root).unwrap();
         MirrorConfig {
@@ -10035,7 +10657,6 @@ out_dir = "dist"
             address: ServiceAddress::front_door("yah.dev"),
             description: None,
             components: vec![],
-            db: DbCatalog::default(),
         }
         .save(root)
         .unwrap();
@@ -10074,7 +10695,6 @@ out_dir = "dist"
             name: "yah-marketing".into(),
             address: ServiceAddress::front_door("yah.dev"),
             description: None,
-            db: DbCatalog::default(),
             components: vec![ServiceComponent {
                 mount: None,
                 id: "site".into(),
@@ -10379,7 +10999,6 @@ worker_bundle_path = ".yah/workers/cdn-yah-dev/"
             name: "yah-marketing".into(),
             address: ServiceAddress::front_door("yah.dev"),
             description: None,
-            db: DbCatalog::default(),
             components: vec![
                 ServiceComponent {
                     mount: None,
@@ -10745,7 +11364,6 @@ origin = "http://127.0.0.1:9000"
             name: "noisetable-marketing".into(),
             address: ServiceAddress::front_door("noisetable.com"),
             description: None,
-            db: DbCatalog::default(),
             components: vec![
                 ServiceComponent {
                     mount: Some("/app".into()),
@@ -10791,7 +11409,6 @@ origin = "http://127.0.0.1:9000"
             name: "noisetable-marketing".into(),
             address: ServiceAddress::front_door("noisetable.com"),
             description: None,
-            db: DbCatalog::default(),
             components: vec![
                 ServiceComponent {
                     mount: None,
@@ -10838,7 +11455,6 @@ origin = "http://127.0.0.1:9000"
             name: "noisetable".into(),
             address: ServiceAddress::front_door("noisetable.com"),
             description: None,
-            db: DbCatalog::default(),
             components: vec![
                 ServiceComponent {
                     mount: Some("app".into()),
@@ -10883,7 +11499,6 @@ origin = "http://127.0.0.1:9000"
             name: "noisetable".into(),
             address: ServiceAddress::front_door("noisetable.com"),
             description: None,
-            db: DbCatalog::default(),
             components: vec![
                 ServiceComponent {
                     mount: None,
@@ -11494,11 +12109,11 @@ taints = ["no-server", "no-appliance", "no-job"]
         }
     }
 
-    /// A machine in `group` with its quorum eligibility stated (R605-F12).
-    fn in_group_as(name: &str, group: &str, role: SovereignRole) -> MachineConfig {
+    /// A machine in `group` with its raft participation stated (R605-F35).
+    fn in_group_as(name: &str, group: &str, participation: Participation) -> MachineConfig {
         MachineConfig {
             sovereign_group: Some(group.to_string()),
-            sovereign_role: Some(role),
+            sovereign_participation: participation,
             ..make_machine(name, vec![])
         }
     }
@@ -11573,23 +12188,22 @@ taints = ["no-server", "no-appliance", "no-job"]
         );
     }
 
-    // ─── R605-F12: the voting axis ──────────────────────────────────────────
+    // ─── R605-F35: participation, and the group's voter list ────────────────
 
-    /// The whole ticket in one assertion. us-west-003 is a member of prod —
-    /// same secrets, same upgrade cadence, same destruction — and must never
-    /// hold a prod raft seat. Before the role axis, the only thing refusing it
-    /// was its *absent* group stamp, so writing down the truth above would have
-    /// removed the guard.
+    /// us-west-003 is a member of prod — same secrets, same upgrade cadence,
+    /// same destruction — and must never hold a prod raft node id. Before
+    /// R605-F12 the only thing refusing it was its *absent* group stamp; since
+    /// R605-F35 the refusal is its `out` participation.
     #[test]
-    fn a_non_voting_member_is_refused_into_its_own_group() {
+    fn an_out_member_is_refused_into_its_own_group() {
         let verdict = judge_join(
-            &in_group_as("us-west-003", "prod", SovereignRole::NonVoter),
-            &in_group_as("us-west-001", "prod", SovereignRole::Voter),
+            &in_group_as("us-west-003", "prod", Participation::Out),
+            &in_group_as("us-west-001", "prod", Participation::In),
         );
         let JoinVerdict::Refuse(msg) = verdict else {
-            panic!("a non-voting prod member must not join the prod quorum: {verdict:?}");
+            panic!("an `out` prod member must not join the prod raft: {verdict:?}");
         };
-        assert!(msg.contains("us-west-003") && msg.contains("NON-VOTING"), "{msg}");
+        assert!(msg.contains("us-west-003") && msg.contains("OUT of"), "{msg}");
         // The refusal must not blame the group: both sides say "prod", and a
         // cross-group message here would read as a bug in the check itself.
         assert!(!msg.contains("cross-group"), "{msg}");
@@ -11599,13 +12213,13 @@ taints = ["no-server", "no-appliance", "no-job"]
         );
     }
 
-    /// Read from the other end: a box declared non-voting has no quorum seat to
-    /// be grown, so it cannot be a join target either.
+    /// Read from the other end: a box declared out of its group's raft has no
+    /// raft to be grown, so it cannot be a join target either.
     #[test]
-    fn a_non_voting_target_has_no_quorum_to_grow() {
+    fn an_out_target_has_no_raft_to_grow() {
         let verdict = judge_join(
-            &in_group_as("us-west-001", "prod", SovereignRole::Voter),
-            &in_group_as("us-west-003", "prod", SovereignRole::NonVoter),
+            &in_group_as("us-west-001", "prod", Participation::In),
+            &in_group_as("us-west-003", "prod", Participation::Out),
         );
         assert!(
             matches!(&verdict, JoinVerdict::Refuse(msg) if msg.contains("the target")
@@ -11614,14 +12228,14 @@ taints = ["no-server", "no-appliance", "no-job"]
         );
     }
 
-    /// A non-voter joining a *standalone* target is refused for two reasons at
-    /// once, and the message must pick the one whose fix would actually work.
-    /// Naming the role here would send the operator to flip `sovereign_role`
-    /// and come back to the same refusal.
+    /// An `out` member joining a *standalone* target is refused for two
+    /// reasons at once, and the message must pick the one whose fix would
+    /// actually work. Naming participation here would send the operator to flip
+    /// a field and come back to the same refusal.
     #[test]
-    fn a_refusal_names_the_group_when_fixing_the_role_would_not_help() {
+    fn a_refusal_names_the_group_when_fixing_participation_would_not_help() {
         let verdict = judge_join(
-            &in_group_as("us-west-003", "prod", SovereignRole::NonVoter),
+            &in_group_as("us-west-003", "prod", Participation::Out),
             &in_group("us-west-002", None),
         );
         let JoinVerdict::Refuse(msg) = verdict else {
@@ -11631,43 +12245,33 @@ taints = ["no-server", "no-appliance", "no-job"]
             msg.contains(".yah/infra/machines/us-west-002.toml"),
             "the refusal must point at the target's missing group stamp: {msg}"
         );
-        assert!(!msg.contains("NON-VOTING"), "{msg}");
+        assert!(!msg.contains("OUT of"), "{msg}");
     }
 
-    /// The back-compat seam, pinned: the six nodes stamped before R605-F12
-    /// write no role, and an absent role means what declaring a group has
-    /// always meant. If this flips, the live prod and dev quorums stop being
-    /// growable on a config the operator never edited.
+    /// An unwritten participation is `in`, which is what declaring a group has
+    /// always meant — and since R605-F35 it grants a learner join at most.
     #[test]
-    fn an_unwritten_role_still_joins_its_group() {
+    fn an_unwritten_participation_still_joins_its_group() {
         let joiner = in_group("us-west-013", Some("dev"));
-        assert_eq!(joiner.sovereign_role, None);
+        assert_eq!(joiner.sovereign_participation, Participation::In);
         assert_eq!(
             judge_join(&joiner, &in_group("us-west-011", Some("dev"))),
             JoinVerdict::Permit
         );
-        assert_eq!(
-            judge_join(
-                &joiner,
-                &in_group_as("us-west-011", "dev", SovereignRole::Voter)
-            ),
-            JoinVerdict::Permit
-        );
     }
 
-    /// A non-voting member is still a *member*, and the two claims must not be
-    /// conflated: `sovereign_membership()` reports the group either way, so a
-    /// consumer asking "is this box in prod's blast radius" gets yes.
+    /// An `out` member is still a *member*: `sovereign_membership()` reports
+    /// the group either way, so a consumer asking "is this box in prod's blast
+    /// radius" gets yes.
     #[test]
-    fn a_non_voter_is_still_in_the_group_it_names() {
-        let m = in_group_as("us-west-003", "prod", SovereignRole::NonVoter);
+    fn an_out_member_is_still_in_the_group_it_names() {
+        let m = in_group_as("us-west-003", "prod", Participation::Out);
         assert_eq!(m.sovereign_membership().group, Some("prod"));
-        assert!(!m.sovereign_membership().role.is_voter());
+        assert!(!m.sovereign_membership().participation.is_in());
 
-        // …and the group-membership query the fleet reads is unaffected by it.
         let cfg = make_empty_cfg(vec![
             m,
-            in_group_as("us-west-001", "prod", SovereignRole::Voter),
+            in_group_as("us-west-001", "prod", Participation::In),
         ]);
         assert_eq!(
             cfg.machines_in_group("prod")
@@ -11678,12 +12282,45 @@ taints = ["no-server", "no-appliance", "no-job"]
         );
     }
 
-    /// The role travels through TOML in one spelling, and an absent one stays
-    /// absent on the way back out — otherwise every machine file would grow a
-    /// `sovereign_role = "voter"` line the operator never wrote, and the
-    /// unroled-member lint would have nothing left to find.
+    /// Participation travels through TOML in one spelling, the default stays
+    /// unwritten on the way back out, and a VM's host round-trips.
     #[test]
-    fn sovereign_role_round_trips_and_is_omitted_when_unwritten() {
+    fn participation_and_host_round_trip_and_the_default_is_omitted() {
+        let m: MachineConfig = toml::from_str(
+            r#"
+name = "us-west-003"
+provider = "static"
+region = "us-west"
+arch = "x86_64"
+mesh_tags = []
+sovereign_group = "prod"
+sovereign_participation = "out"
+"#,
+        )
+        .unwrap();
+        assert_eq!(m.sovereign_participation, Participation::Out);
+        assert_eq!(m.physical_host(), "us-west-003", "metal is its own host");
+        let out = toml::to_string(&m).unwrap();
+        assert!(out.contains(r#"sovereign_participation = "out""#), "{out}");
+
+        let vm = MachineConfig {
+            name: "us-west-011-vm1".into(),
+            sovereign_participation: Participation::In,
+            host_machine: Some("us-west-011".into()),
+            ..m
+        };
+        assert_eq!(vm.physical_host(), "us-west-011");
+        let out = toml::to_string(&vm).unwrap();
+        assert!(!out.contains("sovereign_participation"), "{out}");
+        assert!(out.contains(r#"host_machine = "us-west-011""#), "{out}");
+    }
+
+    /// The retired R605-F12 spelling is not read as participation: a stale
+    /// `sovereign_role` line parses (MachineConfig tolerates unknown keys) and
+    /// changes nothing — the machine is `in`, and whether it votes is the
+    /// group's list. `yah cloud validate` is where a stale file gets noticed.
+    #[test]
+    fn a_retired_sovereign_role_line_is_not_participation() {
         let m: MachineConfig = toml::from_str(
             r#"
 name = "us-west-003"
@@ -11696,18 +12333,70 @@ sovereign_role = "non-voter"
 "#,
         )
         .unwrap();
-        assert_eq!(m.sovereign_role, Some(SovereignRole::NonVoter));
-        assert!(toml::to_string(&m)
-            .unwrap()
-            .contains(r#"sovereign_role = "non-voter""#));
+        assert_eq!(m.sovereign_participation, Participation::In);
+    }
 
-        let unwritten = MachineConfig {
-            sovereign_role: None,
-            ..m
+    fn group(name: &str, voters: &[(&str, u64)]) -> SovereignGroupConfig {
+        SovereignGroupConfig {
+            name: name.into(),
+            voters: voters
+                .iter()
+                .map(|(m, id)| SovereignVoter {
+                    machine: (*m).into(),
+                    raft_node_id: *id,
+                })
+                .collect(),
+        }
+    }
+
+    /// A seat needs all three declarations to agree: the group stamp,
+    /// participation, and the group's list. Anything less is no seat — the
+    /// same reading the leader applies, so the camp's picture of who votes is
+    /// never more generous than the cluster's.
+    #[test]
+    fn a_seat_needs_the_stamp_participation_and_the_groups_list() {
+        let mut cfg = make_empty_cfg(vec![
+            in_group_as("us-west-011", "dev", Participation::In),
+            in_group_as("us-west-011-vm1", "dev", Participation::In),
+            in_group_as("us-west-013", "dev", Participation::Out),
+            in_group_as("us-west-001", "prod", Participation::In),
+        ]);
+        cfg.sovereign_groups = vec![group("dev", &[("us-west-011", 11), ("us-west-013", 13)])];
+
+        let seat = |name: &str| {
+            let m = cfg.machines.iter().find(|m| m.name == name).unwrap();
+            cfg.voting_group(m)
         };
-        assert!(!toml::to_string(&unwritten)
-            .unwrap()
-            .contains("sovereign_role"));
+        assert_eq!(seat("us-west-011"), Some("dev"), "listed participant");
+        assert_eq!(seat("us-west-011-vm1"), None, "unlisted participant = learner");
+        assert_eq!(seat("us-west-013"), None, "listed but `out` is not a seat");
+        assert_eq!(seat("us-west-001"), None, "a group with no file seats nobody");
+        assert_eq!(cfg.seated_voters("dev"), 1);
+        assert_eq!(cfg.seated_voters("prod"), 0);
+    }
+
+    /// The daemon flag is rendered from the file, sorted, so a copy in a
+    /// drop-in can be compared against it byte for byte.
+    #[test]
+    fn a_groups_voters_flag_is_its_sorted_raft_ids() {
+        let g = group("dev", &[("us-west-014", 14), ("us-west-011", 11), ("us-west-013", 13)]);
+        assert_eq!(g.voters_flag(), "11,13,14");
+        assert!(g.lists("us-west-013") && !g.lists("us-west-011-vm1"));
+    }
+
+    /// The group file is closed-world: a misspelled key (the near-miss is
+    /// `raft_id`) must fail to parse rather than load a seat with no id.
+    #[test]
+    fn a_group_file_refuses_unknown_keys() {
+        let ok: SovereignGroupConfig = toml::from_str(
+            "name = \"dev\"\n[[voters]]\nmachine = \"us-west-011\"\nraft_node_id = 11\n",
+        )
+        .unwrap();
+        assert_eq!(ok.voters.len(), 1);
+        assert!(toml::from_str::<SovereignGroupConfig>(
+            "name = \"dev\"\n[[voters]]\nmachine = \"us-west-011\"\nraft_id = 11\n",
+        )
+        .is_err());
     }
 
     /// The invariant the ticket is most explicit about: a sovereign group is a

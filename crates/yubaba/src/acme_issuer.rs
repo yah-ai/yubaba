@@ -468,11 +468,18 @@ pub fn spawn(
     raft: YubabaRaft,
     config: IssuerConfig,
     store: Arc<ObjectCertStore>,
+    signer: yubaba_auth_token::PeerSigner,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move { run(node_id, raft, config, store).await })
+    tokio::spawn(async move { run(node_id, raft, config, store, signer).await })
 }
 
-async fn run(node_id: YubabaNodeId, raft: YubabaRaft, cfg: IssuerConfig, store: Arc<ObjectCertStore>) {
+async fn run(
+    node_id: YubabaNodeId,
+    raft: YubabaRaft,
+    cfg: IssuerConfig,
+    store: Arc<ObjectCertStore>,
+    signer: yubaba_auth_token::PeerSigner,
+) {
     let kek = match load_cluster_kek(&cfg.kek_path) {
         Ok(k) => k,
         Err(e) => {
@@ -495,7 +502,7 @@ async fn run(node_id: YubabaNodeId, raft: YubabaRaft, cfg: IssuerConfig, store: 
         .timeout(crate::raft::FORWARD_TIMEOUT)
         .build()
     {
-        Ok(c) => c,
+        Ok(c) => yubaba_auth_token::PeerClient::new(c, signer),
         Err(e) => {
             error!(
                 "acme issuer: could not build the forward-to-leader HTTP client — \

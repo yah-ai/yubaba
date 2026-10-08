@@ -45,17 +45,26 @@
 //! direction: an unknown joiner is refused, because "I could not establish
 //! which blast radius that box belongs to" is not a reason to grow this one.
 //!
-//! # Membership is not eligibility (R605-F12)
+//! # Participation is not a seat (R605-F35)
 //!
-//! A group answers *which blast radius*; `--sovereign-role voter|non-voter`
-//! answers *may it hold a seat*. Both sides of a join must be voters, so a box
-//! that shares this cluster's fate without sharing its quorum — us-west-003,
-//! a residential-uplink build worker that runs prod workloads — is refused by
-//! its own declaration instead of by the absence of one.
+//! A group answers *which blast radius*; `--sovereign-participation in|out`
+//! answers *is this node in the group's raft at all*. Both sides of a join must
+//! participate, so a box that shares this cluster's fate without sharing its
+//! raft — us-west-003, a residential-uplink build worker that runs prod
+//! workloads — is refused by its own declaration instead of by the absence of
+//! one.
 //!
-//! The role has a back-compat seam the group does not, because it shipped
-//! later: a peer whose build predates it answers with no role key at all and is
-//! read as a voter. That is deliberate and bounded; [`read_group`] carries the
+//! What this gate does **not** decide is who votes. Every join it permits is a
+//! *learner* join; whether the leader then promotes the joiner is read from the
+//! group's voter list (`--sovereign-voters`, see
+//! [`ServerState::voter_seats`](crate::ServerState::voter_seats)), never from
+//! anything the joiner says. R605-F12 put a `voter | non-voter` role on each
+//! node; R605-F35 retired it because quorum composition belongs to the group,
+//! where one declaration can be checked for where its voters sit.
+//!
+//! Participation has a back-compat seam the group does not, because it shipped
+//! later: a peer whose build predates it answers with no participation key and
+//! is read as `in`. That is deliberate and bounded; [`read_group`] carries the
 //! reasoning and the window it leaves.
 //!
 //! # A group is also a cell id (R736-T3)
@@ -72,7 +81,7 @@
 use std::time::Duration;
 
 use serde::Deserialize;
-use workload_spec::sovereign::{Membership, SovereignRole};
+use workload_spec::sovereign::{Membership, Participation};
 
 use crate::cell;
 
@@ -87,15 +96,15 @@ const ASK_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerGroup {
     /// The peer declares this group (`yubaba serve --sovereign-group <label>`)
-    /// and this role (`--sovereign-role`, R605-F12).
+    /// and this participation (`--sovereign-participation`, R605-F35).
     ///
-    /// A peer that answers with a group but no `sovereign_role` key at all —
-    /// a build between R742-F1 and R605-F12 — arrives here as
-    /// [`SovereignRole::Voter`], resolved in [`read_group`]. See there for why
-    /// that is not [`Self::Unsupported`].
+    /// A peer that answers with a group but no `sovereign_participation` key at
+    /// all — any build before R605-F35 — arrives here as [`Participation::In`],
+    /// resolved in [`read_group`]. See there for why that is not
+    /// [`Self::Unsupported`].
     Declared {
         group: String,
-        role: SovereignRole,
+        participation: Participation,
     },
     /// The peer answered, and declares no group: it was started without
     /// `--sovereign-group`. The fix is a daemon restart with the flag, not a
@@ -116,9 +125,10 @@ pub enum Gate {
     /// response says `sovereign_group_judged: false` so this is never mistaken
     /// for a check that passed.
     NotInForce,
-    /// Both sides declare the same group and both are voters. Carries the group
-    /// so the response can say which one was judged — the role is not carried
-    /// because a permit implies `voter` on both sides.
+    /// Both sides declare the same group and both participate in its raft.
+    /// Carries the group so the response can say which one was judged.
+    /// A permit is a **learner** join: whether the joiner then gets a vote is
+    /// the leader's voter list's call, not this gate's.
     Permit(String),
     /// Refused, with an operator-readable reason. A refusal that only says
     /// "invalid" gets worked around rather than fixed, so every message here
@@ -130,14 +140,14 @@ pub enum Gate {
 /// Apply the gate. Pure — no I/O, so every branch is unit-testable without a
 /// live cluster.
 ///
-/// `target_group` / `target_role` are what *this* node (the leader receiving
-/// the call) declares; `joiner` is what the prospective learner said when
-/// asked. The two labels are how each node is named back to the operator — a
-/// raft node id and address, at this layer, since a daemon does not know its
-/// machine's `.yah/infra/machines` file name.
+/// `target_group` / `target_participation` are what *this* node (the leader
+/// receiving the call) declares; `joiner` is what the prospective learner said
+/// when asked. The two labels are how each node is named back to the operator
+/// — a raft node id and address, at this layer, since a daemon does not know
+/// its machine's `.yah/infra/machines` file name.
 pub fn judge(
     target_group: Option<&str>,
-    target_role: SovereignRole,
+    target_participation: Participation,
     target_label: &str,
     joiner: &PeerGroup,
     joiner_label: &str,
@@ -146,43 +156,44 @@ pub fn judge(
         return Gate::NotInForce;
     };
 
-    // R605-F12: this node is a declared non-voter and is nonetheless serving
-    // add-learner, which means it holds a raft seat its own declaration says it
-    // must not. Refuse rather than grow the quorum from a box that is already
-    // in a state the operator asked to be impossible.
-    if !target_role.is_voter() {
+    // R605-F35: this node declares itself out of its group's raft and is
+    // nonetheless serving add-learner, which means it holds a raft seat its own
+    // declaration says it must not. Refuse rather than grow the raft from a box
+    // that is already in a state the operator asked to be impossible.
+    if !target_participation.is_in() {
         return Gate::Refuse(format!(
-            "join refused: this cluster ({target_label}) declares itself a NON-VOTING member of \
-             sovereign group {target_group:?} (--sovereign-role non-voter), so it should not be \
-             holding a raft seat at all, let alone growing the quorum. Either this node was \
-             started with a --raft-node-id it should not have, or the role is wrong — resolve \
-             that before adding {joiner_label}."
+            "join refused: this cluster ({target_label}) declares itself OUT of sovereign group \
+             {target_group:?}'s raft (--sovereign-participation out), so it should not be \
+             holding a raft seat at all, let alone growing the raft. Either this node was \
+             started with a --raft-node-id it should not have, or its participation is wrong — \
+             resolve that before adding {joiner_label}."
         ));
     }
 
     match joiner {
         PeerGroup::Declared {
             group: joiner_group,
-            role: joiner_role,
+            participation: joiner_participation,
         } => {
             if workload_spec::sovereign::join_permitted(
-                Membership::new(joiner_group, *joiner_role),
-                Membership::new(target_group, target_role),
+                Membership::new(joiner_group, *joiner_participation),
+                Membership::new(target_group, target_participation),
             ) {
                 Gate::Permit(target_group.to_string())
             } else if joiner_group == target_group {
-                // Same group, refused — so the role is the only thing it can
-                // be, and printing the cross-group message here would name one
-                // group twice and read as a bug in the check.
+                // Same group, refused — so participation is the only thing it
+                // can be, and printing the cross-group message here would name
+                // one group twice and read as a bug in the check.
                 Gate::Refuse(format!(
-                    "join refused: the joiner {joiner_label} is a NON-VOTING member of sovereign \
-                     group {target_group:?}, the same group as this cluster ({target_label}). It \
-                     is inside this blast radius but declares itself ineligible for the quorum, \
-                     so the join is refused by declaration rather than by omission. If it should \
-                     genuinely vote, set `sovereign_role = \"voter\"` in its \
-                     .yah/infra/machines/<name>.toml and restart its yubaba with \
-                     --sovereign-role voter; if it should not, this refusal is the flag doing \
-                     its job."
+                    "join refused: the joiner {joiner_label} declares itself OUT of sovereign \
+                     group {target_group:?}'s raft, the same group as this cluster \
+                     ({target_label}). It is inside this blast radius but takes no part in its \
+                     raft — not as a voter, not as a learner — so the join is refused by \
+                     declaration rather than by omission. If it should genuinely join, set \
+                     `sovereign_participation = \"in\"` in its .yah/infra/machines/<name>.toml \
+                     and restart its yubaba with --sovereign-participation in (it joins as a \
+                     learner; a vote additionally needs the group's voter list to name it); if \
+                     it should not, this refusal is the flag doing its job."
                 ))
             } else {
                 Gate::Refuse(format!(
@@ -232,11 +243,11 @@ pub fn judge(
 struct PeerStatus {
     #[serde(default, deserialize_with = "present_but_maybe_null")]
     sovereign_group: Option<Option<String>>,
-    /// R605-F12. Plain `#[serde(default)]` here, unlike the group above,
+    /// R605-F35. Plain `#[serde(default)]` here, unlike the group above,
     /// because absence and `null` call for the *same* action: see
-    /// [`read_group`].
+    /// [`read_group`]. R605-F12's `sovereign_role` key is not read at all.
     #[serde(default)]
-    sovereign_role: Option<SovereignRole>,
+    sovereign_participation: Option<Participation>,
     /// R736-T3. Same `Option<Option<_>>` shape as the group, for the same
     /// reason: a build predating cell tagging has to be told to roll, and a
     /// current build that was simply never given `--jurisdiction` has to be told
@@ -272,7 +283,7 @@ pub struct PeerDeclaration {
 }
 
 /// Ask the node at `addr` what it declares about itself — its sovereign group,
-/// its role, and its jurisdiction.
+/// its participation, and its jurisdiction.
 ///
 /// `addr` is the raft membership address the `add-learner` call carried, and
 /// `http://{addr}` is the same base URL the raft network client dials peers on
@@ -312,22 +323,30 @@ pub async fn ask_peer(addr: &str) -> Result<PeerDeclaration, String> {
 /// silently if it ever stopped holding, collapsing "old build" into "no group"
 /// and giving the operator an instruction that cannot work.
 ///
-/// # Why a missing `sovereign_role` is `Voter` and not a fourth peer state
+/// # Why a missing `sovereign_participation` is `In` and not a fourth peer state
 ///
-/// R605-F12 added the role after the group, so there is a live population of
-/// daemons — everything between R742-F1 and R605-F12, which today is the whole
-/// prod raft — that answers with a group and no role key. Refusing those would
-/// stop a stamped cluster from growing until every member had been rolled,
-/// which is a strictly worse failure than the one the role guards against, and
-/// it is the trade this module already made for the group itself: the gate
-/// degrades toward the pre-R742-F1 behaviour and never below it.
+/// R605-F35 added participation after the group, so there is a live population
+/// of daemons — every build before it, which today is the whole prod raft and
+/// the dev raft — that answers with a group and no participation key. Refusing
+/// those would stop a stamped cluster from growing until every member had been
+/// rolled, which is a strictly worse failure than the one participation guards
+/// against, and it is the trade this module already made for the group itself:
+/// the gate degrades toward the pre-R742-F1 behaviour and never below it.
+///
+/// Those builds publish R605-F12's `sovereign_role` instead, and it is
+/// deliberately **not** read as a stand-in (pre-1.0: one shape wins). That
+/// costs nothing a join can feel: a `non-voter` on a pre-F35 build was a box
+/// already out of every raft (us-west-003, standalone with no raft node id),
+/// and an `in` reading here grants a learner join, never a seat — the seat is
+/// the leader's voter list's call.
 ///
 /// The residue is a real window, worth naming rather than hiding: a box whose
-/// `machine.toml` says `non-voter` but whose daemon predates `--sovereign-role`
-/// answers "voter" and this gate lets it in. `cloud::judge_join` reads the TOML
-/// and refuses it on the camp side, which is where operator-driven joins go —
-/// so the window is a node-side backstop lagging a rollout, not an unguarded
-/// path. It closes for a given group the moment its nodes carry the flag.
+/// `machine.toml` says `out` but whose daemon predates
+/// `--sovereign-participation` answers nothing and this gate reads it as `in`.
+/// `cloud::judge_join` reads the TOML and refuses it on the camp side, which is
+/// where operator-driven joins go — so the window is a node-side backstop
+/// lagging a rollout, not an unguarded path. It closes for a given group the
+/// moment its nodes carry the flag.
 fn read_group(body: &str) -> Result<PeerDeclaration, String> {
     let status: PeerStatus =
         serde_json::from_str(body).map_err(|e| format!("unparseable /raft/status body: {e}"))?;
@@ -335,7 +354,7 @@ fn read_group(body: &str) -> Result<PeerDeclaration, String> {
         group: match status.sovereign_group {
             Some(Some(group)) => PeerGroup::Declared {
                 group,
-                role: status.sovereign_role.unwrap_or_default(),
+                participation: status.sovereign_participation.unwrap_or_default(),
             },
             Some(None) => PeerGroup::Undeclared,
             None => PeerGroup::Unsupported,
@@ -364,57 +383,58 @@ mod tests {
         read_group(body).unwrap().group
     }
 
-    /// A peer declaring `group` on a build that carries the role axis.
-    fn declared(group: &str, role: SovereignRole) -> PeerGroup {
+    /// A peer declaring `group` on a build that carries the participation axis.
+    fn declared(group: &str, participation: Participation) -> PeerGroup {
         PeerGroup::Declared {
             group: group.into(),
-            role,
+            participation,
         }
     }
 
-    /// This node is a voter in `target` — the ordinary case every test but the
-    /// non-voting-target one wants.
+    /// This node participates in `target` — the ordinary case every test but
+    /// the out-of-raft-target one wants.
     fn judge_against(target: Option<&str>, joiner: PeerGroup) -> Gate {
-        judge(target, SovereignRole::Voter, TARGET, &joiner, JOINER)
+        judge(target, Participation::In, TARGET, &joiner, JOINER)
     }
 
     #[test]
     fn a_join_within_one_group_is_permitted() {
         assert_eq!(
-            judge_against(Some("prod"), declared("prod", SovereignRole::Voter)),
+            judge_against(Some("prod"), declared("prod", Participation::In)),
             Gate::Permit("prod".into())
         );
     }
 
-    /// R605-F12: same group, still refused, and the message must say *role* —
-    /// a cross-group message here would name "prod" twice and read as a bug.
+    /// R605-F35 (the R605-F12 non-voter refusal, carried over): same group,
+    /// still refused, and the message must say *participation* — a cross-group
+    /// message here would name "prod" twice and read as a bug.
     #[test]
-    fn a_non_voting_joiner_is_refused_by_role_not_by_group() {
-        let Gate::Refuse(msg) = judge_against(Some("prod"), declared("prod", SovereignRole::NonVoter))
+    fn an_out_joiner_is_refused_by_participation_not_by_group() {
+        let Gate::Refuse(msg) = judge_against(Some("prod"), declared("prod", Participation::Out))
         else {
-            panic!("a non-voting member must not join its own group's quorum");
+            panic!("an `out` member must not join its own group's raft");
         };
-        assert!(msg.contains("NON-VOTING"), "{msg}");
-        assert!(msg.contains("--sovereign-role voter"), "{msg}");
+        assert!(msg.contains("OUT of"), "{msg}");
+        assert!(msg.contains("--sovereign-participation in"), "{msg}");
         assert!(
             !msg.contains("cross-group"),
             "same-group refusal must not claim a cross-group cause: {msg}"
         );
     }
 
-    /// The other end of the same assertion: a box declared non-voting is
-    /// serving add-learner, so it holds a seat its own declaration forbids.
-    /// Refuse before growing a quorum from it.
+    /// The other end of the same assertion: a box declared out of its group's
+    /// raft is serving add-learner, so it holds a seat its own declaration
+    /// forbids. Refuse before growing a raft from it.
     #[test]
-    fn a_non_voting_target_refuses_every_joiner() {
+    fn an_out_target_refuses_every_joiner() {
         for joiner in [
-            declared("prod", SovereignRole::Voter),
-            declared("prod", SovereignRole::NonVoter),
-            declared("dev", SovereignRole::Voter),
+            declared("prod", Participation::In),
+            declared("prod", Participation::Out),
+            declared("dev", Participation::In),
         ] {
-            let gate = judge(Some("prod"), SovereignRole::NonVoter, TARGET, &joiner, JOINER);
+            let gate = judge(Some("prod"), Participation::Out, TARGET, &joiner, JOINER);
             let Gate::Refuse(msg) = gate else {
-                panic!("a non-voting cluster must refuse joins, got {gate:?}");
+                panic!("an `out` cluster must refuse joins, got {gate:?}");
             };
             assert!(msg.contains("--raft-node-id"), "{msg}");
         }
@@ -424,7 +444,7 @@ mod tests {
     /// operator has to go and reconstruct is one that gets worked around.
     #[test]
     fn a_cross_group_join_is_refused_naming_both_groups() {
-        let Gate::Refuse(msg) = judge_against(Some("prod"), declared("dev", SovereignRole::Voter))
+        let Gate::Refuse(msg) = judge_against(Some("prod"), declared("dev", Participation::In))
         else {
             panic!("a dev node joining prod must be refused");
         };
@@ -459,8 +479,8 @@ mod tests {
     #[test]
     fn an_unstamped_cluster_does_not_gate_at_all() {
         for joiner in [
-            declared("dev", SovereignRole::Voter),
-            declared("dev", SovereignRole::NonVoter),
+            declared("dev", Participation::In),
+            declared("dev", Participation::Out),
             PeerGroup::Undeclared,
             PeerGroup::Unsupported,
         ] {
@@ -475,7 +495,7 @@ mod tests {
     #[test]
     fn group_labels_are_compared_exactly() {
         assert!(matches!(
-            judge_against(Some("dev"), declared("Dev", SovereignRole::Voter)),
+            judge_against(Some("dev"), declared("Dev", Participation::In)),
             Gate::Refuse(_)
         ));
     }
@@ -498,8 +518,8 @@ mod tests {
             PeerGroup::Undeclared
         );
         assert_eq!(
-            group_of(r#"{"node_id":4,"sovereign_group":"prod","sovereign_role":"voter"}"#),
-            declared("prod", SovereignRole::Voter)
+            group_of(r#"{"node_id":4,"sovereign_group":"prod","sovereign_participation":"in"}"#),
+            declared("prod", Participation::In)
         );
     }
 
@@ -532,36 +552,47 @@ mod tests {
         );
         assert_eq!(
             declaring.group,
-            declared("prod-us", SovereignRole::Voter),
+            declared("prod-us", Participation::In),
             "both axes come out of the one read, so neither can be stale relative to the other"
         );
     }
 
-    /// R605-F12's back-compat seam, pinned because it is a *decision* and not
-    /// an oversight: a build that predates the role axis answers with a group
-    /// and no role key, and is read as a voter so a stamped cluster stays
+    /// R605-F35's back-compat seam, pinned because it is a *decision* and not
+    /// an oversight: a build that predates participation answers with a group
+    /// and no participation key, and is read as `in` so a stamped cluster stays
     /// growable mid-rollout. If this ever flips to a refusal, the whole prod
     /// raft stops accepting members until it has been rolled — see
     /// [`read_group`]'s doc for the window this leaves and why it is bounded.
     #[test]
-    fn a_group_without_a_role_key_is_a_voter_not_a_refusal() {
+    fn a_group_without_a_participation_key_is_in_not_a_refusal() {
         assert_eq!(
             group_of(r#"{"node_id":4,"sovereign_group":"prod"}"#),
-            declared("prod", SovereignRole::Voter)
+            declared("prod", Participation::In)
         );
         assert_eq!(
-            group_of(r#"{"node_id":4,"sovereign_group":"prod","sovereign_role":null}"#),
-            declared("prod", SovereignRole::Voter)
+            group_of(r#"{"node_id":4,"sovereign_group":"prod","sovereign_participation":null}"#),
+            declared("prod", Participation::In)
         );
     }
 
-    /// The role travels in the same spelling the TOML and the CLI flag use, so
-    /// a peer that declares itself non-voting is read as one.
+    /// The retired R605-F12 key is not a stand-in for participation: a pre-F35
+    /// build's `"sovereign_role":"non-voter"` reads as `in`, because whether it
+    /// votes was never this gate's question again. A permit is a learner join.
     #[test]
-    fn a_peer_reports_its_role_in_the_toml_spelling() {
+    fn the_retired_role_key_is_not_read() {
         assert_eq!(
             group_of(r#"{"node_id":4,"sovereign_group":"prod","sovereign_role":"non-voter"}"#),
-            declared("prod", SovereignRole::NonVoter)
+            declared("prod", Participation::In)
+        );
+    }
+
+    /// Participation travels in the same spelling the TOML and the CLI flag
+    /// use, so a peer that declares itself out is read as out.
+    #[test]
+    fn a_peer_reports_its_participation_in_the_toml_spelling() {
+        assert_eq!(
+            group_of(r#"{"node_id":4,"sovereign_group":"prod","sovereign_participation":"out"}"#),
+            declared("prod", Participation::Out)
         );
     }
 
@@ -574,9 +605,9 @@ mod tests {
             group_of(
                 r#"{"membership_config":{"x":1},"liveness":{"peers":{}},
                     "members":{"1":{"addr":"a","region":"us-west"}},
-                    "sovereign_group":"dev","sovereign_role":"voter"}"#
+                    "sovereign_group":"dev","sovereign_participation":"in"}"#
             ),
-            declared("dev", SovereignRole::Voter)
+            declared("dev", Participation::In)
         );
     }
 

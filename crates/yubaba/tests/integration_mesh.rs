@@ -46,7 +46,6 @@
 //!
 //! @yah:ticket(R732-T6, "R732-T5's split-brain fencing tests never run by default — extract from integration_mesh.rs like R737-T5 did")
 //! @yah:at(2026-09-08T08:00:22Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-miravel)
 //! @yah:parent(R732)
 //! @yah:next("Extract the split_brain module out of integration_mesh.rs into its own gate-free test file (mirror raft_tenant_placement.rs's approach for R737-T5), register it in tests/main.rs, and confirm it still passes with zero cargo features. Leave multi_node_mesh and the other containerd-integration-gated tests in integration_mesh.rs untouched.")
@@ -116,6 +115,8 @@ fn test_workload_spec(name: &str) -> WorkloadSpec {
         },
         labels: Default::default(),
         durability: None,
+        db: Vec::new(),
+        capabilities: Vec::new(),
         annotations: Default::default(),
         files: Vec::new(),
     }
@@ -940,6 +941,7 @@ mod split_brain {
         yubaba_tenant_streamer::StreamerConfig {
             node_id: NODE_A,
             yubaba_url: "http://127.0.0.1:1".into(),
+            cluster_key_file: None,
             data_root: std::path::PathBuf::from("/nonexistent"),
             sink: yubaba_tenant_streamer::SinkConfig {
                 bucket: "test".into(),

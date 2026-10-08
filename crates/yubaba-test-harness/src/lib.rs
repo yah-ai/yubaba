@@ -133,7 +133,8 @@ fn membership_applied(metrics: &openraft::RaftMetrics<yubaba::raft::YubabaRaftCo
 pub mod solo_node;
 pub use solo_node::{
     solo_node, solo_node_in_cell, solo_node_in_region, solo_node_in_sovereign_group,
-    solo_node_unregistered, solo_node_with_sovereign_role, SoloNode, HARNESS_CAPACITY,
+    solo_node_listing_voters, solo_node_unregistered, solo_node_with_sovereign_participation,
+    SoloNode, HARNESS_CAPACITY,
 };
 
 // ── MeshResponse ─────────────────────────────────────────────────────────────
@@ -271,6 +272,10 @@ impl WardenHandle {
 struct ClusterNode {
     /// Yubaba RPC handle.
     yubaba: WardenHandle,
+    /// R876-T18: the hex cluster key this node enforces with, for
+    /// [`test_cluster_enforcing`]. `None` is the default warn-mode, unkeyed
+    /// node. Kept per node so a restart re-binds under the same policy.
+    cluster_key: Option<String>,
     /// Provider-side server ID — used for `destroy_server` in smoke-tier teardown.
     #[allow(dead_code)]
     server_id: ServerId,
@@ -747,7 +752,12 @@ impl Cluster {
         // 503 when `ServerState::raft` is `None`.
         let reopened = if attach_raft {
             Some(
-                yubaba::raft::open_with_state_machine(node_id, raft_dir, &policy)
+                yubaba::raft::open_with_state_machine(
+                    node_id,
+                    raft_dir,
+                    &policy,
+                    raft_signer(node.cluster_key.as_deref(), node_id)?,
+                )
                     .await
                     .with_context(|| format!("bind_node: re-open raft for node {idx}"))?,
             )
@@ -777,6 +787,9 @@ impl Cluster {
             .with_runtime(runtime);
         if let Some(dir) = headscale_dir {
             builder = builder.with_headscale_dir(dir);
+        }
+        if let Some(key) = &node.cluster_key {
+            builder = builder.with_http_auth(enforcing_policy(key)?);
         }
         builder = builder
             .with_cluster_policy(policy)
@@ -1078,7 +1091,7 @@ where
     } else {
         let runtime: Arc<dyn kamaji::Kamaji + Send + Sync> = Arc::new(runtime);
         let runtimes = (0..nodes).map(|_| Arc::clone(&runtime)).collect();
-        test_cluster_local(runtimes, policy).await
+        test_cluster_local(runtimes, policy, None).await
     }
 }
 
@@ -1114,7 +1127,48 @@ where
         let nodes = runtimes.len();
         return test_cluster_smoke(provider, nodes).await;
     }
-    test_cluster_local(runtimes, policy).await
+    test_cluster_local(runtimes, policy, None).await
+}
+
+/// R876-T18: a local cluster whose every node runs `--auth-mode require`
+/// under one shared cluster key, and signs its own peer traffic with it —
+/// the end state of the auth roll. A test client that wants the HTTP API
+/// must bring a token of its own; [`yubaba::http_auth::mint_peer_token`]
+/// under the same key opens every Peer route.
+pub async fn test_cluster_enforcing<R>(
+    runtime: R,
+    nodes: usize,
+    policy: ClusterPolicy,
+    cluster_key_hex: &str,
+) -> Result<Cluster>
+where
+    R: kamaji::Kamaji + 'static,
+{
+    let runtime: Arc<dyn kamaji::Kamaji + Send + Sync> = Arc::new(runtime);
+    let runtimes = (0..nodes).map(|_| Arc::clone(&runtime)).collect();
+    test_cluster_local(runtimes, policy, Some(cluster_key_hex.to_string())).await
+}
+
+/// The require-mode policy [`test_cluster_enforcing`] installs on each node.
+fn enforcing_policy(cluster_key_hex: &str) -> Result<yubaba::http_auth::HttpAuthPolicy> {
+    yubaba::http_auth::HttpAuthPolicy::new(
+        yubaba::http_auth::AuthMode::Require,
+        &[],
+        Some(cluster_key_hex),
+    )
+    .map_err(|e| anyhow::anyhow!(e))
+}
+
+/// The raft transport's signer for a node: keyed under `cluster_key`, or
+/// unsigned for the default unkeyed harness node.
+fn raft_signer(
+    cluster_key: Option<&str>,
+    node_id: u64,
+) -> Result<yubaba_auth_token::PeerSigner> {
+    Ok(match cluster_key {
+        Some(key) => enforcing_policy(key)?.peer_signer(format!("node:{node_id}")),
+        None => yubaba_auth_token::PeerSigner::unsigned(),
+    })
 }
 
 // ── Local tier ────────────────────────────────────────────────────────────────
@@ -1132,6 +1186,7 @@ where
 async fn test_cluster_local(
     runtimes: Vec<Arc<dyn kamaji::Kamaji + Send + Sync>>,
     policy: ClusterPolicy,
+    cluster_key: Option<String>,
 ) -> Result<Cluster> {
     let nodes = runtimes.len();
     if nodes == 0 {
@@ -1169,7 +1224,12 @@ async fn test_cluster_local(
                 .with_context(|| format!("creating raft dir for node {i}"))?;
             let node_id = (i as u64) + 1; // 1-indexed
             let (raft, state_machine) =
-                yubaba::raft::open_with_state_machine(node_id, raft_dir.clone(), &policy)
+                yubaba::raft::open_with_state_machine(
+                    node_id,
+                    raft_dir.clone(),
+                    &policy,
+                    raft_signer(cluster_key.as_deref(), node_id)?,
+                )
                     .await
                     .with_context(|| format!("opening raft node {node_id}"))?;
             raft_nodes.push(Some(raft));
@@ -1209,6 +1269,9 @@ async fn test_cluster_local(
             .with_context(|| format!("loading yubaba state for node {i}"))?
             .with_runtime(Arc::clone(&runtimes[i]))
             .with_headscale_dir(headscale_dir.clone());
+        if let Some(key) = &cluster_key {
+            srv_state = srv_state.with_http_auth(enforcing_policy(key)?);
+        }
 
         let mut lease_detector = None;
         let mut rpo_registry = None;
@@ -1252,6 +1315,7 @@ async fn test_cluster_local(
 
         cluster_nodes.push(ClusterNode {
             yubaba: WardenHandle::new(format!("http://127.0.0.1:{port}")),
+            cluster_key: cluster_key.clone(),
             server_id: ServerId(format!("local-node-{i}")),
             task: Some(task),
             raft: raft_nodes[i].clone(),
@@ -1417,6 +1481,7 @@ where
 
         cluster_nodes.push(ClusterNode {
             yubaba: WardenHandle::new(base_url),
+            cluster_key: None,
             server_id,
             task: None,
             raft: None,

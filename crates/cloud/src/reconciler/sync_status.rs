@@ -699,7 +699,6 @@ mod tests {
                 address: crate::config::ServiceAddress::front_door("yah.dev"),
                 description: None,
                 components: vec![],
-                db: crate::DbCatalog::default(),
             },
             mirrors: BTreeMap::from([
                 ("dev".to_string(), local_static_mirror()),

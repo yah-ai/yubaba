@@ -1,11 +1,11 @@
 {
   "cluster_protocol": 8,
-  "cluster_protocol_surface": "5a0941bf261a2f6b08603b9824c31ae0e3ac3ba404a10d4b0ecf9e966e28f348",
+  "cluster_protocol_surface": "504d4b70ab230699b320e462740dc0171f312c50fa7d0d839bd2b899df9c7537",
   "cluster_protocol_surface_inputs": {
-    "rust-file oss/yubaba/crates/yubaba-consensus/src/raft/mod.rs": "cc15ec05b16d5149343b0e2e192549bcfe31d07b6770f402ac331e7b2da6d990",
-    "rust-file oss/yubaba/crates/yubaba-consensus/src/raft/network.rs": "c7d07e9e5b22c6cccf44be6f5b5aa1a909951e835febac19cca5576cbc3eb582",
-    "rust-lines oss/yubaba/crates/yubaba/src/lib.rs containing /raft/": "e3cbe9bddf7aa7ba4f856c16112ea9f6358184c46d0c1f1f46f9c889abb9010d",
-    "rust-items oss/yubaba/crates/yubaba/src/lib.rs fn raft_*": "6927e3f1bdb168add0ca77095e8193b41aa06337b8b7d18e7f630d8607e7e0ab",
+    "rust-file oss/yubaba/crates/yubaba-consensus/src/raft/mod.rs": "155b5df08aba919ae5bcfc105cbc932ed6f5a3cc94b01211bfb58c3062f11755",
+    "rust-file oss/yubaba/crates/yubaba-consensus/src/raft/network.rs": "8c4cd685ad3f862462aac22fc5eb8a620cf29a020a5045cba493e440fcede5a0",
+    "rust-lines oss/yubaba/crates/yubaba/src/lib.rs containing /raft/": "868d6f03452679c022751f4c4b9714030879055d7a78fb62acfb504d6c11c711",
+    "rust-items oss/yubaba/crates/yubaba/src/lib.rs fn raft_*": "0758cc4b5d7f703684878c6a592929c74652a1c70c930a01cda7a5803fd72472",
     "cargo-dep oss/yubaba/crates/yubaba-consensus/Cargo.toml [openraft]": "a56b2cbf96d5169e11aba469da76f119b2d3ea86a8eb292778f7d7de10b91440"
   },
   "cluster_protocol_history": {
@@ -19,10 +19,10 @@
     "8": "R936-B3 (2026-09-22) - the ingress-owner record becomes a raft node id. `YubabaRequest` gained ClaimIngressOwner { node_id }, the only thing current code writes to claim ingress/appliance ownership; SetIngressOwner { machine } is RETIRED but keeps its exact shape because live logs (prod last_log_index ~2.8M) and snapshots hold it, and it now applies by resolving the machine through the member rows' machine tag. Decided on this file's standing discriminator: an added VARIANT on the externally-tagged YubabaRequest with no #[serde(other)] is a hard `unknown variant` for an epoch-7 node that receives it over AppendEntries, so it cannot apply or advance. The break is conditional and quiet: a mixed 7/8 cluster runs normally until the first ClaimIngressOwner commits, and only an ownership claim writes one. ROLL ORDER THEREFORE MATTERS: roll every non-owner voter first and the current ingress owner LAST, so no epoch-7 binary is running when the first claim is written (a claim happens only on a vacancy/failover or on the owner's own restart). Pinned by raft::tests::claim_ingress_owner_is_new_bytes_and_the_retired_variant_keeps_its_shape."
   },
   "state_epoch": 7,
-  "state_epoch_surface": "1d878ab88e88ff36e53c70fa9bdcb7431176e331adaa83f52dec63b37eb3c8b6",
+  "state_epoch_surface": "4e99163675ddfe352fac9568d184b70124d5a3875d776d36c1a9cd33fa9f12e6",
   "state_epoch_surface_inputs": {
-    "rust-file oss/yubaba/crates/yubaba-consensus/src/raft/mod.rs": "cc15ec05b16d5149343b0e2e192549bcfe31d07b6770f402ac331e7b2da6d990",
-    "rust-file oss/yubaba/crates/yubaba-consensus/src/raft/store.rs": "96707998a61fa62a39cca10d054cc9a13217d4bc77050d4145fd712e8f49931a",
+    "rust-file oss/yubaba/crates/yubaba-consensus/src/raft/mod.rs": "155b5df08aba919ae5bcfc105cbc932ed6f5a3cc94b01211bfb58c3062f11755",
+    "rust-file oss/yubaba/crates/yubaba-consensus/src/raft/store.rs": "a2a3b3a211264c69f87c48c5fe0f6cd7b84260c162013b660c6c2a11597f68bd",
     "cargo-dep oss/yubaba/crates/yubaba-consensus/Cargo.toml [openraft]": "a56b2cbf96d5169e11aba469da76f119b2d3ea86a8eb292778f7d7de10b91440"
   },
   "state_epoch_history": {
@@ -35,6 +35,19 @@
     "7": "R936-B3 (2026-09-22) - disk side of cluster_protocol \"8\". YubabaState.ingress_owner changes type from Option<String> to Option<IngressOwnerRecord>, an untagged enum: Node(u64) serializes as a bare number (what every new write produces), LegacyMachine(String) as the bare string a pre-B3 snapshot carries. NEW-READS-OLD holds: a pre-B3 raft_state.json / snapshot / state backup loads with the string as LegacyMachine and resolves through the member rows on read (YubabaState::ingress_owner_node), pinned by raft::tests::a_pre_r936_b3_name_record_loads_and_a_claim_writes_a_node_id. OLD-READS-NEW BREAKS: an epoch-6 binary decoding `\"ingress_owner\": 2` into Option<String> fails, so a ROLLBACK past the first post-B3 snapshot or claim entry cannot load its own state, and an epoch-6 follower cannot install a snapshot from an epoch-7 leader. Same shape as the R732-F1 precedent: a rollback needs the raft dir restored from before the roll."
   },
   "surface_rerecords": [
+    {
+      "at": "2026-10-06",
+      "axes": [
+        "cluster_protocol"
+      ],
+      "verdict": "NOT BREAKING. cluster_protocol stays 8; `rust-lines lib.rs containing /raft/` and `rust-items lib.rs fn raft_*` moved, both from R605-F35 alone (no other unstaged hunk in lib.rs at record time; the 2026-10-01 hashes reproduced on the tree before this change, per xtask cluster_epoch_drift green at baseline).",
+      "cause": "R605-F35 (group-level voter set). raft_status replaces the `sovereign_role` key with `sovereign_participation` (\"in\"|\"out\", always emitted) and adds `sovereign_voters` (this node's own --sovereign-voters list). raft_add_learner reads the joiner's participation instead of its role, and after a successful learner add promotes the joiner via openraft ChangeMembers::AddVoterIds iff THIS node's --sovereign-voters lists it and VoterAdmission admits it; its 200 body gains `voter_listed`, `promoted`, `promotion`. raft_promote_voter gains a 403 for a node the group does not list. New free fn promote_listed_voter (its error string carries a /raft/ path).",
+      "why_not_a_bump": [
+        "Nothing on the replication path moved: YubabaRequest, YubabaResponse, YubabaState and the raft RPCs are untouched (raft/mod.rs and raft/network.rs hash the same), so state_epoch is not involved either. The promotion is the same AddVoterIds membership change POST /raft/promote-voter has always issued.",
+        "/raft/status is read cross-node only by a leader's operator-path ask_peer during add-learner. NEW-DIALS-OLD: a pre-F35 joiner publishes no `sovereign_participation` key, which read_group resolves to `in` (the old `sovereign_role` key is deliberately not read) - a learner join, never a seat. OLD-DIALS-NEW: a 0.8.42 leader reads no `sovereign_role` key from a new joiner and resolves it to `voter`, exactly as it treats every pre-F12 build - the join is permitted as before, and an old leader never auto-promotes. us-west-003 (the only `out`/`non-voter` box) is standalone with no raft node id, so neither direction can join it anywhere.",
+        "New behaviour is opt-in by flags old builds do not have: a node promotes on join only when started with --sovereign-group AND --sovereign-voters listing the joiner. With --sovereign-group but no list it promotes nobody (fail-closed) - on prod that is a no-op because ClusterPolicy::fleet() is LearnerOnly + Frozen; on dev (rig) it freezes promotion until the list is passed. Additive response keys only; every in-tree consumer reads these bodies as serde_json::Value or a non-deny_unknown_fields struct."
+      ]
+    },
     {
       "at": "2026-10-01",
       "axes": [
@@ -572,6 +585,26 @@
       "verdict": "RE-RECORD ONLY on BOTH axes - cluster_protocol stays 7 and state_epoch stays 6. R911-T7 deletes the raft cluster-secret map: the `secrets` field on YubabaState, its accessors (cluster_secret, cluster_secret_index), the secrets-change watch (subscribe_secrets / secrets_epoch), and the map's apply arms, which become a single no-op for PutSecret | DeleteSecret. WIRE: no YubabaRequest or YubabaResponse variant, field or serde attribute changed - PutSecret and DeleteSecret keep their exact shapes precisely so the live logs (prod last_log_index ~2.8M) and snapshots holding them still deserialize; network.rs and the openraft pin hash `same`. ON DISK, new-reads-old: a pre-T7 raft_state.json or installed snapshot carrying `secrets` loads because YubabaState has no deny_unknown_fields, the key is ignored and never written back, and legacy entries replay through the real apply path as no-ops - pinned by raft::tests::a_legacy_put_or_delete_secret_entry_replays_as_a_no_op, ::a_pre_r911_t7_snapshot_with_a_secret_map_loads_and_drops_it, store::tests::a_pre_r911_t7_state_file_loads_replays_legacy_secret_entries_and_drops_the_map and ::a_pre_r911_t7_snapshot_installs_and_drops_the_secret_map. Old-reads-new: a T7 snapshot simply lacks the key, and the pre-T7 R911 build (0.8.40-h13, what every voter runs) defaults it to an empty map that it never reads, since F1 moved every reader to the fleet object store.",
       "cause": "R911-T7 (W294 Decision 8): after R911-T6 rolled both sovereign groups onto the R911 build and R911-F5's migration re-sealed every raft record into the fleet object store (prod migrated 7, dev migrated 3, failed 0), nothing reads the raft secret map. Keeping it would leave a second copy of every cluster secret in raft forever, sealed the old unbound way.",
       "residual_risk": "(1) MIXED STATE IS POSSIBLE BUT UNOBSERVABLE: a pre-T7 node applying a PutSecret would insert into its own map while a T7 node does not, so the two state machines' `secrets` content could differ. No such entry can be committed today - every live build's /raft/write refuses PutSecret/DeleteSecret (R911-F3) and no in-process writer remains - and no build reads the map, so nothing can act on a difference. (2) ROLLBACK BELOW R911 IS NOT SUPPORTED, and this change makes that permanent: a pre-R911 binary resolves cluster secrets from raft, and after a T7 node persists state or ships a snapshot it would find the map empty. That rollback was already unsafe from R911-F3 on, since a secret changed through PUT /secrets never reaches the raft map; the supported rollback target is the R911 build itself, which this change keeps safe in both directions."
+    },
+    {
+      "at": "2026-10-03",
+      "axes": [
+        "cluster_protocol",
+        "state_epoch"
+      ],
+      "cause": "R876-T18 step 1: every node-to-node HTTP caller signs with a peer-tier PASETO token minted per request from the cluster key. In consensus: new peer_auth.rs (PeerSigner/PeerClient); YubabaNetworkFactory::new and raft::open/open_with_state_machine take a PeerSigner; client_write_forwarded takes a &PeerClient instead of a bare reqwest::Client; store.rs changes only a #[cfg(test)] call site.",
+      "verdict": "RE-RECORD ONLY on BOTH axes - cluster_protocol stays 8, state_epoch stays 7. WIRE: no raft RPC path, body, YubabaRequest/YubabaResponse variant, field or serde attribute changed; the transport adds an `Authorization: Bearer` header and nothing else. Mixed builds interoperate in every combination that can exist on a roll: a pre-B15 node has no auth layer and ignores the header; a B15+ node in warn mode (the default) serves an unsigned pre-T18 peer and verifies a signed one; an unkeyed T18 node sends no header at all, byte-identical to before. The one combination that refuses traffic - a require-mode receiver and an unsigned sender - is selected by CONFIG (`--auth-mode require`), not by build, and R876-T18's roll order (keys on every node, then flip) is what keeps it from occurring; bumping the epoch would not prevent it and would wrongly forbid the safe warn-mode mix. ON DISK: nothing serialized moved - mod.rs changes are fn signatures, store.rs is a test call site.",
+      "residual_risk": "A node flipped to require while ANY peer is still unkeyed or pre-T18 drops that peer's votes/heartbeats with 401 and loses it from the quorum while systemd reports active. That is a roll-order hazard owned by R876-T18 step 3 (see its gotchas), not a version-skew hazard this epoch can encode. Proven safe in-process by yubaba tests/raft_peer_auth.rs (all-require 3-node cluster elects, forwards a follower write, and refuses anonymous)."
+    },
+    {
+      "at": "2026-10-03",
+      "axes": [
+        "cluster_protocol",
+        "state_epoch"
+      ],
+      "cause": "R876-T18 step 1, out-of-process half: PeerSigner/PeerClient moved out of yubaba-consensus/src/peer_auth.rs into the new crate oss/yubaba/crates/yubaba-auth-token (with the token format from yubaba::http_auth), so the tenant streamer and passway can mint without linking yubaba. In raft/mod.rs, raft/network.rs and raft/store.rs the only change since the previous 2026-10-03 re-record is the import path `crate::peer_auth::X` -> `yubaba_auth_token::X`.",
+      "verdict": "RE-RECORD ONLY on BOTH axes - cluster_protocol stays 8, state_epoch stays 7. Same types, same behaviour, new crate path: the token bytes, header, and every raft RPC path and body are identical to the build the previous entry recorded. Verified by diffing all three files against 2cbdc7963bfc28a81446a243fcc0f8d2ff19ab04 - every hunk is R876-T18 peer-auth work, no peer edits.",
+      "residual_risk": "None beyond the previous entry's: the flip-to-require ordering risk is unchanged and owned by R876-T18 step 3."
     }
   ]
 }

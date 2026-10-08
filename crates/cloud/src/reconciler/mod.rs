@@ -48,7 +48,6 @@
 //!
 //! @yah:relay(R458, "Cloud reconciler for .yah/domains/*.toml — R2 custom-domain shape")
 //! @yah:at(2026-06-05T08:40:57Z)
-//! @yah:status(open)
 //! @yah:next("F1: implement ensure_r2_custom_domain (mirror of ensure_r2_bucket) + wire into yah cloud apply as a post-services pass. Scope: domains with cdn_bucket set and no [[routes]] (today: cdn-yah-dev.toml). Worker-routed shape (yah-dev, app-yah-dev) is a separate surface.")
 //! @arch:see(.yah/domains/cdn-yah-dev.toml)
 //!
@@ -940,7 +939,6 @@ mod source_seam_tests {
             address: crate::config::ServiceAddress::front_door("scrabcake.example"),
             description: None,
             components: vec![comp],
-            db: crate::DbCatalog::default(),
         }
     }
 

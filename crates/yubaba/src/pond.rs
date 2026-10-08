@@ -42,7 +42,6 @@
 //!
 //! @yah:relay(R455, "Phase D — mesofact-dev backend container + bridge network + Worker bindings")
 //! @yah:at(2026-06-05T08:23:34Z)
-//! @yah:status(open)
 //! @yah:phase(D)
 //! @yah:parent(Q453)
 //! @yah:next("Add a third supervised slot to pond: almanac + issue-tracker side-by-side under tini, on a per-cell docker bridge so the Worker can DNS-resolve the backend")
@@ -51,7 +50,6 @@
 //!
 //! @yah:relay(R456, "Phase E — Per-slot probes in PondStateRecord")
 //! @yah:at(2026-06-05T08:23:37Z)
-//! @yah:status(open)
 //! @yah:phase(E)
 //! @yah:parent(Q453)
 //! @yah:next("Extend PondStateRecord with per-slot liveness/readiness probes; top-level phase becomes a roll-up; surface granularity through the observation seam to the UI")

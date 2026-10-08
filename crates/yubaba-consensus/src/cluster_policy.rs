@@ -139,7 +139,7 @@
 //! @yah:gotcha("ROLL NOT DONE: nothing is deployed and no fleet node runs alpha.35. The roll is a separate outward step. An un-rolled node keeps the pre-T6 behaviour behind the R936-B6 gate, and it still ANSWERS /raft/pre-vote.")
 //! @yah:gotcha("OPEN QUESTION, NOT DECIDED HERE: can the R936-B6 election gate now retire? Pre-Vote alone held a flapping voter to 1->1 in raft_flapping_voter, the same bound as the gate, and alpha.35 also makes a leader reject pre-votes while its quorum-ack lease holds, which covers the gate's discard-leader-grant rule. Both run today, doubling probe traffic. Retiring the gate is the 'one owner' move, but it wants the prod roll of T6 first and a live flap check.")
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crate::raft::YubabaNodeId;
@@ -387,6 +387,101 @@ impl VoterAdmission {
                 }
             }
         }
+    }
+}
+
+/// Which nodes this node's sovereign group lets hold a voter seat — R605-F35.
+///
+/// The group's half of "may this learner be promoted", beside
+/// [`VoterAdmission`]'s policy half. Both must say yes. Policy answers *how
+/// many* voters and *whether this kind of cluster grows its own*; this answers
+/// *which ones*, and it is a declaration, not a preset — so it is deliberately
+/// not a field of [`ClusterPolicy`], whose fields record what `--cluster-profile`
+/// chose. It is built from `yubaba serve --sovereign-group` plus
+/// `--sovereign-voters`, which carry `.yah/infra/sovereign-groups/<group>.toml`
+/// onto the daemon.
+///
+/// Read by every path that can hand out a vote: `POST /raft/promote-voter`,
+/// the listed-voter promotion `POST /raft/add-learner` performs after a join,
+/// and the membership ratchet's rehydrate half
+/// ([`plan_rehydrate`](crate::membership_ratchet::plan_rehydrate)). The last is
+/// the one that makes this load-bearing: under [`ClusterPolicy::rig`] the
+/// ratchet promotes stable learners with no operator present, so without a list
+/// a co-located VM member that joined as a learner would be handed a seat on
+/// the same host as an existing voter within one hold-down.
+///
+/// Promotion only. The founding set (`POST /raft/initialize`) is not judged
+/// against it: founding is an operator naming every voter at once, and the
+/// total-loss recovery path re-founds prod with `raft init` mid-outage, where a
+/// refusal over a missing flag would cost more than it guards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoterSeats {
+    /// This node declares no sovereign group, so nothing owns this cluster's
+    /// quorum composition by declaration: promotion is [`VoterAdmission`]'s
+    /// call alone — the pre-R605-F35 behaviour, which is what keeps pond, rig
+    /// and BYO clusters (none of them stamped) growing as they did — and a
+    /// join never promotes on its own, because nobody is listed.
+    NoGroup,
+    /// This node declares `group`, which seats exactly `voters` (raft ids).
+    ///
+    /// **Empty is fail-closed**: a group whose daemon was started without
+    /// `--sovereign-voters` promotes nobody. A missing list is the declaration
+    /// failing to reach the box, and the wrong default here is a node promoted
+    /// into a quorum seat — so the safe reading is "no seats granted", reported
+    /// by name in every refusal.
+    Listed {
+        group: String,
+        voters: BTreeSet<YubabaNodeId>,
+    },
+}
+
+impl VoterSeats {
+    /// Seats for `group`, granting exactly `voters`.
+    pub fn listed(
+        group: impl Into<String>,
+        voters: impl IntoIterator<Item = YubabaNodeId>,
+    ) -> Self {
+        Self::Listed {
+            group: group.into(),
+            voters: voters.into_iter().collect(),
+        }
+    }
+
+    /// Does the group list `node` as a voter? What `POST /raft/add-learner`
+    /// asks before promoting a joiner. Always `false` under [`Self::NoGroup`]:
+    /// with nothing listed, a join is a learner join and nothing more.
+    pub fn lists(&self, node: YubabaNodeId) -> bool {
+        matches!(self, Self::Listed { voters, .. } if voters.contains(&node))
+    }
+
+    /// Why the group's declaration refuses `node` a seat, or `None` when it
+    /// does not (listed, or no group declared). The refusal names the group,
+    /// the list it holds and the edit that changes the answer, because "not
+    /// allowed" with no list attached gets worked around rather than fixed.
+    pub fn refusal(&self, node: YubabaNodeId) -> Option<String> {
+        let Self::Listed { group, voters } = self else {
+            return None;
+        };
+        if voters.contains(&node) {
+            return None;
+        }
+        Some(if voters.is_empty() {
+            format!(
+                "node {node} is not a listed voter of sovereign group {group:?}: this node holds \
+                 NO voter list for it (yubaba serve was started with --sovereign-group but \
+                 without --sovereign-voters), so it promotes nobody. Quorum composition is the \
+                 group's declaration (R605-F35) — copy the raft ids from \
+                 .yah/infra/sovereign-groups/{group}.toml into --sovereign-voters and restart."
+            )
+        } else {
+            format!(
+                "node {node} is not a listed voter of sovereign group {group:?}, which seats \
+                 {voters:?}; it stays a learner. Quorum composition is the group's declaration \
+                 (R605-F35): if it should vote, add it to \
+                 .yah/infra/sovereign-groups/{group}.toml (`yah cloud validate` checks where \
+                 it sits) and restart the group's yubabas with --sovereign-voters naming it."
+            )
+        })
     }
 }
 
@@ -1307,5 +1402,37 @@ mod tests {
         assert!(IngressOwnership::FollowsRaftLeader.follows_raft_leader());
         assert!(IngressOwnership::FollowsRaftLeader.manages_ingress());
         assert!(!IngressOwnership::FollowsRaftLeader.elects_from_eligibility_set());
+    }
+
+    // ─── R605-F35: the group's voter list ───────────────────────────────────
+
+    /// A listed node is promotable and an unlisted one is refused by name.
+    #[test]
+    fn a_group_seats_exactly_the_voters_it_lists() {
+        let seats = VoterSeats::listed("dev", [11, 13, 14]);
+        assert!(seats.lists(13));
+        assert_eq!(seats.refusal(13), None);
+        assert!(!seats.lists(21));
+        let why = seats.refusal(21).expect("an unlisted VM member is refused a seat");
+        assert!(why.contains("node 21") && why.contains("\"dev\""), "{why}");
+        assert!(why.contains("sovereign-groups/dev.toml"), "{why}");
+    }
+
+    /// Fail-closed: a declared group whose daemon holds no list promotes
+    /// nobody, and says which flag is missing.
+    #[test]
+    fn a_group_with_an_empty_list_promotes_nobody() {
+        let seats = VoterSeats::listed("dev", []);
+        assert!(!seats.lists(11));
+        let why = seats.refusal(11).expect("no list means no seats");
+        assert!(why.contains("--sovereign-voters"), "{why}");
+    }
+
+    /// No group, no declaration to refuse with: promotion stays the policy's
+    /// call (pond, rig, BYO), but a join never promotes on its own.
+    #[test]
+    fn no_group_refuses_nothing_and_lists_nobody() {
+        assert_eq!(VoterSeats::NoGroup.refusal(4), None);
+        assert!(!VoterSeats::NoGroup.lists(4));
     }
 }

@@ -140,11 +140,10 @@
 //!
 //! @yah:ticket(R733-F1, "ResidencyPolicy on the tenant record: MobilityTier(Locked|ReadFollow|Relocatable) + home_jurisdiction + bucket_class")
 //! @yah:at(2026-08-09T22:21:40Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-glimmerstone)
 //! @yah:phase(P1)
 //! @yah:parent(R733)
-//! @yah:next("Tier: Warrior — an immutable, correctness-bearing field whose shape every downstream gate inherits; cheap to write, expensive to get wrong.")
+//! @yah:next("Tier: Cleric — an immutable, correctness-bearing field whose shape every downstream gate inherits; cheap to write, expensive to get wrong.")
 //! @yah:next("VERIFIED ABSENT 2026-08-09: `rg -i 'residency|jurisdiction|MobilityTier|home_region' --glob '*.rs' oss/` returns nothing. The concept exists only in noisetable's design notes.")
 //! @yah:next("Co-lands with R732-F1's TenantOwnership in the same raft state map — same cluster-epochs drift-gate consequence applies.")
 //! @yah:next("Set at tenant creation, immutable except by a deliberate audited operation. Tier 0 must be enforceable, not merely documented.")
@@ -153,18 +152,16 @@
 //!
 //! @yah:ticket(R733-T2, "policy.permits(action, destination) gate, wired as the FIRST step of placement, replica spin-up, and cross-cell move")
 //! @yah:at(2026-08-09T22:21:47Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-glimmerstone)
 //! @yah:phase(P1)
 //! @yah:parent(R733)
-//! @yah:next("Tier: Cleric — one predicate plus three call sites; the value is that it exists before the callers do.")
+//! @yah:next("Tier: Warrior — one predicate plus three call sites; the value is that it exists before the callers do.")
 //! @yah:next("One function, three consumers: R737 placement/failover (Tier 0/1 must stay in home_jurisdiction), R735 replica spin-up (Tier 0 = deny any off-jurisdiction replica), R736 move protocol step 1.")
 //! @yah:next("Land the gate BEFORE those consumers exist. W249's whole argument is that retrofitting a residency check into a dozen paths later is the failure mode.")
 //! @yah:depends_on(R733-F1)
 //!
 //! @yah:ticket(R733-T3, "Jurisdiction-classed R2 bucket selection at tenant creation (JurisdictionLocked(j) vs Global)")
 //! @yah:at(2026-08-09T22:21:54Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-glimmerstone)
 //! @yah:phase(P1)
 //! @yah:parent(R733)
@@ -174,11 +171,10 @@
 //!
 //! @yah:ticket(R733-T4, "Tier 0 enforcement test: a Locked tenant never gets an off-jurisdiction replica or relocation, regardless of presence signals")
 //! @yah:at(2026-08-09T22:22:03Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-glimmerstone)
 //! @yah:phase(P1)
 //! @yah:parent(R733)
-//! @yah:next("Tier: Cleric — the test that converts 'documented' into 'enforced'; it is the point of the whole relay.")
+//! @yah:next("Tier: Warrior — the test that converts 'documented' into 'enforced'; it is the point of the whole relay.")
 //! @yah:next("Assert the deny holds against every entry path the gate guards, not just the one the code happens to call today.")
 //! @yah:depends_on(R733-T2)
 //!
@@ -299,6 +295,7 @@ pub use network::{YubabaNetwork, YubabaNetworkFactory};
 pub use store::{YubabaLogStore, YubabaStateMachine};
 
 use crate::cluster_policy::ClusterPolicy;
+use yubaba_auth_token::{PeerClient, PeerSigner};
 
 // ── Type config ──────────────────────────────────────────────────────────────
 
@@ -2449,8 +2446,9 @@ pub async fn open(
     node_id: YubabaNodeId,
     raft_dir: PathBuf,
     policy: &ClusterPolicy,
+    signer: PeerSigner,
 ) -> anyhow::Result<YubabaRaft> {
-    Ok(open_with_state_machine(node_id, raft_dir, policy).await?.0)
+    Ok(open_with_state_machine(node_id, raft_dir, policy, signer).await?.0)
 }
 
 /// Like [`open`], but also hands back a clone of the [`YubabaStateMachine`] so
@@ -2464,6 +2462,7 @@ pub async fn open_with_state_machine(
     node_id: YubabaNodeId,
     raft_dir: PathBuf,
     policy: &ClusterPolicy,
+    signer: PeerSigner,
 ) -> anyhow::Result<(YubabaRaft, YubabaStateMachine)> {
     std::fs::create_dir_all(&raft_dir)?;
 
@@ -2474,7 +2473,7 @@ pub async fn open_with_state_machine(
 
     let log_store = YubabaLogStore::open(raft_dir.clone()).await?;
     let state_machine = YubabaStateMachine::open(raft_dir).await?;
-    let network = YubabaNetworkFactory::new()?;
+    let network = YubabaNetworkFactory::new(signer)?;
 
     let raft = YubabaRaft::new(node_id, config, network.clone(), log_store, state_machine.clone()).await?;
 
@@ -2565,7 +2564,7 @@ pub const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 /// own idea of how long a tick is.
 pub async fn client_write_forwarded(
     raft: &YubabaRaft,
-    client: &reqwest::Client,
+    client: &PeerClient,
     req: YubabaRequest,
 ) -> anyhow::Result<YubabaResponse> {
     match raft.client_write(req.clone()).await {

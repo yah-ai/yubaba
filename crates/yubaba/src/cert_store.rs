@@ -545,6 +545,18 @@ pub struct Enrollment {
     /// a door with no backend yet (it answers 503).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discover: Option<workload_spec::TenantPasswayDiscovery>,
+    /// R931-B12: this domain's passway backends, stated rather than discovered
+    /// — bare `host:port`, the door's `upstreams`. The other answer to "where
+    /// are the backends", for a door whose backend is not a workload yubaba
+    /// holds records for: a service's **inner door** on the door's own
+    /// loopback, which is derived from the service name and so is correct by
+    /// construction where discovery would route past it (R870-F23).
+    /// [`validate`](Self::validate) refuses a record carrying both.
+    ///
+    /// A node older than this field drops it on decode and arms the door with
+    /// no backend — a 503, never a route somewhere wrong.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstreams: Vec<String>,
 }
 
 /// The ACME inputs a self-declared enrollment carries (R910-F2). The directory
@@ -574,6 +586,7 @@ impl Enrollment {
             machines: Vec::new(),
             acme: None,
             discover: None,
+            upstreams: Vec::new(),
         }
     }
 
@@ -611,6 +624,13 @@ impl Enrollment {
                  scope the record with `machines`",
                 self.tls_backend
             ));
+        }
+        // The door's `PASSWAY_UPSTREAM_SOURCE` is one or the other, so a record
+        // carrying both would have one silently ignored (R931-B12).
+        if self.discover.is_some() && !self.upstreams.is_empty() {
+            return Err("`discover` and `upstreams` are two answers to one question — a door \
+                        polls yubaba or is told its backends, not both"
+                .to_string());
         }
         if let Some(acme) = &self.acme {
             for (field, value) in [
@@ -1993,6 +2013,22 @@ mod tests {
         let old = br#"{"tls_backend":"127.0.0.1:8443","http_backend":null,"enrolled_at":1,"holding":null}"#;
         let e: Enrollment = serde_json::from_slice(old).unwrap();
         assert!(e.machines.is_empty() && e.acme.is_none() && e.discover.is_none());
+        assert!(e.upstreams.is_empty());
+    }
+
+    /// R931-B12: a door is told its backends OR polls for them — a record
+    /// naming both would have the static set silently ignored by the door.
+    #[test]
+    fn a_record_with_both_discovery_and_static_upstreams_is_refused() {
+        let mut e = Enrollment::new(backend(8445), at(1_700_000_000));
+        e.machines = vec!["us-west-011".into()];
+        e.upstreams = vec!["127.0.0.1:19123".into()];
+        e.validate().expect("static upstreams alone are a valid door");
+        e.discover = Some(workload_spec::TenantPasswayDiscovery {
+            urls: vec!["http://100.64.0.10:7443".into()],
+            ident: "noisetable-staging".into(),
+        });
+        assert!(e.validate().unwrap_err().contains("`discover` and `upstreams`"));
     }
 
     #[test]

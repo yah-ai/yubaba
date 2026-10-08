@@ -83,7 +83,6 @@
 //!
 //! @yah:relay(R369, "Pond CI + robustness hygiene")
 //! @yah:at(2026-06-01T03:27:01Z)
-//! @yah:status(open)
 //! @yah:next("W142 surfaces three open follow-ups that aren't naming hygiene (R368) and aren't UI gaps (R367) — they're about defending the pond contract over time: Worker bundle freshness in CI, MinIO license posture, and workerd binary vendoring for spinup budget. File each as a child")
 //! @arch:see(.yah/docs/working/W142-pond.md)
 //!
@@ -122,7 +121,6 @@
 //!
 //! @yah:relay(R374, "Yubaba owns liveness in pond — retract R256-F6 camp-direct carveout")
 //! @yah:at(2026-06-01T17:25:26Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:claude)
 //! @yah:next("Frame: in pond today, camp directly drives container lifecycle and desktop adopts via a bare TCP probe of the miniflare port. Half-alive states (miniflare orphaned to launchd ppid=1, MinIO gone) get silently adopted, surfacing as 'Network connection lost' from entry.worker.js. R362-B1 patched two narrow symptoms but the shape keeps inviting the same bug class.")
 //! @yah:next("Direction: yubaba becomes the liveness/readiness authority in pond too. Camp's job shrinks to 'ensure ONE yubaba is up'; desktop's job shrinks to 'ask yubaba for the workload's status'. Half-alive becomes structurally impossible because yubaba's reconciler only reports Ready when every slot's probe passes.")
@@ -209,7 +207,6 @@
 //!
 //! @yah:relay(R408, "Pond: dual-process yubaba-container adaptation")
 //! @yah:at(2026-06-02T03:25:42Z)
-//! @yah:status(open)
 //! @yah:phase(P3)
 //! @yah:parent(Q405)
 //! @arch:see(.yah/docs/working/W154-yubaba-dual-runtime.md)
@@ -1790,7 +1787,6 @@ mod tests {
             address: crate::config::ServiceAddress::front_door("yah.dev"),
             description: None,
             components: vec![],
-            db: crate::DbCatalog::default(),
         };
         let comp = crate::ServiceComponent {
             mount: None,
@@ -1864,7 +1860,6 @@ mod tests {
             address: crate::config::ServiceAddress::front_door("test.dev"),
             description: None,
             components: vec![],
-            db: crate::DbCatalog::default(),
         };
         let comp = crate::ServiceComponent {
             mount: None,
@@ -1950,7 +1945,6 @@ mod tests {
             address: crate::config::ServiceAddress::front_door("test.dev"),
             description: None,
             components: vec![],
-            db: crate::DbCatalog::default(),
         };
         let comp = crate::ServiceComponent {
             mount: None,
@@ -2034,7 +2028,6 @@ mod tests {
             address: crate::config::ServiceAddress::front_door("test.dev"),
             description: None,
             components: vec![],
-            db: crate::DbCatalog::default(),
         };
         let comp = crate::ServiceComponent {
             mount: None,
@@ -2112,7 +2105,6 @@ mod tests {
             address: crate::config::ServiceAddress::front_door("test.dev"),
             description: None,
             components: vec![],
-            db: crate::DbCatalog::default(),
         };
         let comp = crate::ServiceComponent {
             mount: None,

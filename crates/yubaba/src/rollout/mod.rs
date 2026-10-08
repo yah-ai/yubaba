@@ -212,7 +212,7 @@ pub async fn commit_guarded(
     raft: &crate::raft::YubabaRaft,
     state_machine: &crate::raft::YubabaStateMachine,
     rollout_id: &str,
-    forward_with: Option<&reqwest::Client>,
+    forward_with: Option<&yubaba_auth_token::PeerClient>,
     mut intent: impl FnMut(Option<&RolloutRecord>) -> Option<RolloutRecord>,
 ) -> anyhow::Result<Written> {
     use crate::raft::{RolloutWriteOutcome, YubabaResponse};

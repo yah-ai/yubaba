@@ -932,7 +932,8 @@ mod tests {
             allocatable: None,
             taints: taints.iter().map(|t| t.to_string()).collect(),
             sovereign_group: None,
-            sovereign_role: None,
+            sovereign_participation: Default::default(),
+            host_machine: None,
             ingress_floating_ip: None,
         }
     }

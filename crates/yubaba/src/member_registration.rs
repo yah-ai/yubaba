@@ -118,9 +118,10 @@ pub fn spawn(
     raft: YubabaRaft,
     state_machine: YubabaStateMachine,
     declaration: NodeDeclaration,
+    signer: yubaba_auth_token::PeerSigner,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        run(node_id, raft, state_machine, declaration).await;
+        run(node_id, raft, state_machine, declaration, signer).await;
     })
 }
 
@@ -174,12 +175,13 @@ async fn run(
     raft: YubabaRaft,
     state_machine: YubabaStateMachine,
     declaration: NodeDeclaration,
+    signer: yubaba_auth_token::PeerSigner,
 ) {
     let client = match reqwest::Client::builder()
         .timeout(crate::raft::FORWARD_TIMEOUT)
         .build()
     {
-        Ok(client) => client,
+        Ok(client) => yubaba_auth_token::PeerClient::new(client, signer),
         Err(e) => {
             // Only reachable if the TLS backend fails to initialise, in which
             // case a follower could never forward. Registration is optional
@@ -260,7 +262,7 @@ async fn run(
 async fn write_row(
     node_id: YubabaNodeId,
     raft: &YubabaRaft,
-    client: &reqwest::Client,
+    client: &yubaba_auth_token::PeerClient,
     row: &MemberInfo,
 ) -> anyhow::Result<()> {
     client_write_forwarded(

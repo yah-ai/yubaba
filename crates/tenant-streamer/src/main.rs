@@ -157,11 +157,12 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let ownership = HttpOwnership::new(config.yubaba_url.clone(), config.node_id);
+    let signer = peer_signer(&config)?;
+    let ownership = HttpOwnership::new(config.yubaba_url.clone(), config.node_id, signer.clone());
     // R782: same node-local base URL `ownership` already talks to — this
     // process discovers the leader itself before pushing (see the module doc
     // on `rpo_report::RpoReporter`).
-    let rpo_reporter = Arc::new(RpoReporter::new(config.yubaba_url.clone(), config.node_id));
+    let rpo_reporter = Arc::new(RpoReporter::new(config.yubaba_url.clone(), config.node_id, signer));
     let streamer = TenantStreamer::new(ownership, sinks, config);
 
     let (tx, rx) = tokio::sync::watch::channel(false);
@@ -186,6 +187,21 @@ async fn main() -> Result<()> {
         .await;
     info!("tenant streamer stopped");
     Ok(())
+}
+
+/// R876-T18: the signer every yubaba call goes out under. A configured key
+/// file that cannot be read fails startup rather than degrading to unsigned —
+/// that degradation would only surface once the fleet flips to `require`.
+fn peer_signer(config: &StreamerConfig) -> Result<yubaba_auth_token::PeerSigner> {
+    let signer = yubaba_auth_token::PeerSigner::from_key_file(
+        config.cluster_key_file.as_deref(),
+        format!("svc:tenant-streamer@node:{}", config.node_id),
+    )
+    .map_err(anyhow::Error::msg)?;
+    if !signer.is_signing() {
+        warn!("no cluster_key_file configured: calls to yubaba go unsigned and will 401 once it enforces");
+    }
+    Ok(signer)
 }
 
 /// `yubaba-tenant-streamer rebuild` — W339's procedure, once, over every
@@ -218,7 +234,7 @@ async fn run_rebuild(
         let store = tokio::task::spawn_blocking(move || build_pointer_store(&sink)).await??;
         Some(Arc::from(store))
     };
-    let claims = HttpOwnership::new(config.yubaba_url.clone(), config.node_id);
+    let claims = HttpOwnership::new(config.yubaba_url.clone(), config.node_id, peer_signer(config)?);
 
     info!(
         tenants = selected.len(),

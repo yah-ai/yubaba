@@ -155,7 +155,6 @@
 //!
 //! @yah:ticket(R523-F2, "Wire transit-cost.toml into scheduler placement scoring (the F16 half R330-F17 left undone)")
 //! @yah:at(2026-09-13T20:28:06Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-miravel)
 //! @yah:parent(R523)
 //! @yah:gotcha("Live multi-region fleet verification of R330-F17's actual routing behavior (dialing from a real us-west/eu-west operator box, per that ticket's Verification section) was NOT done — this session had no live multi-region fleet access. All of F17's verify bullets are covered by unit/integration tests against the real production code paths (ServiceRecordMeshState, RouteTables, MeshDirectory) with synthetic peer data instead. An operator should run one real end-to-end check (deploy a service with HA instances across two regions, confirm nearest-first resolution from each side) before relying on this in production.")

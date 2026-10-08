@@ -52,7 +52,8 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use cloud::provider::HetznerDriver;
-use yubaba::cluster_policy::ClusterPolicy;
+use yubaba_auth_token::PeerClient;
+use yubaba::cluster_policy::{ClusterPolicy, VoterSeats};
 use yubaba::membership_ratchet::{run_once, BuildEpochs, RatchetOutcome};
 
 /// noisetable R118-T11: the build epochs `run_once` stamps onto the provenance record it
@@ -125,11 +126,14 @@ fn rehydration_policy() -> ClusterPolicy {
     }
 }
 
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("reqwest client")
+fn client() -> PeerClient {
+    PeerClient::new(
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("reqwest client"),
+        yubaba_auth_token::PeerSigner::unsigned(),
+    )
 }
 
 /// Node ids are 1-indexed: node 0 → id 1.
@@ -143,7 +147,7 @@ fn id_of(idx: usize) -> YubabaNodeId {
 /// Reports a **whole view** from one observer, which is what a detector holds:
 /// every peer it is not, at one evaluation instant.
 async fn report_view(
-    http: &reqwest::Client,
+    http: &PeerClient,
     base_url: &str,
     observer: YubabaNodeId,
     node_count: usize,
@@ -194,7 +198,7 @@ async fn report_view(
 /// left to fail — the majority side is what the leader reads.
 async fn report_from_survivors(
     cluster: &Cluster,
-    http: &reqwest::Client,
+    http: &PeerClient,
     dark: &BTreeSet<YubabaNodeId>,
     special: &[(YubabaNodeId, PeerLivenessVerdict)],
 ) {
@@ -235,7 +239,7 @@ fn voters(cluster: &Cluster) -> BTreeSet<YubabaNodeId> {
 /// a multiple of somebody's poll interval.
 async fn ratchet_until(
     cluster: &Cluster,
-    http: &reqwest::Client,
+    http: &PeerClient,
     policy: &ClusterPolicy,
     want: usize,
     budget: Duration,
@@ -252,7 +256,7 @@ async fn ratchet_until(
 /// already cleared it.
 async fn ratchet_until_at(
     cluster: &Cluster,
-    http: &reqwest::Client,
+    http: &PeerClient,
     policy: &ClusterPolicy,
     want: usize,
     budget: Duration,
@@ -273,7 +277,7 @@ async fn ratchet_until_at(
             ) else {
                 continue;
             };
-            match run_once(node_id, raft, sm, policy, http, clock(), epochs()).await {
+            match run_once(node_id, raft, sm, policy, &VoterSeats::NoGroup, http, clock(), epochs()).await {
                 RatchetOutcome::NotLeader => {}
                 other => last = format!("node {node_id}: {other:?}"),
             }
@@ -292,7 +296,7 @@ async fn ratchet_until_at(
 /// Tick the ratchet on every node once, and return the leader's outcome.
 async fn tick_once(
     cluster: &Cluster,
-    http: &reqwest::Client,
+    http: &PeerClient,
     policy: &ClusterPolicy,
 ) -> RatchetOutcome {
     tick_once_at(cluster, http, policy, now_secs()).await
@@ -301,7 +305,7 @@ async fn tick_once(
 /// [`tick_once`] at an explicit `now`.
 async fn tick_once_at(
     cluster: &Cluster,
-    http: &reqwest::Client,
+    http: &PeerClient,
     policy: &ClusterPolicy,
     now: u64,
 ) -> RatchetOutcome {
@@ -314,7 +318,7 @@ async fn tick_once_at(
         ) else {
             continue;
         };
-        match run_once(node_id, raft, sm, policy, http, now, epochs()).await {
+        match run_once(node_id, raft, sm, policy, &VoterSeats::NoGroup, http, now, epochs()).await {
             RatchetOutcome::NotLeader => {}
             other => outcome = other,
         }
@@ -678,7 +682,7 @@ async fn the_fleet_never_shrinks_under_the_stimulus_that_makes_the_rig_shrink() 
 /// not because anything called `add_learner`.
 async fn shrink_to_one_voter(
     cluster: &mut Cluster,
-    http: &reqwest::Client,
+    http: &PeerClient,
     policy: &ClusterPolicy,
     victim_idx: usize,
 ) -> usize {

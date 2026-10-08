@@ -13,7 +13,6 @@
 //!
 //! @yah:relay(R427, "Yubaba as ownership writer + service-principal contract")
 //! @yah:at(2026-06-03T22:42:08Z)
-//! @yah:status(open)
 //! @yah:phase(P2)
 //! @yah:parent(Q425)
 //! @arch:see(.yah/docs/working/W159-camp-trust-boundaries-and-mcp-auth.md)

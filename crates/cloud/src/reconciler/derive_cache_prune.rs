@@ -199,7 +199,6 @@ mod tests {
             address: crate::config::ServiceAddress::front_door(String::new()),
             description: None,
             components,
-            db: crate::DbCatalog::default(),
         }
     }
 

@@ -32,7 +32,6 @@
 //!
 //! @yah:relay(R320, "Cloudflare first-class Infra provider + yah.dev R2 publish")
 //! @yah:at(2026-05-26T00:19:09Z)
-//! @yah:status(open)
 //! @arch:see(.yah/docs/working/W074-cloudflare-infra-provider.md)
 //!
 //! @yah:ticket(R320-T8, "Wire cloudflare reference path into MesofactStaticReconciler")
@@ -186,7 +185,6 @@
 //!
 //! @yah:relay(R441, "Workspace test breakage on main (surfaced via R438-T3 sweep)")
 //! @yah:at(2026-06-04T22:55:58Z)
-//! @yah:status(open)
 //! @yah:next("4 independent pre-existing test failures on main, all caught while running `cargo test --workspace` during R438-T3 ImageRef tightening. Each surfaces test signal that's been silently broken; pick up the child tickets and route them to the right owner per area.")
 //! @yah:gotcha("These aren't ImageRef-related and didn't break during R438-T3 — they were broken on main before that work started. The umbrella is a discovery channel, not a regression.")
 //! @arch:see(.yah/docs/working/W164-derived-static-assets.md)
@@ -1538,7 +1536,6 @@ out_dir = "dist"
                 address: crate::config::ServiceAddress::front_door("test.local".to_string()),
                 description: None,
                 components: vec![],
-                db: crate::DbCatalog::default(),
             };
             let component = ServiceComponent {
                 mount: None,

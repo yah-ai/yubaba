@@ -109,6 +109,8 @@ fn container_spec(name: &str) -> WorkloadSpec {
         },
         labels: Default::default(),
         durability: None,
+        db: Vec::new(),
+        capabilities: Vec::new(),
         annotations: Default::default(),
     }
 }

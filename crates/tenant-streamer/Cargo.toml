@@ -27,10 +27,10 @@ path = "src/main.rs"
 # turso-backup is `publish = false` and owns no such name, so there is nothing
 # to patch. Same relative-path shape as yubaba's own `mshr` dep. Verified
 # 2026-08-10 against oss/turso-backup/Cargo.toml.
-turso-backup = { path = "../../../turso-backup", version = "0.8.42" }
+turso-backup = { path = "../../../turso-backup", version = "0.8.43" }
 # TenantId only — the one tenant identifier in the system (R732-F1 deliberately
 # minted no second one).
-workload-spec = { package = "yah-workload-spec", version = "0.8.42" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.43" }
 # R869 / W339 step 1. The global tenant->cell pointer's GENERATION is the only
 # fence a cluster rebuilt from nothing can raise against a node resurrected from
 # the dead, because it is minted by CAS on an object the dead raft group cannot
@@ -42,13 +42,13 @@ yah-tenant-pointer = { path = "../../../yah-base/crates/tenant-pointer" }
 # The `ObjectStore` trait that pointer CAS runs over (plus its in-memory double
 # in tests). This one IS on crates.io, so it takes the house `version` +
 # [patch.crates-io] shape rather than a path.
-yah-object-store = "0.8.42"
+yah-object-store = "0.8.43"
 
 anyhow = "1.0"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 # Building the R2/S3 store and passing it to turso-backup as Arc<dyn ObjectStore>.
-object_store = { version = "0.13", features = ["aws"] }
+object_store = { version = "0.14", features = ["aws"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -56,6 +56,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "syn
 # 0.8 to match every other toml consumer in this workspace (almanac, cloud) —
 # a second major would resolve as a duplicate transitive for no gain.
 toml = "0.8"
+# R876-T18: every call this process makes to yubaba (`GET /tenants/{id}`,
+# `POST /raft/write`, `GET /raft/status`, `POST /mesh/rpo-report`) is a Peer-class
+# route, so it carries a peer token minted under the cluster key. This crate owns
+# the token format; linking it is not linking yubaba (W253 tenet 1 holds).
+yubaba-auth-token = { version = "0.8.43" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

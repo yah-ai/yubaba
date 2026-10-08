@@ -106,6 +106,107 @@ fn ns_override_in<'a>(
         .and_then(|v| v.as_str())
 }
 
+/// One `[[r2_bucket]]` row on a Cloudflare provider file (W358 decision 3): the
+/// credential pair that is scoped to ONE bucket. Refs are `keystore://<slot>`,
+/// the same grammar as `r2_access_key` / `r2_secret_key`.
+///
+/// ```toml
+/// [[r2_bucket]]
+/// name       = "noisetable-account-backup"
+/// access_key = "keystore://cloudflare-r2-account-backup-access-key-id"
+/// secret_key = "keystore://cloudflare-r2-account-backup-secret-key"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct R2BucketCredential {
+    pub name: String,
+    pub access_key: String,
+    pub secret_key: String,
+}
+
+/// What a read of one R2 bucket needs: the account (it names the S3 endpoint,
+/// `https://<account_id>.r2.cloudflarestorage.com`) and the bucket's own pair.
+#[derive(Clone, PartialEq, Eq)]
+pub struct R2BucketAccess {
+    pub account_id: String,
+    pub access_key: String,
+    pub secret_key: String,
+}
+
+impl std::fmt::Debug for R2BucketAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("R2BucketAccess")
+            .field("account_id", &self.account_id)
+            .field("access_key", &"<redacted>")
+            .field("secret_key", &"<redacted>")
+            .finish()
+    }
+}
+
+/// The access for `bucket`, from whichever Cloudflare
+/// provider file under `<camp_root>/.yah/infra/providers/` declares an
+/// `[[r2_bucket]]` row for it. Fails loudly, naming the bucket, when no
+/// provider does — there is deliberately NO fallback to the global admin R2
+/// pair (`r2_keys`): a snapshot read must not be able to reach the camp's
+/// whole R2 account just because one bucket was never given its own key.
+pub fn r2_access_for_bucket(camp_root: &Path, bucket: &str) -> Result<R2BucketAccess> {
+    let dir = crate::paths::providers_dir(camp_root);
+    let mut matches = Vec::new();
+    if dir.exists() {
+        let mut files: Vec<_> = std::fs::read_dir(&dir)
+            .with_context(|| format!("reading {}", dir.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "toml"))
+            .collect();
+        files.sort();
+        for path in files {
+            let cfg = ProviderConfig::load(&path)?;
+            if cfg.kind != crate::config::Provider::Cloudflare {
+                continue;
+            }
+            let id = cfg.id.clone();
+            let account_id = cfg
+                .fields
+                .get("account_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let p = CfProvider {
+                account_id,
+                provider_id: id,
+                cfg,
+                tenant: TenantId::singleton(),
+                namespace: NamespaceId::singleton(),
+            };
+            if p.r2_bucket_row(bucket)?.is_some() {
+                matches.push(p);
+            }
+        }
+    }
+    match matches.as_slice() {
+        [one] => {
+            anyhow::ensure!(
+                !one.account_id.is_empty(),
+                "provider `{}` declares bucket `{bucket}` but no `account_id`",
+                one.provider_id
+            );
+            let (access_key, secret_key) = one.r2_keys_for_bucket(bucket)?;
+            Ok(R2BucketAccess { account_id: one.account_id.clone(), access_key, secret_key })
+        }
+        [] => anyhow::bail!(
+            "no `[[r2_bucket]]` row names bucket `{bucket}` in any Cloudflare provider under {} — \
+             add `[[r2_bucket]] name = \"{bucket}\"` with that bucket's own access_key/secret_key \
+             `keystore://` refs (the global R2 pair is never used for a snapshot read)",
+            dir.display()
+        ),
+        many => anyhow::bail!(
+            "bucket `{bucket}` is declared by {} providers ({}); a bucket's credential must have one owner",
+            many.len(),
+            many.iter().map(|p| p.provider_id.as_str()).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
 /// A resolved Cloudflare provider: its parsed config file, the resolved
 /// `account_id`, and the `(tenant, namespace)` scope it was resolved for.
 /// Accessors prefer a `[namespaces.<ns>]` override over the top-level field and
@@ -226,6 +327,53 @@ impl CfProvider {
                 format!("R2 secret key `{s_slot}` not found — `yah keys set {s_slot}` or export {s_env}")
             })?;
         Ok((access, secret))
+    }
+
+    /// The `[[r2_bucket]]` rows of this provider file. A malformed row (unknown
+    /// key, missing field) is an error, not a skipped row.
+    pub fn r2_buckets(&self) -> Result<Vec<R2BucketCredential>> {
+        match self.cfg.fields.get("r2_bucket") {
+            None => Ok(Vec::new()),
+            Some(v) => v.clone().try_into().with_context(|| {
+                format!(
+                    "provider `{}`: `[[r2_bucket]]` rows must be {{ name, access_key, secret_key }}",
+                    self.provider_id
+                )
+            }),
+        }
+    }
+
+    fn r2_bucket_row(&self, bucket: &str) -> Result<Option<R2BucketCredential>> {
+        let mut rows: Vec<_> = self.r2_buckets()?.into_iter().filter(|r| r.name == bucket).collect();
+        anyhow::ensure!(
+            rows.len() <= 1,
+            "provider `{}` declares bucket `{bucket}` in {} `[[r2_bucket]]` rows",
+            self.provider_id,
+            rows.len()
+        );
+        Ok(rows.pop())
+    }
+
+    /// R2 S3 keys scoped to ONE bucket, from its `[[r2_bucket]]` row. No row is
+    /// an error naming the bucket; the global pair ([`Self::r2_keys`]) is never
+    /// substituted.
+    pub fn r2_keys_for_bucket(&self, bucket: &str) -> Result<(String, String)> {
+        let row = self.r2_bucket_row(bucket)?.with_context(|| {
+            format!(
+                "provider `{}` has no `[[r2_bucket]]` row for bucket `{bucket}` \
+                 (the global R2 pair is never used as a fallback)",
+                self.provider_id
+            )
+        })?;
+        let resolve = |field: &str, uri: &str| -> Result<String> {
+            let (slot, env) = self.parse_uri(field, uri)?;
+            fob::get_or_env(&slot, &env)
+                .with_context(|| format!("resolving `{slot}` for bucket `{bucket}`"))?
+                .with_context(|| {
+                    format!("`{slot}` (bucket `{bucket}`) not found — `yah keys set {slot}` or export {env}")
+                })
+        };
+        Ok((resolve("access_key", &row.access_key)?, resolve("secret_key", &row.secret_key)?))
     }
 
     /// Resolve the management-token slot/env. Precedence: a
@@ -533,5 +681,56 @@ r2_access_key = \"keystore://nt-r2-access\"
         assert_eq!(p.zone().as_deref(), Some("yah.dev"));
         // Non-singleton namespace with no explicit creds → scoped default slot.
         assert_eq!(p.api_token_slot().unwrap().0, "other-cloudflare-api-token");
+    }
+
+    const BUCKET_PROVIDER: &str = "schema_version = 1\nid = \"cloudflare\"\nkind = \"cloudflare\"\naccount_id = \"a\"\n\
+        r2_access_key = \"keystore://f7-global-access\"\nr2_secret_key = \"keystore://f7-global-secret\"\n\
+        [[r2_bucket]]\nname = \"f7-backup\"\naccess_key = \"keystore://f7-bkt-access\"\nsecret_key = \"keystore://f7-bkt-secret\"\n";
+
+    #[test]
+    fn r2_bucket_row_resolves_its_own_pair() {
+        let tmp = tempdir().unwrap();
+        write_provider(tmp.path(), "cloudflare", BUCKET_PROVIDER);
+        std::env::set_var("F7_BKT_ACCESS", "bucket-access");
+        std::env::set_var("F7_BKT_SECRET", "bucket-secret");
+        std::env::set_var("F7_GLOBAL_ACCESS", "admin-access");
+        std::env::set_var("F7_GLOBAL_SECRET", "admin-secret");
+        let got = r2_access_for_bucket(tmp.path(), "f7-backup").unwrap();
+        assert_eq!(got.account_id, "a");
+        assert_eq!((got.access_key.as_str(), got.secret_key.as_str()), ("bucket-access", "bucket-secret"));
+        assert!(!format!("{got:?}").contains("bucket-secret"));
+    }
+
+    #[test]
+    fn unlisted_bucket_fails_naming_it_and_never_falls_back_to_the_global_pair() {
+        let tmp = tempdir().unwrap();
+        write_provider(tmp.path(), "cloudflare", BUCKET_PROVIDER);
+        std::env::set_var("F7_GLOBAL_ACCESS", "admin-access");
+        std::env::set_var("F7_GLOBAL_SECRET", "admin-secret");
+        let err = r2_access_for_bucket(tmp.path(), "other-bucket").unwrap_err().to_string();
+        assert!(err.contains("other-bucket"), "{err}");
+        assert!(!err.contains("admin-"), "{err}");
+        // No providers dir at all is the same loud error.
+        let empty = tempdir().unwrap();
+        let err = r2_access_for_bucket(empty.path(), "f7-backup").unwrap_err().to_string();
+        assert!(err.contains("f7-backup"), "{err}");
+    }
+
+    #[test]
+    fn r2_bucket_row_refuses_unknown_keys_and_unresolvable_slots() {
+        let tmp = tempdir().unwrap();
+        write_provider(
+            tmp.path(),
+            "cloudflare",
+            &BUCKET_PROVIDER.replace("name = \"f7-backup\"", "name = \"f7-backup\"\nsecert_key = \"x\""),
+        );
+        let err = format!("{:#}", r2_access_for_bucket(tmp.path(), "f7-backup").unwrap_err());
+        assert!(err.contains("secert_key") || err.contains("unknown field"), "{err}");
+
+        let tmp = tempdir().unwrap();
+        write_provider(tmp.path(), "cloudflare", &BUCKET_PROVIDER.replace("f7-bkt-access", "f7-unset-slot"));
+        std::env::set_var("F7_BKT_SECRET", "bucket-secret");
+        let err = format!("{:#}", r2_access_for_bucket(tmp.path(), "f7-backup").unwrap_err());
+        assert!(err.contains("f7-unset-slot"), "{err}");
     }
 }

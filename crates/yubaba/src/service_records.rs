@@ -625,6 +625,11 @@ pub struct ServiceRecord {
     /// record still appears in `GET /service-records` (with the reason, for the
     /// operator) and never in `?ready=true` (for the front door).
     pub routable: bool,
+    /// What this workload publishes on `GET /services` (R960-F8) —
+    /// [`WorkloadSpec::served_capabilities`] read at deploy. Like
+    /// [`Self::routable`], persisted in the ledger because the spec is gone
+    /// after a restart. Empty for bundle-tier and cold-admitted records.
+    pub capabilities: Vec<workload_spec::ServedCapability>,
     /// Wall-clock time (Unix ms) this record was last written. Lets a
     /// consumer notice a record that hasn't been refreshed in a long time
     /// even if `health` still says `Ready` (staleness, not correctness).
@@ -823,6 +828,10 @@ struct LedgerEntry {
     /// the honest value.
     #[serde(default = "ledger_routable_default")]
     routable: bool,
+    /// R960-F8 — [`ServiceRecord::capabilities`]. Absent in a pre-field
+    /// ledger, which held no declared capabilities.
+    #[serde(default)]
+    capabilities: Vec<workload_spec::ServedCapability>,
 }
 
 /// See [`LedgerEntry::routable`] — pre-R881-B1 ledgers predate the field and
@@ -940,6 +949,7 @@ impl ServiceRecords {
                     resolved_ports: entry.resolved_ports,
                     container_id: entry.container_id,
                     routable: entry.routable,
+                    capabilities: entry.capabilities,
                     health: Health::NotReady {
                         reason: "rehydrated",
                     },
@@ -1167,6 +1177,7 @@ impl ServiceRecords {
                 resolved_ports: r.resolved_ports.clone(),
                 container_id: r.container_id.clone(),
                 routable: r.routable,
+                capabilities: r.capabilities.clone(),
             })
             .collect();
         // Stable order so an unchanged registry produces a byte-identical
@@ -1258,6 +1269,7 @@ impl ServiceRecords {
             resolved_ports: BTreeMap::new(),
             container_id: container_id.into(),
             routable,
+            capabilities: spec.served_capabilities(),
             health: health_for(routable, Health::Ready),
             observed_at_unix_ms: now_unix_ms(),
         };
@@ -1304,6 +1316,7 @@ impl ServiceRecords {
             // binds the node's address by construction, which is the same fact
             // `admit_bundle` already relies on to publish `node_mesh_ip` here.
             routable: true,
+            capabilities: Vec::new(),
             health: Health::Ready,
             observed_at_unix_ms: now_unix_ms(),
         };
@@ -1503,6 +1516,7 @@ impl ServiceRecords {
                         // anyway: it is admitted with a record at deploy, so it
                         // takes the refresh arm above.
                         routable: true,
+                        capabilities: Vec::new(),
                         health: Health::from_status(&state.status),
                         observed_at_unix_ms: now_unix_ms(),
                     },
@@ -1822,21 +1836,15 @@ pub struct ServiceRecordWire {
     /// consumer select an endpoint by what the port *is* rather than by where
     /// it happened to sort.
     ///
-    /// The consumer that reads it today is `yah cloud apply`'s ingress port
-    /// resolution (`ServiceRecordFanout::port_for` selects the port named
-    /// `http`), via `named_ports` above.
-    ///
-    /// **passway does NOT read this yet, and that is a live gap, not a
-    /// completed handover.** `addrs_from_body`
-    /// (`oss/passway/crates/passway/src/discovery.rs`) pushes every endpoint of
-    /// every ready record into one flat backend set — right for a
-    /// single-listener workload, and silently wrong for a workload with an
-    /// `http` and a `metrics` port, where half the apex traffic lands on the
-    /// metrics listener. Nothing has hit that yet because no fronted workload
-    /// declares two ports, and this field is what will let passway fix it when
-    /// one does. Changing passway's backend selection is a behaviour change to
-    /// a separate binary in its own workspace, so R844-F15 stopped at making
-    /// the fact available rather than acting on it there.
+    /// Two consumers select by it, under one rule — dial the port named
+    /// `http`: `yah cloud apply`'s ingress port resolution
+    /// (`ServiceRecordFanout::port_for`, via `named_ports` above), and
+    /// passway's backend discovery (`fronted_endpoint` in
+    /// `oss/passway/crates/passway/src/discovery.rs`, R844-B25). Before B25
+    /// passway flattened every endpoint into its backend set, which put
+    /// noisetable-account's mesh-only admin listener behind
+    /// api.noisetable.com on 2026-10-07. A record with names but no `http`
+    /// is now refused by both rather than guessed at.
     ///
     /// Omitted when empty; same two readings as [`Self::named_ports`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -2111,6 +2119,8 @@ mod tests {
             },
             labels: Default::default(),
             durability: None,
+            db: Vec::new(),
+            capabilities: Vec::new(),
             annotations: Default::default(),
             files: Vec::new(),
         }
