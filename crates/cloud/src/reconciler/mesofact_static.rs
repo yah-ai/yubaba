@@ -1215,7 +1215,8 @@ fn publish_prefix(service: &str, env: &str, mount: Option<&str>) -> String {
 /// the declared table, because the Worker now applies the headers of the ONE
 /// entry that claimed the path — where it used to route and header
 /// independently. Without the stamp, a domain's catch-all headers would
-/// silently stop reaching its proxied paths.
+/// silently stop reaching its proxied paths. Its `cors_origins` (R826) are
+/// stamped the same way.
 pub fn worker_route_table_json(
     mode: &WorkerMode,
     assets: WorkerAssets<'_>,
@@ -1249,11 +1250,12 @@ fn worker_route_table(
             from: prefix.to_string(),
             to: to.to_string(),
         });
+        // The declared route's CORS list rides along with its headers, for the
+        // same reason: both are "what this path's responses carry" (R826).
+        let declared = domain.and_then(|d| d.route_for_path(prefix));
         RouteTableEntry {
-            headers: domain
-                .and_then(|d| d.route_for_path(prefix))
-                .map(|r| r.headers.clone())
-                .unwrap_or_default(),
+            headers: declared.map(|r| r.headers.clone()).unwrap_or_default(),
+            cors_origins: declared.map(|r| r.cors_origins.clone()).unwrap_or_default(),
             path,
             mode: ResolvedRouteMode::Backend {
                 component: format!("slot:{slot}"),
@@ -1824,9 +1826,17 @@ account_id = "test-account"
             WORKER_SCRIPT.contains("env[entry.binding]"),
             "bundled Worker must read buckets through the matched entry's binding"
         );
-        assert!(!WORKER_SCRIPT.contains(".put("), "bundled Worker must not write to R2 (put)");
+        // `caches.default.put(` fills the zone's edge cache (MFT-R825-F2), not
+        // a bucket — so it is the one `.put(` receiver allowed.
         assert!(
-            !WORKER_SCRIPT.contains(".delete("),
+            !WORKER_SCRIPT.replace("caches.default.put(", "").contains(".put("),
+            "bundled Worker must not write to R2 (put)"
+        );
+        // `headers.delete(` is a response header removal (R826 strips an
+        // upstream's Access-Control-Allow-Origin), not a bucket write — so it is
+        // the one `.delete(` receiver allowed.
+        assert!(
+            !WORKER_SCRIPT.replace("headers.delete(", "").contains(".delete("),
             "bundled Worker must not write to R2 (delete)"
         );
         assert!(
@@ -1962,6 +1972,7 @@ account_id = "test-account"
     #[test]
     fn config_bindings_carry_the_declared_routes_and_their_headers() {
         let domain = worker_domain(vec![crate::config::DomainRoute {
+            cors_origins: Vec::new(),
             path: "/app/*".into(),
             headers: [(
                 "Cross-Origin-Opener-Policy".to_string(),
@@ -2093,6 +2104,7 @@ account_id = "test-account"
             prefixes: vec!["/api/".to_string(), "/rpc/".to_string()],
         };
         let domain = worker_domain(vec![crate::config::DomainRoute {
+            cors_origins: Vec::new(),
             path: "/*".into(),
             headers: Default::default(),
             mode: crate::config::RouteMode::Static {

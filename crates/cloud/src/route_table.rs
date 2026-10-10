@@ -451,6 +451,9 @@ pub struct RouteTableEntry {
     pub mode: ResolvedRouteMode,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    /// [`DomainRoute::cors_origins`], as declared (R826).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cors_origins: Vec<String>,
     pub auth: RouteAuth,
 }
 
@@ -481,6 +484,7 @@ impl DomainConfig {
                 path: route.path.clone(),
                 mode: self.resolve_mode(route, placement)?,
                 headers: route.headers.clone(),
+                cors_origins: route.cors_origins.clone(),
                 auth: route_auth(&route.path, placement.auth_required_prefixes()),
             });
         }
@@ -558,7 +562,11 @@ impl DomainConfig {
     /// anything is placed. Both spellings share [`headers_json`], so the
     /// projection cannot drift from the table it projects.
     pub fn route_headers_json(&self) -> String {
-        headers_json(self.routes.iter().map(|r| (r.path.as_str(), &r.headers)))
+        headers_json(
+            self.routes
+                .iter()
+                .map(|r| (r.path.as_str(), &r.headers, r.cors_origins.as_slice())),
+        )
     }
 
     /// The declared route that governs `path` — the same walk
@@ -598,7 +606,11 @@ impl RouteTable {
     /// [`DomainConfig::route_headers_json`] — the same routes, the same order,
     /// the same dropped-when-headerless rule.
     pub fn headers_json(&self) -> String {
-        headers_json(self.entries.iter().map(|e| (e.path.as_str(), &e.headers)))
+        headers_json(
+            self.entries
+                .iter()
+                .map(|e| (e.path.as_str(), &e.headers, e.cors_origins.as_slice())),
+        )
     }
 }
 
@@ -618,23 +630,34 @@ pub fn route_table_for_service(
         .transpose()
 }
 
-/// The one serializer of the header wire format — `[{path, headers}]` in
-/// manifest order, headerless routes dropped.
+/// The one serializer of the header wire format — `[{path, headers,
+/// cors_origins?}]` in manifest order, routes that declare neither dropped.
 ///
-/// A free function over `(path, headers)` pairs rather than a method, because
-/// it has two callers on purpose: the declared routes (pre-placement) and the
-/// compiled table. Two walks, one format, and a test pinning that they agree.
+/// A free function over `(path, headers, cors_origins)` triples rather than a
+/// method, because it has two callers on purpose: the declared routes
+/// (pre-placement) and the compiled table. Two walks, one format, and a test
+/// pinning that they agree.
+///
+/// `cors_origins` is omitted when empty so a table that declares none is
+/// byte-identical to what it was before R826 — the sovereign door reading it
+/// may be a release older than this producer.
 pub(crate) fn headers_json<'a>(
-    rules: impl Iterator<Item = (&'a str, &'a BTreeMap<String, String>)>,
+    rules: impl Iterator<Item = (&'a str, &'a BTreeMap<String, String>, &'a [String])>,
 ) -> String {
     #[derive(Serialize)]
     struct Rule<'a> {
         path: &'a str,
         headers: &'a BTreeMap<String, String>,
+        #[serde(skip_serializing_if = "<[String]>::is_empty")]
+        cors_origins: &'a [String],
     }
     let rules: Vec<Rule<'_>> = rules
-        .filter(|(_, headers)| !headers.is_empty())
-        .map(|(path, headers)| Rule { path, headers })
+        .filter(|(_, headers, cors_origins)| !headers.is_empty() || !cors_origins.is_empty())
+        .map(|(path, headers, cors_origins)| Rule {
+            path,
+            headers,
+            cors_origins,
+        })
         .collect();
     serde_json::to_string(&rules).unwrap_or_else(|_| "[]".to_string())
 }
@@ -759,6 +782,7 @@ mod tests {
 
     fn route(path: &str, mode: RouteMode, headers: &[(&str, &str)]) -> DomainRoute {
         DomainRoute {
+            cors_origins: Vec::new(),
             path: path.to_string(),
             headers: headers
                 .iter()
@@ -1091,6 +1115,10 @@ mod tests {
             entries[0].get("headers").is_none(),
             "a headerless entry carries no headers key: {json}"
         );
+        assert!(
+            entries[0].get("cors_origins").is_none(),
+            "an entry with no CORS list carries no cors_origins key: {json}"
+        );
 
         assert_eq!(entries[1]["mode"], "redirect");
         assert_eq!(entries[1]["target"], "https://acme.example/new");
@@ -1105,6 +1133,38 @@ mod tests {
     /// its probe header compiles to a table whose header half is byte-identical
     /// to what `route_headers_json` emits today — so nothing deployed changes
     /// behaviour when F2/F3 land.
+    /// R826: a route's `cors_origins` reaches the Worker's ROUTE_TABLE entry
+    /// and the sovereign door's header column alike, and the two projections
+    /// still agree byte for byte — including on a route whose list is its only
+    /// declaration, which the header column must not drop as "headerless".
+    #[test]
+    fn cors_origins_reach_both_projections_identically() {
+        let mut cors_only = route(
+            "/pkg/*",
+            RouteMode::StaticBucket {
+                bucket: "releases".into(),
+            },
+            &[],
+        );
+        cors_only.cors_origins = vec![
+            "https://noisetable.com".into(),
+            "https://staging.noisetable.com".into(),
+        ];
+        let dom = domain("cdn", vec![cors_only]);
+        let table = dom.route_table(&FixedPlacement::default()).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&table.to_json()).unwrap();
+        assert_eq!(
+            parsed[0]["cors_origins"],
+            serde_json::json!(["https://noisetable.com", "https://staging.noisetable.com"])
+        );
+        assert_eq!(table.headers_json(), dom.route_headers_json());
+        assert_eq!(
+            dom.route_headers_json(),
+            r#"[{"path":"/pkg/*","headers":{},"cors_origins":["https://noisetable.com","https://staging.noisetable.com"]}]"#
+        );
+    }
+
     #[test]
     fn yah_devs_header_half_is_byte_identical_to_route_headers_json() {
         let dom = yah_dev();

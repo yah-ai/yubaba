@@ -90,27 +90,6 @@ pub fn services_dir(workspace_root: &Path) -> PathBuf {
     yah_dir(workspace_root).join("services")
 }
 
-/// Directory holding this camp's fleet workload declarations — the TOML
-/// serialization of a `WorkloadSpec`, one file per workload, which
-/// `yah cloud workload deploy <n> <machine>` looks up by name.
-///
-/// R568-T7: this is the R215+ home, `<workspace_root>/.yah/infra/workloads/`,
-/// and it is new. Before it, [`crate::config::CloudConfig::load`] read workloads
-/// *only* from the pre-R215 `.yah/cloud/workloads/`, which R222-B1 emptied —
-/// so in any post-R215 camp `cfg.workload(name)` could never resolve anything
-/// and the whole `yah cloud workload …` surface was structurally dead. It went
-/// unnoticed because the only workloads ever deployed were forge/QED runs,
-/// which synthesize their spec in memory and never touch this loader.
-///
-/// The CLI has been telling operators this path all along
-/// (`app/yah/cli/src/cloud.rs`: "no workload '{name}' in .yah/infra/workloads/"),
-/// so this makes the code agree with the message rather than the reverse.
-/// The legacy directory is still read and merged, R215+ winning on a name
-/// collision — the same shape [`machines_dir`]'s callers use.
-pub fn workloads_dir(workspace_root: &Path) -> PathBuf {
-    infra_dir(workspace_root).join("workloads")
-}
-
 /// Directory holding **this camp's own** machine inventory (`<name>.toml` per
 /// node): always `<workspace_root>/.yah/infra/machines/`.
 ///

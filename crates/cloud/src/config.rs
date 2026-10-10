@@ -1373,7 +1373,7 @@ pub enum WorkloadConfigError {
     },
 }
 
-/// A workload declaration loaded from `.yah/cloud/workloads/<name>.toml`.
+/// A workload declaration lowered from a `.yah/services/` mirror overlay.
 ///
 /// Each file is the human-authored TOML serialization of a [`WorkloadSpec`].
 /// On load, the spec is validated against the shape layer; failures surface as
@@ -1589,7 +1589,7 @@ pub struct CloudConfig {
     // ─── Pre-R215 legacy (slated for removal in B3-T3) ────────────────────
     /// Legacy mirrors from `.yah/cloud/mirrors/`.
     pub legacy_mirrors: Vec<LegacyMirrorConfig>,
-    /// Workloads from `.yah/cloud/workloads/*.toml` (R092-F1 schema).
+    /// Workloads lowered from `.yah/services/` (W361).
     pub workloads: Vec<WorkloadConfig>,
     /// Topology from `.yah/cloud/topology.toml` (mirror→machine assignments).
     pub topology: TopologyConfig,
@@ -1644,38 +1644,22 @@ impl CloudConfig {
         // Legacy `.yah/cloud/` reads — empty in post-B1 workspaces. Wrapped in
         // a helper so a missing tree is silent (no error, no warning).
         let cloud_dir = crate::paths::legacy_cloud_dir(workspace_root);
-        let (legacy_mirrors, legacy_workloads, topology) = if cloud_dir.exists() {
+        let (legacy_mirrors, topology) = if cloud_dir.exists() {
             (
                 load_mirrors(cloud_dir.join("mirrors"))?,
-                load_workloads(cloud_dir.join("workloads"))?,
                 load_topology(cloud_dir.join("topology.toml"))?,
             )
         } else {
             Default::default()
         };
 
-        // Workloads come from `.yah/infra/workloads/` (R215+). R568-T7: before
-        // that path was read here, this field was populated *only* from the
-        // legacy tree above — which R222-B1 emptied — so `cfg.workload(name)`
-        // resolved nothing in every post-R215 camp and `yah cloud workload
-        // deploy` could not find any declaration at all. The bug survived
-        // because the only workloads ever deployed were forge/QED runs, which
-        // build their spec in memory and never come through here. Same
-        // dedupe-by-name shape as machines below: R215+ wins.
-        //
-        // R959-F2: plus every workload lowered from `.yah/services/` (W361);
-        // an ident declared both ways is refused by `effective_workloads`.
-        let mut workloads: Vec<WorkloadConfig> = effective_workloads(workspace_root, &services)?
+        // Workloads are lowered from `.yah/services/` (W361); R959-T5 deleted
+        // the `.yah/infra/workloads/` and `.yah/cloud/workloads/` readers, so
+        // there is exactly one source.
+        let workloads: Vec<WorkloadConfig> = lowered_workloads(&services)?
             .into_iter()
             .map(|d| WorkloadConfig { spec: d.spec })
             .collect();
-        let workload_names: std::collections::HashSet<String> =
-            workloads.iter().map(|w| w.spec.name.clone()).collect();
-        for w in legacy_workloads {
-            if !workload_names.contains(&w.spec.name) {
-                workloads.push(WorkloadConfig { spec: w.spec });
-            }
-        }
 
         // R870-B13: machines are resolved by [`resolve_fleet_inventory`] —
         // camp-local, the pre-R215 legacy tree, and every machine borrowed
@@ -2681,7 +2665,7 @@ fn check_trust_substrate(group: &[WorkloadSpec]) -> Result<()> {
 /// Two ways a member is reached, in this order:
 /// - [`Requirement::provides`], the inline spec a `supply = "self"` requirement
 ///   carries;
-/// - otherwise an ident lookup against `declared` (`.yah/infra/workloads/`),
+/// - otherwise an ident lookup against `declared` (the lowered workloads),
 ///   matched on mesh identity first and on workload name second, because those
 ///   coincide for every spec in the tree today but the requirement is written in
 ///   the mesh-identity currency.
@@ -3177,29 +3161,30 @@ pub(crate) fn load_domains(dir: &Path) -> Result<BTreeMap<String, DomainConfig>>
 /// @yah:handoff("2026-10-09 release courier Ashguard:hydra, second pass (F4357). Step 0(b) now PASSES by content. The first lower.rs commit is ce86178e. In HEAD:app/yah/cli/src/cloud.rs, WorkloadCommands::Lower is at :1961 and handle_workload_lower at :4893. In HEAD lower.rs, the double-declaration refusal bails at :134/:139. Step 1 is only half done, and the cause is structural. The 0.8.44 bump IS applied in the working tree: `cargo xtask release patch` made 277 edits, root Cargo.toml now reads 0.8.44, and `cargo metadata` exited 0 at the root and in oss/cheers, mesofact, turso-backup and yah-base. The xtask also listed 8 lines it did not bump; it says each is either a hand-move pin or a frozen literal. Its sample: kg-anno-wasm/pkg/package.json:8, mesofact cli/new/curated.rs:121, and qed publish.rs:1913-1945, which are test fixtures. Nothing was published, so CDN latest is still 0.8.43. Reason: .yah/qed/yah-cli-release.toml builds with workspace=\"isolated\", a fresh git worktree at HEAD, and the binary's --version comes from CARGO_PKG_VERSION (app/yah/cli/build.rs:34). Running it now would therefore publish HEAD's 0.8.43 bytes. YAH_RELEASE_VERSION=0.8.44 would only rename the channel key, and the binary would still report 0.8.43, so I did not run it. The bump has to be committed before the recipe can run, and git policy is defer. DEFERRED GIT COMMANDS for the operator: add the version-bump files to the index by explicit name. The candidates are the modified */Cargo.toml and */Cargo.lock files (about 104 version-surface paths), app/yah/desktop/tauri.conf.json and packages/yah/ui/package.json. Caution: some of those Cargo.toml files also carry peers' in-flight non-version edits, so review `git diff` per file. Then: git commit -m \"release: v0.8.44\"; git tag v0.8.44; git push origin main --tags. After the commit, run `yah qed run yah-cli-release`, verify that cdn.yah.dev/yah/index.json lists 0.8.44, install, and check that `yah cloud workload lower --help` works in both camps. That is Steps 1 and 2 as originally briefed. Install is not done: both camps still resolve /Users/leif/.local/bin/yah, which is 0.8.43 with no `workload lower`.")
 /// @yah:handoff("Leader @Glimmerstone:dove, F4358: the operator is cutting a yah-wide 0.8.44 release themselves; F1+F2 are committed (first lower.rs commit ce86178e). The 0.8.44 bump is ALREADY applied, uncommitted, in the working tree (the courier ran `cargo xtask release patch`); running it again would bump to 0.8.45. Once 0.8.44 is installed and `yah cloud workload lower --help` works in both camps, dispatch the R959-T3 and R959-T4 cutover runbooks in parallel immediately. Until T4 lands, noisetable-api ingress cannot resolve its workload on 0.8.44: no `yah cloud reconcile` on noisetable in between.")
 /// @yah:handoff("2026-10-09 leader @Glimmerstone:dove gate check (courier @Ashguard:griffin, session:64455002): 0.8.44 is NOT published. The CDN yah/index.json (updated 2026-10-08T20:40Z) lists 0.8.43 as latest. refs/tags/v0.8.44 does not exist and HEAD is ce86178e. Both camps resolve /Users/leif/.local/bin/yah = 0.8.43+44606339-dirty, where `yah cloud workload lower --help` exits 2. Nothing was installed. T3/T4 stay held behind the operator-owned release (F4358). T5/F6 code is also held: a tree edit to oss/yubaba/crates/cloud could be swept into the operator's 0.8.44 commit, and T5 removes the disk reader the cutover window relies on. Once 0.8.44 is installed and `workload lower --help` exits 0 in both camps, dispatch T3+T4 in parallel and run T4 in one sitting (noisetable-api ingress is broken until its overlay lands).")
+/// @yah:handoff("LOCAL INSTALL (Ashguard session:e51ba322, 2026-10-10): QED run cd64514c yah-cli-release cancelled=y (stopped during build-aarch64-apple-darwin; no publish step ran). CDN yah/index.json still 0.8.43 latest=y. Installed via `cargo xtask install --live` from the shared tree (config.rs diff was test/fixture-only); yah --version = 0.8.45+abb379b5-dirty in both ~/ss/yah and ~/ss/noisetable; `yah cloud workload lower --help` exit 0 in both. Build skew advisory: oss/yubaba/crates/yubaba/src/lib.rs edited by a peer mid-build. Backup: /Users/leif/.local/bin/yah.0.8.43-dirty.bak")
+/// @yah:handoff("2026-10-10 leader @Glimmerstone:griffin. The operator reversed F4360 (publish + install): local install only. QED run cd64514c (yah-cli-release) was cancelled at 03:04:02Z during its build steps, so nothing was published and CDN latest is still 0.8.43. `cargo xtask install --live` from the shared tree installed `yah 0.8.45+abb379b5-dirty` at /Users/leif/.local/bin/yah; the leader confirmed `yah cloud workload lower --help` exits 0 in both camps. Backup: ~/.local/bin/yah.0.8.43-dirty.bak. T3 and T4 cutovers re-dispatched post-install: T4 to session:69dd0ef1 (Cleric), T3 to session:6f09b6db (Warrior). Operator plan: once this camp's workload cutover is finished, run a full 0.8.46 release start to finish. If the cutover needs it, hotshipping yubaba/passway/kamaji is pre-approved.")
+/// @yah:handoff("2026-10-10 leader @Glimmerstone:griffin (session:17110577), handing off at ~262k context. CUTOVER DONE AND LEADER-VERIFIED. R959-T3 (review): yah camp, 7 idents (yah-cloud-admin + dev-rig service with vm-us-west-111/112/113/141/142/143); .yah/infra/workloads is empty. R959-T4 (review): noisetable camp, 10 idents; .yah/infra/workloads deleted; the R814-T12 R2 env/secrets and the 20261009.1 pin moved into the noisetable-api prod overlay. `yah cloud workload show` resolves all 17 on the installed 0.8.45+abb379b5-dirty. cargo test -p yah-cloud --lib: 1344/0, EXIT=0. Commit commands for both repos are in the T3/T4 review handoffs (git policy defer, nothing committed). NEXT: R959-T5 is ready. Read its new gotcha first: a live R966 peer holds uncommitted cloud.rs edits. Then R959-F6 (collate-only; never apply a render that differs). Sequence T5/F6 against the operator's planned full 0.8.46 release: confirm with the operator whether they land before it. Finding for a separate track: the yah MCP server (app/yah/cli/src/mcp/server.rs:88) handles one tools/call at a time and ignores notifications/cancelled. So an interrupted qed_await (blocking daemon_client::call_camp) keeps the server parked, and every later yah tool call from that session queues behind it. That is what stalled session:04a1e1ba's qed_cancel for 2 min. Operator call pending on whether to file it.")
+/// @yah:handoff("OPERATOR CALL 2026-10-10 (answered \"A\" to the leader's sequencing call). R959-T5 lands BEFORE the full 0.8.46 release, so 0.8.46 ships with one source for workloads. R959-F6 lands AFTER 0.8.46 is cut. A fresh leader takes R959 from here to drive T5 to review. Don't start F6 until the operator confirms 0.8.46 is out.")
 /// The camp's own spec for one workload, by name, through
-/// [`load_effective_workloads`] (lowered or on disk, same shape validation).
+/// [`lowered_camp_workloads`].
 pub fn load_workload(camp_root: &Path, name: &str) -> Result<WorkloadSpec> {
-    load_effective_workloads(camp_root)?
+    lowered_camp_workloads(camp_root)?
         .into_iter()
         .map(|d| d.spec)
         .find(|s| s.name == name)
         .with_context(|| {
             format!(
-                "no workload `{name}`: neither lowered from a .yah/services/*/mirrors/*.toml \
-                 [workload.<component>] overlay nor declared under {}",
-                crate::paths::workloads_dir(camp_root).display()
+                "no workload `{name}`: no .yah/services/*/mirrors/*.toml \
+                 [workload.<component>] overlay lowers to it"
             )
         })
 }
 
-/// One workload declaration and the file it came from (W361 migration
-/// window: lowered from a service + mirror, or hand-written on disk).
+/// One workload declaration and the overlay it was lowered from.
 #[derive(Debug, Clone)]
 pub struct DeclaredWorkload {
     pub spec: WorkloadSpec,
-    /// `.yah/services/<svc>/mirrors/<env>.toml [workload.<component>]` for a
-    /// lowered spec, the file path for an on-disk one.
+    /// `.yah/services/<svc>/mirrors/<env>.toml [workload.<component>]`.
     pub source: String,
 }
 
@@ -3236,78 +3221,9 @@ pub fn lowered_workloads(
     Ok(out)
 }
 
-/// The hand-written `.yah/infra/workloads/*.toml` declarations.
-pub fn disk_workloads(camp_root: &Path) -> Result<Vec<DeclaredWorkload>> {
-    load_workloads(crate::paths::workloads_dir(camp_root))
-}
-
-/// Lowered ∪ on-disk workloads (W361 §Migration step 2). An ident declared
-/// both ways is a load error naming both files — never "prefer one".
-fn effective_workloads(
-    camp_root: &Path,
-    services: &BTreeMap<String, ServiceWithMirrors>,
-) -> Result<Vec<DeclaredWorkload>> {
-    let mut out = lowered_workloads(services)?;
-    for disk in disk_workloads(camp_root)? {
-        if let Some(lowered) = out.iter().find(|d| d.spec.name == disk.spec.name) {
-            bail!(
-                "workload `{}` is declared twice: lowered from {} and hand-written in {}. \
-                 Run `yah cloud workload lower {} --diff` and delete the file once it is empty \
-                 (W361 §Migration)",
-                disk.spec.name,
-                lowered.source,
-                disk.source,
-                disk.spec.name
-            );
-        }
-        out.push(disk);
-    }
-    Ok(out)
-}
-
-/// [`lowered_workloads`] for a camp, loading its services itself. Does not
-/// read `.yah/infra/workloads/`, so it answers mid-migration, when the
-/// double-declaration refusal makes [`load_effective_workloads`] fail.
+/// [`lowered_workloads`] for a camp, loading its services itself.
 pub fn lowered_camp_workloads(camp_root: &Path) -> Result<Vec<DeclaredWorkload>> {
     lowered_workloads(&load_services(&crate::paths::services_dir(camp_root), camp_root)?)
-}
-
-/// [`effective_workloads`] for a camp, loading its services itself.
-pub fn load_effective_workloads(camp_root: &Path) -> Result<Vec<DeclaredWorkload>> {
-    let services = load_services(&crate::paths::services_dir(camp_root), camp_root)?;
-    effective_workloads(camp_root, &services)
-}
-
-fn load_workloads(dir: std::path::PathBuf) -> Result<Vec<DeclaredWorkload>> {
-    if !dir.exists() {
-        return Ok(vec![]);
-    }
-    let mut items = vec![];
-    let mut entries: Vec<_> = std::fs::read_dir(&dir)
-        .with_context(|| format!("reading {}", dir.display()))?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |x| x == "toml"))
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-
-    for entry in entries {
-        let path = entry.path();
-        let path_str = path.display().to_string();
-        let src =
-            std::fs::read_to_string(&path).with_context(|| format!("reading {}", path_str))?;
-        let spec: WorkloadSpec =
-            toml::from_str(&src).with_context(|| format!("parsing {}", path_str))?;
-
-        // R892-B1: refuse a file whose keys the parser silently threw away.
-        refuse_dropped_keys(&src, &spec, &path_str)?;
-
-        // Shape-validate before accepting into the loaded config.
-        validate::shape(&spec)
-            .map_err(|e| anyhow::anyhow!("workload {} failed shape validation: {e}", path_str))?;
-
-        items.push(DeclaredWorkload { spec, source: path_str });
-    }
-    Ok(items)
 }
 
 /// Refuse a workload file that declares keys the parser did not keep (R892-B1).
@@ -4807,13 +4723,13 @@ impl Connection {
 
     /// The `fleet:<workload>:<name>` connections the camp's own workload specs
     /// declare through `[[db]]` (W358 decision 7), sorted by id. Reads the
-    /// camp's effective workloads through [`load_effective_workloads`] —
-    /// lowered from `.yah/services/` or on disk, the specs the camp deploys —
+    /// camp's workloads through [`lowered_camp_workloads`] — the specs the
+    /// camp deploys —
     /// so listing makes no fleet call. No workloads is an empty list; a
     /// workload that fails shape validation (including a bad `[[db]]` row)
     /// fails the whole derivation, naming its file.
     pub fn derive_fleet(camp_root: &Path) -> Result<Vec<Self>> {
-        let loaded = load_effective_workloads(camp_root)?;
+        let loaded = lowered_camp_workloads(camp_root)?;
         let specs: Vec<&WorkloadSpec> = loaded.iter().map(|w| &w.spec).collect();
         let mut out = Self::fleet_from_specs(specs);
         out.sort_by_key(Self::id);
@@ -6383,6 +6299,29 @@ pub struct DomainRoute {
     /// merging across routes (see the Worker's `applyRouteHeaders`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
+    /// Origins this route answers cross-origin reads for (R826) — the one CORS
+    /// spelling the manifest has, beside `headers` and decided by the same
+    /// first-match walk.
+    ///
+    /// Each door echoes the request's `Origin` back as
+    /// `Access-Control-Allow-Origin` only when it is listed, removes any
+    /// `Access-Control-Allow-Origin` the payload brought otherwise, and sends
+    /// `Vary: Origin` on EVERY response the route serves — listed, unlisted or
+    /// no `Origin` at all — so neither an edge nor a browser cache can replay
+    /// one origin's answer to another. Nothing is refused: an unlisted origin
+    /// gets the bytes without the grant, which is what makes the browser block
+    /// the read.
+    ///
+    /// A literal `Access-Control-Allow-Origin` in `headers` names exactly one
+    /// origin forever, which is how `staging.` and a dev mirror's door lost the
+    /// wasm a COEP `require-corp` page fetches; this list is the replacement,
+    /// and [`DomainConfig::validate_route_headers`] refuses a route that
+    /// declares both. Entries are serialized origins as a browser sends them
+    /// (`https://noisetable.com`: lowercase, no path, no trailing slash, no
+    /// default port) — never `*`, which would grant every site, and never
+    /// `null`, which every sandboxed iframe and `file:` page sends.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cors_origins: Vec<String>,
     #[serde(flatten)]
     pub mode: RouteMode,
 }
@@ -6701,6 +6640,69 @@ pub fn domain_for_service(workspace_root: &Path, service: &str) -> Result<Option
     Ok(domain_serving_service(&domains, service).cloned())
 }
 
+/// R826 — one `cors_origins` entry must be an origin exactly as a browser
+/// serializes it into the `Origin` request header, because the doors compare
+/// the two byte-for-byte and an entry that cannot match is a silent refusal.
+///
+/// That means `http`/`https`, a host, an optional non-default port, and nothing
+/// else: no path (so no trailing slash), no query, no userinfo, all lowercase.
+/// `*` and `null` are refused by name — `*` grants every site, which this list
+/// exists not to do, and `null` is the origin of every sandboxed iframe and
+/// `file:` page, i.e. of anyone who wants it. The doors refuse those two as
+/// well; the rest of the shape is checked only here, where the manifest line can
+/// be named.
+pub fn validate_cors_origin(origin: &str) -> Result<()> {
+    use axum::http::Uri;
+
+    match origin {
+        "*" => anyhow::bail!(
+            "`*` grants every site the read — list the origins that should have it"
+        ),
+        "null" => anyhow::bail!(
+            "`null` is the origin of every sandboxed iframe and `file:` page, so listing it \
+             grants anyone who asks"
+        ),
+        _ => {}
+    }
+    let lower = origin.to_ascii_lowercase();
+    if origin != lower {
+        anyhow::bail!(
+            "browsers send origins lowercase, so this can never match — write {lower:?}"
+        );
+    }
+    let uri: Uri = origin
+        .parse()
+        .map_err(|e| anyhow::anyhow!("not a URL origin ({e}) — expected e.g. \"https://example.com\""))?;
+    let (scheme, default_port) = match uri.scheme_str() {
+        Some("https") => ("https", 443),
+        Some("http") => ("http", 80),
+        _ => anyhow::bail!("an origin's scheme is http or https"),
+    };
+    let Some(authority) = uri.authority() else {
+        anyhow::bail!("names no host");
+    };
+    if authority.host().is_empty() || authority.as_str().contains('@') {
+        anyhow::bail!("an origin is scheme://host[:port], with no userinfo");
+    }
+    // Compared against the rebuilt origin rather than `uri.path_and_query()`:
+    // `Uri` normalizes an absent path to `/`, so it cannot tell
+    // `https://a.example` from `https://a.example/`, and only one can match.
+    let bare = format!("{scheme}://{authority}");
+    if origin != bare {
+        anyhow::bail!(
+            "an origin carries no path, query or trailing slash, so this can never match — \
+             write {bare:?}"
+        );
+    }
+    if authority.port_u16() == Some(default_port) {
+        anyhow::bail!(
+            "browsers omit the scheme's default port ({default_port}) from `Origin`, so this \
+             can never match — drop the port"
+        );
+    }
+    Ok(())
+}
+
 impl DomainConfig {
     /// Parse a single `.yah/domains/<name>.toml`, rejecting a manifest whose
     /// declared front door contradicts its route table
@@ -6816,11 +6818,21 @@ impl DomainConfig {
     /// at the doors. Only routes that contribute to the table are checked, so
     /// the invariant is exactly "`route_headers_json`'s output parses".
     ///
+    /// R826 widens "applicable" to the route's `cors_origins`, whose failure
+    /// is quieter still: a malformed entry is never an error at either door, it
+    /// simply never equals any `Origin` a browser sends, and the cross-origin
+    /// read it was declared for is blocked with nothing server-side to say why.
+    /// See [`validate_cors_origin`] for the rule.
+    ///
     /// Called from [`Self::load`], alongside [`Self::validate_front_door`].
     pub fn validate_route_headers(&self) -> Result<()> {
         use axum::http::{HeaderName, HeaderValue};
 
-        for route in self.routes.iter().filter(|r| !r.headers.is_empty()) {
+        for route in self
+            .routes
+            .iter()
+            .filter(|r| !r.headers.is_empty() || !r.cors_origins.is_empty())
+        {
             if route.path.is_empty() {
                 anyhow::bail!(
                     "domain \"{}\" declares response headers on a route whose `path` is \
@@ -6842,6 +6854,31 @@ impl DomainConfig {
                     format!(
                         "domain \"{}\" route \"{}\" declares {name} = {value:?}, which is not \
                          a valid HTTP header value — no newlines and no control characters",
+                        self.name, route.path
+                    )
+                })?;
+            }
+            if route.cors_origins.is_empty() {
+                continue;
+            }
+            if let Some(literal) = route
+                .headers
+                .keys()
+                .find(|name| name.eq_ignore_ascii_case("access-control-allow-origin"))
+            {
+                anyhow::bail!(
+                    "domain \"{}\" route \"{}\" declares both `cors_origins` and a literal \
+                     {literal:?} header — the list decides that header per request, so a fixed \
+                     value beside it is either dead or a second answer. Drop the header and list \
+                     its origin in `cors_origins`",
+                    self.name,
+                    route.path
+                );
+            }
+            for origin in &route.cors_origins {
+                validate_cors_origin(origin).with_context(|| {
+                    format!(
+                        "domain \"{}\" route \"{}\" lists {origin:?} in `cors_origins`",
                         self.name, route.path
                     )
                 })?;
@@ -7659,9 +7696,7 @@ workbench = "snapshot"
     #[test]
     fn fleet_derivation_lists_only_non_none_db_rows() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(".yah/infra/workloads");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("acct.toml"), DB_WORKLOAD_TOML).unwrap();
+        crate::lower::fixture::write_workload(tmp.path(), "acct", DB_WORKLOAD_TOML);
         let fleet = Connection::derive_fleet(tmp.path()).unwrap();
         assert_eq!(fleet.len(), 1, "the `none` row must not be listed");
         let c = &fleet[0];
@@ -7681,10 +7716,8 @@ workbench = "snapshot"
     #[test]
     fn fleet_derivation_refuses_a_snapshot_row_outside_durability_subjects() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(".yah/infra/workloads");
-        std::fs::create_dir_all(&dir).unwrap();
         let bad = DB_WORKLOAD_TOML.replace("subject = \"account.db\"\nworkbench", "subject = \"nope.db\"\nworkbench");
-        std::fs::write(dir.join("acct.toml"), bad).unwrap();
+        crate::lower::fixture::write_workload(tmp.path(), "acct", &bad);
         let err = format!("{:#}", Connection::derive_fleet(tmp.path()).unwrap_err());
         assert!(err.contains("durability.subjects"), "{err}");
     }
@@ -8633,83 +8666,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
         );
     }
 
-    #[test]
-    fn workload_config_load_and_validate() {
-        use workload_spec::{
-            ExposeSpec, ImageRef, MeshExpose, MeshIdent, NamespaceId, ResourceLimits,
-            RestartPolicy, StopPolicy, TenantId, TierTag, WorkloadSpec,
-        };
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        let cloud_dir = make_legacy_cloud_dir(root);
-        std::fs::create_dir_all(cloud_dir.join("workloads")).unwrap();
-
-        let spec = WorkloadSpec {
-            name: "asset-registry".into(),
-            image: ImageRef {
-                registry: "ghcr.io".into(),
-                repository: "noisetable/asset-registry".into(),
-                tag: "v1.0.0".into(),
-                digest: workload_spec::testing::test_digest(),
-            },
-            tier: TierTag("tenant".into()),
-            replicas: 1,
-            command: None,
-            entrypoint: None,
-            workdir: None,
-            user: None,
-            env: vec![],
-            secrets: vec![],
-            volumes: vec![],
-            resources: ResourceLimits {
-                memory_mb: 256,
-                cpu_millis: 512,
-                memory_request_mb: None,
-                cpu_limit_millis: None,
-                pids_max: None,
-                scratch_floor_mb: None,
-            },
-            depends_on: vec![],
-            requires: vec![],
-            healthcheck: None,
-            restart_policy: RestartPolicy::Always,
-            archetype: None,
-            stop_policy: StopPolicy {
-                signal: 15,
-                grace_period: workload_spec::Millis::from_secs(10),
-            },
-            expose: ExposeSpec {
-                mesh: MeshExpose {
-                    identity: MeshIdent("asset-registry.pdx".into()),
-                    ports: MeshExpose::anonymous_ports([8080]),
-                    allow_from: vec![],
-                },
-                public: None,
-                operator: None,
-            },
-            tenant: TenantId::singleton(),
-            namespace: NamespaceId::singleton(),
-            labels: Default::default(),
-            durability: None,
-            db: Vec::new(),
-            capabilities: Vec::new(),
-            annotations: Default::default(),
-            files: Vec::new(),
-        };
-
-        let toml_str = toml::to_string_pretty(&spec).unwrap();
-        std::fs::write(cloud_dir.join("workloads/asset-registry.toml"), &toml_str).unwrap();
-
-        let cfg = CloudConfig::load(root).unwrap();
-        assert_eq!(cfg.workloads.len(), 1);
-        assert_eq!(cfg.workloads[0].spec.name, "asset-registry");
-        assert_eq!(cfg.workload("asset-registry").unwrap().spec.replicas, 1);
-    }
-
-    /// Minimal valid spec for the R215+ loader tests below. Kept as a helper so
-    /// the two tests differ only in *where* the file lands, which is the whole
-    /// thing under test.
+    /// Minimal valid spec for the tests below.
     #[cfg(test)]
     fn minimal_spec(name: &str, replicas: u32) -> workload_spec::WorkloadSpec {
         use workload_spec::{
@@ -8770,85 +8727,10 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
         }
     }
 
-    /// R568-T7. Workloads must load from the R215+ tree.
-    ///
-    /// Before the fix this function tested, `CloudConfig::load` read workloads
-    /// ONLY from the pre-R215 `.yah/cloud/workloads/` — which R222-B1 emptied —
-    /// so in any modern camp `cfg.workload(name)` returned `None` for every
-    /// name and the entire `yah cloud workload …` surface was unreachable. The
-    /// CLI's own error text has said `.yah/infra/workloads/` throughout, so the
-    /// bug read as "you must have typoed the filename".
-    ///
-    /// Note the fixture writes NO legacy `.yah/cloud/` dir at all: that is the
-    /// shape of a real post-R215 camp, and it is exactly the shape the old code
-    /// could not serve.
-    #[test]
-    fn workloads_load_from_the_infra_tree() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        let dir = crate::paths::workloads_dir(root);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("yah-cloud-admin.toml"),
-            toml::to_string_pretty(&minimal_spec("yah-cloud-admin", 1)).unwrap(),
-        )
-        .unwrap();
-
-        let cfg = CloudConfig::load(root).unwrap();
-        assert_eq!(cfg.workloads.len(), 1);
-        assert_eq!(
-            cfg.workload("yah-cloud-admin").unwrap().spec.replicas,
-            1,
-            "a workload declared under .yah/infra/workloads/ must be resolvable by name"
-        );
-    }
-
-    /// A camp mid-migration can have both trees. R215+ wins on a name
-    /// collision — same precedence the machine loader applies — so moving a
-    /// declaration into `.yah/infra/workloads/` takes effect immediately
-    /// instead of being silently shadowed by the copy left behind.
-    #[test]
-    fn infra_workload_shadows_the_legacy_copy_of_the_same_name() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-
-        let legacy = make_legacy_cloud_dir(root);
-        std::fs::create_dir_all(legacy.join("workloads")).unwrap();
-        std::fs::write(
-            legacy.join("workloads/shared.toml"),
-            toml::to_string_pretty(&minimal_spec("shared", 9)).unwrap(),
-        )
-        .unwrap();
-        // Legacy-only name, to prove the old tree is still read rather than
-        // replaced wholesale.
-        std::fs::write(
-            legacy.join("workloads/legacy-only.toml"),
-            toml::to_string_pretty(&minimal_spec("legacy-only", 3)).unwrap(),
-        )
-        .unwrap();
-
-        let infra = crate::paths::workloads_dir(root);
-        std::fs::create_dir_all(&infra).unwrap();
-        std::fs::write(
-            infra.join("shared.toml"),
-            toml::to_string_pretty(&minimal_spec("shared", 1)).unwrap(),
-        )
-        .unwrap();
-
-        let cfg = CloudConfig::load(root).unwrap();
-        assert_eq!(cfg.workloads.len(), 2, "one `shared`, plus `legacy-only`");
-        assert_eq!(
-            cfg.workload("shared").unwrap().spec.replicas,
-            1,
-            "the .yah/infra/ copy must win over the legacy one"
-        );
-        assert_eq!(cfg.workload("legacy-only").unwrap().spec.replicas, 3);
-    }
-
     /// R959-F2 fixture: the yah-cloud-admin service + prod mirror from
-    /// `tests/fixtures/lower/`, optionally with the hand-written file too.
+    /// `tests/fixtures/lower/`.
     #[cfg(test)]
-    fn lowered_camp(with_disk_file: bool) -> tempfile::TempDir {
+    fn lowered_camp() -> tempfile::TempDir {
         let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lower");
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = crate::paths::services_dir(tmp.path()).join("yah-cloud-admin");
@@ -8857,197 +8739,28 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             .unwrap();
         std::fs::copy(format!("{fixtures}/yah-cloud-admin/prod.toml"), svc.join("mirrors/prod.toml"))
             .unwrap();
-        if with_disk_file {
-            let dir = crate::paths::workloads_dir(tmp.path());
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::copy(format!("{fixtures}/live/yah-cloud-admin.toml"), dir.join("yah-cloud-admin.toml"))
-                .unwrap();
-        }
+        let providers = crate::paths::providers_dir(tmp.path());
+        std::fs::create_dir_all(&providers).unwrap();
+        std::fs::write(
+            providers.join("hetzner.toml"),
+            "schema_version = 1\nid = \"hetzner\"\nkind = \"hetzner\"\n\
+             credentials = \"keystore://hetzner/yah\"\ndefault_location = \"pdx\"\n\
+             default_server_type = \"cpx11\"\nssh_keys = []\n",
+        )
+        .unwrap();
         tmp
     }
 
-    /// W361 §Migration step 2: a lowered workload resolves by its ident with
-    /// no file under `.yah/infra/workloads/`.
+    /// W361: a lowered workload resolves by its ident, through both the
+    /// camp-level loader and `CloudConfig::load`.
     #[test]
-    fn a_lowered_workload_resolves_without_a_file() {
-        let tmp = lowered_camp(false);
+    fn a_lowered_workload_resolves_by_ident() {
+        let tmp = lowered_camp();
         let spec = load_workload(tmp.path(), "yah-cloud-admin").unwrap();
         assert_eq!(spec.name, "yah-cloud-admin");
-    }
-
-    /// W361 §Migration step 2: an ident both lowered and on disk is a load
-    /// error naming both files, never "prefer one".
-    #[test]
-    fn an_ident_lowered_and_on_disk_is_refused_naming_both() {
-        let tmp = lowered_camp(true);
-        for err in [
-            load_workload(tmp.path(), "yah-cloud-admin").unwrap_err(),
-            Connection::derive_fleet(tmp.path()).unwrap_err(),
-        ] {
-            let msg = format!("{err:#}");
-            assert!(msg.contains("mirrors/prod.toml [workload."), "{msg}");
-            assert!(msg.contains("yah-cloud-admin.toml"), "{msg}");
-        }
-    }
-
-    #[test]
-    fn workload_loader_rejects_bad_spec() {
-        use workload_spec::{
-            ExposeSpec, ImageRef, MeshExpose, MeshIdent, NamespaceId, ResourceLimits,
-            RestartPolicy, StopPolicy, TenantId, TierTag, WorkloadSpec,
-        };
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        let cloud_dir = make_legacy_cloud_dir(root);
-        std::fs::create_dir_all(cloud_dir.join("workloads")).unwrap();
-
-        // Construct a spec that round-trips through TOML but fails shape
-        // validation: replicas = 200 is above the max of 100.
-        let mut spec = WorkloadSpec {
-            name: "asset-registry".into(),
-            image: ImageRef {
-                registry: "ghcr.io".into(),
-                repository: "test/app".into(),
-                tag: "v1".into(),
-                digest: workload_spec::testing::test_digest(),
-            },
-            tier: TierTag("tenant".into()),
-            replicas: 200, // ← invalid: exceeds max 100
-            command: None,
-            entrypoint: None,
-            workdir: None,
-            user: None,
-            env: vec![],
-            secrets: vec![],
-            volumes: vec![],
-            resources: ResourceLimits {
-                memory_mb: 256,
-                cpu_millis: 512,
-                memory_request_mb: None,
-                cpu_limit_millis: None,
-                pids_max: None,
-                scratch_floor_mb: None,
-            },
-            depends_on: vec![],
-            requires: vec![],
-            healthcheck: None,
-            restart_policy: RestartPolicy::Always,
-            archetype: None,
-            stop_policy: StopPolicy {
-                signal: 15,
-                grace_period: workload_spec::Millis::from_secs(10),
-            },
-            expose: ExposeSpec {
-                mesh: MeshExpose {
-                    identity: MeshIdent("asset-registry.pdx".into()),
-                    ports: MeshExpose::anonymous_ports([8080]),
-                    allow_from: vec![],
-                },
-                public: None,
-                operator: None,
-            },
-            tenant: TenantId::singleton(),
-            namespace: NamespaceId::singleton(),
-            labels: Default::default(),
-            durability: None,
-            db: Vec::new(),
-            capabilities: Vec::new(),
-            annotations: Default::default(),
-            files: Vec::new(),
-        };
-
-        let toml_str = toml::to_string_pretty(&spec).unwrap();
-        std::fs::write(cloud_dir.join("workloads/bad.toml"), &toml_str).unwrap();
-
-        let result = CloudConfig::load(root);
-        assert!(
-            result.is_err(),
-            "loading a WorkloadSpec with replicas=200 should return Err"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("shape validation")
-                || msg.contains("Replicas")
-                || msg.contains("replicas"),
-            "error should mention shape validation or replicas field, got: {msg}"
-        );
-
-        // The `spec` binding is only used for the write — suppress warning.
-        let _ = &mut spec;
-    }
-
-    #[test]
-    fn workload_config_save_round_trip() {
-        use workload_spec::{
-            ExposeSpec, ImageRef, MeshExpose, MeshIdent, NamespaceId, ResourceLimits,
-            RestartPolicy, StopPolicy, TenantId, TierTag, WorkloadSpec,
-        };
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-
-        let spec = WorkloadSpec {
-            name: "signing-service".into(),
-            image: ImageRef {
-                registry: "ghcr.io".into(),
-                repository: "noisetable/signing".into(),
-                tag: "v2.0.0".into(),
-                digest: workload_spec::testing::test_digest(),
-            },
-            tier: TierTag("private".into()),
-            replicas: 2,
-            command: None,
-            entrypoint: None,
-            workdir: None,
-            user: None,
-            env: vec![],
-            secrets: vec![],
-            volumes: vec![],
-            resources: ResourceLimits {
-                memory_mb: 128,
-                cpu_millis: 256,
-                memory_request_mb: None,
-                cpu_limit_millis: None,
-                pids_max: None,
-                scratch_floor_mb: None,
-            },
-            depends_on: vec![],
-            requires: vec![],
-            healthcheck: None,
-            restart_policy: RestartPolicy::Always,
-            archetype: None,
-            stop_policy: StopPolicy {
-                signal: 15,
-                grace_period: workload_spec::Millis::from_secs(5),
-            },
-            expose: ExposeSpec {
-                mesh: MeshExpose {
-                    identity: MeshIdent("signing.pdx".into()),
-                    ports: MeshExpose::anonymous_ports([9090]),
-                    allow_from: vec![],
-                },
-                public: None,
-                operator: None,
-            },
-            tenant: TenantId::singleton(),
-            namespace: NamespaceId::singleton(),
-            labels: Default::default(),
-            durability: None,
-            db: Vec::new(),
-            capabilities: Vec::new(),
-            annotations: Default::default(),
-            files: Vec::new(),
-        };
-
-        let wc = WorkloadConfig { spec };
-        let cloud_dir = make_legacy_cloud_dir(root);
-        wc.save(&cloud_dir).unwrap();
-
-        let loaded = CloudConfig::load(root).unwrap();
-        assert_eq!(loaded.workloads.len(), 1);
-        assert_eq!(loaded.workloads[0].spec.name, "signing-service");
-        assert_eq!(loaded.workloads[0].spec.replicas, 2);
+        let cfg = CloudConfig::load(tmp.path()).unwrap();
+        assert_eq!(cfg.workloads.len(), 1);
+        assert!(cfg.workload("yah-cloud-admin").is_some());
     }
 
     #[test]
@@ -10898,6 +10611,7 @@ out_dir = "dist"
             worker_bundle_path: Some(".yah/workers/yah-dev/".into()),
             routes: vec![
                 DomainRoute {
+                    cors_origins: Vec::new(),
                     headers: Default::default(),
                     path: "/".into(),
                     mode: RouteMode::Static {
@@ -10905,6 +10619,7 @@ out_dir = "dist"
                     },
                 },
                 DomainRoute {
+                    cors_origins: Vec::new(),
                     headers: Default::default(),
                     path: "/dashboard/api/*".into(),
                     mode: RouteMode::Backend {
@@ -10914,6 +10629,7 @@ out_dir = "dist"
                     },
                 },
                 DomainRoute {
+                    cors_origins: Vec::new(),
                     headers: Default::default(),
                     path: "/old".into(),
                     mode: RouteMode::Redirect {
@@ -11046,6 +10762,7 @@ target = "https://yah.dev/blog"
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                cors_origins: Vec::new(),
                 headers: Default::default(),
                 path: "/".into(),
                 mode: RouteMode::Static {
@@ -11363,6 +11080,110 @@ headers = { "X-Frame-Options" = "DENY\nSet-Cookie: pwned=1" }
         let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
         assert!(err.contains("X-Frame-Options"), "{err}");
         assert!(err.contains("not a valid HTTP header value"), "{err}");
+    }
+
+    // ---- R826: the CORS allowlist ------------------------------------------
+
+    fn cors_domain(route_body: &str) -> String {
+        format!(
+            r#"
+schema_version = 1
+name = "yah-dev"
+domain = "yah.dev"
+front_door = "worker"
+cdn_bucket = "yah-dev"
+
+[[routes]]
+path = "/*"
+mode = "static"
+component = "yah-marketing/site"
+{route_body}
+"#
+        )
+    }
+
+    /// The happy path end to end: the TOML key loads, and both projections the
+    /// doors read (the header column and, via `route_table`, the full table)
+    /// carry it — the header column keeping a route whose only declaration is
+    /// the list.
+    #[test]
+    fn cors_origins_load_and_reach_the_header_column() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_marketing_service(root);
+        write_domain_toml(
+            root,
+            "yah-dev",
+            &cors_domain(
+                r#"cors_origins = ["https://noisetable.com", "https://staging.noisetable.com", "http://localhost:8787"]"#,
+            ),
+        );
+        let cfg = CloudConfig::load(root).unwrap();
+        let dom = cfg.domain("yah-dev").unwrap();
+        assert_eq!(dom.routes[0].cors_origins.len(), 3);
+        assert_eq!(
+            dom.route_headers_json(),
+            r#"[{"path":"/*","headers":{},"cors_origins":["https://noisetable.com","https://staging.noisetable.com","http://localhost:8787"]}]"#
+        );
+    }
+
+    /// The list decides `Access-Control-Allow-Origin` per request, so a literal
+    /// one beside it — in any case — is refused rather than ordered against it.
+    #[test]
+    fn cors_origins_beside_a_literal_acao_header_fails_the_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        write_marketing_service(root);
+        write_domain_toml(
+            root,
+            "yah-dev",
+            &cors_domain(
+                r#"cors_origins = ["https://noisetable.com"]
+headers = { "access-control-allow-origin" = "https://noisetable.com" }"#,
+            ),
+        );
+        let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
+        assert!(err.contains("/*"), "{err}");
+        assert!(err.contains("both `cors_origins` and a literal"), "{err}");
+    }
+
+    #[test]
+    fn a_cors_origin_that_could_never_match_fails_the_load_naming_it() {
+        for (bad, why) in [
+            ("*", "grants every site"),
+            ("null", "sandboxed iframe"),
+            ("https://noisetable.com/", "no path"),
+            ("https://NoiseTable.com", "lowercase"),
+            ("https://noisetable.com:443", "default port"),
+            ("noisetable.com", "http or https"),
+            ("ftp://noisetable.com", "http or https"),
+            ("https://u:p@noisetable.com", "userinfo"),
+        ] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let root = tmp.path();
+            write_marketing_service(root);
+            write_domain_toml(
+                root,
+                "yah-dev",
+                &cors_domain(&format!(r#"cors_origins = ["{bad}"]"#)),
+            );
+            let err = format!("{:#}", CloudConfig::load(root).unwrap_err());
+            assert!(err.contains(&format!("{bad:?}")), "{bad}: {err}");
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn serialized_origins_pass_the_cors_origin_check() {
+        for good in [
+            "https://noisetable.com",
+            "https://staging.noisetable.com",
+            "http://localhost:8787",
+            "http://127.0.0.1:3000",
+            "https://noisetable.com:8443",
+        ] {
+            validate_cors_origin(good).unwrap_or_else(|e| panic!("{good}: {e:#}"));
+        }
     }
 
     /// The invariant this gate exists to hold: everything `route_headers_json`
@@ -11802,6 +11623,7 @@ cdn_bucket = "yah-dev"
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                cors_origins: Vec::new(),
                 headers: Default::default(),
                 path: "/*".into(),
                 mode: RouteMode::Static {
@@ -11835,6 +11657,7 @@ cdn_bucket = "yah-dev"
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                cors_origins: Vec::new(),
                 headers: Default::default(),
                 path: "/".into(),
                 mode: RouteMode::Static {
@@ -11864,6 +11687,7 @@ cdn_bucket = "yah-dev"
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                cors_origins: Vec::new(),
                 headers: Default::default(),
                 path: "/".into(),
                 mode: RouteMode::Static {
@@ -11893,6 +11717,7 @@ cdn_bucket = "yah-dev"
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                cors_origins: Vec::new(),
                 headers: Default::default(),
                 path: "/".into(),
                 mode: RouteMode::Static {
@@ -11921,6 +11746,7 @@ cdn_bucket = "yah-dev"
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                cors_origins: Vec::new(),
                 headers: Default::default(),
                 path: "/old".into(),
                 mode: RouteMode::Redirect {
@@ -11976,6 +11802,7 @@ cdn_bucket = "yah-dev"
             cdn_bucket: "net-yah-dev".into(), // shared per-tier bucket
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                cors_origins: Vec::new(),
                 headers: Default::default(),
                 path: "/*".into(),
                 mode: RouteMode::Static {
@@ -13482,7 +13309,7 @@ path  = "../first"
         }
     }
 
-    /// The declared inventory an ident is resolved against — `.yah/infra/workloads/`.
+    /// The declared inventory an ident is resolved against — the lowered workloads.
     fn declared(specs: Vec<WorkloadSpec>) -> Vec<WorkloadConfig> {
         specs.into_iter().map(|spec| WorkloadConfig { spec }).collect()
     }

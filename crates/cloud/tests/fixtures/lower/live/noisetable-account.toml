@@ -14,8 +14,8 @@ restart_policy = "always"
 [image]
 registry = "cr.yah.dev"
 repository = "noisetable-account"
-tag = "20261008.1-amd64-dev"
-digest = "sha256:d7eedfaa3ebe920c5c74a88c6eef2213dfce40e2673b3b8d64d249d0c8a9b9f7"
+tag = "20261009.1-amd64"
+digest = "sha256:2f20f53d853c98a63539f44811f83b18b7540887b7743b535944c0e29aca60af"
 
 [resources]
 memory_mb = 512
@@ -120,6 +120,22 @@ value = { literal = { value = "/run/secrets/cheers-vend-verify.key" } }
 name = "NOISETABLE_ACCOUNT_VEND_AUDIENCE"
 value = { literal = { value = "noisetable-account/account-live" } }
 
+[[env]]
+name = "XLB_R2_ENDPOINT"
+value = { literal = { value = "https://3948dc292e724e71b0deefde0ea95999.r2.cloudflarestorage.com" } }
+
+[[env]]
+name = "XLB_R2_BUCKET"
+value = { literal = { value = "noisetable-assets" } }
+
+[[env]]
+name = "XLB_R2_ACCESS_KEY_ID_FILE"
+value = { literal = { value = "/run/secrets/r2-access-key-id" } }
+
+[[env]]
+name = "XLB_R2_SECRET_ACCESS_KEY_FILE"
+value = { literal = { value = "/run/secrets/r2-secret-key" } }
+
 [[secrets]]
 source = { cluster = { name = "noisetable/account/session-key" } }
 target = { file = { path = "/run/secrets/session.key", mode = 0o400 } }
@@ -135,6 +151,14 @@ target = { file = { path = "/run/secrets/smtp.password", mode = 0o400 } }
 [[secrets]]
 source = { cluster = { name = "cheers/vend/verify-key" } }
 target = { file = { path = "/run/secrets/cheers-vend-verify.key", mode = 0o400 } }
+
+[[secrets]]
+source = { cluster = { name = "noisetable/account/r2-access-key-id" } }
+target = { file = { path = "/run/secrets/r2-access-key-id", mode = 0o400 } }
+
+[[secrets]]
+source = { cluster = { name = "noisetable/account/r2-secret-key" } }
+target = { file = { path = "/run/secrets/r2-secret-key", mode = 0o400 } }
 
 [healthcheck]
 probe = { http_get = { path = "/__mesofact/health", port = 4332, expect_status = 200 } }

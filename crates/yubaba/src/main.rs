@@ -706,6 +706,16 @@ enum Cmd {
         /// Yubaba daemon address to query (default: localhost).
         #[arg(long, default_value = "http://127.0.0.1:7443")]
         daemon: String,
+        /// R876-T22: operator secret key file. When it exists every request
+        /// carries a fresh operator token. Otherwise `YUBABA_BEARER_TOKEN`
+        /// (a caller-minted per-invocation token, env only) is sent as-is,
+        /// else `--cluster-key-file` signs Peer routes. See `cli_client`.
+        #[arg(long, value_name = "PATH", env = "YAH_OPERATOR_KEY_FILE")]
+        operator_key_file: Option<PathBuf>,
+        /// Cluster key file: peer tokens for Peer routes (`status`, `peers`)
+        /// when no operator credential is present.
+        #[arg(long, value_name = "PATH", env = "YUBABA_CLUSTER_KEY_FILE")]
+        cluster_key_file: Option<PathBuf>,
         #[command(subcommand)]
         cmd: RaftCmd,
     },
@@ -2193,12 +2203,22 @@ async fn main() -> Result<()> {
 
         Cmd::Auth { cmd } => run_auth_cmd(cmd),
 
-        Cmd::Raft { daemon, cmd } => match cmd {
+        Cmd::Raft {
+            daemon,
+            operator_key_file,
+            cluster_key_file,
+            cmd,
+        } => {
+            use yubaba::cli_client::{self, CliAuth};
+            let auth = CliAuth::resolve(
+                operator_key_file.as_deref(),
+                std::env::var(cli_client::BEARER_TOKEN_ENV).ok(),
+                cluster_key_file.as_deref(),
+            )?;
+            let http = reqwest::Client::new();
+            match cmd {
             RaftCmd::Status => {
-                let body: serde_json::Value = reqwest::get(format!("{daemon}/raft/status"))
-                    .await?
-                    .json()
-                    .await?;
+                let body = cli_client::raft_status(&http, &auth, &daemon).await?;
                 println!("{}", serde_json::to_string_pretty(&body)?);
                 Ok(())
             }
@@ -2220,77 +2240,34 @@ async fn main() -> Result<()> {
                     };
                     parsed.insert(id, serde_json::json!({ "addr": addr, "region": region }));
                 }
-                let client = reqwest::Client::new();
-                let resp = client
-                    .post(format!("{daemon}/raft/initialize"))
-                    .json(&serde_json::json!({ "members": parsed }))
-                    .send()
-                    .await?;
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                if status.is_success() {
-                    println!("{body}");
-                } else {
-                    anyhow::bail!("raft init failed ({status}): {body}");
-                }
+                let body = serde_json::json!({ "members": parsed });
+                let out = cli_client::operator_post(&http, &auth, &daemon, "/raft/initialize", &body, "raft init").await?;
+                println!("{out}");
                 Ok(())
             }
             RaftCmd::AddLearner { node_id, addr } => {
-                let client = reqwest::Client::new();
-                let resp = client
-                    .post(format!("{daemon}/raft/add-learner"))
-                    .json(&serde_json::json!({ "node_id": node_id, "addr": addr }))
-                    .send()
-                    .await?;
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                if status.is_success() {
-                    println!("{body}");
-                } else {
-                    anyhow::bail!("raft add-learner failed ({status}): {body}");
-                }
+                let body = serde_json::json!({ "node_id": node_id, "addr": addr });
+                let out = cli_client::operator_post(&http, &auth, &daemon, "/raft/add-learner", &body, "raft add-learner").await?;
+                println!("{out}");
                 Ok(())
             }
             RaftCmd::PromoteVoter { node_id } => {
-                let client = reqwest::Client::new();
-                let resp = client
-                    .post(format!("{daemon}/raft/promote-voter"))
-                    .json(&serde_json::json!({ "node_id": node_id }))
-                    .send()
-                    .await?;
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                if status.is_success() {
-                    println!("{body}");
-                } else {
-                    anyhow::bail!("raft promote-voter failed ({status}): {body}");
-                }
+                let body = serde_json::json!({ "node_id": node_id });
+                let out = cli_client::operator_post(&http, &auth, &daemon, "/raft/promote-voter", &body, "raft promote-voter").await?;
+                println!("{out}");
                 Ok(())
             }
             RaftCmd::RemoveMember { node_ids } => {
-                let client = reqwest::Client::new();
-                let resp = client
-                    .post(format!("{daemon}/raft/remove-member"))
-                    .json(&serde_json::json!({ "node_ids": node_ids }))
-                    .send()
-                    .await?;
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                if status.is_success() {
-                    println!("{body}");
-                } else {
-                    anyhow::bail!("raft remove-member failed ({status}): {body}");
-                }
+                let body = serde_json::json!({ "node_ids": node_ids });
+                let out = cli_client::operator_post(&http, &auth, &daemon, "/raft/remove-member", &body, "raft remove-member").await?;
+                println!("{out}");
                 Ok(())
             }
             RaftCmd::Peers => {
                 // Membership says who the cluster believes in; the liveness
                 // section (R118-T9, present when a failure detector is wired)
                 // says which of them the leader has actually heard from.
-                let body: serde_json::Value = reqwest::get(format!("{daemon}/raft/status"))
-                    .await?
-                    .json()
-                    .await?;
+                let body = cli_client::raft_status(&http, &auth, &daemon).await?;
                 let peers = serde_json::json!({
                     "membership": &body["membership_config"],
                     "liveness": &body["liveness"],
@@ -2299,22 +2276,13 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             RaftCmd::TransferLeader { to } => {
-                let client = reqwest::Client::new();
-                let resp = client
-                    .post(format!("{daemon}/raft/transfer-leader"))
-                    .json(&serde_json::json!({ "to": to }))
-                    .send()
-                    .await?;
-                if resp.status().is_success() {
-                    println!("leadership transfer to node {to} initiated");
-                } else {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    anyhow::bail!("transfer-leader failed ({status}): {body}");
-                }
+                let body = serde_json::json!({ "to": to });
+                cli_client::operator_post(&http, &auth, &daemon, "/raft/transfer-leader", &body, "transfer-leader").await?;
+                println!("leadership transfer to node {to} initiated");
                 Ok(())
             }
-        },
+            }
+        }
         #[cfg(feature = "acme")]
         Cmd::Domain { cmd } => run_domain_cmd(cmd),
         #[cfg(feature = "acme")]

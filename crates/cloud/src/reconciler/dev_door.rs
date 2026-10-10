@@ -124,14 +124,26 @@ fn resolve_bucket(ctx: &ReconcileCtx<'_>, fields: &BTreeMap<String, toml::Value>
 /// workerd, about a URL they never typed.
 fn store_endpoint(ctx: &ReconcileCtx<'_>) -> Result<String> {
     running_endpoint(ctx.workspace_root).with_context(|| {
-        format!(
-            "the dev-tier s3 driver is not running — {} has no coordinates, so there is \
-             nowhere to publish {}/{}'s assets. The camp brings this driver up: start \
-             `yah camp` for this workspace (or attach it in the desktop).",
-            super::s3_driver::coords_path(ctx.workspace_root).display(),
-            ctx.service.name,
-            ctx.component.id,
-        )
+        let coords = super::s3_driver::coords_path(ctx.workspace_root);
+        // R967-B1: a camp that is running but whose driver failed to come up
+        // must not be told to "start yah camp". Quote what actually failed.
+        match super::s3_driver::recorded_bringup_error(ctx.workspace_root) {
+            Some(why) => format!(
+                "the dev-tier s3 driver is not running — {} has no coordinates, so there is \
+                 nowhere to publish {}/{}'s assets. Its last bring-up failed: {why}",
+                coords.display(),
+                ctx.service.name,
+                ctx.component.id,
+            ),
+            None => format!(
+                "the dev-tier s3 driver is not running — {} has no coordinates, so there is \
+                 nowhere to publish {}/{}'s assets. The camp brings this driver up: start \
+                 `yah camp` for this workspace (or attach it in the desktop).",
+                coords.display(),
+                ctx.service.name,
+                ctx.component.id,
+            ),
+        }
     })
 }
 
@@ -353,5 +365,23 @@ mod tests {
             .to_string();
         assert!(err.contains("coords.json"), "{err}");
         assert!(err.contains("yah camp"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_recorded_bringup_failure_is_quoted_instead_of_telling_a_running_camp_to_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let failure = super::super::s3_driver::bringup_error_path(dir.path());
+        std::fs::create_dir_all(failure.parent().unwrap()).unwrap();
+        std::fs::write(&failure, "port 49786 (PORT_S3) is held by pid 80519\n").unwrap();
+        let svc = service();
+        let comp = component();
+        let m = mirror("schema_version = 1\nshape = \"local\"\n");
+        let err = format!(
+            "{:#}",
+            store_endpoint(&ctx(dir.path(), &svc, &comp, &m)).expect_err("no coords written")
+        );
+        assert!(err.contains("coords.json"), "{err}");
+        assert!(err.contains("pid 80519"), "{err}");
+        assert!(!err.contains("start `yah camp`"), "{err}");
     }
 }

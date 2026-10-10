@@ -129,7 +129,7 @@ impl LoadedRoot {
     }
 
     /// Every workload/service name declared by this root (service names from the
-    /// R215+ tree plus any legacy `.yah/cloud/workloads/` names).
+    /// lowered workloads).
     fn declared_names(&self) -> impl Iterator<Item = String> + '_ {
         self.config
             .services

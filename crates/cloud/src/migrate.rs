@@ -75,7 +75,7 @@ pub fn named_volume_path(name: &str) -> String {
 /// guard stops being a guard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationRefusal {
-    /// No `.yah/infra/workloads/<name>.toml`.
+    /// No lowered workload of that name.
     UnknownWorkload { name: String, declared: Vec<String> },
 
     /// No machine declares `sovereign_group = "<group>"`. Indistinguishable
@@ -143,7 +143,7 @@ impl fmt::Display for MigrationRefusal {
         match self {
             Self::UnknownWorkload { name, declared } => write!(
                 f,
-                "no workload '{name}' in .yah/infra/workloads/ — declared: {}",
+                "no workload '{name}' lowered from .yah/services/*/mirrors/*.toml — declared: {}",
                 list_or_none(declared)
             ),
             Self::UnknownGroup { group, declared } => write!(
@@ -740,7 +740,7 @@ mod tests {
 
     /// Fixtures go through `CloudConfig::load` rather than being hand-built,
     /// so every one of them is a workload TOML that would actually load —
-    /// including `load_workloads`' shape validation. A struct literal would let
+    /// including lowering's shape validation. A struct literal would let
     /// a test pass on a spec no operator could write.
     struct Camp {
         dir: TempDir,
@@ -785,11 +785,10 @@ mod tests {
         /// A workload. `extra` carries the archetype / volumes / secrets under
         /// test; everything else is the minimum a spec needs to load.
         fn workload(self, name: &str, extra: &str) -> Self {
-            let dir = self.root().join(".yah/infra/workloads");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join(format!("{name}.toml")),
-                format!(
+            crate::lower::fixture::write_workload(
+                self.root(),
+                name,
+                &format!(
                     "schema_version = 1\nname = \"{name}\"\ntier = \"infra\"\n\
                      replicas = 1\nrestart_policy = \"always\"\n\
                      {extra}\n\
@@ -799,8 +798,7 @@ mod tests {
                      [stop_policy]\nsignal = 15\ngrace_period = 10000\n\
                      [expose.mesh]\nidentity = \"{name}\"\nports = [8080]\nallow_from = []\n"
                 ),
-            )
-            .unwrap();
+            );
             self
         }
 

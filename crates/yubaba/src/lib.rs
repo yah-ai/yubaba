@@ -535,6 +535,7 @@ pub use yubaba_consensus::cluster_policy;
 /// NAT-punched QUIC instead of by IP/SSH. Opt-in via `serve --control-plane`.
 pub mod control_plane;
 pub mod deploy;
+pub mod inner_door_schema;
 /// The "is that node still there?" port and its default raft-heartbeat impl
 /// (R118-T9). Deployments with a second evidence channel supply their own.
 pub mod failure_detector;
@@ -574,6 +575,8 @@ pub mod headscale_state;
 /// Who may call this node's HTTP control plane (R876-B15). Route classes,
 /// the two credential tiers, and the middleware `build_router` layers.
 pub mod http_auth;
+/// The credentialed client behind `yubaba raft ...` (R876-T22).
+pub mod cli_client;
 pub mod identity;
 pub mod leader;
 /// Soft-prefer an anchor region for raft leadership, without ever blocking a
@@ -1185,7 +1188,9 @@ pub struct ServerState {
 
     /// R572-F4: effective [`LifecycleArchetype`] of each live workload, keyed
     /// on mesh ident (= `spec.expose.mesh.identity.0`). Populated on a
-    /// successful deploy and cleared on destroy. Drives two behaviours:
+    /// successful deploy, rebuilt at boot from kamaji's deployed specs
+    /// (`rehydrate_appliance_guard`, R966), and cleared on destroy. Drives two
+    /// behaviours:
     ///
     /// - `drain_workloads` skips `Appliance` entries (pinned, non-drainable).
     /// - `deploy_workload_spec` rejects a second deploy of the same ident when
@@ -1193,9 +1198,11 @@ pub struct ServerState {
     pub archetype_registry: Mutex<HashMap<String, LifecycleArchetype>>,
 
     /// R931-B7: per ident, [`request_spec_digest`] of the spec its live deploy
-    /// was POSTed with. Same lifecycle as [`Self::archetype_registry`]; read
-    /// only by the appliance single-instance guard, to tell a re-POST of the
-    /// running spec from a genuine second instance.
+    /// was POSTed with. Same lifecycle as [`Self::archetype_registry`] — the
+    /// boot rebuild reads it off the deployed spec's
+    /// [`deploy::appliance::REQUEST_DIGEST_STAMP`]; read only by the appliance
+    /// single-instance guard, to tell a re-POST of the running spec from a
+    /// genuine second instance.
     pub appliance_spec_digests: Mutex<HashMap<String, u64>>,
 
     /// R880: mesh idents currently mid-deploy or mid-destroy on THIS node.
@@ -2005,6 +2012,7 @@ impl floater::FloatHost for NodeFloatHost {
             on_behalf_of_user: None,
             id: None,
             float_forwarded: false,
+            replace: false,
             forward_auth: None,
         };
         let resp = deploy_workload_spec_as(self.state.clone(), body, DeployOrigin::Floater).await;
@@ -3586,6 +3594,100 @@ async fn rehydrate_workload_resources(state: &ServerState) {
     );
 }
 
+/// R966: rebuild the single-instance guard's memory — each live workload's
+/// archetype, and the digest of the spec it was POSTed with — from the specs
+/// kamaji is supervising. Both maps used to come back empty after a restart,
+/// so one changed-spec deploy of a live appliance was a 409 before a yubaba
+/// restart and a silent in-place replace after one, and `drain_workloads`
+/// drained appliances it exists to skip.
+///
+/// The archetype is the deployed spec's own (`effective_archetype` does not
+/// count yubaba's secret binds); the digest is the stamp the deploy wrote
+/// ([`deploy::appliance::REQUEST_DIGEST_STAMP`]). A workload deployed before
+/// that stamp existed gets its archetype and no digest, so an identical
+/// re-POST of it answers 409 until its next replace — the safe direction.
+/// Kamaji only, and best-effort like [`rehydrate_workload_resources`]: a
+/// failure is logged loudly, never fatal to boot.
+async fn rehydrate_appliance_guard(state: &ServerState) {
+    let Some(kamaji) = state
+        .constable_client
+        .as_ref()
+        .and_then(KamajiSibling::current)
+    else {
+        return;
+    };
+    let mut listed = kamaji.list().await;
+    for _ in 1..REHYDRATE_ATTEMPTS {
+        if listed.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        listed = kamaji.list().await;
+    }
+    let entries = match listed {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                attempts = REHYDRATE_ATTEMPTS,
+                "boot-time appliance-guard rehydration failed (kamaji List): until each live \
+                 appliance is redeployed, a changed-spec deploy of it replaces in place instead \
+                 of answering 409, and drain does not skip it"
+            );
+            return;
+        }
+    };
+    let mut restored = 0usize;
+    for entry in entries {
+        let key = entry
+            .mesh_ident
+            .clone()
+            .unwrap_or_else(|| entry.id.as_str().to_string());
+        let described =
+            tokio::time::timeout(DEPLOY_STATUS_TIMEOUT, kamaji.describe(&entry.id)).await;
+        let spec = match described {
+            Ok(Ok(Some(workload_spec::Workload::Container(manifest)))) => {
+                match manifest.into_spec() {
+                    Ok(spec) => spec,
+                    Err(_) => continue,
+                }
+            }
+            // Bundles and other non-container workloads never enter the guard.
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => {
+                tracing::warn!(ident = %key, error = %e, "appliance-guard rehydration: Describe failed");
+                continue;
+            }
+            // This runs before the listener serves; a kamaji that does not
+            // answer one Describe will not answer the next, and 5s apiece
+            // would hold boot hostage to the size of the node.
+            Err(_) => {
+                tracing::error!(
+                    ident = %key,
+                    restored,
+                    "appliance-guard rehydration stopped: kamaji did not answer Describe; the \
+                     rest of this node's appliances are unguarded until redeployed"
+                );
+                break;
+            }
+        };
+        if let Some(digest) = crate::deploy::appliance::stamped_request_digest(&spec) {
+            state
+                .appliance_spec_digests
+                .lock()
+                .unwrap()
+                .insert(key.clone(), digest);
+        }
+        state
+            .archetype_registry
+            .lock()
+            .unwrap()
+            .insert(key, spec.effective_archetype());
+        restored += 1;
+    }
+    tracing::info!(restored, "rehydrated the appliance guard from kamaji's deployed specs");
+}
+
 async fn live_workload_idents_with_retry(state: &ServerState) -> Result<Vec<String>> {
     let mut backoff = std::time::Duration::from_millis(500);
     let mut last_err = None;
@@ -3644,6 +3746,7 @@ pub async fn serve(addr: &str, state: Arc<ServerState>) -> Result<()> {
     let local = listener.local_addr().ok();
     tracing::info!(addr = ?local, "yah-yubaba listening");
     rehydrate_workload_resources(&state).await;
+    rehydrate_appliance_guard(&state).await;
     tokio::spawn(service_records::run(Arc::clone(&state)));
     tokio::spawn(workload_health::run(Arc::clone(&state)));
     axum::serve(listener, build_router(state))
@@ -3661,6 +3764,7 @@ pub async fn serve_on_listener(
     let local = listener.local_addr().ok();
     tracing::info!(addr = ?local, "yah-yubaba listening (embedded)");
     rehydrate_workload_resources(&state).await;
+    rehydrate_appliance_guard(&state).await;
     // R594-F6: same refresh sweep as `serve`. Spawned here rather than in
     // `build_router` because the router is also built by tests, which want no
     // background task; both real entry points are exactly these two.
@@ -4970,6 +5074,14 @@ struct WorkloadDeployBody {
     /// disagreeing views can never bounce it between them.
     #[serde(default)]
     float_forwarded: bool,
+    /// R966: the caller means to REPLACE a live appliance of this ident on
+    /// this node. Without it a changed-spec deploy of a live appliance is
+    /// R572-F4's 409; with it the handler tears the incumbent down and starts
+    /// this spec under the one deploy lock, proving the named volumes were kept
+    /// (`deploy::appliance::Replacement`). Ignored for anything that is not a
+    /// live appliance here.
+    #[serde(default)]
+    replace: bool,
     /// R876-T18: the caller's own `Authorization` header, never read off the
     /// body. A floater deploy forwarded to its owner lands on an Operator
     /// route there, which a peer token cannot open — so the forward carries
@@ -5305,14 +5417,15 @@ fn bundle_redeploy_is_noop(
     })
 }
 
-/// Digest of a deploy request's spec as POSTed (R931-B7). In-process only —
-/// `DefaultHasher` is not stable across releases, and nothing persists it.
+/// Digest of a deploy request's spec as POSTed (R931-B7): the first 8 bytes
+/// of a SHA-256. R966 persists it on the deployed spec
+/// ([`deploy::appliance::REQUEST_DIGEST_STAMP`]), so it must agree across
+/// releases — which `DefaultHasher`, used until then, does not promise.
 ///
 /// R931-B11: hashed over a key-sorted rendering. `labels` / `annotations` are
 /// `HashMap`s with a per-map random iteration order, so the raw serialization
 /// of two parses of one body differed and no appliance ever read `unchanged`.
 fn request_spec_digest(spec: &workload_spec::WorkloadSpec) -> u64 {
-    use std::hash::{Hash, Hasher};
     fn canonical(v: &serde_json::Value, out: &mut String) {
         match v {
             serde_json::Value::Object(map) => {
@@ -5342,9 +5455,15 @@ fn request_spec_digest(spec: &workload_spec::WorkloadSpec) -> u64 {
     if let Ok(value) = serde_json::to_value(spec) {
         canonical(&value, &mut rendered);
     }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    rendered.hash(&mut hasher);
-    hasher.finish()
+    stable_digest_u64(rendered.as_bytes())
+}
+
+/// The first 8 bytes of `bytes`' SHA-256, big-endian. Stable across builds
+/// and toolchains, which is what lets [`request_spec_digest`] be persisted.
+fn stable_digest_u64(bytes: &[u8]) -> u64 {
+    use sha2::Digest as _;
+    let sha = sha2::Sha256::digest(bytes);
+    u64::from_be_bytes(sha[..8].try_into().expect("a SHA-256 is 32 bytes"))
 }
 
 /// Whether a re-POST of a live appliance is the spec it already runs
@@ -5750,6 +5869,27 @@ enum DeployOrigin {
     Floater,
 }
 
+/// @yah:relay(R966, "A live appliance has no supported image-upgrade path: yubaba 409s every changed-spec deploy, the CLI has no destroy verb, and noisetable had to roll prod by raw POST /workloads/<id>/destroy + deploy --where")
+/// @yah:status(review)
+/// @yah:at(2026-10-10T03:18:27Z)
+/// @yah:assignee(bundle-anthropic-glimmerstone)
+/// @yah:next("EVIDENCE (noisetable R814-T12, 2026-10-09): installed yah 0.8.43 `yah cloud workload` has no destroy verb (only deploy/rolling/status/logs). yubaba 409s any changed-spec deploy of a live appliance ('appliance already live: destroy the existing instance before redeploying', oss/yubaba/crates/yubaba/src/lib.rs:5816-5845), guarded by in-memory archetype_registry/appliance_spec_digests that empty on restart (lib.rs:2213-2214), so whether a roll works depends on whether yubaba happened to restart (it had on 2026-10-08, not on 2026-10-09). After a destroy, plain deploy refused placement ('volume node not inspectable') and needed --where=node:<machine>. The only validate->destroy->deploy implementation is replace_live_inner_door (app/yah/cli/src/cloud.rs:13525-13565).")
+/// @yah:next("ACTUAL ROLL: raw POST http://100.64.0.1:7443/workloads/noisetable-account/destroy then `yah cloud workload deploy noisetable-account --where=node:us-west-001`; ~31s outage (25 non-200 probe samples at 1/s, 000 then 503) of a prod service with a durable /data volume. Volume sha256 list was identical before/after, verified by hand against a manual backup; nothing in the tooling asserts that.")
+/// @yah:next("SUGGESTED SHAPE: generalize replace_live_inner_door into `yah cloud workload deploy --replace` for appliances: validate the new spec, destroy the live instance, redeploy on the volume's node (no manual --where), and ASSERT volume preservation (hash or mount-identity check) before and after, restoring/aborting if it differs. Also decide whether the in-memory digest guard should persist so the 409 is deterministic across yubaba restarts. Leave the assignee empty; the operator staffs new relays.")
+/// @yah:handoff("LANDED (tree anchor abb379b5 + uncommitted R966 hunks). NODE-SIDE REPLACE: POST /workloads/deploy takes `replace: true`. On a live Appliance the guard no longer 409s; it reads the incumbent spec from kamaji (live_container_spec), refuses up front (409, nothing torn down) if the replacement drops/moves/renames any named volume or a volume dir under /var/lib/yah/kamaji/volumes cannot be identified (deploy/appliance.rs Replacement::plan). Teardown runs LATE, right before rt.deploy_workload, under the same R880 deploy lock (teardown_for_replace): every netns/secret/mesh-env refusal leaves the incumbent serving. Between teardown and start it re-checks each volume dir's dev+ino (abort, nothing started, if changed) and records a quiesced metadata manifest; after start it re-checks dev+ino and returns `replaced: {preserved, volumes[]}`. Replacement failing after teardown forgets the ident like a destroy (forget_live_workload) and says NOTHING is running.")
+/// @yah:handoff("DETERMINISTIC GUARD: request digest is now a SHA-256 prefix (stable_digest_u64) stamped on the spec kamaji supervises as annotation yah.deploy.request-digest; rehydrate_appliance_guard rebuilds archetype_registry + appliance_spec_digests from kamaji List+Describe at boot in both serve entry points (bounded: stops at first Describe timeout). Root fix underneath: LifecycleArchetype::infer (oss/yah-base workload-spec) ignores from_secret_mount binds, so a deployed spec reports its authored archetype (R854's trap) — also means drain skips appliances after a restart again.")
+/// @yah:handoff("CLI: `yah cloud workload deploy <name> --replace` (pins to the volume's live node via the existing R931-B10 discovery, requires node validate, fails non-zero unless the node proves every volume kept); new `yah cloud workload destroy <name> [--where=node:X] [--yes]` (saves rollback record, never deletes volumes); plain-deploy 409 now names --replace; `rolling` refuses an appliance with named volumes and points at deploy --replace; inner door sends replace:true and replace_live_inner_door (CLI-side validate/destroy/deploy) is DELETED.")
+/// @yah:handoff("DISCOVERED + FIXED IN PASS: destroy handler's bookkeeping + cheers revoke extracted into forget_live_workload / revoke_ownership_row (oss/yubaba/crates/yubaba/src/lib.rs) so replace and destroy clear identical state; WorkloadDeployRequest gained `replace` (18 literal sites updated across app/yah/cli, crates/yah/agent-tools, cloud-client tests); WorkloadDeployResponse gained typed `replaced` + `unchanged`.")
+/// @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib -> 1084 passed / 0 failed, EXIT=0 (includes 8 new deploy::appliance tests, a_replace_that_cannot_read_the_incumbent_is_refused_and_tears_nothing_down, the_request_digest_hash_is_a_pinned_sha256_prefix, all destroy_* tests over the refactor). Re-ran the R966 subset after the last lib.rs edit: 106/0.")
+/// @yah:verify("cargo test --manifest-path oss/yah-base/Cargo.toml -p yah-workload-spec -> 214 + 108 / 0 (new a_materialized_secret_bind_does_not_make_a_workload_an_appliance).")
+/// @yah:verify("cargo test -p cloud-client -> 59/0. cargo check -p yah -p yah-agent-tools --tests -> EXIT=0. cargo test -p yah --lib (cloud filters) -> 43/0 incl. a_live_appliance_409_*, a_replace_succeeds_only_when_the_node_proved_every_volume_kept, the_replace_report_parses_from_yubabas_response_shape.")
+/// @yah:verify("NOT VERIFIED LIVE (needs a fleet ship): (1) restart yubaba on a node with a live appliance, POST a changed spec without replace -> expect 409 both before and after the restart; (2) `yah cloud workload deploy noisetable-account --replace` -> expect `replaced ... every named volume kept`, outage = kamaji stop+start only; (3) needs a desktop build + relaunch / yah-install for the CLI to reach live binaries.")
+/// @yah:gotcha("SHIP ORDER: yubaba BEFORE the CLI. The new CLI's inner door (mirror up) sends replace:true; a pre-R966 yubaba ignores the field and 409s a CHANGED door, and the CLI now bails 'node predates replace — roll yubaba first' instead of the old CLI-side destroy+deploy. No shim kept, by design (CLAUDE.md break-it-don't-tape-it).")
+/// @yah:gotcha("ONE-TIME 409s AFTER THE ROLL: digests switched from DefaultHasher to SHA-256 and live workloads carry no stamp yet, so the first identical re-POST of each live appliance after the roll is not recognised as unchanged. Plain deploy: 409 (safe). Inner door: one in-place replace per door (~seconds), then stamped and stable.")
+/// @yah:gotcha("A digest still changes whenever WorkloadSpec gains a serialized field (it hashes the parsed-and-reserialized spec), so the 'unchanged' fast path resets once per such release. Safe direction; noted, not fixed.")
+/// @yah:gotcha("The volume check is device+inode of /var/lib/yah/kamaji/volumes/<name> (containerd backend + kamaji hydrate's root, pinned by the_volume_root_is_kamajis). A docker-backed node stores named volumes elsewhere, so replace REFUSES there ('cannot be identified') — use destroy + deploy deliberately.")
+/// @yah:gotcha("The quiesced manifest is METADATA (path/kind/size/mtime), recorded not compared: content hashing would lengthen the outage, and a post-start comparison would false-alarm on the replacement's own writes.")
+/// @yah:cleanup("R959-T5 deletes .yah/infra/workloads and its disk reader. R966's uncommitted WorkloadCommands::Destroy doc comment in app/yah/cli/src/cloud.rs still names `.yah/infra/workloads/<name>.toml`. Reword it to the lowered source: `.yah/services/<svc>` [components.workload] + `mirrors/<env>.toml` [workload.<component>]. Left untouched by T5 because it is R966's hunk.")
 async fn deploy_workload_spec_as(
     s: Arc<ServerState>,
     req: WorkloadDeployBody,
@@ -5809,10 +5949,31 @@ async fn deploy_workload_spec_as(
             .into_response();
     };
 
+    // R966: set when this request replaces the live appliance. The teardown it
+    // licenses runs LATE — just before the backend deploy, below — so every
+    // refusal between here and there (netns, secrets, mesh env) leaves the
+    // incumbent serving, and the outage is the backend's stop + start alone.
+    let mut replacing: Option<crate::deploy::appliance::Replacement> = None;
+
+    // R876-B20: before anything is torn down or handed to kamaji, so a refused
+    // table leaves the live door and its routes file untouched.
+    if let Some(error) = inner_door_schema_refusal(&spec).await {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "status": "rejected",
+                "ident": ident,
+                "error": error,
+            })),
+        )
+            .into_response();
+    }
+
     // R572-F4: reject a second deploy of the same appliance ident while the
     // first is still live.  Servers are freely re-deployable (rolling update);
     // appliances carry per-ident state (pinned volume, single-instance
-    // invariant from W244 §Schema gaps #1) — the caller must destroy first.
+    // invariant from W244 §Schema gaps #1) — the caller must destroy first, or
+    // ask for a replace (R966).
     if s.archetype_registry.lock().unwrap().get(&ident).copied()
         == Some(LifecycleArchetype::Appliance)
     {
@@ -5834,15 +5995,46 @@ async fn deploy_workload_spec_as(
             )
                 .into_response();
         }
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "status": "rejected",
-                "ident": ident,
-                "error": "appliance already live: destroy the existing instance before redeploying",
-            })),
-        )
-            .into_response();
+        if !req.replace {
+            // `appliance already live` is matched by the CLI
+            // (`is_live_appliance_conflict`); keep the phrase.
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "status": "rejected",
+                    "ident": ident,
+                    "error": "appliance already live: destroy the existing instance before \
+                              redeploying, or replace it in one step (`replace: true`; \
+                              `yah cloud workload deploy <name> --replace`)",
+                })),
+            )
+                .into_response();
+        }
+        let planned = match live_container_spec(&s, &ident).await {
+            Ok(incumbent) => crate::deploy::appliance::Replacement::plan(
+                &incumbent,
+                &spec,
+                std::path::Path::new(crate::deploy::appliance::KAMAJI_VOLUME_ROOT),
+            ),
+            Err(why) => Err(format!(
+                "refusing to replace the live appliance: its spec cannot be read ({why}), so \
+                 nothing can prove the replacement keeps its volumes. Nothing was torn down."
+            )),
+        };
+        match planned {
+            Ok(plan) => replacing = Some(plan),
+            Err(refusal) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "status": "rejected",
+                        "ident": ident,
+                        "error": refusal,
+                    })),
+                )
+                    .into_response();
+            }
+        }
     }
 
     // R406-T9: route deploy through Kamaji (the W154 supervision backend)
@@ -6142,6 +6334,7 @@ async fn deploy_workload_spec_as(
                     on_behalf_of_user: req.on_behalf_of_user.clone(),
                     id: None,
                     float_forwarded: false,
+                    replace: false,
                     forward_auth: req.forward_auth.clone(),
                 },
                 Err(e) => {
@@ -6274,7 +6467,21 @@ async fn deploy_workload_spec_as(
             }
         }
 
-        match rt.deploy_workload(&spec, &mesh).await {
+        // R966: the guard's memory rides on the spec kamaji supervises, so a
+        // restarted yubaba reads it back (`rehydrate_appliance_guard`).
+        crate::deploy::appliance::stamp_request_digest(&mut spec, request_digest);
+
+        // R966: everything that can refuse this spec has accepted it; only now
+        // does the incumbent come down.
+        let deployed = match replacing.as_mut() {
+            Some(plan) => match teardown_for_replace(&s, &rt, &ident, &mesh_ident, plan).await {
+                Ok(()) => rt.deploy_workload(&spec, &mesh).await,
+                Err(e) => Err(e),
+            },
+            None => rt.deploy_workload(&spec, &mesh).await,
+        };
+
+        match deployed {
             Ok(result) => {
                 // Public ingress (R780): yubaba's own deploy handler has no
                 // mechanism to register a Cloudflare Tunnel route for a
@@ -6444,6 +6651,20 @@ async fn deploy_workload_spec_as(
                 if let Some(line) = &result.hydrate {
                     resp_json["hydrate"] = serde_json::Value::String(line.clone());
                 }
+                // R966: the volume evidence. The CLI fails the replace on
+                // `preserved: false` rather than reading `deployed` as success.
+                if let Some(plan) = replacing.as_mut() {
+                    plan.verify_started();
+                    if !plan.preserved() {
+                        tracing::error!(
+                            ident = %ident,
+                            report = %plan.report(),
+                            "replaced appliance is running, but a named volume is not the \
+                             directory the incumbent held"
+                        );
+                    }
+                    resp_json["replaced"] = plan.report();
+                }
                 if let Some(key) = preauthkey {
                     resp_json["preauthkey"] = serde_json::Value::String(key);
                     resp_json["operator_mode"] = serde_json::Value::String(operator_mode.into());
@@ -6544,6 +6765,28 @@ async fn deploy_workload_spec_as(
                 // R860-T6: the requirer never started; its carried providers
                 // exist only to serve it.
                 rollback_self_supplied(&s, &ident, &provisioned).await;
+                // R966: the incumbent is gone, so nothing under this ident is
+                // running: forget it the way a destroy does, or the next deploy
+                // meets a single-instance guard protecting nothing.
+                if let Some(plan) = replacing.as_ref().filter(|p| p.torn_down) {
+                    for provider in forget_live_workload(&s, &ident, &mesh_ident) {
+                        let _ = destroy_workload_boxed(Arc::clone(&s), provider).await;
+                    }
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "status": "error",
+                            "ident": ident,
+                            "error": format!(
+                                "{e:#} — the live instance was torn down for this replace and \
+                                 NOTHING is running under {ident} now; `replaced` holds each \
+                                 volume's evidence"
+                            ),
+                            "replaced": plan.report(),
+                        })),
+                    )
+                        .into_response();
+                }
                 // Reap any secret files materialized before the failed deploy so
                 // decrypted PEM doesn't linger for a workload that never started.
                 //
@@ -6786,6 +7029,25 @@ fn check_deploy_body(spec_json: serde_json::Value) -> SpecCheck {
 /// kamaji's own preflight (`kamaji_containerd_core::check_bind_sources`, run
 /// before it tears the incumbent down), so the class is covered; it is just not
 /// covered *here*, and a `validated` answer does not promise it.
+/// R876-B20: refuse an inner-door spec whose route table names a schema this
+/// node's installed passway cannot read. Refusing at admission means kamaji is
+/// never handed the spec, so the routes file already on disk — the one the
+/// running door serves — is left exactly as it was. The probe of the binary is
+/// cached per path+mtime+size (see [`inner_door_schema::PasswaySchemaProbe`]).
+async fn inner_door_schema_refusal(spec: &workload_spec::WorkloadSpec) -> Option<String> {
+    static PROBE: std::sync::LazyLock<inner_door_schema::PasswaySchemaProbe> =
+        std::sync::LazyLock::new(Default::default);
+    let spec = spec.clone();
+    let refusal = tokio::task::spawn_blocking(move || {
+        inner_door_schema::refusal(&spec, |bin| PROBE.readable(bin))
+    })
+    .await
+    .ok()
+    .flatten()?;
+    tracing::error!(error = %refusal, "R876-B20: inner-door route schema refused");
+    Some(refusal)
+}
+
 fn missing_bind_volume_sources(spec: &workload_spec::WorkloadSpec) -> Option<String> {
     let missing: Vec<String> = spec
         .volumes
@@ -6827,7 +7089,11 @@ async fn validate_workload_spec(
             // `noisetable-account` down on 2026-09-22: its bind source was
             // missing on the node, and nothing here had ever looked at the
             // node.
-            if let Some(error) = missing_bind_volume_sources(&spec) {
+            let refusal = match missing_bind_volume_sources(&spec) {
+                Some(error) => Some(error),
+                None => inner_door_schema_refusal(&spec).await,
+            };
+            if let Some(error) = refusal {
                 return (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(serde_json::json!({
@@ -7010,40 +7276,7 @@ async fn destroy_workload_as(
         }
     }
 
-    // R600-F6 (W273): reap the workload's materialized-secret tmpfs dir so
-    // decrypted PEM does not outlive the container. Idempotent — a no-op when
-    // the workload had no File secrets.
-    crate::deploy::secret_mount::teardown_secret_dir(&s.secret_mount_root, &ident);
-    // R876-B16: reap the bundle/revalidate-receiver's native File secrets the
-    // same way — no-op when this ident never materialized any.
-    crate::deploy::secret_mount::teardown_native_secret_files(&s.secret_mount_root, &ident);
-    // R600-F4: stop tracking it for cert-rotation reload (no-op if unregistered).
-    s.secret_workloads.lock().unwrap().remove(&ident);
-    // R572-F4: clear the archetype so a fresh deploy of the same ident is accepted.
-    s.archetype_registry.lock().unwrap().remove(&ident);
-    s.appliance_spec_digests.lock().unwrap().remove(&ident);
-    // R860-T6 (W338 §"Placement consequences" 4): take this workload's
-    // requirement edges out of the graph. Removed BEFORE the cascade below runs,
-    // so a graph that somehow described a cycle closes instead of recursing
-    // forever, and so a concurrent destroy of the same ident cannot cascade
-    // twice.
-    let cascade = s
-        .requirement_graph
-        .lock()
-        .unwrap()
-        .remove(&ident)
-        .map(|deployed| deployed.self_supplied)
-        .unwrap_or_default();
-    // Release its committed capacity — a destroyed workload must stop
-    // counting against `yah.committed.*` or the node slowly reports itself
-    // full while sitting idle.
-    s.workload_resources.lock().unwrap().remove(&ident);
-    // R594-F6: stop advertising it as an ingress upstream, and drop it from
-    // the port ledger so it does not come back on the next boot. Retract
-    // rather than delete: the record stays queryable as `Retracted` for
-    // diagnostics, and `is_ready()` — the only thing a proxy routes on — is
-    // already false. No-op when the ident was never a serving workload.
-    s.service_records.retract(&mesh_ident);
+    let cascade = forget_live_workload(&s, &ident, &mesh_ident);
 
     // R860-T6 / W338 §"Placement consequences" 4: **teardown cascades along
     // `self` edges and never along `wait` edges.**
@@ -7072,51 +7305,24 @@ async fn destroy_workload_as(
     }
 
     // Revoke the cheers ownership row (if registered).
-    let row_id = s.ownership_rows.lock().unwrap().remove(&ident);
-    let mut revoked = false;
-    if let (Some(cheers), Some(row_id)) = (&s.cheers_client, row_id.as_ref()) {
-        match cheers.revoke_ownership(row_id).await {
-            Ok(()) => {
-                revoked = true;
-                tracing::info!(
-                    ident = %ident,
-                    row_id = %row_id,
-                    "cheers ownership row revoked"
-                );
-            }
-            Err(cheers_client::CheersError::Status { status, .. })
-                if status == StatusCode::NOT_FOUND =>
-            {
-                tracing::info!(
-                    ident = %ident,
-                    row_id = %row_id,
-                    "cheers ownership row already gone (idempotent destroy)"
-                );
-            }
-            Err(e) => {
-                // Workload is already torn down; surface revoke failure to
-                // the caller so the row can be reconciled out-of-band, but
-                // don't error the whole destroy — the on-host state is
-                // already consistent.
-                tracing::warn!(
-                    ident = %ident,
-                    row_id = %row_id,
-                    error = %e,
-                    "cheers ownership revoke failed after teardown; row may need reconciler"
-                );
-                return (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "status": teardown_status,
-                        "ident": ident,
-                        "revoked": false,
-                        "revoke_error": e.to_string(),
-                    })),
-                )
-                    .into_response();
-            }
+    let revoked = match revoke_ownership_row(&s, &ident).await {
+        Ok(revoked) => revoked,
+        Err(revoke_error) => {
+            // Workload is already torn down; surface revoke failure to the
+            // caller so the row can be reconciled out-of-band, but don't error
+            // the whole destroy — the on-host state is already consistent.
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": teardown_status,
+                    "ident": ident,
+                    "revoked": false,
+                    "revoke_error": revoke_error,
+                })),
+            )
+                .into_response();
         }
-    }
+    };
 
     // R603-T5: reap the run's durable produced dir now that it's torn down. The
     // consumer retrieves the artifact (GET /produced) before destroy, so by here
@@ -7155,6 +7361,158 @@ async fn destroy_workload_as(
         body["teardown_note"] = serde_json::Value::String(err);
     }
     (StatusCode::OK, Json(body)).into_response()
+}
+
+/// Forget a workload that is no longer running on this node: its secret
+/// files, every in-memory registry keyed on it, its committed capacity, its
+/// service record. Shared by destroy and by a replace whose replacement failed
+/// after the incumbent came down (R966). Returns the self-supplied providers it
+/// carried, for the caller to cascade into.
+fn forget_live_workload(
+    s: &ServerState,
+    ident: &str,
+    mesh_ident: &workload_spec::MeshIdent,
+) -> Vec<String> {
+    // R600-F6 (W273): reap the workload's materialized-secret tmpfs dir so
+    // decrypted PEM does not outlive the container. Idempotent — a no-op when
+    // the workload had no File secrets.
+    crate::deploy::secret_mount::teardown_secret_dir(&s.secret_mount_root, ident);
+    // R876-B16: reap the bundle/revalidate-receiver's native File secrets the
+    // same way — no-op when this ident never materialized any.
+    crate::deploy::secret_mount::teardown_native_secret_files(&s.secret_mount_root, ident);
+    // R600-F4: stop tracking it for cert-rotation reload (no-op if unregistered).
+    s.secret_workloads.lock().unwrap().remove(ident);
+    // R572-F4: clear the archetype so a fresh deploy of the same ident is accepted.
+    s.archetype_registry.lock().unwrap().remove(ident);
+    s.appliance_spec_digests.lock().unwrap().remove(ident);
+    // R860-T6 (W338 §"Placement consequences" 4): take this workload's
+    // requirement edges out of the graph. Removed BEFORE the caller's cascade
+    // runs, so a graph that somehow described a cycle closes instead of
+    // recursing forever, and so a concurrent destroy of the same ident cannot
+    // cascade twice.
+    let cascade = s
+        .requirement_graph
+        .lock()
+        .unwrap()
+        .remove(ident)
+        .map(|deployed| deployed.self_supplied)
+        .unwrap_or_default();
+    // Release its committed capacity — a destroyed workload must stop
+    // counting against `yah.committed.*` or the node slowly reports itself
+    // full while sitting idle.
+    s.workload_resources.lock().unwrap().remove(ident);
+    // R594-F6: stop advertising it as an ingress upstream, and drop it from
+    // the port ledger so it does not come back on the next boot. Retract
+    // rather than delete: the record stays queryable as `Retracted` for
+    // diagnostics, and `is_ready()` — the only thing a proxy routes on — is
+    // already false. No-op when the ident was never a serving workload.
+    s.service_records.retract(mesh_ident);
+    cascade
+}
+
+/// Revoke the cheers ownership row registered for `ident`, if any (R427-F1).
+/// `Ok(true)` revoked it, `Ok(false)` there was none (or cheers already had
+/// none — 404 is idempotent success), `Err` names a revoke that failed.
+async fn revoke_ownership_row(s: &ServerState, ident: &str) -> Result<bool, String> {
+    let row_id = s.ownership_rows.lock().unwrap().remove(ident);
+    let (Some(cheers), Some(row_id)) = (&s.cheers_client, row_id.as_ref()) else {
+        return Ok(false);
+    };
+    match cheers.revoke_ownership(row_id).await {
+        Ok(()) => {
+            tracing::info!(ident = %ident, row_id = %row_id, "cheers ownership row revoked");
+            Ok(true)
+        }
+        Err(cheers_client::CheersError::Status { status, .. }) if status == StatusCode::NOT_FOUND => {
+            tracing::info!(
+                ident = %ident,
+                row_id = %row_id,
+                "cheers ownership row already gone (idempotent destroy)"
+            );
+            Ok(false)
+        }
+        Err(e) => {
+            tracing::warn!(
+                ident = %ident,
+                row_id = %row_id,
+                error = %e,
+                "cheers ownership revoke failed after teardown; row may need reconciler"
+            );
+            Err(e.to_string())
+        }
+    }
+}
+
+/// The spec kamaji is supervising under mesh ident `ident` — what a replace
+/// compares the replacement against (R966). `Err` names why it is unreadable.
+async fn live_container_spec(
+    s: &ServerState,
+    ident: &str,
+) -> Result<workload_spec::WorkloadSpec, String> {
+    let kamaji = s
+        .constable_client
+        .as_ref()
+        .and_then(KamajiSibling::current)
+        .ok_or_else(|| "no kamaji sibling is attached".to_string())?;
+    let live = kamaji.list().await.map_err(|e| format!("kamaji List: {e}"))?;
+    let entry = live
+        .iter()
+        .find(|e| e.id.0 == ident || e.mesh_ident.as_deref() == Some(ident))
+        .ok_or_else(|| format!("kamaji is not supervising {ident}"))?;
+    let described = tokio::time::timeout(DEPLOY_STATUS_TIMEOUT, kamaji.describe(&entry.id))
+        .await
+        .map_err(|_| format!("kamaji did not answer Describe for {ident}"))?
+        .map_err(|e| format!("kamaji Describe: {e}"))?;
+    match described {
+        Some(workload_spec::Workload::Container(manifest)) => manifest
+            .into_spec()
+            .map_err(|_| format!("{ident} is supervised as a build recipe, not a spec")),
+        Some(_) => Err(format!("{ident} is not a container workload")),
+        None => Err(format!("kamaji holds no spec for {ident}")),
+    }
+}
+
+/// Take down the live appliance a `replace: true` deploy is replacing, then
+/// prove its named volumes are still the directories they were (R966). Runs
+/// under the handler's deploy lock, after every check that can refuse the
+/// replacement has passed.
+///
+/// A destroy minus what the replacement still needs: the per-ident secret dir
+/// (the replacement just materialized into it), the self-supplied providers
+/// (still live — the deploy skipped re-standing them because they are) and the
+/// registries (overwritten on success; the failure arm forgets them). The
+/// cheers row IS revoked — the replacement registers its own.
+///
+/// `plan.torn_down` is set the moment the incumbent is gone; an `Err` after
+/// that means nothing is running under `ident`.
+async fn teardown_for_replace(
+    s: &Arc<ServerState>,
+    rt: &Arc<dyn ContainerRuntime + Send + Sync>,
+    ident: &str,
+    mesh_ident: &workload_spec::MeshIdent,
+    plan: &mut crate::deploy::appliance::Replacement,
+) -> anyhow::Result<()> {
+    if let Err(e) = rt.teardown_workload(mesh_ident).await {
+        let msg = e.to_string();
+        if !msg.to_lowercase().contains("not found") {
+            return Err(e.context(format!(
+                "replace: tearing down the live {ident} failed, so the replacement was not \
+                 started — the incumbent may still be running"
+            )));
+        }
+        tracing::warn!(ident = %ident, error = %msg, "replace: incumbent was already gone");
+    }
+    plan.torn_down = true;
+    if let Err(e) = revoke_ownership_row(s, ident).await {
+        tracing::warn!(
+            ident = %ident,
+            error = %e,
+            "replace: the incumbent's cheers row was not revoked; the reconciler owns it now"
+        );
+    }
+    plan.verify_quiesced().map_err(anyhow::Error::msg)?;
+    tracing::info!(ident = %ident, volumes = %plan.report(), "replace: incumbent down, volumes kept");
+    Ok(())
 }
 
 /// `GET /workloads/{ident}/logs` — stream logs for a workload.
@@ -14709,6 +15067,55 @@ mod tests {
             "error should mention 'appliance already live', got: {}",
             b["error"]
         );
+        assert!(
+            b["error"].as_str().unwrap().contains("--replace"),
+            "R966: the refusal names the verb that replaces, got: {}",
+            b["error"]
+        );
+    }
+
+    /// R966: `replace: true` must earn its teardown. With no kamaji to read the
+    /// incumbent's spec from, nothing can prove the replacement keeps its
+    /// volumes — refused, and the live appliance is still registered.
+    #[tokio::test]
+    async fn a_replace_that_cannot_read_the_incumbent_is_refused_and_tears_nothing_down() {
+        let (_tmp, state) = fresh_state();
+        state
+            .archetype_registry
+            .lock()
+            .unwrap()
+            .insert("my-appliance".into(), LifecycleArchetype::Appliance);
+
+        let app = build_router(Arc::clone(&state));
+        let mut body = appliance_spec("my-appliance");
+        body["replace"] = serde_json::json!(true);
+        let resp = app
+            .oneshot(
+                Request::post("/workloads/deploy")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let b = body_json(resp).await;
+        let error = b["error"].as_str().unwrap();
+        assert!(error.contains("cannot be read"), "{error}");
+        assert!(error.contains("Nothing was torn down"), "{error}");
+        assert_eq!(
+            state.archetype_registry.lock().unwrap().get("my-appliance").copied(),
+            Some(LifecycleArchetype::Appliance),
+            "a refused replace leaves the live appliance registered"
+        );
+    }
+
+    /// R966: the request digest is persisted on the deployed spec, so the hash
+    /// under it must be the same function in every build — a SHA-256 prefix,
+    /// not `DefaultHasher`. Pinned with SHA-256("")'s known first 8 bytes.
+    #[test]
+    fn the_request_digest_hash_is_a_pinned_sha256_prefix() {
+        assert_eq!(stable_digest_u64(b""), 0xe3b0_c442_98fc_1c14);
     }
 
     // ── R860-B3: the deploy handler REACHES the dependency gate ──────────────

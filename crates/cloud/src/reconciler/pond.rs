@@ -1495,6 +1495,13 @@ pub fn read_warden_pond_port(workspace_root: &std::path::Path) -> Result<u16> {
     Ok(port)
 }
 
+/// R876-T23: the operator signer for camp-pond calls — the same key file as
+/// every CloudClient. The camp spawns its pond trusting that key's public
+/// half (`YUBABA_OPERATOR_KEYS`), so these sign rather than stay an exception.
+fn pond_signer() -> Result<yubaba_auth_token::OperatorSigner> {
+    yubaba_auth_token::default_operator_signer().map_err(|e| anyhow::anyhow!(e))
+}
+
 /// `GET http://127.0.0.1:{port}/pond/state?ident=...`. Returns `Ok(None)`
 /// when yubaba replies 404 (no registration for that ident — clear "pond
 /// not running" signal). Bails on connection errors / non-404 non-2xx.
@@ -1504,8 +1511,8 @@ pub async fn query_warden_pond_state(port: u16, ident: &str) -> Result<Option<Ad
         .build()
         .context("building reqwest client for yubaba status query")?;
     let url = format!("http://127.0.0.1:{port}/pond/state");
-    let resp = client
-        .get(&url)
+    let resp = pond_signer()?
+        .sign(client.get(&url))
         .query(&[("ident", ident)])
         .send()
         .await
@@ -1552,8 +1559,8 @@ pub async fn teardown_warden_pond(port: u16, ident: &str) -> Result<bool> {
         .build()
         .context("building reqwest client for yubaba teardown")?;
     let url = format!("http://127.0.0.1:{port}/pond/teardown");
-    let resp = client
-        .post(&url)
+    let resp = pond_signer()?
+        .sign(client.post(&url))
         .json(&serde_json::json!({ "ident": ident }))
         .send()
         .await
@@ -1582,8 +1589,8 @@ pub async fn query_warden_pond_list(port: u16) -> Result<Vec<AdoptPondRecord>> {
         .build()
         .context("building reqwest client for yubaba list query")?;
     let url = format!("http://127.0.0.1:{port}/pond");
-    let resp = client
-        .get(&url)
+    let resp = pond_signer()?
+        .sign(client.get(&url))
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;

@@ -227,12 +227,12 @@ pub async fn up_pg_driver(
     let Some(port) = wait_for_coords(&coords, timeout).await else {
         warn!(timeout = ?timeout, "yah-pg-dev did not publish coords; tearing down");
         runtime.teardown_workload(&ident).await.ok();
-        let (_out, err) = super::native_support::capture_paths(&state_dir, &ident_str);
-        anyhow::bail!(
-            "the dev-tier pg driver did not become ready within {timeout:?} — \
-             check {} for why",
-            err.display(),
-        );
+        anyhow::bail!(super::native_support::ready_timeout_message(
+            "pg",
+            timeout,
+            &state_dir,
+            &ident_str,
+        ));
     };
 
     info!(

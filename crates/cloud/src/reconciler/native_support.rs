@@ -133,6 +133,35 @@ pub(crate) fn capture_paths(state_dir: &std::path::Path, ident: &str) -> (PathBu
 
 
 
+/// The last `n` lines of a capture file, or a note that there are none.
+pub(crate) fn tail_lines(path: &std::path::Path, n: usize) -> String {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return "(no output captured)".to_string();
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return "(no output captured)".to_string();
+    }
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// The one ready-timeout message for every dev-tier native driver (R967-B1):
+/// what timed out, and the tail of the driver's stderr, which is where a bind
+/// failure or a missing binary actually says so.
+pub(crate) fn ready_timeout_message(
+    what: &str,
+    timeout: Duration,
+    state_dir: &std::path::Path,
+    ident: &str,
+) -> String {
+    let (_out, err) = capture_paths(state_dir, ident);
+    format!(
+        "the dev-tier {what} driver did not become ready within {timeout:?}; last lines of {}:\n{}",
+        err.display(),
+        tail_lines(&err, 20),
+    )
+}
+
 /// Supervisor task for a kamaji-native workload.
 ///
 /// NativeRuntime captures stdout/stderr to files with no follow, but the
@@ -277,6 +306,21 @@ mod tests {
         let buf = LogBuffer::new();
         FileTail::new(path).drain_into(&buf).await;
         assert_eq!(buf.since(0).await.0, vec!["first line".to_string()]);
+    }
+
+    #[test]
+    fn the_ready_timeout_message_quotes_the_stderr_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_out, err) = capture_paths(dir.path(), "drv");
+        std::fs::create_dir_all(err.parent().unwrap()).unwrap();
+        let body: String = (0..30).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&err, body + "Error: Address already in use (os error 48)\n").unwrap();
+        let msg = ready_timeout_message("s3", Duration::from_secs(5), dir.path(), "drv");
+        assert!(msg.contains("did not become ready within"), "{msg}");
+        assert!(msg.contains("Address already in use"), "{msg}");
+        assert!(msg.contains("line 29") && !msg.contains("line 5\n"), "{msg}");
+        let none = ready_timeout_message("s3", Duration::from_secs(5), dir.path(), "absent");
+        assert!(none.contains("no output captured"), "{none}");
     }
 
     #[test]

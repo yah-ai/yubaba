@@ -1418,7 +1418,7 @@ mod tests {
 
     /// Fixtures go through `CloudConfig::load`, never a struct literal, for the
     /// reason `migrate`'s own fixture records: a hand-built spec can express a
-    /// shape no operator could write, and `load_workloads` shape-validates —
+    /// shape no operator could write, and lowering shape-validates —
     /// which since R850-P4 includes the durability declaration. A test that
     /// skips the loader would pass on a spec the fleet would reject.
     struct Camp {
@@ -1487,11 +1487,10 @@ mod tests {
         }
 
         fn workload_sized(self, name: &str, memory_mb: u32, cpu_millis: u32, extra: &str) -> Self {
-            let dir = self.root().join(".yah/infra/workloads");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join(format!("{name}.toml")),
-                format!(
+            crate::lower::fixture::write_workload(
+                self.root(),
+                name,
+                &format!(
                     "schema_version = 1\nname = \"{name}\"\ntier = \"infra\"\n\
                      restart_policy = \"always\"\n\
                      {extra}\n\
@@ -1501,8 +1500,7 @@ mod tests {
                      [stop_policy]\nsignal = 15\ngrace_period = 10000\n\
                      [expose.mesh]\nidentity = \"{name}\"\nports = [8080]\nallow_from = []\n"
                 ),
-            )
-            .unwrap();
+            );
             self
         }
 

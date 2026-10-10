@@ -63,6 +63,7 @@
 //! @yah:handoff("Tree anchor at handoff: 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2 — the shared tree as I left it. Diff against it (`git diff 0a85122cdb33dbf97ebc04b84e07d9cfc049c0b2..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
 //! @yah:verify("RE-VERIFIED AT HEAD 00ee20d1 (session:aa5e882d, 2026-09-05). oss/yubaba/crates/yubaba/src/deploy/self_supply.rs present (12,317 bytes); `requirement_graph` / `gated_idents` resolve across lib.rs, deploy/mesh_resolve.rs and deploy/mod.rs. `cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib` = 731 passed / 0 failed, exit 0.")
 
+pub mod appliance;
 pub mod mesh_resolve;
 pub mod secret_mount;
 pub mod self_supply;

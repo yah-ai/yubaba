@@ -42,6 +42,11 @@
 //! `S3_BUCKET` the camp has injected since R274-F5, so nothing downstream
 //! changes. They are created before `coords.json` is published, making the
 //! coords file mean "you can PUT now" rather than "the port is open".
+//!
+//! @yah:relay(R967, "Dev-tier native drivers survive a camp restart as orphans and wedge every later bring-up")
+//! @yah:at(2026-10-10T03:24:56Z)
+//! @yah:next("Umbrella for defects in the kamaji-native dev driver family (yah-s3-fs, yah-smtp-dev, yah-pg-dev) found from the noisetable camp. The shared shape: native_support::native_spec drivers are children of the camp process in practice, kamaji's native backend has no cross-restart adoption, and ports.json remembers the port per workload name — so a driver that outlives its camp holds the exact port the next bring-up is handed. Fix once in native_support / the native backend, not per driver.")
+//! @yah:next("Acceptance: with a stale driver listening on the remembered port, the next camp boot either adopts it (coords republished) or replaces it (SIGTERM, then bind), and the failure message when neither is possible names the pid and port instead of telling an operator to start a camp that is already running.")
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -189,6 +194,20 @@ pub fn coords_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join(".yah/infra/state/dev/s3/coords.json")
 }
 
+/// Why the last bring-up failed, written beside `coords.json` (R967-B1).
+/// Cleared at the start of every bring-up, so its presence means the most
+/// recent attempt failed.
+pub fn bringup_error_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(".yah/infra/state/dev/s3/bringup-error")
+}
+
+/// The recorded failure of the last bring-up, if there is one.
+pub fn recorded_bringup_error(workspace_root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(bringup_error_path(workspace_root)).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// Where the camp's running S3 driver can be reached, read out of the
 /// `coords.json` it publishes at bring-up.
 ///
@@ -206,7 +225,52 @@ pub fn running_endpoint(workspace_root: &Path) -> Option<String> {
 
 /// Deploy `yah-s3-fs` on a kamaji [`NativeRuntime`] and wait for it to publish
 /// coordinates.
+///
+/// @yah:ticket(R967-B1, "Orphaned yah-s3-fs holds the remembered port; bring-up retracts coords.json then fails to bind, so every dev mirror up reports \"the dev-tier s3 driver is not running\" forever")
+/// @yah:status(review)
+/// @yah:assignee(agent:bundle-anthropic-miravel)
+/// @yah:at(2026-10-10T03:41:21Z)
+/// @yah:parent(R967)
+/// @yah:severity(high)
+/// @yah:next("Tier: Warrior. MEASURED 2026-10-09 in the noisetable camp (/Users/leif/ss/noisetable). A `yah-s3-fs serve --workspace /Users/leif/ss/noisetable --bucket noisetable-api --bucket noisetable-desktop --bucket noisetable-marketing` process (pid 80519, ppid 1, started Oct 6 23:28:31) outlived the camp daemon that spawned it. On the next camp boot, up_s3_driver deleted .yah/infra/state/dev/s3/coords.json (line ~233), kamaji's native backend spawned a fresh driver with PORT_S3=49786 — the number .yah/jit/native/ports.json remembers for workload yah-s3-fs — and that fresh process died at once: .yah/jit/native/yah-s3-fs/stderr.log reads `Error: binding 0.0.0.0:49786 / Address already in use (os error 48)`. wait_for_coords timed out, teardown_workload removed the dead one, and the orphan — still listening on *:49786 per lsof — never republishes coords because it only writes them at its own bring-up. Net state: a working listener on the right port, an empty coords path, and dev_door.rs:128 telling the operator to `start yah camp` for a camp that is running. Operator-visible symptom: `yah cloud mirror up noisetable-marketing --env dev` fails with 'the dev-tier s3 driver is not running — …/coords.json has no coordinates'.")
+/// @yah:next("FIX, in native_support or the native backend rather than here so yah-smtp-dev (ports 49784/49785, same ports.json mechanism) and yah-pg-dev get it too: before deploy_workload, if the remembered port has a listener, either (a) adopt it when its argv matches the spec (and for yah-s3-fs ask it to republish coords, or just do not retract coords when a live matching listener is found), or (b) SIGTERM it and wait for the port to free, then spawn. Then make the ready-timeout error quote the driver's stderr tail and, when the bind failed, the pid holding the port (`lsof -nP -iTCP:<port> -sTCP:LISTEN`), instead of dev_door's 'start yah camp' line.")
+/// @yah:next("Workaround that resolved it: `kill -TERM 80519`, then restart the camp so s3_driver::activate (app/yah/cli/src/camp.rs ~4057, boot-time only — mirror up does not retry bring-up) runs again. Second latent gap worth a line in the same fix: s3_driver::teardown at camp.rs:3300 is the only thing that stops the driver, so any camp exit that skips it (crash, SIGKILL, desktop quit path) manufactures this orphan.")
+/// @yah:verify("With a yah-s3-fs already listening on the remembered PORT_S3 and no coords.json, `yah camp` boot (or whatever runs s3_driver::activate) ends with coords.json present and `yah cloud mirror up <svc> --env dev` publishing; and with a FOREIGN process on that port, the error names pid and port.")
+/// @yah:handoff("Tree anchor abb379b5. kamaji: new crates/kamaji/src/orphan.rs (pid file <state_dir>/<ident>/pid = pid + start time via proc_pidinfo/proc stat; reap SIGTERM->TERM_GRACE->SIGKILL; port_is_free; lsof describe_holder). native.rs: spawn_child records pid, teardown_workload clears, deploy_workload reaps after in-memory teardown then fails on any declared port still bound, naming workload, PORT_ env var, port, holder pid. Ports ledger rule untouched.")
+/// @yah:handoff("yubaba cloud: native_support::ready_timeout_message + tail_lines used by s3/smtp/pg timeout bails; s3_driver up_s3_driver now wraps up_s3_driver_inner and records failure to .yah/infra/state/dev/s3/bringup-error (cleared at start of each bring-up); dev_door store_endpoint quotes it, else the old start-yah-camp line.")
+/// @yah:handoff("Not done / observed: stop_child signals only the pid (no pgid), so the pid file is pid-only; camp.rs teardown-skip orphan source (crash/SIGKILL) not addressed beyond reaping on next boot; no mirror-up retry per decision 5.")
+/// @yah:verify("kamaji (native-integration, --no-fail-fast): baseline lib 235 pass / 1 fail (native::tests::graceful_upgrade_swaps_process_and_signals_old); after: 239 pass / 0 fail (3 new orphan tests + 1 that was failing now passes/flaky).")
+/// @yah:verify("yah-cloud --no-fail-fast: after 1350 lib pass / 1 fail (inner_door::tests::the_rendered_door_is_cleartext_on_loopback_and_carries_its_own_table; peer was editing inner_door.rs/config.rs mid-run; not in files I touched); no pre-change baseline recorded for this crate; new tests (ready timeout tail, recorded bring-up failure) pass.")
+/// @yah:verify("cargo check -p yah EXIT=0 (no baseline run taken before edits).")
+/// @yah:handoff("Follow-up (verifier defects): (1) orphan::port_is_free (wildcard) deleted; deploy now probes the workload's own mesh_ip via orphan::is_held_settled = connect probe at bind_ip:port (+300ms recheck). Not ports::is_free: measured on macOS, a SO_REUSEADDR bind to 127.0.0.1:P SUCCEEDS while another socket holds *:P, so a bind probe misses exactly the noisetable orphan (dev drivers resolve bind_ip=LOCALHOST via s3_driver MeshAssignment::inlined but bind 0.0.0.0). A bind probe also tripped on parallel tests' ephemeral sockets (flaked ~1/6); connect-only plus self-connect guard plus settle: 12/12 clean. A listener on a neighbouring mesh IP is not connectable at ours, so it no longer blocks. Side effect: a held port sees one short probe connection.")
+/// @yah:handoff("(2) graceful_upgrade_workload failure path now restores the pid file to the surviving old process (old pid read from the handle before spawn; cleared if none). Natural-exit clearing deliberately NOT added: the start-time guard plus reap's delete already make a stale file harmless, and the supervisor reap path has no clean hook.")
+/// @yah:handoff("Test a_listener_on_another_address_does_not_block_the_deploy uses 127.0.0.2 and returns early where that cannot bind (macOS without an lo0 alias), so it does not exercise the case on this Mac; the *:P foreign test (mesh 127.0.0.1) covers the noisetable case here. Test port holder now binds :0 and reports its port (pick-then-release raced parallel ledgers).")
+/// @yah:verify("kamaji lib+all targets (--no-fail-fast): 240 pass / 0 fail (verifier 238/1); graceful_upgrade_swaps_process_and_signals_old alone: 1 pass; 12 consecutive lib runs 0 fail. yah-cloud: 1341 pass / 0 fail (verifier 1339/4). cargo check -p yah EXIT=0. Logs /tmp/r967b1-f1..f4.log, /tmp/r967b1-k9-*.log.")
+/// @yah:handoff("Round 3: (1) ports::tests::the_local_tier_treats_a_pin_as_a_preference_not_an_error now picks its pin by scanning 20000-30000 (below macOS 49152+ and Linux 32768+ ephemeral ranges) instead of pick_free_port; no retry, assertion unchanged. It was the only pick_free_port use left in ports.rs/native.rs tests (grep). (2) orphan::record now REMOVES the pid file when the pid has no readable start time (already dead), so the failed-upgrade restore cannot leave the file naming the dead replacement; unit test in orphan.rs. (3) Added a_failed_graceful_upgrade_leaves_the_pid_file_naming_the_survivor (upgrade with a replacement spec that exits 1; asserts the file holds old pid + its start time).")
+/// @yah:verify("kamaji --features native-integration --lib x5 (logs /tmp/r967b1-g1..g5.log): 242 pass / 0 fail on each of 5 runs. jit_lazy_fork: EXIT=0, prints jit_lazy_fork: OK (harness-less target, no libtest result line). cargo check -p yah EXIT=0.")
 pub async fn up_s3_driver(
+    workspace_root: &Path,
+    buckets: Vec<String>,
+    opts: &S3DriverOptions,
+) -> Result<RunningS3Driver> {
+    // R967-B1: a failed bring-up is recorded beside the coords so a later
+    // `mirror up` can say WHY the driver is absent instead of guessing that
+    // the camp is not running.
+    let failure = bringup_error_path(workspace_root);
+    let _ = std::fs::remove_file(&failure);
+    match up_s3_driver_inner(workspace_root, buckets, opts).await {
+        Ok(running) => Ok(running),
+        Err(e) => {
+            if let Some(dir) = failure.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&failure, format!("{e:#}\n"));
+            Err(e)
+        }
+    }
+}
+
+async fn up_s3_driver_inner(
     workspace_root: &Path,
     buckets: Vec<String>,
     opts: &S3DriverOptions,
@@ -266,12 +330,12 @@ pub async fn up_s3_driver(
     let Some(ready) = wait_for_coords(&coords, timeout).await else {
         warn!(timeout = ?timeout, "yah-s3-fs did not publish coords; tearing down");
         runtime.teardown_workload(&ident).await.ok();
-        let (_out, err) = super::native_support::capture_paths(&state_dir, &ident_str);
-        anyhow::bail!(
-            "the dev-tier s3 driver did not become ready within {timeout:?} — \
-             check {} for why",
-            err.display(),
-        );
+        anyhow::bail!(super::native_support::ready_timeout_message(
+            "s3",
+            timeout,
+            &state_dir,
+            &ident_str,
+        ));
     };
 
     info!(

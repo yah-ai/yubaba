@@ -387,6 +387,7 @@ pub fn plan_alias_claim(
         cdn_bucket: tier.bucket().to_string(),
         worker_bundle_path: None,
         routes: vec![DomainRoute {
+            cors_origins: Vec::new(),
             path: "/*".into(),
             // A claimed alias serves one bundle at the root with no special
             // header needs; a tenant that wants some edits its own manifest.
@@ -1339,6 +1340,7 @@ mod tests {
     /// three buckets, one bucket named twice, the default bucket last.
     fn multi_bucket_manifest() -> DomainConfig {
         let bucket_route = |path: &str, bucket: &str| DomainRoute {
+            cors_origins: Vec::new(),
             headers: Default::default(),
             path: path.into(),
             mode: RouteMode::StaticBucket {
@@ -1476,6 +1478,7 @@ mod tests {
             cdn_bucket: "net-yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                cors_origins: Vec::new(),
                 headers: Default::default(),
                 path: "/*".into(),
                 mode: RouteMode::Static {
@@ -1543,6 +1546,7 @@ mod tests {
         let mut dom = net_tier_manifest();
         dom.routes = vec![
             DomainRoute {
+                cors_origins: Vec::new(),
                 headers: Default::default(),
                 path: "/docs/*".into(),
                 mode: RouteMode::Static {
@@ -1550,6 +1554,7 @@ mod tests {
                 },
             },
             DomainRoute {
+                cors_origins: Vec::new(),
                 headers: Default::default(),
                 path: "/*".into(),
                 mode: RouteMode::Static {
@@ -1582,6 +1587,7 @@ mod tests {
         dom.routes.insert(
             0,
             DomainRoute {
+                cors_origins: Vec::new(),
                 headers: Default::default(),
                 path: "/old/*".into(),
                 mode: RouteMode::Redirect {
@@ -1682,6 +1688,7 @@ mod tests {
     fn plan_bails_when_no_static_route() {
         let mut dom = net_tier_manifest();
         dom.routes = vec![DomainRoute {
+            cors_origins: Vec::new(),
             headers: Default::default(),
             path: "/old".into(),
             mode: RouteMode::Redirect {
@@ -1781,6 +1788,7 @@ mod tests {
             cdn_bucket: "yah-dev".into(),
             worker_bundle_path: None,
             routes: vec![DomainRoute {
+                cors_origins: Vec::new(),
                 headers: Default::default(),
                 path: "/*".into(),
                 mode: RouteMode::Static {

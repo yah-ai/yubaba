@@ -127,25 +127,58 @@ var PAGE_CACHE_CONTROL = "no-cache";
 function httpGet(origin) {
   return (key) => fetch(`${origin}/${key}`);
 }
-function r2Get(bucket) {
+function r2Get(bucket, cache) {
   return async (key) => {
+    const cacheKey = cache.keyFor(key);
+    const hit = await caches.default.match(cacheKey);
+    if (hit)
+      return hit;
     const obj = await bucket.get(key);
     if (!obj)
       return new Response(null, { status: 404 });
     const headers = new Headers;
     obj.writeHttpMetadata(headers);
     headers.set("ETag", obj.httpEtag);
-    return new Response(obj.body, { headers });
+    const resp = new Response(obj.body, { headers });
+    if (!edgeCacheable(headers.get("Cache-Control")))
+      return resp;
+    cache.ctx.waitUntil(caches.default.put(cacheKey, resp.clone()));
+    return resp;
   };
 }
-function assetSource(env, entry) {
+function r2EdgeCache(request, ctx, binding) {
+  const origin = new URL(request.url).origin;
+  return {
+    ctx,
+    keyFor: (key) => `${origin}/__mesofact/r2/${encodeURIComponent(binding)}/${key}`
+  };
+}
+function edgeCacheable(cacheControl) {
+  if (!cacheControl)
+    return false;
+  let maxAge;
+  let sMaxAge;
+  for (const raw of cacheControl.split(",")) {
+    const [name, value] = raw.trim().toLowerCase().split("=", 2);
+    if (name === "no-store" || name === "no-cache" || name === "private") {
+      return false;
+    }
+    const n = Number.parseInt(value ?? "", 10);
+    if (name === "max-age" && Number.isFinite(n))
+      maxAge = n;
+    if (name === "s-maxage" && Number.isFinite(n))
+      sMaxAge = n;
+  }
+  return (sMaxAge ?? maxAge ?? 0) > 0;
+}
+function assetSource(request, env, ctx, entry) {
   if (entry?.mode === "static" && entry.binding !== undefined) {
     const bucket = env[entry.binding];
     if (!bucket || typeof bucket.get !== "function") {
       console.error(`mesofact: ROUTE_TABLE entry ${JSON.stringify(entry.path)} reads R2 binding ${JSON.stringify(entry.binding)}, which this Worker was not deployed with`);
       return new Response("Bad Gateway", { status: 502 });
     }
-    const get = r2Get(bucket);
+    const get = r2Get(bucket, r2EdgeCache(request, ctx, entry.binding));
     return { get, pointers: get };
   }
   if (entry?.mode === "static" && entry.origin) {
@@ -161,7 +194,7 @@ function assetSource(env, entry) {
   };
 }
 var router_default = {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const path = new URL(request.url).pathname;
     let entry;
     try {
@@ -169,11 +202,11 @@ var router_default = {
     } catch (err) {
       return routingUnavailable(path, err);
     }
-    const resp = await route(request, env, entry);
-    return applyRouteHeaders(resp, entry);
+    const resp = await route(request, env, ctx, entry);
+    return applyRouteHeaders(resp, entry, request.headers.get("Origin"));
   }
 };
-async function route(request, env, entry) {
+async function route(request, env, ctx, entry) {
   const url = new URL(request.url);
   const path = url.pathname;
   const resilience = parseResilience(env.SSR_RESILIENCE);
@@ -191,7 +224,7 @@ async function route(request, env, entry) {
     const target = entry.origin + rewritePath(entry, path) + url.search;
     return proxyWithResilience(request, target, policyFor(resilience, path));
   }
-  const source = assetSource(env, entry);
+  const source = assetSource(request, env, ctx, entry);
   if (source instanceof Response)
     return source;
   let key;
@@ -345,18 +378,31 @@ function routingUnavailable(path, err) {
     headers: { "Content-Type": "text/plain" }
   });
 }
-function applyRouteHeaders(resp, entry) {
+function applyRouteHeaders(resp, entry, origin) {
   const entries = Object.entries(entry?.headers ?? {});
-  if (entries.length === 0)
+  const corsOrigins = entry?.cors_origins ?? [];
+  if (entries.length === 0 && corsOrigins.length === 0)
     return resp;
   const headers = new Headers(resp.headers);
   for (const [name, value] of entries)
     headers.set(name, value);
+  applyCors(headers, corsOrigins, origin);
   return new Response(NULL_BODY_STATUS.has(resp.status) ? null : resp.body, {
     status: resp.status,
     statusText: resp.statusText,
     headers
   });
+}
+function applyCors(headers, corsOrigins, origin) {
+  if (corsOrigins.length === 0)
+    return;
+  headers.delete("Access-Control-Allow-Origin");
+  if (origin !== null && corsOrigins.includes(origin)) {
+    headers.set("Access-Control-Allow-Origin", origin);
+  }
+  const varies = (headers.get("Vary") ?? "").split(",").map((t) => t.trim()).some((t) => t === "*" || t.toLowerCase() === "origin");
+  if (!varies)
+    headers.append("Vary", "Origin");
 }
 function parseRouteTable(raw) {
   if (!raw)
@@ -368,7 +414,7 @@ function parseRouteTable(raw) {
     assertSettableHeaders(entries);
   } catch (err) {
     console.error(`mesofact: ROUTE_TABLE carries a header that cannot be applied, serving with NO route headers — ${err instanceof Error ? err.message : String(err)}`);
-    entries = entries.map(({ headers: _drop, ...rest }) => rest);
+    entries = entries.map(({ headers: _drop, cors_origins: _dropCors, ...rest }) => rest);
   }
   routeTableCache = { raw, entries };
   return entries;
@@ -380,7 +426,7 @@ function validateRouteTable(raw) {
   }
   return v.map((entry, i) => {
     if (!isRouteEntry(entry)) {
-      throw new Error(`entry ${i} is not a {path: string, mode: "static"|"backend"|"redirect", headers?: object}`);
+      throw new Error(`entry ${i} is not a {path: string, mode: "static"|"backend"|"redirect", headers?: object, cors_origins?: string[]}`);
     }
     if (entry.path === "") {
       throw new Error(`entry ${i} has an empty path — an entry that matches nothing (or everything, depending on who reads it) is not a route`);
@@ -401,6 +447,14 @@ function assertSettableHeaders(entries) {
         throw new Error(`entry ${i} declares ${JSON.stringify(name)} = ${JSON.stringify(value)}, which cannot be set as a response header — ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+    const cors = entry.cors_origins ?? [];
+    const wild = cors.find((o) => o === "*" || o === "null");
+    if (wild !== undefined) {
+      throw new Error(`entry ${i} lists ${JSON.stringify(wild)} in cors_origins, which would grant every site (or every sandboxed page) rather than the ones named`);
+    }
+    if (cors.length > 0 && Object.keys(entry.headers ?? {}).some((name) => name.toLowerCase() === "access-control-allow-origin")) {
+      throw new Error(`entry ${i} declares both cors_origins and a literal Access-Control-Allow-Origin header`);
+    }
   });
 }
 function isRouteEntry(v) {
@@ -418,6 +472,11 @@ function isRouteEntry(v) {
     return false;
   if (e.headers !== undefined) {
     if (!e.headers || typeof e.headers !== "object" || Array.isArray(e.headers)) {
+      return false;
+    }
+  }
+  if (e.cors_origins !== undefined) {
+    if (!Array.isArray(e.cors_origins) || !e.cors_origins.every((o) => typeof o === "string")) {
       return false;
     }
   }

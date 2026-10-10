@@ -32,7 +32,7 @@ async-trait = "0.1"
 # list is anyhow + async-trait by design, so it costs a plinth nothing — and the
 # derivation genuinely is a read of raft state, which is why it is here and the
 # vendor HTTP adapters (`yah-floating-ip-adapters`) are not.
-floating_ip = { package = "yah-floating-ip", path = "../floating-ip", version = "0.8.45" }
+floating_ip = { package = "yah-floating-ip", path = "../floating-ip", version = "0.8.46" }
 openraft = { version = "=0.10.0-alpha.35", features = ["serde"] }
 # The raft transport itself is HTTP — `raft/network.rs` is a `RaftNetworkV2`
 # over reqwest. This is not an avoidable dependency of the consensus core; it
@@ -45,12 +45,12 @@ tokio-stream = { version = "0.1", features = ["io-util"] }
 tracing = "0.1"
 # R876-T18: `PeerSigner` / `PeerClient`, so every raft RPC this transport sends
 # carries a peer token. The token format lives there, not here.
-yubaba-auth-token = { version = "0.8.45" }
+yubaba-auth-token = { version = "0.8.46" }
 # `TenantId`, `ResourceLimits`, `rollout::RolloutPolicy` and `secrets::SecretAccess`
 # are replicated state — they are in `YubabaState`. Default features only: the
 # `seal` / `admission-verify` surfaces the fleet daemon enables are issuer-side
 # and never touch the state machine.
-workload-spec = { package = "yah-workload-spec", version = "0.8.45" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.46" }
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }

@@ -518,3 +518,90 @@ mod tests {
         assert!(msg.contains("fronts no compute slot"), "{msg}");
     }
 }
+
+/// Test-only camp builder: declare a workload the only way a camp can now,
+/// as a `.yah/services/<name>/` service plus `mirrors/prod.toml` overlay
+/// (R959-T5 deleted the `.yah/infra/workloads/` reader).
+#[cfg(test)]
+pub(crate) mod fixture {
+    use std::path::Path;
+
+    /// Write `spec_toml` (a whole `WorkloadSpec` document) as service `name`:
+    /// `name` and `expose.mesh.identity` are derived, `durability`/`db` are
+    /// overlay-only, and everything else is the env-invariant base.
+    pub(crate) fn write_workload(root: &Path, name: &str, spec_toml: &str) {
+        let mut spec: toml::Table = toml::from_str(spec_toml).unwrap();
+        spec.remove("name");
+        if let Some(mesh) = spec
+            .get_mut("expose")
+            .and_then(|e| e.get_mut("mesh"))
+            .and_then(|m| m.as_table_mut())
+        {
+            mesh.remove("identity");
+        }
+        // A public hostname is derived from a fronted compute slot under an
+        // `[[ingress]]` edge, so it moves out of the spec into the mirror.
+        let public = spec
+            .get_mut("expose")
+            .and_then(|e| e.get_mut("public"))
+            .and_then(|p| p.as_table_mut())
+            .map(|p| (p.remove("hostname"), p.remove("port")));
+        let mut overlay = toml::Table::new();
+        overlay.insert("ident".into(), name.into());
+        for key in ["durability", "db"] {
+            if let Some(v) = spec.remove(key) {
+                overlay.insert(key.into(), v);
+            }
+        }
+        let component = toml::toml! {
+            id = "main"
+            kind = "container"
+            path = "."
+            role = "compute"
+        };
+        let mut component = component;
+        component.insert("workload".into(), spec.into());
+        let mut service = toml::Table::new();
+        service.insert("schema_version".into(), 1.into());
+        service.insert("name".into(), name.into());
+        service.insert(
+            "address".into(),
+            toml::toml! {
+                kind = "front-door"
+                domain = "fixture.mesh.yah.dev"
+            }
+            .into(),
+        );
+        service.insert("components".into(), vec![toml::Value::Table(component)].into());
+        let mut mirror = toml::Table::new();
+        mirror.insert("schema_version".into(), 1.into());
+        mirror.insert("shape".into(), "single-machine".into());
+        if let Some((Some(hostname), Some(port))) = public {
+            mirror.insert(
+                "ingress".into(),
+                vec![toml::Value::Table(toml::toml! {
+                    provider = "passway"
+                    machines = ["a"]
+                })]
+                .into(),
+            );
+            let mut compute = toml::Table::new();
+            compute.insert("kind".into(), "static".into());
+            compute.insert("machine".into(), "a".into());
+            compute.insert("zone".into(), hostname);
+            compute.insert("port".into(), port);
+            mirror.insert(
+                "providers".into(),
+                toml::Table::from_iter([("compute".to_string(), compute.into())]).into(),
+            );
+        }
+        let mut workload = toml::Table::new();
+        workload.insert("main".into(), overlay.into());
+        mirror.insert("workload".into(), workload.into());
+
+        let dir = crate::paths::services_dir(root).join(name);
+        std::fs::create_dir_all(dir.join("mirrors")).unwrap();
+        std::fs::write(dir.join("service.toml"), toml::to_string(&service).unwrap()).unwrap();
+        std::fs::write(dir.join("mirrors/prod.toml"), toml::to_string(&mirror).unwrap()).unwrap();
+    }
+}

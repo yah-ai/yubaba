@@ -1149,11 +1149,21 @@ where
     test_cluster_local(runtimes, policy, Some(cluster_key_hex.to_string())).await
 }
 
+/// R876-T22: the operator keypair `(public, secret)` hex every
+/// [`test_cluster_enforcing`] node trusts — generated once per test process.
+/// Write the secret to a 0600 file to drive an operator client against one.
+pub fn enforcing_operator_keypair_hex() -> &'static (String, String) {
+    static KP: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    KP.get_or_init(|| {
+        yubaba_auth_token::generate_operator_keypair_hex().expect("generating test operator keypair")
+    })
+}
+
 /// The require-mode policy [`test_cluster_enforcing`] installs on each node.
 fn enforcing_policy(cluster_key_hex: &str) -> Result<yubaba::http_auth::HttpAuthPolicy> {
     yubaba::http_auth::HttpAuthPolicy::new(
         yubaba::http_auth::AuthMode::Require,
-        &[],
+        std::slice::from_ref(&enforcing_operator_keypair_hex().0),
         Some(cluster_key_hex),
     )
     .map_err(|e| anyhow::anyhow!(e))

@@ -139,3 +139,71 @@ async fn the_tenant_streamer_reads_ownership_from_an_enforcing_node_only_when_ke
         .expect_err("an unkeyed streamer must be refused by an enforcing node");
     assert!(format!("{err:#}").contains("401"), "expected a 401, got: {err:#}");
 }
+
+/// R876-T22: the `yubaba raft` client verbs against an all-require cluster.
+/// An Operator membership verb (`transfer-leader`) 401s with no credential,
+/// and succeeds with an operator key file and with a caller-minted
+/// `YUBABA_BEARER_TOKEN`. The same `cli_client` calls the CLI makes.
+#[tokio::test]
+async fn yubaba_raft_cli_verbs_sign_with_an_operator_key_file_or_a_bearer() {
+    use yubaba::cli_client::{self, CliAuth};
+
+    let key = generate_cluster_key_hex().expect("cluster key");
+    let cluster = test_cluster_enforcing(DummyRuntime, 3, ClusterPolicy::fleet(), &key)
+        .await
+        .expect("enforcing cluster");
+    let (_public, secret) = yubaba_test_harness::enforcing_operator_keypair_hex();
+    let http = reqwest::Client::new();
+
+    let transfer = |auth: CliAuth, leader: usize| {
+        let base = cluster.yubaba(leader).base_url.clone();
+        let to = ((leader + 1) % cluster.node_count()) as u64 + 1;
+        let http = http.clone();
+        async move {
+            let body = serde_json::json!({ "to": to });
+            cli_client::operator_post(&http, &auth, &base, "/raft/transfer-leader", &body, "transfer-leader").await
+        }
+    };
+
+    // Neither credential: refused outright.
+    let leader = cluster.wait_for_agreed_leader(Duration::from_secs(30)).await.unwrap();
+    let err = transfer(CliAuth::resolve(None, None, None).unwrap(), leader)
+        .await
+        .expect_err("a tokenless membership verb must be refused");
+    assert!(format!("{err:#}").contains("401"), "expected a 401, got: {err:#}");
+
+    // A cluster key is not enough for an Operator route: the peer signer is
+    // only applied to Peer routes, so this is still tokenless -> 401.
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ck = tmp.path().join("cluster.key");
+    std::fs::write(&ck, &key).unwrap();
+    let err = transfer(CliAuth::resolve(None, None, Some(&ck)).unwrap(), leader)
+        .await
+        .expect_err("a cluster key must not open an Operator verb");
+    assert!(format!("{err:#}").contains("401"), "expected a 401, got: {err:#}");
+
+    // Operator key file: a fresh operator token per request.
+    let ok = tmp.path().join("operator.key");
+    std::fs::write(&ok, secret).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    std::env::set_var("YAH_OPERATOR_SUBJECT", "user:raft-cli-test");
+    transfer(CliAuth::resolve(Some(&ok), None, None).unwrap(), leader)
+        .await
+        .expect("an operator key file must open transfer-leader");
+
+    // Caller-minted bearer, as an ssh'd invocation receives it.
+    let leader = cluster.wait_for_agreed_leader(Duration::from_secs(30)).await.unwrap();
+    let sk = yubaba_auth_token::operator_secret_from_hex(secret).unwrap();
+    let token = yubaba_auth_token::mint_operator_token(&sk, "user:raft-cli-test", 300, now()).unwrap();
+    transfer(CliAuth::resolve(None, Some(token), None).unwrap(), leader)
+        .await
+        .expect("a YUBABA_BEARER_TOKEN must open transfer-leader");
+
+    // Peer route through the same client: the cluster key alone serves status.
+    cli_client::raft_status(&http, &CliAuth::resolve(None, None, Some(&ck)).unwrap(), &cluster.yubaba(leader).base_url)
+        .await
+        .expect("a cluster key must open GET /raft/status");
+}

@@ -136,11 +136,19 @@ use crate::config::{
     domain_serving_service, normalize_mount, DeployTier, DomainConfig, ServiceConfig,
 };
 
-/// `schema_version` of the route table this module writes. Must match
-/// passway's `path_routes_file::SCHEMA_VERSION`; a mismatch is a boot failure
-/// on the door naming both numbers, which is the intended way for a
-/// producer/consumer skew to surface (see that module's doc).
-pub const ROUTES_SCHEMA_VERSION: u32 = 1;
+/// Route-table `schema_version` for a table whose mounts all name fixed
+/// `upstreams` — readable by every passway ever shipped.
+///
+/// R876-B20: this module writes the MINIMUM version that expresses the table
+/// ([`routes_schema_for`]), and the node refuses to admit a table its
+/// installed passway cannot read (yubaba's `inner_door_schema` module). passway's
+/// `path_routes_file::SCHEMA_VERSIONS` is the reader's side of the same
+/// contract.
+pub const ROUTES_SCHEMA_FIXED: u32 = 1;
+
+/// Route-table `schema_version` for a table in which any mount `discover`s.
+/// The highest version this producer can write.
+pub const ROUTES_SCHEMA_DISCOVER: u32 = 2;
 
 /// Which deployed thing serves a mount.
 ///
@@ -173,6 +181,9 @@ pub struct InnerDoorMount {
     /// cannot double-apply them, and why a bundle sub-mount's entry is not
     /// redundant.
     pub headers: BTreeMap<String, String>,
+    /// The same route's `cors_origins` (R826), owned by this tier on the same
+    /// terms as `headers`.
+    pub cors_origins: Vec<String>,
 }
 
 /// A service's inner door, as configuration — everything but the addresses.
@@ -230,8 +241,10 @@ pub fn plan(
             DeployTier::Workload => DeployedUnit::Component(component.id.clone()),
         };
         let mount = passway_mount(component.mount.as_deref());
+        let (headers, cors_origins) = headers_for(domain, &mount);
         mounts.push(InnerDoorMount {
-            headers: headers_for(domain, &mount),
+            headers,
+            cors_origins,
             mount,
             unit,
         });
@@ -307,12 +320,19 @@ pub fn plan(
 /// [`RouteTable`]: crate::route_table::RouteTable
 /// [`RouteTable::match_path`]: crate::route_table::RouteTable::match_path
 /// [`RouteTable::headers_json`]: crate::route_table::RouteTable::headers_json
-fn headers_for(domain: Option<&DomainConfig>, mount: &str) -> BTreeMap<String, String> {
+///
+/// The route's `cors_origins` (R826) come back beside its headers: one walk
+/// decides both, so a mount can never carry one route's headers and another's
+/// CORS list.
+fn headers_for(
+    domain: Option<&DomainConfig>,
+    mount: &str,
+) -> (BTreeMap<String, String>, Vec<String>) {
     // passway spells the root mount `""`; a request for it is `/`.
     let path = if mount.is_empty() { "/" } else { mount };
     domain
         .and_then(|d| d.route_for_path(path))
-        .map(|r| r.headers.clone())
+        .map(|r| (r.headers.clone(), r.cors_origins.clone()))
         .unwrap_or_default()
 }
 
@@ -330,16 +350,25 @@ struct RoutesFile<'a> {
 #[derive(Debug, Serialize)]
 struct RouteEntry<'a> {
     mount: &'a str,
-    discover: RouteDiscover<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discover: Option<RouteDiscover<'a>>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     headers: &'a BTreeMap<String, String>,
+    /// Omitted when empty, and that is roll safety rather than tidiness:
+    /// passway parses this file with `deny_unknown_fields`, so a release that
+    /// predates R826 refuses any file carrying the key. Only a mount that
+    /// actually declares origins needs the newer passway (the R876-B20 shape,
+    /// confined to the domains that opt in).
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    cors_origins: &'a [String],
 }
 
 /// Mirror of passway's `path_routes_file::MountDiscovery` (R936-B12).
 ///
 /// @yah:ticket(R876-B20, "yubaba 0.8.43 writes `discover` into passway's path-routes file under schema_version 1, so any node with an older passway crash-loops its inner door; rollouts ship yubaba without the passway that can read its output")
-/// @yah:at(2026-10-08T07:05:09Z)
-/// @yah:assignee(agent:bundle-anthropic-glimmerstone)
+/// @yah:status(review)
+/// @yah:at(2026-10-10T03:46:38Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
 /// @yah:parent(R876)
 /// @yah:severity(high)
 /// @yah:next("Bump the path-routes schema for the `discover` shape: oss/passway/crates/passway/src/path_routes_file.rs SCHEMA_VERSION 1 -> 2, so a reader that cannot parse it fails at boot naming both numbers (the mechanism that module documents) instead of 'unknown field `discover`'.")
@@ -354,6 +383,14 @@ struct RouteEntry<'a> {
 /// @yah:files(oss/yubaba/crates/cloud/src/inner_door.rs)
 /// @yah:files(oss/passway/crates/passway/src/path_routes_file.rs)
 /// @yah:files(scripts/hotship.sh)
+/// @yah:handoff("IMPLEMENTED (courier Ashguard, 2026-10-09; code only, nothing shipped). PASSWAY: path_routes_file.rs SCHEMA_VERSION -> SCHEMA_VERSIONS=&[1,2]; v1 still accepts discover (yubaba 0.8.43-0.8.45 wrote that onto live nodes; the module doc's new section 'Which versions this binary reads' records it as a consumer reading what producers in the field write). Any other version fails, naming the file's number and [1, 2]. New SCHEMAS_FLAG='--path-routes-schemas' + schemas_line() -> 'path-routes-schemas 1 2'; main.rs checks argv[1] at the top of main() and prints/exits 0 before logging/TLS/listener. Passway had NO argv parsing before, so an OLD passway ignores the flag and tries to start; the probe defends against that with env -i (no TLS env, so it panics fast) plus a timeout. passway reads the routes file once at process start (path_routes_from_env in main.rs; the reloads there are TLS-only), so there is no runtime hot-reload ordering to handle.")
+/// @yah:handoff("YUBABA RENDERER (cloud/src/inner_door.rs): ROUTES_SCHEMA_VERSION replaced by ROUTES_SCHEMA_FIXED=1 / ROUTES_SCHEMA_DISCOVER=2. RouteEntry.discover is now Option (skip if None), and routes_schema_for() writes the minimum version. NOTE: routes_file() makes every mount discover (R936-B12), so today's renderer always emits v2; the v1 branch is exercised only by a unit test on routes_schema_for.")
+/// @yah:handoff("NODE-SIDE GATE (new oss/yubaba/crates/yubaba/src/inner_door_schema.rs, `pub mod inner_door_schema` in lib.rs). The routes file is rendered off-node and written on-node by kamaji materialize_files at spawn. So the check sits at yubaba admission: inner_door_schema_refusal() in lib.rs runs in deploy_workload_spec_as (after the deploy lock, BEFORE any appliance-replace teardown or the kamaji handoff) and in validate_workload_spec. A refusal returns 422 {status: rejected, error} and logs tracing::error. The error names the needed schema, the passway's readable set, and 'Ship passway alongside yubaba'. kamaji never receives the spec, so the existing routes file stays as it was. The probe (PasswaySchemaProbe) runs `passway --path-routes-schemas` with env_clear, null stdin and a 2s kill timeout, caches per path+mtime+size, and runs on spawn_blocking. Missing binary, nonzero exit, timeout or unparseable output all read as {1}. It lives in yubaba, not cloud, because yubaba deliberately has no runtime dep on cloud (Cargo.toml note). INNER_DOOR_BINARY/ROUTES_DIR are therefore restated there, with a pointer to cloud's.")
+/// @yah:handoff("ROLLOUT: scripts/hotship.sh has a new --allow-routes-skew flag (documented beside --allow-proto-skew) and a 'yubaba/passway pairing' guard after the kamaji/yubaba one. When yubaba ships without passway, it ssh-probes each node with `timeout 5 env -i /usr/local/bin/passway --path-routes-schemas`. If a node does not read schema 2, it refuses and prints the --binaries line with passway added, plus the override. ACTIVATION_ORDER is unchanged: all bytes are installed before the activation loop restarts any unit, and passway reads routes only at start, so a paired ship is already correctly ordered. roll-node.sh is NOT changed: it installs passway from the same release tarball as yubaba (since 0.8.33), so it cannot half-ship the pair.")
+/// @yah:verify("Baseline -> after (darwin, durable logs /tmp/r876b20-*.log). passway `cargo test --manifest-path oss/passway/Cargo.toml -p passway`: lib 250 -> 252, 45 -> 45, tests/main 42 -> 43, all EXIT=0 (new: every_schema_producers_in_the_field_write_parses, the_schemas_line_names_every_version_this_binary_reads, and the forked-binary test the_binary_names_the_route_schemas_it_reads_and_exits; a_wrong_schema_version_* now uses v3 and asserts 'reads versions [1, 2]'). yah-cloud `--lib inner_door`: 21 -> 22 passed (new: a_table_writes_v1_unless_a_mount_discovers; two existing assertions moved from schema_version 1 to 2). yubaba `--lib inner_door_schema`: 5 new passed (v1-only refusal by name, admit when readable, non-door never probed, schemas-line parse, no-answer -> {1}). `cargo check -p yubaba -p yah-cloud --tests` EXIT=0. `bash -n scripts/hotship.sh` OK, and the parse/refuse logic was simulated locally on three outputs. The hotship dry-run was NOT run: its guard ssh-probes real nodes, which was out of scope (no live-fleet actions).")
+/// @yah:verify("NOT RUN: the full `cargo test -p yubaba --lib` suite (only the new module's tests ran). No live verification (old passway + new yubaba on a node); that needs a fleet roll.")
+/// @yah:handoff("Leader re-verified 2026-10-09 (courier @Ashguard:hydra, session:01fcc8e2). passway reads path-routes schemas {1,2}. A v1 file may still carry discover, which is the shape yubaba 0.8.43-0.8.45 wrote onto live nodes. passway now answers --path-routes-schemas. yah-cloud inner_door renders the lowest schema the table needs: v1 when no mount discovers, v2 otherwise. New oss/yubaba/crates/yubaba/src/inner_door_schema.rs is node-side and lives in yubaba because yubaba has no runtime dep on cloud. It probes /usr/local/bin/passway with env cleared and a 2s timeout, caches per path+mtime+size, and treats a silent binary as {1}. At deploy/validate it refuses with a 422 a table that passway can't read, before anything is torn down or written. scripts/hotship.sh refuses yubaba-without-passway onto a node whose passway doesn't read schema 2, overridable with --allow-routes-skew. scripts/roll-node.sh needed no change: it already installs passway with yubaba from the release manifest (since 0.8.33).")
+/// @yah:verify("Leader re-run: cargo test --manifest-path oss/passway/Cargo.toml -p passway = 252 + 45 + 43 passed / 0 failed (courier's baseline 250/45/42). yah-cloud --lib inner_door = 22 passed (baseline 21). yubaba --lib (full) = 1089 passed / 0 failed, including inner_door_schema. bash -n scripts/hotship.sh OK. NOT run: the hotship refusal against a live node (no fleet action in scope).")
 #[derive(Debug, Serialize)]
 struct RouteDiscover<'a> {
     ident: String,
@@ -413,17 +450,29 @@ impl InnerDoorPlan {
         for m in &self.mounts {
             routes.push(RouteEntry {
                 mount: &m.mount,
-                discover: RouteDiscover {
+                discover: Some(RouteDiscover {
                     ident: self.unit_ident(&m.unit, bundle_ident),
                     yubaba,
-                },
+                }),
                 headers: &m.headers,
+                cors_origins: &m.cors_origins,
             });
         }
         Ok(serde_json::to_string(&RoutesFile {
-            schema_version: ROUTES_SCHEMA_VERSION,
+            schema_version: routes_schema_for(&routes),
             routes,
         })?)
+    }
+}
+
+/// The lowest `schema_version` that expresses `routes` (R876-B20): v1 unless a
+/// mount discovers, so a table that needs nothing new is readable by every
+/// passway in the field.
+fn routes_schema_for(routes: &[RouteEntry<'_>]) -> u32 {
+    if routes.iter().any(|r| r.discover.is_some()) {
+        ROUTES_SCHEMA_DISCOVER
+    } else {
+        ROUTES_SCHEMA_FIXED
     }
 }
 
@@ -443,6 +492,13 @@ pub const ROUTES_DIR: &str = "/var/lib/passway/routes";
 /// ever dials it at. Literal rather than a parameter — see
 /// [`InnerDoorPlan::workload`].
 pub const INNER_DOOR_HOST: &str = "127.0.0.1";
+
+/// Where every door host keeps its sovereign group's cluster key (R876-T18
+/// step 2, 0600 root). Every door — outer and inner — names it as
+/// `PASSWAY_YUBABA_CLUSTER_KEY_FILE` so its yubaba polls carry a peer token.
+/// A door naming a key file it cannot read refuses to boot, so a new door host
+/// needs the key before any door is placed on it.
+pub const DOOR_CLUSTER_KEY_FILE: &str = "/etc/yah-cloud/cluster.key";
 
 /// Low end of the window [`listen_port`] picks from, inclusive.
 pub const INNER_DOOR_PORT_LOW: u16 = 10_000;
@@ -610,6 +666,12 @@ impl InnerDoorPlan {
                 "PASSWAY_HEALTH_CHECK_INTERVAL_SECS",
                 DISCOVERY_INTERVAL_SECS.to_string(),
             ),
+            // R876-T18: every `discover` mount polls Peer-class
+            // /service-records, which a require-mode yubaba 401s unsigned.
+            literal_env(
+                "PASSWAY_YUBABA_CLUSTER_KEY_FILE",
+                DOOR_CLUSTER_KEY_FILE.to_string(),
+            ),
         ];
 
         let mut annotations = HashMap::new();
@@ -767,6 +829,7 @@ mod tests {
                 routes: routes
                     .iter()
                     .map(|(path, headers)| DomainRoute {
+                        cors_origins: Vec::new(),
                         path: path.to_string(),
                         headers: headers
                             .iter()
@@ -953,10 +1016,59 @@ mod tests {
         assert_eq!(
             json,
             format!(
-                r#"{{"schema_version":1,"routes":[{{"mount":"","discover":{{"ident":"noisetable","yubaba":["http://100.64.0.1:7443","http://100.64.0.3:7443"]}}}},{{"mount":"/app","discover":{{"ident":"{account}","yubaba":["http://100.64.0.1:7443","http://100.64.0.3:7443"]}},"headers":{{"cross-origin-opener-policy":"same-origin"}}}}]}}"#
+                r#"{{"schema_version":2,"routes":[{{"mount":"","discover":{{"ident":"noisetable","yubaba":["http://100.64.0.1:7443","http://100.64.0.3:7443"]}}}},{{"mount":"/app","discover":{{"ident":"{account}","yubaba":["http://100.64.0.1:7443","http://100.64.0.3:7443"]}},"headers":{{"cross-origin-opener-policy":"same-origin"}}}}]}}"#
             )
         );
         assert!(!json.contains("upstreams"), "R936-B12: no baked addresses: {json}");
+    }
+
+    /// R876-B20: the table carries the lowest schema that expresses it.
+    #[test]
+    fn a_table_writes_v1_unless_a_mount_discovers() {
+        let empty = BTreeMap::new();
+        let fixed = RouteEntry { mount: "", discover: None, headers: &empty, cors_origins: &[] };
+        assert_eq!(routes_schema_for(&[fixed]), ROUTES_SCHEMA_FIXED);
+        let yubaba = ["http://y:7443".to_string()];
+        let fixed = RouteEntry { mount: "", discover: None, headers: &empty, cors_origins: &[] };
+        let disc = RouteEntry {
+            mount: "/app",
+            discover: Some(RouteDiscover { ident: "x".into(), yubaba: &yubaba }),
+            headers: &empty,
+            cors_origins: &[],
+        };
+        assert_eq!(routes_schema_for(&[fixed, disc]), ROUTES_SCHEMA_DISCOVER);
+    }
+
+
+    /// R826: the governing route's `cors_origins` reach the mount and the file
+    /// passway reads — on that mount only, and absent (not `[]`) elsewhere, so a
+    /// passway older than the key still parses every table that does not use it.
+    #[test]
+    fn cors_origins_travel_with_their_own_mount_into_the_routes_file() {
+        let svc = service(
+            "noisetable",
+            vec![
+                component("site", None, DeployTier::Bundle),
+                component("account", Some("app"), DeployTier::Workload),
+            ],
+        );
+        let mut domains = domains("noisetable", &[("/app/*", &[]), ("/*", &[])]);
+        domains.get_mut("test").unwrap().routes[0].cors_origins =
+            vec!["https://noisetable.com".to_string()];
+        let plan = plan(&svc, &domains).unwrap().unwrap();
+
+        assert!(plan.mounts[0].cors_origins.is_empty());
+        assert_eq!(plan.mounts[1].cors_origins, vec!["https://noisetable.com".to_string()]);
+
+        let json = plan
+            .routes_file("noisetable", &["http://100.64.0.1:7443".to_string()])
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["routes"][0].get("cors_origins").is_none(), "{json}");
+        assert_eq!(
+            parsed["routes"][1]["cors_origins"],
+            serde_json::json!(["https://noisetable.com"])
+        );
     }
 
     /// With nowhere to discover from, every mount would 503; refuse instead.
@@ -1014,11 +1126,16 @@ mod tests {
             env.get("PASSWAY_PATH_ROUTES_FILE").map(|s| s.to_string()),
             Some(file.path.display().to_string())
         );
-        assert!(file.content.contains("\"schema_version\":1"), "{}", file.content);
+        assert!(file.content.contains("\"schema_version\":2"), "{}", file.content);
         assert!(file.content.contains("http://100.64.0.3:7443"), "{}", file.content);
         assert_eq!(spec.command.as_deref(), Some(&[INNER_DOOR_BINARY.to_string()][..]));
         // R936-B12: the door notices a unit move within one short poll.
         assert_eq!(env.get("PASSWAY_UPDATE_INTERVAL_SECS"), Some(&"2"));
+        // R876-T18: the door's discovery polls are signed.
+        assert_eq!(
+            env.get("PASSWAY_YUBABA_CLUSTER_KEY_FILE"),
+            Some(&DOOR_CLUSTER_KEY_FILE)
+        );
     }
 
     /// R936-B11: the door is native AND asks its node's kamaji to replay it
