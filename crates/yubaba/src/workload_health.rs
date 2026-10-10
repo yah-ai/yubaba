@@ -51,13 +51,25 @@
 //! surface that says it is will be ignored within a week. The record carries
 //! both — the raw latest status *and* the folded verdict — because a consumer
 //! choosing between them should have to say which one it means.
+//!
+//! @yah:ticket(R964-B2, "GET /workloads reports health status=ready for a Pending workload with no pid and no ports")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:at(2026-10-09T18:16:03Z)
+//! @yah:parent(R964)
+//! @yah:severity(medium)
+//! @yah:next("The health field must not outlive or contradict the workload state: a workload that is not Running should report starting/unknown (or drop the stale probe result), so a census or alert reading health alone cannot see a dead service as healthy.")
+//! @yah:verify("Seen on us-west-011 2026-10-09: noisetable-account-staging state=Pending pid=null ports=[] alongside health {status: ready, consecutive_failures: 0, last_checked_at fresh}.")
+//! @yah:handoff("Root cause: sweep_once probed every listed workload regardless of kamaji state; kamaji's probe answers Ready for a target with no healthcheck, so a Pending workload (no pid/ports) got health=ready and the verdict was never invalidated on state change.")
+//! @yah:handoff("Fix in oss/yubaba/crates/yubaba/src/workload_health.rs: new probeable(state) (Starting|Running only) and reconcile() which drops record+last_probe for non-probeable workloads and excludes them from the due set; sweep_once now delegates membership/due logic to reconcile. Absent health key = not probed (existing contract). Not committed (git policy defer).")
+//! @yah:verify("cargo test -p yubaba --lib workload_health: 12 passed 0 failed (11 pre-existing + a_non_running_workload_loses_its_stale_ready_verdict_and_is_not_probed). Skew advisory flagged peer edits in kamaji-bin/cloud files mid-run; not in this change.")
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kamaji::sibling::KamajiSibling;
-use kamaji_proto::ProbeStatus;
+use kamaji_proto::{ProbeStatus, WorkloadState};
 use serde::Serialize;
 
 /// How often the loop wakes. This is the *resolution* of the per-workload
@@ -293,6 +305,47 @@ fn now_unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Whether a workload in `state` can have a meaningful probe verdict.
+///
+/// R964-B2: kamaji answers `Ready` for a target with no probe declared ("trust
+/// the workload's existence as readiness"), so probing a `Pending` workload
+/// with no pid and no ports produced `health: ready` beside `state: Pending`.
+/// Only a workload that has started (or is serving) has anything to probe.
+fn probeable(state: WorkloadState) -> bool {
+    matches!(state, WorkloadState::Starting | WorkloadState::Running)
+}
+
+/// Reconcile the registry against kamaji's listing and return who is due.
+///
+/// Destroyed workloads lose their entry; workloads that are not [`probeable`]
+/// lose their verdict (and cadence clock) so a stale `ready` cannot outlive the
+/// state change that contradicts it, and are not probed.
+fn reconcile(
+    guard: &mut BTreeMap<String, Entry>,
+    live: Vec<(String, kamaji_proto::WorkloadId, WorkloadState)>,
+    now: Instant,
+) -> Vec<(String, kamaji_proto::WorkloadId, Option<Policy>)> {
+    let live_keys: std::collections::BTreeSet<&str> =
+        live.iter().map(|(k, _, _)| k.as_str()).collect();
+    guard.retain(|k, _| live_keys.contains(k.as_str()));
+    for (key, _, state) in &live {
+        let entry = guard.entry(key.clone()).or_insert_with(|| Entry::new(now));
+        if !probeable(*state) {
+            entry.record = None;
+            entry.last_probe = None;
+        }
+    }
+    live.into_iter()
+        .filter(|(key, _, state)| {
+            probeable(*state) && guard.get(key).is_some_and(|e| e.due(now))
+        })
+        .map(|(key, id, _)| {
+            let policy = guard.get(&key).and_then(|e| e.policy);
+            (key, id, policy)
+        })
+        .collect()
+}
+
 /// One turn of [`run`]'s loop, factored out so a test can drive the real thing
 /// instead of re-implementing the tick.
 ///
@@ -315,29 +368,12 @@ pub async fn sweep_once(state: &Arc<crate::ServerState>) -> bool {
     };
 
     let now = Instant::now();
-    let live: Vec<(String, kamaji_proto::WorkloadId)> = entries
+    let live: Vec<(String, kamaji_proto::WorkloadId, WorkloadState)> = entries
         .into_iter()
-        .map(|e| (e.id.as_str().to_string(), e.id))
+        .map(|e| (e.id.as_str().to_string(), e.id, e.state))
         .collect();
 
-    // Reconcile membership first, so a destroyed workload's last verdict does
-    // not sit in the map being read as current.
-    let due: Vec<(String, kamaji_proto::WorkloadId, Option<Policy>)> = {
-        let mut guard = state.workload_health.lock();
-        let live_keys: std::collections::BTreeSet<&str> =
-            live.iter().map(|(k, _)| k.as_str()).collect();
-        guard.retain(|k, _| live_keys.contains(k.as_str()));
-        for (key, _) in &live {
-            guard.entry(key.clone()).or_insert_with(|| Entry::new(now));
-        }
-        live.into_iter()
-            .filter(|(key, _)| guard.get(key).is_some_and(|e| e.due(now)))
-            .map(|(key, id)| {
-                let policy = guard.get(&key).and_then(|e| e.policy);
-                (key, id, policy)
-            })
-            .collect()
-    };
+    let due = reconcile(&mut state.workload_health.lock(), live, now);
 
     for (key, id, known_policy) in due {
         // Read the declared policy once per workload. `describe` is a registry
@@ -540,6 +576,29 @@ mod tests {
         // Once probed, the interval governs rather than the initial delay.
         e.last_probe = Some(now);
         assert!(!e.due(now));
+    }
+
+    #[test]
+    fn a_non_running_workload_loses_its_stale_ready_verdict_and_is_not_probed() {
+        // R964-B2: Pending, pid=null, ports=[] beside health=ready.
+        let id = kamaji_proto::WorkloadId::new("wl");
+        let now = Instant::now();
+        let mut map = BTreeMap::new();
+        let mut e = Entry::new(now);
+        e.record = Some(fold(None, ProbeStatus::Ready, policy(1), 1));
+        e.last_probe = Some(now);
+        map.insert("wl".to_string(), e);
+
+        let due = reconcile(
+            &mut map,
+            vec![("wl".into(), id.clone(), WorkloadState::Pending)],
+            now,
+        );
+        assert!(due.is_empty(), "a Pending workload must not be probed");
+        assert!(map["wl"].record.is_none(), "stale verdict must be dropped");
+
+        let due = reconcile(&mut map, vec![("wl".into(), id, WorkloadState::Running)], now);
+        assert_eq!(due.len(), 1, "once Running it is probed again");
     }
 
     #[test]

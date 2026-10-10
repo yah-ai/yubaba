@@ -1,0 +1,49 @@
+name = "noisetable-compiler-staging"
+
+tier = "infra"
+archetype = "appliance"
+replicas = 1
+restart_policy = "always"
+
+[image]
+registry = "cr.yah.dev"
+repository = "noisetable-compiler"
+tag = "20261001b-arm64"
+digest = "sha256:92b5b877bfc4d892d2696d0ab4b20ee6acccd5016fab0897ba025e8c7fb5a70f"
+
+[resources]
+memory_mb = 512
+cpu_millis = 2000
+
+[[volumes]]
+source = { named = { name = "noisetable-compiler-staging-state" } }
+target = "/var/lib/noisetable-compiler"
+read_only = false
+
+[annotations]
+"yah.network" = "host"
+"yah.node-selector.mesh-tags" = "arch:arm,os:linux"
+
+[expose.mesh]
+identity = "noisetable-compiler-staging"
+ports = [7845, 7846, 7847]
+allow_from = []
+
+[[env]]
+name = "NOISETABLE_COMPILER_LOOKUP"
+value = { literal = { value = "lan" } }
+
+[[env]]
+name = "NOISETABLE_COMPILER_MAX_CONCURRENT"
+value = { literal = { value = "2" } }
+
+[healthcheck]
+probe = { tcp_connect = { port = 7847 } }
+interval = 15000
+timeout = 5000
+initial_delay = 15000
+failure_threshold = 3
+
+[stop_policy]
+signal = 15
+grace_period = 10000

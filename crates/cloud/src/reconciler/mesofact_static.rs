@@ -592,6 +592,11 @@ impl MesofactStaticReconciler {
 
         let mirror_prefix =
             publish_prefix(&ctx.service.name, ctx.env, ctx.component.mount.as_deref());
+        // The component's declared immutability (MFT-R825-F1) — the same
+        // policy the bundle path finalizes with, so R2 and `mesofact serve`
+        // agree on which objects may be cached for a year.
+        let policy = yah_mesofact_bundle::assets::OutputPolicy::load(&workload_dir, &dist_dir)
+            .with_context(|| format!("reading {}'s declared asset policy", workload_dir.display()))?;
         let report = publish_to_r2(
             &dist_dir,
             &account_id,
@@ -600,6 +605,7 @@ impl MesofactStaticReconciler {
             &secret_key,
             Some(&mirror_prefix),
             purge,
+            &policy,
         )
         .await
         .with_context(|| format!("publishing to R2 bucket {bucket:?} (account {account_id})"))?;
@@ -1529,6 +1535,7 @@ out_dir = "dist"
                 drivers: Default::default(),
                 asset_aliases: Default::default(),
                 build: Default::default(),
+                workload: Default::default(),
             };
             let service = ServiceConfig {
                 schema_version: 1,
@@ -1547,6 +1554,7 @@ out_dir = "dist"
                 wave: 0,
                 git: None,
                 deploy: Default::default(),
+                workload: None,
             };
             Self {
                 _workspace: workspace,

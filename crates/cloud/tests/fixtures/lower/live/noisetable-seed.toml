@@ -1,0 +1,50 @@
+name = "noisetable-seed"
+
+tier = "infra"
+archetype = "appliance"
+replicas = 1
+restart_policy = "always"
+
+[image]
+registry = "cr.yah.dev"
+repository = "noisetable-seed"
+tag = "20261001-amd64"
+digest = "sha256:407e3ae2be042f6cb0aef3d732db9202b327bbe84e829d45e0d2cb5eb069142e"
+
+[resources]
+memory_mb = 256
+cpu_millis = 250
+
+[[volumes]]
+source = { named = { name = "noisetable-seed-state" } }
+target = "/var/lib/noisetable-seed"
+read_only = false
+
+[annotations]
+"yah.network" = "host"
+"yah.placement.requires-taint" = "public-ip"
+"yah.node-selector.mesh-tags" = "arch:x86,os:linux"
+
+[expose.mesh]
+identity = "noisetable-seed"
+ports = [7843, 7844]
+allow_from = []
+
+[[env]]
+name = "NOISETABLE_SEED_PINS"
+value = { literal = { value = "nt-samples:e154239ac61d4def5e14bf8f7d5171e6de67a922e7caa9912607206def757f17" } }
+
+[[env]]
+name = "NOISETABLE_SEED_CACHE_BUDGET_BYTES"
+value = { literal = { value = "2147483648" } }
+
+[healthcheck]
+probe = { tcp_connect = { port = 7844 } }
+interval = 15000
+timeout = 5000
+initial_delay = 30000
+failure_threshold = 3
+
+[stop_policy]
+signal = 15
+grace_period = 10000

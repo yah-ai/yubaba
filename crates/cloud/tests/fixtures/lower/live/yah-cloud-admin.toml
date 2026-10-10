@@ -1,0 +1,60 @@
+
+name = "yah-cloud-admin"
+
+tier = "infra"
+
+archetype = "server"
+
+replicas = 1
+restart_policy = "always"
+
+[image]
+registry = "cr.yah.dev"
+repository = "yah-cloud-admin"
+tag = "20260914-amd64"
+digest = "sha256:75d5fc3a9c14b05d4c06bcb09e087b633cde0976f60e2980ae76ee29825c1d97"
+
+[resources]
+memory_mb = 256
+cpu_millis = 250
+
+[annotations]
+"yah.network" = "host"
+
+[expose.mesh]
+identity = "yah-cloud-admin"
+ports = [4325]
+allow_from = []
+
+
+
+[[env]]
+name = "YAH_CLOUD_ADMIN_AUTH_PUBLIC_KEY_FILE"
+value = { literal = { value = "/run/secrets/cheers-verify.key" } }
+
+[[env]]
+name = "YAH_CLOUD_ADMIN_AUTH_KID"
+value = { literal = { value = "YOHV4Riq-g8fX4uYl8rTjQ" } }
+
+[[env]]
+name = "YAH_CLOUD_ADMIN_AUTH_ISS"
+value = { literal = { value = "yah-camp" } }
+
+[[env]]
+name = "YAH_CLOUD_ADMIN_AUTH_AUD"
+value = { literal = { value = "yah-cloud-admin" } }
+
+[[secrets]]
+source = { cluster = { name = "cheers/cloud-admin/verify-key" } }
+target = { file = { path = "/run/secrets/cheers-verify.key", mode = 0o400 } }
+
+[healthcheck]
+probe = { http_get = { path = "/__mesofact/health", port = 4325, expect_status = 200 } }
+interval = 15000
+timeout = 5000
+initial_delay = 20000
+failure_threshold = 3
+
+[stop_policy]
+signal = 15
+grace_period = 10000

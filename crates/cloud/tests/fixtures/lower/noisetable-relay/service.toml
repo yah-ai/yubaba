@@ -1,0 +1,74 @@
+# W361 migration fixture (R959-T4): noisetable-relay's service.toml (prod only).
+# Lowered with prod.toml it must equal ../live/noisetable-relay.toml
+# (copied from ~/ss/noisetable/.yah/infra/workloads/, 2026-10-09).
+schema_version = 1
+name = "noisetable-relay"
+
+[address]
+kind = "front-door"
+domain = "relay.noisetable.com"
+
+[[components]]
+id = "relay"
+kind = "container"
+path = "."
+role = "compute"
+
+[components.workload]
+tier = "infra"
+archetype = "appliance"
+replicas = 1
+restart_policy = "always"
+
+[components.workload.resources]
+memory_mb = 512
+cpu_millis = 500
+
+[components.workload.annotations]
+"yah.network" = "host"
+"yah.placement.requires-taint" = "public-ip"
+"yah.node-selector.mesh-tags" = "arch:x86,os:linux"
+
+[components.workload.expose.mesh]
+ports = [8449, 8450, 7842]
+allow_from = []
+
+[[components.workload.volumes]]
+source = { named = { name = "noisetable-relay-acme" } }
+target = "/var/lib/noisetable-relay/acme"
+read_only = false
+
+[[components.workload.env]]
+name = "NOISETABLE_RELAY_TLS"
+value = { literal = { value = "letsencrypt" } }
+
+[[components.workload.env]]
+name = "NOISETABLE_RELAY_DOMAIN"
+value = { literal = { value = "relay.noisetable.com" } }
+
+[[components.workload.env]]
+name = "NOISETABLE_RELAY_ACME_CONTACT"
+value = { literal = { value = "mailto:ops@noisetable.com" } }
+
+[[components.workload.env]]
+name = "NOISETABLE_RELAY_HTTPS_ADDR"
+value = { literal = { value = "127.0.0.1:8449" } }
+
+[[components.workload.env]]
+name = "NOISETABLE_RELAY_PUBLIC_HTTPS_PORT"
+value = { literal = { value = "443" } }
+
+[[components.workload.env]]
+name = "NOISETABLE_RELAY_HTTP_ADDR"
+value = { literal = { value = "127.0.0.1:8450" } }
+
+[components.workload.healthcheck]
+probe = { http_get = { path = "/generate_204", port = 8450, expect_status = 204 } }
+interval = 15000
+timeout = 5000
+initial_delay = 30000
+failure_threshold = 3
+
+[components.workload.stop_policy]
+signal = 15
+grace_period = 15000

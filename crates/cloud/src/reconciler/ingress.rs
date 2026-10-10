@@ -1828,6 +1828,7 @@ mod tests {
             drivers: Default::default(),
             asset_aliases: Default::default(),
             build: Default::default(),
+            workload: Default::default(),
         }
     }
 

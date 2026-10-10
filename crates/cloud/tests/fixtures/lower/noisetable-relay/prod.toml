@@ -1,0 +1,13 @@
+# W361 migration fixture (R959-T4): noisetable-relay mirrors/prod.toml. The
+# image pin is the only mirror-side field (build-relay-image.sh writes it).
+schema_version = 1
+shape = "single-machine"
+
+[workload.relay]
+ident = "noisetable-relay"
+
+[workload.relay.image]
+registry = "cr.yah.dev"
+repository = "noisetable-relay"
+tag = "20261001-amd64"
+digest = "sha256:aa7edcf232dce217c6023e8a18de4d1e7303cd1dd186ae974d8f408a120d3a6e"

@@ -145,6 +145,7 @@ pub mod inner_door;
 // `local_driver_glue` carries the cloud-config adapter that used to live as
 // `LocalContainerSpec::from_provider_config`.
 pub mod local_driver_glue;
+pub mod lower;
 pub mod mesh;
 pub mod migrate;
 pub mod multi_root;
@@ -185,6 +186,7 @@ pub use local_driver::{
     RuntimePref, RuntimeProvider, SocketRuntimeProvider, LABEL_KEY, NAME_PREFIX,
 };
 pub use local_driver_glue::local_container_spec_from_provider;
+pub use lower::{keyed_sets, lower, WorkloadBase, WorkloadOverlay};
 pub use provider::{
     on_ingress_owner_changed, reconcile_assignment, BucketAcl, BucketRef, CfAccountInfo,
     CloudflareClient, CloudflareEnvoy, CreateR2BucketResult, CreateTokenResult, CreateTunnelResult,
@@ -193,7 +195,7 @@ pub use provider::{
     Location, MachineProvider, OvhFloatingIp, ProjectId, R2BucketInfo, R2CustomDomain, ServerId,
     ServerSpec, ServerStatus, ServerSummary, TokenGrant, TunnelConnState, TunnelDnsRecord,
     TunnelDriftRow, TunnelDriftState, VultrFloatingIp, WorkerDeployResult, DOOR_DNS_GRANTS,
-    MESOFACT_STATIC_GRANTS, TUNNEL_EDIT_GRANTS,
+    MESOFACT_STATIC_GRANTS, R2_BUCKET_READ_GRANTS, R2_BUCKET_RW_GRANTS, TUNNEL_EDIT_GRANTS,
 };
 #[cfg(feature = "local-docker")]
 pub use provider::{LocalDockerEnvoy, LocalDockerProvider};

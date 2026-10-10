@@ -349,6 +349,11 @@ pub enum GrantScope {
     Account,
     /// Granted on a single zone (`com.cloudflare.api.account.zone.<id>`).
     Zone,
+    /// Granted on a single R2 bucket
+    /// (`com.cloudflare.edge.r2.bucket.<account_id>_default_<bucket>`) — R965.
+    /// The `default` is R2's jurisdiction segment; every bucket on this
+    /// account lives there.
+    R2Bucket,
 }
 
 /// One permission to bake into a minted token: a Cloudflare permission-group
@@ -490,15 +495,76 @@ pub const DOOR_DNS_GRANTS: &[TokenGrant] = &[
     },
 ];
 
+/// Read-only object access on the buckets a token is minted over (R965):
+/// `GetObject`, `HeadObject` and `ListObjectsV2` — List is part of Item Read,
+/// verified live 2026-08-05 on `yah-fleet-index-read`, so never describe a
+/// token built from this as "can read exactly one key". IDs resolved live
+/// 2026-10-09 against `GET /accounts/{id}/tokens/permission_groups`; the
+/// catalog lists both groups under scope `com.cloudflare.edge.r2.bucket`.
+pub const R2_BUCKET_READ_GRANTS: &[TokenGrant] = &[TokenGrant {
+    group_name: "Workers R2 Storage Bucket Item Read",
+    scope: GrantScope::R2Bucket,
+    fallback_id: "6a018a9f2fc74eb6b293b0c548f38b39",
+}];
+
+/// [`R2_BUCKET_READ_GRANTS`] plus object write/delete on the same buckets.
+/// An R2 token scopes to a bucket and never to a prefix, so this reaches
+/// every key in each bucket named.
+pub const R2_BUCKET_RW_GRANTS: &[TokenGrant] = &[
+    TokenGrant {
+        group_name: "Workers R2 Storage Bucket Item Read",
+        scope: GrantScope::R2Bucket,
+        fallback_id: "6a018a9f2fc74eb6b293b0c548f38b39",
+    },
+    TokenGrant {
+        group_name: "Workers R2 Storage Bucket Item Write",
+        scope: GrantScope::R2Bucket,
+        fallback_id: "2efd5506f9c8494dacb1fa10a3e7d5b6",
+    },
+];
+
 /// Result of minting an account-owned API token. `value` is the secret and is
 /// returned by Cloudflare exactly once — store it immediately.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateTokenResult {
     pub id: String,
     pub name: String,
     /// The token secret. Shown once by Cloudflare; never retrievable again.
     pub value: String,
+}
+
+impl std::fmt::Debug for CreateTokenResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateTokenResult")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+impl CreateTokenResult {
+    /// The S3 credential pair R2 derives from this token (R965): access key
+    /// id = the token id, secret access key = lowercase hex SHA-256 of the
+    /// token value. The token value itself is never needed again.
+    pub fn r2_s3_pair(&self) -> (String, String) {
+        r2_s3_pair(&self.id, &self.value)
+    }
+}
+
+/// See [`CreateTokenResult::r2_s3_pair`].
+pub fn r2_s3_pair(token_id: &str, token_value: &str) -> (String, String) {
+    use sha2::Digest;
+    (
+        token_id.to_string(),
+        hex::encode(sha2::Sha256::digest(token_value.as_bytes())),
+    )
+}
+
+/// Resource key a [`GrantScope::R2Bucket`] grant is issued on.
+pub fn r2_bucket_resource(account_id: &str, bucket: &str) -> String {
+    format!("com.cloudflare.edge.r2.bucket.{account_id}_default_{bucket}")
 }
 
 // ---------- client ----------
@@ -1582,8 +1648,10 @@ impl CloudflareClient {
     }
 
     /// Mint an **account-owned** API token under `account_id` from `grants`
-    /// scoped to `account_id` + every zone in `zone_ids` (zone-scoped grants
-    /// apply to all of them; at least one is required).
+    /// scoped to `account_id`, every zone in `zone_ids`, and every R2 bucket
+    /// in `r2_buckets`. Each list is required exactly when `grants` carries a
+    /// grant at that scope (an R2-only token takes no zone, R965).
+    /// `expires_on` sets Cloudflare's own TTL on the token.
     ///
     /// Resolves each grant's permission-group name against the live catalog
     /// (falling back to its baked-in ID), groups the IDs into account- and
@@ -1598,22 +1666,51 @@ impl CloudflareClient {
         &self,
         account_id: &str,
         zone_ids: &[String],
+        r2_buckets: &[String],
         token_name: &str,
         grants: &[TokenGrant],
+        expires_on: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<CreateTokenResult> {
-        anyhow::ensure!(!zone_ids.is_empty(), "token create: no zone given");
+        let needs = |scope| grants.iter().any(|g| g.scope == scope);
+        anyhow::ensure!(
+            !needs(GrantScope::Zone) || !zone_ids.is_empty(),
+            "token create: zone-scoped grants but no zone given"
+        );
+        anyhow::ensure!(
+            !needs(GrantScope::R2Bucket) || !r2_buckets.is_empty(),
+            "token create: bucket-scoped grants but no R2 bucket given"
+        );
         // A catalog lookup failure is non-fatal: build_token_body falls back
         // to the baked-in IDs for any name the (empty) catalog can't resolve.
         let catalog = self
             .list_permission_group_ids(account_id)
             .await
             .unwrap_or_default();
-        let body = build_token_body(token_name, account_id, zone_ids, grants, &catalog);
+        let mut body =
+            build_token_body(token_name, account_id, zone_ids, r2_buckets, grants, &catalog);
+        if let Some(t) = expires_on {
+            body["expires_on"] =
+                serde_json::Value::String(t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+        }
 
         let resp: CfSingle<CreateTokenResult> = self
             .cf_post(&format!("/accounts/{account_id}/tokens"), &body)
             .await?;
-        self.ok(&resp.success, &resp.errors)?;
+        self.ok(&resp.success, &resp.errors).map_err(|e| {
+            // Measured (R707-F4, R965): an ACCOUNT-owned token answers 9109 on
+            // every /accounts/{id}/tokens verb, API Tokens:Write or not. Only a
+            // USER-owned token can mint here.
+            if e.to_string().contains("9109") {
+                e.context(
+                    "the bootstrap token cannot manage account tokens — it must be a \
+                     USER-owned token with API Tokens:Write (this camp's is vault slot \
+                     `cloudflare-legacy-yah`: pass --bootstrap-slot cloudflare-legacy-yah); \
+                     an account-owned token such as `cloudflare-api-token` answers 9109 here",
+                )
+            } else {
+                e
+            }
+        })?;
         resp.result
             .ok_or_else(|| anyhow!("token create: no result in response"))
     }
@@ -1824,12 +1921,14 @@ fn resolve_grant_id(
 
 /// Build the `POST /accounts/{id}/tokens` request body for `grants`, grouping
 /// account- and zone-scoped permission groups into separate policy blocks
-/// (Cloudflare rejects a single block mixing the two scopes). A scope with no
-/// grants produces no block.
+/// (Cloudflare rejects a single block mixing the two scopes), plus one block
+/// for R2-bucket-scoped groups naming every bucket. A scope with no grants
+/// produces no block.
 fn build_token_body(
     token_name: &str,
     account_id: &str,
     zone_ids: &[String],
+    r2_buckets: &[String],
     grants: &[TokenGrant],
     catalog: &std::collections::BTreeMap<String, String>,
 ) -> serde_json::Value {
@@ -1868,6 +1967,13 @@ fn build_token_body(
                 .map(|z| format!("com.cloudflare.api.account.zone.{z}"))
                 .collect(),
             ids_for(GrantScope::Zone),
+        ),
+        block(
+            r2_buckets
+                .iter()
+                .map(|b| r2_bucket_resource(account_id, b))
+                .collect(),
+            ids_for(GrantScope::R2Bucket),
         ),
     ]
     .into_iter()
@@ -2077,7 +2183,7 @@ mod tests {
         let mut catalog = BTreeMap::new();
         catalog.insert("Zone Read".to_string(), "CATALOG_ZONE_READ".to_string());
 
-        let body = build_token_body("t", "ACCT", &["ZONE".into()], MESOFACT_STATIC_GRANTS, &catalog);
+        let body = build_token_body("t", "ACCT", &["ZONE".into()], &[], MESOFACT_STATIC_GRANTS, &catalog);
         let policies = body["policies"].as_array().unwrap();
         assert_eq!(policies.len(), 2, "one account block + one zone block");
 
@@ -2121,7 +2227,7 @@ mod tests {
             scope: GrantScope::Zone,
             fallback_id: "ZR",
         }];
-        let body = build_token_body("t", "A", &["Z".into()], only_zone, &BTreeMap::new());
+        let body = build_token_body("t", "A", &["Z".into()], &[], only_zone, &BTreeMap::new());
         let policies = body["policies"].as_array().unwrap();
         assert_eq!(policies.len(), 1, "no account block when no account grants");
         assert_eq!(
@@ -2137,7 +2243,7 @@ mod tests {
     fn door_dns_grants_cover_every_zone_and_nothing_else() {
         use std::collections::BTreeMap;
         let zones: Vec<String> = vec!["Z1".into(), "Z2".into(), "Z3".into()];
-        let body = build_token_body("t", "ACCT", &zones, DOOR_DNS_GRANTS, &BTreeMap::new());
+        let body = build_token_body("t", "ACCT", &zones, &[], DOOR_DNS_GRANTS, &BTreeMap::new());
         let policies = body["policies"].as_array().unwrap();
         assert_eq!(policies.len(), 1, "zone block only");
         let res = policies[0]["resources"].as_object().unwrap();
@@ -2164,7 +2270,7 @@ mod tests {
     #[test]
     fn tunnel_edit_grants_build_account_only_policy() {
         use std::collections::BTreeMap;
-        let body = build_token_body("t", "ACCT", &["ZONE".into()], TUNNEL_EDIT_GRANTS, &BTreeMap::new());
+        let body = build_token_body("t", "ACCT", &["ZONE".into()], &[], TUNNEL_EDIT_GRANTS, &BTreeMap::new());
         let policies = body["policies"].as_array().unwrap();
         assert_eq!(policies.len(), 1, "no zone block for an account-only profile");
         assert_eq!(
@@ -2178,6 +2284,60 @@ mod tests {
             .map(|g| g["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["c07321b023e944ff818fec44d8203567"]);
+    }
+
+    /// R965: an R2-bucket token is ONE policy block naming each bucket's
+    /// resource key and nothing else — no account or zone resource, even
+    /// when a zone is passed in, so a bucket token can never widen to `*`.
+    #[test]
+    fn r2_bucket_grants_name_only_the_buckets() {
+        use std::collections::BTreeMap;
+        let buckets: Vec<String> = vec!["noisetable-assets".into(), "other".into()];
+        for (grants, want) in [
+            (R2_BUCKET_READ_GRANTS, vec!["6a018a9f2fc74eb6b293b0c548f38b39"]),
+            (
+                R2_BUCKET_RW_GRANTS,
+                vec![
+                    "2efd5506f9c8494dacb1fa10a3e7d5b6",
+                    "6a018a9f2fc74eb6b293b0c548f38b39",
+                ],
+            ),
+        ] {
+            let body =
+                build_token_body("t", "ACCT", &["ZONE".into()], &buckets, grants, &BTreeMap::new());
+            let policies = body["policies"].as_array().unwrap();
+            assert_eq!(policies.len(), 1, "bucket block only");
+            let res = policies[0]["resources"].as_object().unwrap();
+            let mut keys: Vec<&str> = res.keys().map(String::as_str).collect();
+            keys.sort();
+            assert_eq!(
+                keys,
+                vec![
+                    "com.cloudflare.edge.r2.bucket.ACCT_default_noisetable-assets",
+                    "com.cloudflare.edge.r2.bucket.ACCT_default_other",
+                ]
+            );
+            let mut ids: Vec<&str> = policies[0]["permission_groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|g| g["id"].as_str().unwrap())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, want);
+        }
+    }
+
+    /// R965: the S3 pair R2 derives from a token, pinned against the
+    /// FIPS 180-2 `abc` vector so a change to the derivation cannot pass.
+    #[test]
+    fn r2_s3_pair_is_token_id_and_sha256_hex_of_value() {
+        let (key_id, secret) = r2_s3_pair("tok-id", "abc");
+        assert_eq!(key_id, "tok-id");
+        assert_eq!(
+            secret,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     /// Decode the multipart `metadata` part and return its parsed JSON.

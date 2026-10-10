@@ -1,0 +1,36 @@
+# W361 migration fixture (R959-T4): noisetable-coordinator mirrors/staging.toml.
+schema_version = 1
+shape = "single-machine"
+
+[workload.coordinator]
+ident = "noisetable-coordinator-staging"
+
+[workload.coordinator.image]
+registry = "cr.yah.dev"
+repository = "noisetable-coordinator"
+tag = "20261001-arm64"
+digest = "sha256:336a1dc2659c611eeff4ab5aba07b0561b9a783045ae430087bf0b5bd0021dd7"
+
+[workload.coordinator.annotations]
+"yah.node-selector.mesh-tags" = "arch:arm,os:linux"
+
+[[workload.coordinator.volumes]]
+source = { named = { name = "noisetable-coordinator-staging-state" } }
+target = "/var/lib/noisetable-coordinator"
+read_only = false
+
+[[workload.coordinator.env]]
+name = "NOISETABLE_COORDINATOR_ROOM_NAME"
+value = { literal = { value = "noisetable staging wan room" } }
+
+[[workload.coordinator.env]]
+name = "NOISETABLE_COORDINATOR_ISSUER_PUBLIC_KEY"
+value = { literal = { value = "2d13ceb0b503043d800cb9e31409ea3f63e75e54a285341362fbd6dd50e354ec" } }
+
+[[workload.coordinator.env]]
+name = "NOISETABLE_COORDINATOR_POLICY"
+value = { literal = { value = '{"users":{"user:probe":["edit","observe"]}}' } }
+
+[[workload.coordinator.env]]
+name = "NOISETABLE_COORDINATOR_MEMBERS"
+value = { literal = { value = '[{"key":"bfc12164bd26c1cd969df3e818e8d8ef6b1c2748bc3b2a7d2cb3aaf84d4e56e0","label":"wan probe","roles":["observe"]}]' } }

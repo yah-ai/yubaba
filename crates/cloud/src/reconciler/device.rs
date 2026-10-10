@@ -1712,6 +1712,7 @@ mod tests {
             drivers: Default::default(),
             asset_aliases: Default::default(),
             build: Default::default(),
+            workload: Default::default(),
         }
     }
 
@@ -1789,6 +1790,7 @@ mod tests {
                 wave: 0,
                 git: None,
                 deploy: Default::default(),
+                workload: None,
             }],
         }
     }

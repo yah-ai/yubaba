@@ -213,6 +213,7 @@ mod tests {
             wave: 0,
             git: None,
             deploy: Default::default(),
+            workload: None,
         }
     }
 
@@ -327,6 +328,7 @@ recipe = "quantize"
                 wave: 0,
                 git: None,
                 deploy: Default::default(),
+                workload: None,
             }],
         );
         let live = collect_live_derive_hashes(tmp.path(), [&svc]).unwrap();

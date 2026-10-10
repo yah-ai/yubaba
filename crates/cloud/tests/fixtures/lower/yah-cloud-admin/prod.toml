@@ -1,0 +1,21 @@
+# W361 migration fixture: yah-cloud-admin mirrors/prod.toml with its overlay.
+# The compute slot is not fronted and there is no [[ingress]], so no
+# expose.public is derived.
+schema_version = 1
+shape = "single-machine"
+
+[providers.compute]
+use = "hetzner"
+
+[providers.compute.required]
+regions = ["us-west"]
+mesh_tags = ["tag:cloud-runner"]
+
+[workload.cloud-admin]
+ident = "yah-cloud-admin"
+
+[workload.cloud-admin.image]
+registry = "cr.yah.dev"
+repository = "yah-cloud-admin"
+tag = "20260914-amd64"
+digest = "sha256:75d5fc3a9c14b05d4c06bcb09e087b633cde0976f60e2980ae76ee29825c1d97"

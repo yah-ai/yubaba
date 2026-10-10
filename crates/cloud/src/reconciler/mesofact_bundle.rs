@@ -1532,6 +1532,7 @@ mod tests {
             drivers: Default::default(),
             asset_aliases: BTreeMap::new(),
             build: Default::default(),
+            workload: Default::default(),
         }
     }
 

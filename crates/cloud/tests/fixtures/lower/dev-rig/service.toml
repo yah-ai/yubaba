@@ -1,0 +1,46 @@
+# W361 migration fixture (R959-T3): the dev rig's service.toml. One `guest`
+# component carries the env-invariant microVM body; each vm-us-west-NNN mirror
+# overlays its ident and node pin. Lowered with vm-us-west-NNN.toml it must
+# equal ../live/vm-us-west-NNN.toml (copied from .yah/infra/workloads/, 2026-10-09).
+schema_version = 1
+name = "dev-rig"
+
+[address]
+kind = "front-door"
+domain = "dev-rig.mesh.yah.dev"
+
+[[components]]
+id = "guest"
+kind = "container"
+path = "oss/kamaji"
+role = "compute"
+
+[components.workload]
+tier = "infra"
+archetype = "server"
+replicas = 1
+restart_policy = "always"
+command = ["/bin/sh", "-c", "exec sleep infinity"]
+
+[components.workload.image]
+registry = "local"
+repository = "kamaji-service-guest"
+tag = "trixie"
+digest = ""
+
+[components.workload.resources]
+memory_mb = 1024
+memory_request_mb = 1024
+cpu_millis = 1000
+
+[components.workload.annotations]
+"yah.exec" = "microvm"
+"yah.resume" = "node"
+
+[components.workload.expose.mesh]
+ports = []
+allow_from = []
+
+[components.workload.stop_policy]
+signal = 15
+grace_period = 10000

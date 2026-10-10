@@ -1,0 +1,21 @@
+# W361 migration fixture (R959-T4): noisetable-seed mirrors/prod.toml.
+schema_version = 1
+shape = "single-machine"
+
+[workload.seed]
+ident = "noisetable-seed"
+
+[workload.seed.image]
+registry = "cr.yah.dev"
+repository = "noisetable-seed"
+tag = "20261001-amd64"
+digest = "sha256:407e3ae2be042f6cb0aef3d732db9202b327bbe84e829d45e0d2cb5eb069142e"
+
+[workload.seed.annotations]
+"yah.placement.requires-taint" = "public-ip"
+"yah.node-selector.mesh-tags" = "arch:x86,os:linux"
+
+[[workload.seed.volumes]]
+source = { named = { name = "noisetable-seed-state" } }
+target = "/var/lib/noisetable-seed"
+read_only = false

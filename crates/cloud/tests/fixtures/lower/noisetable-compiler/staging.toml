@@ -1,0 +1,28 @@
+# W361 migration fixture (R959-T4): noisetable-compiler mirrors/staging.toml.
+schema_version = 1
+shape = "single-machine"
+
+[workload.compiler]
+ident = "noisetable-compiler-staging"
+
+[workload.compiler.image]
+registry = "cr.yah.dev"
+repository = "noisetable-compiler"
+tag = "20261001b-arm64"
+digest = "sha256:92b5b877bfc4d892d2696d0ab4b20ee6acccd5016fab0897ba025e8c7fb5a70f"
+
+[workload.compiler.annotations]
+"yah.node-selector.mesh-tags" = "arch:arm,os:linux"
+
+[[workload.compiler.volumes]]
+source = { named = { name = "noisetable-compiler-staging-state" } }
+target = "/var/lib/noisetable-compiler"
+read_only = false
+
+[[workload.compiler.env]]
+name = "NOISETABLE_COMPILER_LOOKUP"
+value = { literal = { value = "lan" } }
+
+[[workload.compiler.env]]
+name = "NOISETABLE_COMPILER_MAX_CONCURRENT"
+value = { literal = { value = "2" } }

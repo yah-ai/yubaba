@@ -1,0 +1,116 @@
+# W361 migration fixture: noisetable-api mirrors/prod.toml with its overlay.
+# The compute slot drops `name` (replaced by overlay `ident`); zone/port
+# derive expose.public.
+schema_version = 1
+shape = "single-machine"
+
+[[ingress]]
+provider = "passway"
+machines = ["us-east-001", "us-south-001", "us-west-001"]
+
+[providers.compute]
+kind = "static"
+machine = "us-east-001"
+zone = "api.noisetable.com"
+port = 4332
+
+[workload.api]
+ident = "noisetable-account"
+
+[workload.api.image]
+registry = "cr.yah.dev"
+repository = "noisetable-account"
+tag = "20261008.1-amd64-dev"
+digest = "sha256:d7eedfaa3ebe920c5c74a88c6eef2213dfce40e2673b3b8d64d249d0c8a9b9f7"
+
+[workload.api.annotations]
+"yah.float" = "cluster"
+
+[[workload.api.volumes]]
+source = { named = { name = "noisetable-account-data" } }
+target = "/data"
+read_only = false
+
+[workload.api.durability]
+tier        = "stream"
+engine      = "turso"
+store       = "s3://noisetable-account-backup/noisetable-account"
+subjects    = ["account.db", "grants.db", "projects.db", "sessions.db"]
+rpo_seconds = 120
+
+[[workload.api.db]]
+name      = "account"
+subject   = "account.db"
+workbench = "snapshot"
+
+[[workload.api.db]]
+name      = "account-live"
+subject   = "account.db"
+workbench = "vend"
+
+[workload.api.expose.mesh]
+ports = [
+  { name = "http", port = 4332 },
+  { name = "admin", port = 4334 },
+  { name = "sql", port = 4335 },
+]
+
+[[workload.api.env]]
+name = "NOISETABLE_ACCOUNT_PUBLIC_ORIGIN"
+value = { literal = { value = "https://noisetable.com" } }
+
+[[workload.api.env]]
+name = "NOISETABLE_ACCOUNT_MAIL_FROM"
+value = { literal = { value = "Noise Table <noreply@noisetable.com>" } }
+
+[[workload.api.env]]
+name = "NOISETABLE_ACCOUNT_MAILER"
+value = { literal = { value = "smtp" } }
+
+[[workload.api.env]]
+name = "NOISETABLE_ACCOUNT_SMTP_HOST"
+value = { literal = { value = "smtp.mailgun.org" } }
+
+[[workload.api.env]]
+name = "NOISETABLE_ACCOUNT_SMTP_USERNAME"
+value = { literal = { value = "postmaster@noisetable.com" } }
+
+[[workload.api.env]]
+name = "NOISETABLE_ACCOUNT_ALLOWED_ORIGINS"
+value = { literal = { value = "https://noisetable.com" } }
+
+[[workload.api.env]]
+name = "NOISETABLE_ACCOUNT_SMTP_PASSWORD_FILE"
+value = { literal = { value = "/run/secrets/smtp.password" } }
+
+[[workload.api.env]]
+name = "NOISETABLE_ACCOUNT_ADMIN_ADDR"
+value = { literal = { value = "0.0.0.0:4334" } }
+
+[[workload.api.env]]
+name = "NOISETABLE_ACCOUNT_ADMIN_PRINCIPALS"
+value = { literal = { value = "user:05f11360-3e6c-4155-b5bb-f8285c064858" } }
+
+[[workload.api.env]]
+name = "NOISETABLE_ACCOUNT_VEND_VERIFY_KEY_FILE"
+value = { literal = { value = "/run/secrets/cheers-vend-verify.key" } }
+
+[[workload.api.env]]
+name = "NOISETABLE_ACCOUNT_VEND_AUDIENCE"
+value = { literal = { value = "noisetable-account/account-live" } }
+
+[[workload.api.secrets]]
+source = { cluster = { name = "noisetable/account/session-key" } }
+target = { file = { path = "/run/secrets/session.key", mode = 0o400 } }
+
+[[workload.api.secrets]]
+source = { cluster = { name = "noisetable/account/magic-link-key" } }
+target = { file = { path = "/run/secrets/magic-link.key", mode = 0o400 } }
+
+[[workload.api.secrets]]
+source = { cluster = { name = "noisetable/account/smtp-password" } }
+target = { file = { path = "/run/secrets/smtp.password", mode = 0o400 } }
+
+[[workload.api.secrets]]
+source = { cluster = { name = "cheers/vend/verify-key" } }
+target = { file = { path = "/run/secrets/cheers-vend-verify.key", mode = 0o400 } }

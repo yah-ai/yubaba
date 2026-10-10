@@ -559,6 +559,7 @@ mod tests {
             wave: 0,
             git: None,
             deploy: Default::default(),
+            workload: None,
         }
     }
 
@@ -620,6 +621,7 @@ mod tests {
             wave: 1,
             git: None,
             deploy: Default::default(),
+            workload: None,
         });
         // Loading must not try to parse the mesofact-static path.
         let live = compute_live_set(root, &svc).unwrap();

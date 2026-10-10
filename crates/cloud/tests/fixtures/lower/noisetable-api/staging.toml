@@ -1,0 +1,71 @@
+# W361 migration fixture: noisetable-api mirrors/staging.toml with its overlay.
+# No [durability] / [[db]] (overlay-only, staging declares neither).
+schema_version = 1
+shape = "single-machine"
+
+[[ingress]]
+provider = "passway"
+machines = ["us-west-011"]
+hostnames = ["api-staging.noisetable.com"]
+
+[[ingress]]
+provider = "cloudflare-tunnel"
+via = "passway"
+use = "cloudflare-tunnel-staging"
+tunnel_id = "1b41587a-7298-4f29-97bf-40d51ed79397"
+machines = ["us-west-011"]
+hostnames = ["api-staging.noisetable.com"]
+
+[providers.compute]
+kind = "static"
+machine = "us-west-011"
+zone = "api-staging.noisetable.com"
+port = 4332
+
+[workload.api]
+ident = "noisetable-account-staging"
+
+[workload.api.image]
+registry = "cr.yah.dev"
+repository = "noisetable-account"
+tag = "20261001.1-arm64-staging-dev"
+digest = "sha256:9798416035d73cb265ffabd36f306886ae4e12f3897729101a0a44cf8fd6c95a"
+
+[workload.api.annotations]
+"yah.node-selector.mesh-tags" = "arch:arm,os:linux"
+
+[[workload.api.volumes]]
+source = { named = { name = "noisetable-account-staging-data" } }
+target = "/data"
+read_only = false
+
+[workload.api.expose.mesh]
+ports = [4332]
+
+[[workload.api.env]]
+name = "NOISETABLE_ACCOUNT_PUBLIC_ORIGIN"
+value = { literal = { value = "https://staging.noisetable.com" } }
+
+[[workload.api.env]]
+name = "NOISETABLE_ACCOUNT_RP_ID"
+value = { literal = { value = "staging.noisetable.com" } }
+
+[[workload.api.env]]
+name = "NOISETABLE_ACCOUNT_MAIL_FROM"
+value = { literal = { value = "Noise Table (staging) <noreply@noisetable.com>" } }
+
+[[workload.api.env]]
+name = "NOISETABLE_ACCOUNT_MAILER"
+value = { literal = { value = "log" } }
+
+[[workload.api.env]]
+name = "NOISETABLE_ACCOUNT_ALLOWED_ORIGINS"
+value = { literal = { value = "https://staging.noisetable.com" } }
+
+[[workload.api.secrets]]
+source = { cluster = { name = "noisetable/account-staging/session-key" } }
+target = { file = { path = "/run/secrets/session.key", mode = 0o400 } }
+
+[[workload.api.secrets]]
+source = { cluster = { name = "noisetable/account-staging/magic-link-key" } }
+target = { file = { path = "/run/secrets/magic-link.key", mode = 0o400 } }

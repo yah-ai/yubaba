@@ -1,0 +1,63 @@
+# W361 migration fixture: yah-cloud-admin's service.toml carrying the
+# env-invariant base. Lowered with prod.toml it must equal
+# ../live/yah-cloud-admin.toml (copied from .yah/infra/workloads/, 2026-10-09).
+schema_version = 1
+name = "yah-cloud-admin"
+
+[address]
+kind = "front-door"
+domain = "cloud-admin.mesh.yah.dev"
+
+[[components]]
+id = "cloud-admin"
+kind = "container"
+path = "crates/yah/cloud-admin"
+role = "compute"
+
+[components.workload]
+tier = "infra"
+archetype = "server"
+replicas = 1
+restart_policy = "always"
+
+[components.workload.resources]
+memory_mb = 256
+cpu_millis = 250
+
+[components.workload.annotations]
+"yah.network" = "host"
+
+[components.workload.expose.mesh]
+ports = [4325]
+allow_from = []
+
+[[components.workload.env]]
+name = "YAH_CLOUD_ADMIN_AUTH_PUBLIC_KEY_FILE"
+value = { literal = { value = "/run/secrets/cheers-verify.key" } }
+
+[[components.workload.env]]
+name = "YAH_CLOUD_ADMIN_AUTH_KID"
+value = { literal = { value = "YOHV4Riq-g8fX4uYl8rTjQ" } }
+
+[[components.workload.env]]
+name = "YAH_CLOUD_ADMIN_AUTH_ISS"
+value = { literal = { value = "yah-camp" } }
+
+[[components.workload.env]]
+name = "YAH_CLOUD_ADMIN_AUTH_AUD"
+value = { literal = { value = "yah-cloud-admin" } }
+
+[[components.workload.secrets]]
+source = { cluster = { name = "cheers/cloud-admin/verify-key" } }
+target = { file = { path = "/run/secrets/cheers-verify.key", mode = 0o400 } }
+
+[components.workload.healthcheck]
+probe = { http_get = { path = "/__mesofact/health", port = 4325, expect_status = 200 } }
+interval = 15000
+timeout = 5000
+initial_delay = 20000
+failure_threshold = 3
+
+[components.workload.stop_policy]
+signal = 15
+grace_period = 10000

@@ -1,0 +1,44 @@
+# W361 migration fixture (R959-T4): noisetable-compiler's service.toml. The
+# env-invariant body; prod.toml / staging.toml overlay ident, image, volume,
+# placement annotations and env. Lowered it must equal ../live/noisetable-compiler{,-staging}.toml
+# (copied from ~/ss/noisetable/.yah/infra/workloads/, 2026-10-09).
+schema_version = 1
+name = "noisetable-compiler"
+
+[address]
+kind = "front-door"
+domain = "compiler.mesh.noisetable.com"
+
+[[components]]
+id = "compiler"
+kind = "container"
+path = "."
+role = "compute"
+
+[components.workload]
+tier = "infra"
+archetype = "appliance"
+replicas = 1
+restart_policy = "always"
+
+[components.workload.resources]
+memory_mb = 512
+cpu_millis = 2000
+
+[components.workload.annotations]
+"yah.network" = "host"
+
+[components.workload.expose.mesh]
+ports = [7845, 7846, 7847]
+allow_from = []
+
+[components.workload.healthcheck]
+probe = { tcp_connect = { port = 7847 } }
+interval = 15000
+timeout = 5000
+initial_delay = 15000
+failure_threshold = 3
+
+[components.workload.stop_policy]
+signal = 15
+grace_period = 10000

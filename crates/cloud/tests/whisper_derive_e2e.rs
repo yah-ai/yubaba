@@ -238,6 +238,7 @@ impl TestWorkspace {
                 git: None,
                 wave: 0,
                 deploy: Default::default(),
+                workload: None,
             },
             mirror: MirrorConfig {
                 schema_version: 1,
@@ -248,6 +249,7 @@ impl TestWorkspace {
                 drivers: Default::default(),
                 asset_aliases: BTreeMap::new(),
                 build: Default::default(),
+                workload: Default::default(),
             },
             workspace_root,
             _tmp: tmp,

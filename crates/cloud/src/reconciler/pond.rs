@@ -1798,6 +1798,7 @@ mod tests {
             wave: 0,
             git: None,
             deploy: Default::default(),
+            workload: None,
         };
         let mirror = crate::MirrorConfig {
             schema_version: 1,
@@ -1808,6 +1809,7 @@ mod tests {
             drivers: Default::default(),
             asset_aliases: Default::default(),
             build: Default::default(),
+            workload: Default::default(),
         };
         let ctx = ReconcileCtx {
             workspace_root: tmp.path(),
@@ -1871,6 +1873,7 @@ mod tests {
             wave: 0,
             git: None,
             deploy: Default::default(),
+            workload: None,
         };
         let mirror = crate::MirrorConfig {
             schema_version: 1,
@@ -1881,6 +1884,7 @@ mod tests {
             drivers: Default::default(),
             asset_aliases: Default::default(),
             build: Default::default(),
+            workload: Default::default(),
         };
         let ctx = ReconcileCtx {
             workspace_root: tmp.path(),
@@ -1956,6 +1960,7 @@ mod tests {
             wave: 0,
             git: None,
             deploy: Default::default(),
+            workload: None,
         };
         let mirror = crate::MirrorConfig {
             schema_version: 1,
@@ -1966,6 +1971,7 @@ mod tests {
             drivers: Default::default(),
             asset_aliases: Default::default(),
             build: Default::default(),
+            workload: Default::default(),
         };
         let ctx = ReconcileCtx {
             workspace_root: tmp.path(),
@@ -2039,6 +2045,7 @@ mod tests {
             wave: 0,
             git: None,
             deploy: Default::default(),
+            workload: None,
         };
         let mirror = crate::MirrorConfig {
             schema_version: 1,
@@ -2049,6 +2056,7 @@ mod tests {
             drivers: Default::default(),
             asset_aliases: Default::default(),
             build: Default::default(),
+            workload: Default::default(),
         };
         let ctx = ReconcileCtx {
             workspace_root: tmp.path(),
@@ -2116,6 +2124,7 @@ mod tests {
             wave: 0,
             git: None,
             deploy: Default::default(),
+            workload: None,
         };
         let mirror = crate::MirrorConfig {
             schema_version: 1,
@@ -2126,6 +2135,7 @@ mod tests {
             drivers: Default::default(),
             asset_aliases: Default::default(),
             build: Default::default(),
+            workload: Default::default(),
         };
         let ctx = ReconcileCtx {
             workspace_root: tmp.path(),

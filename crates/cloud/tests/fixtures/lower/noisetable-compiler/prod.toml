@@ -1,0 +1,33 @@
+# W361 migration fixture (R959-T4): noisetable-compiler mirrors/prod.toml.
+schema_version = 1
+shape = "single-machine"
+
+[workload.compiler]
+ident = "noisetable-compiler"
+
+[workload.compiler.image]
+registry = "cr.yah.dev"
+repository = "noisetable-compiler"
+tag = "20261001b-amd64"
+digest = "sha256:396f8ba0cdca1ffa23a79a956d07494877b5e361c2532762a24a3d7c984ac891"
+
+[workload.compiler.annotations]
+"yah.placement.requires-taint" = "public-ip"
+"yah.node-selector.mesh-tags" = "arch:x86,os:linux"
+
+[[workload.compiler.volumes]]
+source = { named = { name = "noisetable-compiler-state" } }
+target = "/var/lib/noisetable-compiler"
+read_only = false
+
+[[workload.compiler.env]]
+name = "NOISETABLE_COMPILER_LOOKUP"
+value = { literal = { value = "wan" } }
+
+[[workload.compiler.env]]
+name = "YAH_XLB_RELAY"
+value = { literal = { value = "https://relay.noisetable.com" } }
+
+[[workload.compiler.env]]
+name = "NOISETABLE_COMPILER_MAX_CONCURRENT"
+value = { literal = { value = "2" } }

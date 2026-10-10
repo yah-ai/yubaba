@@ -1,0 +1,62 @@
+name = "noisetable-coordinator"
+
+tier = "tenant"
+
+archetype = "appliance"
+
+replicas = 1
+restart_policy = "always"
+
+[image]
+registry = "cr.yah.dev"
+repository = "noisetable-coordinator"
+tag = "20261001-amd64"
+digest = "sha256:1bb1b17a65795a2727c726d38e13f5abc17953ba8fdfa78211a73cb0a354d4d2"
+
+[resources]
+memory_mb = 256
+cpu_millis = 250
+
+[annotations]
+"yah.node-selector.mesh-tags" = "arch:x86,os:linux"
+
+[[volumes]]
+source = { named = { name = "noisetable-coordinator-state" } }
+target = "/var/lib/noisetable-coordinator"
+read_only = false
+
+[expose.mesh]
+identity = "noisetable-coordinator"
+ports = []
+allow_from = []
+
+[[env]]
+name = "NOISETABLE_COORDINATOR_ROOM_NAME"
+value = { literal = { value = "noisetable wan room" } }
+
+[[env]]
+name = "NOISETABLE_COORDINATOR_RELAYS"
+value = { literal = { value = "https://relay.noisetable.com/" } }
+
+[[env]]
+name = "NOISETABLE_COORDINATOR_ISSUER_PUBLIC_KEY"
+value = { literal = { value = "eea2b74a400132b602327460a62a21884cc2ad86a3eeeedee41c6e05199121ac" } }
+
+[[env]]
+name = "NOISETABLE_COORDINATOR_POLICY"
+value = { literal = { value = '{}' } }
+
+[[env]]
+name = "NOISETABLE_COORDINATOR_MEMBERS"
+value = { literal = { value = '[{"key":"a335d57a96e343f94d9fe9d6cb337ca3f0547763388f0fcb49411f63c1a8bc38","label":"wan probe","roles":["observe"]}]' } }
+
+[healthcheck]
+probe = { exec = { argv = ["/usr/local/bin/noisetable-coordinator", "health"] } }
+interval = 15000
+timeout = 5000
+initial_delay = 60000
+failure_threshold = 4
+
+[stop_policy]
+signal = 15
+grace_period = 10000

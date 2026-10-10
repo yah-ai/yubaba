@@ -1,0 +1,44 @@
+# W361 migration fixture (R959-T4): noisetable-coordinator's service.toml.
+# Lowered with prod/staging it must equal ../live/noisetable-coordinator{,-staging}.toml
+# (copied from ~/ss/noisetable/.yah/infra/workloads/, 2026-10-09).
+schema_version = 1
+name = "noisetable-coordinator"
+
+[address]
+kind = "front-door"
+domain = "coordinator.mesh.noisetable.com"
+
+[[components]]
+id = "coordinator"
+kind = "container"
+path = "."
+role = "compute"
+
+[components.workload]
+tier = "tenant"
+archetype = "appliance"
+replicas = 1
+restart_policy = "always"
+
+[components.workload.resources]
+memory_mb = 256
+cpu_millis = 250
+
+[components.workload.expose.mesh]
+ports = []
+allow_from = []
+
+[[components.workload.env]]
+name = "NOISETABLE_COORDINATOR_RELAYS"
+value = { literal = { value = "https://relay.noisetable.com/" } }
+
+[components.workload.healthcheck]
+probe = { exec = { argv = ["/usr/local/bin/noisetable-coordinator", "health"] } }
+interval = 15000
+timeout = 5000
+initial_delay = 60000
+failure_threshold = 4
+
+[components.workload.stop_policy]
+signal = 15
+grace_period = 10000

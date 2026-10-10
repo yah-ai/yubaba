@@ -1,0 +1,12 @@
+# W361 migration fixture (R959-T3): dev-rig mirror for the vm-us-west-143 guest.
+schema_version = 1
+shape = "single-machine"
+
+[providers.compute]
+use = "hetzner"
+
+[workload.guest]
+ident = "vm-us-west-143"
+
+[workload.guest.annotations]
+"yah.node-selector.node" = "us-west-014"

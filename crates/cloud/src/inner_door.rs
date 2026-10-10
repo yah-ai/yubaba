@@ -739,6 +739,7 @@ mod tests {
             mount: mount.map(str::to_string),
             wave: 0,
             deploy,
+            workload: None,
         }
     }
 

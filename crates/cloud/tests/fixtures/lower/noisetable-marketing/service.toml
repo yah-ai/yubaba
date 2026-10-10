@@ -1,0 +1,68 @@
+# W361 migration fixture: noisetable-marketing's service.toml (noisetable
+# camp). `issues` is `deploy = "workload"`, so its ident is the default
+# component_workload_ident and may not be overridden.
+schema_version = 1
+name = "noisetable-marketing"
+
+[address]
+kind = "front-door"
+domain = "noisetable.com"
+
+[[components]]
+id = "site"
+kind = "mesofact-spa"
+path = "web/landing"
+role = "static"
+
+[[components]]
+id = "app"
+kind = "mesofact-static"
+path = "app/browser"
+role = "static"
+mount = "/app"
+
+[[components]]
+id = "issues"
+kind = "binary"
+path = "web/services/issues"
+role = "compute"
+mount = "/api/issues"
+deploy = "workload"
+wave = 1
+
+[components.workload]
+tier = "tenant"
+archetype = "appliance"
+replicas = 1
+restart_policy = "always"
+
+[components.workload.resources]
+memory_mb = 256
+cpu_millis = 250
+
+[components.workload.expose.mesh]
+ports = [4333]
+allow_from = []
+
+[[components.workload.env]]
+name = "NOISETABLE_ISSUES_DB_PATH"
+value = { literal = { value = "/data/issues.db" } }
+
+[[components.workload.env]]
+name = "NOISETABLE_ISSUES_PORT"
+value = { literal = { value = "4333" } }
+
+[[components.workload.env]]
+name = "NOISETABLE_ISSUES_BIND"
+value = { literal = { value = "0.0.0.0" } }
+
+[components.workload.healthcheck]
+probe = { http_get = { path = "/__mesofact/health", port = 4333, expect_status = 200 } }
+interval = 15000
+timeout = 5000
+initial_delay = 10000
+failure_threshold = 3
+
+[components.workload.stop_policy]
+signal = 15
+grace_period = 10000

@@ -1,0 +1,64 @@
+
+name = "noisetable-marketing-issues"
+tier = "tenant"
+archetype = "appliance"
+replicas = 1
+restart_policy = "always"
+
+[annotations]
+"yah.float" = "cluster"
+
+[image]
+registry = "cr.yah.dev"
+repository = "noisetable-issues"
+tag = "20261007.1-amd64-dev"
+digest = "sha256:afca8d9304295b3ca0929a7ff5edce8d5b0cb36282704c084c95ecb8c43b7430"
+
+[resources]
+memory_mb = 256
+cpu_millis = 250
+
+[[volumes]]
+source = { named = { name = "noisetable-issues-data" } }
+target = "/data"
+read_only = false
+
+[durability]
+tier        = "stream"
+engine      = "turso"
+store       = "s3://noisetable-account-backup/noisetable-issues"
+subjects    = ["issues.db"]
+rpo_seconds = 120
+
+[expose.mesh]
+identity = "noisetable-marketing-issues"
+ports = [4333]
+allow_from = []
+
+
+[[env]]
+name = "NOISETABLE_ISSUES_DB_PATH"
+value = { literal = { value = "/data/issues.db" } }
+
+[[env]]
+name = "NOISETABLE_ISSUES_ACCOUNT_JWKS_URL"
+value = { literal = { value = "https://api.noisetable.com/api/v1/.well-known/jwks.json" } }
+
+[[env]]
+name = "NOISETABLE_ISSUES_PORT"
+value = { literal = { value = "4333" } }
+
+[[env]]
+name = "NOISETABLE_ISSUES_BIND"
+value = { literal = { value = "0.0.0.0" } }
+
+[healthcheck]
+probe = { http_get = { path = "/__mesofact/health", port = 4333, expect_status = 200 } }
+interval = 15000
+timeout = 5000
+initial_delay = 10000
+failure_threshold = 3
+
+[stop_policy]
+signal = 15
+grace_period = 10000

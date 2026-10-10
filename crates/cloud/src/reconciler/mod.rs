@@ -929,6 +929,7 @@ mod source_seam_tests {
             wave: 0,
             git,
             deploy: Default::default(),
+            workload: None,
         }
     }
 
@@ -952,6 +953,7 @@ mod source_seam_tests {
             drivers: Default::default(),
             asset_aliases: BTreeMap::new(),
             build: Default::default(),
+            workload: Default::default(),
         }
     }
 

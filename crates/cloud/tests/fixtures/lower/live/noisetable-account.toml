@@ -1,0 +1,148 @@
+
+name = "noisetable-account"
+
+tier = "tenant"
+
+archetype = "appliance"
+replicas = 1
+restart_policy = "always"
+
+
+[annotations]
+"yah.float" = "cluster"
+
+[image]
+registry = "cr.yah.dev"
+repository = "noisetable-account"
+tag = "20261008.1-amd64-dev"
+digest = "sha256:d7eedfaa3ebe920c5c74a88c6eef2213dfce40e2673b3b8d64d249d0c8a9b9f7"
+
+[resources]
+memory_mb = 512
+cpu_millis = 500
+
+[[volumes]]
+source = { named = { name = "noisetable-account-data" } }
+target = "/data"
+read_only = false
+
+[durability]
+tier        = "stream"
+engine      = "turso"
+store       = "s3://noisetable-account-backup/noisetable-account"
+subjects    = ["account.db", "grants.db", "projects.db", "sessions.db"]
+rpo_seconds = 120
+
+[[db]]
+name      = "account"
+subject   = "account.db"
+workbench = "snapshot"
+
+[[db]]
+name      = "account-live"
+subject   = "account.db"
+workbench = "vend"
+
+[expose.mesh]
+identity = "noisetable-account"
+ports = [
+  { name = "http", port = 4332 },
+  { name = "admin", port = 4334 },
+  { name = "sql", port = 4335 },
+]
+allow_from = []
+
+[expose.public]
+hostname = "api.noisetable.com"
+port = 4332
+tls = "cf_managed"
+
+
+[[env]]
+name = "NOISETABLE_ACCOUNT_PUBLIC_ORIGIN"
+value = { literal = { value = "https://noisetable.com" } }
+
+[[env]]
+name = "NOISETABLE_ACCOUNT_SIGN_IN_PATH"
+value = { literal = { value = "/account" } }
+
+[[env]]
+name = "NOISETABLE_ACCOUNT_MAGIC_LINK_TTL_SECS"
+value = { literal = { value = "3600" } }
+
+[[env]]
+name = "NOISETABLE_ACCOUNT_MAIL_FROM"
+value = { literal = { value = "Noise Table <noreply@noisetable.com>" } }
+
+[[env]]
+name = "NOISETABLE_ACCOUNT_MAILER"
+value = { literal = { value = "smtp" } }
+
+[[env]]
+name = "NOISETABLE_ACCOUNT_SMTP_HOST"
+value = { literal = { value = "smtp.mailgun.org" } }
+
+[[env]]
+name = "NOISETABLE_ACCOUNT_SMTP_USERNAME"
+value = { literal = { value = "postmaster@noisetable.com" } }
+
+
+[[env]]
+name = "NOISETABLE_ACCOUNT_ALLOWED_ORIGINS"
+value = { literal = { value = "https://noisetable.com" } }
+
+
+[[env]]
+name = "NOISETABLE_ACCOUNT_SESSION_SECRET_KEY_FILE"
+value = { literal = { value = "/run/secrets/session.key" } }
+
+[[env]]
+name = "NOISETABLE_ACCOUNT_MAGIC_LINK_KEY_FILE"
+value = { literal = { value = "/run/secrets/magic-link.key" } }
+
+[[env]]
+name = "NOISETABLE_ACCOUNT_SMTP_PASSWORD_FILE"
+value = { literal = { value = "/run/secrets/smtp.password" } }
+
+[[env]]
+name = "NOISETABLE_ACCOUNT_ADMIN_ADDR"
+value = { literal = { value = "0.0.0.0:4334" } }
+
+[[env]]
+name = "NOISETABLE_ACCOUNT_ADMIN_PRINCIPALS"
+value = { literal = { value = "user:05f11360-3e6c-4155-b5bb-f8285c064858" } }
+
+[[env]]
+name = "NOISETABLE_ACCOUNT_VEND_VERIFY_KEY_FILE"
+value = { literal = { value = "/run/secrets/cheers-vend-verify.key" } }
+
+[[env]]
+name = "NOISETABLE_ACCOUNT_VEND_AUDIENCE"
+value = { literal = { value = "noisetable-account/account-live" } }
+
+[[secrets]]
+source = { cluster = { name = "noisetable/account/session-key" } }
+target = { file = { path = "/run/secrets/session.key", mode = 0o400 } }
+
+[[secrets]]
+source = { cluster = { name = "noisetable/account/magic-link-key" } }
+target = { file = { path = "/run/secrets/magic-link.key", mode = 0o400 } }
+
+[[secrets]]
+source = { cluster = { name = "noisetable/account/smtp-password" } }
+target = { file = { path = "/run/secrets/smtp.password", mode = 0o400 } }
+
+[[secrets]]
+source = { cluster = { name = "cheers/vend/verify-key" } }
+target = { file = { path = "/run/secrets/cheers-vend-verify.key", mode = 0o400 } }
+
+[healthcheck]
+probe = { http_get = { path = "/__mesofact/health", port = 4332, expect_status = 200 } }
+interval = 15000
+timeout = 5000
+initial_delay = 20000
+failure_threshold = 3
+
+[stop_policy]
+signal = 15
+grace_period = 10000

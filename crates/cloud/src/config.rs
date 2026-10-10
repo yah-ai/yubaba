@@ -1662,12 +1662,18 @@ impl CloudConfig {
         // because the only workloads ever deployed were forge/QED runs, which
         // build their spec in memory and never come through here. Same
         // dedupe-by-name shape as machines below: R215+ wins.
-        let mut workloads = load_workloads(crate::paths::workloads_dir(workspace_root))?;
+        //
+        // R959-F2: plus every workload lowered from `.yah/services/` (W361);
+        // an ident declared both ways is refused by `effective_workloads`.
+        let mut workloads: Vec<WorkloadConfig> = effective_workloads(workspace_root, &services)?
+            .into_iter()
+            .map(|d| WorkloadConfig { spec: d.spec })
+            .collect();
         let workload_names: std::collections::HashSet<String> =
             workloads.iter().map(|w| w.spec.name.clone()).collect();
         for w in legacy_workloads {
             if !workload_names.contains(&w.spec.name) {
-                workloads.push(w);
+                workloads.push(WorkloadConfig { spec: w.spec });
             }
         }
 
@@ -3166,17 +3172,113 @@ pub(crate) fn load_domains(dir: &Path) -> Result<BTreeMap<String, DomainConfig>>
 /// @yah:handoff("GIT (policy defer, NOT run): git add .yah/docs/working/W361-service-lowers-to-workload-spec.md oss/yubaba/crates/cloud/src/config.rs && git commit -m 'R959 P1: W361 service->WorkloadSpec lowering design; file F1-T5'")
 /// @yah:handoff("Tree anchor at handoff: 1dfbb17b4c078b509a11d26896e5214c48f5b67d — the shared tree as I left it. Diff against it (`git diff 1dfbb17b4c078b509a11d26896e5214c48f5b67d..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
 /// @yah:next("Claim R959-F1 next. Read its gotchas first: the field addition touches about 100 struct literals across 20 files, and R960 peers are editing config.rs.")
-/// The camp's own spec for one workload, by name, through [`load_workloads`]
-/// (same files the camp deploys, same shape validation).
+/// @yah:handoff("2026-10-09 leader (@Glimmerstone:eclipse): F1 + F2 in review (yah-cloud lib 1333/0). T3/T4 cutover is release-gated: deleting a workload TOML before readers carry F2 hides it from v0.8.43, and landing an overlay beside the TOML trips F2's double-declaration refusal. Operator call F4356: the operator commits F1+F2 and the leader runs the release, then T3/T4 cutover runbooks run immediately after (the F2 release breaks noisetable-api ingress reconcile until T4's overlay lands). Pre-release fixture/equality half of T3+T4 dispatched to @Miravel:spade (session:51349a63).")
+/// @yah:handoff("2026-10-09 release courier Ashguard:hydra: BLOCKED at Step 0(b) and released nothing. Installed /Users/leif/.local/bin/yah (both camps resolve it) reports 0.8.43+44606339-dirty, and running workload lower in it fails with 'unrecognized subcommand'. The CDN index.json's latest version is 0.8.43. F1+F2 are NOT committed. oss/yubaba/crates/cloud/src/lower.rs is untracked (??) and has no git log history. At HEAD, app/yah/cli/src/cloud.rs has no WorkloadCommands::Lower and no handle_workload_lower: the working tree has them at cloud.rs:1926 and :4469, but they are uncommitted. oss/yubaba/crates/cloud/src/lib.rs is also modified. Commit F1+F2 (lower.rs, cloud.rs, lib.rs and any other F1/F2 files), then re-dispatch the release courier. No git commands were deferred because no release step ran.")
+/// @yah:handoff("2026-10-09 release courier Ashguard:hydra, second pass (F4357). Step 0(b) now PASSES by content. The first lower.rs commit is ce86178e. In HEAD:app/yah/cli/src/cloud.rs, WorkloadCommands::Lower is at :1961 and handle_workload_lower at :4893. In HEAD lower.rs, the double-declaration refusal bails at :134/:139. Step 1 is only half done, and the cause is structural. The 0.8.44 bump IS applied in the working tree: `cargo xtask release patch` made 277 edits, root Cargo.toml now reads 0.8.44, and `cargo metadata` exited 0 at the root and in oss/cheers, mesofact, turso-backup and yah-base. The xtask also listed 8 lines it did not bump; it says each is either a hand-move pin or a frozen literal. Its sample: kg-anno-wasm/pkg/package.json:8, mesofact cli/new/curated.rs:121, and qed publish.rs:1913-1945, which are test fixtures. Nothing was published, so CDN latest is still 0.8.43. Reason: .yah/qed/yah-cli-release.toml builds with workspace=\"isolated\", a fresh git worktree at HEAD, and the binary's --version comes from CARGO_PKG_VERSION (app/yah/cli/build.rs:34). Running it now would therefore publish HEAD's 0.8.43 bytes. YAH_RELEASE_VERSION=0.8.44 would only rename the channel key, and the binary would still report 0.8.43, so I did not run it. The bump has to be committed before the recipe can run, and git policy is defer. DEFERRED GIT COMMANDS for the operator: add the version-bump files to the index by explicit name. The candidates are the modified */Cargo.toml and */Cargo.lock files (about 104 version-surface paths), app/yah/desktop/tauri.conf.json and packages/yah/ui/package.json. Caution: some of those Cargo.toml files also carry peers' in-flight non-version edits, so review `git diff` per file. Then: git commit -m \"release: v0.8.44\"; git tag v0.8.44; git push origin main --tags. After the commit, run `yah qed run yah-cli-release`, verify that cdn.yah.dev/yah/index.json lists 0.8.44, install, and check that `yah cloud workload lower --help` works in both camps. That is Steps 1 and 2 as originally briefed. Install is not done: both camps still resolve /Users/leif/.local/bin/yah, which is 0.8.43 with no `workload lower`.")
+/// @yah:handoff("Leader @Glimmerstone:dove, F4358: the operator is cutting a yah-wide 0.8.44 release themselves; F1+F2 are committed (first lower.rs commit ce86178e). The 0.8.44 bump is ALREADY applied, uncommitted, in the working tree (the courier ran `cargo xtask release patch`); running it again would bump to 0.8.45. Once 0.8.44 is installed and `yah cloud workload lower --help` works in both camps, dispatch the R959-T3 and R959-T4 cutover runbooks in parallel immediately. Until T4 lands, noisetable-api ingress cannot resolve its workload on 0.8.44: no `yah cloud reconcile` on noisetable in between.")
+/// @yah:handoff("2026-10-09 leader @Glimmerstone:dove gate check (courier @Ashguard:griffin, session:64455002): 0.8.44 is NOT published. The CDN yah/index.json (updated 2026-10-08T20:40Z) lists 0.8.43 as latest. refs/tags/v0.8.44 does not exist and HEAD is ce86178e. Both camps resolve /Users/leif/.local/bin/yah = 0.8.43+44606339-dirty, where `yah cloud workload lower --help` exits 2. Nothing was installed. T3/T4 stay held behind the operator-owned release (F4358). T5/F6 code is also held: a tree edit to oss/yubaba/crates/cloud could be swept into the operator's 0.8.44 commit, and T5 removes the disk reader the cutover window relies on. Once 0.8.44 is installed and `workload lower --help` exits 0 in both camps, dispatch T3+T4 in parallel and run T4 in one sitting (noisetable-api ingress is broken until its overlay lands).")
+/// The camp's own spec for one workload, by name, through
+/// [`load_effective_workloads`] (lowered or on disk, same shape validation).
 pub fn load_workload(camp_root: &Path, name: &str) -> Result<WorkloadSpec> {
-    load_workloads(crate::paths::workloads_dir(camp_root))?
+    load_effective_workloads(camp_root)?
         .into_iter()
-        .map(|w| w.spec)
+        .map(|d| d.spec)
         .find(|s| s.name == name)
-        .with_context(|| format!("no workload `{name}` under {}", crate::paths::workloads_dir(camp_root).display()))
+        .with_context(|| {
+            format!(
+                "no workload `{name}`: neither lowered from a .yah/services/*/mirrors/*.toml \
+                 [workload.<component>] overlay nor declared under {}",
+                crate::paths::workloads_dir(camp_root).display()
+            )
+        })
 }
 
-fn load_workloads(dir: std::path::PathBuf) -> Result<Vec<WorkloadConfig>> {
+/// One workload declaration and the file it came from (W361 migration
+/// window: lowered from a service + mirror, or hand-written on disk).
+#[derive(Debug, Clone)]
+pub struct DeclaredWorkload {
+    pub spec: WorkloadSpec,
+    /// `.yah/services/<svc>/mirrors/<env>.toml [workload.<component>]` for a
+    /// lowered spec, the file path for an on-disk one.
+    pub source: String,
+}
+
+/// Every workload `lower()` yields from `services`: each service, each
+/// mirror, each component whose mirror declares an overlay. Two lowerings
+/// with the same ident are refused, naming both.
+pub fn lowered_workloads(
+    services: &BTreeMap<String, ServiceWithMirrors>,
+) -> Result<Vec<DeclaredWorkload>> {
+    let mut out: Vec<DeclaredWorkload> = Vec::new();
+    for svc in services.values() {
+        for (env, mirror) in &svc.mirrors {
+            for component in &svc.service.components {
+                let Some(spec) = crate::lower::lower(&svc.service, &component.id, env, mirror)?
+                else {
+                    continue;
+                };
+                let source = format!(
+                    ".yah/services/{}/mirrors/{env}.toml [workload.{}]",
+                    svc.service.name, component.id
+                );
+                if let Some(prev) = out.iter().find(|d| d.spec.name == spec.name) {
+                    bail!(
+                        "workload `{}` is lowered twice: by {} and by {}",
+                        spec.name,
+                        prev.source,
+                        source
+                    );
+                }
+                out.push(DeclaredWorkload { spec, source });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The hand-written `.yah/infra/workloads/*.toml` declarations.
+pub fn disk_workloads(camp_root: &Path) -> Result<Vec<DeclaredWorkload>> {
+    load_workloads(crate::paths::workloads_dir(camp_root))
+}
+
+/// Lowered ∪ on-disk workloads (W361 §Migration step 2). An ident declared
+/// both ways is a load error naming both files — never "prefer one".
+fn effective_workloads(
+    camp_root: &Path,
+    services: &BTreeMap<String, ServiceWithMirrors>,
+) -> Result<Vec<DeclaredWorkload>> {
+    let mut out = lowered_workloads(services)?;
+    for disk in disk_workloads(camp_root)? {
+        if let Some(lowered) = out.iter().find(|d| d.spec.name == disk.spec.name) {
+            bail!(
+                "workload `{}` is declared twice: lowered from {} and hand-written in {}. \
+                 Run `yah cloud workload lower {} --diff` and delete the file once it is empty \
+                 (W361 §Migration)",
+                disk.spec.name,
+                lowered.source,
+                disk.source,
+                disk.spec.name
+            );
+        }
+        out.push(disk);
+    }
+    Ok(out)
+}
+
+/// [`lowered_workloads`] for a camp, loading its services itself. Does not
+/// read `.yah/infra/workloads/`, so it answers mid-migration, when the
+/// double-declaration refusal makes [`load_effective_workloads`] fail.
+pub fn lowered_camp_workloads(camp_root: &Path) -> Result<Vec<DeclaredWorkload>> {
+    lowered_workloads(&load_services(&crate::paths::services_dir(camp_root), camp_root)?)
+}
+
+/// [`effective_workloads`] for a camp, loading its services itself.
+pub fn load_effective_workloads(camp_root: &Path) -> Result<Vec<DeclaredWorkload>> {
+    let services = load_services(&crate::paths::services_dir(camp_root), camp_root)?;
+    effective_workloads(camp_root, &services)
+}
+
+fn load_workloads(dir: std::path::PathBuf) -> Result<Vec<DeclaredWorkload>> {
     if !dir.exists() {
         return Ok(vec![]);
     }
@@ -3203,7 +3305,7 @@ fn load_workloads(dir: std::path::PathBuf) -> Result<Vec<WorkloadConfig>> {
         validate::shape(&spec)
             .map_err(|e| anyhow::anyhow!("workload {} failed shape validation: {e}", path_str))?;
 
-        items.push(WorkloadConfig { spec });
+        items.push(DeclaredWorkload { spec, source: path_str });
     }
     Ok(items)
 }
@@ -3229,7 +3331,7 @@ fn load_workloads(dir: std::path::PathBuf) -> Result<Vec<WorkloadConfig>> {
 /// declared that the re-serialisation does not carry. Value *representation* may
 /// legitimately change across that trip (an enum canonicalising its spelling),
 /// so only missing KEYS are reported, never differing values.
-fn refuse_dropped_keys(src: &str, spec: &WorkloadSpec, path_str: &str) -> Result<()> {
+pub(crate) fn refuse_dropped_keys(src: &str, spec: &WorkloadSpec, path_str: &str) -> Result<()> {
     let declared: toml::Value = match toml::from_str(src) {
         Ok(v) => v,
         // Unreachable: the caller just parsed this same text into a typed spec.
@@ -4454,6 +4556,12 @@ pub struct ServiceComponent {
     /// instead of merely refused.
     #[serde(default, skip_serializing_if = "DeployTier::is_default")]
     pub deploy: DeployTier,
+
+    /// `[components.workload]` — the env-invariant base of this component's
+    /// fleet `WorkloadSpec` (W361). Only used when a mirror declares
+    /// `[workload.<id>]`; see [`crate::lower::lower`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload: Option<crate::lower::WorkloadBase>,
 }
 
 /// How one [`ServiceComponent`] reaches a node — see
@@ -4698,13 +4806,14 @@ impl Connection {
     }
 
     /// The `fleet:<workload>:<name>` connections the camp's own workload specs
-    /// declare through `[[db]]` (W358 decision 7), sorted by id. Reads
-    /// `.yah/infra/workloads/*.toml` through [`load_workloads`] — the files the
-    /// camp deploys — so listing makes no fleet call. A missing directory is an
-    /// empty list; a workload that fails shape validation (including a bad
-    /// `[[db]]` row) fails the whole derivation, naming its file.
+    /// declare through `[[db]]` (W358 decision 7), sorted by id. Reads the
+    /// camp's effective workloads through [`load_effective_workloads`] —
+    /// lowered from `.yah/services/` or on disk, the specs the camp deploys —
+    /// so listing makes no fleet call. No workloads is an empty list; a
+    /// workload that fails shape validation (including a bad `[[db]]` row)
+    /// fails the whole derivation, naming its file.
     pub fn derive_fleet(camp_root: &Path) -> Result<Vec<Self>> {
-        let loaded = load_workloads(crate::paths::workloads_dir(camp_root))?;
+        let loaded = load_effective_workloads(camp_root)?;
         let specs: Vec<&WorkloadSpec> = loaded.iter().map(|w| &w.spec).collect();
         let mut out = Self::fleet_from_specs(specs);
         out.sort_by_key(Self::id);
@@ -5547,6 +5656,11 @@ pub struct MirrorConfig {
     /// an override that silently never fires.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub build: BTreeMap<String, MirrorBuildOverride>,
+    /// `[workload.<component-id>]` — per-environment overlay of a component's
+    /// fleet `WorkloadSpec` (W361). Its presence is what makes the component
+    /// lower to a fleet workload on this mirror; see [`crate::lower::lower`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workload: BTreeMap<String, crate::lower::WorkloadOverlay>,
 }
 
 /// One component's per-environment build override — the value type of
@@ -5826,6 +5940,19 @@ impl MirrorProviderSlot {
         match self {
             Self::Reference { .. } => None,
             Self::Inline { kind, .. } => Some(*kind),
+        }
+    }
+
+    /// Provider kind whichever way the slot is spelled: the inline `kind`, or
+    /// the kind of the `.yah/infra/providers/` entry a `use = "<id>"` reference
+    /// names. `None` only for a reference to a provider id that is not loaded.
+    pub fn resolved_kind(&self, providers: &[ProviderConfig]) -> Option<Provider> {
+        match self {
+            Self::Inline { kind, .. } => Some(*kind),
+            Self::Reference { provider_id, .. } => providers
+                .iter()
+                .find(|p| &p.id == provider_id)
+                .map(|p| p.kind),
         }
     }
 
@@ -8718,6 +8845,51 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
         assert_eq!(cfg.workload("legacy-only").unwrap().spec.replicas, 3);
     }
 
+    /// R959-F2 fixture: the yah-cloud-admin service + prod mirror from
+    /// `tests/fixtures/lower/`, optionally with the hand-written file too.
+    #[cfg(test)]
+    fn lowered_camp(with_disk_file: bool) -> tempfile::TempDir {
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lower");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = crate::paths::services_dir(tmp.path()).join("yah-cloud-admin");
+        std::fs::create_dir_all(svc.join("mirrors")).unwrap();
+        std::fs::copy(format!("{fixtures}/yah-cloud-admin/service.toml"), svc.join("service.toml"))
+            .unwrap();
+        std::fs::copy(format!("{fixtures}/yah-cloud-admin/prod.toml"), svc.join("mirrors/prod.toml"))
+            .unwrap();
+        if with_disk_file {
+            let dir = crate::paths::workloads_dir(tmp.path());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::copy(format!("{fixtures}/live/yah-cloud-admin.toml"), dir.join("yah-cloud-admin.toml"))
+                .unwrap();
+        }
+        tmp
+    }
+
+    /// W361 §Migration step 2: a lowered workload resolves by its ident with
+    /// no file under `.yah/infra/workloads/`.
+    #[test]
+    fn a_lowered_workload_resolves_without_a_file() {
+        let tmp = lowered_camp(false);
+        let spec = load_workload(tmp.path(), "yah-cloud-admin").unwrap();
+        assert_eq!(spec.name, "yah-cloud-admin");
+    }
+
+    /// W361 §Migration step 2: an ident both lowered and on disk is a load
+    /// error naming both files, never "prefer one".
+    #[test]
+    fn an_ident_lowered_and_on_disk_is_refused_naming_both() {
+        let tmp = lowered_camp(true);
+        for err in [
+            load_workload(tmp.path(), "yah-cloud-admin").unwrap_err(),
+            Connection::derive_fleet(tmp.path()).unwrap_err(),
+        ] {
+            let msg = format!("{err:#}");
+            assert!(msg.contains("mirrors/prod.toml [workload."), "{msg}");
+            assert!(msg.contains("yah-cloud-admin.toml"), "{msg}");
+        }
+    }
+
     #[test]
     fn workload_loader_rejects_bad_spec() {
         use workload_spec::{
@@ -10214,6 +10386,7 @@ out_dir = "dist"
                 wave: 0,
                 git: None,
                 deploy: Default::default(),
+                workload: None,
             }],
         };
         svc.save(root).unwrap();
@@ -10587,6 +10760,7 @@ out_dir = "dist"
             drivers: Default::default(),
             asset_aliases: Default::default(),
             build: Default::default(),
+            workload: Default::default(),
         };
         // Save with canonical name; legacy "cloud" is normalised to "prod" on load.
         mirror.save(root, "dev-yah", "prod").unwrap();
@@ -10630,6 +10804,7 @@ out_dir = "dist"
             drivers: Default::default(),
             asset_aliases: Default::default(),
             build: Default::default(),
+            workload: Default::default(),
         }
         .save(root, "dev-yah", "local")
         .unwrap();
@@ -10670,6 +10845,7 @@ out_dir = "dist"
                 drivers: Default::default(),
                 asset_aliases: Default::default(),
                 build: Default::default(),
+                workload: Default::default(),
             }
             .save(root, "dev-yah", env)
             .unwrap();
@@ -10705,6 +10881,7 @@ out_dir = "dist"
                 wave: 0,
                 git: None,
                 deploy: Default::default(),
+                workload: None,
             }],
         };
         svc.save(root).unwrap();
@@ -11010,6 +11187,7 @@ worker_bundle_path = ".yah/workers/cdn-yah-dev/"
                     wave: 0,
                     git: None,
                     deploy: Default::default(),
+                    workload: None,
                 },
                 ServiceComponent {
                     mount: Some("/app".into()),
@@ -11021,6 +11199,7 @@ worker_bundle_path = ".yah/workers/cdn-yah-dev/"
                     wave: 0,
                     git: None,
                     deploy: Default::default(),
+                    workload: None,
                 },
             ],
         };
@@ -11375,6 +11554,7 @@ origin = "http://127.0.0.1:9000"
                     wave: 0,
                     git: None,
                     deploy: Default::default(),
+                    workload: None,
                 },
                 ServiceComponent {
                     mount: Some("app/".into()),
@@ -11386,6 +11566,7 @@ origin = "http://127.0.0.1:9000"
                     wave: 0,
                     git: None,
                     deploy: Default::default(),
+                    workload: None,
                 },
             ],
         };
@@ -11420,6 +11601,7 @@ origin = "http://127.0.0.1:9000"
                     wave: 0,
                     git: None,
                     deploy: Default::default(),
+                    workload: None,
                 },
                 ServiceComponent {
                     mount: None,
@@ -11431,6 +11613,7 @@ origin = "http://127.0.0.1:9000"
                     wave: 0,
                     git: None,
                     deploy: Default::default(),
+                    workload: None,
                 },
             ],
         };
@@ -11466,6 +11649,7 @@ origin = "http://127.0.0.1:9000"
                     wave: 0,
                     git: None,
                     deploy: DeployTier::Bundle,
+                    workload: None,
                 },
                 ServiceComponent {
                     mount: Some("/app/".into()),
@@ -11477,6 +11661,7 @@ origin = "http://127.0.0.1:9000"
                     wave: 0,
                     git: None,
                     deploy: DeployTier::Workload,
+                    workload: None,
                 },
             ],
         };
@@ -11510,6 +11695,7 @@ origin = "http://127.0.0.1:9000"
                     wave: 0,
                     git: None,
                     deploy: DeployTier::Workload,
+                    workload: None,
                 },
                 ServiceComponent {
                     mount: Some("/".into()),
@@ -11521,6 +11707,7 @@ origin = "http://127.0.0.1:9000"
                     wave: 0,
                     git: None,
                     deploy: DeployTier::Workload,
+                    workload: None,
                 },
             ],
         };

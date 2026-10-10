@@ -2302,6 +2302,7 @@ mod tests {
                 drivers: Default::default(),
                 asset_aliases: BTreeMap::new(),
                 build: Default::default(),
+                workload: Default::default(),
             };
             let service = ServiceConfig {
                 schema_version: 1,
@@ -2320,6 +2321,7 @@ mod tests {
                 wave: 0,
                 git: None,
                 deploy: Default::default(),
+                workload: None,
             };
             Self {
                 _workspace: workspace,

@@ -1378,6 +1378,7 @@ socket = "/tmp/mine.sock"
                 wave: 0,
                 git: None,
                 deploy: Default::default(),
+                workload: None,
             }],
         }
     }
@@ -1400,6 +1401,7 @@ socket = "/tmp/mine.sock"
             drivers: Default::default(),
             asset_aliases: Default::default(),
             build: Default::default(),
+            workload: Default::default(),
         }
     }
 
@@ -1654,6 +1656,7 @@ socket = "/tmp/mine.sock"
             drivers: Default::default(),
             asset_aliases: Default::default(),
             build: Default::default(),
+            workload: Default::default(),
         };
         assert!(!slot_declared(&m));
         m.providers.insert(

@@ -1,0 +1,59 @@
+# W361 migration fixture: noisetable-api's service.toml (noisetable camp)
+# carrying the env-invariant base of the `api` component. Lowered with
+# prod.toml / staging.toml it must equal ../live/noisetable-account(-staging).toml.
+schema_version = 1
+name = "noisetable-api"
+
+[address]
+kind = "front-door"
+domain = "api.noisetable.com"
+health_path = "/api/v1/status"
+
+[[components]]
+id = "api"
+kind = "binary"
+path = "web/services/account"
+role = "compute"
+
+[components.workload]
+tier = "tenant"
+archetype = "appliance"
+replicas = 1
+restart_policy = "always"
+
+[components.workload.resources]
+memory_mb = 512
+cpu_millis = 500
+
+[components.workload.expose.mesh]
+allow_from = []
+
+[components.workload.expose.public]
+tls = "cf_managed"
+
+[[components.workload.env]]
+name = "NOISETABLE_ACCOUNT_SIGN_IN_PATH"
+value = { literal = { value = "/account" } }
+
+[[components.workload.env]]
+name = "NOISETABLE_ACCOUNT_MAGIC_LINK_TTL_SECS"
+value = { literal = { value = "3600" } }
+
+[[components.workload.env]]
+name = "NOISETABLE_ACCOUNT_SESSION_SECRET_KEY_FILE"
+value = { literal = { value = "/run/secrets/session.key" } }
+
+[[components.workload.env]]
+name = "NOISETABLE_ACCOUNT_MAGIC_LINK_KEY_FILE"
+value = { literal = { value = "/run/secrets/magic-link.key" } }
+
+[components.workload.healthcheck]
+probe = { http_get = { path = "/__mesofact/health", port = 4332, expect_status = 200 } }
+interval = 15000
+timeout = 5000
+initial_delay = 20000
+failure_threshold = 3
+
+[components.workload.stop_policy]
+signal = 15
+grace_period = 10000

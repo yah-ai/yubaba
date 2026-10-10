@@ -1,0 +1,43 @@
+# W361 migration fixture: noisetable-marketing mirrors/prod.toml with the
+# `issues` overlay. No compute slot (the inner door fronts it), so no
+# expose.public is derived.
+schema_version = 1
+shape = "single-machine"
+
+[[ingress]]
+provider = "passway"
+machines = ["us-east-001", "us-south-001", "us-west-001"]
+
+[providers.bundle]
+use = "cloudflare"
+bucket = "noisetable-marketing"
+origin = "https://cdn.noisetable.com"
+name = "noisetable"
+machines = ["us-east-001", "us-south-001"]
+fronted = true
+zone = "noisetable.com"
+
+[workload.issues.image]
+registry = "cr.yah.dev"
+repository = "noisetable-issues"
+tag = "20261007.1-amd64-dev"
+digest = "sha256:afca8d9304295b3ca0929a7ff5edce8d5b0cb36282704c084c95ecb8c43b7430"
+
+[workload.issues.annotations]
+"yah.float" = "cluster"
+
+[[workload.issues.volumes]]
+source = { named = { name = "noisetable-issues-data" } }
+target = "/data"
+read_only = false
+
+[workload.issues.durability]
+tier        = "stream"
+engine      = "turso"
+store       = "s3://noisetable-account-backup/noisetable-issues"
+subjects    = ["issues.db"]
+rpo_seconds = 120
+
+[[workload.issues.env]]
+name = "NOISETABLE_ISSUES_ACCOUNT_JWKS_URL"
+value = { literal = { value = "https://api.noisetable.com/api/v1/.well-known/jwks.json" } }

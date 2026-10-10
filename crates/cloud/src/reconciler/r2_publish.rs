@@ -79,6 +79,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
+use yah_mesofact_bundle::assets::OutputPolicy;
 use yah_object_store::{ObjectStore as _, R2ObjectStore};
 
 use super::publish_beacon::{PublishBeacon, BEACON_KEY};
@@ -116,19 +117,17 @@ pub use yah_object_store::r2::{
 /// polyfill) is NOT content-addressed, and a year-long immutable cache on it
 /// would be unrecoverable. Unknown ⇒ `no-cache`, always — the failure mode of
 /// guessing "cacheable" is much worse than the failure mode of guessing "not".
-fn cache_control_for(rel: &str) -> &'static str {
-    let hashed = rel
-        .strip_prefix("hydrate/")
-        .and_then(|f| f.rsplit_once('.'))
-        // `<name>.<hash>.js` → after dropping `.js`, the trailing dot-segment
-        // is the hash. Bun emits 8+ chars of base62; require that rather than
-        // "has two dots", so `app.min.js` is not mistaken for hashed output.
-        .and_then(|(stem, ext)| (ext == "js").then_some(stem))
-        .and_then(|stem| stem.rsplit_once('.'))
-        .is_some_and(|(_, tok)| {
-            tok.len() >= 8 && tok.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        });
-    if hashed {
+///
+/// MFT-R825-F1: the rule itself now lives in
+/// [`yah_mesofact_bundle::assets::OutputPolicy`], shared with the bundle path
+/// that `mesofact serve` answers from, and it gained the component's DECLARED
+/// patterns (`[build] immutable` in its `mesofact.config.toml`) beside the
+/// hydrate rule above. One rule, two publish paths; this function only maps
+/// its verdict to the object-store directives. `rel` is relative to the
+/// publish's `dist_dir`, BEFORE the `html/` strip — the policy needs the
+/// prefix to tell a page from a hydrate bundle.
+fn cache_control_for(rel: &str, policy: &OutputPolicy) -> &'static str {
+    if policy.is_immutable(rel) {
         yah_object_store::CACHE_CONTROL_IMMUTABLE
     } else {
         yah_object_store::CACHE_CONTROL_NO_CACHE
@@ -177,6 +176,15 @@ pub struct R2PublishReport {
 ///
 /// `key_prefix`: when `Some`, all keys are prefixed with `<prefix>/`. Use
 /// `"<service>/<env>"` to isolate two mirrors that share the same R2 bucket.
+///
+/// `policy` decides each object's `Cache-Control` ([`cache_control_for`]);
+/// pass [`OutputPolicy::load`] for a component's build output, or
+/// `OutputPolicy::default()` for a tree no component declared anything about
+/// (everything revalidates). Files a bundle assembly's finalize step wrote
+/// into the tree — the asset index and `.br`/`.gz` variants — are skipped:
+/// Cloudflare negotiates encodings at its own edge, and uploading them would
+/// only publish raw compressed bytes at extra URLs.
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_to_r2(
     dist_dir: &Path,
     account_id: &str,
@@ -185,6 +193,7 @@ pub async fn publish_to_r2(
     secret_key: &str,
     key_prefix: Option<&str>,
     purge: Option<R2PurgeOpts>,
+    policy: &OutputPolicy,
 ) -> Result<R2PublishReport> {
     if !tokio::fs::try_exists(dist_dir)
         .await
@@ -250,6 +259,12 @@ pub async fn publish_to_r2(
         if rel_str.starts_with("server/") {
             continue;
         }
+        // Bundle-path serving metadata (MFT-R825-F1) — see the fn docs.
+        let parent_dir = rel.parent().map(|p| dist_dir.join(p)).unwrap_or_else(|| dist_dir.to_path_buf());
+        let file_name = rel.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if yah_mesofact_bundle::assets::is_finalize_artifact(&parent_dir, &file_name) {
+            continue;
+        }
         // Strip `html/` prefix; optionally prepend mirror key_prefix.
         let stripped = rel_str.strip_prefix("html/").unwrap_or(&rel_str);
         let key = match key_prefix {
@@ -272,7 +287,7 @@ pub async fn publish_to_r2(
 
         let s = Arc::clone(&store);
         let key_clone = key.clone();
-        let cc = cache_control_for(stripped);
+        let cc = cache_control_for(&rel_str, policy);
         tokio::task::spawn_blocking(move || {
             // A site asset is fetched by a page, never saved by hand — no
             // download name.
@@ -482,6 +497,7 @@ mod tests {
             "secret",
             None,
             None,
+            &OutputPolicy::default(),
         )
         .await
         .unwrap_err();
@@ -554,13 +570,27 @@ mod tests {
         assert!(bad.is_empty());
     }
 
-    // ── Cache-Control classification (R703-T10) ─────────────────────────────
+    // ── Cache-Control classification (R703-T10, MFT-R825-F1) ────────────────
+
+    /// A mesofact-build-shaped dist (it has `html/`), optionally with a
+    /// declaration. Keys below are relative to that dist, before the `html/`
+    /// strip — the same paths the publish loop hands `cache_control_for`.
+    fn mesofact_policy(declared: Option<&str>) -> (TempDir, OutputPolicy) {
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join("dist/html")).unwrap();
+        if let Some(d) = declared {
+            std::fs::write(project.path().join("mesofact.config.toml"), d).unwrap();
+        }
+        let policy = OutputPolicy::load(project.path(), &project.path().join("dist")).unwrap();
+        (project, policy)
+    }
 
     /// Pinned against REAL filenames read out of the built dist trees on
     /// 2026-08-09, not invented ones — the whole rule rests on which files the
     /// builder content-hashes, so a test over made-up names would prove nothing.
     #[test]
     fn only_content_hashed_hydrate_bundles_are_immutable() {
+        let (_p, policy) = mesofact_policy(None);
         // app/yah/web/marketing/dist/hydrate/ and dashboard's, verbatim.
         for k in [
             "hydrate/issues.ervzmehh.js",
@@ -570,7 +600,7 @@ mod tests {
             "hydrate/index.chunk-CStDXFd1.js",
         ] {
             assert_eq!(
-                cache_control_for(k),
+                cache_control_for(k, &policy),
                 "public, max-age=31536000, immutable",
                 "{k}"
             );
@@ -582,17 +612,18 @@ mod tests {
     /// keep — a stale yah.dev page with no way to bust it.
     #[test]
     fn fixed_keys_are_no_cache() {
+        let (_p, policy) = mesofact_policy(None);
         for k in [
-            "index.html",
-            "releases.html",
-            "404.html",
-            "install.sh",
-            "illustrations/yah-table-dark.webp",
+            "html/index.html",
+            "html/releases.html",
+            "html/404.html",
+            "html/install.sh",
+            "html/illustrations/yah-table-dark.webp",
             "manifest.json",
             "tag-index.json",
             ".well-known/yah-publish.json",
         ] {
-            assert_eq!(cache_control_for(k), "no-cache, max-age=0", "{k}");
+            assert_eq!(cache_control_for(k, &policy), "no-cache, max-age=0", "{k}");
         }
     }
 
@@ -601,6 +632,7 @@ mod tests {
     /// cache on it would be unrecoverable — unknown must fall to `no-cache`.
     #[test]
     fn hydrate_files_that_are_not_hash_named_stay_no_cache() {
+        let (_p, policy) = mesofact_policy(None);
         for k in [
             "hydrate/app.js",        // no hash segment at all
             "hydrate/app.min.js",    // a second dot, but `min` is not a hash
@@ -608,7 +640,30 @@ mod tests {
             "hydrate/vendor.LICENSE",// not even a .js
             "hydrate/readme.md",
         ] {
-            assert_eq!(cache_control_for(k), "no-cache, max-age=0", "{k}");
+            assert_eq!(cache_control_for(k, &policy), "no-cache, max-age=0", "{k}");
         }
+    }
+
+    /// MFT-R825-F1: the R2 path honours the SAME declaration the bundle path
+    /// serves from — the gotcha that ticket carried was "do not add a third
+    /// rule".
+    #[test]
+    fn declared_patterns_reach_the_r2_path() {
+        let (_p, policy) =
+            mesofact_policy(Some("[build]\nimmutable = [\"wasm/*_bg.wasm\"]\n"));
+        assert_eq!(
+            cache_control_for("html/wasm/demo-0123abcd_bg.wasm", &policy),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(cache_control_for("html/index.html", &policy), "no-cache, max-age=0");
+
+        // A flat (Trunk) output: the patterns match from the dist root.
+        let flat = TempDir::new().unwrap();
+        std::fs::create_dir_all(flat.path().join("dist")).unwrap();
+        std::fs::write(flat.path().join("mesofact.config.toml"), "[build]\nimmutable = [\"*_bg.wasm\"]\n")
+            .unwrap();
+        let policy = OutputPolicy::load(flat.path(), &flat.path().join("dist")).unwrap();
+        assert_eq!(cache_control_for("app-0123abcd_bg.wasm", &policy), "public, max-age=31536000, immutable");
+        assert_eq!(cache_control_for("index.html", &policy), "no-cache, max-age=0");
     }
 }

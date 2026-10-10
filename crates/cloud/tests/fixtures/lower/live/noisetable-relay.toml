@@ -1,0 +1,73 @@
+name = "noisetable-relay"
+
+tier = "infra"
+
+archetype = "appliance"
+
+replicas = 1
+restart_policy = "always"
+
+[image]
+registry = "cr.yah.dev"
+repository = "noisetable-relay"
+tag = "20261001-amd64"
+digest = "sha256:aa7edcf232dce217c6023e8a18de4d1e7303cd1dd186ae974d8f408a120d3a6e"
+
+[resources]
+memory_mb = 512
+cpu_millis = 500
+
+[[volumes]]
+source = { named = { name = "noisetable-relay-acme" } }
+target = "/var/lib/noisetable-relay/acme"
+read_only = false
+
+[annotations]
+"yah.network" = "host"
+
+"yah.placement.requires-taint" = "public-ip"
+
+"yah.node-selector.mesh-tags" = "arch:x86,os:linux"
+
+[expose.mesh]
+identity = "noisetable-relay"
+ports = [8449, 8450, 7842]
+allow_from = []
+
+
+
+[[env]]
+name = "NOISETABLE_RELAY_TLS"
+value = { literal = { value = "letsencrypt" } }
+
+[[env]]
+name = "NOISETABLE_RELAY_DOMAIN"
+value = { literal = { value = "relay.noisetable.com" } }
+
+[[env]]
+name = "NOISETABLE_RELAY_ACME_CONTACT"
+value = { literal = { value = "mailto:ops@noisetable.com" } }
+
+[[env]]
+name = "NOISETABLE_RELAY_HTTPS_ADDR"
+value = { literal = { value = "127.0.0.1:8449" } }
+
+[[env]]
+name = "NOISETABLE_RELAY_PUBLIC_HTTPS_PORT"
+value = { literal = { value = "443" } }
+
+[[env]]
+name = "NOISETABLE_RELAY_HTTP_ADDR"
+value = { literal = { value = "127.0.0.1:8450" } }
+
+
+[healthcheck]
+probe = { http_get = { path = "/generate_204", port = 8450, expect_status = 204 } }
+interval = 15000
+timeout = 5000
+initial_delay = 30000
+failure_threshold = 3
+
+[stop_policy]
+signal = 15
+grace_period = 15000

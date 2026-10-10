@@ -1,0 +1,20 @@
+# W361 migration fixture (R959-T4): noisetable-seed mirrors/staging.toml.
+schema_version = 1
+shape = "single-machine"
+
+[workload.seed]
+ident = "noisetable-seed-staging"
+
+[workload.seed.image]
+registry = "cr.yah.dev"
+repository = "noisetable-seed"
+tag = "20261001-arm64"
+digest = "sha256:4cb97a1246f19f16191d8914febe86d5b5401d751ccf9132236f45f84760473b"
+
+[workload.seed.annotations]
+"yah.node-selector.mesh-tags" = "arch:arm,os:linux"
+
+[[workload.seed.volumes]]
+source = { named = { name = "noisetable-seed-staging-state" } }
+target = "/var/lib/noisetable-seed"
+read_only = false
