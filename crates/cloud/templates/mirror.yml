@@ -82,9 +82,17 @@ runcmd:
   - apt-get install -y containerd
   - systemctl enable --now containerd
   # Yubaba + kamaji bundle — fetch + verify + install (R406-T13).
-  # The tarball contains: yubaba, kamaji, yubaba.service, kamaji.service,
-  # yubaba.slice. cloud-init lays the binaries under /usr/local/bin and the units
-  # under /etc/systemd/system/ before systemctl daemon-reload.
+  # The tarball contains: yubaba, kamaji, yah-scryer, yubaba.service,
+  # kamaji.service, yah-scryer.service, yubaba.slice. cloud-init lays the
+  # binaries under /usr/local/bin and the units under /etc/systemd/system/
+  # before systemctl daemon-reload.
+  #
+  # yah-scryer is NOT optional on a node that runs kamaji.service: that unit
+  # sets KAMAJI_SCRYER_SOCKET=/run/yah-scryer/ingest.sock, so kamaji binds
+  # that socket into EVERY container it starts, and refuses the deploy when
+  # the socket is absent (R932-B1, kamaji-containerd-core check_bind_sources).
+  # A node stood up without scryer therefore runs no container at all —
+  # us-west-004 refused the 0.8.48 release's musl CLI build for exactly this.
   #
   # R858-F17: turso-backup-hydrate and turso-backup-tail ship in the SAME
   # tarball rather than a separate download — they are yah's own co-developed
@@ -111,6 +119,7 @@ runcmd:
   - tar -xzf /tmp/yah-yubaba.tar.gz -C /tmp
   - sh -c 'cp /tmp/yubaba-*/yubaba /usr/local/bin/yubaba'
   - sh -c 'cp /tmp/yubaba-*/kamaji /usr/local/bin/kamaji'
+  - sh -c 'cp /tmp/yubaba-*/yah-scryer /usr/local/bin/yah-scryer'
   # Double-quoted, not bare: these two carry a `: ` inside their echo, and a
   # colon-space in a BARE YAML scalar makes the whole runcmd entry parse as a
   # mapping — cloud-init then skips it silently and the helpers never land.
@@ -118,7 +127,7 @@ runcmd:
   # it went red when these were added.
   - "sh -c '[ -f /tmp/yubaba-*/turso-backup-hydrate ] && cp /tmp/yubaba-*/turso-backup-hydrate /usr/local/bin/turso-backup-hydrate || echo \"turso-backup-hydrate: absent from this tarball, durability-declaring workloads will refuse to deploy (R858-F17)\" >&2'"
   - "sh -c '[ -f /tmp/yubaba-*/turso-backup-tail ] && cp /tmp/yubaba-*/turso-backup-tail /usr/local/bin/turso-backup-tail || echo \"turso-backup-tail: absent from this tarball, durability-declaring workloads will refuse to deploy (R858-F17)\" >&2'"
-  - chmod +x /usr/local/bin/yubaba /usr/local/bin/kamaji
+  - chmod +x /usr/local/bin/yubaba /usr/local/bin/kamaji /usr/local/bin/yah-scryer
   - sh -c '[ -f /usr/local/bin/turso-backup-hydrate ] && chmod +x /usr/local/bin/turso-backup-hydrate; [ -f /usr/local/bin/turso-backup-tail ] && chmod +x /usr/local/bin/turso-backup-tail; true'
   # KAMAJI_HYDRATE_HELPER / KAMAJI_TAIL_HELPER, as Environment= in a drop-in,
   # never as ExecStart= flags — see kamaji.service's own warning: a drop-in
@@ -131,6 +140,7 @@ runcmd:
   - sh -c 'cp /tmp/yubaba-*/yubaba.slice /etc/systemd/system/yubaba.slice'
   - sh -c 'cp /tmp/yubaba-*/kamaji.service /etc/systemd/system/kamaji.service'
   - sh -c 'cp /tmp/yubaba-*/yubaba.service /etc/systemd/system/yubaba.service'
+  - sh -c 'cp /tmp/yubaba-*/yah-scryer.service /etc/systemd/system/yah-scryer.service'
   # litestream-headscale.service — headscale DB replication for whichever node
   # holds the ingress owner role. Laid down here and never enabled: leader.rs
   # starts it on gaining that role and stops it on losing it. It MUST be
@@ -138,7 +148,7 @@ runcmd:
   # pre-stage block below) — yubaba runs ProtectSystem=strict and cannot write
   # /etc/systemd/system, so a unit it "installs" at runtime is a silent EROFS.
   - sh -c 'cp /tmp/yubaba-*/litestream-headscale.service /etc/systemd/system/litestream-headscale.service'
-  - chmod 0644 /etc/systemd/system/yubaba.slice /etc/systemd/system/kamaji.service /etc/systemd/system/yubaba.service /etc/systemd/system/litestream-headscale.service
+  - chmod 0644 /etc/systemd/system/yubaba.slice /etc/systemd/system/kamaji.service /etc/systemd/system/yubaba.service /etc/systemd/system/yah-scryer.service /etc/systemd/system/litestream-headscale.service
   - sh -c 'rm -rf /tmp/yah-yubaba.tar.gz /tmp/yubaba-*'
   # litestream — the replicate/restore binary litestream-headscale.service execs
   # and leader.rs shells for `litestream restore` before starting the appliance.
@@ -232,7 +242,9 @@ runcmd:
   # /var/lib/yah/yubaba (the secret store, in yubaba.service's ReadWritePaths)
   # is created by the unit itself via StateDirectory=yah/yubaba (R589-T2), so no
   # pre-mkdir crutch is needed here — the unit no longer fails 226/NAMESPACE.
-  # Bring up the supervision tree (W154 ordering): slice → kamaji → yubaba.
+  # Bring up the supervision tree (W154 ordering): slice → scryer → kamaji → yubaba.
+  # scryer goes before kamaji so its ingest socket exists before kamaji's
+  # first deploy binds it into a container.
   # kamaji.service has After=yubaba.slice + PartOf=yubaba.slice; yubaba.service
   # has After=kamaji.service + Wants=kamaji.service, so enabling yubaba
   # transitively starts the other two — but bringing each one up explicitly
@@ -241,5 +253,6 @@ runcmd:
   # see yubaba.slice's own comment), so it gets `start`, not `enable --now`.
   - systemctl daemon-reload
   - systemctl start yubaba.slice
+  - systemctl enable --now yah-scryer.service
   - systemctl enable --now kamaji.service
   - systemctl enable --now yubaba.service

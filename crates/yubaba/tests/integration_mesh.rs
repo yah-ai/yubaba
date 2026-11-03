@@ -115,6 +115,8 @@ fn test_workload_spec(name: &str) -> WorkloadSpec {
         },
         labels: Default::default(),
         durability: None,
+        lease_id: None,
+        deadline: None,
         db: Vec::new(),
         capabilities: Vec::new(),
         annotations: Default::default(),
@@ -371,7 +373,7 @@ mod split_brain {
     use futures_util::StreamExt;
     use object_store::memory::InMemory;
     use object_store::ObjectStore;
-    use turso_backup::snapshot::BackupTarget;
+    use store_claim::BackupTarget;
     use turso_backup::stream::{
         list_and_parse_generation_manifests, tail_frames, FrameInfo, StreamConfig, StreamOutcome,
         WalSeam, Watermark, WAL_FRAME_HEADER_SIZE,
@@ -941,7 +943,8 @@ mod split_brain {
         yubaba_tenant_streamer::StreamerConfig {
             node_id: NODE_A,
             yubaba_url: "http://127.0.0.1:1".into(),
-            cluster_key_file: None,
+            service_key_file: None,
+            identity_file: None,
             data_root: std::path::PathBuf::from("/nonexistent"),
             sink: yubaba_tenant_streamer::SinkConfig {
                 bucket: "test".into(),

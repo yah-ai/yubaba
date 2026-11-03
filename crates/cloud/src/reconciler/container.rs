@@ -321,6 +321,18 @@ fn default_image_tag(service: &str, component: &str) -> String {
 /// The `:ro` suffix rides on the container-path string because
 /// `ContainerRunSpec::docker_run_args` emits `-v <host>:<container>` verbatim;
 /// that is docker's own mount-option syntax, not a hack around the type.
+///
+/// @yah:ticket(R715-F10, "Container recipe cannot declare \"create this host dir if absent\": [[run.mounts]] data dir must pre-exist or mirror up --env pond fails")
+/// @yah:at(2026-10-10T18:46:53Z)
+/// @yah:assignee(agent:bundle-anthropic-miravel)
+/// @yah:parent(R715)
+/// @yah:assumes("Tier: Warrior. ContainerMount (workload-spec lib.rs:1250) has only host/container/read_only; resolve_mounts bails on a missing host path by design. Wanted: an opt-in field (e.g. create = true) that mkdir -p's a writable mount source, keeping the hard error as default. First consumer: noisetable web/services/{account,issues}/workload.toml (noisetable R823-T3 residual).")
+///
+/// @yah:ticket(R715-F11, "Container recipe has no one-shot init step: generated secrets (keygen into a mount) cannot be declared")
+/// @yah:at(2026-10-10T18:47:06Z)
+/// @yah:assignee(agent:bundle-anthropic-miravel)
+/// @yah:parent(R715)
+/// @yah:assumes("Tier: Warrior. ContainerBuildStep/ContainerRunConfig (workload-spec lib.rs:1189/1227) have no init/pre-run hook, so a service that needs keys generated once (noisetable-account: session.secret + magic-link.key via its image's `--generate-keys /out`) cannot say so; operator must run docker by hand. Wanted: a declared [run.init] (image command run once into a mount, skipped when its output files exist). Pairs with R715-F10 (mkdir of mount source). First consumer: noisetable R823-T3 residual.")
 fn resolve_mounts(
     mounts: &[ContainerMount],
     workspace_root: &std::path::Path,

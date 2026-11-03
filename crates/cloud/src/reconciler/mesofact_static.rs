@@ -957,6 +957,7 @@ pub(crate) fn lower_build_to_forge_spec(
         BuildMode::InContainer { image } => (Some(image.clone()), TaskRuntime::Container),
     };
     Some(ForgeSpec {
+        resources: None,
         command: ForgeCommand::Subprocess {
             argv: vec!["sh".into(), "-c".into(), command],
             image,

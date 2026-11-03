@@ -40,21 +40,42 @@ async fn an_all_require_cluster_elects_replicates_and_forwards_signed() {
     let follower = (0..cluster.node_count()).find(|i| *i != leader).unwrap();
 
     // A follower's write goes out over `/raft/write` on the leader — a Peer
-    // route — through the node's own `ServerState::http`.
+    // route — through the node's own `ServerState::http`. R997-B27: every
+    // node here also enforces node proofs, so this election and forward are
+    // the end-to-end check that raft RPC and forwards prove their sender. The
+    // lock owner is the follower's own id, as `acme_issuer` writes it.
     let state = cluster.server_state(follower).expect("follower state");
     let follower_raft = cluster.raft(follower).expect("follower raft");
+    let follower_id = follower as u64 + 1;
     raft::client_write_forwarded(
         follower_raft,
         &state.http,
         YubabaRequest::AcquireLock {
             key: "r876-t18".into(),
-            owner: "raft_peer_auth".into(),
+            owner: follower_id.to_string(),
             ttl_secs: 60,
             acquired_at: now() as u64,
         },
     )
     .await
     .expect("a follower's forwarded write must reach the enforcing leader");
+
+    // ...but the leader binds it to the follower: a lock taken in another
+    // node's name is refused.
+    let other_id = leader as u64 + 1;
+    let refused = raft::client_write_forwarded(
+        follower_raft,
+        &state.http,
+        YubabaRequest::AcquireLock {
+            key: "r997-b27".into(),
+            owner: other_id.to_string(),
+            ttl_secs: 60,
+            acquired_at: now() as u64,
+        },
+    )
+    .await
+    .expect_err("a forwarded write naming another node must be refused");
+    assert!(refused.to_string().contains("403"), "{refused}");
 
     // Non-vacuity: the nodes really are enforcing. Anonymous is refused, a
     // peer token minted under the same key is served.
@@ -72,6 +93,18 @@ async fn an_all_require_cluster_elects_replicates_and_forwards_signed() {
         .await
         .unwrap();
     assert_eq!(signed.status(), StatusCode::OK);
+
+    // R997-B27: a cluster-key bearer alone no longer writes cluster state.
+    let leader_base = &cluster.yubaba(leader).base_url;
+    let unproven = http
+        .post(format!("{leader_base}/raft/write"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "request": { "AcquireLock": {
+            "key": "r997-b27", "owner": "1", "ttl_secs": 60, "acquired_at": now() } } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unproven.status(), StatusCode::UNAUTHORIZED, "a peer write must prove its node");
 
     // The floater replication routes are Peer class (node-to-node, including
     // the owner's unattended re-publish), so a peer token opens them...

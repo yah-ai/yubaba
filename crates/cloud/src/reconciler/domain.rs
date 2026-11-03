@@ -1232,7 +1232,7 @@ pub fn plan_passway_apex(
         // CNAME, so an A record for its machine would sit beside that CNAME —
         // and a tunnel-fronted node is usually one with no public address at
         // all, where `public_origins` would refuse the private one outright
-        // (us-west-011's 192.168.10.11 is the case that filed this).
+        // (us-west-011's 192.168.250.11 is the case that filed this).
         .filter(|fd| !fd.stacked.contains(&domain.domain))
         .map(|fd| fd.machine.clone())
         .collect();
@@ -1814,6 +1814,7 @@ mod tests {
             nickname: None,
             legacy_hostkey_fingerprint: None,
             registration: Default::default(),
+            camps: Vec::new(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -1829,6 +1830,7 @@ mod tests {
             sovereign_group: None,
             sovereign_participation: Default::default(),
             host_machine: None,
+            availability: Default::default(),
             ingress_floating_ip: None,
         }
     }
@@ -1838,8 +1840,8 @@ mod tests {
     /// fronts internal hostnames over the mesh and must not reach the apex.
     fn fleet() -> Vec<MachineConfig> {
         vec![
-            machine("us-east-001", Some("51.81.85.145"), &["public-ip"]),
-            machine("us-west-001", Some("15.204.89.240"), &["public-ip"]),
+            machine("us-east-001", Some("203.0.113.13"), &["public-ip"]),
+            machine("us-west-001", Some("203.0.113.11"), &["public-ip"]),
             machine("us-west-002", Some("100.64.0.4"), &[]),
         ]
     }
@@ -1890,11 +1892,11 @@ mod tests {
             vec![
                 PasswayOrigin {
                     machine: "us-east-001".into(),
-                    address: Ipv4Addr::new(51, 81, 85, 145),
+                    address: Ipv4Addr::new(203, 0, 113, 13),
                 },
                 PasswayOrigin {
                     machine: "us-west-001".into(),
-                    address: Ipv4Addr::new(15, 204, 89, 240),
+                    address: Ipv4Addr::new(203, 0, 113, 11),
                 },
             ],
             "an untainted mesh-only front door is not an apex origin"
@@ -1954,7 +1956,7 @@ mod tests {
                 .iter()
                 .map(|o| o.address.to_string())
                 .collect::<Vec<_>>(),
-            vec!["15.204.89.240", "51.81.85.145"],
+            vec!["203.0.113.11", "203.0.113.13"],
         );
     }
 
@@ -2011,7 +2013,7 @@ mod tests {
             owner.join(".yah/infra/machines/us-east-001.toml"),
             "name = \"us-east-001\"\nprovider = \"ovh\"\nmesh_tags = []\n\
              taints = [\"public-ip\"]\n\
-             [connect]\naddress = \"51.81.85.145\"\nssh = \"root@51.81.85.145\"\n\
+             [connect]\naddress = \"203.0.113.13\"\nssh = \"root@203.0.113.13\"\n\
              identity_file = \"~/.ssh/yah\"\n",
         )
         .unwrap();
@@ -2056,7 +2058,7 @@ mod tests {
                 .iter()
                 .map(|o| o.address.to_string())
                 .collect::<Vec<_>>(),
-            vec!["51.81.85.145".to_string()],
+            vec!["203.0.113.13".to_string()],
         );
     }
 
@@ -2072,7 +2074,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join(".yah/infra/machines")).unwrap();
-        for (name, addr) in [("us-east-001", "51.81.85.145"), ("us-west-001", "15.204.89.240")] {
+        for (name, addr) in [("us-east-001", "203.0.113.13"), ("us-west-001", "203.0.113.11")] {
             std::fs::write(
                 root.join(format!(".yah/infra/machines/{name}.toml")),
                 format!(
@@ -2119,7 +2121,7 @@ mod tests {
                 .iter()
                 .map(|o| o.address.to_string())
                 .collect::<Vec<_>>(),
-            vec!["51.81.85.145".to_string()],
+            vec!["203.0.113.13".to_string()],
             "the staging hostname's door must not be published at the apex"
         );
     }
@@ -2127,7 +2129,7 @@ mod tests {
     /// R910: a passway door a cloudflare tunnel stacks in front of is not an
     /// apex origin. The machine is the one that filed it — `public-ip`-tainted
     /// but on a LAN address — so without the filter `public_origins` refuses
-    /// 192.168.10.11 and the apply fails, instead of planning no apex at all.
+    /// 192.168.250.11 and the apply fails, instead of planning no apex at all.
     #[test]
     fn a_door_behind_a_cloudflare_tunnel_is_not_an_apex_origin() {
         let dir = tempfile::tempdir().unwrap();
@@ -2137,7 +2139,7 @@ mod tests {
             root.join(".yah/infra/machines/us-west-011.toml"),
             "name = \"us-west-011\"\nprovider = \"ovh\"\nmesh_tags = []\n\
              taints = [\"public-ip\"]\n\
-             [connect]\naddress = \"192.168.10.11\"\nssh = \"root@192.168.10.11\"\n\
+             [connect]\naddress = \"192.168.250.11\"\nssh = \"root@192.168.250.11\"\n\
              identity_file = \"~/.ssh/yah\"\n",
         )
         .unwrap();
@@ -2232,7 +2234,7 @@ mod tests {
     fn a_declared_front_door_that_resolves_to_no_public_address_still_errors() {
         // Declared as a front door, but carries no `public-ip` taint — so the
         // taint filter empties the set even though the edge exists.
-        let machines = vec![machine("us-east-001", Some("51.81.85.145"), &[])];
+        let machines = vec![machine("us-east-001", Some("203.0.113.13"), &[])];
         let resolved = public_origins(&["us-east-001".to_string()], &machines, &[]).unwrap();
         let err = plan_domain_passway(&passway_manifest(), resolved, true).unwrap_err();
         let msg = format!("{err:#}");
@@ -2268,7 +2270,7 @@ mod tests {
         let plan = plan_of(&["us-east-001", "us-west-001"]);
         let diff = diff_apex_records(
             &plan,
-            &live(&[("51.81.85.145", false), ("15.204.89.240", false)]),
+            &live(&[("203.0.113.13", false), ("203.0.113.11", false)]),
         );
         assert_eq!(diff, ApexRecordDiff::default());
         assert!(diff.is_converged());
@@ -2277,8 +2279,8 @@ mod tests {
     #[test]
     fn adding_a_machine_yields_exactly_one_added_record_and_no_prune() {
         let plan = plan_of(&["us-east-001", "us-west-001"]);
-        let diff = diff_apex_records(&plan, &live(&[("51.81.85.145", false)]));
-        assert_eq!(diff.upsert, vec!["15.204.89.240".to_string()]);
+        let diff = diff_apex_records(&plan, &live(&[("203.0.113.13", false)]));
+        assert_eq!(diff.upsert, vec!["203.0.113.11".to_string()]);
         assert!(diff.prune.is_empty(), "{diff:?}");
     }
 
@@ -2287,9 +2289,9 @@ mod tests {
         let plan = plan_of(&["us-east-001"]);
         let diff = diff_apex_records(
             &plan,
-            &live(&[("51.81.85.145", false), ("15.204.89.240", false)]),
+            &live(&[("203.0.113.13", false), ("203.0.113.11", false)]),
         );
-        assert_eq!(diff.prune, vec!["15.204.89.240".to_string()]);
+        assert_eq!(diff.prune, vec!["203.0.113.11".to_string()]);
         assert!(
             diff.upsert.is_empty(),
             "the survivor is already correct: {diff:?}"
@@ -2302,8 +2304,8 @@ mod tests {
     #[test]
     fn a_proxied_record_at_a_desired_address_is_rewritten_not_left_alone() {
         let plan = plan_of(&["us-east-001"]);
-        let diff = diff_apex_records(&plan, &live(&[("51.81.85.145", true)]));
-        assert_eq!(diff.upsert, vec!["51.81.85.145".to_string()]);
+        let diff = diff_apex_records(&plan, &live(&[("203.0.113.13", true)]));
+        assert_eq!(diff.upsert, vec!["203.0.113.13".to_string()]);
         assert!(
             diff.prune.is_empty(),
             "the address is declared — it must not be pruned: {diff:?}"
@@ -2324,11 +2326,11 @@ mod tests {
         // reported problems — so its absence is not trustworthy evidence of a
         // withdrawal. us-east-001 is newly declared and must still be written.
         let plan = plan_of_incomplete(&["us-east-001"]);
-        let diff = diff_apex_records(&plan, &live(&[("15.204.89.240", false)]));
+        let diff = diff_apex_records(&plan, &live(&[("203.0.113.11", false)]));
 
         assert_eq!(
             diff.upsert,
-            vec!["51.81.85.145".to_string()],
+            vec!["203.0.113.13".to_string()],
             "additions must still land through a dirty collation"
         );
         assert!(
@@ -2337,15 +2339,15 @@ mod tests {
         );
         assert_eq!(
             diff.withheld_prune,
-            vec!["15.204.89.240".to_string()],
+            vec!["203.0.113.11".to_string()],
             "the withheld record is reported so the applier can name it"
         );
 
         // Same inputs, clean collation: the prune is real. This is the
         // control that proves the gate is what changed the outcome.
         let trusted = plan_of(&["us-east-001"]);
-        let diff = diff_apex_records(&trusted, &live(&[("15.204.89.240", false)]));
-        assert_eq!(diff.prune, vec!["15.204.89.240".to_string()]);
+        let diff = diff_apex_records(&trusted, &live(&[("203.0.113.11", false)]));
+        assert_eq!(diff.prune, vec!["203.0.113.11".to_string()]);
         assert!(diff.withheld_prune.is_empty(), "{diff:?}");
     }
 
@@ -2374,14 +2376,14 @@ mod tests {
             got.origins,
             vec![PasswayOrigin {
                 machine: "us-west-001".into(),
-                address: Ipv4Addr::new(15, 204, 89, 240),
+                address: Ipv4Addr::new(203, 0, 113, 11),
             }]
         );
         assert_eq!(
             got.health_withdrawn,
             vec![PasswayOrigin {
                 machine: "us-east-001".into(),
-                address: Ipv4Addr::new(51, 81, 85, 145),
+                address: Ipv4Addr::new(203, 0, 113, 13),
             }],
             "a withheld origin must still be reported, with the address it would have published"
         );
@@ -2422,8 +2424,8 @@ mod tests {
     #[test]
     fn an_address_a_live_origin_still_serves_is_not_withdrawn() {
         let fleet = vec![
-            machine("us-east-001", Some("51.81.85.145"), &["public-ip"]),
-            machine("us-east-002", Some("51.81.85.145"), &["public-ip"]),
+            machine("us-east-001", Some("203.0.113.13"), &["public-ip"]),
+            machine("us-east-002", Some("203.0.113.13"), &["public-ip"]),
         ];
         let resolved = public_origins(
             &["us-east-001".to_string(), "us-east-002".to_string()],
@@ -2437,7 +2439,7 @@ mod tests {
                 .iter()
                 .map(|o| o.address.to_string())
                 .collect::<Vec<_>>(),
-            vec!["51.81.85.145"]
+            vec!["203.0.113.13"]
         );
         assert!(
             plan.health_withdrawn.is_empty(),
@@ -2451,7 +2453,7 @@ mod tests {
     /// resting on a box we watched go down.
     #[test]
     fn health_withdrawal_and_declaration_completeness_are_independent() {
-        let live = live(&[("51.81.85.145", false), ("15.204.89.240", false)]);
+        let live = live(&[("203.0.113.13", false), ("203.0.113.11", false)]);
 
         // complete + healthy: an ordinary withdrawal from a trusted declaration.
         let complete_healthy = plan_domain_passway(
@@ -2461,7 +2463,7 @@ mod tests {
         )
         .unwrap();
         let d = diff_apex_records(&complete_healthy, &live);
-        assert_eq!(d.prune, vec!["51.81.85.145"]);
+        assert_eq!(d.prune, vec!["203.0.113.13"]);
         assert!(d.withheld_prune.is_empty());
 
         // complete + down: the same prune, now on health grounds.
@@ -2472,7 +2474,7 @@ mod tests {
         )
         .unwrap();
         let d = diff_apex_records(&complete_down, &live);
-        assert_eq!(d.prune, vec!["51.81.85.145"]);
+        assert_eq!(d.prune, vec!["203.0.113.13"]);
         assert!(d.withheld_prune.is_empty());
 
         // incomplete + healthy: might be a withdrawal, might be a typo — withheld.
@@ -2487,7 +2489,7 @@ mod tests {
             d.prune.is_empty(),
             "an absence under an incomplete collation must never prune"
         );
-        assert_eq!(d.withheld_prune, vec!["51.81.85.145"]);
+        assert_eq!(d.withheld_prune, vec!["203.0.113.13"]);
 
         // incomplete + down: PRUNED ANYWAY. We saw this machine declared and we
         // saw it die; the incompleteness is about a different declaration.
@@ -2500,7 +2502,7 @@ mod tests {
         let d = diff_apex_records(&incomplete_down, &live);
         assert_eq!(
             d.prune,
-            vec!["51.81.85.145"],
+            vec!["203.0.113.13"],
             "a health withdrawal rests on a positive observation, not on an absence, so \
              origins_complete = false must not suppress it"
         );
@@ -2521,12 +2523,12 @@ mod tests {
         let d = diff_apex_records(
             &plan,
             &live(&[
-                ("51.81.85.145", false), // declared + confirmed down -> prune
-                ("15.204.89.240", false), // the surviving origin -> kept
+                ("203.0.113.13", false), // declared + confirmed down -> prune
+                ("203.0.113.11", false), // the surviving origin -> kept
                 ("203.0.113.9", false),  // never declared at all -> withheld
             ]),
         );
-        assert_eq!(d.prune, vec!["51.81.85.145"]);
+        assert_eq!(d.prune, vec!["203.0.113.13"]);
         assert_eq!(d.withheld_prune, vec!["203.0.113.9"]);
         assert!(d.upsert.is_empty());
     }
@@ -2539,12 +2541,12 @@ mod tests {
         let plan = plan_of_incomplete(&["us-east-001"]);
         let diff = diff_apex_records(
             &plan,
-            &live(&[("51.81.85.145", false), ("15.204.89.240", false)]),
+            &live(&[("203.0.113.13", false), ("203.0.113.11", false)]),
         );
         assert!(diff.upsert.is_empty(), "{diff:?}");
         assert!(diff.prune.is_empty(), "{diff:?}");
         assert!(diff.is_converged(), "no write to make: {diff:?}");
-        assert_eq!(diff.withheld_prune, vec!["15.204.89.240".to_string()]);
+        assert_eq!(diff.withheld_prune, vec!["203.0.113.11".to_string()]);
     }
 
     /// Ordering contract (`cf-apex-mode.sh:245-246,287-288`): the applier
@@ -2553,9 +2555,9 @@ mod tests {
     #[test]
     fn a_full_origin_swap_writes_the_new_record_before_pruning_the_old() {
         let plan = plan_of(&["us-west-001"]);
-        let diff = diff_apex_records(&plan, &live(&[("51.81.85.145", false)]));
-        assert_eq!(diff.upsert, vec!["15.204.89.240".to_string()]);
-        assert_eq!(diff.prune, vec!["51.81.85.145".to_string()]);
+        let diff = diff_apex_records(&plan, &live(&[("203.0.113.13", false)]));
+        assert_eq!(diff.upsert, vec!["203.0.113.11".to_string()]);
+        assert_eq!(diff.prune, vec!["203.0.113.13".to_string()]);
         assert!(!diff.is_converged());
     }
 }

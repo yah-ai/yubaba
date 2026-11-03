@@ -324,6 +324,28 @@ impl HysteresisPolicy {
     }
 }
 
+/// The extra wait W364 §3 puts on top of [`HysteresisPolicy::confirm_down_after`]
+/// before a lost node's workloads move: the chaos policy's restart window, so a
+/// rebooting node (yubaba back within about a minute) keeps its workloads.
+pub const REPLACEMENT_GRACE_MARGIN: Duration = Duration::from_secs(60);
+
+/// The least [`replacement_grace`] can be. At `RaftTiming::wan()`
+/// `confirm_down_after` is only 5 s, so the sum alone is 65 s, short enough to
+/// re-place workloads during an ordinary yubaba restart or hotship. W364 §3
+/// budgets about 120 s total; the floor holds it there whatever the timing.
+pub const REPLACEMENT_GRACE_FLOOR: Duration = Duration::from_secs(120);
+
+/// W364 §3's grace: how long a node must have been raw-`Down` before its
+/// workload replicas are re-placed — `confirm_down_after` +
+/// [`REPLACEMENT_GRACE_MARGIN`], never less than [`REPLACEMENT_GRACE_FLOOR`].
+/// The ONE deadline both sides of W364 §4 use (R977): the leader's reconcile
+/// ([`crate::workload_reconcile`]) moves no earlier, and a node that has lost
+/// quorum contact for this long fences its own movable copies (R977-F5). Two
+/// constants here would let them drift apart and widen the overlap §4 bounds.
+pub fn replacement_grace(policy: HysteresisPolicy) -> Duration {
+    (policy.confirm_down_after + REPLACEMENT_GRACE_MARGIN).max(REPLACEMENT_GRACE_FLOOR)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Candidate {
     direction: Confirmed,

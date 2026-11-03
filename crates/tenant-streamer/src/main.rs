@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::{error, info, warn};
-use turso_backup::snapshot::BackupTarget;
+use store_claim::BackupTarget;
 use turso_backup::stream::{CoreWalSeam, StreamOutcome};
 use workload_spec::TenantId;
 use yubaba_tenant_streamer::rebuild::{
@@ -193,15 +193,36 @@ async fn main() -> Result<()> {
 /// file that cannot be read fails startup rather than degrading to unsigned —
 /// that degradation would only surface once the fleet flips to `require`.
 fn peer_signer(config: &StreamerConfig) -> Result<yubaba_auth_token::PeerSigner> {
-    let signer = yubaba_auth_token::PeerSigner::from_key_file(
-        config.cluster_key_file.as_deref(),
+    let signer = yubaba_auth_token::PeerSigner::from_service_key_file(
+        config.service_key_file.as_deref(),
         format!("svc:tenant-streamer@node:{}", config.node_id),
     )
     .map_err(anyhow::Error::msg)?;
     if !signer.is_signing() {
-        warn!("no cluster_key_file configured: calls to yubaba go unsigned and will 401 once it enforces");
+        warn!("no service_key_file configured: calls to yubaba go unsigned and will 401 once it enforces");
     }
-    Ok(signer)
+    // R997-B27: prove the lease writes come from this node's streamer.
+    let identity = match config.identity_file.as_deref() {
+        Some(path) => {
+            use yubaba_auth_token::node_identity::{IdentityKind, NodeIdentity};
+            let identity = NodeIdentity::from_file(path).map_err(anyhow::Error::msg)?;
+            let cert = identity.cert();
+            if cert.kind != IdentityKind::TenantStreamer || cert.node_id != config.node_id {
+                anyhow::bail!(
+                    "identity_file certifies a {} for node {}, not this node's ({}) tenant-streamer",
+                    cert.kind,
+                    cert.node_id,
+                    config.node_id
+                );
+            }
+            Some(std::sync::Arc::new(identity))
+        }
+        None => {
+            warn!("no identity_file configured: lease writes carry no node proof and a node in identity mode require refuses them");
+            None
+        }
+    };
+    Ok(signer.with_node_identity(identity))
 }
 
 /// `yubaba-tenant-streamer rebuild` — W339's procedure, once, over every

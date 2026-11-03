@@ -424,8 +424,15 @@ impl ServiceRecordFanout {
     /// sole anonymous port — so a multi-listener unit resolves the same way at
     /// both tiers or at neither.
     pub fn address_for_ident(&self, ident: &str) -> Option<String> {
-        let mut found: Vec<String> = Vec::new();
-        for (_, visibility) in self.nodes.iter() {
+        self.locate_ident(ident).map(|(_, addr)| addr)
+    }
+
+    /// [`address_for_ident`](Self::address_for_ident) plus the machine whose
+    /// record answered (the first node reporting it, when two report the same
+    /// address). Same singular-or-`None` rule.
+    pub fn locate_ident(&self, ident: &str) -> Option<(String, String)> {
+        let mut found: Vec<(String, String)> = Vec::new();
+        for (machine, visibility) in self.nodes.iter() {
             for record in visibility.records().iter().filter(|r| r.ident == ident) {
                 let port = record
                     .named_ports
@@ -437,8 +444,8 @@ impl ServiceRecordFanout {
                     });
                 let Some(port) = port else { continue };
                 let addr = format!("{}:{port}", record.mesh_ip);
-                if !found.contains(&addr) {
-                    found.push(addr);
+                if !found.iter().any(|(_, a)| *a == addr) {
+                    found.push((machine.clone(), addr));
                 }
             }
         }
@@ -655,6 +662,7 @@ mod tests {
             via: None,
             behind_tunnel: false,
             tunnel_door: None,
+            door: None,
         }
     }
 
@@ -1193,6 +1201,16 @@ mod tests {
         fanout.push_answer("us-east-001", vec![named_record("acct", "100.64.0.3", &[43117])]);
         fanout.push_answer("us-south-001", vec![named_record("acct", "100.64.0.4", &[43117])]);
         assert_eq!(fanout.address_for_ident("acct"), None);
+    }
+
+    /// The machine whose record answered is named alongside the address.
+    #[test]
+    fn locate_ident_names_the_machine_that_answered() {
+        let mut fanout = ServiceRecordFanout::default();
+        fanout.push_answer("us-east-001", vec![named_record("acct", "100.64.0.3", &[43117])]);
+        fanout.push_answer("us-south-001", vec![named_record("other", "100.64.0.4", &[1])]);
+        assert_eq!(fanout.locate_ident("acct"), Some(("us-east-001".to_string(), "100.64.0.3:43117".to_string())));
+        assert_eq!(fanout.locate_ident("nope"), None);
     }
 
     /// The same workload reported by two nodes at ONE address — a duplicate

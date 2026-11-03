@@ -138,7 +138,7 @@
 //! @yah:gotcha("THIS IS NOT STALENESS, IT IS STRUCTURAL ZERO — and that distinction is the whole ticket. Measured 2026-09-10 on us-west-003 by @Ashguard:eclipse. yubaba serves GET /node/usage at oss/yubaba/crates/yubaba/src/lib.rs:2581, which calls node::committed_totals(&s.workload_resources) (node.rs:512). `workload_resources` is an in-memory Mutex<BTreeMap> (node.rs:509), constructed Default::default() at lib.rs:1390, inserted on deploy success (lib.rs:4512) and removed on destroy (lib.rs:4680). NOTHING REHYDRATES IT AT STARTUP. So after any yubaba/kamaji restart it reports `yah.workloads.count` = 0 permanently, no matter what the node is actually holding — it does not drift toward wrong, it starts wrong and stays wrong. A scheduler trusting /node/usage will therefore overcommit a rebooted node indefinitely. CONTRAST THE SIBLING ENDPOINT, which is correct: GET /workloads (lib.rs:3073) goes through the kamaji UDS `client.list()` to containerd, which SURVIVES a restart. The two endpoints disagreeing is the visible symptom; the durability asymmetry is the cause. OBSERVED CONCRETELY: on us-west-003 after its restart, /workloads listed 16 Pending forge-* entries while /node/usage read workloads.count 0 — and when those 16 containerd records were removed, /workloads went to [] while /node/usage read 0 both before AND after, i.e. it was never tracking them at all.")
 //! @yah:next("THE FIX IS CHEAP AND THE CALL ALREADY EXISTS — rehydrate `workload_resources` at boot from kamaji's `client.list()`, which is the SAME call GET /workloads already makes at lib.rs:3073. That makes containerd the single source of truth for what a node holds and removes the durability asymmetry rather than papering over it. Do NOT solve this by making /workloads read the in-memory map too: that would make both endpoints wrong after a restart instead of one.")
 //! @yah:gotcha("RELATED BUT DELIBERATELY SEPARATE — do not fold these together. (1) kamaji HAS NO STARTUP RECONCILIATION AT ALL: its boot is build_ctx + resume_bundle_workloads() only (crates/kamaji-bin/src/main.rs:510-516), which replays persisted BUNDLE deploy records and never looks at containerd's namespace. The labels that would support reconciliation already exist and document the intent — crates/kamaji-bin/src/containerd.rs:1115-1118 literally says 'how reconciliation recovers the workload id after a Kamaji restart' — but nothing consumes them at boot. Confirmed by tree-wide grep for reconcile/sweep/orphan/gc/prune. This ticket's rehydration is the yubaba-side half; a kamaji-side reconcile is a larger, separable piece. (2) R823-B4 owns the LEAK that made this visible: teardown_workload sends the MeshIdent `forge.<uuid>` where the container is named `forge-<uuid>`, so every reap silently no-ops while reporting success. That is a different bug with a different fix and it is already diagnosed and code-complete but unrolled. Fixing B7 does not fix the leak, and rolling the leak fix does not fix B7. (3) The rest of R885 is per-workload cgroup limits at ADMISSION — complementary; nothing there reclaims a record or corrects an accounting surface.")
-//! @yah:verify("Restart yubaba on a node holding at least one live workload and assert GET /node/usage `yah.workloads.count` matches GET /workloads immediately after boot, without a deploy having happened in between. That last clause is the real test: the count is currently repopulated ONLY by a subsequent deploy (lib.rs:4512), so any verification that deploys first will pass against the unfixed code. us-west-003 is a usable target — it is reachable on LAN (yah@192.168.10.32) and mesh (100.64.0.9), running yubaba/kamaji 0.8.28, single-node, epoch 4.")
+//! @yah:verify("Restart yubaba on a node holding at least one live workload and assert GET /node/usage `yah.workloads.count` matches GET /workloads immediately after boot, without a deploy having happened in between. That last clause is the real test: the count is currently repopulated ONLY by a subsequent deploy (lib.rs:4512), so any verification that deploys first will pass against the unfixed code. us-west-003 is a usable target — it is reachable on LAN (yah@192.168.250.32) and mesh (100.64.0.9), running yubaba/kamaji 0.8.28, single-node, epoch 4.")
 //! @yah:gotcha("Tier: Cleric — a single well-understood seam with the required call already in the codebase; it needs care about restart ordering and source-of-truth choice, not novel design.")
 //! @yah:handoff("FIXED: node.rs's ResourceRegistry changed from Mutex<BTreeMap<String, WorkloadResources>> to Mutex<BTreeMap<String, Option<WorkloadResources>>>. None means 'this workload exists (recovered from the runtime backend) but its original resource request is unrecoverable' -- distinct from a fabricated zero, which preserves enrich_workloads' pre-existing documented 'absent means unknown, not zero' contract for GET /workloads. New node::record_seen_with_unknown_resources(registry, ident) inserts None without clobbering an already-known entry. committed_totals now counts ALL entries (known+unknown) toward yah.workloads.count but sums only known ones into the memory/cpu totals.")
 //! @yah:handoff("WIRED AT BOOT: lib.rs gained rehydrate_workload_resources(state) + live_workload_idents[_with_retry], called from both real entry points serve() and serve_on_listener() right after the listener binds, before axum::serve starts routing. It mirrors list_workloads' own backend selection (kamaji sibling client.list() first, legacy in-process runtime.list_workloads() second) and reuses the existing mesh_ident.unwrap_or(id) key-resolution idiom already used at lib.rs:3574 for drain_workloads, so /node/usage and /workloads can never disagree about which backend is authoritative for 'what does this node hold'.")
@@ -171,9 +171,38 @@
 //! @yah:handoff("LABELLED, NOT SILENT FALLBACK: added yah.filesystem.source (String, paired 1:1 with system.filesystem.usage/limit's Option-ness) to both NodeSpecs and NodeUsage, carrying the exact path read_filesystem_at actually measured -- /var/lib/containerd, /System/Volumes/Data, or a labelled / when every candidate is missing. read_filesystem/read_filesystem_at now return (used, total, source_path) instead of just the two numbers, threaded through both collect_specs() and usage() into the new field. A fleet node silently falling back to / is now a visible, attributable JSON key instead of a plausible-looking number with no way to tell what it measured -- closing the exact failure shape this whole ticket exists to kill.")
 //! @yah:verify("cargo check --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib --tests: clean, 2026-09-11, after the filesystem_source field addition.")
 //! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib: 984 passed, 0 failed (prior verified baseline was 983/0; the +1 is the new usage_omits_filesystem_fields_together_when_unmeasured test, zero regressions). New/strengthened tests confirmed passing by name: read_filesystem_at_skips_a_missing_candidate_and_falls_through and read_filesystem_at_falls_back_to_root_when_no_candidate_exists now assert the SOURCE string names the real candidate, not just that a value came back; specs_collect_on_this_platform and usage_collects_on_this_platform gained the pairing invariant (a filesystem number and its source are always both-present or both-absent); specs_serialize_with_otel_semconv_keys and usage_serializes_with_otel_semconv_keys assert the new yah.filesystem.source wire key round-trips; usage_omits_filesystem_fields_together_when_unmeasured is new.")
+//!
+//! @yah:ticket(R1005-F1, "NodeUsage: report every workload-relevant mount (containerd root, QED state root /var/lib/yah/qed, camp/home root), each with its mount path; the machine card shows the fullest and names it, tooltip lists all. filesystem_source exists today but the UI (MachineInventory.tsx disk meter) never displays it.")
+//! @yah:assignee(agent:claude)
+//! @yah:at(2026-10-24T07:28:37Z)
+//! @yah:parent(R1005)
+//!
+//! @yah:ticket(R1019-F5, "Output retention on terminal workloads: produced bytes kept for a fixed window then deleted whether fetched or not, and counted against the machine's disk_mb grants until deleted")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:at(2026-10-27T04:01:48Z)
+//! @yah:phase(P1)
+//! @yah:parent(R1019)
+//! @yah:next("Tier: Warrior. Today reap (remote.rs:446) runs only after the caller fetched outputs, so a caller that died leaks its terminal workload's bytes forever. The machine deletes them after the retention window instead.")
+//! @yah:next("Retention window is W384 open question 6: pick a default, write it into W384.")
+//! @yah:next("The grant table (R1019-F3) counts retained bytes against disk_mb until deletion, so a machine full of unfetched outputs refuses grants (W384 §2.4).")
+//! @yah:verify("A test: a terminal workload nobody fetches is gone after the window, and its bytes stopped counting against disk_mb at that moment and not before.")
+//! @arch:see(.yah/docs/working/W384-fleet-build-leases.md)
+//! @yah:assumes("Leader 2026-10-27: F5 now waits on F21 because both edit the grant table (oss/yubaba build_grants.rs and lib.rs). F5 also shares velveteen-exec remote.rs (reap ~:446 and fetch ~:450) with F4, so re-read that file before editing it.")
+//! @yah:depends_on(R1019-F3)
+//! @yah:depends_on(R1019-F21)
+//! @yah:handoff("Retention + lease-dir lifecycle in oss/yubaba/crates/yubaba/src/build_grants.rs. OQ6 picked: OUTPUT_RETENTION = 1h from the moment a lease goes terminal (Released/Expired/cascade/reconcile; Grant.ended_at stamped). Written into W384 section 2.4 and OQ6.")
+//! @yah:handoff("Terminal grants now stay in the GrantTable (prune_terminal removed) and committed() counts disk_mb over every grant in the table, so retained bytes count until deletion. sweep() takes a LeaseDirs, calls due(now), deletes lease dir + the workload's produced dir (forge_produced::host_dir via Grant.workload), then forget()s only the ones that deleted; a failed delete keeps counting and retries next 5s sweep. release() gained a now param.")
+//! @yah:handoff("LeaseDirs (roots injectable, LeaseDirs::host() in prod): lib.rs acquire_build_grant mkdirs LEASE_HOST_ROOT/<id> after a successful acquire (releases the grant and returns 500 if mkdir fails). init_build_grants runs remove_orphan_dirs after a successful rehydrate only (a failed rehydrate removes nothing); only lease-<epoch> names are touched.")
+//! @yah:handoff("remote.rs: doc-comment only on reap (no behaviour change; F4's fetch_produced_file untouched). F21 cleanup: whole entry was removed by remove_cleanup; the hardlink-check half re-appended without the mkdir half.")
+//! @yah:handoff("PASS: cargo test -p yubaba --lib: 1226 passed, 0 failed (baseline 1222, +4 new): an_unfetched_terminal_workload_is_deleted_after_the_window_and_stops_counting_then (still present and counted 1s before window, gone and free at the window), a_failed_delete_keeps_counting_the_bytes_and_retries, the_lease_dir_exists_after_grant_and_is_gone_after_terminal_plus_window, a_lease_dir_with_no_grant_at_boot_is_removed_and_a_rehydrated_one_is_kept. Four existing tests edited: they asserted a terminal grant is pruned at once; now assert not-live, or forget() explicitly.")
+//! @yah:gotcha("Retained disk uses the grant's needs.disk_mb as the byte count (actual dir size is not measured). A grant that never deployed still holds its disk_mb for the window after release.")
+//! @yah:gotcha("Observation: the 3-day PRODUCED_RETENTION mtime sweep in lib.rs is unchanged and still covers produced dirs of unleased workloads. The mkdir-at-grant handler path (LeaseDirs::host(), /var/lib/yah/leases) has no test; the LeaseDirs methods it calls do.")
+//! @yah:verify("PASSED LIVE (R1019-T22, 2026-10-27, us-west-004 0.8.50-h1) after the unit fix (yubaba.service + kamaji.service gain yah/leases in StateDirectory and /var/lib/yah/leases in ReadWritePaths; installed on 004 and 002): POST /grants -> lease-1793081278469 granted, /var/lib/yah/leases/lease-1793081278469 created at grant (06:08:14Z); released (terminal) 06:08:20Z, dir retained; dir gone between 07:08:12Z and 07:08:42Z = terminal + OUTPUT_RETENTION (60 min) + sweep tick. No code or retention change. Earlier EROFS failure was the unit sandbox, not F5 code.")
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -393,6 +422,23 @@ pub struct NodeSpecs {
 /// Every measurement is `Option`: a node that can report memory but not CPU
 /// returns the memory and a null CPU, rather than a 500. Partial data beats
 /// no data for a health dashboard.
+/// One distinct filesystem that backs one or more workload-relevant roots.
+///
+/// `roots` names why this mount is in the payload (for example containerd or
+/// QED state); `mount_path` is the actual mount point reported by `df`. A
+/// single mount can back several roots, so it appears once rather than
+/// misleading a consumer into treating duplicate capacity readings as
+/// independent disks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FilesystemUsage {
+    pub mount_path: String,
+    pub roots: Vec<String>,
+    pub usage_bytes: u64,
+    pub limit_bytes: u64,
+    pub utilization: Option<f64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct NodeUsage {
     pub schema_version: u32,
@@ -479,6 +525,13 @@ pub struct NodeUsage {
         default
     )]
     pub filesystem_source: Option<String>,
+
+    /// Every distinct filesystem that backs a workload-relevant root. The
+    /// legacy `system.filesystem.*` fields above remain the containerd-first
+    /// compatibility signal; consumers displaying disk pressure should use
+    /// this list and select its fullest entry.
+    #[serde(rename = "yah.filesystems", default, skip_serializing_if = "Vec::is_empty")]
+    pub filesystems: Vec<FilesystemUsage>,
 
     #[serde(
         rename = "yah.load.1m",
@@ -569,6 +622,19 @@ pub struct WorkloadResources {
     pub cpu_millis: u32,
 }
 
+impl WorkloadResources {
+    /// What `spec` asked to be GIVEN: `memory_request_mb()`, not the
+    /// `resources.memory_mb` ceiling. Summing ceilings would book a single
+    /// forge run as 32 GiB committed on an 8 GiB node. One derivation for the
+    /// deploy handler and the boot rebuild (R977-B11).
+    pub fn of(spec: &workload_spec::WorkloadSpec) -> Self {
+        Self {
+            memory_mb: spec.memory_request_mb(),
+            cpu_millis: spec.resources.cpu_millis,
+        }
+    }
+}
+
 /// Registry of `ident -> requested resources` for workloads this yubaba
 /// knows about.
 ///
@@ -600,6 +666,25 @@ pub fn record_seen_with_unknown_resources(registry: &ResourceRegistry, ident: St
         Err(poisoned) => poisoned.into_inner(),
     };
     guard.entry(ident).or_insert(None);
+}
+
+/// R977-B11: restore a workload's request from the spec kamaji is supervising
+/// — the boot-time half of what the deploy handler records. Fills an absent or
+/// `None` entry; never overwrites a known request (a deploy that landed first
+/// recorded the newer truth).
+pub fn record_rehydrated_resources(
+    registry: &ResourceRegistry,
+    ident: String,
+    resources: WorkloadResources,
+) {
+    let mut guard = match registry.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let slot = guard.entry(ident).or_insert(None);
+    if slot.is_none() {
+        *slot = Some(resources);
+    }
 }
 
 /// Sum of all recorded requests, and how many workloads contributed (known or
@@ -848,6 +933,45 @@ impl MetricScope {
 /// the right lifetime for a liveness signal — persisting the last-known xrun
 /// count across a restart would republish a measurement nobody is standing
 /// behind any more.
+///
+/// @yah:ticket(R979-T11, "Publish each node's warm relay mounts (count and relay IDs) through DomainMetrics into /node/usage")
+/// @yah:status(review)
+/// @yah:at(2026-10-13T13:36:40Z)
+/// @yah:assignee(agent:bundle-anthropic-miravel)
+/// @yah:phase(P3)
+/// @yah:parent(R979)
+/// @yah:next("Tier: Warrior. Mechanical once R979-F3 defines how a relay mount is recognised.")
+/// @yah:next("W365 section 4 puck data: the warm-relay count is not on the wire today. Publish it through DomainMetrics (node.rs), which merges flat into NodeUsage, the same way other domain sources do. The ranking needs the relay IDs as well as the count, for warm affinity ('the node holding this relay's workdir'), so publish both.")
+/// @yah:verify("GET /node/usage on a node holding two relay mounts reports both relay IDs; after one is released, it reports one.")
+/// @yah:depends_on(R979-F3)
+/// @yah:files(oss/yubaba/crates/yubaba/src/node.rs)
+/// @yah:handoff("workload-spec: added relay_workdir::{RelayMount{id,live}, list_mounts(root)} (valid-id dirs, live via F3's is_live, sorted; missing root = empty). node.rs: NodeProbe::publish_relay_mounts(root) pushes source yubaba-relay-mounts through DomainMetrics on every usage() sample (root = relay_workdir::HOST_ROOT); keys relay.mounts.warm (count) and relay.mounts.<id>.live (bool). Deviation from the brief's [{id,live}] shape: the metric wire is scalar-only (arrays/objects rejected at ingest), so ids ride in the key names. No relay root dir => nothing published (source withdrawn), else every node would carry warm:0 and two existing lib.rs tests that assert an empty domain/no yah.metrics.sources would fail (first run did fail those 2). Per-id keys are capped at 127 (source key cap 128); warm count stays true.")
+/// @yah:handoff("Tests: new node::tests::relay_mounts_publish_ids_and_live_flags_and_follow_removal (two mounts, one live/one released -> both ids + flags, warm=2; rm one dir -> warm=1, id gone). workload-spec --lib: 220 pass / 0 fail (baseline 220; no new workload-spec test, helper is covered via the yubaba test). yubaba --lib: 1157 pass / 0 fail (1156 pre-edit baseline inferred = 1155 pass + 2 fail in first run minus my test; pre-edit count not run separately). Logs /tmp/t11-ws-2.log, /tmp/t11-yb-2.log.")
+/// @yah:handoff("PENDING A NODE ROLL (not done): live GET /node/usage on a node holding two relay mounts must show relay.mounts.warm=2 and both relay.mounts.<id>.live keys; after release+eviction one.")
+/// @yah:verify("GET /node/usage after a roll shows relay.mounts.warm and relay.mounts.<id>.live per mount")
+/// Source name of the node-published relay-mount metrics.
+const RELAY_MOUNTS_SOURCE: &str = "yubaba-relay-mounts";
+
+/// Warm relay mounts as a [`MetricReport`]: `relay.mounts.warm` (count) and a
+/// `relay.mounts.<repo>.<id>.live` bool per mount. Scalar-only, so the mount
+/// list is carried in the key names; the repo is part of the key because a
+/// relay id is only unique within its camp (R979-F8). Mounts past the
+/// per-source key cap are dropped from the per-mount keys but still counted
+/// in `relay.mounts.warm`.
+fn relay_mounts_report(root: &Path) -> MetricReport {
+    let mounts = workload_spec::relay_workdir::list_mounts(root);
+    let mut metrics = BTreeMap::new();
+    metrics.insert("relay.mounts.warm".to_string(), MetricValue::from(mounts.len() as u64));
+    for m in mounts.iter().take(MAX_METRICS_PER_SOURCE - 1) {
+        metrics.insert(format!("relay.mounts.{}.{}.live", m.repo, m.id), MetricValue::Bool(m.live));
+    }
+    MetricReport {
+        source: RELAY_MOUNTS_SOURCE.into(),
+        metrics,
+        ttl_ms: None,
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct DomainMetrics {
     sources: Mutex<BTreeMap<String, MetricScope>>,
@@ -1104,6 +1228,7 @@ impl NodeProbe {
         let (cpu_utilization, cpu_source, sample_window_ms) = self.sample_cpu(window_ms).await;
         let mem = read_memory();
         let fs = read_filesystem();
+        let filesystems = read_filesystems();
         let filesystem_usage_bytes = fs.as_ref().map(|(used, _, _)| *used);
         let filesystem_limit_bytes = fs.as_ref().map(|(_, total, _)| *total);
         let filesystem_utilization = fs.as_ref().and_then(|(used, total, _)| ratio(*used, *total));
@@ -1121,6 +1246,7 @@ impl NodeProbe {
             filesystem_limit_bytes,
             filesystem_utilization,
             filesystem_source,
+            filesystems,
             load_1m: load.map(|l| l.0),
             load_5m: load.map(|l| l.1),
             load_15m: load.map(|l| l.2),
@@ -1130,8 +1256,25 @@ impl NodeProbe {
             sample_window_ms,
             collector: collector.as_str().into(),
             collected_at_unix_ms: now_ms(),
-            domain: self.domain.snapshot(),
+            domain: {
+                self.publish_relay_mounts(Path::new(workload_spec::relay_workdir::HOST_ROOT));
+                self.domain.snapshot()
+            },
         }
+    }
+
+    /// Publish the warm relay mounts under `root` into the domain registry
+    /// (R979-T11). Re-published on every usage sample, so the entry follows
+    /// the directory set and goes stale if sampling stops.
+    fn publish_relay_mounts(&self, root: &Path) {
+        // No relay root means this node never hosted a relay: publish nothing
+        // rather than a `warm: 0` that every unrelated node would carry.
+        if !root.is_dir() {
+            self.domain.withdraw(RELAY_MOUNTS_SOURCE);
+            return;
+        }
+        // Best-effort: a rejected report only costs this sample the relay keys.
+        let _ = self.domain.report(relay_mounts_report(root));
     }
 
     /// Returns `(utilization, source, window_ms)`.
@@ -1529,6 +1672,13 @@ fn parse_vm_stat_used(text: &str) -> Option<u64> {
 /// other volumes sharing the container, and on Linux it excludes the
 /// root-reserved blocks. Both are space a workload cannot have. `total −
 /// available` is the honest "how much can still be written" figure on both.
+///
+/// @yah:relay(R1005, "Node disk meter reports one mount unlabelled; QED cache fills a 60G /var while / has 292G free")
+/// @yah:assignee(agent:claude)
+/// @yah:at(2026-10-24T07:15:27Z)
+/// @yah:next("QED cache GC: size cap + LRU eviction for /var/lib/yah/qed/cache (24G on us-west-003, entries back to 2026-10-08) and relay (6.3G).")
+/// @yah:next("Provisioning: decide whether QED state belongs on the 60G var LV or the 400G root LV (VG has 0 free, so growing var means shrinking root).")
+/// @yah:assumes("us-west-003 2026-10-24: Infra tab DISK 72% = /var (yah-var 60G, 41G used), correct for the probed path /var/lib/containerd per R885-B8. But containerd is only 6.9G of it; /var/lib/yah/qed is 31G. / (yah-root 394G) is 23% and invisible on the card.")
 fn read_filesystem() -> Option<(u64, u64, String)> {
     if matches!(Collector::detect(), Collector::Unsupported) {
         return None;
@@ -1536,14 +1686,52 @@ fn read_filesystem() -> Option<(u64, u64, String)> {
     read_filesystem_at(&workload_root_candidates())
 }
 
-/// Paths to probe for "the filesystem workloads actually consume", in
-/// priority order — the first one that exists wins. See [`read_filesystem`]
-/// for why `/var/lib/containerd` leads rather than `/`.
+/// Read every distinct filesystem that can fill through a workload path.
+///
+/// The candidate order preserves the legacy containerd-first reading, while
+/// the structured list deduplicates by the actual `df` mount point. This
+/// makes a shared `/var` appear once with both containerd and QED roots, and
+/// leaves `/` visible whenever it is a distinct filesystem.
+fn read_filesystems() -> Vec<FilesystemUsage> {
+    let mut filesystems: Vec<FilesystemUsage> = Vec::new();
+    for root in workload_root_candidates() {
+        if !Path::new(root).exists() {
+            continue;
+        }
+        let Some((usage_bytes, limit_bytes, mount_path)) = read_filesystem_path(root) else {
+            continue;
+        };
+        if let Some(existing) = filesystems
+            .iter_mut()
+            .find(|fs| fs.mount_path == mount_path)
+        {
+            existing.roots.push(root.to_string());
+            continue;
+        }
+        filesystems.push(FilesystemUsage {
+            mount_path,
+            roots: vec![root.to_string()],
+            usage_bytes,
+            limit_bytes,
+            utilization: ratio(usage_bytes, limit_bytes),
+        });
+    }
+    filesystems
+}
+
+/// Paths to probe for filesystems workloads actually consume. The first
+/// existing path remains the legacy primary metric; the complete list feeds
+/// [`read_filesystems`]. See [`read_filesystem`] for why containerd leads.
 fn workload_root_candidates() -> Vec<&'static str> {
     if cfg!(target_os = "macos") {
-        vec!["/var/lib/containerd", "/System/Volumes/Data", "/"]
+        vec![
+            "/var/lib/containerd",
+            "/var/lib/yah/qed",
+            "/System/Volumes/Data",
+            "/",
+        ]
     } else {
-        vec!["/var/lib/containerd", "/"]
+        vec!["/var/lib/containerd", "/var/lib/yah/qed", "/"]
     }
 }
 
@@ -1556,20 +1744,24 @@ fn workload_root_candidates() -> Vec<&'static str> {
 /// returns which path won so a fallback is a labelled fact, not a silent
 /// substitution.
 fn read_filesystem_at(candidates: &[&str]) -> Option<(u64, u64, String)> {
-    let mount = candidates
+    let root = candidates
         .iter()
         .find(|p| std::path::Path::new(p).exists())
         .copied()
         .unwrap_or("/");
-    let (used, total) = parse_df(&run("df", &["-Pk", mount])?)?;
-    Some((used, total, mount.to_string()))
+    let (used, total, _) = read_filesystem_path(root)?;
+    Some((used, total, root.to_string()))
 }
 
-/// Parse `df -Pk` output into `(used_bytes, total_bytes)`.
-fn parse_df(out: &str) -> Option<(u64, u64)> {
+fn read_filesystem_path(path: &str) -> Option<(u64, u64, String)> {
+    parse_df(&run("df", &["-Pk", path])?)
+}
+
+/// Parse `df -Pk` output into `(used_bytes, total_bytes, mount_path)`.
+fn parse_df(out: &str) -> Option<(u64, u64, String)> {
     // Filesystem  1024-blocks  Used  Available  Capacity  Mounted-on
     let fields: Vec<&str> = out.lines().nth(1)?.split_whitespace().collect();
-    if fields.len() < 4 {
+    if fields.len() < 6 {
         return None;
     }
     let total_kb: u64 = fields[1].parse().ok()?;
@@ -1577,6 +1769,7 @@ fn parse_df(out: &str) -> Option<(u64, u64)> {
     Some((
         total_kb.saturating_sub(available_kb).saturating_mul(1024),
         total_kb.saturating_mul(1024),
+        fields.last()?.to_string(),
     ))
 }
 
@@ -1653,6 +1846,35 @@ mod tests {
                 .collect(),
             ttl_ms: None,
         }
+    }
+
+    #[test]
+    fn relay_mounts_publish_ids_and_live_flags_and_follow_removal() {
+        let root = std::env::temp_dir().join(format!("yah-relay-mounts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Mounts are <root>/<repo>/<id> (R979-F8); the repo rides in the key.
+        let live = root.join("yah").join("R1-live");
+        let released = root.join("yah").join("R2-released");
+        let other_camp = root.join("noisetable").join("R1-live");
+        std::fs::create_dir_all(&released).unwrap();
+        std::fs::create_dir_all(&other_camp).unwrap();
+        workload_spec::relay_workdir::mark_live(&live).unwrap();
+
+        let probe = NodeProbe::new();
+        probe.publish_relay_mounts(&root);
+        let snap = probe.domain().snapshot();
+        assert_eq!(snap["relay.mounts.warm"], 3);
+        assert_eq!(snap["relay.mounts.yah.R1-live.live"], true);
+        assert_eq!(snap["relay.mounts.yah.R2-released.live"], false);
+        assert_eq!(snap["relay.mounts.noisetable.R1-live.live"], false);
+
+        std::fs::remove_dir_all(&released).unwrap();
+        probe.publish_relay_mounts(&root);
+        let snap = probe.domain().snapshot();
+        assert_eq!(snap["relay.mounts.warm"], 2);
+        assert_eq!(snap["relay.mounts.yah.R1-live.live"], true);
+        assert!(!snap.contains_key("relay.mounts.yah.R2-released.live"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2112,8 +2334,9 @@ mod tests {
     fn df_used_is_total_minus_available() {
         let out = "Filesystem     1024-blocks      Used Available Capacity  Mounted on\n\
                    /dev/disk3s1s1   971298980  12271396 344029740     4%    /\n";
-        let (used, total) = parse_df(out).unwrap();
+        let (used, total, mount_path) = parse_df(out).unwrap();
         assert_eq!(total, 971_298_980 * 1024);
+        assert_eq!(mount_path, "/");
         // 971298980 - 344029740 = 627269240, i.e. ~65% — not the 4% the
         // `Used` column would have implied.
         assert_eq!(used, 627_269_240 * 1024);
@@ -2234,6 +2457,45 @@ mod tests {
         );
         reg.lock().unwrap().insert("rehydrated.pdx".into(), None);
         assert_eq!(committed_totals(&reg), (2, 512, 250));
+    }
+
+    /// R977-B11: the boot rebuild turns the ident-only rehydration's `None`
+    /// into the spec's request (so `GET /workloads` keeps cpu_millis/memory_mb
+    /// across a restart, as fleet-git's 3072 MB did not in R977-T6), fills an
+    /// ident nothing listed, and never overwrites a request a deploy recorded.
+    #[test]
+    fn record_rehydrated_resources_fills_unknown_and_never_clobbers_a_known_request() {
+        let fleet_git = WorkloadResources {
+            memory_mb: 3072,
+            cpu_millis: 1000,
+        };
+        let deployed = WorkloadResources {
+            memory_mb: 512,
+            cpu_millis: 250,
+        };
+        let reg: ResourceRegistry = Mutex::new(BTreeMap::new());
+        record_seen_with_unknown_resources(&reg, "fleet-git".into());
+        reg.lock().unwrap().insert("deployed".into(), Some(deployed));
+        record_rehydrated_resources(&reg, "fleet-git".into(), fleet_git);
+        record_rehydrated_resources(&reg, "unlisted".into(), fleet_git);
+        record_rehydrated_resources(
+            &reg,
+            "deployed".into(),
+            WorkloadResources {
+                memory_mb: 9,
+                cpu_millis: 9,
+            },
+        );
+        let g = reg.lock().unwrap();
+        assert_eq!(g["fleet-git"], Some(fleet_git));
+        assert_eq!(g["unlisted"], Some(fleet_git));
+        assert_eq!(g["deployed"], Some(deployed));
+        drop(g);
+        assert_eq!(committed_totals(&reg), (3, 3072 * 2 + 512, 2250));
+        let mut rows = serde_json::json!([{"id": "fleet-git", "state": "Running"}]);
+        enrich_workloads(&reg, &mut rows);
+        assert_eq!(rows[0]["memory_mb"], 3072);
+        assert_eq!(rows[0]["cpu_millis"], 1000);
     }
 
     #[test]
@@ -2393,6 +2655,13 @@ mod tests {
             filesystem_usage_bytes: Some(28_000_000_000),
             filesystem_limit_bytes: Some(60_000_000_000),
             filesystem_source: Some("/var/lib/containerd".into()),
+            filesystems: vec![FilesystemUsage {
+                mount_path: "/var".into(),
+                roots: vec!["/var/lib/containerd".into(), "/var/lib/yah/qed".into()],
+                usage_bytes: 28_000_000_000,
+                limit_bytes: 60_000_000_000,
+                utilization: Some(28.0 / 60.0),
+            }],
             committed_memory_mb: 512,
             committed_cpu_millis: 250,
             workloads_count: 1,
@@ -2408,6 +2677,11 @@ mod tests {
         assert_eq!(v["system.filesystem.usage"], 28_000_000_000u64);
         assert_eq!(v["system.filesystem.limit"], 60_000_000_000u64);
         assert_eq!(v["yah.filesystem.source"], "/var/lib/containerd");
+        assert_eq!(v["yah.filesystems"][0]["mountPath"], "/var");
+        assert_eq!(
+            v["yah.filesystems"][0]["roots"],
+            serde_json::json!(["/var/lib/containerd", "/var/lib/yah/qed"])
+        );
         assert_eq!(v["yah.committed.memory_mb"], 512);
         assert_eq!(v["yah.cpu.source"], "procstat");
         assert_eq!(v["yah.sample.window_ms"], 200);

@@ -1,0 +1,46 @@
+[package]
+name = "fleet-git"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The fleet git remote (W363): an axum supervisor that execs the host's own `git http-backend` per request, with cheers token auth, a per-repo push lock, hook-owned ref policy and a store-claim serving fence."
+keywords = ["yubaba", "git", "fleet", "fencing"]
+categories = ["development-tools"]
+# store-claim is `publish = false` (path dep below), so this crate is too.
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "fleet-git"
+path = "src/main.rs"
+
+[dependencies]
+# W363 §3: the serving fence. Path source with no version, like
+# tenant-streamer's: store-claim is `publish = false` and owns no crates.io
+# name. Deliberately NOT turso-backup, so no database engine enters this build.
+store-claim = { path = "../../../turso-backup/crates/store-claim" }
+# W363 §5: verify-only half of cheers. No minter is reachable from this crate.
+cheers-verify = { path = "../../../cheers/crates/cheers-verify", version = "0.8.51" }
+cheers-core = { path = "../../../cheers/crates/cheers-core", version = "0.8.51" }
+
+anyhow = "1.0"
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+# Same pin as store-claim / tenant-streamer (0.14); keep in lockstep.
+object_store = { version = "0.14", features = ["aws"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "sync", "time", "signal", "fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+pasetors = "0.7"
+tempfile = "3"

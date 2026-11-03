@@ -35,6 +35,31 @@
 //! every failure here backs off and retries rather than propagating — a node
 //! that cannot register yet simply has no row yet, which is the state it was
 //! already in. Nothing waits on it and nothing fails because of it.
+//!
+//! @yah:ticket(R1019-B29, "Prod leader's raft replica holds mesh_tags=None for us-west-001/us-east-001 rows that followers hold; registration never heals it, so role-placed fleet-git cannot be re-placed")
+//! @yah:at(2026-10-28T00:38:04Z)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:parent(R1019)
+//! @yah:severity(high)
+//! @yah:next("Measured 2026-10-27 (Glimmerstone:polaris, R1019-F28 roll): at applied index 2857449, prod leader us-south-001 (node 1) serves /raft/status members.2 (us-west-001) and members.3 (us-east-001) with mesh_tags=null. Followers 2 and 3 serve the full role lists (role:public-uptime,role:best-effort,...); every other field matches. Persistent over 18 samples/90s, with no south restart since 23:15:04Z. INFERENCE (not proven): the rows were applied on south while it ran pre-F28 0.8.49 during the mixed-version roll roll-yubaba-1793140495, and serde(default) dropped the field. plan_registration compares desired against the node's OWN replica (member_registration.rs:154), where rows 2/3 already read Some, so neither node rewrites and the leader's copy never heals.")
+//! @yah:next("Impact: replica re-placement runs leader-only (workload_reconcile.rs:1026) and refuses mesh-tags(unknown) (:308). So us-west-001 and us-east-001 are not re-placement targets while south leads. fleet-git (role:public-uptime, on us-east-001) and yah-cloud-admin (on us-west-001) have no fallback; us-south-001 fails fleet-git's 3072 MB floor. Fix options: (1) registration compares against the leader's row (ask the leader, as workload_reconcile.rs:649 does), or re-asserts its row periodically; (2) a one-off forced rewrite of rows 2/3. A leadership transfer off us-south-001 would mask it, but south hosts headscale (fleet skill: avoid step-downs there). Repro: /tmp/f28r-row.sh 2 100.64.0.2 100.64.0.1 100.64.0.3 (operator token via scripts/lib/yubaba-auth.sh, YUBABA_BIN=oss/yubaba/target/aarch64-apple-darwin/release/yubaba).")
+//! @yah:handoff("VERIFIED (Glimmerstone:polaris). The divergence is in the replicated LOG itself, not only in the state. South's /var/lib/yah-cloud/raft/raft_log.json has entries 2857342 (SetMember node 3) and 2857343 (SetMember node 2), both term 151, with mesh_tags null. The same indices in us-west-001's and us-east-001's logs carry the full role lists. South's persisted raft_state.json (the state a restart loads) holds rows 2/3 with mesh_tags null. Timeline from roll-yubaba-1793140495: west-001 (22:35:15-46Z) and east (22:35:48-36:28Z) came up on h8 while south was leader on 0.8.49 (term 150). About 60 term-150 SetMember entries for node 2 carry null on all three replicas: the 0.8.49 leader dropped the field at proposal, so the h8 nodes rewrote every 1s. South handed leadership to west-001 (term 151) at 22:36:29Z but ran 0.8.49 until about 22:36:31Z. In that window it received 2857342/2857343 from the h8 leader and decoded them with its pre-F28 type, dropping mesh_tags. The writers' own replicas kept the field, so plan_registration (which compares against the node's OWN replica) read converged. The h9 roll restarted both writers at 23:15-23:16Z after south was already on h9, and the rows stayed null. That proves a plain restart does not re-send SetMember. ROOT CAUSE TO RECORD: F28 added mesh_tags as a #[serde(default)] Option on SetMember/MemberInfo, and the epoch bump was skipped on the theory that 'an old follower drops the field and records None, which fails closed'. It fails closed, but it does not heal: an entry decoded by an old replica stays diverged in that replica's log and state forever, and registration has no path that notices. Field-drop became persistent per-replica divergence on whichever node led next. The real fix is one of: re-register on every start (written here), or bump state_epoch/cluster_protocol so a mixed-version roll goes through the hot-release flag-day path.")
+//! @yah:handoff("FIX WRITTEN: member_registration.rs adds recorded_until_written(recorded, written_since_start). run() treats no replica's row as converged until this process has written its row once since start, so every yubaba start re-asserts its row with one raft entry, and that repairs any replica upgraded since. New test a_restarted_node_writes_its_row_once_even_when_its_own_replica_matches. cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib member_registration: 16 passed / 0 failed, EXIT=0 (/tmp/f28r-b29-test-a1.log). member_registration.rs is not a cluster-epoch input (xtask/src/cluster_epochs.rs:297-336). NEXT, in this session: hotship us-west-001 alone (follower), confirm the leader's row 2 carries mesh_tags with quorum and leader stable, then us-east-001. The leader us-south-001 is not restarted.")
+//! @yah:handoff("STOPPED BEFORE ANY PROD CHANGE (Glimmerstone:polaris). The live heal is shipping this fix to the two prod followers, and operator decision F4551 holds prod: 'nothing more ships tonight' (recorded in Ashguard:dove's R1021-T6 handoff in headscale_appliance.rs). The yah-gate approval for the us-west-001 hotship dry-run also timed out after 10 min with no answer, so nothing ran against prod. I did not restart us-west-001 alone: the h9 roll (roll-yubaba-1793142882) already restarted both writers at 23:15-23:16Z with south on h9, and the rows stayed null, so a restart without the fix re-sends nothing. Test note: the 16/0 member_registration run was flagged SUSPECT because headscale_appliance.rs changed mid-build, but that diff is comment-only (annotations), so the result stands. The prod leader us-south-001 still holds rows 2/3 mesh_tags=null as of index ~2857460: fleet-git and yah-cloud-admin have no re-placement target while south leads.")
+//! @yah:handoff("Tree anchor at handoff: 8ab52acfa4e3666d04aed8775f6099198247c79b — the shared tree as I left it. Diff against it (`git diff 8ab52acfa4e3666d04aed8775f6099198247c79b..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:handoff("SEGMENT 1 (Glimmerstone:polaris, 2026-10-27). One edit: segment 0 had inserted the new test a_restarted_node_writes_its_row_once_even_when_its_own_replica_matches between a_converged_node_stays_converged_through_an_election and that test's doc comment, so the election test lost its doc and the new test's doc began with the election test's '…but a converged node…' text. I moved the new test to sit after the election test, so each test has its own doc again. No logic changed. NOT RE-VERIFIED: run 1 (/tmp/b29-seg1-test-c7.log) was 'lost by the daemon; no exit status' while compiling yah-cloud. Run 2 exited 75 (EX_TEMPFAIL: camp daemon wedged, os error 35). camp.machine showed load about 76 on 15 CPUs. Bash is then gated with the operator away. board.handoff also timed out twice against the wedged daemon, so I wrote this entry by hand and did NOT close the session or change the column. No prod action taken, because operator hold F4551 still applies.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib member_registration — expect 16 passed / 0 failed (segment 0 baseline), including a_restarted_node_writes_its_row_once_even_when_its_own_replica_matches and a_converged_node_stays_converged_through_an_election with its doc comment restored")
+//! @yah:gotcha("The fix heals a diverged row on the WRITER's next restart, not when the diverged replica upgrades. In a single roll, a node that restarts before the stale replica upgrades leaves that replica's copy of its row diverged until the next roll. That is enough for the live heal (hotship us-west-001, then us-east-001, with south already on h9). If heal-without-restart is wanted, replace written_since_start with a last-written Instant and re-assert every N minutes, which costs one raft entry per node per period.")
+//! @yah:next("When F4551's prod hold lifts (operator call): hotship the tree's yubaba (with recorded_until_written) to us-west-001 ALONE: `PATH=<F28 yah>:$PATH YUBABA_BIN=oss/yubaba/target/aarch64-apple-darwin/release/yubaba bash scripts/hotship.sh --nodes us-west-001 --dry-run`, then for real. Confirm with /tmp/f28r-row.sh 2 100.64.0.2 100.64.0.1 100.64.0.3 that the LEADER's row 2 now carries mesh_tags, that the prod leader is still node 1, and that 3/3 are live. Then do us-east-001 (row 3). Do not restart us-south-001: it leads and hosts headscale. Its own row 1 is already correct everywhere. Check first what else in oss/yubaba the build would carry: main.rs has 15 uncommitted lines from another session, and Ashguard:dove has three unshipped fixes in the tree. Alternatively, ride the fix on prod roll 3 when it happens.")
+//! @yah:next("Root-cause follow-up (file or fold into R1021): a #[serde(default)] field added to a raft request without an epoch bump is not just 'fails closed'. A replica that decodes the entry on an old binary diverges in its log and state permanently. Either every such field needs re-assertion on upgrade (this fix covers member rows only), or the cluster-epoch policy must treat a new raft field as a bump. Update the cluster_protocol_history note that justified skipping it (Ashguard:coffee, R1021-T6 gotcha on R1019-F28).")
+//! @yah:handoff("SEGMENT 1 (Glimmerstone:polaris, 2026-10-27). One edit: segment 0 had inserted the new test a_restarted_node_writes_its_row_once_even_when_its_own_replica_matches between a_converged_node_stays_converged_through_an_election and that test's doc comment, so the election test lost its doc and the new test's doc began with the election test's '…but a converged node…' text. I moved the new test to sit after the election test, so each test has its own doc again. No logic changed. recorded_until_written and run() are as segment 0 left them (member_registration.rs:187-206, :230, :243-247, :270). NOT RE-VERIFIED: run 1 (/tmp/b29-seg1-test-c7.log) was 'lost by the daemon; no exit status' while compiling yah-cloud. Run 2 exited 75 (EX_TEMPFAIL: camp daemon wedged, os error 35). camp.machine showed load about 76 on 15 CPUs. Bash is then gated with the operator away. Segment 0's 16/0 run covers the logic. The reorder only moves a #[test] fn inside mod tests. No prod action taken, because operator hold F4551 still applies.")
+//! @yah:handoff("Tree anchor at handoff: 8ab52acfa4e3666d04aed8775f6099198247c79b — the shared tree as I left it. Diff against it (`git diff 8ab52acfa4e3666d04aed8775f6099198247c79b..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib member_registration — expect 16 passed / 0 failed (segment 0 baseline), now including a_restarted_node_writes_its_row_once_even_when_its_own_replica_matches and a_converged_node_stays_converged_through_an_election with its doc comment restored")
+//! @yah:gotcha("The fix heals a diverged row on the WRITER's next restart, not when the diverged replica upgrades. In a single roll, a node that restarts before the stale replica upgrades leaves that replica's copy of its row diverged until the next roll. That is enough for the live heal (hotship us-west-001, then us-east-001, with south already on h9). If heal-without-restart is wanted, replace written_since_start with a last-written Instant and re-assert every N minutes, which costs one raft entry per node per period.")
+//! @yah:handoff("SEGMENT 1 (Glimmerstone:polaris, 2026-10-27). One edit: segment 0 had inserted the new test a_restarted_node_writes_its_row_once_even_when_its_own_replica_matches between a_converged_node_stays_converged_through_an_election and that test's doc comment, so the election test lost its doc and the new test's doc began with the election test's '…but a converged node…' text. I moved the new test to sit after the election test, so each test has its own doc again. No logic changed. recorded_until_written and run() are as segment 0 left them (member_registration.rs:187-206, :230, :243-247, :270). NOT RE-VERIFIED: run 1 (/tmp/b29-seg1-test-c7.log) was 'lost by the daemon; no exit status' while compiling yah-cloud. Run 2 exited 75 (EX_TEMPFAIL: camp daemon wedged, os error 35). camp.machine showed load about 76 on 15 CPUs. Bash is then gated with the operator away. Segment 0's 16/0 run covers the logic. The reorder only moves a #[test] fn inside mod tests. No prod action taken, because operator hold F4551 still applies.")
+//! @yah:handoff("Tree anchor at handoff: 8ab52acfa4e3666d04aed8775f6099198247c79b — the shared tree as I left it. Diff against it (`git diff 8ab52acfa4e3666d04aed8775f6099198247c79b..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yubaba --lib member_registration — expect 16 passed / 0 failed (segment 0 baseline), now including a_restarted_node_writes_its_row_once_even_when_its_own_replica_matches and a_converged_node_stays_converged_through_an_election with its doc comment restored")
+//! @yah:gotcha("The fix heals a diverged row on the WRITER's next restart, not when the diverged replica upgrades. In a single roll, a node that restarts before the stale replica upgrades leaves that replica's copy of its row diverged until the next roll. That is enough for the live heal (hotship us-west-001, then us-east-001, with south already on h9). If heal-without-restart is wanted, replace written_since_start with a last-written Instant and re-assert every N minutes, which costs one raft entry per node per period.")
 
 use std::time::Duration;
 
@@ -170,6 +195,27 @@ fn plan_registration(
     Registration::Write(desired)
 }
 
+/// The recorded row [`plan_registration`] may treat as converged: none at all
+/// until this process has written its row once since it started.
+///
+/// R1019-B29. A node's own replica is not the cluster's. Each replica decodes
+/// a `SetMember` entry with its own binary, so during a mixed-version roll an
+/// older replica drops a `#[serde(default)]` field the entry carried and
+/// records `None`. That happened on prod on 2026-10-27: us-south-001, still on
+/// a pre-F28 binary for two seconds after handing off leadership, applied the
+/// term-151 rows for us-west-001 and us-east-001 without `mesh_tags`, while the
+/// two writers' own replicas kept them. Comparing against their own replicas,
+/// the writers read converged, and the leader's copy, which is the one the
+/// replica reconcile reads, never healed. Rewriting once per start means the
+/// next restart onto any binary repairs every replica that has since been
+/// upgraded. It costs one raft entry per node start.
+fn recorded_until_written(
+    recorded: Option<&MemberInfo>,
+    written_since_start: bool,
+) -> Option<&MemberInfo> {
+    recorded.filter(|_| written_since_start)
+}
+
 async fn run(
     node_id: YubabaNodeId,
     raft: YubabaRaft,
@@ -192,6 +238,7 @@ async fn run(
     };
     let watch = raft.metrics();
     let mut backoff = RETRY_MIN;
+    let mut written_since_start = false;
 
     loop {
         let (self_addr, current_leader) = {
@@ -204,10 +251,11 @@ async fn run(
             (addr, metrics.current_leader)
         };
 
+        let recorded = state_machine.member(node_id);
         let delay = match plan_registration(
             self_addr.as_deref(),
             current_leader,
-            state_machine.member(node_id).as_ref(),
+            recorded_until_written(recorded.as_ref(), written_since_start),
             &declaration,
         ) {
             Registration::Wait(why) => {
@@ -230,6 +278,7 @@ async fn run(
                         public_address = ?row.public_address,
                         "registered this node's raft member row"
                     );
+                    written_since_start = true;
                     backoff = RETRY_MIN;
                     // Do not sleep the settled interval on the strength of a
                     // successful write: the row is not *recorded* until the
@@ -278,6 +327,9 @@ async fn write_row(
             location: row.location.clone(),
             ingress_floating_ip: row.ingress_floating_ip.clone(),
             public_address: row.public_address.clone(),
+            taints: row.taints.clone(),
+            mesh_tags: row.mesh_tags.clone(),
+            sovereign_participation: row.sovereign_participation,
         },
     )
     .await
@@ -563,6 +615,34 @@ mod tests {
         );
     }
 
+    /// R1019-B29: a restarted node rewrites its row once even though its own
+    /// replica already matches, because another replica may have dropped a
+    /// field from the same entry. After that one write, the converged branch
+    /// holds again and the loop stays quiet.
+    #[test]
+    fn a_restarted_node_writes_its_row_once_even_when_its_own_replica_matches() {
+        let own_replica = row("100.64.0.1:7443", Some("us-west"));
+        let declared = decl(Some("us-west"), None, None);
+        assert_eq!(
+            plan_registration(
+                Some("100.64.0.1:7443"),
+                Some(1),
+                recorded_until_written(Some(&own_replica), false),
+                &declared,
+            ),
+            Registration::Write(own_replica.clone())
+        );
+        assert_eq!(
+            plan_registration(
+                Some("100.64.0.1:7443"),
+                Some(1),
+                recorded_until_written(Some(&own_replica), true),
+                &declared,
+            ),
+            Registration::Converged
+        );
+    }
+
     /// R859-F2 phase A: the four public-ingress fields are compared like every
     /// other half of the row, and — the part worth pinning — a row that is
     /// identical on every *older* field still rewrites when only the ingress
@@ -579,7 +659,7 @@ mod tests {
             region: Some("us-west".into()),
             machine: Some("us-west-001".into()),
             provider: Some("static".into()),
-            public_address: Some("15.204.89.240".into()),
+            public_address: Some("203.0.113.11".into()),
             ..Default::default()
         };
         // The row a pre-phase-A binary would have left behind: same address,

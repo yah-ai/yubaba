@@ -29,11 +29,28 @@
 //! forwards a `SetMember` write — read from the same
 //! `membership_config.membership().get_node(...)` raft already carries no
 //! extra discovery needed.
+//!
+//! # This node's own side of the lease: quorum contact (R977-F5)
+//!
+//! The renewals here are the only evidence the leader's reconcile acts on, so
+//! this loop is also the one place a node can tell, from its own side, that the
+//! cluster has stopped hearing from it. Every successful POST records an ack
+//! time for that peer; each tick turns those into [`last_quorum_contact`] —
+//! the latest instant by which a **majority of voters** held a renewal from
+//! this node. [`crate::workload_fence`] fences opted-in movable workloads once
+//! that instant is older than its grace.
+//!
+//! A majority rather than "the leader": a leader on the far side of a partition
+//! is exactly the one this node cannot name, and only a majority can elect one.
+//! The residual is a non-transitive partition (a majority hears this node, the
+//! leader does not); there raft re-elects, but until it does the fence holds
+//! off. A peer never acked is credited from the moment this loop first saw it,
+//! so a fresh boot is not read as a long silence.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use openraft::async_runtime::watch::WatchReceiver;
 use tokio::task::JoinHandle;
@@ -125,6 +142,45 @@ fn plan_renewal(node_id: YubabaNodeId, members: &[(YubabaNodeId, String)]) -> Re
     }
 }
 
+/// Per-node [`last_quorum_contact`] values, written by each node's renewal
+/// loop. Keyed by node id because the in-process test clusters run several
+/// nodes in one process; in a deployed yubaba it holds exactly one entry.
+static QUORUM_CONTACT: OnceLock<Mutex<HashMap<YubabaNodeId, Instant>>> = OnceLock::new();
+
+fn quorum_contact_cell() -> &'static Mutex<HashMap<YubabaNodeId, Instant>> {
+    QUORUM_CONTACT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The latest instant by which a majority of voters held a renewal from
+/// `node_id` (see the module doc). `None` until this node's renewal loop has
+/// seen a membership: no evidence, which a caller must never read as silence.
+pub fn last_quorum_contact(node_id: YubabaNodeId) -> Option<Instant> {
+    quorum_contact_cell().lock().unwrap().get(&node_id).copied()
+}
+
+/// The instant a majority of voters last held this node's renewal.
+///
+/// `peer_contact` is one instant per voter *other than this node*: its last
+/// successful renewal, or when this loop first saw it if none has landed. This
+/// node counts toward the majority itself when it is a voter. `None` when there
+/// are no voters, or fewer peer samples than a majority needs.
+fn quorum_contact_at(
+    self_is_voter: bool,
+    voter_count: usize,
+    mut peer_contact: Vec<Instant>,
+    now: Instant,
+) -> Option<Instant> {
+    if voter_count == 0 {
+        return None;
+    }
+    let needed = (voter_count / 2 + 1).saturating_sub(usize::from(self_is_voter));
+    if needed == 0 {
+        return Some(now);
+    }
+    peer_contact.sort_unstable_by(|a, b| b.cmp(a));
+    peer_contact.get(needed - 1).copied()
+}
+
 async fn run(
     node_id: YubabaNodeId,
     raft: YubabaRaft,
@@ -143,25 +199,48 @@ async fn run(
     };
     let watch = raft.metrics();
     let mut inflight: HashMap<String, JoinHandle<()>> = HashMap::new();
+    // Peer address -> last successful renewal (or first sight). Written by the
+    // POST tasks, read once per tick for `last_quorum_contact`.
+    let acks: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         tokio::time::sleep(interval).await;
 
-        let members: Vec<(YubabaNodeId, String)> = {
+        let (members, voters): (Vec<(YubabaNodeId, String)>, BTreeSet<YubabaNodeId>) = {
             let metrics = watch.borrow_watched();
-            metrics
-                .membership_config
-                .membership()
-                .nodes()
-                .map(|(id, n)| (*id, n.addr.clone()))
-                .collect()
+            let membership = metrics.membership_config.membership();
+            (
+                membership.nodes().map(|(id, n)| (*id, n.addr.clone())).collect(),
+                membership.voter_ids().collect(),
+            )
         };
 
         match plan_renewal(node_id, &members) {
             RenewalPlan::Broadcast { peers } => {
+                let now = Instant::now();
+                {
+                    let mut acks = acks.lock().unwrap();
+                    acks.retain(|addr, _| peers.contains(addr));
+                    for addr in &peers {
+                        acks.entry(addr.clone()).or_insert(now);
+                    }
+                }
                 dispatch_tick(node_id, lease_detector.as_deref(), peers, &mut inflight, |addr| {
-                    post_renewal(client.clone(), node_id, addr)
+                    post_renewal(client.clone(), node_id, addr, acks.clone())
                 });
+                let peer_contact: Vec<Instant> = {
+                    let acks = acks.lock().unwrap();
+                    members
+                        .iter()
+                        .filter(|(id, _)| *id != node_id && voters.contains(id))
+                        .filter_map(|(_, addr)| acks.get(addr).copied())
+                        .collect()
+                };
+                if let Some(at) =
+                    quorum_contact_at(voters.contains(&node_id), voters.len(), peer_contact, now)
+                {
+                    quorum_contact_cell().lock().unwrap().insert(node_id, at);
+                }
             }
             RenewalPlan::NoPeersYet => {
                 debug!(node_id, "lease renewal: no membership known yet, waiting");
@@ -222,7 +301,12 @@ fn dispatch_tick<F, Fut>(
     }
 }
 
-async fn post_renewal(client: yubaba_auth_token::PeerClient, node_id: YubabaNodeId, addr: String) {
+async fn post_renewal(
+    client: yubaba_auth_token::PeerClient,
+    node_id: YubabaNodeId,
+    addr: String,
+    acks: Arc<Mutex<HashMap<String, Instant>>>,
+) {
     let url = format!("http://{addr}/mesh/lease-renew");
     match client
         .post(&url)
@@ -232,6 +316,7 @@ async fn post_renewal(client: yubaba_auth_token::PeerClient, node_id: YubabaNode
     {
         Ok(resp) if resp.status().is_success() => {
             debug!(node_id, %addr, "lease renewal: renewed against peer");
+            acks.lock().unwrap().insert(addr, Instant::now());
         }
         Ok(resp) => {
             // `debug`, not `warn`: with a broadcast this fires once per
@@ -402,5 +487,58 @@ mod tests {
         dispatch_tick(3, None, vec![DEAD.to_string(), LIVE.to_string()], &mut inflight, &send);
         dispatch_tick(3, None, vec![LIVE.to_string()], &mut inflight, &send);
         assert_eq!(inflight.keys().collect::<Vec<_>>(), vec![LIVE]);
+    }
+
+    /// R977-F5: in a three-voter cluster this node plus ONE peer is a
+    /// majority, so contact is the most recent peer ack, and one dead peer
+    /// costs nothing.
+    #[test]
+    fn three_voters_need_one_peer_so_a_dead_peer_does_not_age_contact() {
+        let now = Instant::now();
+        let dead = now - Duration::from_secs(600);
+        let live = now - Duration::from_millis(400);
+        assert_eq!(quorum_contact_at(true, 3, vec![dead, live], now), Some(live));
+    }
+
+    /// Isolated from both peers: contact is the newer of the two stale acks,
+    /// i.e. it ages from the moment the node lost its last peer.
+    #[test]
+    fn an_isolated_voter_ages_from_its_last_peer_ack() {
+        let now = Instant::now();
+        let a = now - Duration::from_secs(90);
+        let b = now - Duration::from_secs(70);
+        assert_eq!(quorum_contact_at(true, 3, vec![a, b], now), Some(b));
+    }
+
+    /// Five voters: this node plus two peers. The second-freshest peer ack is
+    /// the quorum instant.
+    #[test]
+    fn five_voters_take_the_second_freshest_peer() {
+        let now = Instant::now();
+        let s = |secs| now - Duration::from_secs(secs);
+        assert_eq!(quorum_contact_at(true, 5, vec![s(1), s(80), s(2), s(90)], now), Some(s(2)));
+    }
+
+    /// A lone voter is a majority by itself; there is no cluster to lose.
+    #[test]
+    fn a_single_voter_is_always_in_contact() {
+        let now = Instant::now();
+        assert_eq!(quorum_contact_at(true, 1, vec![], now), Some(now));
+    }
+
+    /// A learner does not count toward the majority it is measured against.
+    #[test]
+    fn a_learner_needs_a_full_majority_of_voter_peers() {
+        let now = Instant::now();
+        let s = |secs| now - Duration::from_secs(secs);
+        assert_eq!(quorum_contact_at(false, 3, vec![s(1), s(5), s(90)], now), Some(s(5)));
+    }
+
+    /// No voters, or fewer samples than a majority needs, is no evidence.
+    #[test]
+    fn no_voters_or_too_few_samples_is_no_evidence() {
+        let now = Instant::now();
+        assert_eq!(quorum_contact_at(true, 0, vec![], now), None);
+        assert_eq!(quorum_contact_at(false, 3, vec![now], now), None);
     }
 }

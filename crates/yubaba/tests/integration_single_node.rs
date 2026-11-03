@@ -93,6 +93,8 @@ fn test_workload_spec(name: &str) -> WorkloadSpec {
         },
         labels: Default::default(),
         durability: None,
+        lease_id: None,
+        deadline: None,
         db: Vec::new(),
         capabilities: Vec::new(),
         annotations: Default::default(),

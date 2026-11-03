@@ -54,7 +54,7 @@ use object_store::memory::InMemory;
 use object_store::ObjectStore as _;
 use std::sync::Arc;
 use tempfile::TempDir;
-use turso_backup::snapshot::BackupTarget;
+use store_claim::BackupTarget;
 use turso_backup::stream::{
     tail_frames, FrameInfo, StreamConfig, StreamOutcome, WalSeam, Watermark, WAL_FRAME_HEADER_SIZE,
 };
@@ -207,6 +207,9 @@ fn a_disaster_ready_fleet() -> YubabaState {
                 location: None,
                 ingress_floating_ip: None,
                 public_address: None,
+                taints: None,
+                mesh_tags: None,
+                sovereign_participation: None,
             },
         ),
         YubabaResponse::Ok

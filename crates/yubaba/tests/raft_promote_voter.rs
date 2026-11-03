@@ -236,8 +236,22 @@ async fn fleet_policy_refuses_to_promote_a_learner() {
     );
 
     // The R118-T9 failure detector, reported through /raft/status. The leader
-    // is actively replicating to every peer, so all of them read as live.
-    let status_body = raft_status(&leader_url).await;
+    // is actively replicating to every peer, so all of them read as live —
+    // once it has heard from each at least once. The learner joined moments
+    // ago, and under CPU load the first read could still find it `unknown`
+    // with `silent_for_ms: null` (5 of 42 loaded runs of the `raft_` suites,
+    // measured for R936-B15). So poll for that, then assert on what was read.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let status_body = loop {
+        let body = raft_status(&leader_url).await;
+        let all_live = body["liveness"]["peers"]
+            .as_object()
+            .is_some_and(|peers| !peers.is_empty() && peers.values().all(|o| o["state"] == "live"));
+        if all_live || tokio::time::Instant::now() >= deadline {
+            break body;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert_eq!(
         status_body["liveness"]["channel"], "raft-heartbeat",
         "the leader must name the evidence channel its liveness came from: {status_body}"

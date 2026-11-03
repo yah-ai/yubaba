@@ -171,8 +171,8 @@ use tracing::{debug, info, warn};
 use crate::cluster_policy::RaftTiming;
 use crate::ingress_effector::EffectOutcome;
 use crate::lease_detector::{
-    judge_readiness, Confirmed, HysteresisPolicy, LeaseFailureDetector, NotReady,
-    ReadinessInputs, TransitionTracker,
+    judge_readiness, replacement_grace, Confirmed, HysteresisPolicy, LeaseFailureDetector,
+    NotReady, ReadinessInputs, TransitionTracker,
 };
 use crate::raft::{SlaTier, TenantDemand, YubabaNodeId, YubabaRaft, YubabaRequest, YubabaStateMachine};
 
@@ -266,6 +266,12 @@ pub enum PlacementDecision {
     /// The owner is not confirmed down. Nothing to do — this is the steady
     /// state for almost every tenant on almost every tick.
     OwnerLive,
+    /// The owner is confirmed down but has not been down for the whole
+    /// [`replacement_grace`] yet (R977-B15). Nothing moves: an ordinary yubaba
+    /// restart or hotship reads as a confirmed-down owner within ~10 s, and a
+    /// node that lost yubaba usually still runs its containers, so re-placing
+    /// here would start a second live copy beside the first.
+    OwnerInGrace { remaining: Duration },
     /// The owner is confirmed down, but no candidate is both live and
     /// admitting (and, for a warm-tier tenant, already warm). Includes the
     /// case that matters most: a cluster-wide capacity crunch, where the
@@ -323,13 +329,22 @@ pub fn judge_candidate(
 /// Ties (after the region preference) break to the lowest node id, so two
 /// evaluations of the same state — this leader on the next tick, or a new
 /// leader after failover — reach the same target rather than thrashing.
+///
+/// `owner_down_for` is how long the owner has been confirmed down (`None`:
+/// not confirmed down). Nothing moves until it reaches `grace` — the same
+/// [`replacement_grace`] W364 §3 puts on workload re-placement, so a floater
+/// and a reconciled workload wait out one number, not two (R977-B15).
 pub fn decide_transfer(
-    owner_confirmed_down: bool,
+    owner_down_for: Option<Duration>,
+    grace: Duration,
     tenant: &TenantSnapshot,
     candidates: &BTreeMap<YubabaNodeId, NodeEligibility>,
 ) -> PlacementDecision {
-    if !owner_confirmed_down {
+    let Some(down_for) = owner_down_for else {
         return PlacementDecision::OwnerLive;
+    };
+    if down_for < grace {
+        return PlacementDecision::OwnerInGrace { remaining: grace - down_for };
     }
     let mut eligible: Vec<(YubabaNodeId, &NodeEligibility)> = candidates
         .iter()
@@ -435,6 +450,12 @@ async fn run(
     );
     let watch = raft.metrics();
     let mut tracker = TransitionTracker::new();
+    // R977-B15: when each node's Down was committed, so `decide_transfer` can
+    // hold a tenant through the restart grace. Process-local, like the tracker:
+    // a freshly elected leader re-confirms and waits a full grace again, which
+    // errs toward not moving.
+    let mut confirmed_down_at: BTreeMap<YubabaNodeId, std::time::Instant> = BTreeMap::new();
+    let grace = replacement_grace(config.hysteresis);
     // R859-F2 phase B. `plan_ingress_owner_effect` is stateless, so "the owner
     // changed" has to mean "changed since the last tick THIS process saw" —
     // there is nowhere else to hold it. Starting at `None` on a freshly elected
@@ -459,7 +480,17 @@ async fn run(
             Some(d) => d.observe().await,
             None => LivenessReport::new(),
         };
-        tracker.observe(&report, config.hysteresis, std::time::Instant::now());
+        let observed_at = std::time::Instant::now();
+        for (node, dir) in tracker.observe(&report, config.hysteresis, observed_at) {
+            match dir {
+                Confirmed::Down => {
+                    confirmed_down_at.insert(node, observed_at);
+                }
+                Confirmed::Up => {
+                    confirmed_down_at.remove(&node);
+                }
+            }
+        }
         if let Some(d) = door_dns.as_mut() {
             d.observe(is_leader, std::time::Instant::now(), &report, config.hysteresis);
         }
@@ -608,10 +639,15 @@ async fn run(
         }
 
         for (tenant, ownership) in &tenants {
-            let owner_confirmed_down = tracker.committed(ownership.owner) == Some(Confirmed::Down);
-            if !owner_confirmed_down {
+            if tracker.committed(ownership.owner) != Some(Confirmed::Down) {
                 continue;
             }
+            // Same arithmetic as the workload reconcile's `down_for`: the
+            // confirm dwell had already elapsed when the Down committed.
+            let owner_down_for = confirmed_down_at.get(&ownership.owner).map(|at| {
+                std::time::Instant::now().saturating_duration_since(*at)
+                    + config.hysteresis.confirm_down_after
+            });
             let placement = state_machine.tenant_placement(tenant);
             let snapshot = TenantSnapshot {
                 owner: ownership.owner,
@@ -648,8 +684,15 @@ async fn run(
                 })
                 .collect();
 
-            match decide_transfer(owner_confirmed_down, &snapshot, &candidates) {
+            match decide_transfer(owner_down_for, grace, &snapshot, &candidates) {
                 PlacementDecision::OwnerLive => {}
+                PlacementDecision::OwnerInGrace { remaining } => debug!(
+                    node_id,
+                    tenant = %tenant.0,
+                    dead_owner = ownership.owner,
+                    remaining_secs = remaining.as_secs(),
+                    "scheduler: owner confirmed down but still inside the restart grace — not re-placing yet"
+                ),
                 PlacementDecision::NoEligibleCandidate => {
                     // Report *which* gate each candidate failed. "No eligible
                     // candidate" alone is the least actionable line an operator
@@ -741,6 +784,8 @@ fn unix_now_secs() -> u64 {
 mod tests {
     use super::*;
 
+    const GRACE: Duration = Duration::from_secs(120);
+
     fn snapshot(owner: YubabaNodeId, region: Option<&str>, tier: SlaTier) -> TenantSnapshot {
         TenantSnapshot {
             owner,
@@ -767,7 +812,45 @@ mod tests {
     fn a_live_owner_is_left_alone_regardless_of_candidates() {
         let s = snapshot(1, None, SlaTier::ColdHydrate);
         let candidates = BTreeMap::from([(2, node(true, None, true))]);
-        assert_eq!(decide_transfer(false, &s, &candidates), PlacementDecision::OwnerLive);
+        assert_eq!(decide_transfer(None, GRACE, &s, &candidates), PlacementDecision::OwnerLive);
+    }
+
+    /// R977-B15: us-east-001 re-placed both noisetable floaters ~10 s after
+    /// yubaba stopped on their owner, whose containers were still serving.
+    #[test]
+    fn an_owner_down_for_less_than_the_grace_is_not_re_placed() {
+        let s = snapshot(1, None, SlaTier::ColdHydrate);
+        let candidates = BTreeMap::from([(2, node(true, None, true))]);
+        assert_eq!(
+            decide_transfer(Some(Duration::from_secs(10)), GRACE, &s, &candidates),
+            PlacementDecision::OwnerInGrace { remaining: Duration::from_secs(110) }
+        );
+        assert_eq!(
+            decide_transfer(Some(GRACE - Duration::from_millis(1)), GRACE, &s, &candidates),
+            PlacementDecision::OwnerInGrace { remaining: Duration::from_millis(1) }
+        );
+    }
+
+    #[test]
+    fn an_owner_down_for_the_whole_grace_is_re_placed() {
+        let s = snapshot(1, None, SlaTier::ColdHydrate);
+        let candidates = BTreeMap::from([(2, node(true, None, true))]);
+        assert_eq!(decide_transfer(Some(GRACE), GRACE, &s, &candidates), PlacementDecision::TransferTo(2));
+        assert_eq!(
+            decide_transfer(Some(GRACE * 3), GRACE, &s, &candidates),
+            PlacementDecision::TransferTo(2)
+        );
+    }
+
+    #[test]
+    fn the_scheduler_grace_is_the_workload_reconciles_grace() {
+        // One number for both re-placement paths (W364 §3): the fleet profile's
+        // 5 s confirm dwell is lifted to the 120 s floor.
+        let policy = HysteresisPolicy {
+            confirm_down_after: Duration::from_secs(5),
+            confirm_up_after: Duration::from_secs(5),
+        };
+        assert_eq!(replacement_grace(policy), GRACE);
     }
 
     #[test]
@@ -778,7 +861,7 @@ mod tests {
             (3, node(true, None, false)), // no room
             (4, node(true, None, true)),  // the one
         ]);
-        assert_eq!(decide_transfer(true, &s, &candidates), PlacementDecision::TransferTo(4));
+        assert_eq!(decide_transfer(Some(GRACE), GRACE, &s, &candidates), PlacementDecision::TransferTo(4));
     }
 
     #[test]
@@ -788,7 +871,7 @@ mod tests {
             (2, node(false, None, true)),
             (3, node(true, None, false)),
         ]);
-        assert_eq!(decide_transfer(true, &s, &candidates), PlacementDecision::NoEligibleCandidate);
+        assert_eq!(decide_transfer(Some(GRACE), GRACE, &s, &candidates), PlacementDecision::NoEligibleCandidate);
     }
 
     #[test]
@@ -798,7 +881,7 @@ mod tests {
         // itself as the re-placement target.
         let s = snapshot(1, None, SlaTier::ColdHydrate);
         let candidates = BTreeMap::from([(1, node(true, None, true))]);
-        assert_eq!(decide_transfer(true, &s, &candidates), PlacementDecision::NoEligibleCandidate);
+        assert_eq!(decide_transfer(Some(GRACE), GRACE, &s, &candidates), PlacementDecision::NoEligibleCandidate);
     }
 
     #[test]
@@ -808,7 +891,7 @@ mod tests {
             (2, node(true, Some("us-east"), true)),
             (3, node(true, Some("us-west"), true)),
         ]);
-        assert_eq!(decide_transfer(true, &s, &candidates), PlacementDecision::TransferTo(3));
+        assert_eq!(decide_transfer(Some(GRACE), GRACE, &s, &candidates), PlacementDecision::TransferTo(3));
     }
 
     /// W246: "in-region-preferred", not in-region-required. Leaving a tenant
@@ -818,7 +901,7 @@ mod tests {
     fn an_out_of_region_candidate_is_used_when_no_in_region_one_exists() {
         let s = snapshot(1, Some("us-west"), SlaTier::ColdHydrate);
         let candidates = BTreeMap::from([(2, node(true, Some("us-east"), true))]);
-        assert_eq!(decide_transfer(true, &s, &candidates), PlacementDecision::TransferTo(2));
+        assert_eq!(decide_transfer(Some(GRACE), GRACE, &s, &candidates), PlacementDecision::TransferTo(2));
     }
 
     #[test]
@@ -829,26 +912,26 @@ mod tests {
             (2, node(true, None, true)),
             (9, node(true, None, true)),
         ]);
-        assert_eq!(decide_transfer(true, &s, &candidates), PlacementDecision::TransferTo(2));
+        assert_eq!(decide_transfer(Some(GRACE), GRACE, &s, &candidates), PlacementDecision::TransferTo(2));
     }
 
     #[test]
     fn a_warm_replica_tenant_requires_an_already_warm_candidate() {
         let s = snapshot(1, None, SlaTier::WarmReplica);
         let candidates = BTreeMap::from([(2, node(true, None, true))]); // live, admits, but not warm
-        assert_eq!(decide_transfer(true, &s, &candidates), PlacementDecision::NoEligibleCandidate);
+        assert_eq!(decide_transfer(Some(GRACE), GRACE, &s, &candidates), PlacementDecision::NoEligibleCandidate);
 
         let mut warm_candidate = node(true, None, true);
         warm_candidate.warm_for_tenant = true;
         let candidates = BTreeMap::from([(2, warm_candidate)]);
-        assert_eq!(decide_transfer(true, &s, &candidates), PlacementDecision::TransferTo(2));
+        assert_eq!(decide_transfer(Some(GRACE), GRACE, &s, &candidates), PlacementDecision::TransferTo(2));
     }
 
     #[test]
     fn a_cold_hydrate_tenant_does_not_require_warmth() {
         let s = snapshot(1, None, SlaTier::ColdHydrate);
         let candidates = BTreeMap::from([(2, node(true, None, true))]);
-        assert_eq!(decide_transfer(true, &s, &candidates), PlacementDecision::TransferTo(2));
+        assert_eq!(decide_transfer(Some(GRACE), GRACE, &s, &candidates), PlacementDecision::TransferTo(2));
     }
 
     // ── readiness gates now actually gate (R737-F2) ──────────────────────
@@ -865,7 +948,7 @@ mod tests {
 
         let candidates = BTreeMap::from([(2, sick), (3, node(true, None, true))]);
         assert_eq!(
-            decide_transfer(true, &s, &candidates),
+            decide_transfer(Some(GRACE), GRACE, &s, &candidates),
             PlacementDecision::TransferTo(3),
             "a healthy higher-id node must beat an unhealthy lower-id one"
         );
@@ -888,7 +971,7 @@ mod tests {
 
         let candidates = BTreeMap::from([(2, never), (3, down)]);
         assert_eq!(
-            decide_transfer(true, &s, &candidates),
+            decide_transfer(Some(GRACE), GRACE, &s, &candidates),
             PlacementDecision::NoEligibleCandidate
         );
     }

@@ -130,17 +130,18 @@
 //! @yah:gotcha("THE LIMIT I COULD NOT DESIGN AWAY, AND DID NOT HIDE: the public fetch goes wherever DNS sends it, so a hostname published through two front doors is measured at ONE of them and this pass cannot say which. A divergence affecting only the other door reads as clean. Every verdict for such a hostname carries a note saying so — but only once a comparison actually happened, since on a rule where nothing could be compared that note is noise stacked on the finding. Closing it needs a fetch pinned to each door's public address with a `Host` override, which needs a public IP per door that nothing in the `Collation` carries today. Pinned by `a_hostname_on_two_front_doors_is_noted_as_measured_at_only_one`.")
 //! @yah:verify("UNIT: `cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib ingress_verify` = 19 passed / 0 failed (11 before, +8 new). THE ONE THAT MATTERS IS `a_503_at_the_apex_fails_a_rule_whose_mesh_side_is_entirely_green` — it reproduces the 2026-09-03 outage as a unit test, asserting FIRST that `verify_collation` alone reports the rule clean (that assertion is the precondition, because a green mesh side is what reported success during the outage) and THEN that the public leg fails it. The other seven cover the stale-serve shape (200 serving a different digest than the backend), a transport failure, a hostname with no beacon, a public 200 with nothing to compare, an unmeasured hostname, a hostname on two doors, and the fully-clean case where the two digests match and NOTHING is caveated. Wider: `-p yah-cloud --lib ingress` = 94 passed / 0 failed; `-p yah-cloud --lib` = 1019 passed / 0 failed / 4 ignored (1011 before, so +8 and nothing lost).")
 //! @yah:verify("THE PURITY CANARY, which this ticket's own `next` named as the property to protect: `cargo test -p xtask --test main mirror_ingress` = 11 passed / 0 failed. `collate` was not touched — the public leg is a fourth step on `verify`, per the same reasoning R844-F16 used to make `verify` a sibling verb rather than a flag. `cargo check --workspace --all-targets` cargo-exit=0, zero `^error` lines. Installed and re-installed with `cargo xtask install` (sha256 b751f470e329253765075e5c050256f4e848ae1e9265f55fd6965f024bafbf24, `PATH resolves here`), per this relay's standing gotcha that `cargo build` does not update the binary an operator runs.")
-//! @yah:verify("THIS TICKET'S STATED ACCEPTANCE TEST — \\\"green on the healthy fleet, https://yah.dev/ through both declared front doors, agreeing with what verify resolves\\\" — WAS **NOT** MET, AND NOT BECAUSE OF THIS CHANGE. The fleet is not healthy right now: the mesh coordination server is down (`cloud.mesh.yah.dev` -&gt; 15.204.89.240 REFUSES :443 and :80 while :22 answers, and `tailscale status` reports this machine logged out with \\\"fetch control key ... connection refused\\\"), so NO 100.64.0.0/10 address is reachable from here and the mesh half of the check cannot run at all. Filed as R858 with the full measurement chain. I am recording this as unmet rather than reporting a partial green.")
+//! @yah:verify("THIS TICKET'S STATED ACCEPTANCE TEST — \\\"green on the healthy fleet, https://yah.dev/ through both declared front doors, agreeing with what verify resolves\\\" — WAS **NOT** MET, AND NOT BECAUSE OF THIS CHANGE. The fleet is not healthy right now: the mesh coordination server is down (`cloud.mesh.yah.dev` -&gt; 203.0.113.11 REFUSES :443 and :80 while :22 answers, and `tailscale status` reports this machine logged out with \\\"fetch control key ... connection refused\\\"), so NO 100.64.0.0/10 address is reachable from here and the mesh half of the check cannot run at all. Filed as R858 with the full measurement chain. I am recording this as unmet rather than reporting a partial green.")
 //! @yah:verify("WHAT THE LIVE RUN DID PROVE, and it is more than nothing: `yah cloud ingress verify --path .` from the freshly installed binary fetched `https://yah.dev/.well-known/yah-publish.json` over the real public internet, parsed it, and — because no backend beacon could be read across the dead mesh — printed exactly the right sentence instead of a pass: \\\"https://yah.dev answers with a publish beacon, but no discovered backend served one to compare it against, so this proves the hostname is up and NOT that it is fronting the discovered backend\\\". Independently confirmed by hand: `curl https://yah.dev/` = HTTP 200 in 0.81s and the beacon is `{\\\"prefix\\\":\\\"bundle/yah-marketing\\\",\\\"digest\\\":\\\"bfb47cd42468b080c474193fa6091ec273b6c99ab5a8a3b91d9c847cd7278551\\\",\\\"files\\\":39}`. So the public leg ran end to end against production and, on a real unplanned failure it was never designed for, refused to overclaim — which is the behaviour this ticket exists to install. `--skip-public` also exercised live: every verdict then reads \\\"the public path was not checked for yah.dev — this verdict speaks only for the mesh side, which is necessary and not sufficient\\\", and the summary names the dropped claim.")
 //! @yah:next("RE-RUN THE ACCEPTANCE TEST ONCE R858 CLEARS — it is one command and it is the only thing outstanding on this ticket: `yah cloud ingress verify --path .` must exit 0 with both front doors' rules reporting the mesh dial open AND the public beacon matching the backend's. Until the mesh is reachable that run measures nothing about the fourth claim.")
 //! @yah:notify_on(R858, "The mesh is reachable again — run this ticket's outstanding acceptance test: `yah cloud ingress verify --path .` must exit 0 with BOTH front doors reporting the mesh dial open AND the public beacon digest matching the backend's. It could not be run at landing time because no 100.64.0.0/10 address answered. If it passes, that closes the last open item here; if it fails, read which of the two legs failed before touching the code — the mesh leg is R844-F16's and predates this change.")
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use anyhow::Result;
 
 use crate::config::{IngressProvider, MachineConfig};
+use crate::lower::AdmittedSlot;
 use crate::reconciler::domain::{public_origins, PasswayOrigin};
 use crate::reconciler::ingress::{Collation, IngressPlan, IngressRule};
 use crate::reconciler::service_discovery::ServiceRecordFanout;
@@ -219,6 +220,12 @@ pub struct RuleResolution {
     /// Placement nodes that did not, each with the reason — an `Unknown` node's
     /// own words, or "answered, and has no such record".
     pub missing: Vec<(String, String)>,
+    /// How many placement nodes must serve, when that is fewer than all of
+    /// them: the lowered spec's `replicas` for a slot placed by admission
+    /// (R959-F6). There the placement is every node that *could* hold the
+    /// workload, so the others answering "no record" is the expected shape,
+    /// not a missing replica. `None` means every placement node is a replica.
+    pub quorum: Option<usize>,
 }
 
 impl RuleResolution {
@@ -616,9 +623,14 @@ pub fn apply_public_path(report: &mut VerifyReport, readings: &PublicReadings) {
 /// Ports must already be resolved ([`IngressPlan::resolve_ports_from`]):
 /// discovery matches records by port, so a portless rule resolves no address
 /// either and is reported as both.
+///
+/// `admitted` is the mirror's [`crate::lower::admitted_compute_slots`]: a
+/// rule on one of those slots carries the spec's `replicas` as its
+/// [`RuleResolution::quorum`].
 pub fn resolve_upstreams_reporting(
     plan: &mut IngressPlan,
     fanout: &ServiceRecordFanout,
+    admitted: &HashMap<String, AdmittedSlot>,
 ) -> Vec<RuleResolution> {
     let mut out = Vec::new();
     for rule in &mut plan.rules {
@@ -633,6 +645,7 @@ pub fn resolve_upstreams_reporting(
             pinned,
             covered,
             missing,
+            quorum: admitted.get(&rule.slot).map(|a| a.replicas as usize),
         });
     }
     out
@@ -760,6 +773,10 @@ where
                                 .collect::<Vec<_>>()
                                 .join("; ")
                         ));
+                    } else if res.quorum.is_some_and(|q| res.covered.len() >= q) {
+                        // R959-F6: placed by admission on every node that
+                        // could hold it, and as many serve as the spec asks
+                        // for. The idle rest is the shape, not a gap.
                     } else {
                         findings.push(VerifyFinding::PartialPlacement {
                             covered: res.covered.clone(),
@@ -919,6 +936,7 @@ mod tests {
             nickname: None,
             legacy_hostkey_fingerprint: None,
             registration: Default::default(),
+            camps: Vec::new(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -934,6 +952,7 @@ mod tests {
             sovereign_group: None,
             sovereign_participation: Default::default(),
             host_machine: None,
+            availability: Default::default(),
             ingress_floating_ip: None,
         }
     }
@@ -941,9 +960,9 @@ mod tests {
     /// The live fleet on 2026-09-14: three public doors and a mesh-only box.
     fn fleet() -> Vec<MachineConfig> {
         vec![
-            machine("us-east-001", "51.81.85.145", &["public-ip"]),
-            machine("us-south-001", "45.32.194.254", &["public-ip"]),
-            machine("us-west-001", "15.204.89.240", &["public-ip"]),
+            machine("us-east-001", "203.0.113.13", &["public-ip"]),
+            machine("us-south-001", "203.0.113.12", &["public-ip"]),
+            machine("us-west-001", "203.0.113.11", &["public-ip"]),
             machine("us-west-011", "100.64.0.11", &[]),
         ]
     }
@@ -975,7 +994,7 @@ mod tests {
             .map(|p| (p.hostname.as_str(), p.origin.machine.as_str()))
             .collect();
         assert_eq!(got, vec![("yah.dev", "us-west-001")]);
-        assert!(probes[0].message(200).contains("15.204.89.240"));
+        assert!(probes[0].message(200).contains("203.0.113.11"));
     }
 
     #[test]
@@ -1024,6 +1043,7 @@ mod tests {
             via: None,
             behind_tunnel: false,
             tunnel_door: None,
+            door: None,
         }
     }
 
@@ -1045,7 +1065,7 @@ mod tests {
         let mut resolutions = RuleResolutions::new();
         let mut planned = Vec::new();
         for (service, env, plan) in &mut plans {
-            for res in resolve_upstreams_reporting(plan, fanout) {
+            for res in resolve_upstreams_reporting(plan, fanout, &HashMap::new()) {
                 resolutions.insert(res.key(), res);
             }
             planned.push(PlannedEdge {
@@ -1189,6 +1209,49 @@ mod tests {
         // The address it DID resolve is still reported — a failure that hides
         // the working half is a worse report, not a stricter one.
         assert_eq!(report.verdicts[0].addresses(), vec!["100.64.0.3:8080"]);
+    }
+
+    /// R959-F6: a slot placed by admission lists every node that COULD hold
+    /// the workload, so one of two serving meets a `replicas = 1` spec. The
+    /// same rule with nothing serving still fails.
+    #[test]
+    fn an_admitted_slot_needs_only_its_replicas_to_serve() {
+        let admitted = HashMap::from([(
+            "bundle".to_string(),
+            AdmittedSlot {
+                machines: vec!["us-east-001".into(), "us-west-001".into()],
+                replicas: 1,
+            },
+        )]);
+        let verify = |fanout: &ServiceRecordFanout| {
+            let mut p = plan(
+                vec![rule("api.example.com", Some(4332), &["us-east-001", "us-west-001"])],
+                &["us-east-001"],
+            );
+            let mut resolutions = RuleResolutions::new();
+            for res in resolve_upstreams_reporting(&mut p, fanout, &admitted) {
+                resolutions.insert(res.key(), res);
+            }
+            let edge = PlannedEdge {
+                service: "api".to_string(),
+                env: "prod".to_string(),
+                plan: p,
+            };
+            let collation = collate_front_doors(&[edge]).unwrap();
+            verify_collation(&collation, &resolutions, fanout.unknown_note().as_deref(), always_open)
+        };
+
+        let mut serving = ServiceRecordFanout::default();
+        serving.push_answer("us-east-001", vec![]);
+        serving.push_answer("us-west-001", vec![record("api", "100.64.0.1", &[4332])]);
+        let report = verify(&serving);
+        assert!(report.is_clean(), "{:#?}", report.verdicts);
+        assert_eq!(report.verdicts[0].addresses(), vec!["100.64.0.1:4332"]);
+
+        let mut idle = ServiceRecordFanout::default();
+        idle.push_answer("us-east-001", vec![]);
+        idle.push_answer("us-west-001", vec![]);
+        assert!(!verify(&idle).is_clean());
     }
 
     #[test]

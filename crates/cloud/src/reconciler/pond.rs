@@ -312,6 +312,17 @@
 //! @yah:handoff("New `yah cloud pond cert [--reissue]` - issues the leaf and exits, without serving. Exists specifically so the 443 path has an unprivileged issuance step to point at.")
 //! @yah:verify("cargo test -p yah-cloud --lib pond_door: 12 passed, now including issuing_as_root_is_refused_but_reusing_an_existing_leaf_is_not (the sudo guard, executed rather than merely written) and the_pid_file_and_upgrade_sock_are_keyed_by_port. cargo build -p yah --bin yah clean; `yah cloud pond cert` prints the mkcert install instruction as designed.")
 //! @yah:gotcha("SHARED-TREE INCIDENT, self-inflicted and fully reverted - worth knowing because the trap is easy to repeat. `rustfmt oss/yubaba/crates/cloud/src/reconciler/mod.rs` FOLLOWS THE MOD TREE and reformatted 10 sibling files in that directory, several holding peers' uncommitted edits. Reverted precisely against commit c4e5a80f2bf41119e50c261919d62537918aba16: for each file, compared on-disk content against rustfmt(c4e5a80f) - 7 matched exactly (so they held no one's edits, only my churn) and were restored from c4e5a80f; pond_publish.rs and static_asset_prune.rs were already rustfmt-clean at c4e5a80f so my run never touched them (their diffs are a peer's R630-B1 uri_encode_key work, left intact); static_asset.rs had both, so its 6 formatting hunks were hand-reverted one at a time, leaving only the peer's R630-B1 lines. Verified after: the reconciler/ diff is my files plus the peer's edits and nothing else. Rule: format a single file by path, never a mod.rs.")
+//!
+//! @yah:ticket(R584-B7, "pond miniflare door ignores slot issues_origin/backend_origin: ROUTE_TABLE built with BackendOrigins::default(), so /api/issues 404s at pond")
+//! @yah:status(review)
+//! @yah:at(2026-10-10T18:44:18Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R584)
+//! @yah:severity(medium)
+//! @yah:next("Found by noisetable R823-T3 (read, not run: docker is inert for agents). pond.rs spawn_miniflare_child (~:955) calls worker_route_table_json(..., &BackendOrigins::default(), None), and pond::miniflare_route_table (~:879) does the same for the camp path (app/yah/cli/src/camp.rs ~:4822). BackendOrigins::from_slot_fields (mesofact_static.rs ~:1162) is only consumed at ~:633 (cloud apply). A pond mirror declaring issues_origin on its static slot therefore gets no /api/issues* entry. Fix: thread BackendOrigins::from_slot_fields(static_fields) into both call sites; test that the pond table carries /api/issues* -> origin + /issues.")
+//! @yah:next("Noisetable evidence: .yah/services/noisetable-marketing/mirrors/pond.toml declares issues_origin = http://127.0.0.1:4343 on providers.\"static:site\" (miniflare is a host process at pond, so loopback).")
+//! @yah:handoff("LANDED (Ashguard:spade). spawn_miniflare_child and pond::miniflare_route_table now take `backends: &BackendOrigins`. The pond up path and dev_door::up_dev_door pass BackendOrigins::from_slot_fields(static_fields). camp.rs (the yubaba miniflare deploy spec, ~:4822) passes it from that loop's static_fields. That is one surgical hunk in a file @Ashguard:eclipse has uncommitted edits in, at other line ranges (13530, 27214). issues_origin/backend_origin on a static slot now route /api/issues* and /releases* at dev and pond exactly as cloud apply does.")
+//! @yah:verify("New test pond_route_table_routes_the_slot_issues_origin: the table carries /api/issues plus the http://127.0.0.1:4343 origin when issues_origin is set, and no /api/issues when unset. yah-cloud lib: 1359 pass. cargo check -p yah: EXIT=0. NOT run live at pond (docker inert for agents).")
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -627,6 +638,9 @@ pub async fn up_pond(
         &format!("{}/{}", minio_running.endpoint, minio_running.bucket),
         worker_script,
         &worker_mode,
+        // R584-B7: the slot's issues_origin/backend_origin route exactly as
+        // cloud apply's Worker does (mesofact_static.rs, from_slot_fields).
+        &super::mesofact_static::BackendOrigins::from_slot_fields(static_fields),
     )
     .await
     .map_err(|e| {
@@ -861,6 +875,7 @@ pub fn miniflare_route_table(
     ssr_origin: &str,
     ssr_prefixes: &[String],
     asset_origin: &str,
+    backends: &super::mesofact_static::BackendOrigins,
 ) -> Result<String> {
     let mode = if worker_mode == "ssr" {
         super::mesofact_static::WorkerMode::Ssr {
@@ -876,7 +891,7 @@ pub fn miniflare_route_table(
         &mode,
         crate::route_table::WorkerAssets::Deployed(asset_origin),
         asset_origin,
-        &super::mesofact_static::BackendOrigins::default(),
+        backends,
         None,
     )
 }
@@ -919,7 +934,18 @@ pub(super) async fn spawn_miniflare_child(
     asset_origin: &str,
     worker_script: &str,
     mode: &super::mesofact_static::WorkerMode,
-) -> Result<(tokio::process::Child, LogBuffer)> {
+    backends: &super::mesofact_static::BackendOrigins,
+) -> Result<(MiniflareChild, LogBuffer)> {
+    // R584-B8: the door's files live beside its shim — the capture logs the
+    // ready line is read from, and the pgid record a re-run reaps.
+    let door_dir = state
+        .miniflare_shim
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    let pgid_path = door_dir.join(MINIFLARE_PGID_FILE);
+    reap_door_predecessor(&pgid_path).await;
+
     // Fail fast (and self-heal our own orphans) on a squatted port — otherwise
     // a bind conflict hides behind a 30s "did not emit ready signal" timeout.
     ensure_sim_port_free(sim_port).await?;
@@ -934,9 +960,10 @@ pub(super) async fn spawn_miniflare_child(
     // custom domain). Which store that is depends on the tier and is the
     // caller's business: MinIO at pond, the `yah-s3-fs` driver at dev.
     let node_binary = resolve_js_binary(options.js_binary.as_deref());
-    let miniflare_import =
-        resolve_miniflare_import(ctx.workspace_root).unwrap_or_else(|| "miniflare".to_string());
-    let workerd_binary = resolve_workerd_binary(ctx.workspace_root);
+    let node_modules = ensure_worker_node_modules(ctx.workspace_root).await?;
+    let miniflare_import = miniflare_import_in(&node_modules)
+        .with_context(|| format!("no miniflare entry point under {}", node_modules.display()))?;
+    let workerd_binary = workerd_binary_in(&node_modules);
 
     info!(
         port = sim_port,
@@ -956,7 +983,7 @@ pub(super) async fn spawn_miniflare_child(
         mode,
         crate::route_table::WorkerAssets::Deployed(asset_origin),
         asset_origin,
-        &super::mesofact_static::BackendOrigins::default(),
+        backends,
         None,
     )?;
     let (worker_mode, _, _) = worker_mode_triple(mode);
@@ -972,62 +999,95 @@ pub(super) async fn spawn_miniflare_child(
         .env("MF_MINIFLARE_IMPORT", &miniflare_import)
         .env("ASSET_ORIGIN", asset_origin)
         .env("WORKER_MODE", &worker_mode)
-        .env("ROUTE_TABLE", &route_table)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .env("ROUTE_TABLE", &route_table);
+    // R584-B8: the door must be able to outlive the process that spawned it
+    // (`yah cloud mirror up` exits once the mirror is up, the way a
+    // local-process slot outlives it). So: no kill_on_drop, output to files
+    // rather than pipes the parent's exit would break, and its own process
+    // group — out of reach of the CLI's terminal signals, and the unit
+    // R584-B9's teardown signals so the workerd bun double-forks goes too.
+    let stdout_path = door_dir.join("miniflare.stdout.log");
+    let stderr_path = door_dir.join("miniflare.stderr.log");
+    let open_capture = |path: &std::path::Path| {
+        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))
+    };
+    cmd.stdout(Stdio::from(open_capture(&stdout_path)?))
+        .stderr(Stdio::from(open_capture(&stderr_path)?));
+    #[cfg(unix)]
+    cmd.process_group(0);
     if let Some(ref wb) = workerd_binary {
         cmd.env("MINIFLARE_WORKERD_PATH", wb);
     }
 
-    let mut child = cmd.spawn().map_err(|e| {
+    let child = cmd.spawn().map_err(|e| {
         anyhow::anyhow!(e).context(format!(
             "spawning miniflare via `{}` — ensure bun (or Node.js ≥18) is on PATH, \
              or set BUN/NODE env var",
             node_binary.display(),
         ))
     })?;
+    // process_group(0) makes the child its own group leader: pgid == pid.
+    let pgid = child.id().map(|pid| pid as i32);
+    if let Some(pgid) = pgid {
+        if let Err(e) = std::fs::write(&pgid_path, pgid.to_string()) {
+            warn!(path = %pgid_path.display(), error = %e, "could not record door pgid");
+        }
+    }
 
     let log_buf = LogBuffer::new();
     let (ready_tx, ready_rx) = oneshot::channel::<()>();
-    if let Some(stdout) = child.stdout.take() {
+    let (tail_stop, mut tail_stop_rx) = oneshot::channel::<()>();
+    {
         let buf = log_buf.clone();
         tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let mut lines = BufReader::new(stdout).lines();
+            let mut out_tail = super::native_support::FileTail::new(stdout_path);
+            let mut err_tail = super::native_support::FileTail::new(stderr_path);
             let mut ready_tx = Some(ready_tx);
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(tx) = ready_tx.take() {
-                    if line.contains("[miniflare-sim] ready on ") {
-                        let _ = tx.send(());
-                    } else {
-                        ready_tx = Some(tx);
+            let mut seen = 0usize;
+            loop {
+                let stop = tokio::select! {
+                    _ = &mut tail_stop_rx => true,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => false,
+                };
+                out_tail.drain_into(&buf).await;
+                err_tail.drain_into(&buf).await;
+                if ready_tx.is_some() {
+                    let (lines, cursor) = buf.since(seen).await;
+                    seen = cursor;
+                    if lines.iter().any(|l| l.contains("[miniflare-sim] ready on ")) {
+                        let _ = ready_tx.take().map(|tx| tx.send(()));
                     }
                 }
-                buf.push(line).await;
+                if stop {
+                    return;
+                }
             }
         });
     }
-    if let Some(stderr) = child.stderr.take() {
-        let buf = log_buf.clone();
-        tokio::spawn(async move {
-            use tokio::io::{AsyncBufReadExt, BufReader};
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                buf.push(line).await;
-            }
-        });
-    }
+    let mut child = MiniflareChild {
+        child,
+        pgid,
+        pgid_path,
+        _tail_stop: tail_stop,
+    };
 
-    match tokio::time::timeout(options.ready_timeout, ready_rx).await {
-        Ok(Ok(())) => Ok((child, log_buf)),
-        Ok(Err(_)) | Err(_) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            // Give the reader tasks a beat to drain, then surface what the
+    // A shim that dies before its ready line fails now, not at the timeout —
+    // what a closed stdout pipe used to signal before output went to files.
+    let ready = tokio::time::timeout(options.ready_timeout, async {
+        tokio::select! {
+            r = ready_rx => r.is_ok(),
+            _ = child.child.wait() => false,
+        }
+    })
+    .await;
+    match ready {
+        Ok(true) => Ok((child, log_buf)),
+        Ok(false) | Err(_) => {
+            child.kill_group().await;
+            // Give the tail task a beat to drain, then surface what the
             // shim actually said — an opaque timeout hides the real error
             // (missing miniflare import, port conflict, workerd crash, …).
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
             let (lines, _) = log_buf.since(0).await;
             let tail = if lines.is_empty() {
                 "(no output captured)".to_string()
@@ -1122,11 +1182,14 @@ fn write_credentials_file(
 fn supervise_miniflare_and_minio(
     runtime: LocalRuntime,
     minio_name: String,
-    miniflare: tokio::process::Child,
+    miniflare: MiniflareChild,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<Result<()>> {
     tokio::spawn(async move {
-        run_miniflare_supervisor(miniflare, shutdown_rx).await;
+        if run_miniflare_supervisor(miniflare, shutdown_rx).await == Supervised::Detached {
+            // The door was left serving (R584-B8); its store must stay too.
+            return Ok(());
+        }
         if let Err(e) = runtime
             .stop_and_remove(&minio_name, Duration::from_secs(3))
             .await
@@ -1137,41 +1200,154 @@ fn supervise_miniflare_and_minio(
     })
 }
 
-/// Shared miniflare child supervision shape. SIGTERM lets the miniflare
-/// shim call `mf.dispose()` (which kills the workerd subprocess cleanly);
-/// falls back to SIGKILL after 5 s.
+/// Pgid record beside a door's shim, read by the next spawn on that door.
+const MINIFLARE_PGID_FILE: &str = "miniflare.pgid";
+
+/// Grace between SIGTERM and SIGKILL for a door's process group.
+const DOOR_TERM_GRACE: Duration = Duration::from_secs(5);
+
+/// A spawned miniflare shim and the process group it leads (R584-B8/B9).
+///
+/// Dropping this does NOT kill anything: a door is durable the way a
+/// local-process slot is, so it survives the handle (and the `mirror up` CLI
+/// that held it). It dies by [`MiniflareChild::kill_group`] — an explicit
+/// shutdown or rollback — or by the next spawn on the same door reaping the
+/// recorded pgid.
+pub(super) struct MiniflareChild {
+    child: tokio::process::Child,
+    pgid: Option<i32>,
+    pgid_path: PathBuf,
+    /// Dropping stops the capture-file tail task.
+    _tail_stop: oneshot::Sender<()>,
+}
+
+impl MiniflareChild {
+    /// SIGTERM the whole group, then SIGKILL it after [`DOOR_TERM_GRACE`].
+    ///
+    /// The group, not the pid: bun double-forks workerd, and a workerd
+    /// reparented to launchd ignores SIGTERM (R584-B9), so signalling only the
+    /// shim leaves it serving the port. SIGKILL goes to the group even when the
+    /// shim itself exited in time, because the shim exiting is exactly the case
+    /// that strands workerd.
+    async fn kill_group(&mut self) {
+        signal_group(self.pgid, &mut self.child, GroupSignal::Term);
+        if tokio::time::timeout(DOOR_TERM_GRACE, self.child.wait())
+            .await
+            .is_err()
+        {
+            warn!(pgid = ?self.pgid, "miniflare did not exit after SIGTERM; sending SIGKILL");
+        }
+        signal_group(self.pgid, &mut self.child, GroupSignal::Kill);
+        let _ = self.child.wait().await;
+        let _ = std::fs::remove_file(&self.pgid_path);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GroupSignal {
+    Term,
+    Kill,
+}
+
+fn signal_group(pgid: Option<i32>, child: &mut tokio::process::Child, sig: GroupSignal) {
+    #[cfg(unix)]
+    if let Some(pgid) = pgid {
+        let sig = match sig {
+            GroupSignal::Term => libc::SIGTERM,
+            GroupSignal::Kill => libc::SIGKILL,
+        };
+        // SAFETY: killpg is defined for any pgid/signal pair and reports
+        // failure (an already-empty group) through its return value.
+        unsafe {
+            libc::killpg(pgid, sig);
+        }
+        return;
+    }
+    let _ = (pgid, sig);
+    let _ = child.start_kill();
+}
+
+/// Reap the door a previous spawn left serving (R584-B8), by its recorded
+/// pgid: SIGTERM, a grace, SIGKILL — the local-process re-run ladder, applied
+/// to the group. The record is removed either way.
+async fn reap_door_predecessor(pgid_path: &std::path::Path) {
+    let Ok(text) = std::fs::read_to_string(pgid_path) else {
+        return;
+    };
+    let _ = std::fs::remove_file(pgid_path);
+    #[cfg(unix)]
+    if let Ok(pgid) = text.trim().parse::<i32>() {
+        // SAFETY: signal 0 only checks for existence.
+        let alive = || unsafe { libc::killpg(pgid, 0) == 0 };
+        if !alive() {
+            return;
+        }
+        info!(pgid, "replacing predecessor door");
+        unsafe {
+            libc::killpg(pgid, libc::SIGTERM);
+        }
+        let deadline = tokio::time::Instant::now() + DOOR_TERM_GRACE;
+        while alive() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if alive() {
+            warn!(pgid, "predecessor door ignored SIGTERM; sending SIGKILL");
+            unsafe {
+                libc::killpg(pgid, libc::SIGKILL);
+            }
+        }
+        // Let the kernel release the listener before the port probe.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    #[cfg(not(unix))]
+    let _ = text;
+}
+
+/// How [`run_miniflare_supervisor`] ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Supervised {
+    /// The shim exited, or a shutdown reaped its group.
+    Stopped,
+    /// The shutdown sender was dropped without a send —
+    /// [`RunningWorkload::detach`](super::RunningWorkload::detach). The door
+    /// is left serving for the next spawn to reap.
+    Detached,
+}
+
+/// Shared miniflare child supervision shape. A shutdown SIGTERMs the
+/// shim's process group (the shim calls `mf.dispose()`, which stops workerd
+/// cleanly), then SIGKILLs the group after 5 s — R584-B9.
+///
+/// @yah:ticket(R584-B9, "Door/pond rollback orphans workerd: shutdown signals only the bun shim, not its process group")
+/// @yah:status(review)
+/// @yah:at(2026-10-10T19:14:41Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R584)
+/// @yah:severity(medium)
+/// @yah:handoff("LANDED (Ashguard:polaris). Door/pond shutdown and rollback now signal the shim's PROCESS GROUP (it is spawned with process_group(0), so workerd shares the group even after it is reparented to launchd): MiniflareChild::kill_group sends killpg SIGTERM, waits up to DOOR_TERM_GRACE (5s), then sends killpg SIGKILL unconditionally, because the shim exiting in time is exactly the case that strands workerd. When the shim exits on its own, the supervisor also SIGKILLs the group. A failed ready wait kills the group too. The desktop's rollback (mirror_run.rs `w.shutdown().await`) gets this with no change there. The CLI now rolls back on failure instead of dropping (see R584-B8).")
+/// @yah:verify("Unit: kill_group_reaps_a_grandchild_that_ignores_sigterm (sh group with trap '' TERM + forked sleep; the group is gone after kill_group). Live, opt-in binary, in a scratch workspace (deleted afterwards) whose third component fails after two doors (:4341/:4342) came up: mirror up exit 1, then no shim, no workerd and no listener on 4341/4342, and pgrep workerd showed only the separately running noisetable doors.")
 pub(super) async fn run_miniflare_supervisor(
-    mut miniflare: tokio::process::Child,
+    mut miniflare: MiniflareChild,
     shutdown_rx: oneshot::Receiver<()>,
-) {
+) -> Supervised {
     tokio::select! {
-        res = miniflare.wait() => {
+        res = miniflare.child.wait() => {
             if let Ok(status) = res {
                 if !status.success() {
                     warn!(?status, "miniflare exited non-zero");
                 }
             }
+            // Don't strand a workerd the shim left behind.
+            signal_group(miniflare.pgid, &mut miniflare.child, GroupSignal::Kill);
+            let _ = std::fs::remove_file(&miniflare.pgid_path);
+            Supervised::Stopped
         }
-        _ = shutdown_rx => {
-            #[cfg(unix)]
-            if let Some(pid) = miniflare.id() {
-                let _ = std::process::Command::new("kill")
-                    .arg(pid.to_string())
-                    .status();
+        res = shutdown_rx => {
+            if res.is_err() {
+                return Supervised::Detached;
             }
-            match tokio::time::timeout(Duration::from_secs(5), miniflare.wait()).await {
-                Ok(_) => {}
-                Err(_) => {
-                    warn!("miniflare did not exit after SIGTERM; sending SIGKILL");
-                    let _ = miniflare.start_kill();
-                    let _ = miniflare.wait().await;
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = miniflare.start_kill();
-                let _ = miniflare.wait().await;
-            }
+            miniflare.kill_group().await;
+            Supervised::Stopped
         }
     }
 }
@@ -1208,6 +1384,20 @@ pub fn which_bun_on_path() -> bool {
 /// Locate the worker directory's node_modules under the workspace root. Two
 /// live layouts: the yah monorepo (cloud vendored at `oss/yubaba/crates/cloud`)
 /// and the standalone yubaba export (`crates/cloud`).
+///
+/// @yah:ticket(R584-B6, "Dev door / pond miniflare unresolvable outside the yah tree: bare 'miniflare' fallback has no provisioning")
+/// @yah:status(review)
+/// @yah:at(2026-10-10T18:44:13Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R584)
+/// @yah:severity(high)
+/// @yah:next("Tier: Warrior. resolve_worker_node_modules only probes <workspace>/oss/yubaba/crates/cloud/worker/node_modules and <workspace>/crates/cloud/worker/node_modules, so it works only in the yah/yubaba trees by layout. In any consumer camp (noisetable) resolve_miniflare_import returns None, MF_MINIFLARE_IMPORT='miniflare', and the shim, written to .yah/infra/state/dev/door/<svc>-<comp>/miniflare-sim.mjs, cannot resolve it (no ancestor node_modules). The doc comment's promised 'lazy npm install' fallback does not exist.")
+/// @yah:next("Repro: in ~/ss/noisetable, `yah cloud mirror up noisetable-marketing --env dev` -> 'miniflare did not emit ready signal within 30s ... Cannot find package miniflare from .yah/infra/state/dev/door/noisetable-marketing-site/miniflare-sim.mjs'.")
+/// @yah:next("Fix in yah: provision the worker runtime itself (e.g. install @yah/cloud-worker's pinned miniflare into a yah-owned cache dir and resolve from there, the way the workerd binary is cached), not by asking consumers to vendor miniflare. Consumer camps must not need ../yah node_modules.")
+/// @yah:next("Same resolver hits pond (noisetable R823-T3, read from source): miniflare-container is NOT a container image with miniflare baked in. pond.rs spawn_miniflare_child (~:937) spawns the shim as a HOST node/bun process, MinIO is the only container, and it calls resolve_miniflare_import -> resolve_worker_node_modules (pond.rs ~:1220), which probes only oss/yubaba/crates/cloud/worker/node_modules and crates/cloud/worker/node_modules under the workspace root, falling back to bare \"miniflare\". A consumer camp's pond mirror therefore has the identical failure as its dev mirror. Not run (docker inert for agents).")
+/// @yah:handoff("LANDED (Ashguard:spade). Design: a yah-OWNED install, not a lazy npm in the consumer's tree. worker/package.json and worker/bun.lock are include_str!'d into the binary, so an INSTALLED yah (no source tree, no co-dev symlink) carries its exact pins. `ensure_worker_node_modules` (pond.rs) uses the source tree's worker/node_modules when present (co-dev, zero install). Otherwise it uses `worker_runtime_cache_dir()`: $YAH_WORKER_CACHE, else $XDG_CACHE_HOME/yah/cloud-worker, else ~/.cache/yah/cloud-worker, under <sha256(package.json+bun.lock)[..16]>, so a yah upgrade that bumps miniflare gets a fresh tree. On first use it provisions with `bun install --frozen-lockfile` (or `npm install` without bun) in a staging dir renamed into place, which is race-safe. The bare \"miniflare\" fallback is gone: a failed provision is a named error, not a 30s ready timeout. resolve_miniflare_import/resolve_workerd_binary became miniflare_import_in/workerd_binary_in(node_modules). This covers dev door and pond, which share spawn_miniflare_child.")
+/// @yah:verify("yah-cloud lib tests: 1359 pass, 0 fail (new: worker_runtime_cache_is_yah_owned_and_keyed_by_the_pins, a_consumer_camp_resolves_the_in_tree_worker_without_installing). Live in noisetable with the opt-in binary: ~/.cache/yah/cloud-worker/1733377bde61745a was provisioned, and both doors (site :4331, app :4332) printed their dev url, which is emitted only after miniflare's ready signal. The workerd ran from the cache. Using the live pre-fix ~/.local/bin/yah, web-dev-smoke still shows the old \"Cannot find package 'miniflare'\", so the fix needs yah-install to reach QED.")
+/// @yah:gotcha("Separate pre-existing gap, not fixed: dev/pond static doors are supervised IN the `yah cloud mirror up` CLI process (into_running + tokio supervisor), so :4331/:4332 stop serving the moment the CLI exits. web-dev-smoke's probe steps after mirror-marketing can therefore never see them unless the daemon/Run tab hosts the door. The local-process api (:4334) does survive.")
 fn resolve_worker_node_modules(workspace_root: &std::path::Path) -> Option<PathBuf> {
     [
         "oss/yubaba/crates/cloud/worker/node_modules",
@@ -1221,34 +1411,113 @@ fn resolve_worker_node_modules(workspace_root: &std::path::Path) -> Option<PathB
     .find_map(|p| p.canonicalize().ok())
 }
 
-/// Return an absolute path to miniflare's CJS entry point if the monorepo
-/// worker directory is present under the workspace root. Operators who have
-/// the yah source tree get zero-download spinup; those who don't fall back to
-/// the bare `"miniflare"` specifier (which requires a lazy npm install).
-pub fn resolve_miniflare_import(workspace_root: &std::path::Path) -> Option<String> {
-    let index = resolve_worker_node_modules(workspace_root)?.join("miniflare/dist/src/index.js");
-    if index.exists() {
-        Some(index.to_string_lossy().into_owned())
-    } else {
-        None
-    }
+/// The worker runtime manifest yah ships (R584-B6). Embedded so an INSTALLED
+/// yah — no source tree anywhere near the consumer camp — can provision the
+/// exact miniflare/workerd pins it was built and tested against.
+const WORKER_PACKAGE_JSON: &str = include_str!("../../worker/package.json");
+const WORKER_BUN_LOCK: &str = include_str!("../../worker/bun.lock");
+
+/// Yah-owned install location for the worker runtime: `$YAH_WORKER_CACHE`, else
+/// `$XDG_CACHE_HOME/yah/cloud-worker`, else `~/.cache/yah/cloud-worker`, keyed
+/// by a hash of the embedded manifest + lockfile so a yah upgrade that bumps
+/// miniflare gets a fresh install instead of a stale one.
+pub fn worker_runtime_cache_dir() -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let root = std::env::var_os("YAH_WORKER_CACHE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_CACHE_HOME").map(|d| PathBuf::from(d).join("yah/cloud-worker"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/yah/cloud-worker"))
+        })?;
+    let mut h = Sha256::new();
+    h.update(WORKER_PACKAGE_JSON.as_bytes());
+    h.update(WORKER_BUN_LOCK.as_bytes());
+    Some(root.join(&hex::encode(h.finalize())[..16]))
 }
 
-/// Return the workerd binary path from the monorepo's worker node_modules, if
-/// present. Passed to miniflare as `MINIFLARE_WORKERD_PATH` so the 83 MB
-/// binary is never re-downloaded when it's already on disk. Falls back to
-/// miniflare's own resolution (from the `workerd` npm package) when absent.
-pub fn resolve_workerd_binary(workspace_root: &std::path::Path) -> Option<PathBuf> {
-    let bin = resolve_worker_node_modules(workspace_root)?.join(if cfg!(windows) {
+/// node_modules holding miniflare for the sim shim (R584-B6). The yah/yubaba
+/// source tree's own worker dir wins when present (co-dev, zero install);
+/// otherwise yah provisions its pinned runtime into
+/// [`worker_runtime_cache_dir`] on first use — `bun install --frozen-lockfile`
+/// against the embedded lockfile, `npm install` when bun is absent — staged in
+/// a sibling dir and renamed into place so concurrent first runs cannot observe
+/// a half-written tree. Consumer camps never vendor miniflare themselves.
+pub async fn ensure_worker_node_modules(workspace_root: &std::path::Path) -> Result<PathBuf> {
+    if let Some(nm) = resolve_worker_node_modules(workspace_root) {
+        if miniflare_import_in(&nm).is_some() {
+            return Ok(nm);
+        }
+    }
+    let dir = worker_runtime_cache_dir()
+        .context("cannot place the yah worker runtime cache: neither HOME nor XDG_CACHE_HOME is set")?;
+    let nm = dir.join("node_modules");
+    if miniflare_import_in(&nm).is_some() {
+        return Ok(nm);
+    }
+    let parent = dir.parent().expect("cache dir has a parent");
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let staging = parent.join(format!(
+        ".staging-{}-{}",
+        std::process::id(),
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)?;
+    std::fs::write(staging.join("package.json"), WORKER_PACKAGE_JSON)?;
+    let mut cmd = if which_bun_on_path() {
+        std::fs::write(staging.join("bun.lock"), WORKER_BUN_LOCK)?;
+        let mut c = Command::new("bun");
+        c.args(["install", "--frozen-lockfile"]);
+        c
+    } else {
+        let mut c = Command::new("npm");
+        c.args(["install", "--no-audit", "--no-fund"]);
+        c
+    };
+    info!(dir = %dir.display(), "provisioning yah worker runtime (miniflare)");
+    let out = cmd
+        .current_dir(&staging)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("spawning bun/npm to provision the yah worker runtime (miniflare)")?;
+    if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&staging);
+        bail!(
+            "provisioning miniflare into {} failed ({}): {}",
+            dir.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    // A concurrent run may have won the race; its tree is equivalent.
+    if std::fs::rename(&staging, &dir).is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    let nm = nm.canonicalize().unwrap_or(nm);
+    miniflare_import_in(&nm)
+        .with_context(|| format!("miniflare missing from {} after install", nm.display()))?;
+    Ok(nm)
+}
+
+/// Absolute path to miniflare's CJS entry point under `node_modules`.
+pub fn miniflare_import_in(node_modules: &std::path::Path) -> Option<String> {
+    let index = node_modules.join("miniflare/dist/src/index.js");
+    index.exists().then(|| index.to_string_lossy().into_owned())
+}
+
+/// The workerd binary under `node_modules`, passed to miniflare as
+/// `MINIFLARE_WORKERD_PATH` so the 83 MB binary is never re-downloaded. Falls
+/// back to miniflare's own resolution (from the `workerd` npm package) when absent.
+pub fn workerd_binary_in(node_modules: &std::path::Path) -> Option<PathBuf> {
+    let bin = node_modules.join(if cfg!(windows) {
         "workerd/bin/workerd.exe"
     } else {
         "workerd/bin/workerd"
     });
-    if bin.exists() {
-        Some(bin)
-    } else {
-        None
-    }
+    bin.exists().then_some(bin)
 }
 
 // ── Sim-port pre-flight: surface (and self-heal) serve-layer conflicts ───────
@@ -1613,6 +1882,76 @@ pub async fn query_warden_pond_list(port: u16) -> Result<Vec<AdoptPondRecord>> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    // ── door process group (R584-B8 / R584-B9) ───────────────────────────
+
+    /// A shim stand-in that leads its own group and forks a grandchild —
+    /// the bun → workerd shape. `ignore_term` makes both ignore SIGTERM, the
+    /// orphaned-workerd behaviour R584-B9 is about.
+    #[cfg(unix)]
+    fn spawn_group(ignore_term: bool) -> tokio::process::Child {
+        let script = if ignore_term {
+            "trap '' TERM; sleep 60 & wait"
+        } else {
+            "sleep 60 & wait"
+        };
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(script).process_group(0);
+        cmd.spawn().expect("spawn sh")
+    }
+
+    #[cfg(unix)]
+    fn group_alive(pgid: i32) -> bool {
+        unsafe { libc::killpg(pgid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_group_reaps_a_grandchild_that_ignores_sigterm() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = spawn_group(true);
+        let pgid = child.id().unwrap() as i32;
+        let pgid_path = dir.path().join(MINIFLARE_PGID_FILE);
+        std::fs::write(&pgid_path, pgid.to_string()).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (tail_stop, _rx) = oneshot::channel();
+        let mut mf = MiniflareChild {
+            child,
+            pgid: Some(pgid),
+            pgid_path: pgid_path.clone(),
+            _tail_stop: tail_stop,
+        };
+        mf.kill_group().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!group_alive(pgid), "the whole group, grandchild included, is gone");
+        assert!(!pgid_path.exists(), "an explicit stop clears the record");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_detached_door_survives_and_the_next_spawn_reaps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = spawn_group(false);
+        let pgid = child.id().unwrap() as i32;
+        let pgid_path = dir.path().join(MINIFLARE_PGID_FILE);
+        std::fs::write(&pgid_path, pgid.to_string()).unwrap();
+        let (tail_stop, _rx) = oneshot::channel();
+        let mf = MiniflareChild {
+            child,
+            pgid: Some(pgid),
+            pgid_path: pgid_path.clone(),
+            _tail_stop: tail_stop,
+        };
+        let (tx, rx) = oneshot::channel::<()>();
+        drop(tx); // RunningWorkload::detach
+        assert_eq!(run_miniflare_supervisor(mf, rx).await, Supervised::Detached);
+        assert!(group_alive(pgid), "detach leaves the door serving");
+
+        reap_door_predecessor(&pgid_path).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!group_alive(pgid), "a re-run reaps the predecessor group");
+        assert!(!pgid_path.exists());
+    }
 
     // ── sim-port pre-flight ──────────────────────────────────────────────
 
@@ -2288,7 +2627,7 @@ mod tests {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         // CARGO_MANIFEST_DIR = crates/yah/cloud → workspace root is 3 up
         let workspace = manifest.ancestors().nth(3).unwrap();
-        let result = resolve_miniflare_import(workspace);
+        let result = resolve_worker_node_modules(workspace).and_then(|nm| miniflare_import_in(&nm));
         // Only assert the path shape when the dir is present; CI without
         // node_modules will get None, which is the correct fallback.
         if let Some(path) = result {
@@ -2300,6 +2639,49 @@ mod tests {
                 std::path::Path::new(&path).exists(),
                 "resolved path must exist: {path}"
             );
+        }
+    }
+
+    #[test]
+    fn pond_route_table_routes_the_slot_issues_origin() {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "issues_origin".to_string(),
+            toml::Value::String("http://127.0.0.1:4343/".into()),
+        );
+        let backends = super::super::mesofact_static::BackendOrigins::from_slot_fields(&fields);
+        let table =
+            miniflare_route_table("static", "", &[], "http://127.0.0.1:9000/b", &backends).unwrap();
+        assert!(table.contains("/api/issues"), "{table}");
+        assert!(table.contains("http://127.0.0.1:4343"), "{table}");
+        let bare = miniflare_route_table(
+            "static",
+            "",
+            &[],
+            "http://127.0.0.1:9000/b",
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(!bare.contains("/api/issues"), "{bare}");
+    }
+
+    #[test]
+    fn worker_runtime_cache_is_yah_owned_and_keyed_by_the_pins() {
+        let dir = worker_runtime_cache_dir().expect("HOME is set under cargo test");
+        let parent = dir.parent().unwrap();
+        assert!(parent.ends_with("yah/cloud-worker") || std::env::var_os("YAH_WORKER_CACHE").is_some());
+        assert_eq!(dir.file_name().unwrap().len(), 16);
+        assert!(WORKER_PACKAGE_JSON.contains("\"miniflare\""));
+    }
+
+    #[tokio::test]
+    async fn a_consumer_camp_resolves_the_in_tree_worker_without_installing() {
+        // Under the monorepo the source-tree worker wins; a camp with no such
+        // tree goes to the cache. Only assert when this checkout has node_modules.
+        let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(4).unwrap();
+        if resolve_worker_node_modules(ws).and_then(|nm| miniflare_import_in(&nm)).is_some() {
+            let nm = ensure_worker_node_modules(ws).await.unwrap();
+            assert!(miniflare_import_in(&nm).is_some());
         }
     }
 }

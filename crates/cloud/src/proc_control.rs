@@ -176,17 +176,11 @@ impl ProcState {
 /// A workload's self-description. Only [`Self::state`] is required.
 ///
 /// @yah:relay(R866, "Deployed-credential drift: apply-time value fingerprints reported back over the ProcStatus rail")
-/// @yah:at(2026-09-05T08:47:33Z)
-/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:status(review)
+/// @yah:at(2026-10-10T22:21:15Z)
+/// @yah:assignee(bundle-anthropic-glimmerstone)
 /// @arch:see(.yah/docs/working/W337-credential-health-and-rotation.md)
 /// @yah:depends_on(R556-F6)
-/// @yah:next("THE PROBLEM. A credential used by a cloud workload is injected at `yah cloud apply` time from the local vault via resolve_serve_env (grep `fn resolve_serve_env` in app/yah/cli/src/cloud.rs — :7979 on 2026-09-05, but it has moved three times). That splits rot in two: (a) the vault copy rotted, which a local `yah keys doctor` probe already catches, and (b) THE DEPLOYED COPY DRIFTED FROM THE VAULT COPY — someone rotated the vault and never re-applied, or applied and the workload never restarted. In case (b) the vault probe is GREEN and the service is DOWN. This relay is (b) and only (b).")
-/// @yah:next("SCOPE THE DELTA. The apply-time PRESENCE half is already built and must NOT be rebuilt: resolve_serve_env is FATAL on an empty resolution, with an error naming the slot and the `yah keys set` fix, so a serve process is never forked with a blank credential. What it cannot catch is a value that resolves fine and is DEAD, or one that DRIFTED after apply.")
-/// @yah:next("SHAPE. At apply time store a SALTED hash of each injected value; have the workload report the hash of what it is actually running with; compare. That detects (b) without moving a secret anywhere. HARD CONSTRAINT: no secret value, and no secret LENGTH, may appear in the fingerprint path, in the reported status document, or in any log.")
-/// @yah:next("USE THE EXISTING ProcStatus RAIL — do not build a bespoke per-workload health endpoint. Right here in this file: workloads publish a `ProcStatus` self-description document (:155), fetched by `fetch_status` (:234) over a `ControlEndpoint` that is `Socket(PathBuf)` OR `Http(String)` (:211, doc: \\\"for a process that already serves HTTP, including every cloud-tier workload\\\"), at conventional path DEFAULT_HTTP_PATH = \\\"/_yah/status\\\" (:111, overridable per-workload via `[process.control] http_path`). Producer side is a published two-line helper crate, oss/kamaji/crates/procctl (serve_env / serve_at / ControlServer, lib.rs:78). Riding this rail makes the feature work for EVERY procctl-conforming workload rather than mesofact alone.")
-/// @yah:next("THE ONE GAP, and it is the first edit: ProcStatus has NO field a hex fingerprint fits. `metrics` is `BTreeMap<String, f64>` (numeric only), `endpoints` is addresses, `detail` is documented as ONE HUMAN LINE. Add a string-valued field — `env_fingerprint`, or a general free-form `labels: BTreeMap<String, String>`; THAT CHOICE IS A NAMING CALL, make it deliberately — carrying #[serde(default)] so workloads built before this change keep deserializing.")
-/// @yah:next("SURFACE IT IN THE EXISTING TABLE, not a new command. `yah cloud mirror-status` already does declared-vs-observed comparison for replicas and already has a --drift filter: `handle_mirror_status` at app/yah/cli/src/cloud.rs:11862, row type `MirrorStatusRow` at :6774, --drift applied at :11929. Add a row type; do not add a command. (Older prose cites :9684 for this — that was never a mirror-status line.)")
-/// @yah:gotcha("THERE IS NO LIVE CONSUMER YET, AND THAT GATES THIS RELAY — it is why depends_on(R556-F6) is set. Measured 2026-09-05: ZERO uncommented `vault:` declarations in any tracked TOML. All four hits are commented out — .yah/services/yah-analytics/mirrors/cloud.toml:616-618 (the `#!` cut-over block) and .yah/qed/gha-actions.toml:25 — so today there is nothing for an apply-time hash to hash and the reporting half would be dead code on both ends. Step (4) of R556-F6's cut-over uncomments that block and creates the first live declaration. Confirm the field shape against what R556-T12 actually SHIPPED, not against the comment: the comment predates it and names `cloudflare-r2-endpoint`, a slot the vault does not have.")
 /// @yah:gotcha("RIPGREP TRAP that has already cost two sessions a false reading: rg skips hidden directories by default, and every `vault:` declaration in this tree lives under .yah/. So `rg '=\\s*\"vault:\"' --glob '*.toml'` WITHOUT --hidden returns clean over a tree that is not clean. Always pass --hidden when re-measuring the trigger.")
 /// @yah:gotcha("BLAST RADIUS IS WIDER THAN IT LOOKS — weigh it before starting. This touches oss/yubaba AND oss/kamaji, which are INDEPENDENT Cargo workspaces excluded from the yah root workspace (so no `workspace = true` inheritance from the root inside them), and procctl is a crates.io PUBLISH surface, meaning a ProcStatus field change is a wire-format change for external consumers (noisetable, in the entambi repo, is named as one in this file's own R-notes). #[serde(default)] on the new field is not optional politeness; it is what keeps already-deployed workloads deserializing.")
 /// @yah:gotcha("HISTORY: this was R856-F8, deferred unbuilt across three sessions (2026-09-03/04/05) because the trigger never fired. Operator decision 2026-09-05 re-filed it here as its own relay rather than holding R856 open — R856's remaining work is vault-local and finished, while this spans two oss workspaces and a publish surface. R856-F8 is archived; its design record is W337 §5.")
@@ -194,6 +188,14 @@ impl ProcState {
 /// @yah:verify("No secret value and no secret LENGTH appears in the fingerprint path, in the reported ProcStatus document, or in any log")
 /// @yah:verify("A workload built before the new ProcStatus field still deserializes (pin it with a test that feeds the pre-change JSON through serde), so a partial fleet roll cannot break status reporting")
 /// @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud proc_control  # the rail's existing serde round-trip tests still pass (see proc_control.rs:493)")
+/// @yah:handoff("CODE LANDED 2026-10-10 across four workspaces, all suites green. NAMING CALL MADE: `env_fingerprint: BTreeMap<String,String>` (typed, purpose-named), not a free-form `labels` map — a generic string map would invite producers to put secret-adjacent junk there and would hide a schema inside key names. WIRE RULE: deployer sets YAH_ENV_FINGERPRINT_KEY + YAH_ENV_FINGERPRINT_VARS (comma list); producer reports lowercase-hex HMAC-SHA256(key utf8, value utf8) per listed+set name; Python one-liner; pinned by one cross-language vector (d09f5c67…) in all three implementations. KEY CUSTODY: per-mirror key = HMAC(vault slot `env-fingerprint-key`, \"yah/env-fingerprint/v1/<svc>/<env>\"), root minted by the first apply that needs it. Rejected: key in the status doc (offline brute-force of weak values) and read-back from the node (spec_redact.rs redacts env by design). FILES: oss/kamaji/crates/procctl (field, env_fingerprint/_from_env/_from, ControlServer stamps it at bind); oss/yubaba/crates/cloud/src/env_fingerprint.rs (new: mirror_key, mint_root, stamp, compare→Verdict) + proc_control.rs field; oss/yah-base/crates/keys/src/spec.rs (registry entry); oss/mesofact/crates/mesofact/src/health.rs (`/_yah/status` in probe_routes — the live consumer's producer); app/yah/cli/src/cloud.rs (stamp_env_fingerprint in deploy_mesofact_bundle; `mirror status <service> --env <env>` with CredentialDriftRow).")
+/// @yah:gotcha("`yah cloud mirror status <camp>` (no --env) reads ONLY legacy `.yah/cloud/mirrors/<camp>.toml` — absent in this repo, live in ~/ss/noisetable. So the service-mirror report is `mirror status <service> --env <env>` (symmetric with `mirror up`), not the camp form; the ticket's `mirror-status` spelling never existed. --drift on the service form KEEPS unverified rows, so 'no drift detected' prints only when every declared var was actually compared.")
+/// @yah:handoff("LIVE ON yah-analytics/prod 2026-10-10 (operator-authorized, F4370 'Full live verify'). Runtime built by `yah qed run mesofact-musl` (run 33ff6224, x86 leg; mesofact sha256 9f17b979…), published as runtime asset mesofact/0.8.46-r866 (blob 1368118b…) to yah-dev — labelled -r866 so it cannot collide with the official v0.8.46 release binary. .yah/services/yah-analytics/mirrors/prod.toml repinned 0.8.43 -> 0.8.46-r866 with provenance comment. `target/opt-in/bin/yah cloud mirror up yah-analytics --env prod` minted vault slot env-fingerprint-key and stamped 4 declared vars; workload Running on us-east-001. Public door unchanged: no bearer -> 401, cheers bearer -> 200 rendering '0 events · snapshot 2026-10-10T22:18:26Z' (signed R2 reads intact on the new runtime).\nSHAPE AS SHIPPED (full rationale in W337 §5 'As built' and W315 §env_fingerprint): ProcStatus gains `env_fingerprint: BTreeMap<String,String>` (#[serde(default)], skipped when empty) in both procctl and yah-cloud. Deployer sets YAH_ENV_FINGERPRINT_KEY + YAH_ENV_FINGERPRINT_VARS; producer reports hex HMAC-SHA256(key, value) per listed+set name. Per-mirror key = HMAC(vault root `env-fingerprint-key`, 'yah/env-fingerprint/v1/<svc>/<env>'); the key is never on the wire and never read back from the node. Producers: mesofact `GET /_yah/status` (health.rs probe_routes — every bundle on a runtime >= this one) and procctl ControlServer (stamped at bind). Comparer: `yah cloud mirror status <service> --env <env> [--drift] [--format json]`, row type CredentialDriftRow; verdicts in oss/yubaba/crates/cloud/src/env_fingerprint.rs. One cross-language vector (Python stdlib) pinned in all three implementations.\nDISCOVERED + FIXED IN THIS PASS: `mirror status <camp>` reads only legacy .yah/cloud/mirrors/ (absent here, live in ~/ss/noisetable), so it could never see a service mirror — added the --env service form beside it rather than a new command; the legacy form is untouched. Registered env-fingerprint-key in fob's CREDENTIAL_SPECS (oss/yah-base/crates/keys/src/spec.rs) so `yah keys list`/doctor know it.")
+/// @yah:verify("THE TICKET'S SCENARIO, LIVE: saved cloudflare-r2-endpoint to a 0600 temp file (never printed), changed the vault value (trailing slash toggled), did NOT re-apply -> `yah cloud mirror status yah-analytics --env prod --drift` printed exactly one row: ANALYTICS_R2_ENDPOINT 'DRIFT: running value differs from the vault' + the mirror-up fix line; `yah keys doctor --all` on the same vault: '65 slot(s): 7 absent, 50 indeterminate, 8 valid / no credential is known to be broken.' Restored byte-identical (compared, temp file removed) -> '--drift: no drift detected — every declared variable compared in sync'. Doctor CAVEAT, stated not smoothed: doctor has no Cloudflare prober, so it calls the R2 slots 'indeterminate', never 'Valid' — the green-vault/down-service gap is real, but 'Valid' in the ticket's wording is not literally what doctor prints for these slots.\nNO SECRET OR LENGTH ON THE WIRE, measured: raw `curl http://100.64.0.3:33175/_yah/status` = {state, version, env_fingerprint:{4 × 64-hex}} — no key, no value, fixed width. Apply output prints var NAMES only. Unit-pinned: an_env_fingerprint_is_fixed_width_whatever_the_value, only_listed_and_set_variables_are_fingerprinted (key never reported), stamp_lists_only_declared_names_and_never_their_values.\nPRE-CHANGE DOCUMENTS STILL DESERIALIZE: a_document_from_before_env_fingerprint_still_parses in BOTH oss/kamaji procctl and oss/yubaba proc_control (full pre-R866 field set fed through serde).\nSUITES: cargo test --manifest-path oss/kamaji/Cargo.toml -p kamaji-procctl -p kamaji-bin --all-features -> all green (procctl 28 + kamaji-bin 326 + integration); cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib -> 1376 passed 0 failed (incl. 13 new env_fingerprint + 2 new proc_control); cargo test --manifest-path oss/mesofact/Cargo.toml -p mesofact --lib -> 127 passed (3 new incl. yah_status lifecycle); cargo test --manifest-path oss/yah-base/Cargo.toml -p fob --lib spec -> 19 passed (sorted-registry invariant holds); cargo check -p yah -> 0 errors, no new warnings; cargo test -p xtask --test main mirror_ingress -> 14 passed after the repin; yah cloud validate --path . -> ok.")
+/// @yah:gotcha("env_fingerprint.rs IS A NEW UNTRACKED FILE and git writes are deferred in this camp. `pub mod env_fingerprint;` in oss/yubaba/crates/cloud/src/lib.rs IS tracked — so any source_context fleet build that packs oss/yubaba (packer lists files from the git index) ships the reference without the referent and fails like a corrupt checkout. Operator: `git add oss/yubaba/crates/cloud/src/env_fingerprint.rs` in the next sweep.")
+/// @yah:assumes("/_yah/status will be publicly reachable through the front door on any NON-authed bundle once it moves to a runtime carrying R866 (e.g. https://yah.dev/_yah/status when yah-marketing repins). It exposes state, runtime version and keyed digests. Judged acceptable — the digests are useless without the per-mirror key, and /__mesofact/info + /livez are already public — but it is a judgment, not a measurement; a passway carve-out for /_yah/* is the lever if the operator disagrees.")
+/// @yah:cleanup("Repin yah-analytics off the hand-labelled runtime mesofact/0.8.46-r866 onto the first stock mesofact release that contains R866's health.rs (any >= v0.8.47 cut from this tree); keep the floor max(B13, d1eb25e2, R866).")
+/// @yah:handoff("The doctor caveat in verify (no Cloudflare/R2 prober, so the R2 slots read 'indeterminate', never Valid) is filed as R856-F14, along with the cloudflare-r2-endpoint registry gap.")
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcStatus {
     /// Lifecycle state, in kamaji's vocabulary.
@@ -226,6 +228,14 @@ pub struct ProcStatus {
     /// is a status channel, not a metrics pipeline.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub metrics: std::collections::BTreeMap<String, f64>,
+    /// `NAME → keyed fingerprint` of the environment the process runs with,
+    /// for the names its deployer listed (R866). Compared by
+    /// [`crate::env_fingerprint::compare`]; see that module for why no value,
+    /// no length and no key ever appears here. `#[serde(default)]` is
+    /// load-bearing, not politeness: every producer built before this field
+    /// omits it, and a partial fleet roll puts those behind this consumer.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env_fingerprint: std::collections::BTreeMap<String, String>,
 }
 
 impl ProcStatus {
@@ -609,12 +619,41 @@ mod tests {
             detail: None,
             endpoints,
             metrics: BTreeMap::new(),
+            env_fingerprint: BTreeMap::new(),
         };
         let json = serde_json::to_string(&original).unwrap();
         assert_eq!(serde_json::from_str::<ProcStatus>(&json).unwrap(), original);
         assert!(
             !json.contains("\"ready\""),
             "absent optionals must not be emitted: {json}"
+        );
+        assert!(!json.contains("env_fingerprint"), "{json}");
+    }
+
+    /// R866. The exact document a producer built BEFORE `env_fingerprint`
+    /// emits — the full field set as it stood, so the test fails if a future
+    /// edit makes the new field required. A partial fleet roll puts old
+    /// producers behind this consumer; they must read as "reports no
+    /// fingerprints", never as unparseable.
+    #[test]
+    fn a_document_from_before_env_fingerprint_still_parses() {
+        let pre = r#"{"state":"running","ready":true,"pid":71455,"uptime_secs":41,
+                      "version":"0.8.46","detail":"serving",
+                      "endpoints":{"http":"http://10.0.0.1:8080"},"metrics":{"rps":3.0}}"#;
+        let s: ProcStatus = serde_json::from_str(pre).unwrap();
+        assert!(s.is_ready());
+        assert!(s.env_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn a_document_carrying_env_fingerprints_parses() {
+        let s: ProcStatus = serde_json::from_str(
+            r#"{"state":"running","env_fingerprint":{"R2_SECRET":"d09f5c67"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            s.env_fingerprint.get("R2_SECRET").map(String::as_str),
+            Some("d09f5c67")
         );
     }
 }

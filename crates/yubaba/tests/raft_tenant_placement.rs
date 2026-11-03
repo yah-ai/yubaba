@@ -228,6 +228,9 @@ async fn seed_with_rpo_bound(
                 location: None,
                 ingress_floating_ip: None,
                 public_address: None,
+                taints: None,
+                mesh_tags: None,
+                sovereign_participation: None,
             },
         )
         .await;

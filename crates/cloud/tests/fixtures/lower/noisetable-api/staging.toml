@@ -18,7 +18,6 @@ hostnames = ["api-staging.noisetable.com"]
 
 [providers.compute]
 kind = "static"
-machine = "us-west-011"
 zone = "api-staging.noisetable.com"
 port = 4332
 

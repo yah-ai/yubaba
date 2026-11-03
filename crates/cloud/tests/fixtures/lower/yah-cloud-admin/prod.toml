@@ -7,10 +7,6 @@ shape = "single-machine"
 [providers.compute]
 use = "hetzner"
 
-[providers.compute.required]
-regions = ["us-west"]
-mesh_tags = ["tag:cloud-runner"]
-
 [workload.cloud-admin]
 ident = "yah-cloud-admin"
 

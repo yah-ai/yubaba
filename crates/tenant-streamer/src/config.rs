@@ -87,14 +87,21 @@ pub struct StreamerConfig {
     /// Always node-local: the epoch is read from the LOCAL state machine, and
     /// staleness is safe by design (see the crate doc).
     pub yubaba_url: String,
-    /// R876-T18: the cluster-key file (hex, the same file yubaba's
-    /// `--cluster-key-file` names on this node). When set, every call to
-    /// yubaba carries a peer token minted under it; when absent, calls go
-    /// unsigned — served by a `warn`-mode node, 401'd by a `require`-mode one.
-    /// A path, never the key inline: the key is a bearer secret for the whole
-    /// cluster, and this file is not 0600.
+    /// R997-B26: the SERVICE-key file (hex, the same file yubaba's
+    /// `--service-key-file` names on this node). When set, every call to
+    /// yubaba carries a service-tier token minted under it, which opens the
+    /// ownership read, the leader read, the RPO push and the tenant-lease
+    /// write and nothing else; when absent, calls go unsigned and a
+    /// `require`-mode node 401s them. This process never holds the cluster
+    /// key. A path, never the key inline: this file is not 0600.
     #[serde(default)]
-    pub cluster_key_file: Option<PathBuf>,
+    pub service_key_file: Option<PathBuf>,
+    /// R997-B27: this streamer's identity file (`yubaba auth node-identity
+    /// --kind tenant-streamer --node-id <node_id>`). Its lease writes then
+    /// prove they come from `node_id`'s streamer, which is the only node a
+    /// node in identity mode `require` lets it hold leases for. 0600.
+    #[serde(default)]
+    pub identity_file: Option<PathBuf>,
     /// Root of the local hot tier. Tenant DBs live at
     /// `<data_root>/tenants/<id>/db`.
     pub data_root: PathBuf,
@@ -309,7 +316,8 @@ mod tests {
         StreamerConfig {
             node_id: 1,
             yubaba_url: "http://127.0.0.1:7777".into(),
-            cluster_key_file: None,
+            service_key_file: None,
+            identity_file: None,
             data_root: PathBuf::from("/var/lib/yah"),
             sink: SinkConfig {
                 bucket: "b".into(),
@@ -479,7 +487,7 @@ mod tests {
     /// written before peer auth still parses — and still streams, unsigned,
     /// against a `warn`-mode node.
     #[test]
-    fn cluster_key_file_is_an_optional_path() {
+    fn service_key_file_is_an_optional_path() {
         let base = r#"
             node_id = 1
             yubaba_url = "http://127.0.0.1:7777"
@@ -490,14 +498,14 @@ mod tests {
             region = "auto"
         "#;
         let without = toml::from_str::<StreamerConfig>(base).unwrap();
-        assert_eq!(without.cluster_key_file, None);
+        assert_eq!(without.service_key_file, None);
         let with = toml::from_str::<StreamerConfig>(&base.replacen(
             "data_root",
-            "cluster_key_file = \"/etc/yah-cloud/cluster.key\"\n            data_root",
+            "service_key_file = \"/etc/yah-cloud/service.key\"\n            data_root",
             1,
         ))
         .unwrap();
-        assert_eq!(with.cluster_key_file, Some(PathBuf::from("/etc/yah-cloud/cluster.key")));
+        assert_eq!(with.service_key_file, Some(PathBuf::from("/etc/yah-cloud/service.key")));
     }
 
     /// `deny_unknown_fields` is what turns a typo in a hand-edited config into

@@ -154,6 +154,7 @@ mod tests {
             nickname: None,
             legacy_hostkey_fingerprint: None,
             registration: Default::default(),
+            camps: Vec::new(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -163,6 +164,7 @@ mod tests {
             sovereign_group: None,
             sovereign_participation: Default::default(),
             host_machine: None,
+            availability: Default::default(),
             ingress_floating_ip: None,
         }
     }

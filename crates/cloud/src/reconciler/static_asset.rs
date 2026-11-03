@@ -1903,6 +1903,7 @@ pub(crate) fn lower_recipe_step_to_forge_spec(
     substituted_argv: Vec<String>,
 ) -> ForgeSpec {
     ForgeSpec {
+        resources: None,
         command: ForgeCommand::Subprocess {
             argv: substituted_argv,
             image: Some(recipe.image.clone()),

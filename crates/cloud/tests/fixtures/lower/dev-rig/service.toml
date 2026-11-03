@@ -35,6 +35,9 @@ cpu_millis = 1000
 
 [components.workload.annotations]
 "yah.exec" = "microvm"
+# R1019-F28 (W388): placement is fail-closed on roles. The dev group's Pis
+# declare role:dev-cluster; each mirror's node pin then picks one of them.
+"yah.node-selector.mesh-tags" = "role:dev-cluster"
 "yah.resume" = "node"
 
 [components.workload.expose.mesh]

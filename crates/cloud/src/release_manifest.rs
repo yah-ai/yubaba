@@ -257,6 +257,18 @@ pub struct YubabaReleaseManifest {
     /// hazard (W275 §5 "Roll-back is symmetric").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_epoch: Option<u32>,
+    /// R625-B8: the oldest `cluster_protocol` this release may run mixed with
+    /// during a forward roll, because every replicated variant added since sits
+    /// behind a capability gate an older follower never opens. Absent = no
+    /// forward-mix claim, so any protocol gap still denies the rolling strategy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_protocol_mixes_from: Option<u32>,
+    /// R625-B8: the oldest `state_epoch` whose on-disk state this release loads
+    /// (NEW-READS-OLD). Says nothing about OLD-READS-NEW, so a roll across the
+    /// range is forward-only. Absent = no claim, so any state gap still refuses
+    /// as rebuild-and-migrate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_epoch_reads_from: Option<u32>,
     pub triples: BTreeMap<String, ManifestTripleEntry>,
 }
 
@@ -596,11 +608,29 @@ mod tests {
             version: "0.8.20".into(),
             cluster_protocol: None,
             state_epoch: None,
+            cluster_protocol_mixes_from: None,
+            state_epoch_reads_from: None,
             triples: BTreeMap::new(),
         };
         let json = serde_json::to_string(&undeclared).unwrap();
         assert!(!json.contains("cluster_protocol"), "{json}");
         assert!(!json.contains("state_epoch"), "{json}");
+    }
+
+    #[test]
+    fn manifest_carries_the_forward_compatibility_floors() {
+        // R625-B8: the shape publish-yubaba-release.sh stamps from
+        // cluster-epochs.json. A pre-B8 manifest (the test above) parses with
+        // both floors absent, which the preflight reads as "no forward claim".
+        let raw = r#"{
+            "version": "0.8.49",
+            "cluster_protocol": 10, "cluster_protocol_mixes_from": 9,
+            "state_epoch": 9, "state_epoch_reads_from": 7,
+            "triples": {}
+        }"#;
+        let parsed: YubabaReleaseManifest = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed.cluster_protocol_mixes_from, Some(9));
+        assert_eq!(parsed.state_epoch_reads_from, Some(7));
     }
 
     #[test]

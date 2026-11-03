@@ -28,9 +28,12 @@
 //!
 //! - this module `include_str!`s it and parses it at *compile time*, so the
 //!   running binary and `GET /health` (R625-F4) report what the file says;
-//! - `.github/workflows/release.yml` reads it with `jq` when it merges the
-//!   per-triple fragments into the signed `release-manifest.json`, so the
-//!   published manifest carries the same two integers (R625-F2).
+//! - `scripts/publish-yubaba-release.sh` reads it with `jq` when it merges the
+//!   per-triple fragments into `release-manifest.json`, so the published
+//!   manifest carries the same two integers (R625-F2) and, since R625-B8, the
+//!   two compatibility floors ([`CLUSTER_PROTOCOL_MIXES_FROM`],
+//!   [`STATE_EPOCH_READS_FROM`]) the rollout preflight reads to allow a
+//!   forward-only roll.
 //!
 //! Because there is exactly one file, the manifest cannot drift from the
 //! binary. What the file cannot do on its own is prove the numbers are *right* —
@@ -53,6 +56,30 @@ pub const CLUSTER_PROTOCOL: u32 = declared_u32(EPOCHS_JSON, "\"cluster_protocol\
 /// such that a binary at a different epoch cannot read it. A mismatch means the
 /// roll is **not** reversible, which is the dangerous axis.
 pub const STATE_EPOCH: u32 = declared_u32(EPOCHS_JSON, "\"state_epoch\":");
+
+/// R625-B8: the oldest `cluster_protocol` this build may run **mixed** with
+/// during a forward roll. Every protocol in `(MIXES_FROM, CLUSTER_PROTOCOL]`
+/// added only replicated variants that sit behind a derived capability gate
+/// (history "9": `workload_intent_writes_open`; "10": `attest_writes_open_live`),
+/// so an older follower never receives one. Equal to [`CLUSTER_PROTOCOL`] when
+/// the latest bump is an ungated break — the next bumper must lower nothing and
+/// raise this to the new epoch unless their history entry names the gate.
+pub const CLUSTER_PROTOCOL_MIXES_FROM: u32 =
+    declared_u32(EPOCHS_JSON, "\"cluster_protocol_mixes_from\":");
+
+/// R625-B8: the oldest `state_epoch` whose on-disk state this build loads
+/// (NEW-READS-OLD across every step in `(READS_FROM, STATE_EPOCH]`, each pinned
+/// by a load test in yubaba-consensus). OLD-READS-NEW is NOT implied, which is
+/// why a roll across this range is forward-only. A bump that breaks
+/// NEW-READS-OLD raises this to the new epoch.
+pub const STATE_EPOCH_READS_FROM: u32 = declared_u32(EPOCHS_JSON, "\"state_epoch_reads_from\":");
+
+/// R977-F1: the first `cluster_protocol` that can apply the workload-intent
+/// variants. Pass it to
+/// [`yubaba_consensus::workload_intent::workload_intent_writes_open`]; it is a
+/// fixed number, not `CLUSTER_PROTOCOL`, so a later bump does not re-close the
+/// gate against voters that already understand these variants.
+pub const WORKLOAD_INTENT_MIN_PROTOCOL: u32 = 9;
 
 /// Extract the decimal integer that follows `needle` in `src`.
 ///
@@ -119,6 +146,51 @@ mod tests {
             CLUSTER_PROTOCOL
         );
         assert_eq!(parsed["state_epoch"].as_u64().unwrap() as u32, STATE_EPOCH);
+        assert_eq!(
+            parsed["cluster_protocol_mixes_from"].as_u64().unwrap() as u32,
+            CLUSTER_PROTOCOL_MIXES_FROM
+        );
+        assert_eq!(
+            parsed["state_epoch_reads_from"].as_u64().unwrap() as u32,
+            STATE_EPOCH_READS_FROM
+        );
+    }
+
+    #[test]
+    fn compatibility_floors_sit_inside_the_declared_range() {
+        // A floor above the epoch would claim this build cannot mix with
+        // itself; a floor of 0 would claim compatibility with "never declared".
+        assert!((1..=CLUSTER_PROTOCOL).contains(&CLUSTER_PROTOCOL_MIXES_FROM));
+        assert!((1..=STATE_EPOCH).contains(&STATE_EPOCH_READS_FROM));
+    }
+
+    #[test]
+    fn every_epoch_a_floor_spans_records_why_it_is_forward_compatible() {
+        // The floors are a claim the rollout preflight acts on (R625-B8). Each
+        // step they span must say so in its history entry, so the next bump
+        // either writes that sentence (and a load test / a gate) or raises the
+        // floor — never inherits a floor its own change made false.
+        let parsed: serde_json::Value = serde_json::from_str(EPOCHS_JSON).unwrap();
+        for epoch in STATE_EPOCH_READS_FROM + 1..=STATE_EPOCH {
+            let entry = parsed["state_epoch_history"][epoch.to_string()]
+                .as_str()
+                .unwrap();
+            assert!(
+                entry.contains("NEW-READS-OLD holds"),
+                "state_epoch_reads_from = {STATE_EPOCH_READS_FROM} spans epoch {epoch}, whose \
+                 history entry does not record NEW-READS-OLD — raise the floor or record it"
+            );
+        }
+        for epoch in CLUSTER_PROTOCOL_MIXES_FROM + 1..=CLUSTER_PROTOCOL {
+            let entry = parsed["cluster_protocol_history"][epoch.to_string()]
+                .as_str()
+                .unwrap();
+            assert!(
+                entry.to_ascii_lowercase().contains("gate"),
+                "cluster_protocol_mixes_from = {CLUSTER_PROTOCOL_MIXES_FROM} spans protocol \
+                 {epoch}, whose history entry names no capability gate — raise the floor"
+            );
+        }
     }
 
     #[test]

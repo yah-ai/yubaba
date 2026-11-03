@@ -11,8 +11,11 @@
 //!   the fencing epoch makes a mid-failover double-place impossible.
 //! - **Moving it off a dead node** is [`crate::scheduler`]'s job, unchanged: it
 //!   already transfers any tenant whose owner the lease channel confirms
-//!   `Down`. On the fleet profile that is `down_after` 5s plus a 5s confirm
-//!   dwell, well inside a one-minute budget.
+//!   `Down`, once it has stayed down for the whole
+//!   [`crate::lease_detector::replacement_grace`] (120 s on the fleet profile,
+//!   R977-B15) — the same floor W364 §3 puts on workload re-placement, so an
+//!   ordinary yubaba restart does not start a second copy beside a node whose
+//!   containers are still serving.
 //!
 //! What was missing is the **effector**: nothing turned "node N owns tenant T"
 //! into "workload T runs on node N, and nowhere else". That is this module.
@@ -30,8 +33,9 @@
 //! # The effector is a loop on every node, and it only converges
 //!
 //! Each [`TICK`], every node reads its own applied state and, per recorded
-//! floater, runs [`decide`]: the owner starts a missing copy and renews its
-//! lease; a non-owner stops any copy it holds (that is what stops a returning
+//! floater, runs [`decide`]: the owner starts a missing copy, has the leader
+//! confirm any copy it finds already running before trusting it (R977-B15),
+//! and renews its lease; a non-owner stops any copy it holds (that is what stops a returning
 //! node from double-serving); a vacant or lease-expired tenant is claimed. A
 //! failed action is retried on the next tick; there is no other state.
 //!
@@ -39,12 +43,12 @@
 //! block makes kamaji hydrate the volume from the store before the workload
 //! starts, on whichever node the deploy lands (R858-F17 / R936-B2).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use workload_spec::TenantId;
 
 use crate::raft::{TenantOutcome, TenantOwnership, YubabaNodeId, YubabaRequest, YubabaResponse};
@@ -84,6 +88,10 @@ pub struct FloaterRecord {
     /// arrived from a peer. Only drives [`ADMIT_GRACE_SECS`].
     #[serde(default)]
     pub admitted_at: u64,
+    /// R997-B11: the operator's signature over `spec`. A member accepts a
+    /// replicated record only under a valid one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_sig: Option<String>,
 }
 
 /// This node's copy of every floater spec, one file per ident.
@@ -228,6 +236,12 @@ pub enum FloatAction {
     Run,
     /// This node owns it, runs it, and the lease is due for renewal.
     Renew { epoch: u64 },
+    /// This node's applied view says it owns the floater and a copy is
+    /// running, but this process has never had the leader confirm that
+    /// (R977-B15). The copy predates this yubaba — it survived a yubaba or
+    /// kamaji restart, or a partition — and the cluster may have re-homed the
+    /// floater meanwhile. Ask the leader; if the answer is no, stop the copy.
+    Confirm { epoch: u64 },
     /// Another node owns it and this node still runs a copy: stop it.
     Stop,
     /// Converged.
@@ -250,11 +264,27 @@ pub enum LocalCopy {
 /// crash-looping spec is retried at a bounded rate rather than every tick.
 pub const RESTART_BACKOFF_SECS: u64 = 30;
 
+/// R977-B19: after kamaji's hydrate helper refuses with `chain_unrestorable`
+/// (the store's chain is corrupt or torn; no claim was taken), wait this long
+/// instead of [`RESTART_BACKOFF_SECS`]. Retrying cannot fix the chain; only
+/// `turso-backup-hydrate reseed` can, so a retry is just a periodic re-check.
+pub const UNRESTORABLE_BACKOFF_SECS: u64 = 900;
+
+/// Whether a start failure is the hydrate helper's `chain_unrestorable`
+/// refusal. kamaji carries the helper's JSON line verbatim in its error.
+pub fn chain_unrestorable(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("chain_unrestorable")
+}
+
 /// The whole effector policy, as arithmetic.
+///
+/// `confirmed` is whether the leader has granted this node a renewal for this
+/// floater since this process started — see [`FloatAction::Confirm`].
 pub fn decide(
     me: YubabaNodeId,
     ownership: Option<&TenantOwnership>,
     local: LocalCopy,
+    confirmed: bool,
     now: u64,
 ) -> FloatAction {
     match ownership {
@@ -265,6 +295,8 @@ pub fn decide(
         Some(o) if o.owner == me => {
             if local != LocalCopy::Running {
                 FloatAction::Run
+            } else if !confirmed {
+                FloatAction::Confirm { epoch: o.epoch }
             } else if o.lease_expires.saturating_sub(now) < RENEW_BELOW_SECS {
                 FloatAction::Renew { epoch: o.epoch }
             } else {
@@ -291,10 +323,38 @@ pub trait FloatHost: Send + Sync {
     fn busy(&self, ident: &str) -> bool;
     async fn run(&self, record: &FloaterRecord) -> anyhow::Result<()>;
     async fn stop(&self, ident: &str) -> anyhow::Result<()>;
+    /// Arm the durability tail kamaji held on restart for `ident` (R977-B15).
+    /// Sent only after the leader granted this node's lease, so ownership is
+    /// raft's answer. `Ok(false)` = kamaji lacks the `arm_tail` capability (an
+    /// older kamaji re-arms every tail itself), so nothing was sent.
+    async fn arm_tail(&self, ident: &str) -> anyhow::Result<bool>;
     /// A raft write, forwarded to the leader when this node is a follower.
     async fn write(&self, req: YubabaRequest) -> anyhow::Result<YubabaResponse>;
     /// Push `record` to every other member. Best effort.
     async fn publish(&self, record: &FloaterRecord);
+}
+
+/// What the effector carries from one tick to the next. Process-local on
+/// purpose: a restarted yubaba starts with nothing confirmed.
+#[derive(Debug, Default)]
+pub struct EffectorMemory {
+    /// When this node last attempted to start each ident (restart backoff).
+    started: BTreeMap<String, u64>,
+    /// No start before this time (R977-B19 unrestorable-chain backoff).
+    held_until: BTreeMap<String, u64>,
+    /// Idents the leader has confirmed this node owns, since this process
+    /// started (R977-B15).
+    confirmed: BTreeSet<String>,
+}
+
+/// Ask kamaji to arm this floater's held durability tail (R977-B15). A failure
+/// is logged and retried on the next granted renewal.
+async fn arm_tail(host: &dyn FloatHost, ident: &str) {
+    match host.arm_tail(ident).await {
+        Ok(true) => debug!(ident, "floater: asked kamaji to arm the durability tail"),
+        Ok(false) => debug!(ident, "floater: kamaji lacks arm_tail; it re-arms tails itself"),
+        Err(e) => warn!(ident, "floater: kamaji could not arm the durability tail, will retry: {e:#}"),
+    }
 }
 
 /// One reconcile pass over every recorded floater. Returns what was decided,
@@ -304,7 +364,7 @@ pub async fn tick(
     records: &[FloaterRecord],
     now: u64,
     republish: bool,
-    started: &mut BTreeMap<String, u64>,
+    mem: &mut EffectorMemory,
 ) -> Vec<(String, FloatAction)> {
     if records.is_empty() {
         return Vec::new();
@@ -330,11 +390,17 @@ pub async fn tick(
             Some(false) => LocalCopy::Dead,
             Some(true) => LocalCopy::Running,
         };
-        let action = decide(me, ownership.as_ref(), copy, now);
+        if ownership.as_ref().is_none_or(|o| o.owner != me) {
+            mem.confirmed.remove(ident);
+        }
+        let action = decide(me, ownership.as_ref(), copy, mem.confirmed.contains(ident), now);
         if action == FloatAction::Run
-            && started
+            && mem
+                .started
                 .get(ident)
                 .is_some_and(|at| now < at.saturating_add(RESTART_BACKOFF_SECS))
+            || action == FloatAction::Run
+                && mem.held_until.get(ident).is_some_and(|until| now < *until)
         {
             continue;
         }
@@ -356,7 +422,7 @@ pub async fn tick(
                 }
             }
             FloatAction::Run => {
-                started.insert(ident.to_string(), now);
+                mem.started.insert(ident.to_string(), now);
                 // FENCE BEFORE START. `ownership` is this node's APPLIED view,
                 // which lags the leader right after a boot: measured
                 // 2026-09-23, us-east-001 came back from a power-off still
@@ -374,7 +440,9 @@ pub async fn tick(
                     now,
                 };
                 match host.write(confirm).await {
-                    Ok(YubabaResponse::Tenant(TenantOutcome::Granted { .. })) => {}
+                    Ok(YubabaResponse::Tenant(TenantOutcome::Granted { .. })) => {
+                        mem.confirmed.insert(ident.to_string());
+                    }
                     Ok(other) => {
                         warn!(ident, node = me, epoch, "floater: NOT starting — the leader says this node no longer owns it at this epoch ({other:?}); its applied view is stale");
                         decided.push((ident.to_string(), action));
@@ -387,8 +455,42 @@ pub async fn tick(
                     }
                 }
                 info!(ident, node = me, ?copy, epoch, "floater: this node owns it (confirmed by the leader) and runs no live copy — starting it");
-                if let Err(e) = host.run(record).await {
-                    warn!(ident, "floater: start failed, will retry next tick: {e:#}");
+                match host.run(record).await {
+                    Ok(()) => {
+                        mem.held_until.remove(ident);
+                    }
+                    Err(e) if chain_unrestorable(&e) => {
+                        mem.held_until.insert(ident.to_string(), now + UNRESTORABLE_BACKOFF_SECS);
+                        error!(ident, retry_in_secs = UNRESTORABLE_BACKOFF_SECS, "floater: NOT starting — the store's durability chain does not restore (chain_unrestorable; no claim was taken). Retrying will not fix it: recover it with `turso-backup-hydrate reseed` (see R977-T18). {e:#}");
+                    }
+                    Err(e) => warn!(ident, "floater: start failed, will retry next tick: {e:#}"),
+                }
+            }
+            FloatAction::Confirm { epoch } => {
+                let req = YubabaRequest::RenewTenantLease {
+                    tenant: tenant.clone(),
+                    node: me,
+                    epoch: *epoch,
+                    lease_secs: FLOATER_LEASE_SECS,
+                    now,
+                };
+                match host.write(req).await {
+                    Ok(YubabaResponse::Tenant(TenantOutcome::Granted { .. })) => {
+                        mem.confirmed.insert(ident.to_string());
+                        info!(ident, node = me, epoch, "floater: the leader confirmed this node still owns the copy it is running");
+                        arm_tail(host, ident).await;
+                    }
+                    // A definite "not you": the floater was re-homed while this
+                    // copy kept running unseen. The owner's copy wins.
+                    Ok(other) => {
+                        warn!(ident, node = me, epoch, "floater: the leader says this node no longer owns the copy it is running ({other:?}) — stopping it");
+                        if let Err(e) = host.stop(ident).await {
+                            warn!(ident, "floater: stop failed, will retry next tick: {e:#}");
+                        }
+                    }
+                    // No answer is not a "no": stopping on every leaderless
+                    // moment would take down every floater on a cluster restart.
+                    Err(e) => warn!(ident, "floater: could not confirm ownership with the leader, will retry: {e}"),
                 }
             }
             FloatAction::Renew { epoch } => {
@@ -399,8 +501,13 @@ pub async fn tick(
                     lease_secs: FLOATER_LEASE_SECS,
                     now,
                 };
-                if let Err(e) = host.write(req).await {
-                    warn!(ident, "floater: lease renewal failed, will retry: {e}");
+                match host.write(req).await {
+                    // A granted renewal re-confirms ownership. Arming is
+                    // idempotent, and this is what re-arms a tail after a
+                    // kamaji-only restart, which leaves `confirmed` set.
+                    Ok(YubabaResponse::Tenant(TenantOutcome::Granted { .. })) => arm_tail(host, ident).await,
+                    Ok(_) => {}
+                    Err(e) => warn!(ident, "floater: lease renewal failed, will retry: {e}"),
                 }
             }
             FloatAction::Stop => {
@@ -432,11 +539,11 @@ pub fn spawn(
     tokio::spawn(async move {
         info!(dir = %records.dir().display(), "floater effector active (R936-B12)");
         let mut n: u64 = 0;
-        let mut started = BTreeMap::new();
+        let mut mem = EffectorMemory::default();
         loop {
             let list = records.list();
             let now = unix_now_secs();
-            tick(host.as_ref(), &list, now, n % REPUBLISH_EVERY_TICKS == 0, &mut started).await;
+            tick(host.as_ref(), &list, now, n % REPUBLISH_EVERY_TICKS == 0, &mut mem).await;
             n = n.wrapping_add(1);
             tokio::time::sleep(TICK).await;
         }
@@ -467,32 +574,32 @@ mod tests {
 
     #[test]
     fn a_vacant_floater_is_claimed() {
-        assert_eq!(decide(1, None, Absent, 1000), FloatAction::Claim);
+        assert_eq!(decide(1, None, Absent, true, 1000), FloatAction::Claim);
     }
 
     #[test]
     fn the_owner_starts_a_missing_copy() {
-        assert_eq!(decide(1, Some(&own(1, 3, 1300)), Absent, 1000), FloatAction::Run);
+        assert_eq!(decide(1, Some(&own(1, 3, 1300)), Absent, true, 1000), FloatAction::Run);
     }
 
     /// A container kamaji lists as `Pending` after a reboot is present but
     /// not serving; the owner must start it again, not hold on it forever.
     #[test]
     fn an_owner_whose_lease_lapsed_reclaims_before_anything_else() {
-        assert_eq!(decide(1, Some(&own(1, 3, 999)), Running, 1000), FloatAction::Claim);
-        assert_eq!(decide(1, Some(&own(1, 3, 999)), Absent, 1000), FloatAction::Claim);
+        assert_eq!(decide(1, Some(&own(1, 3, 999)), Running, true, 1000), FloatAction::Claim);
+        assert_eq!(decide(1, Some(&own(1, 3, 999)), Absent, true, 1000), FloatAction::Claim);
     }
 
     #[test]
     fn the_owner_restarts_a_dead_copy() {
-        assert_eq!(decide(1, Some(&own(1, 3, 1300)), Dead, 1000), FloatAction::Run);
+        assert_eq!(decide(1, Some(&own(1, 3, 1300)), Dead, true, 1000), FloatAction::Run);
     }
 
     #[test]
     fn the_owner_renews_only_once_the_lease_is_half_spent() {
-        assert_eq!(decide(1, Some(&own(1, 3, 1300)), Running, 1000), FloatAction::Hold);
+        assert_eq!(decide(1, Some(&own(1, 3, 1300)), Running, true, 1000), FloatAction::Hold);
         assert_eq!(
-            decide(1, Some(&own(1, 3, 1100)), Running, 1000),
+            decide(1, Some(&own(1, 3, 1100)), Running, true, 1000),
             FloatAction::Renew { epoch: 3 }
         );
     }
@@ -501,14 +608,14 @@ mod tests {
     /// re-homed stops its copy on its first tick, dead or alive.
     #[test]
     fn a_non_owner_stops_its_copy_even_while_the_owner_is_live() {
-        assert_eq!(decide(1, Some(&own(2, 4, 1300)), Running, 1000), FloatAction::Stop);
-        assert_eq!(decide(1, Some(&own(2, 4, 1300)), Dead, 1000), FloatAction::Stop);
+        assert_eq!(decide(1, Some(&own(2, 4, 1300)), Running, true, 1000), FloatAction::Stop);
+        assert_eq!(decide(1, Some(&own(2, 4, 1300)), Dead, true, 1000), FloatAction::Stop);
     }
 
     #[test]
     fn a_non_owner_holds_while_the_owner_lease_is_live_and_claims_once_it_lapses() {
-        assert_eq!(decide(1, Some(&own(2, 4, 1300)), Absent, 1000), FloatAction::Hold);
-        assert_eq!(decide(1, Some(&own(2, 4, 999)), Absent, 1000), FloatAction::Claim);
+        assert_eq!(decide(1, Some(&own(2, 4, 1300)), Absent, true, 1000), FloatAction::Hold);
+        assert_eq!(decide(1, Some(&own(2, 4, 999)), Absent, true, 1000), FloatAction::Claim);
     }
 
     #[test]
@@ -520,6 +627,7 @@ mod tests {
             ident: "acct".into(),
             spec: spec.clone(),
             admitted_at: 500,
+            operator_sig: None,
         })
         .unwrap();
         // A peer's re-publish of the same spec leaves the local admission alone.
@@ -527,6 +635,7 @@ mod tests {
             ident: "acct".into(),
             spec: spec.clone(),
             admitted_at: 0,
+            operator_sig: None,
         })
         .unwrap();
         assert_eq!(recs.get("acct").unwrap().admitted_at, 500);
@@ -535,6 +644,7 @@ mod tests {
             ident: "acct".into(),
             spec: serde_json::json!({"name": "acct", "v": 2}),
             admitted_at: 0,
+            operator_sig: None,
         })
         .unwrap();
         assert_eq!(recs.get("acct").unwrap().admitted_at, 0);
@@ -553,6 +663,7 @@ mod tests {
             ident: "../escape".into(),
             spec,
             admitted_at: 0,
+            operator_sig: None,
         })
         .is_err());
     }
@@ -564,8 +675,10 @@ mod tests {
         running: Mutex<BTreeMap<String, bool>>,
         list_fails: bool,
         log: Mutex<Vec<String>>,
-        started: Mutex<BTreeMap<String, u64>>,
+        mem: Mutex<Option<EffectorMemory>>,
         stale_view: Mutex<Option<TenantOwnership>>,
+        /// When set, `run` fails with this message and starts nothing.
+        run_fails: Mutex<Option<String>>,
     }
 
     impl FakeNode {
@@ -576,8 +689,9 @@ mod tests {
                 running: Mutex::new(BTreeMap::new()),
                 list_fails: false,
                 log: Mutex::new(Vec::new()),
-                started: Mutex::new(BTreeMap::new()),
+                mem: Mutex::new(Some(EffectorMemory::default())),
                 stale_view: Mutex::new(None),
+                run_fails: Mutex::new(None),
             }
         }
         fn is_running(&self, ident: &str) -> bool {
@@ -585,9 +699,9 @@ mod tests {
         }
         /// One tick with this node's own persistent restart-backoff memory.
         async fn tick(&self, records: &[FloaterRecord], now: u64, republish: bool) -> Vec<(String, FloatAction)> {
-            let mut started = self.started.lock().unwrap().clone();
-            let out = tick(self, records, now, republish, &mut started).await;
-            *self.started.lock().unwrap() = started;
+            let mut mem = self.mem.lock().unwrap().take().unwrap();
+            let out = tick(self, records, now, republish, &mut mem).await;
+            *self.mem.lock().unwrap() = Some(mem);
             out
         }
     }
@@ -616,6 +730,10 @@ mod tests {
             false
         }
         async fn run(&self, r: &FloaterRecord) -> anyhow::Result<()> {
+            self.log.lock().unwrap().push(format!("attempt {}", r.ident));
+            if let Some(msg) = self.run_fails.lock().unwrap().clone() {
+                anyhow::bail!(msg);
+            }
             self.running.lock().unwrap().insert(r.ident.clone(), true);
             self.log.lock().unwrap().push(format!("run {}", r.ident));
             Ok(())
@@ -624,6 +742,10 @@ mod tests {
             self.running.lock().unwrap().remove(ident);
             self.log.lock().unwrap().push(format!("stop {ident}"));
             Ok(())
+        }
+        async fn arm_tail(&self, ident: &str) -> anyhow::Result<bool> {
+            self.log.lock().unwrap().push(format!("arm_tail {ident}"));
+            Ok(true)
         }
         async fn write(&self, req: YubabaRequest) -> anyhow::Result<YubabaResponse> {
             let mut raft = self.raft.lock().unwrap();
@@ -667,6 +789,7 @@ mod tests {
             ident: ident.into(),
             spec: serde_json::json!({}),
             admitted_at: 0,
+            operator_sig: None,
         }
     }
 
@@ -717,6 +840,93 @@ mod tests {
             east.log.lock().unwrap()
         );
         assert_eq!(raft.lock().unwrap().as_ref().unwrap().owner, 1, "the real owner is untouched");
+    }
+
+    #[test]
+    fn an_owner_running_an_unconfirmed_copy_asks_the_leader_first() {
+        assert_eq!(
+            decide(1, Some(&own(1, 3, 1300)), Running, false, 1000),
+            FloatAction::Confirm { epoch: 3 }
+        );
+    }
+
+    /// R977-B15: west lost yubaba with its containers still running, the
+    /// floater was re-homed to south, and west's restarted yubaba still applied
+    /// itself as owner. Its running copy must stop on the leader's "no", not
+    /// keep serving beside south's.
+    #[tokio::test]
+    async fn a_surviving_copy_the_leader_disowns_is_stopped() {
+        let raft = std::sync::Arc::new(Mutex::new(Some(own(1, 5, 5000))));
+        let west = FakeNode::new(2, raft.clone());
+        *west.stale_view.lock().unwrap() = Some(own(2, 4, 5000));
+        west.running.lock().unwrap().insert("acct".into(), true);
+        let out = west.tick(&[rec("acct")], 1000, false).await;
+        assert_eq!(out, vec![("acct".into(), FloatAction::Confirm { epoch: 4 })]);
+        assert!(!west.is_running("acct"), "{:?}", west.log.lock().unwrap());
+        assert_eq!(raft.lock().unwrap().as_ref().unwrap().owner, 1, "the real owner is untouched");
+    }
+
+    #[tokio::test]
+    async fn a_surviving_copy_the_leader_confirms_keeps_running_and_is_asked_once() {
+        let raft = std::sync::Arc::new(Mutex::new(Some(own(1, 5, 5000))));
+        let a = FakeNode::new(1, raft);
+        a.running.lock().unwrap().insert("acct".into(), true);
+        assert_eq!(
+            a.tick(&[rec("acct")], 1000, false).await,
+            vec![("acct".into(), FloatAction::Confirm { epoch: 5 })]
+        );
+        assert!(a.is_running("acct"));
+        assert!(
+            a.log.lock().unwrap().contains(&"arm_tail acct".to_string()),
+            "a confirmed copy must have its held tail armed: {:?}",
+            a.log.lock().unwrap()
+        );
+        assert_eq!(a.tick(&[rec("acct")], 1002, false).await, vec![("acct".into(), FloatAction::Hold)]);
+    }
+
+    /// R977-B15: a disowned copy never has its tail armed; arming it would
+    /// fence the real owner's tail.
+    #[tokio::test]
+    async fn a_disowned_copy_is_never_asked_to_arm_its_tail() {
+        let raft = std::sync::Arc::new(Mutex::new(Some(own(1, 5, 5000))));
+        let west = FakeNode::new(2, raft);
+        *west.stale_view.lock().unwrap() = Some(own(2, 4, 5000));
+        west.running.lock().unwrap().insert("acct".into(), true);
+        west.tick(&[rec("acct")], 1000, false).await;
+        assert!(!west.log.lock().unwrap().iter().any(|l| l.starts_with("arm_tail")));
+    }
+
+    /// R977-B19: a `chain_unrestorable` refusal is retried at the slow
+    /// backoff, not every 30 s; any other start failure keeps the 30 s rate.
+    #[tokio::test]
+    async fn an_unrestorable_chain_is_retried_at_the_slow_backoff() {
+        let attempts = |n: &FakeNode| {
+            n.log.lock().unwrap().iter().filter(|l| *l == "attempt acct").count()
+        };
+        let raft = std::sync::Arc::new(Mutex::new(Some(own(1, 1, 100_000))));
+        let a = FakeNode::new(1, raft.clone());
+        *a.run_fails.lock().unwrap() = Some(
+            r#"BackendRefused: workload acct was not hydrated and must not start: {"outcome":"refused","reason":"chain_unrestorable","message":"..."}"#.into(),
+        );
+        a.tick(&[rec("acct")], 1000, false).await;
+        a.tick(&[rec("acct")], 1000 + RESTART_BACKOFF_SECS, false).await;
+        a.tick(&[rec("acct")], 1000 + UNRESTORABLE_BACKOFF_SECS - 1, false).await;
+        assert_eq!(attempts(&a), 1, "no retry inside the unrestorable backoff");
+        a.tick(&[rec("acct")], 1000 + UNRESTORABLE_BACKOFF_SECS, false).await;
+        assert_eq!(attempts(&a), 2);
+
+        let b = FakeNode::new(1, raft);
+        *b.run_fails.lock().unwrap() = Some("kamaji error: store unreachable".into());
+        b.tick(&[rec("acct")], 1000, false).await;
+        b.tick(&[rec("acct")], 1000 + RESTART_BACKOFF_SECS, false).await;
+        assert_eq!(attempts(&b), 2, "an ordinary failure keeps the 30 s rate");
+    }
+
+    #[test]
+    fn chain_unrestorable_is_classified_by_the_helpers_reason_tag() {
+        assert!(chain_unrestorable(&anyhow::Error::msg(r#"x {"reason":"chain_unrestorable"}"#)));
+        assert!(!chain_unrestorable(&anyhow::Error::msg(r#"x {"reason":"torn_volume"}"#)));
+        assert!(!chain_unrestorable(&anyhow::anyhow!("store unreachable")));
     }
 
     /// The post-reboot owner: kamaji lists the floater `Pending`, so the owner

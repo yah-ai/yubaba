@@ -170,7 +170,7 @@
 //! @yah:handoff("DISCOVERED WORK, FIXED IN THIS PASS, NOT FILED AS A FOLLOWUP. `cargo test -p yah-cloud --lib` was 1161/2 on arrival, and the two reds were NOT mine and NOT a flake: `cloud_init::tests::{rendered_runcmd_entries_are_all_strings, coordinator_prestage_only_for_standalone}`. Cause: oss/yubaba/crates/cloud/templates/mirror.yml:107-108, the two R858-F17 turso-backup-helper runcmd entries, were written as BARE YAML scalars containing a `: ` — which makes the whole entry parse as a Mapping, so cloud-init skips it and the helpers never land on a provisioned node. The file is committed and clean (last touched by a8f0d501, i.e. it regressed AFTER phase 1's 1150/0 measurement), no live peer owns it, and the fix is two lines: double-quote the entries and escape the inner quotes. Both tests are green and the comment at the site names the gate. This is a real provisioning defect, not just a red test — a node provisioned since a8f0d501 has no turso-backup-hydrate / turso-backup-tail, and R858-F17's own design makes durability-declaring workloads refuse to deploy without them. Worth a look at whether any node was provisioned in that window.")
 //! @yah:verify("PHASE 2 MEASURED, every number run by me and read. `cargo test -p yah-cloud --lib` = 1163 passed / 0 failed (baseline 1150; +13 — 6 in inner_door::tests, 4 in service_discovery::tests, 3 in ingress::tests). `cargo test -p yah --lib` = 1549 / 0 (+3 new in a new `inner_door_apply_tests` module). `cargo test -p xtask --test main mirror_ingress` = 13 / 0 (baseline 11; +2). `cargo test -p yubaba --lib` = 952 / 0, exactly the baseline. `cargo test -p passway` in oss/passway = 205 + 43 + 37 = 285 / 0 against the 283 baseline, and `cargo test -p kamaji --lib --all-features` = 217 / 0 against 208 — BOTH deltas are peers', not mine: I touched neither crate. Sweeps: `cargo test --workspace --all-features --no-run` clean, and the same in oss/yubaba clean (only the two pre-existing unused-import warnings in a peer's in-flight mesofact_static.rs). NO SCHEMA REGEN NEEDED — this pass added functions, constants and one module-visibility widening, and no serde-visible field on any generator input, so .yah/schema/*.json and packages/yah/workload-spec/index.ts are untouched by construction.")
 //! @yah:verify("THE NEGATIVE IS ASSERTED IN THREE PLACES, at three different altitudes, because it is the claim the live fleet rests on. (1) `xtask/tests/mirror_ingress.rs::no_service_on_disk_gets_an_inner_door` walks the REAL `.yah/services/` tree and asserts every service plans `None`. That is the strongest form available without a fleet: the only way to be wrong about it is for a service to acquire `deploy = \"workload\"`, at which point the test names the service. Sibling `every_services_derived_inner_door_port_is_distinct` pins the port derivation against the real service list. (2) `cloud::inner_door_apply_tests::a_single_unit_service_leaves_the_outer_door_exactly_as_it_was` builds a two-component fixture that is BYTE-FOR-BYTE the positive test's, with one word changed (`workload` -> `bundle`), and asserts the rendered `PASSWAY_UPSTREAMS` is still the mirror's pinned `noisetable.com=100.64.0.3:8080`. So the difference between the two outcomes is provably that one field. (3) `inner_door::tests::{a_single_unit_service_gets_no_inner_door, several_bundle_components_are_one_unit_and_still_get_no_door}` from phase 1, still green. THE POSITIVE: `a_two_unit_service_repoints_the_outer_door_at_its_inner_door` (outer door renders `noisetable.com=127.0.0.1:<derived>`, and the port is asserted equal to what the door itself binds — two call sites in two phases that must not be able to disagree) and `the_rendered_table_splits_the_mounts_and_carries_only_their_own_headers` (both units addressed, COOP+COEP on /app and ABSENT on the root).")
-//! @yah:gotcha("TRANSIENT BUILD FAILURE SEEN AND DISPROVEN, recorded so the next reader does not re-chase it. The first `cargo test --workspace --all-features --no-run` came back with `can't find crate for 'runner'` / `'agent_tools'` / `'camp_service'` and a linker failing on a dozen absent `.rlib`s (libgif, libzune_jpeg, libimagesize...) in crates this ticket never touched — the exact shape CLAUDE.md's orphan-gc warning describes. Followed that procedure rather than cleaning: `cargo orphan-gc log -n 300` names NONE of the missing artifacts (every entry in the window reads `deleted 0 artifacts`), so orphan-gc is NOT confirmed here. The likelier cause is plain target-dir contention: a `yah-release-check` QED pipeline was holding the same `/Users/leif/ss/yah/target` for 29 minutes alongside this build. Re-ran with nothing else on the key: CLEAN, zero errors. Not reproducible, orphan-gc log does not name it, and the artifacts were never deleted per its own record.")
+//! @yah:gotcha("TRANSIENT BUILD FAILURE SEEN AND DISPROVEN, recorded so the next reader does not re-chase it. The first `cargo test --workspace --all-features --no-run` came back with `can't find crate for 'runner'` / `'agent_tools'` / `'camp_service'` and a linker failing on a dozen absent `.rlib`s (libgif, libzune_jpeg, libimagesize...) in crates this ticket never touched — the exact shape CLAUDE.md's orphan-gc warning describes. Followed that procedure rather than cleaning: `cargo orphan-gc log -n 300` names NONE of the missing artifacts (every entry in the window reads `deleted 0 artifacts`), so orphan-gc is NOT confirmed here. The likelier cause is plain target-dir contention: a `yah-release-check` QED pipeline was holding the same `target` for 29 minutes alongside this build. Re-ran with nothing else on the key: CLEAN, zero errors. Not reproducible, orphan-gc log does not name it, and the artifacts were never deleted per its own record.")
 //! @yah:next("WHAT REMAINS IS THE LIVE HALF ONLY, and it is an operator call the R870 leader is holding — phase 2 deliberately landed code + tests and touched no node. The two assertions: (a) POSITIVE — a two-component service whose components deploy independently gets one inner door from one `yah cloud apply`, with https://&lt;host&gt;/ and https://&lt;host&gt;/app/ both 200 and `curl -sI` on /app/ carrying cross-origin-opener-policy: same-origin AND cross-origin-embedder-policy: require-corp while / carries neither. (b) NEGATIVE, node-side — for a single-component service (yah-marketing), NO routes file materialized under /var/lib/passway/routes and NO extra workload in kamaji's table. Note that (b) is now also asserted statically against the real tree by `xtask/tests/mirror_ingress.rs::no_service_on_disk_gets_an_inner_door`, so the node-side check is confirmation rather than discovery. BEFORE RUNNING (a): there is no service with `deploy = \"workload\"` on disk, so one has to be declared first — and the R870-B6/V8 roll-order gotcha on this ticket applies the moment anything actually SETS `WorkloadSpec::files`. Confirm the target node's kamaji link codec (kamaji-proto/src/codec.rs) and roll the kamaji+yubaba PAIR first if it is postcard.")
 //! @yah:next("ONE THING PHASE 2 DID NOT BUILD, named so it is not mistaken for done: there is still no FLEET deploy path for a `DeployTier::Workload` component. `reconcile_component` (app/yah/cli/src/cloud.rs:8264) dispatches on `component.kind`, and the only non-bundle arms are `container` — which `ContainerReconciler::up` guards on `MirrorShape::Local`, and `LocalProcessReconciler`, which is the camp/dev tier and registers as `local-process-&lt;service&gt;-&lt;env&gt;-&lt;component&gt;`. So on a real mirror such a component is deployed by hand today (`yah cloud workload deploy`). That is exactly why `inner_door::component_workload_ident` had to STATE the ident rather than look it up. The failure mode is loud rather than silent — a component registered under any other ident leaves its unit unresolved and `routes_file` refuses the whole table, naming the unit — but whoever wires that deploy path must make it register under `component_workload_ident(service, id)`, or change both sides together. Related and already filed: R523-F1 (a component kind that deploys a stateful binary to a fleet node) is the same missing arm seen from the other direction.")
 //! @yah:handoff("PHASE 2 COMPLETE — `yah cloud apply` produces an inner door. Everything above this entry is the detail: the five call sites, the derived-port argument, the header-ownership answer (no change — the outer passway door owns no route headers, proven at proxy.rs:694/700, and the bundle origin's overlap is convergent and strictly wider), the three pieces of plumbing built because steps 3 and 5 needed them, the two placement decisions, and the one mirror.yml provisioning defect fixed on the way through. Nothing was deployed and no node was touched, per the dispatch. Green: yah-cloud 1163/0, yah 1549/0, yubaba 952/0, xtask mirror_ingress 13/0, passway 285/0, kamaji 217/0, both --all-features --no-run sweeps clean. Git policy is `defer`, so nothing is committed — the diff is 6 files: oss/yubaba/crates/cloud/src/{inner_door.rs, reconciler/mod.rs, reconciler/ingress.rs, reconciler/service_discovery.rs}, oss/yubaba/crates/cloud/templates/mirror.yml, app/yah/cli/src/cloud.rs, plus xtask/tests/mirror_ingress.rs.")
@@ -639,10 +639,67 @@ pub struct MachineConfig {
     /// the three Pis name their Pi here. Not a placement input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_machine: Option<String>,
+    /// Whether this box is expected to be up — see [`Availability`].
+    ///
+    /// The one placement input that is a statement about *time* rather than
+    /// capability: admission orders every candidate pool `always-on` first,
+    /// file-name order within each class (`AdmissionScope::of`). It never
+    /// filters — an `ephemeral` box still admits everything its tags admit, it
+    /// is just tried after every always-on peer that admits the same thing.
+    #[serde(default, skip_serializing_if = "Availability::is_always_on")]
+    pub availability: Availability,
     /// `[registration]` — the observed half (R707-T1). Empty until the box has
     /// been attached / mesh-joined. See [`MachineRegistration`].
     #[serde(default, skip_serializing_if = "MachineRegistration::is_empty")]
     pub registration: MachineRegistration,
+    /// `[[camps]]` — camps on this box that serve their own control plane
+    /// (R979-F27), by root. A camp's NodeId is its own key, not the box's or
+    /// yubaba's, so it is declared per camp. A camp absent here is reached
+    /// over `[connect]` ssh.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub camps: Vec<MachineCamp>,
+}
+
+/// One entry of [`MachineConfig::camps`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MachineCamp {
+    /// The camp's root, absolute on the box.
+    pub workspace: String,
+    /// The camp's mshr NodeId (hex), as it publishes at
+    /// `<workspace>/.yah/jit/camp-node-id.json`.
+    pub node_id: String,
+}
+
+/// A machine's declared uptime class — [`MachineConfig::availability`].
+///
+/// `ephemeral` is a box whose absence is its normal state: us-west-002, a WSL2
+/// host that sleeps and reboots with Windows. Placement has no liveness input
+/// (deliberately — see [`CloudConfig::admit_workload_candidates`]), so before
+/// this field a sleeping box that sorted first by file name was the head of
+/// every pool it matched, and every dispatch paid a refused connection before
+/// failing over to the always-on peer behind it. Declaring the fact lets
+/// admission put that peer first without inventing a numeric rank: the order
+/// follows from what the machine *is*, and two always-on boxes still tie-break
+/// by file name, keeping a retried build on the node holding its warm state.
+///
+/// Variant order is the preference order — `Ord` is what admission sorts by.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum Availability {
+    /// Expected to be up; its absence is a fault. The default.
+    #[default]
+    AlwaysOn,
+    /// Not expected to be up; its absence is never a fault to chase.
+    Ephemeral,
+}
+
+impl Availability {
+    pub fn is_always_on(&self) -> bool {
+        *self == Availability::AlwaysOn
+    }
 }
 
 /// True iff `provider` has an auto-provision driver (create/destroy via API).
@@ -654,72 +711,10 @@ pub fn provider_has_machine_driver(provider: &str) -> bool {
     matches!(provider, "hetzner" | "vultr" | "digitalocean")
 }
 
-/// Taint keys a workload may name in `yah.placement.requires-taint` to
-/// *require* a node (W305/R742-T4 affinity vocabulary).
-///
-/// This is a closed list on purpose. `WorkloadSpec::requires_taint` returns
-/// free text, but every producer in the tree is code — `passway_ingress.rs`
-/// and `cloudflared_ingress.rs`, both emitting
-/// [`workload_spec::PUBLIC_IP_TAINT`] — and no on-disk `workload.toml` sets the
-/// annotation at all. So the set of keys a node can usefully carry for
-/// affinity is knowable at compile time, which is what lets
-/// [`taint_effect`] call anything outside it inert instead of guessing.
-///
-/// **Adding an affinity key means adding it here**, in the same change that
-/// teaches a workload to require it. That coupling is the point: it makes the
-/// node side and the workload side impossible to land apart.
-pub const AFFINITY_TAINT_KEYS: &[&str] = &[workload_spec::PUBLIC_IP_TAINT];
-
-/// How a key in [`MachineConfig::taints`] can affect placement.
-///
-/// W305 finding 1: before R742-T4 nothing asked this question, so a key that
-/// no scheduler path could read — `"qa"`, `"no-voter"` — parsed, validated,
-/// and quietly did nothing. Both of the findings that cost real fleet state
-/// were invisible for exactly that reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaintEffect {
-    /// `"no-<archetype>"`: rejects placement outright unless the constraint
-    /// names this key in [`RequiredSpec::tolerates`]. Read by
-    /// [`RequiredSpec::matches`], which walks `machine.taints` and classifies
-    /// each key through [`taint_effect`] (R876-B7).
-    Repels(LifecycleArchetype),
-    /// A key in [`AFFINITY_TAINT_KEYS`]: a workload naming it in
-    /// `yah.placement.requires-taint` is restricted to nodes carrying it.
-    Attracts,
-    /// Neither. No placement decision can read this key.
-    Inert,
-}
-
-/// Classify one node taint key. See [`TaintEffect`].
-///
-/// The repulsion half is derived from [`LifecycleArchetype::ALL`] rather than
-/// a literal list, so a fourth archetype makes `no-<its key>` live without an
-/// edit here.
-pub fn taint_effect(key: &str) -> TaintEffect {
-    if let Some(arch) = LifecycleArchetype::ALL
-        .into_iter()
-        .find(|a| key == format!("no-{}", a.taint_key()))
-    {
-        return TaintEffect::Repels(arch);
-    }
-    if AFFINITY_TAINT_KEYS.contains(&key) {
-        return TaintEffect::Attracts;
-    }
-    TaintEffect::Inert
-}
-
-/// Every key the scheduler *can* act on, sorted — for error messages that
-/// tell the operator what the legal vocabulary actually is instead of only
-/// what was wrong.
-pub fn live_taint_keys() -> Vec<String> {
-    let mut keys: Vec<String> = LifecycleArchetype::ALL
-        .into_iter()
-        .map(|a| format!("no-{}", a.taint_key()))
-        .chain(AFFINITY_TAINT_KEYS.iter().map(|k| (*k).to_string()))
-        .collect();
-    keys.sort();
-    keys
-}
+/// R977-B12: the taint vocabulary moved to `workload_spec` so yubaba's replica
+/// reconcile applies the same rule as fresh admission; re-exported here, same
+/// pattern as [`Participation`].
+pub use workload_spec::{live_taint_keys, taint_effect, TaintEffect, AFFINITY_TAINT_KEYS};
 
 /// What [`judge_join`] decided about one proposed cluster join.
 ///
@@ -1090,7 +1085,7 @@ impl MachineConfig {
     /// **Why a LAN literal loses (R605-T10, operator 2026-08-19).** The LAN
     /// address is an emergency break-glass route, never an official one, and
     /// automation must ALWAYS assume the caller is not on that LAN — this camp
-    /// sits on 192.168.22.0/22 with no route to the fleet's 192.168.10.0/24 at
+    /// sits on 192.168.22.0/22 with no route to the fleet's 192.168.250.0/24 at
     /// all. Writing one into the field every resolver dials does not sit beside
     /// the mesh route, it *overrides* it: R707-T6 made a declared literal beat
     /// `mesh_ipv4` outright, so us-west-011 (mesh-joined, healthy) was elected
@@ -1099,7 +1094,7 @@ impl MachineConfig {
     ///
     /// **What R707-T6 wanted is preserved elsewhere.** Its forcing case was
     /// identity, not reach: the dev raft group advertises LAN addrs
-    /// (`192.168.10.11:7443`, verified live off `/raft/status` 2026-08-27), and
+    /// (`192.168.250.11:7443`, verified live off `/raft/status` 2026-08-27), and
     /// `rollout::yubaba::membership_to_nodes` has to map those back to declared
     /// machines. That match now runs against [`lan_endpoint`](Self::lan_endpoint),
     /// which is composed from the break-glass `[connect].address` metadata and
@@ -1271,12 +1266,12 @@ fn ipv4_host_of(url: &str) -> Option<&str> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ConnectSpec {
-    /// Reachable IPv4/host for the box, e.g. `"45.32.194.254"`. Declared: which
+    /// Reachable IPv4/host for the box, e.g. `"203.0.113.12"`. Declared: which
     /// of a machine's several addresses the camp should use is an operator
     /// choice (public IP vs. LAN IP vs. tailnet IP).
     pub address: String,
     /// SSH target the camp dials for bootstrap + (pre-mesh) tunneled deploys,
-    /// e.g. `"root@45.32.194.254"` or `"struc@100.64.0.4"`. Declared, whole —
+    /// e.g. `"root@203.0.113.12"` or `"struc@100.64.0.4"`. Declared, whole —
     /// see the type doc. Pair with `identity_file` for a copy-pasteable
     /// `ssh -i <identity_file> <ssh>`.
     pub ssh: String,
@@ -2153,10 +2148,12 @@ impl CloudConfig {
     /// repulsion/affinity by enriching [`RequiredSpec::matches`] /
     /// [`Self::resolve_machine`]. Do not fork a second selector.
     pub fn admit_workload(&self, ws: &WorkloadSpec) -> Result<&MachineConfig> {
-        self.resolve_machine(&admission_spec(ws, &self.workloads)?)
+        let req = admission_spec(ws, &self.workloads)?;
+        let scope = AdmissionScope::of(&self.machines, ws, &req);
+        first_match(&scope.candidates, &req, &scope.pool, &scope.empty_pool)
     }
 
-    /// Every machine that admits `ws`, in declaration order — the *pool*
+    /// Every machine that admits `ws`, in preference order — the *pool*
     /// [`Self::admit_workload`] returns the head of (R605-T14).
     ///
     /// # Why a pool and not just the winner
@@ -2176,8 +2173,10 @@ impl CloudConfig {
     /// which has the network — probes and fails over within it:
     /// `app/yah/cli/src/yubaba_client.rs`'s `MeshYubabaClient::deploy`.
     ///
-    /// Order is the declaration order `admit_workload` already used, and callers
-    /// should preserve it as their preference order rather than load-balancing
+    /// Order is `always-on` machines before `ephemeral` ones ([`Availability`]),
+    /// declaration order within each — the order `admit_workload` takes its
+    /// head from — and callers should preserve it as their preference order
+    /// rather than load-balancing
     /// across it: a retried build wants the node still holding its warm
     /// `target/`, which is the same reason [`first_match`] is deliberately
     /// first-fit.
@@ -2186,15 +2185,7 @@ impl CloudConfig {
     /// message [`Self::admit_workload`] would have produced. "No node admits
     /// this" and "the pool is empty" are the same failure and must read the same.
     pub fn admit_workload_candidates(&self, ws: &WorkloadSpec) -> Result<Vec<&MachineConfig>> {
-        let req = admission_spec(ws, &self.workloads)?;
-        let all: Vec<&MachineConfig> = self.machines.iter().collect();
-        let matched = matching(&all, &req);
-        if matched.is_empty() {
-            // Delegate the wording so the two paths cannot drift apart.
-            return Err(first_match(&all, &req, DECLARED_POOL, EMPTY_DECLARED_POOL)
-                .expect_err("matching() found nothing, so first_match cannot succeed"));
-        }
-        Ok(matched)
+        admissible_machines(&self.machines, ws, &self.workloads)
     }
 
     /// [`Self::admit_workload`] restricted to the machines of one sovereign
@@ -2304,6 +2295,106 @@ pub(crate) fn resolve_machines_among<'a>(
         DECLARED_POOL,
         EMPTY_DECLARED_POOL,
     )
+}
+
+/// Every machine in `machines` that admits `ws`, in declaration order: the
+/// pool [`CloudConfig::admit_workload`] takes the head of, over an explicit
+/// inventory (R959-F6).
+///
+/// Free for the reason [`resolve_machine_among`] is: ingress collation holds
+/// the fleet inventory and the camp's lowered workloads, not a
+/// cross-ref-validated [`CloudConfig`], and a lowered compute slot's ingress
+/// placement is exactly this set (W361 decision 4).
+///
+/// `Err`, never `Ok(vec![])`, when nothing admits `ws`, worded the way
+/// [`CloudConfig::admit_workload`] words it.
+pub fn admissible_machines<'a>(
+    machines: &'a [MachineConfig],
+    ws: &WorkloadSpec,
+    declared: &[WorkloadConfig],
+) -> Result<Vec<&'a MachineConfig>> {
+    let req = admission_spec(ws, declared)?;
+    let scope = AdmissionScope::of(machines, ws, &req);
+    let matched = matching(&scope.candidates, &req);
+    if matched.is_empty() {
+        // Delegate the wording so the two paths cannot drift apart.
+        return Err(first_match(&scope.candidates, &req, &scope.pool, &scope.empty_pool)
+            .expect_err("matching() found nothing, so first_match cannot succeed"));
+    }
+    Ok(matched)
+}
+
+/// The candidate set a spec is admitted from, and how a refusal names it
+/// (R959-F6).
+///
+/// Every spec is admitted from the whole inventory except a floater
+/// (`yah.float = cluster`, R936-B12). yubaba refuses a floater on a node that
+/// is not a raft member, and an admitted tenant moves only among the members
+/// of the raft it was admitted into. So a floater's candidates are one
+/// sovereign group's participating members: the group of the first
+/// participating member that admits it, in declaration order, which is the
+/// node [`CloudConfig::admit_workload`] deploys it through.
+///
+/// This is [`first_match`]'s "new placement scope is a new candidate set"
+/// extension point, not a [`RequiredSpec`] axis: a group is a blast radius,
+/// never a statement about what a node can host.
+///
+/// Without it a prod floater's pool ran on into the dev raft, because every arm
+/// Pi and dev-rig guest admits an unconstrained spec. That is where
+/// `MeshYubabaClient::deploy`'s failover would have sent it, and where the
+/// ingress rule for its fronted slot would have pointed.
+struct AdmissionScope<'a> {
+    candidates: Vec<&'a MachineConfig>,
+    pool: String,
+    empty_pool: String,
+}
+
+impl<'a> AdmissionScope<'a> {
+    fn of(machines: &'a [MachineConfig], ws: &WorkloadSpec, req: &RequiredSpec) -> Self {
+        // Always-on before ephemeral; the sort is stable, so file-name order
+        // still breaks ties within each class. Done here, on the shared
+        // candidate set, so `admit_workload`'s head and the dispatcher's pool
+        // cannot disagree about who goes first.
+        let mut all: Vec<&MachineConfig> = machines.iter().collect();
+        all.sort_by_key(|m| m.availability);
+        if !ws.wants_float() {
+            return Self {
+                candidates: all,
+                pool: DECLARED_POOL.to_string(),
+                empty_pool: EMPTY_DECLARED_POOL.to_string(),
+            };
+        }
+        let float = format!(
+            "{} = \"{}\"",
+            workload_spec::FLOAT_ANNOTATION,
+            workload_spec::FLOAT_VALUE
+        );
+        let members: Vec<&MachineConfig> = all
+            .into_iter()
+            .filter(|m| m.sovereign_group.is_some() && m.sovereign_participation.is_in())
+            .collect();
+        let group = matching(&members, req)
+            .first()
+            .and_then(|m| m.sovereign_group.clone());
+        match group {
+            Some(group) => Self {
+                candidates: members
+                    .into_iter()
+                    .filter(|m| m.sovereign_group.as_deref() == Some(group.as_str()))
+                    .collect(),
+                pool: format!("raft members of sovereign group '{group}' ({float})"),
+                empty_pool: String::new(),
+            },
+            None => Self {
+                candidates: members,
+                pool: format!("raft members ({float} runs only on a raft member)"),
+                empty_pool: format!(
+                    "(no machine declares a sovereign_group with sovereign_participation = \
+                     \"in\", and {float} runs only on a raft member)"
+                ),
+            },
+        }
+    }
 }
 
 const DECLARED_POOL: &str = "declared machines";
@@ -2548,6 +2639,11 @@ fn admission_spec(ws: &WorkloadSpec, declared: &[WorkloadConfig]) -> Result<Requ
         mesh_tags.push(MICROVM_MESH_TAG.to_string());
     }
 
+    // R1019-F28 / W388: a group must say which kind of node it is for. Checked
+    // on the unioned tags, after every derived tag is in, so a `local` edge to
+    // a provider that names a role counts as the group naming it.
+    check_roles(ws, &group, &mesh_tags)?;
+
     Ok(RequiredSpec {
         mesh_tags,
         // R833-F8: imperative node pin. Derived here alongside the inferred
@@ -2573,11 +2669,7 @@ fn admission_spec(ws: &WorkloadSpec, declared: &[WorkloadConfig]) -> Result<Requ
         // Derived from `LifecycleArchetype::ALL` rather than a literal list, so
         // a fourth archetype is tolerated by unrelated groups automatically,
         // exactly as `taint_effect` already derives the repulsion half.
-        tolerates: LifecycleArchetype::ALL
-            .into_iter()
-            .filter(|a| !group_archetypes.contains(a))
-            .map(|a| format!("no-{}", a.taint_key()))
-            .collect(),
+        tolerates: workload_spec::archetype_tolerations(&group_archetypes),
         // R572-F5: taint affinity from the requires-taint annotation. The
         // requirer's wins; otherwise the first member that declares one, since
         // the group shares a node and this axis holds a single key. Two members
@@ -2588,6 +2680,62 @@ fn admission_spec(ws: &WorkloadSpec, declared: &[WorkloadConfig]) -> Result<Requ
             .find_map(|m| m.requires_taint().map(str::to_owned)),
         ..Default::default()
     })
+}
+
+/// Refuse a placement group that names no node role, names one outside the
+/// closed vocabulary, or names [`workload_spec::BEST_EFFORT_ROLE`] while a
+/// member is a singleton (W388 §0, §3.2; operator F4538).
+///
+/// Fail-closed is the point. Before roles, a spec that named no positive tag
+/// was placed by file order on whatever untainted node had room: the LAN
+/// store's pool was headed by us-east-001, and yah-cloud-admin could fail over
+/// onto the low-availability us-west-003. A refusal here turns "where did that
+/// land" into a question the spec has to answer before it lands anywhere.
+///
+/// Like [`check_trust_substrate`], this is a property of the spec, so it fails
+/// on the way in with its own sentence instead of as an empty candidate pool.
+/// An unknown role is caught here and not left to the superset match, which
+/// would report a misspelling as "no node admits this".
+fn check_roles(ws: &WorkloadSpec, group: &[WorkloadSpec], mesh_tags: &[String]) -> Result<()> {
+    let legal = workload_spec::ROLE_KEYS.join(", ");
+    let unknown = workload_spec::unknown_roles_of(mesh_tags);
+    if !unknown.is_empty() {
+        anyhow::bail!(
+            "workload {:?} names unknown node role(s) [{}]; legal roles: {legal} (W388)",
+            ws.name,
+            unknown.join(", "),
+        );
+    }
+    let roles = workload_spec::role_keys_of(mesh_tags);
+    if roles.is_empty() {
+        anyhow::bail!(
+            "workload {:?} names no node role, and placement is fail-closed (W388): add one \
+             `role:` to its `{}` annotation — the weakest it accepts. \
+             Legal roles: {legal}. A singleton or critical service names {}.",
+            ws.name,
+            velveteen_exec::remote::NODE_SELECTOR_MESH_TAGS_ANNOTATION,
+            workload_spec::PUBLIC_UPTIME_ROLE,
+        );
+    }
+    if roles.contains(&workload_spec::BEST_EFFORT_ROLE) {
+        if let Some(single) = group
+            .iter()
+            .find(|m| m.replicas < workload_spec::BEST_EFFORT_MIN_REPLICAS)
+        {
+            anyhow::bail!(
+                "workload {:?} names {} but {:?} declares replicas = {}: a best-effort node has \
+                 70-95% uptime and never hosts a singleton (operator F4538, W388 §0). Declare \
+                 replicas >= {}, or name {} instead.",
+                ws.name,
+                workload_spec::BEST_EFFORT_ROLE,
+                single.name,
+                single.replicas,
+                workload_spec::BEST_EFFORT_MIN_REPLICAS,
+                workload_spec::PUBLIC_UPTIME_ROLE,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Refuse any group member whose declared trust exceeds what its requested
@@ -3157,12 +3305,12 @@ pub(crate) fn load_domains(dir: &Path) -> Result<BTreeMap<String, DomainConfig>>
 /// @yah:handoff("Tree anchor at handoff: 1dfbb17b4c078b509a11d26896e5214c48f5b67d — the shared tree as I left it. Diff against it (`git diff 1dfbb17b4c078b509a11d26896e5214c48f5b67d..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
 /// @yah:next("Claim R959-F1 next. Read its gotchas first: the field addition touches about 100 struct literals across 20 files, and R960 peers are editing config.rs.")
 /// @yah:handoff("2026-10-09 leader (@Glimmerstone:eclipse): F1 + F2 in review (yah-cloud lib 1333/0). T3/T4 cutover is release-gated: deleting a workload TOML before readers carry F2 hides it from v0.8.43, and landing an overlay beside the TOML trips F2's double-declaration refusal. Operator call F4356: the operator commits F1+F2 and the leader runs the release, then T3/T4 cutover runbooks run immediately after (the F2 release breaks noisetable-api ingress reconcile until T4's overlay lands). Pre-release fixture/equality half of T3+T4 dispatched to @Miravel:spade (session:51349a63).")
-/// @yah:handoff("2026-10-09 release courier Ashguard:hydra: BLOCKED at Step 0(b) and released nothing. Installed /Users/leif/.local/bin/yah (both camps resolve it) reports 0.8.43+44606339-dirty, and running workload lower in it fails with 'unrecognized subcommand'. The CDN index.json's latest version is 0.8.43. F1+F2 are NOT committed. oss/yubaba/crates/cloud/src/lower.rs is untracked (??) and has no git log history. At HEAD, app/yah/cli/src/cloud.rs has no WorkloadCommands::Lower and no handle_workload_lower: the working tree has them at cloud.rs:1926 and :4469, but they are uncommitted. oss/yubaba/crates/cloud/src/lib.rs is also modified. Commit F1+F2 (lower.rs, cloud.rs, lib.rs and any other F1/F2 files), then re-dispatch the release courier. No git commands were deferred because no release step ran.")
-/// @yah:handoff("2026-10-09 release courier Ashguard:hydra, second pass (F4357). Step 0(b) now PASSES by content. The first lower.rs commit is ce86178e. In HEAD:app/yah/cli/src/cloud.rs, WorkloadCommands::Lower is at :1961 and handle_workload_lower at :4893. In HEAD lower.rs, the double-declaration refusal bails at :134/:139. Step 1 is only half done, and the cause is structural. The 0.8.44 bump IS applied in the working tree: `cargo xtask release patch` made 277 edits, root Cargo.toml now reads 0.8.44, and `cargo metadata` exited 0 at the root and in oss/cheers, mesofact, turso-backup and yah-base. The xtask also listed 8 lines it did not bump; it says each is either a hand-move pin or a frozen literal. Its sample: kg-anno-wasm/pkg/package.json:8, mesofact cli/new/curated.rs:121, and qed publish.rs:1913-1945, which are test fixtures. Nothing was published, so CDN latest is still 0.8.43. Reason: .yah/qed/yah-cli-release.toml builds with workspace=\"isolated\", a fresh git worktree at HEAD, and the binary's --version comes from CARGO_PKG_VERSION (app/yah/cli/build.rs:34). Running it now would therefore publish HEAD's 0.8.43 bytes. YAH_RELEASE_VERSION=0.8.44 would only rename the channel key, and the binary would still report 0.8.43, so I did not run it. The bump has to be committed before the recipe can run, and git policy is defer. DEFERRED GIT COMMANDS for the operator: add the version-bump files to the index by explicit name. The candidates are the modified */Cargo.toml and */Cargo.lock files (about 104 version-surface paths), app/yah/desktop/tauri.conf.json and packages/yah/ui/package.json. Caution: some of those Cargo.toml files also carry peers' in-flight non-version edits, so review `git diff` per file. Then: git commit -m \"release: v0.8.44\"; git tag v0.8.44; git push origin main --tags. After the commit, run `yah qed run yah-cli-release`, verify that cdn.yah.dev/yah/index.json lists 0.8.44, install, and check that `yah cloud workload lower --help` works in both camps. That is Steps 1 and 2 as originally briefed. Install is not done: both camps still resolve /Users/leif/.local/bin/yah, which is 0.8.43 with no `workload lower`.")
+/// @yah:handoff("2026-10-09 release courier Ashguard:hydra: BLOCKED at Step 0(b) and released nothing. Installed ~/.local/bin/yah (both camps resolve it) reports 0.8.43+44606339-dirty, and running workload lower in it fails with 'unrecognized subcommand'. The CDN index.json's latest version is 0.8.43. F1+F2 are NOT committed. oss/yubaba/crates/cloud/src/lower.rs is untracked (??) and has no git log history. At HEAD, app/yah/cli/src/cloud.rs has no WorkloadCommands::Lower and no handle_workload_lower: the working tree has them at cloud.rs:1926 and :4469, but they are uncommitted. oss/yubaba/crates/cloud/src/lib.rs is also modified. Commit F1+F2 (lower.rs, cloud.rs, lib.rs and any other F1/F2 files), then re-dispatch the release courier. No git commands were deferred because no release step ran.")
+/// @yah:handoff("2026-10-09 release courier Ashguard:hydra, second pass (F4357). Step 0(b) now PASSES by content. The first lower.rs commit is ce86178e. In HEAD:app/yah/cli/src/cloud.rs, WorkloadCommands::Lower is at :1961 and handle_workload_lower at :4893. In HEAD lower.rs, the double-declaration refusal bails at :134/:139. Step 1 is only half done, and the cause is structural. The 0.8.44 bump IS applied in the working tree: `cargo xtask release patch` made 277 edits, root Cargo.toml now reads 0.8.44, and `cargo metadata` exited 0 at the root and in oss/cheers, mesofact, turso-backup and yah-base. The xtask also listed 8 lines it did not bump; it says each is either a hand-move pin or a frozen literal. Its sample: kg-anno-wasm/pkg/package.json:8, mesofact cli/new/curated.rs:121, and qed publish.rs:1913-1945, which are test fixtures. Nothing was published, so CDN latest is still 0.8.43. Reason: .yah/qed/yah-cli-release.toml builds with workspace=\"isolated\", a fresh git worktree at HEAD, and the binary's --version comes from CARGO_PKG_VERSION (app/yah/cli/build.rs:34). Running it now would therefore publish HEAD's 0.8.43 bytes. YAH_RELEASE_VERSION=0.8.44 would only rename the channel key, and the binary would still report 0.8.43, so I did not run it. The bump has to be committed before the recipe can run, and git policy is defer. DEFERRED GIT COMMANDS for the operator: add the version-bump files to the index by explicit name. The candidates are the modified */Cargo.toml and */Cargo.lock files (about 104 version-surface paths), app/yah/desktop/tauri.conf.json and packages/yah/ui/package.json. Caution: some of those Cargo.toml files also carry peers' in-flight non-version edits, so review `git diff` per file. Then: git commit -m \"release: v0.8.44\"; git tag v0.8.44; git push origin main --tags. After the commit, run `yah qed run yah-cli-release`, verify that cdn.yah.dev/yah/index.json lists 0.8.44, install, and check that `yah cloud workload lower --help` works in both camps. That is Steps 1 and 2 as originally briefed. Install is not done: both camps still resolve ~/.local/bin/yah, which is 0.8.43 with no `workload lower`.")
 /// @yah:handoff("Leader @Glimmerstone:dove, F4358: the operator is cutting a yah-wide 0.8.44 release themselves; F1+F2 are committed (first lower.rs commit ce86178e). The 0.8.44 bump is ALREADY applied, uncommitted, in the working tree (the courier ran `cargo xtask release patch`); running it again would bump to 0.8.45. Once 0.8.44 is installed and `yah cloud workload lower --help` works in both camps, dispatch the R959-T3 and R959-T4 cutover runbooks in parallel immediately. Until T4 lands, noisetable-api ingress cannot resolve its workload on 0.8.44: no `yah cloud reconcile` on noisetable in between.")
-/// @yah:handoff("2026-10-09 leader @Glimmerstone:dove gate check (courier @Ashguard:griffin, session:64455002): 0.8.44 is NOT published. The CDN yah/index.json (updated 2026-10-08T20:40Z) lists 0.8.43 as latest. refs/tags/v0.8.44 does not exist and HEAD is ce86178e. Both camps resolve /Users/leif/.local/bin/yah = 0.8.43+44606339-dirty, where `yah cloud workload lower --help` exits 2. Nothing was installed. T3/T4 stay held behind the operator-owned release (F4358). T5/F6 code is also held: a tree edit to oss/yubaba/crates/cloud could be swept into the operator's 0.8.44 commit, and T5 removes the disk reader the cutover window relies on. Once 0.8.44 is installed and `workload lower --help` exits 0 in both camps, dispatch T3+T4 in parallel and run T4 in one sitting (noisetable-api ingress is broken until its overlay lands).")
-/// @yah:handoff("LOCAL INSTALL (Ashguard session:e51ba322, 2026-10-10): QED run cd64514c yah-cli-release cancelled=y (stopped during build-aarch64-apple-darwin; no publish step ran). CDN yah/index.json still 0.8.43 latest=y. Installed via `cargo xtask install --live` from the shared tree (config.rs diff was test/fixture-only); yah --version = 0.8.45+abb379b5-dirty in both ~/ss/yah and ~/ss/noisetable; `yah cloud workload lower --help` exit 0 in both. Build skew advisory: oss/yubaba/crates/yubaba/src/lib.rs edited by a peer mid-build. Backup: /Users/leif/.local/bin/yah.0.8.43-dirty.bak")
-/// @yah:handoff("2026-10-10 leader @Glimmerstone:griffin. The operator reversed F4360 (publish + install): local install only. QED run cd64514c (yah-cli-release) was cancelled at 03:04:02Z during its build steps, so nothing was published and CDN latest is still 0.8.43. `cargo xtask install --live` from the shared tree installed `yah 0.8.45+abb379b5-dirty` at /Users/leif/.local/bin/yah; the leader confirmed `yah cloud workload lower --help` exits 0 in both camps. Backup: ~/.local/bin/yah.0.8.43-dirty.bak. T3 and T4 cutovers re-dispatched post-install: T4 to session:69dd0ef1 (Cleric), T3 to session:6f09b6db (Warrior). Operator plan: once this camp's workload cutover is finished, run a full 0.8.46 release start to finish. If the cutover needs it, hotshipping yubaba/passway/kamaji is pre-approved.")
+/// @yah:handoff("2026-10-09 leader @Glimmerstone:dove gate check (courier @Ashguard:griffin, session:64455002): 0.8.44 is NOT published. The CDN yah/index.json (updated 2026-10-08T20:40Z) lists 0.8.43 as latest. refs/tags/v0.8.44 does not exist and HEAD is ce86178e. Both camps resolve ~/.local/bin/yah = 0.8.43+44606339-dirty, where `yah cloud workload lower --help` exits 2. Nothing was installed. T3/T4 stay held behind the operator-owned release (F4358). T5/F6 code is also held: a tree edit to oss/yubaba/crates/cloud could be swept into the operator's 0.8.44 commit, and T5 removes the disk reader the cutover window relies on. Once 0.8.44 is installed and `workload lower --help` exits 0 in both camps, dispatch T3+T4 in parallel and run T4 in one sitting (noisetable-api ingress is broken until its overlay lands).")
+/// @yah:handoff("LOCAL INSTALL (Ashguard session:e51ba322, 2026-10-10): QED run cd64514c yah-cli-release cancelled=y (stopped during build-aarch64-apple-darwin; no publish step ran). CDN yah/index.json still 0.8.43 latest=y. Installed via `cargo xtask install --live` from the shared tree (config.rs diff was test/fixture-only); yah --version = 0.8.45+abb379b5-dirty in both ~/ss/yah and ~/ss/noisetable; `yah cloud workload lower --help` exit 0 in both. Build skew advisory: oss/yubaba/crates/yubaba/src/lib.rs edited by a peer mid-build. Backup: ~/.local/bin/yah.0.8.43-dirty.bak")
+/// @yah:handoff("2026-10-10 leader @Glimmerstone:griffin. The operator reversed F4360 (publish + install): local install only. QED run cd64514c (yah-cli-release) was cancelled at 03:04:02Z during its build steps, so nothing was published and CDN latest is still 0.8.43. `cargo xtask install --live` from the shared tree installed `yah 0.8.45+abb379b5-dirty` at ~/.local/bin/yah; the leader confirmed `yah cloud workload lower --help` exits 0 in both camps. Backup: ~/.local/bin/yah.0.8.43-dirty.bak. T3 and T4 cutovers re-dispatched post-install: T4 to session:69dd0ef1 (Cleric), T3 to session:6f09b6db (Warrior). Operator plan: once this camp's workload cutover is finished, run a full 0.8.46 release start to finish. If the cutover needs it, hotshipping yubaba/passway/kamaji is pre-approved.")
 /// @yah:handoff("2026-10-10 leader @Glimmerstone:griffin (session:17110577), handing off at ~262k context. CUTOVER DONE AND LEADER-VERIFIED. R959-T3 (review): yah camp, 7 idents (yah-cloud-admin + dev-rig service with vm-us-west-111/112/113/141/142/143); .yah/infra/workloads is empty. R959-T4 (review): noisetable camp, 10 idents; .yah/infra/workloads deleted; the R814-T12 R2 env/secrets and the 20261009.1 pin moved into the noisetable-api prod overlay. `yah cloud workload show` resolves all 17 on the installed 0.8.45+abb379b5-dirty. cargo test -p yah-cloud --lib: 1344/0, EXIT=0. Commit commands for both repos are in the T3/T4 review handoffs (git policy defer, nothing committed). NEXT: R959-T5 is ready. Read its new gotcha first: a live R966 peer holds uncommitted cloud.rs edits. Then R959-F6 (collate-only; never apply a render that differs). Sequence T5/F6 against the operator's planned full 0.8.46 release: confirm with the operator whether they land before it. Finding for a separate track: the yah MCP server (app/yah/cli/src/mcp/server.rs:88) handles one tools/call at a time and ignores notifications/cancelled. So an interrupted qed_await (blocking daemon_client::call_camp) keeps the server parked, and every later yah tool call from that session queues behind it. That is what stalled session:04a1e1ba's qed_cancel for 2 min. Operator call pending on whether to file it.")
 /// @yah:handoff("OPERATOR CALL 2026-10-10 (answered \"A\" to the leader's sequencing call). R959-T5 lands BEFORE the full 0.8.46 release, so 0.8.46 ships with one source for workloads. R959-F6 lands AFTER 0.8.46 is cut. A fresh leader takes R959 from here to drive T5 to review. Don't start F6 until the operator confirms 0.8.46 is out.")
 /// The camp's own spec for one workload, by name, through
@@ -5182,6 +5330,57 @@ pub struct IngressEdge {
     /// issue from; see [`TunnelDoor`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel_door: Option<TunnelDoor>,
+    /// The SHARED node-side passway this edge's hostnames are served by,
+    /// spelled `[ingress.door]` (R986).
+    ///
+    /// ```toml
+    /// [ingress.door]
+    /// name      = "noisetable"   # passway-noisetable.service, /etc/passway-noisetable.env
+    /// catch_all = true           # this service's ident is also the door's `*=` entry
+    /// ```
+    ///
+    /// A tenant door fronts several services at once — noisetable's one
+    /// `passway-noisetable` serves api, inference, link and the apex — so its
+    /// `PASSWAY_YUBABA_IDENT` is the MERGE of every same-env mirror naming the
+    /// same door, never one service's slice. `yah cloud apply` and `yah cloud
+    /// ingress door` render that merge and splice it into the env file on
+    /// every machine of the edge. See [`PasswayDoor`].
+    ///
+    /// `None` is a door this mirror does not share (the yah.dev doors, and any
+    /// edge whose `image` makes apply push a kamaji appliance instead).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub door: Option<PasswayDoor>,
+}
+
+/// A shared node-side passway an `[[ingress]]` edge is served by (R986).
+///
+/// The unit and env file are DERIVED from `name` — `passway-<name>.service`,
+/// `/etc/passway-<name>.env` — because those two spellings already agree on
+/// every node that runs a tenant door, and a second field for each would be a
+/// string-agreement declaration nothing checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PasswayDoor {
+    /// The door's name: `[a-z0-9-]+`, the `<name>` in `passway-<name>`.
+    pub name: String,
+    /// This edge's workload ident is ALSO the door's catch-all (`*=<ident>`),
+    /// the backend every hostname no rule names discovers. At most one edge per
+    /// door and env may set it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub catch_all: bool,
+}
+
+impl PasswayDoor {
+    /// `passway-<name>.service`.
+    pub fn unit(&self) -> String {
+        format!("passway-{}.service", self.name)
+    }
+
+    /// `/etc/passway-<name>.env`.
+    pub fn env_file(&self) -> String {
+        format!("/etc/passway-{}.env", self.name)
+    }
 }
 
 /// What a passway door behind a cloudflare tunnel needs that a public door
@@ -5224,6 +5423,7 @@ impl IngressEdge {
             auth: None,
             via: None,
             tunnel_door: None,
+            door: None,
         }
     }
 
@@ -5278,6 +5478,53 @@ impl IngressEdge {
     /// Refuse an `[ingress.tunnel_door]` that cannot produce a working door
     /// (R910-F2). Whether the edge is actually behind a tunnel is a property
     /// of the pair, so `partition` checks that half.
+    /// `[ingress.door]` names a shared node-side passway (R986). Only a plain
+    /// passway edge has one: an `image` makes apply push a kamaji appliance
+    /// (a door it owns outright), and a door behind a tunnel is armed per
+    /// hostname by yubaba's tenant tier — either would give one hostname two
+    /// owners.
+    pub fn validate_door(&self) -> Result<()> {
+        let Some(door) = &self.door else {
+            return Ok(());
+        };
+        if self.provider != IngressProvider::Passway {
+            bail!(
+                "{}: declares `[ingress.door]`, but only a `provider = \"passway\"` edge is served \
+                 by a node-side passway. Move it to the passway edge, or drop it.",
+                self.label()
+            );
+        }
+        if door.name.is_empty()
+            || !door
+                .name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            bail!(
+                "{}: `[ingress.door].name = {:?}` must be `[a-z0-9-]+` — it becomes the unit \
+                 name `passway-<name>.service` and the path `/etc/passway-<name>.env`",
+                self.label(),
+                door.name
+            );
+        }
+        if self.image.is_some() {
+            bail!(
+                "{}: declares both `image` and `[ingress.door]`. `image` makes apply push a kamaji \
+                 passway appliance; `door` names a node-side passway unit. One hostname cannot \
+                 have both owners — drop one.",
+                self.label()
+            );
+        }
+        if self.tunnel_door.is_some() {
+            bail!(
+                "{}: declares both `[ingress.tunnel_door]` and `[ingress.door]`. A door behind a \
+                 tunnel is armed per hostname by yubaba; it is not a shared node-side unit.",
+                self.label()
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate_tunnel_door(&self) -> Result<()> {
         let Some(door) = &self.tunnel_door else {
             return Ok(());
@@ -5714,6 +5961,7 @@ impl MirrorConfig {
                     edge.validate_auth()?;
                     edge.validate_via()?;
                     edge.validate_tunnel_door()?;
+                    edge.validate_door()?;
                 }
                 Ok(edges.clone())
             }
@@ -6122,13 +6370,8 @@ impl RequiredSpec {
         // a mirror's `required = {...}` carries no repulsion declaration and
         // never could, so making repulsion conditional on one made node taints
         // structurally unreadable on that path (R876-S2).
-        for taint in &machine.taints {
-            if !matches!(taint_effect(taint), TaintEffect::Repels(_)) {
-                continue;
-            }
-            if !self.tolerates.iter().any(|t| t == taint) {
-                return false;
-            }
+        if workload_spec::repelling_taint(&machine.taints, &self.tolerates).is_some() {
+            return false;
         }
 
         // R572-F5: taint affinity. Machine must carry the required taint key
@@ -7460,6 +7703,7 @@ mod tests {
             nickname: None,
             legacy_hostkey_fingerprint: None,
             registration: Default::default(),
+            camps: Vec::new(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -7469,6 +7713,7 @@ mod tests {
             sovereign_group: None,
             sovereign_participation: Default::default(),
             host_machine: None,
+            availability: Default::default(),
             ingress_floating_ip: None,
         }
     }
@@ -7488,7 +7733,34 @@ mod tests {
         }
     }
 
-    fn make_empty_cfg(machines: Vec<MachineConfig>) -> CloudConfig {
+    /// R1019-F28 (W388): placement is fail-closed on node roles, so every
+    /// fixture spec names this role ([`with_fixture_role`]) and every fixture
+    /// machine without a role of its own serves it ([`make_empty_cfg`]). Tests
+    /// about roles themselves give their machines and specs explicit ones.
+    const FIXTURE_ROLE: &str = workload_spec::PUBLIC_UPTIME_ROLE;
+
+    /// Add [`FIXTURE_ROLE`] to `ws`'s node selector unless it already names a
+    /// role. Every spec helper below returns through this.
+    fn with_fixture_role(mut ws: WorkloadSpec) -> WorkloadSpec {
+        let key = velveteen_exec::remote::NODE_SELECTOR_MESH_TAGS_ANNOTATION;
+        let sel = ws.annotations.get(key).cloned().unwrap_or_default();
+        if !sel.split(',').any(|t| t.trim().starts_with(workload_spec::ROLE_PREFIX)) {
+            let joined = if sel.trim().is_empty() {
+                FIXTURE_ROLE.to_string()
+            } else {
+                format!("{sel},{FIXTURE_ROLE}")
+            };
+            ws.annotations.insert(key.into(), joined);
+        }
+        ws
+    }
+
+    fn make_empty_cfg(mut machines: Vec<MachineConfig>) -> CloudConfig {
+        for m in &mut machines {
+            if workload_spec::role_keys_of(&m.mesh_tags).is_empty() {
+                m.mesh_tags.push(FIXTURE_ROLE.to_string());
+            }
+        }
         CloudConfig {
             workspace_root: PathBuf::new(),
             machines,
@@ -7828,8 +8100,15 @@ kind = "camp-token"
 
     /// Build a forge WorkloadSpec carrying the R594 node-selector annotation.
     /// `selector` is the comma-joined mesh-tag set; `None` omits the annotation
-    /// entirely (pre-R594 "no constraint").
+    /// entirely (pre-R594 "no constraint"). Returns through
+    /// [`with_fixture_role`]; [`ws_with_raw_selector`] is the untouched form.
     fn ws_with_selector(selector: Option<&str>) -> WorkloadSpec {
+        with_fixture_role(ws_with_raw_selector(selector))
+    }
+
+    /// [`ws_with_selector`] without the fixture role, for tests about the
+    /// selector parse itself or about specs that name no role.
+    fn ws_with_raw_selector(selector: Option<&str>) -> WorkloadSpec {
         use workload_spec::{ImageRef, TierTag};
         let mut ws = WorkloadSpec::for_forge(
             "R590-F1-test",
@@ -7874,6 +8153,80 @@ kind = "camp-token"
         let ws = ws_with_selector(Some("tag:build-worker,arch:arm"));
         let picked = cfg.admit_workload(&ws).unwrap();
         assert_eq!(picked.name, "pi5-001");
+    }
+
+    // ─── R959-F6 floater admission scope ────────────────────────────────────
+
+    fn member(
+        name: &str,
+        tags: Vec<&str>,
+        group: &str,
+        participation: workload_spec::sovereign::Participation,
+    ) -> MachineConfig {
+        let mut m = make_machine(name, tags);
+        m.sovereign_group = Some(group.into());
+        m.sovereign_participation = participation;
+        m
+    }
+
+    fn floater(selector: Option<&str>) -> WorkloadSpec {
+        let mut ws = ws_with_selector(selector);
+        ws.annotations.insert(
+            workload_spec::FLOAT_ANNOTATION.into(),
+            workload_spec::FLOAT_VALUE.into(),
+        );
+        ws
+    }
+
+    /// Laid out the way `.yah/infra/machines/` is: a prod raft member first,
+    /// then a standalone worker, a prod node outside the raft, a second prod
+    /// member, and the dev raft.
+    fn sovereign_fleet() -> CloudConfig {
+        use workload_spec::sovereign::Participation::{In, Out};
+        make_empty_cfg(vec![
+            member("us-east-001", vec!["arch:x86"], "prod", In),
+            make_machine("us-west-002", vec!["arch:x86"]),
+            member("us-west-003", vec!["arch:x86"], "prod", Out),
+            member("us-west-001", vec!["arch:x86"], "prod", In),
+            member("us-west-011", vec!["arch:arm"], "dev", In),
+        ])
+    }
+
+    fn names<'a>(machines: Vec<&'a MachineConfig>) -> Vec<&'a str> {
+        machines.into_iter().map(|m| m.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_floater_is_admitted_only_among_one_rafts_members() {
+        let cfg = sovereign_fleet();
+        // The same spec without `yah.float` runs anywhere, so the narrowing
+        // provably comes from the annotation rather than from the fleet.
+        assert_eq!(
+            names(cfg.admit_workload_candidates(&ws_with_selector(None)).unwrap()),
+            ["us-east-001", "us-west-002", "us-west-003", "us-west-001", "us-west-011"]
+        );
+        assert_eq!(
+            names(cfg.admit_workload_candidates(&floater(None)).unwrap()),
+            ["us-east-001", "us-west-001"]
+        );
+        assert_eq!(cfg.admit_workload(&floater(None)).unwrap().name, "us-east-001");
+    }
+
+    #[test]
+    fn a_floaters_raft_is_the_group_of_the_first_member_that_admits_it() {
+        let cfg = sovereign_fleet();
+        assert_eq!(
+            names(cfg.admit_workload_candidates(&floater(Some("arch:arm"))).unwrap()),
+            ["us-west-011"]
+        );
+    }
+
+    #[test]
+    fn a_floater_no_raft_member_admits_is_refused_naming_raft_membership() {
+        let cfg = make_empty_cfg(vec![make_machine("us-west-002", vec!["arch:x86"])]);
+        let err = format!("{:#}", cfg.admit_workload(&floater(None)).unwrap_err());
+        assert!(err.contains("raft member"), "{err}");
+        assert_eq!(cfg.admit_workload(&ws_with_selector(None)).unwrap().name, "us-west-002");
     }
 
     /// A forge run must be admissible on a build-worker smaller than its own
@@ -8039,7 +8392,7 @@ kind = "camp-token"
             format!(
                 r#"name = "{name}"
 provider = "static"
-mesh_tags = ["tag:build-worker", "arch:x86"]
+mesh_tags = ["tag:build-worker", "arch:x86", "{FIXTURE_ROLE}"]
 "#
             )
         };
@@ -8069,6 +8422,45 @@ mesh_tags = ["tag:build-worker", "arch:x86"]
                 .collect::<Vec<_>>(),
             vec!["a-first", "b-second"],
             "the pool must be every admissible node, in the same declaration order"
+        );
+    }
+
+    /// An `ephemeral` machine goes behind every always-on machine that admits
+    /// the same spec, even when it sorts first by file name — and file-name
+    /// order still breaks ties inside each class. The us-west-002 / 003 / 004
+    /// shape: a sleeping WSL box must not be the head of the pool.
+    #[test]
+    fn ephemeral_machines_admit_after_always_on_ones() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let machines = tmp.path().join(".yah").join("infra").join("machines");
+        std::fs::create_dir_all(&machines).unwrap();
+        let toml_for = |name: &str, extra: &str| {
+            format!(
+                r#"name = "{name}"
+provider = "static"
+mesh_tags = ["tag:build-worker", "arch:x86", "{FIXTURE_ROLE}"]
+{extra}
+"#
+            )
+        };
+        std::fs::write(machines.join("a-sleepy.toml"), toml_for("a-sleepy", r#"availability = "ephemeral""#)).unwrap();
+        std::fs::write(machines.join("b-awake.toml"), toml_for("b-awake", "")).unwrap();
+        std::fs::write(machines.join("c-awake.toml"), toml_for("c-awake", r#"availability = "always-on""#)).unwrap();
+
+        let cfg = CloudConfig::load(tmp.path()).unwrap();
+        assert_eq!(cfg.machines[0].availability, Availability::Ephemeral);
+        assert_eq!(cfg.machines[1].availability, Availability::AlwaysOn, "the default");
+
+        let ws = ws_with_selector(Some("tag:build-worker,arch:x86"));
+        assert_eq!(cfg.admit_workload(&ws).unwrap().name, "b-awake");
+        assert_eq!(
+            cfg.admit_workload_candidates(&ws)
+                .unwrap()
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b-awake", "c-awake", "a-sleepy"],
+            "ephemeral last, file-name order within each class — and never dropped"
         );
     }
 
@@ -8167,12 +8559,90 @@ mesh_tags = ["tag:build-worker", "arch:x86"]
 
     #[test]
     fn node_selector_mesh_tags_trims_and_drops_empties() {
-        let ws = ws_with_selector(Some(" tag:build-worker , arch:x86 ,"));
+        let ws = ws_with_raw_selector(Some(" tag:build-worker , arch:x86 ,"));
         assert_eq!(
             node_selector_mesh_tags(&ws),
             vec!["tag:build-worker".to_string(), "arch:x86".to_string()]
         );
-        assert!(node_selector_mesh_tags(&ws_with_selector(None)).is_empty());
+        assert!(node_selector_mesh_tags(&ws_with_raw_selector(None)).is_empty());
+    }
+
+    // ─── R1019-F28 / W388 node roles ────────────────────────────────────────
+
+    /// `minimal_spec_without_role` with exactly `selector` as its node selector.
+    fn spec_selecting(name: &str, replicas: u32, selector: &str) -> WorkloadSpec {
+        let mut ws = minimal_spec_without_role(name, replicas);
+        ws.annotations.insert(
+            velveteen_exec::remote::NODE_SELECTOR_MESH_TAGS_ANNOTATION.into(),
+            selector.into(),
+        );
+        ws
+    }
+
+    /// Fail-closed: a spec naming no role is refused at admission with a
+    /// sentence that names the fix, even when its other tags would match.
+    #[test]
+    fn a_spec_naming_no_role_is_refused() {
+        for ws in [ws_with_raw_selector(None), ws_with_raw_selector(Some("arch:x86"))] {
+            let err = admission_spec(&ws, &[]).unwrap_err().to_string();
+            assert!(err.contains("names no node role"), "got: {err}");
+            assert!(err.contains(workload_spec::PUBLIC_UPTIME_ROLE), "names the fix, got: {err}");
+        }
+        let cfg = make_empty_cfg(vec![make_machine("any", vec!["arch:x86"])]);
+        assert!(cfg.admit_workload(&ws_with_raw_selector(Some("arch:x86"))).is_err());
+    }
+
+    /// A misspelled or retired role is its own refusal, not an empty pool.
+    /// `role:cloud-capacity` is the spike's name for what became best-effort.
+    #[test]
+    fn an_unknown_role_is_refused_by_name() {
+        let ws = spec_selecting("srv", 2, "arch:x86,role:cloud-capacity");
+        let err = admission_spec(&ws, &[]).unwrap_err().to_string();
+        assert!(err.contains("unknown node role(s) [role:cloud-capacity]"), "got: {err}");
+        assert!(err.contains(workload_spec::BEST_EFFORT_ROLE), "lists the legal roles, got: {err}");
+    }
+
+    /// Operator F4538: best-effort nodes never host a singleton. Two replicas
+    /// is the floor, and a singleton bound in by a `local` edge counts.
+    #[test]
+    fn best_effort_refuses_a_singleton_and_admits_two_replicas() {
+        let single = spec_selecting("srv", 1, workload_spec::BEST_EFFORT_ROLE);
+        let err = admission_spec(&single, &[]).unwrap_err().to_string();
+        assert!(err.contains("declares replicas = 1"), "got: {err}");
+
+        let pair = spec_selecting("srv", 2, workload_spec::BEST_EFFORT_ROLE);
+        let req = admission_spec(&pair, &[]).expect("replicas = 2 is admissible");
+        assert!(req.mesh_tags.iter().any(|t| t == workload_spec::BEST_EFFORT_ROLE));
+
+        let inventory = declared(vec![minimal_spec_without_role("sidecar", 1)]);
+        let bound = WorkloadSpec {
+            requires: vec![requirement("sidecar", Locality::Local)],
+            ..spec_selecting("srv", 2, workload_spec::BEST_EFFORT_ROLE)
+        };
+        let err = admission_spec(&bound, &inventory).unwrap_err().to_string();
+        assert!(err.contains("\"sidecar\" declares replicas = 1"), "got: {err}");
+    }
+
+    /// The role is checked on the group's unioned tags, so a requirer naming
+    /// no role is admitted when the provider it binds `local` names one.
+    #[test]
+    fn a_local_providers_role_counts_for_the_group() {
+        let inventory = declared(vec![spec_selecting(
+            "provider",
+            1,
+            workload_spec::PUBLIC_UPTIME_ROLE,
+        )]);
+        let requirer = WorkloadSpec {
+            requires: vec![requirement("provider", Locality::Local)],
+            ..minimal_spec_without_role("requirer", 1)
+        };
+        let req = admission_spec(&requirer, &inventory).expect("the provider names the role");
+        assert!(req.mesh_tags.iter().any(|t| t == workload_spec::PUBLIC_UPTIME_ROLE));
+
+        assert!(
+            admission_spec(&minimal_spec_without_role("requirer", 1), &inventory).is_err(),
+            "without the edge the same requirer names no role"
+        );
     }
 
     // ─── F16 topology-aware resolver ────────────────────────────────────────
@@ -8414,6 +8884,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             nickname: None,
             legacy_hostkey_fingerprint: None,
             registration: Default::default(),
+            camps: Vec::new(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -8423,6 +8894,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             sovereign_group: None,
             sovereign_participation: Default::default(),
             host_machine: None,
+            availability: Default::default(),
             ingress_floating_ip: None,
         };
         let s = toml::to_string(&cfg).unwrap();
@@ -8555,6 +9027,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             nickname: None,
             legacy_hostkey_fingerprint: None,
             registration: Default::default(),
+            camps: Vec::new(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -8564,6 +9037,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             sovereign_group: None,
             sovereign_participation: Default::default(),
             host_machine: None,
+            availability: Default::default(),
             ingress_floating_ip: None,
         };
         // Land in the legacy tree so the legacy machine loader picks it up.
@@ -8669,6 +9143,10 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
     /// Minimal valid spec for the tests below.
     #[cfg(test)]
     fn minimal_spec(name: &str, replicas: u32) -> workload_spec::WorkloadSpec {
+        with_fixture_role(minimal_spec_without_role(name, replicas))
+    }
+
+    fn minimal_spec_without_role(name: &str, replicas: u32) -> workload_spec::WorkloadSpec {
         use workload_spec::{
             ExposeSpec, ImageRef, MeshExpose, MeshIdent, NamespaceId, ResourceLimits,
             RestartPolicy, StopPolicy, TenantId, TierTag, WorkloadSpec,
@@ -8720,6 +9198,8 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             namespace: NamespaceId::singleton(),
             labels: Default::default(),
             durability: None,
+            lease_id: None,
+            deadline: None,
             db: Vec::new(),
             capabilities: Vec::new(),
             annotations: Default::default(),
@@ -8783,6 +9263,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             nickname: None,
             legacy_hostkey_fingerprint: None,
             registration: Default::default(),
+            camps: Vec::new(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -8792,6 +9273,7 @@ required = { regions = ["us-east"], mesh_tags = ["tag:cloud-runner"], replicas =
             sovereign_group: None,
             sovereign_participation: Default::default(),
             host_machine: None,
+            availability: Default::default(),
             ingress_floating_ip: None,
         };
         machine.save(root).unwrap();
@@ -9162,8 +9644,8 @@ region = "us-south"
 mesh_tags = ["tag:cloud-runner", "tag:voter-candidate"]
 
 [connect]
-address = "45.32.194.254"
-ssh = "root@45.32.194.254"
+address = "203.0.113.12"
+ssh = "root@203.0.113.12"
 identity_file = "~/.ssh/yah"
 yubaba = "http://127.0.0.1:7443"
 arch = "x86_64"
@@ -9174,7 +9656,7 @@ arch = "x86_64"
         assert!(cfg.server_type.is_none());
         assert_eq!(cfg.location(), ""); // accessor defaults empty
         let c = cfg.connect.as_ref().expect("connect block");
-        assert_eq!(c.ssh, "root@45.32.194.254");
+        assert_eq!(c.ssh, "root@203.0.113.12");
         // Loopback is a *declared* reach placeholder, so it stays in [connect]
         // verbatim and composes straight through (R707-T1).
         assert_eq!(c.yubaba.as_deref(), Some("http://127.0.0.1:7443"));
@@ -9202,8 +9684,8 @@ mesh_tags = ["tag:cloud-runner"]
 hostkey_fingerprint = "SHA256:dmpq"
 
 [connect]
-address = "15.204.89.240"
-ssh = "debian@15.204.89.240"
+address = "203.0.113.11"
+ssh = "debian@203.0.113.11"
 identity_file = "~/.ssh/yah"
 yubaba = "http://100.64.0.1:7443"
 "#;
@@ -9225,8 +9707,8 @@ mesh_tags = []
 hostkey_fingerprint = "SHA256:dmpq"
 
 [connect]
-address = "15.204.89.240"
-ssh = "debian@15.204.89.240"
+address = "203.0.113.11"
+ssh = "debian@203.0.113.11"
 identity_file = "~/.ssh/yah"
 yubaba = "http://100.64.0.1:7443"
 "#;
@@ -9236,8 +9718,8 @@ provider = "static"
 mesh_tags = []
 
 [connect]
-address = "15.204.89.240"
-ssh = "debian@15.204.89.240"
+address = "203.0.113.11"
+ssh = "debian@203.0.113.11"
 identity_file = "~/.ssh/yah"
 
 [registration]
@@ -9290,10 +9772,10 @@ provider = "static"
 mesh_tags = []
 
 [connect]
-address = "192.168.10.14"
-ssh = "yah@192.168.10.14"
+address = "192.168.250.14"
+ssh = "yah@192.168.250.14"
 identity_file = "~/.ssh/yah"
-yubaba = "http://192.168.10.14:7443"
+yubaba = "http://192.168.250.14:7443"
 
 [registration]
 mesh_ipv4 = "100.64.0.6"
@@ -9307,7 +9789,7 @@ mesh_ipv4 = "100.64.0.6"
         );
         assert_eq!(
             cfg.lan_endpoint().as_deref(),
-            Some("192.168.10.14:7443"),
+            Some("192.168.250.14:7443"),
             "the LAN address is still recorded — as identity, not as reach"
         );
     }
@@ -9323,16 +9805,16 @@ provider = "static"
 mesh_tags = []
 
 [connect]
-address = "192.168.10.11"
-ssh = "yah@192.168.10.11"
+address = "192.168.250.11"
+ssh = "yah@192.168.250.11"
 identity_file = "~/.ssh/yah"
-yubaba = "http://192.168.10.11:7443"
+yubaba = "http://192.168.250.11:7443"
 "#;
         let cfg: MachineConfig = toml::from_str(src).unwrap();
         assert_eq!(cfg.yubaba_url(), None);
         let err = cfg.reach().unwrap_err();
         assert!(err.contains("us-west-011"), "{err}");
-        assert!(err.contains("192.168.10.11"), "{err}");
+        assert!(err.contains("192.168.250.11"), "{err}");
         assert!(err.contains("mesh_ipv4"), "{err}");
     }
 
@@ -9348,8 +9830,8 @@ provider = "static"
 mesh_tags = []
 
 [connect]
-address = "192.168.10.99"
-ssh = "yah@192.168.10.99"
+address = "192.168.250.99"
+ssh = "yah@192.168.250.99"
 identity_file = "~/.ssh/yah"
 yubaba = "http://127.0.0.1:7443"
 "#;
@@ -9360,7 +9842,7 @@ yubaba = "http://127.0.0.1:7443"
     #[test]
     fn private_ranges_are_exactly_rfc1918() {
         for lan in [
-            "http://192.168.10.11:7443",
+            "http://192.168.250.11:7443",
             "http://10.0.0.5:7443",
             "http://172.16.4.1:7443",
         ] {
@@ -9370,7 +9852,7 @@ yubaba = "http://127.0.0.1:7443"
             "http://100.64.0.6:7443",  // mesh
             "http://127.0.0.1:7443",   // loopback
             "http://172.32.0.1:7443",  // just past 172.16/12
-            "http://45.32.194.254:80", // public
+            "http://203.0.113.12:80", // public
             "http://us-west-001:7443", // name, not a literal
         ] {
             assert!(private_ipv4_from_url(not_lan).is_none(), "{not_lan}");
@@ -9389,8 +9871,8 @@ mesh_tags = []
 hostkey_fingerprint = "SHA256:dmpq"
 
 [connect]
-address = "15.204.89.240"
-ssh = "debian@15.204.89.240"
+address = "203.0.113.11"
+ssh = "debian@203.0.113.11"
 identity_file = "~/.ssh/yah"
 yubaba = "http://100.64.0.1:7443"
 "#;
@@ -9421,8 +9903,8 @@ provider = "static"
 mesh_tags = []
 
 [connect]
-address = "192.168.10.11"
-ssh = "yah@192.168.10.11"
+address = "192.168.250.11"
+ssh = "yah@192.168.250.11"
 identity_file = "~/.ssh/yah"
 yubaba = "http://127.0.0.1:7443"
 "#;
@@ -9450,8 +9932,8 @@ mesh_tags = []
 hostkey_fingerprint = "SHA256:dmpq"
 
 [connect]
-address = "15.204.89.240"
-ssh = "debian@15.204.89.240"
+address = "203.0.113.11"
+ssh = "debian@203.0.113.11"
 identity_file = "~/.ssh/yah"
 yubaba = "http://100.64.0.1:7443"
 "#;
@@ -12042,8 +12524,12 @@ taints = ["no-server", "no-appliance", "no-job"]
         let req = admission_spec(&ws, &[]).unwrap();
         assert_eq!(ws.effective_archetype(), LifecycleArchetype::Server);
 
-        let no_server = make_machine_with_capacity("n", 8192, 4000, vec!["no-server"]);
-        let no_appliance = make_machine_with_capacity("n", 8192, 4000, vec!["no-appliance"]);
+        let serving = |taint| MachineConfig {
+            mesh_tags: vec![FIXTURE_ROLE.to_string()],
+            ..make_machine_with_capacity("n", 8192, 4000, vec![taint])
+        };
+        let no_server = serving("no-server");
+        let no_appliance = serving("no-appliance");
         assert!(!req.matches(&no_server), "its own class still repels it");
         assert!(
             req.matches(&no_appliance),
@@ -12321,6 +12807,7 @@ sovereign_participation = "out"
             name: "us-west-011-vm1".into(),
             sovereign_participation: Participation::In,
             host_machine: Some("us-west-011".into()),
+            availability: Default::default(),
             ..m
         };
         assert_eq!(vm.physical_host(), "us-west-011");
@@ -12595,7 +13082,7 @@ sovereign_group = "dev"
         // request, which is the documented fall-back-to-`resources.memory_mb`
         // path (`WorkloadSpec::memory_request_mb`).
         ws.resources.memory_request_mb = None;
-        ws
+        with_fixture_role(ws)
     }
 
     fn appliance_spec_ws(memory_mb: u32, cpu_millis: u32) -> WorkloadSpec {
@@ -13517,7 +14004,7 @@ path  = "../first"
         let ws = ws_with_selector(Some("tag:build-worker,arch:x86"));
         let req = admission_spec(&ws, &[]).unwrap();
 
-        assert_eq!(req.mesh_tags, vec!["tag:build-worker", "arch:x86"]);
+        assert_eq!(req.mesh_tags, vec!["tag:build-worker", "arch:x86", FIXTURE_ROLE]);
         assert_eq!(req.memory_mb, ws.memory_request_mb());
         assert_eq!(req.cpu_millis, ws.resources.cpu_millis);
         // R876-B7: the axis is now the complement — every repelling key EXCEPT

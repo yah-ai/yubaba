@@ -30,8 +30,14 @@ pub async fn dispatch_on_change(
     env: &str,
 ) -> Result<()> {
     match on_change {
-        OnChangeConfig::MesofactRebuild { service, route } => {
-            revalidate_mesofact(service, route, workspace_root, env).await
+        // One revalidate per route the feed renders (R827-B1). Sequential and
+        // fail-fast: each publishes, and a route that failed must surface
+        // rather than be masked by a later one succeeding.
+        OnChangeConfig::MesofactRebuild { service, routes } => {
+            for route in routes {
+                revalidate_mesofact(service, route, workspace_root, env).await?;
+            }
+            Ok(())
         }
         // Nothing to do here, and that is the design rather than a stub.
         //
@@ -128,7 +134,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".yah")).unwrap();
         let on_change = OnChangeConfig::MesofactRebuild {
             service: "no-such-svc".to_string(),
-            route: "/releases".to_string(),
+            routes: vec!["/releases".to_string()],
         };
         let err = dispatch_on_change(&on_change, root, "prod")
             .await
@@ -160,7 +166,7 @@ wave = 0
         );
         let on_change = OnChangeConfig::MesofactRebuild {
             service: "dev-yah".to_string(),
-            route: "/releases".to_string(),
+            routes: vec!["/releases".to_string()],
         };
         let err = dispatch_on_change(&on_change, root, "prod")
             .await

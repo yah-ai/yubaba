@@ -493,12 +493,13 @@ pub const ROUTES_DIR: &str = "/var/lib/passway/routes";
 /// [`InnerDoorPlan::workload`].
 pub const INNER_DOOR_HOST: &str = "127.0.0.1";
 
-/// Where every door host keeps its sovereign group's cluster key (R876-T18
-/// step 2, 0600 root). Every door — outer and inner — names it as
-/// `PASSWAY_YUBABA_CLUSTER_KEY_FILE` so its yubaba polls carry a peer token.
-/// A door naming a key file it cannot read refuses to boot, so a new door host
-/// needs the key before any door is placed on it.
-pub const DOOR_CLUSTER_KEY_FILE: &str = "/etc/yah-cloud/cluster.key";
+/// Where every door host keeps its sovereign group's SERVICE key (R997-B26,
+/// 0600 root) — separate from the cluster key, which no door holds. Every
+/// door — outer and inner — names it as `PASSWAY_YUBABA_SERVICE_KEY_FILE` so
+/// its yubaba polls carry a service-tier token. A door naming a key file it
+/// cannot read refuses to boot, so a new door host needs the key before any
+/// door is placed on it.
+pub const DOOR_SERVICE_KEY_FILE: &str = "/etc/yah-cloud/service.key";
 
 /// Low end of the window [`listen_port`] picks from, inclusive.
 pub const INNER_DOOR_PORT_LOW: u16 = 10_000;
@@ -571,9 +572,25 @@ pub fn component_workload_ident(service: &str, component_id: &str) -> String {
 }
 
 impl InnerDoorPlan {
-    /// The workload name / mesh identity for this service's inner door.
+    /// The service-wide NAME of this inner door: a label for logs and the
+    /// told-not-discovered marker, never a deploy ident. What is deployed is
+    /// [`Self::workload_name_on`], one per front-door node.
     pub fn workload_name(&self) -> String {
         format!("passway-inner-{}", self.service)
+    }
+
+    /// The workload name / mesh identity of this service's inner door ON
+    /// `node`. One ident per node, because yubaba keys a workload's intent by
+    /// ident and an `Appliance` has one placement: the same ident deployed to
+    /// three front doors left one intent placing it on whichever node was
+    /// deployed last, and rejoin cleanup (R977-F4) stopped the other copies as
+    /// stale. A per-node ident gives each door its own intent, so the
+    /// reconciler owns its placement, restart and recovery like any appliance.
+    pub fn workload_name_on(&self, node: &str) -> String {
+        crate::reconciler::native_support::sanitize_ident(&format!(
+            "passway-inner-{}-{node}",
+            self.service
+        ))
     }
 
     /// Where this door's route table is materialized on the node.
@@ -643,12 +660,13 @@ impl InnerDoorPlan {
     /// R572-F1 already made and recorded.
     pub fn workload(
         &self,
+        node: &str,
         listen_port: u16,
         bundle_ident: &str,
         yubaba: &[String],
     ) -> Result<Workload> {
         let routes_path = self.routes_path();
-        let name = self.workload_name();
+        let name = self.workload_name_on(node);
         let listen = format!("127.0.0.1:{listen_port}");
 
         let env = vec![
@@ -669,8 +687,8 @@ impl InnerDoorPlan {
             // R876-T18: every `discover` mount polls Peer-class
             // /service-records, which a require-mode yubaba 401s unsigned.
             literal_env(
-                "PASSWAY_YUBABA_CLUSTER_KEY_FILE",
-                DOOR_CLUSTER_KEY_FILE.to_string(),
+                "PASSWAY_YUBABA_SERVICE_KEY_FILE",
+                DOOR_SERVICE_KEY_FILE.to_string(),
             ),
         ];
 
@@ -763,6 +781,8 @@ impl InnerDoorPlan {
             },
             labels: HashMap::new(),
             durability: None,
+            lease_id: None,
+            deadline: None,
             db: Vec::new(),
             capabilities: Vec::new(),
             annotations,
@@ -1084,7 +1104,29 @@ mod tests {
         let plan = plan(&svc, &BTreeMap::new()).unwrap().unwrap();
         let err = plan.routes_file("noisetable", &[]).unwrap_err().to_string();
         assert!(err.contains("at least one yubaba"), "{err}");
-        assert!(plan.workload(8443, "noisetable", &[]).is_err());
+        assert!(plan.workload("us-west-001", 8443, "noisetable", &[]).is_err());
+    }
+
+    /// One intent per door: two front doors sharing an ident share a single
+    /// `Appliance` placement, and rejoin cleanup stops whichever copy the
+    /// intent does not name (the 2026-10-27 noisetable.com 503).
+    #[test]
+    fn each_front_door_node_gets_its_own_door_ident() {
+        let svc = service(
+            "noisetable",
+            vec![
+                component("site", None, DeployTier::Bundle),
+                component("account", Some("app"), DeployTier::Workload),
+            ],
+        );
+        let plan = plan(&svc, &BTreeMap::new()).unwrap().unwrap();
+        let yubaba = ["http://100.64.0.3:7443".to_string()];
+        let west = plan.workload("us-west-001", 8443, "noisetable", &yubaba).unwrap();
+        let south = plan.workload("us-south-001", 8443, "noisetable", &yubaba).unwrap();
+        let (west, south) = (west.container_spec().unwrap(), south.container_spec().unwrap());
+        assert_eq!(west.name, "passway-inner-noisetable-us-west-001");
+        assert_eq!(south.name, "passway-inner-noisetable-us-south-001");
+        assert_eq!(west.expose.mesh.identity.0, west.name);
     }
 
     /// The rendered door, pinned on the four properties that are not
@@ -1101,7 +1143,7 @@ mod tests {
         );
         let plan = plan(&svc, &BTreeMap::new()).unwrap().unwrap();
         let workload = plan
-            .workload(8443, "noisetable", &["http://100.64.0.3:7443".to_string()])
+            .workload("us-west-001", 8443, "noisetable", &["http://100.64.0.3:7443".to_string()])
             .unwrap();
         let spec = workload.container_spec().expect("container-shaped");
 
@@ -1133,8 +1175,8 @@ mod tests {
         assert_eq!(env.get("PASSWAY_UPDATE_INTERVAL_SECS"), Some(&"2"));
         // R876-T18: the door's discovery polls are signed.
         assert_eq!(
-            env.get("PASSWAY_YUBABA_CLUSTER_KEY_FILE"),
-            Some(&DOOR_CLUSTER_KEY_FILE)
+            env.get("PASSWAY_YUBABA_SERVICE_KEY_FILE"),
+            Some(&DOOR_SERVICE_KEY_FILE)
         );
     }
 
@@ -1152,7 +1194,7 @@ mod tests {
         );
         let plan = plan(&svc, &BTreeMap::new()).unwrap().unwrap();
         let workload = plan
-            .workload(8443, "noisetable", &["http://100.64.0.3:7443".to_string()])
+            .workload("us-west-001", 8443, "noisetable", &["http://100.64.0.3:7443".to_string()])
             .unwrap();
         let spec = workload.container_spec().expect("container-shaped");
         assert!(spec.wants_native_exec());
@@ -1265,7 +1307,7 @@ mod tests {
         let plan = plan(&svc, &domains).unwrap().unwrap();
 
         let workload = plan
-            .workload(plan.listen_port(), "noisetable", &["http://100.64.0.3:7443".to_string()])
+            .workload("us-west-001", plan.listen_port(), "noisetable", &["http://100.64.0.3:7443".to_string()])
             .unwrap();
         let spec = workload.container_spec().expect("container-shaped");
         let listen = spec

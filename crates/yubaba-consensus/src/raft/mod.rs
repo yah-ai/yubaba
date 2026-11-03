@@ -289,7 +289,12 @@ use std::time::Duration;
 use openraft::{BasicNode, Raft};
 use serde::{Deserialize, Serialize};
 use workload_spec::secrets::SecretAccess;
+use workload_spec::sovereign::Participation;
 use workload_spec::TenantId;
+
+pub use crate::workload_intent::{
+    ReplicaPlacement, WorkloadIntent, WorkloadIntentOutcome, WorkloadKey,
+};
 
 pub use network::{YubabaNetwork, YubabaNetworkFactory};
 pub use store::{YubabaLogStore, YubabaStateMachine};
@@ -364,6 +369,18 @@ pub enum YubabaRequest {
         /// [`MemberInfo::public_address`].
         #[serde(default)]
         public_address: Option<String>,
+        /// R977-B12: this node's declared taints — see [`MemberInfo::taints`].
+        /// `#[serde(default)]`: an older `SetMember` lands as `None` (unknown).
+        #[serde(default)]
+        taints: Option<Vec<String>>,
+        /// R1019-F28: this node's declared mesh tags — see
+        /// [`MemberInfo::mesh_tags`]. `#[serde(default)]`: an older `SetMember`
+        /// lands as `None` (unknown).
+        #[serde(default)]
+        mesh_tags: Option<Vec<String>>,
+        /// R977-B12: see [`MemberInfo::sovereign_participation`].
+        #[serde(default)]
+        sovereign_participation: Option<Participation>,
     },
     RemoveMember {
         node_id: YubabaNodeId,
@@ -724,6 +741,36 @@ pub enum YubabaRequest {
     ClearTenantPlacement {
         tenant: TenantId,
     },
+
+    // R977-F1 (W364 §1): workload intent. Appended last; an older follower
+    // cannot parse these, so nothing may write them until
+    // `workload_intent::workload_intent_writes_open` says every voter can.
+    /// Declare (or redeclare) a workload's intent. Epochs never regress; see
+    /// [`crate::workload_intent::apply_put`].
+    PutWorkloadIntent {
+        key: WorkloadKey,
+        intent: WorkloadIntent,
+    },
+    /// Withdraw a workload's intent (stop/destroy).
+    DropWorkloadIntent { key: WorkloadKey },
+    /// Move one ordinal, CAS on `(from_node, from_epoch)`; bumps the epoch.
+    MoveWorkloadReplica {
+        key: WorkloadKey,
+        ordinal: u32,
+        from_node: String,
+        from_epoch: u64,
+        to_node: String,
+    },
+    // R997-B11: appended last. An older node cannot parse it, so nothing may
+    // write it until every log receiver advertises `workload_intent_attest`
+    // on `/health`.
+    /// Attach the operator's signature to an existing intent, iff its stored
+    /// `spec_json` is exactly `spec_json`. Placements are untouched.
+    AttestWorkloadIntent {
+        key: WorkloadKey,
+        spec_json: String,
+        operator_sig: String,
+    },
 }
 
 // openraft 0.10 requires `AppData: Debug + Display`. The Debug form is a faithful,
@@ -747,6 +794,8 @@ pub enum YubabaResponse {
     NodeHealth(NodeHealthOutcome),
     /// R118-F8: outcome of filing one node's liveness verdict about a peer.
     PeerLiveness(PeerLivenessOutcome),
+    /// R977-F1: outcome of a workload-intent request.
+    WorkloadIntent(WorkloadIntentOutcome),
 }
 
 /// The answer to a [`YubabaRequest::ReportPeerLiveness`] (R118-F8).
@@ -910,6 +959,10 @@ pub struct YubabaState {
     /// it, and the answer is about the membership it is *currently* out of.
     #[serde(default)]
     pub last_membership_ratchet: Option<MembershipRatchetRecord>,
+    /// R977-F1 (W364 §1): what should be running and where. `#[serde(default)]`
+    /// so a pre-R977 snapshot loads with nothing declared.
+    #[serde(default)]
+    pub workload_intent: BTreeMap<WorkloadKey, WorkloadIntent>,
 }
 
 impl YubabaState {
@@ -1994,6 +2047,42 @@ pub struct MemberInfo {
     /// [`IngressOwnerEffect::Withdraw`]: ../../floating_ip/enum.IngressOwnerEffect.html
     #[serde(default)]
     pub public_address: Option<String>,
+
+    /// R977-B12: this node's `.yah/infra/machines/<name>.toml` `taints`, copied
+    /// onto the box like `--region` (`--taints` / `YUBABA_TAINTS`).
+    ///
+    /// The replica reconcile re-places a workload onto a member, and a fresh
+    /// deploy refuses a node whose taints repel the workload
+    /// (`workload_spec::repelling_taint`). Without this field the reconcile
+    /// could not see `no-server` on a workstation at all.
+    ///
+    /// `None` is *unknown* — a node that predates the field or was started
+    /// without the flag — and the reconcile refuses it (fail closed).
+    /// `Some(vec![])` is a node that declared no taints.
+    #[serde(default)]
+    pub taints: Option<Vec<String>>,
+
+    /// R1019-F28 (W388): this node's `.yah/infra/machines/<name>.toml`
+    /// `mesh_tags` (`--mesh-tags` / `YUBABA_MESH_TAGS`), its `role:`s among
+    /// them.
+    ///
+    /// The replica reconcile re-places a workload only onto a member whose
+    /// tags are a superset of the spec's non-`arch:` selector, the rule fresh
+    /// admission applies. Before this field it could not read them at all, so
+    /// any replica selecting a role or a `tag:` was unmovable.
+    ///
+    /// `None` is unknown and refuses a spec that names such a tag (fail
+    /// closed). `Some(vec![])` is a node that declared none.
+    #[serde(default)]
+    pub mesh_tags: Option<Vec<String>>,
+
+    /// R977-B12: this node's `--sovereign-participation`. An `out` node can
+    /// still hold a raft seat (it warns at boot, it does not refuse), and the
+    /// reconcile must not re-place onto it: re-placement targets raft members
+    /// only, the floater scope where fresh admission requires `in`.
+    /// `None` is unknown and refuses.
+    #[serde(default)]
+    pub sovereign_participation: Option<Participation>,
 }
 
 /// The half of a [`MemberInfo`] a node declares **about itself** — everything
@@ -2022,6 +2111,12 @@ pub struct NodeDeclaration {
     pub ingress_floating_ip: Option<String>,
     /// [`MemberInfo::public_address`].
     pub public_address: Option<String>,
+    /// [`MemberInfo::taints`].
+    pub taints: Option<Vec<String>>,
+    /// [`MemberInfo::mesh_tags`].
+    pub mesh_tags: Option<Vec<String>>,
+    /// [`MemberInfo::sovereign_participation`].
+    pub sovereign_participation: Option<Participation>,
 }
 
 impl MemberInfo {
@@ -2041,6 +2136,9 @@ impl MemberInfo {
             location: decl.location.clone(),
             ingress_floating_ip: decl.ingress_floating_ip.clone(),
             public_address: decl.public_address.clone(),
+            taints: decl.taints.clone(),
+            mesh_tags: decl.mesh_tags.clone(),
+            sovereign_participation: decl.sovereign_participation,
         }
     }
 }
@@ -2066,6 +2164,9 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
             location,
             ingress_floating_ip,
             public_address,
+            taints,
+            mesh_tags,
+            sovereign_participation,
         } => {
             state.members.insert(
                 *node_id,
@@ -2078,6 +2179,9 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
                     location: location.clone(),
                     ingress_floating_ip: ingress_floating_ip.clone(),
                     public_address: public_address.clone(),
+                    taints: taints.clone(),
+                    mesh_tags: mesh_tags.clone(),
+                    sovereign_participation: *sovereign_participation,
                 },
             );
             YubabaResponse::Ok
@@ -2424,6 +2528,39 @@ pub fn apply(state: &mut YubabaState, req: &YubabaRequest) -> YubabaResponse {
             state.placement.remove(tenant);
             YubabaResponse::Ok
         }
+
+        // ── R977-F1 (W364 §1): workload intent ─────────────────────────────
+        YubabaRequest::PutWorkloadIntent { key, intent } => YubabaResponse::WorkloadIntent(
+            crate::workload_intent::apply_put(&mut state.workload_intent, key, intent),
+        ),
+        YubabaRequest::AttestWorkloadIntent {
+            key,
+            spec_json,
+            operator_sig,
+        } => YubabaResponse::WorkloadIntent(crate::workload_intent::apply_attest(
+            &mut state.workload_intent,
+            key,
+            spec_json,
+            operator_sig,
+        )),
+        YubabaRequest::DropWorkloadIntent { key } => {
+            state.workload_intent.remove(key);
+            YubabaResponse::WorkloadIntent(WorkloadIntentOutcome::Dropped)
+        }
+        YubabaRequest::MoveWorkloadReplica {
+            key,
+            ordinal,
+            from_node,
+            from_epoch,
+            to_node,
+        } => YubabaResponse::WorkloadIntent(crate::workload_intent::apply_move(
+            &mut state.workload_intent,
+            key,
+            *ordinal,
+            from_node,
+            *from_epoch,
+            to_node,
+        )),
     }
 }
 
@@ -2532,8 +2669,9 @@ pub async fn bootstrap_single_node(
     }
 }
 
-/// Default timeout for the forward-to-leader HTTP write in
-/// [`client_write_forwarded`].
+/// The bound on each leg of [`client_write_forwarded`]: the local
+/// `client_write`, and (as the callers' `PeerClient` timeout) the forward to
+/// the leader.
 pub const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Write `req` through consensus from **any** node, forwarding to the leader
@@ -2556,6 +2694,29 @@ pub const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 /// `BasicNode.addr` that openraft hands back in the error is the same mesh
 /// address the raft transport dials, so the forward needs no extra discovery.
 ///
+/// # The local write is bounded too (R936-B15)
+///
+/// openraft (=0.10.0-alpha.35) completes a `client_write` only when its entry
+/// is applied **on this node**, or when this node purges or truncates it
+/// (`RaftCore::client_responders`). Nothing completes it on a leadership
+/// change. Two ways that strands a call:
+///
+/// - A leader that loses quorum keeps its in-flight writes pending until
+///   quorum returns, which may be never. The R936-B15 test
+///   `a_write_this_node_can_never_apply_is_bounded_not_awaited_forever` stages
+///   this deterministically.
+/// - A leader that has removed itself keeps leading for
+///   `removed_leader_step_down` (150 ms) and then hands off. If a write it
+///   accepted is still uncommitted at the hand-off, the new leader can commit
+///   it, but nobody replicates to a node outside membership, so this node never
+///   applies it. This is the suspected cause of `POST /raft/remove-member`
+///   hanging in R936-B15. That is inference: the hang did not reproduce.
+///
+/// So the local write gets the same [`FORWARD_TIMEOUT`] the forward leg already
+/// has. Expiry means the outcome is unknown — the entry may still commit —
+/// which is no different from a forward that timed out, and every caller
+/// writes idempotent requests and retries.
+///
 /// # Errors
 ///
 /// Every failure is the caller's to retry — none is terminal. In particular a
@@ -2567,7 +2728,14 @@ pub async fn client_write_forwarded(
     client: &PeerClient,
     req: YubabaRequest,
 ) -> anyhow::Result<YubabaResponse> {
-    match raft.client_write(req.clone()).await {
+    let Ok(local) = tokio::time::timeout(FORWARD_TIMEOUT, raft.client_write(req.clone())).await
+    else {
+        anyhow::bail!(
+            "local raft write did not resolve within {FORWARD_TIMEOUT:?}; its outcome is unknown \
+             (this node may have left membership or lost quorum with the entry in flight)"
+        );
+    };
+    match local {
         Ok(resp) => Ok(resp.data),
         Err(openraft::error::RaftError::APIError(
             openraft::error::ClientWriteError::ForwardToLeader(fwd),
@@ -2581,9 +2749,10 @@ pub async fn client_write_forwarded(
                 );
             };
             let url = format!("http://{}/raft/write", leader.addr);
+            // R997-B27: the leader binds the write to the node this proves.
             let resp = client
-                .post(&url)
-                .json(&serde_json::json!({ "request": req }))
+                .post_json_proved(&url, &serde_json::json!({ "request": req }))
+                .map_err(|e| anyhow::anyhow!(e))?
                 .send()
                 .await?;
             let status = resp.status();
@@ -2881,7 +3050,10 @@ mod tests {
                 provider: Some("static".into()),
                 location: None,
                 ingress_floating_ip: None,
-                public_address: Some("15.204.89.240".into()),
+                public_address: Some("203.0.113.11".into()),
+                taints: None,
+                mesh_tags: None,
+                sovereign_participation: None,
             },
         );
         assert_eq!(
@@ -2907,7 +3079,7 @@ mod tests {
         );
         assert_eq!(
             state.members.get(&1).and_then(|m| m.public_address.as_deref()),
-            Some("15.204.89.240"),
+            Some("203.0.113.11"),
             "R859-F2 phase A: the public address must survive apply — it is the only fact that \
              turns `withdraw us-west-001` into an A record the fleet may delete, and a \
              content-matched delete cannot be performed without it"
@@ -2942,6 +3114,9 @@ mod tests {
                     location: None,
                     ingress_floating_ip: None,
                     public_address: None,
+                    taints: None,
+                    mesh_tags: None,
+                    sovereign_participation: None,
                 },
             );
         }
@@ -3965,6 +4140,9 @@ mod tests {
                 location: None,
                 ingress_floating_ip: None,
                 public_address: None,
+                taints: None,
+                mesh_tags: None,
+                sovereign_participation: None,
             },
         );
     }
@@ -4394,5 +4572,174 @@ mod tests {
         let old: PreF2MemberInfo = serde_json::from_str(tagged)
             .expect("a downgraded binary must still parse a region-tagged member row");
         assert_eq!(old.addr, "100.64.0.1:7443");
+    }
+
+    // ── R977-F1 (W364 §1): workload intent ──────────────────────────────────
+
+    fn wkey() -> WorkloadKey {
+        WorkloadKey("fleet-git".into())
+    }
+
+    fn intent_on(node: &str, epoch: u64) -> WorkloadIntent {
+        WorkloadIntent {
+            spec_json: "{}".into(),
+            replicas: 1,
+            placements: [(
+                0,
+                ReplicaPlacement {
+                    node: node.into(),
+                    epoch,
+                },
+            )]
+            .into(),
+            movable: true,
+            requesting_camp_id: None,
+            on_behalf_of_user: None,
+            operator_sig: None,
+        }
+    }
+
+    fn mv(from: &str, from_epoch: u64, to: &str) -> YubabaRequest {
+        YubabaRequest::MoveWorkloadReplica {
+            key: wkey(),
+            ordinal: 0,
+            from_node: from.into(),
+            from_epoch,
+            to_node: to.into(),
+        }
+    }
+
+    fn placed(state: &YubabaState) -> ReplicaPlacement {
+        state.workload_intent[&wkey()].placements[&0].clone()
+    }
+
+    #[test]
+    fn put_workload_intent_records_it_and_round_trips_the_state() {
+        let mut state = YubabaState::default();
+        let resp = apply(
+            &mut state,
+            &YubabaRequest::PutWorkloadIntent {
+                key: wkey(),
+                intent: intent_on("a", 1),
+            },
+        );
+        assert!(matches!(
+            resp,
+            YubabaResponse::WorkloadIntent(WorkloadIntentOutcome::Recorded { .. })
+        ));
+        assert_eq!(state.workload_intent[&wkey()], intent_on("a", 1));
+        let restored: YubabaState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(restored.workload_intent, state.workload_intent);
+    }
+
+    #[test]
+    fn a_re_put_never_regresses_an_ordinals_epoch() {
+        let mut state = YubabaState::default();
+        let put = |node: &str| YubabaRequest::PutWorkloadIntent {
+            key: wkey(),
+            intent: intent_on(node, 1),
+        };
+        apply(&mut state, &put("a"));
+        apply(&mut state, &mv("a", 1, "b"));
+        // Redeploy on the same node at epoch 1: keeps 2.
+        apply(&mut state, &put("b"));
+        assert_eq!(placed(&state), ReplicaPlacement { node: "b".into(), epoch: 2 });
+        // Redeploy back on `a` at epoch 1: must exceed 2, so A->B->A is visible.
+        apply(&mut state, &put("a"));
+        assert_eq!(placed(&state), ReplicaPlacement { node: "a".into(), epoch: 3 });
+    }
+
+    #[test]
+    fn drop_workload_intent_removes_it() {
+        let mut state = YubabaState::default();
+        apply(
+            &mut state,
+            &YubabaRequest::PutWorkloadIntent {
+                key: wkey(),
+                intent: intent_on("a", 1),
+            },
+        );
+        let resp = apply(&mut state, &YubabaRequest::DropWorkloadIntent { key: wkey() });
+        assert!(matches!(
+            resp,
+            YubabaResponse::WorkloadIntent(WorkloadIntentOutcome::Dropped)
+        ));
+        assert!(state.workload_intent.is_empty());
+    }
+
+    #[test]
+    fn move_workload_replica_cas_win_bumps_the_epoch() {
+        let mut state = YubabaState::default();
+        state.workload_intent.insert(wkey(), intent_on("a", 1));
+        let resp = apply(&mut state, &mv("a", 1, "b"));
+        let want = ReplicaPlacement { node: "b".into(), epoch: 2 };
+        assert!(matches!(
+            resp,
+            YubabaResponse::WorkloadIntent(WorkloadIntentOutcome::Moved { ref placement })
+                if *placement == want
+        ));
+        assert_eq!(placed(&state), want);
+    }
+
+    #[test]
+    fn move_workload_replica_cas_loss_on_a_stale_node_or_epoch() {
+        let mut state = YubabaState::default();
+        state.workload_intent.insert(wkey(), intent_on("a", 3));
+        for stale in [mv("a", 2, "b"), mv("c", 3, "b")] {
+            let resp = apply(&mut state, &stale);
+            assert!(matches!(
+                resp,
+                YubabaResponse::WorkloadIntent(WorkloadIntentOutcome::Fenced {
+                    current: Some(ref p)
+                }) if p.node == "a" && p.epoch == 3
+            ), "{resp:?}");
+        }
+        assert_eq!(placed(&state), ReplicaPlacement { node: "a".into(), epoch: 3 });
+        // No such key: fenced with nothing current.
+        let mut empty = YubabaState::default();
+        assert!(matches!(
+            apply(&mut empty, &mv("a", 1, "b")),
+            YubabaResponse::WorkloadIntent(WorkloadIntentOutcome::Fenced { current: None })
+        ));
+    }
+
+    #[test]
+    fn move_workload_replica_replay_is_a_no_op() {
+        let mut state = YubabaState::default();
+        state.workload_intent.insert(wkey(), intent_on("a", 1));
+        apply(&mut state, &mv("a", 1, "b"));
+        let before = state.workload_intent.clone();
+        let resp = apply(&mut state, &mv("a", 1, "b"));
+        assert!(matches!(
+            resp,
+            YubabaResponse::WorkloadIntent(WorkloadIntentOutcome::Moved { ref placement })
+                if placement.epoch == 2 && placement.node == "b"
+        ));
+        assert_eq!(state.workload_intent, before, "a replay must not advance again");
+    }
+
+    #[test]
+    fn a_pre_r977_snapshot_without_workload_intent_loads_empty() {
+        let legacy = r#"{"members":{},"service_placement":{},"locks":{},"ingress_owner":null,"rollouts":{},"tenants":{},"placement":{}}"#;
+        let state: YubabaState = serde_json::from_str(legacy).unwrap();
+        assert!(state.workload_intent.is_empty());
+    }
+
+    /// cluster-epochs.json state_epoch "9" claims NEW-READS-OLD for R997-B11,
+    /// and `state_epoch_reads_from` stands on that claim (R625-B8): a pre-B11
+    /// snapshot, whose intents carry no `operator_sig` key at all, loads with
+    /// every intent unattested rather than failing.
+    #[test]
+    fn a_pre_r997_b11_snapshot_without_operator_sig_loads_unattested() {
+        let mut state = YubabaState::default();
+        state.workload_intent.insert(wkey(), intent_on("a", 1));
+        let legacy = serde_json::to_string(&state).unwrap();
+        assert!(
+            !legacy.contains("operator_sig"),
+            "an unattested intent must serialize in the pre-B11 shape: {legacy}"
+        );
+        let loaded: YubabaState = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(loaded.workload_intent[&wkey()].operator_sig, None);
     }
 }

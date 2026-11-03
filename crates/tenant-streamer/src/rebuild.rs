@@ -69,7 +69,7 @@
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use turso_backup::snapshot::BackupTarget;
+use store_claim::BackupTarget;
 use turso_backup::stream::{read_fence_state, FenceState};
 use workload_spec::TenantId;
 use yah_object_store::ObjectStore;

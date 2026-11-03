@@ -70,7 +70,7 @@ use std::sync::Arc;
 use futures_util::StreamExt;
 use object_store::memory::InMemory;
 use object_store::ObjectStore;
-use turso_backup::snapshot::BackupTarget;
+use store_claim::BackupTarget;
 use turso_backup::stream::{
     tail_frames, FrameInfo, StreamConfig, StreamOutcome, WalSeam, Watermark, WAL_FRAME_HEADER_SIZE,
 };

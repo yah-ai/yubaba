@@ -168,13 +168,14 @@ async fn publish(ctx: &ReconcileCtx<'_>, endpoint: &str, bucket: &str) -> Result
         return Ok(0);
     }
 
+    let prefix = mount_key_prefix(ctx);
     let report = super::pond_publish::publish_to_pond(
         &dist_dir,
         endpoint,
         bucket,
         DEV_ACCESS_KEY,
         DEV_SECRET_KEY,
-        None,
+        prefix.as_deref(),
     )
     .await
     .with_context(|| format!("publishing {} to dev bucket {bucket}", dist_dir.display()))?;
@@ -186,6 +187,41 @@ async fn publish(ctx: &ReconcileCtx<'_>, endpoint: &str, bucket: &str) -> Result
 /// `static_fields` are the `providers.static` slot's fields — `port` and an
 /// optional `bucket` override. `worker_script` is the compiled Worker bundle,
 /// injected by the caller so dev runs the same artifact prod does.
+///
+/// @yah:ticket(R584-B8, "Dev/pond static doors die with the `yah cloud mirror up` CLI: miniflare is supervised in-process with kill_on_drop")
+/// @yah:status(review)
+/// @yah:at(2026-10-10T19:14:35Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R584)
+/// @yah:severity(high)
+/// @yah:handoff("LANDED (Ashguard:polaris, courier for noisetable R823, F1071). Choice: a detached supervised child, not a hand-off to the daemon. It is the same durability contract local-process slots already have (pid record + reap on re-run), so it works with no camp running, and the Run tab keeps its in-process supervision unchanged. pond.rs spawn_miniflare_child: no kill_on_drop. stdout/stderr go to door_dir/miniflare.{stdout,stderr}.log (FileTail feeds the LogBuffer and detects the ready line; FileTail is no longer gated to unix). process_group(0), and the pgid is recorded in door_dir/miniflare.pgid. A re-run calls reap_door_predecessor (killpg TERM, 5s, KILL) before ensure_sim_port_free. New MiniflareChild owns child+pgid. Dropping it kills nothing. run_miniflare_supervisor returns Supervised::{Stopped, Detached}: a dropped-unsent shutdown sender means Detached, and the door is left serving. New RunningWorkload::detach() (reconciler/mod.rs). native_support's local-process supervisor also skips teardown on a dropped sender. CLI handle_mirror_up (app/yah/cli/src/cloud.rs) now holds the workloads. On success it detaches them. On any phase failure it rolls them back via shutdown(). Pond: when detached, supervise_miniflare_and_minio leaves MinIO up too. There is no `mirror down` verb (MirrorCommands is Show/Status/Up), so the re-run is the reaper, as it is for local-process.")
+/// @yah:verify("yah-cloud lib: 1363 pass / 0 fail / 6 ignored (baseline 1359; +4: a_detached_door_survives_and_the_next_spawn_reaps_it, kill_group_reaps_a_grandchild_that_ignores_sigterm, a_local_process_workload_port_collides_with_a_door, a_mounted_component_publishes_under_its_mount). cargo check -p yah -p desktop EXIT=0. Opt-in binary (target/opt-in/bin/yah) in noisetable: after `mirror up noisetable-marketing --env dev` exited 0, :4331/ gave 200 and :4332/app/ 200 (with R584-B10). On a re-run the old bun/workerd pids were all gone, exactly one bun+workerd per door, one listener each on 4331/4332. Needs yah-install (live ~/.local/bin/yah) before QED web-dev-smoke sees it, and a yah-desktop-build + relaunch for the Run tab.")
+/// @yah:gotcha("Behaviour change: since dropping a door handle no longer kills it, a desktop that quits abruptly without calling shutdown leaves its doors serving until the next up of that door reaps them. Previously kill_on_drop killed bun but stranded workerd anyway. Also: the stop-everything step of my verification sent SIGTERM to pids from the stale noisetable-desktop owner.json records (1743, 97637; files dated Oct 4/5). Neither pid exists now, and I cannot tell whether either was live (possibly recycled) when signalled.")
+/// The bucket key prefix a component publishes under: its `mount`, the way
+/// the cloud tier's `publish_prefix` appends it after `<svc>/<env>`. Every
+/// component of a service shares the one dev bucket, so without this a
+/// `mount = "/app"` component landed at the bucket root — clobbering its
+/// root-mounted sibling's `index.html` and leaving `/app/` a 404 (noisetable
+/// R823, found under R584-B8).
+///
+/// @yah:ticket(R584-B10, "Dev door publishes every component to the bucket root, ignoring `mount`: /app/ 404s and siblings clobber index.html")
+/// @yah:status(review)
+/// @yah:at(2026-10-10T19:14:49Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R584)
+/// @yah:severity(medium)
+/// @yah:handoff("LANDED (Ashguard:polaris), found while working noisetable R823 item 2. This ticket was filed after the fix, not before. Cause: dev_door::publish passed key_prefix None, so every component of a service published to the root of the one shared dev bucket. noisetable-marketing's app (mount=/app, out_dir=publish, so it serves app/browser/publish) overwrote the site's index.html and left nothing at app/. :4332/app/ was a 404 and :4332/ served whichever index won. This was not an artifact of R584-B8. Fix: new mount_key_prefix(ctx) publishes under normalize_mount(mount), matching the cloud tier's publish_prefix `<svc>/<env>/<mount>`. No noisetable declaration change is needed.")
+/// @yah:verify("Unit: a_mounted_component_publishes_under_its_mount. Live, opt-in: :4332/app/ 200 serving the app bundle (cdn.noisetable.com/app/ refs, 4 hits) and :4331/ the site (0 hits).")
+/// @yah:gotcha("The same None prefix exists in pond.rs up_pond's publish_to_pond call. NOT changed (out of brief scope; docker is inert for agents). Separately, the dev door sends no per-route headers: spawn_miniflare_child passes domain None to worker_route_table_json, so /app/ lacks noisetable-com.toml's COOP/COEP, and web-dev-smoke's app-boot fails crossOriginIsolated. Not filed here.")
+/// @yah:cleanup("noisetable's dev bucket still holds the app files the pre-fix runs published at its root (BUILDINFO.json, THIRD-PARTY-NOTICES.*). Harmless, but a clean re-publish of the bucket would drop them.")
+fn mount_key_prefix(ctx: &ReconcileCtx<'_>) -> Option<String> {
+    ctx.component
+        .mount
+        .as_deref()
+        .map(crate::config::normalize_mount)
+        .filter(|m| !m.is_empty())
+}
+
 pub async fn up_dev_door(
     ctx: &ReconcileCtx<'_>,
     options: &PondOptions,
@@ -217,6 +253,7 @@ pub async fn up_dev_door(
         &asset_origin,
         worker_script,
         &worker_mode,
+        &super::mesofact_static::BackendOrigins::from_slot_fields(static_fields),
     )
     .await?;
 
@@ -225,7 +262,8 @@ pub async fn up_dev_door(
     // store is the camp's, outlives this mirror, and is shared with every other
     // dev service. Stopping the mirror stops the door and nothing else.
     let supervisor = tokio::spawn(async move {
-        run_miniflare_supervisor(child, shutdown_rx).await;
+        // Detached (R584-B8) or stopped: either way nothing more to own.
+        let _ = run_miniflare_supervisor(child, shutdown_rx).await;
         Ok(())
     });
 
@@ -352,6 +390,24 @@ mod tests {
         let mut fields = BTreeMap::new();
         fields.insert("bucket".to_string(), toml::Value::String("other".into()));
         assert_eq!(resolve_bucket(&c, &fields), "other");
+    }
+
+    #[test]
+    fn a_mounted_component_publishes_under_its_mount() {
+        let svc = service();
+        let m = mirror("schema_version = 1\nshape = \"local\"\n");
+        let root = component();
+        assert_eq!(mount_key_prefix(&ctx(Path::new("/tmp"), &svc, &root, &m)), None);
+
+        let app: ServiceComponent = toml::from_str(
+            "id = \"app\"\nkind = \"mesofact-static\"\npath = \"app/browser\"\n\
+             role = \"static\"\nmount = \"/app\"\n",
+        )
+        .expect("parse component");
+        assert_eq!(
+            mount_key_prefix(&ctx(Path::new("/tmp"), &svc, &app, &m)).as_deref(),
+            Some("app")
+        );
     }
 
     #[tokio::test]

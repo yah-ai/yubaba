@@ -10,7 +10,6 @@ machines = ["us-east-001", "us-south-001", "us-west-001"]
 
 [providers.compute]
 kind = "static"
-machine = "us-east-001"
 zone = "api.noisetable.com"
 port = 4332
 
@@ -101,7 +100,7 @@ value = { literal = { value = "noisetable-account/account-live" } }
 
 [[workload.api.env]]
 name = "XLB_R2_ENDPOINT"
-value = { literal = { value = "https://3948dc292e724e71b0deefde0ea95999.r2.cloudflarestorage.com" } }
+value = { literal = { value = "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com" } }
 
 [[workload.api.env]]
 name = "XLB_R2_BUCKET"

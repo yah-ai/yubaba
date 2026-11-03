@@ -58,8 +58,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
-use turso_backup::snapshot::BackupTarget;
-use turso_backup::stream::{probe_conditional_puts, PreconditionSupport};
+use store_claim::{probe_conditional_puts, BackupTarget, PreconditionSupport};
 use yah_object_store::r2::R2ObjectStore;
 
 pub use config::{SinkConfig, StreamerConfig, TenantConfig};

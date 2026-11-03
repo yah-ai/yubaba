@@ -121,6 +121,8 @@ fn isolated_spec(name: &str, ports: Vec<u16>) -> WorkloadSpec {
         },
         labels: Default::default(),
         durability: None,
+        lease_id: None,
+        deadline: None,
         db: Vec::new(),
         capabilities: Vec::new(),
         annotations: Default::default(),
@@ -581,6 +583,7 @@ async fn an_unroutable_tenant_workload_makes_the_ingress_apply_refuse() {
         via: None,
         behind_tunnel: false,
         tunnel_door: None,
+        door: None,
     };
     let mut fanout = ServiceRecordFanout::default();
     fanout.push_answer("us-east-001", discovered);

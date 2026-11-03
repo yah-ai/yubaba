@@ -23,9 +23,15 @@
 
 use std::time::Duration;
 
+use cloud::provider::HetznerDriver;
 use serde_json::json;
 use yubaba::cluster_policy::ClusterPolicy;
-use yubaba_test_harness::{solo_node, solo_node_in_region, solo_node_unregistered, SoloNode};
+use yubaba::raft::{self, YubabaRequest, FORWARD_TIMEOUT};
+use yubaba::runtime::DummyRuntime;
+use yubaba_test_harness::{
+    solo_node, solo_node_in_region, solo_node_unregistered, test_cluster_with_policy, Cluster,
+    SoloNode,
+};
 
 async fn post_json(base_url: &str, path: &str, body: serde_json::Value) -> (u16, String) {
     let resp = yubaba_test_harness::http()
@@ -304,6 +310,18 @@ async fn untagged_rig_nodes_still_register_their_addresses() {
 /// one: a 2-2-1 five-voter fleet, and an operator decommissioning both machines
 /// in one region. Three survivors is a perfectly good number; two of them being
 /// in `us-east` is the problem.
+///
+/// The allowed removal of `[1, 3]` usually removes the **sitting leader**: node
+/// 1 founds the cluster and wins the first election (it led in 30 of 30 fleets
+/// probed for R936-B15). This test hung until a 900 s kill in 2 of 32 loaded
+/// runs on 2026-09-26, and did not hang in 128 loaded runs on 2026-10-10. The
+/// suspected cause is inferred, not reproduced. A removed leader keeps leading
+/// for openraft's `removed_leader_step_down` (150 ms) and then hands off, and a
+/// write it accepted but had not seen commit by then is never resolved. That
+/// can happen to the handler's row writes or to `change_membership`'s own
+/// uniform step. The row writes are now bounded, and so is every request this
+/// suite makes. See
+/// [`a_write_this_node_can_never_apply_is_bounded_not_awaited_forever`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn a_removal_that_would_leave_a_lopsided_quorum_is_refused() {
     let (nodes, leader_idx) =
@@ -357,6 +375,68 @@ async fn a_removal_that_would_leave_a_lopsided_quorum_is_refused() {
         parsed["spread_judged"], true,
         "and the response must say the spread clause actually ran, so an operator can tell \
          an allowed removal from an unjudgeable one: {body}"
+    );
+}
+
+/// R936-B15: a write this node accepted but can never apply returns an error
+/// within [`FORWARD_TIMEOUT`] instead of hanging the caller forever.
+///
+/// openraft completes a `client_write` only once the entry is applied on this
+/// node, or purged or truncated here. The suspected B15 trigger is a leader that
+/// has just removed itself: nobody replicates to a node outside membership, so
+/// a write still in flight at its hand-off never applies. That race sits on a
+/// 150 ms timer and cannot be staged on demand. This test stages a
+/// deterministic case of the same stranding instead: a leader whose two
+/// followers are gone accepts the write while its lease holds, and can never
+/// commit it. Without the bound, `client_write_forwarded` stays pending
+/// forever, and so does any handler awaiting it.
+///
+/// The error text is asserted so the test is not vacuous. A leader that had
+/// already let its lease lapse would refuse the write immediately, and that
+/// would pass for the wrong reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_this_node_can_never_apply_is_bounded_not_awaited_forever() {
+    let provider = HetznerDriver::new("unused-on-local-tier");
+    let mut cluster: Cluster =
+        test_cluster_with_policy(&provider, DummyRuntime, 3, ClusterPolicy::fleet())
+            .await
+            .expect("3-node fleet cluster");
+    let leader = cluster
+        .wait_for_agreed_leader(Duration::from_secs(30))
+        .await
+        .expect("the founding cluster elects a leader");
+
+    // Both followers go dark well inside the leader's lease (the fleet's WAN
+    // timing), so the leader still accepts the write and appends it.
+    for idx in (0..3).filter(|i| *i != leader) {
+        cluster.kill_node(idx).await.expect("kill a follower");
+    }
+
+    let raft = cluster.raft(leader).expect("leader raft").clone();
+    let state = cluster.server_state(leader).expect("leader state");
+    let started = tokio::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        FORWARD_TIMEOUT + Duration::from_secs(20),
+        raft::client_write_forwarded(
+            &raft,
+            &state.http,
+            YubabaRequest::RemoveMember { node_id: 99 },
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "client_write_forwarded was still pending {:?} after its leader lost quorum: an \
+             unresolvable local write must be bounded, not awaited forever",
+            started.elapsed()
+        )
+    });
+
+    let err = outcome.expect_err("a write that cannot commit must not report success");
+    assert!(
+        err.to_string().contains("did not resolve within"),
+        "the write must have been ACCEPTED and then bounded. Any other error means the leader \
+         refused it up front and this test proved nothing: {err:#}"
     );
 }
 

@@ -276,6 +276,18 @@ fn slot_binds_localhost(slot: &MirrorProviderSlot) -> bool {
 /// Deterministic: services + mirror envs are walked in sorted order, slot
 /// roles sorted, `PORT_FIELDS` in declared order — so the "first" binder of a
 /// port is stable across runs. Missing `.yah/services/` is not an error.
+///
+/// @yah:ticket(R715-B8, "yah cloud validate port-collision check never reads local-process workload ports")
+/// @yah:status(review)
+/// @yah:at(2026-10-10T19:14:56Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R715)
+/// @yah:next("Tier: Warrior. check_port_collisions (oss/yubaba/crates/cloud/src/validate.rs ~:279) uses slot_binds_localhost (~:264), which only walks miniflare/minio slots. A local-process slot's port lives in the component's workload.toml [process] and is never read, so it cannot collide-detect.")
+/// @yah:next("Evidence (noisetable R823-T1, 2026-10-10): a forced 4332 collision against the noisetable-api :4334 slot validated clean. Fix: include local-process slots (port from workload.toml) in the collision walk.")
+/// @yah:next("Not filed as dependent on R715-B7 (cross-camp/ordering aside): independent, but only observable end to end once binary components reach the local-process reconciler.")
+/// @yah:verify("A test where two mirrors/slots (one local-process) bind the same port reports a PortCollision; noisetable `yah cloud validate` sees 4334.")
+/// @yah:handoff("LANDED (Ashguard:polaris). check_port_collisions (oss/yubaba/crates/cloud/src/validate.rs) now also walks local_process_ports(): on a shape=local mirror whose [providers.compute] is inline kind local-process, each in-tree component of kind binary|container contributes its workload.toml [process].port, under slot_role 'compute' with field '<component>/workload.toml [process].port'. The predicate is inlined rather than calling local_process::slot_declared, because that module is cfg(unix) and validate is not. Git components are skipped, since their source is not checked out at validate time. Seam: this reads LoadedMirror.service_config, a field @Glimmerstone:griffin added for R959-F6 that is uncommitted in the shared tree. My hunk depends on theirs landing.")
+/// @yah:verify("Unit: a_local_process_workload_port_collides_with_a_door (collides with a door on the same port; no collision once the mirror drops the local-process slot). yah-cloud lib 1363/0. Live, opt-in, on a scratch copy of noisetable's .yah (deleted afterwards) with static:app forced to 4334, validate reported 'host port 4334 is bound by both noisetable-api/dev (providers.compute.api/workload.toml [process].port) and noisetable-marketing/dev (providers.static:app.port)'. The unforced copy reported 0 port problems. Both runs also showed 2 pre-existing ingress-plan errors for noisetable-api prod/staging in the scratch copy. Those are unrelated to ports.")
 pub fn check_port_collisions(workspace_root: &Path) -> anyhow::Result<Vec<PortCollision>> {
     // port → first source seen
     let mut seen: BTreeMap<u16, PortSource> = BTreeMap::new();
@@ -311,9 +323,71 @@ pub fn check_port_collisions(workspace_root: &Path) -> anyhow::Result<Vec<PortCo
                 }
             }
         }
+        // R715-B8: a local-process compute slot binds whatever port each
+        // component it runs declares in its workload.toml `[process]` — the
+        // slot itself carries none, so the walk above never saw it.
+        for (component, port) in local_process_ports(workspace_root, &m) {
+            let source = PortSource {
+                service: m.service.clone(),
+                env: m.env.clone(),
+                slot_role: "compute".to_string(),
+                field: format!("{component}/workload.toml [process].port"),
+            };
+            match seen.get(&port) {
+                Some(first) => collisions.push(PortCollision {
+                    port,
+                    first: first.clone(),
+                    second: source,
+                }),
+                None => {
+                    seen.insert(port, source);
+                }
+            }
+        }
     }
 
     Ok(collisions)
+}
+
+/// `(component id, port)` for every component a `local-process` compute slot
+/// on this mirror runs natively: kind `binary` or `container` on a `local`
+/// mirror (the [`crate::reconciler::binary_runtime`] / container-arm routing),
+/// with an in-tree workload.toml whose `[process]` declares a `port`. A git
+/// component's source is not checked out at validate time, so it is skipped
+/// rather than guessed at; so is an unreadable workload.toml, which the
+/// reconciler reports by name when it runs.
+fn local_process_ports(workspace_root: &Path, m: &LoadedMirror) -> Vec<(String, u16)> {
+    if !matches!(m.mirror.shape, crate::MirrorShape::Local)
+        // local_process::slot_declared's predicate, inlined: that module is
+        // unix-only and validate is not.
+        || m.mirror.providers.get("compute").and_then(|s| s.inline_kind())
+            != Some(Provider::LocalProcess)
+    {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for component in &m.service_config.components {
+        if !matches!(component.kind.as_str(), "binary" | "container") || component.git.is_some()
+        {
+            continue;
+        }
+        let path = workspace_root.join(&component.path).join("workload.toml");
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = toml::from_str::<toml::Value>(&src) else {
+            continue;
+        };
+        let port = value
+            .get("process")
+            .and_then(|p| p.get("port"))
+            .and_then(toml::Value::as_integer)
+            .and_then(|p| u16::try_from(p).ok());
+        if let Some(port) = port {
+            out.push((component.id.clone(), port));
+        }
+    }
+    out
 }
 
 // ── Shared machine-TOML loader (R787) ───────────────────────────────────────
@@ -510,6 +584,54 @@ pub fn check_retired_arch_tags(workspace_root: &Path) -> anyhow::Result<Vec<Reti
                 machine: machine.name.clone(),
                 machine_toml: path.clone(),
                 tag: tag.clone(),
+            });
+        }
+    }
+    Ok(found)
+}
+
+// ── R1019-F28 (W388): node roles outside the closed vocabulary ─────────────
+
+/// A machine declaring a `role:` mesh tag that is not in
+/// [`workload_spec::ROLE_KEYS`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownRole {
+    pub machine: String,
+    pub machine_toml: PathBuf,
+    /// The offending tag, verbatim (e.g. `role:cloud-capacity`).
+    pub tag: String,
+}
+
+impl UnknownRole {
+    pub fn message(&self) -> String {
+        format!(
+            "machine {:?} declares the node role {:?}, which is not in the role vocabulary\n\
+             \u{2192} placement is SUPERSET matching, so a workload naming the real role \
+             never matches this node and reports 'no node' with nothing naming the typo.\n\
+             \u{2192} legal roles: {} (W388; workload_spec::ROLE_KEYS)\n  {}",
+            self.machine,
+            self.tag,
+            workload_spec::ROLE_KEYS.join(", "),
+            self.machine_toml.display(),
+        )
+    }
+}
+
+/// Flag every `role:` mesh tag on a camp-local machine that is outside the
+/// closed role vocabulary (W388 §4 item 2).
+///
+/// Same family and the same camp-local scoping as
+/// [`check_retired_arch_tags`], and for the same reason: the failure is a node
+/// that quietly stops being a candidate. Admission refuses an unknown role on
+/// the workload side; this is the node side.
+pub fn check_unknown_roles(workspace_root: &Path) -> anyhow::Result<Vec<UnknownRole>> {
+    let mut found = Vec::new();
+    for (path, machine) in load_camp_local_machine_tomls(workspace_root)? {
+        for tag in workload_spec::unknown_roles_of(&machine.mesh_tags) {
+            found.push(UnknownRole {
+                machine: machine.name.clone(),
+                machine_toml: path.clone(),
+                tag: tag.to_string(),
             });
         }
     }
@@ -830,7 +952,7 @@ pub fn check_sovereign_groups(
 pub struct LanDialTarget {
     pub machine: String,
     pub machine_toml: PathBuf,
-    /// The offending URL, verbatim (e.g. `http://192.168.10.11:7443`).
+    /// The offending URL, verbatim (e.g. `http://192.168.250.11:7443`).
     pub url: String,
     /// The registered mesh address, when the box has one — the difference
     /// between "delete a line" and "go join the mesh first".
@@ -856,7 +978,7 @@ impl LanDialTarget {
              \u{2192} the LAN address is an emergency break-glass route, never an official one \
              (R605-T10, operator 2026-08-19). Automation ALWAYS assumes the caller is not on that \
              LAN, and this camp genuinely is not — it sits on 192.168.22.0/22 with no route to \
-             192.168.10.0/24.\n\
+             192.168.250.0/24.\n\
              \u{2192} it does not sit beside the mesh route, it OVERRODE it: before this check, a \
              declared literal beat `[registration].mesh_ipv4` outright (R707-T6), so a healthy \
              mesh-joined build worker was elected and then dialed at an address only its own \
@@ -1061,6 +1183,9 @@ pub struct LoadedMirror {
     /// Path to the mirror TOML — what an operator opens to fix a finding.
     pub path: PathBuf,
     pub mirror: MirrorConfig,
+    /// The `service.toml` the mirror belongs to: lowering a component on this
+    /// mirror needs it (R959-F6).
+    pub service_config: ServiceConfig,
 }
 
 /// Every `.yah/services/<svc>/mirrors/<env>.toml` in the workspace, in a
@@ -1136,6 +1261,7 @@ pub fn load_service_mirrors(workspace_root: &Path) -> anyhow::Result<Vec<LoadedM
                     .to_string(),
                 path,
                 mirror,
+                service_config: service.clone(),
             });
         }
     }
@@ -1253,8 +1379,35 @@ pub fn collate_workspace_ingress(workspace_root: &Path) -> anyhow::Result<Ingres
     let mut planned = Vec::new();
     let mut problems = Vec::new();
 
+    // R959-F6: a lowered compute slot is placed by admission, which sums a
+    // placement group over the camp's own lowered workloads. A camp whose
+    // lowering fails is one finding; each mirror then still plans against
+    // the specs alone, and its own lowering error lands on that mirror.
+    let declared: Vec<crate::config::WorkloadConfig> =
+        match crate::config::lowered_camp_workloads(workspace_root) {
+            Ok(lowered) => lowered
+                .into_iter()
+                .map(|d| crate::config::WorkloadConfig { spec: d.spec })
+                .collect(),
+            Err(e) => {
+                problems.push(IngressProblem::Collation {
+                    detail: format!("lowering the camp's workloads: {e:#}"),
+                });
+                Vec::new()
+            }
+        };
+
     for m in load_service_mirrors(workspace_root)? {
-        let placements = match crate::reconciler::resolve_ingress_placements(&machines, &m.mirror) {
+        let placements = match crate::lower::admitted_compute_slots(
+            &m.service_config,
+            &m.env,
+            &m.mirror,
+            &machines,
+            &declared,
+        )
+        .and_then(|admitted| {
+            crate::reconciler::resolve_ingress_placements(&machines, &m.mirror, &admitted)
+        }) {
             Ok(p) => p,
             Err(e) => {
                 problems.push(IngressProblem::Declaration {
@@ -1526,6 +1679,49 @@ mod tests {
     }
 
     #[test]
+    fn a_local_process_workload_port_collides_with_a_door() {
+        // R715-B8: noisetable's shape — an api `binary` run by a local-process
+        // compute slot on :4334, whose port lives only in its workload.toml.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let svc_dir = root.join(".yah/services/api");
+        std::fs::create_dir_all(&svc_dir).unwrap();
+        std::fs::write(
+            svc_dir.join("service.toml"),
+            "schema_version = 1\nname = \"api\"\n[address]\nkind = \"front-door\"\n\
+             domain = \"api.example.com\"\n\
+             [[components]]\nid = \"account\"\nkind = \"binary\"\npath = \"svc/account\"\nrole = \"compute\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("svc/account")).unwrap();
+        std::fs::write(
+            root.join("svc/account/workload.toml"),
+            "[process]\ncargo_package = \"account\"\nport = 4334\n",
+        )
+        .unwrap();
+        write_mirror(
+            root,
+            "api",
+            "dev",
+            "schema_version = 1\nshape = \"local\"\n\
+             [providers.compute]\nkind = \"local-process\"\n",
+        );
+        write_service(root, "site", "site/web");
+        write_mirror(root, "site", "dev", &local_static_mirror(4334));
+
+        let cols = check_port_collisions(root).unwrap();
+        assert_eq!(cols.len(), 1, "{cols:?}");
+        assert_eq!(cols[0].port, 4334);
+        assert_eq!(cols[0].first.service, "api");
+        assert_eq!(cols[0].first.slot_role, "compute");
+        assert!(cols[0].first.field.contains("account"), "{cols:?}");
+
+        // Off a local-process slot the same workload binds nothing here.
+        write_mirror(root, "api", "dev", "schema_version = 1\nshape = \"local\"\n");
+        assert!(check_port_collisions(root).unwrap().is_empty());
+    }
+
+    #[test]
     fn same_service_two_envs_reusing_a_port_is_flagged() {
         // The ticket's "scrabcake cloud+dev reuse <port> twice more" shape.
         let dir = tempdir().unwrap();
@@ -1654,6 +1850,29 @@ mod tests {
     fn missing_machines_dir_is_not_error_for_arch_tags() {
         let dir = tempdir().unwrap();
         assert!(check_retired_arch_tags(dir.path()).unwrap().is_empty());
+    }
+
+    // ── R1019-F28 (W388): unknown node roles ──────────────────────────────
+
+    #[test]
+    fn every_role_in_the_vocabulary_is_clean() {
+        let dir = tempdir().unwrap();
+        let mut tags = vec!["arch:x86"];
+        tags.extend(workload_spec::ROLE_KEYS);
+        write_machine_tags(dir.path(), "n1", &tags);
+        assert!(check_unknown_roles(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_role_outside_the_vocabulary_is_flagged_with_the_legal_list() {
+        let dir = tempdir().unwrap();
+        write_machine_tags(dir.path(), "n1", &["arch:x86", "role:build", "role:cloud-capacity"]);
+        let found = check_unknown_roles(dir.path()).unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].tag, "role:cloud-capacity");
+        let msg = found[0].message();
+        assert!(msg.contains("role:best-effort"), "{msg}");
+        assert!(msg.contains("n1"), "{msg}");
     }
 
     // ── R605-F35: sovereign group members ─────────────────────────────────
@@ -2087,15 +2306,15 @@ mod tests {
         write_reach_machine(
             root,
             "us-west-011",
-            "address = \"192.168.10.11\"\nssh = \"yah@192.168.10.11\"\n\
+            "address = \"192.168.250.11\"\nssh = \"yah@192.168.250.11\"\n\
              identity_file = \"~/.ssh/yah\"\n\
-             yubaba = \"http://192.168.10.11:7443\"",
+             yubaba = \"http://192.168.250.11:7443\"",
             "",
         );
         let found = check_lan_dial_targets(root).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].machine, "us-west-011");
-        assert_eq!(found[0].url, "http://192.168.10.11:7443");
+        assert_eq!(found[0].url, "http://192.168.250.11:7443");
         assert_eq!(found[0].mesh_ipv4, None);
         let msg = found[0].message();
         assert!(msg.contains("mesh-join it"), "{msg}");
@@ -2111,9 +2330,9 @@ mod tests {
         write_reach_machine(
             root,
             "us-west-014",
-            "address = \"192.168.10.14\"\nssh = \"yah@192.168.10.14\"\n\
+            "address = \"192.168.250.14\"\nssh = \"yah@192.168.250.14\"\n\
              identity_file = \"~/.ssh/yah\"\n\
-             yubaba = \"http://192.168.10.14:7443\"",
+             yubaba = \"http://192.168.250.14:7443\"",
             "mesh_ipv4 = \"100.64.0.6\"",
         );
         let found = check_lan_dial_targets(root).unwrap();
@@ -2134,14 +2353,14 @@ mod tests {
         write_reach_machine(
             root,
             "meshed",
-            "address = \"192.168.10.15\"\nssh = \"yah@192.168.10.15\"\n\
+            "address = \"192.168.250.15\"\nssh = \"yah@192.168.250.15\"\n\
              identity_file = \"~/.ssh/yah\"",
             "mesh_ipv4 = \"100.64.0.7\"",
         );
         write_reach_machine(
             root,
             "tunnelled",
-            "address = \"192.168.10.16\"\nssh = \"yah@192.168.10.16\"\n\
+            "address = \"192.168.250.16\"\nssh = \"yah@192.168.250.16\"\n\
              identity_file = \"~/.ssh/yah\"\n\
              yubaba = \"http://127.0.0.1:7443\"",
             "",
@@ -2149,9 +2368,9 @@ mod tests {
         write_reach_machine(
             root,
             "public",
-            "address = \"45.32.194.254\"\nssh = \"debian@45.32.194.254\"\n\
+            "address = \"203.0.113.12\"\nssh = \"debian@203.0.113.12\"\n\
              identity_file = \"~/.ssh/yah\"\n\
-             yubaba = \"http://45.32.194.254:7443\"",
+             yubaba = \"http://203.0.113.12:7443\"",
             "",
         );
         assert!(check_lan_dial_targets(root).unwrap().is_empty());

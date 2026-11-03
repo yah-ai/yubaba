@@ -93,8 +93,6 @@ pub use kamaji::{WorkloadState, WorkloadStatus};
 pub mod tenant_ownership;
 pub use tenant_ownership::LocalOwnership;
 
-/// R734-F2: one uninitialised node on loopback, for the routes and RPCs whose
-/// interesting behaviour happens *before* a cluster exists.
 /// The HTTP client every harness helper and test should talk to nodes with.
 ///
 /// R903: do not call `reqwest::Client::new()` per request. Each build walks the
@@ -109,15 +107,27 @@ pub use tenant_ownership::LocalOwnership;
 /// runtime that opened it. With no idle connections kept, a clone used from
 /// any runtime dials fresh (loopback, microseconds) and nothing outlives the
 /// test that created it. The expensive part — the build — happens once.
+///
+/// Every request is bounded by [`HTTP_REQUEST_TIMEOUT`] (R936-B15). Before
+/// that, a handler that never returned left its test pending until an outside
+/// runner killed it at 900 s, and the kill destroyed the only record of which
+/// call was stuck. Now the call fails with its own URL and the test panics.
 pub fn http() -> reqwest::Client {
     static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
             .pool_max_idle_per_host(0)
+            .timeout(HTTP_REQUEST_TIMEOUT)
             .build()
             .expect("yubaba-test-harness shared HTTP client")
     });
     CLIENT.clone()
 }
+
+/// The per-request bound on [`http`]. No route a test calls through this client
+/// long-polls (checked 2026-10-10; the deploy helpers use their own client).
+/// A loopback request still pending after two minutes is a hung handler, not a
+/// slow one.
+pub const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Whether this node has applied its own current membership entry — the point
 /// after which openraft accepts a membership change from it. A freshly elected
@@ -130,6 +140,8 @@ fn membership_applied(metrics: &openraft::RaftMetrics<yubaba::raft::YubabaRaftCo
     }
 }
 
+/// R734-F2: one uninitialised node on loopback, for the routes and RPCs whose
+/// interesting behaviour happens *before* a cluster exists.
 pub mod solo_node;
 pub use solo_node::{
     solo_node, solo_node_in_cell, solo_node_in_region, solo_node_in_sovereign_group,
@@ -789,7 +801,7 @@ impl Cluster {
             builder = builder.with_headscale_dir(dir);
         }
         if let Some(key) = &node.cluster_key {
-            builder = builder.with_http_auth(enforcing_policy(key)?);
+            builder = builder.with_http_auth(enforcing_policy(key, node_id)?);
         }
         builder = builder
             .with_cluster_policy(policy)
@@ -1160,12 +1172,29 @@ pub fn enforcing_operator_keypair_hex() -> &'static (String, String) {
 }
 
 /// The require-mode policy [`test_cluster_enforcing`] installs on each node.
-fn enforcing_policy(cluster_key_hex: &str) -> Result<yubaba::http_auth::HttpAuthPolicy> {
+/// R997-B27: each node also carries its own identity, certified by the test
+/// operator key, and refuses peer writes and raft RPC that prove none.
+fn enforcing_policy(
+    cluster_key_hex: &str,
+    node_id: u64,
+) -> Result<yubaba::http_auth::HttpAuthPolicy> {
+    let (public, secret) = enforcing_operator_keypair_hex();
+    let operator =
+        yubaba_auth_token::operator_secret_from_hex(secret).map_err(anyhow::Error::msg)?;
+    let identity = yubaba_auth_token::node_identity::NodeIdentity::mint(
+        &operator,
+        yubaba_auth_token::node_identity::IdentityKind::Node,
+        node_id,
+    )
+    .map_err(anyhow::Error::msg)?;
     yubaba::http_auth::HttpAuthPolicy::new(
         yubaba::http_auth::AuthMode::Require,
-        std::slice::from_ref(&enforcing_operator_keypair_hex().0),
+        std::slice::from_ref(public),
         Some(cluster_key_hex),
     )
+    .and_then(|p| {
+        p.with_node_identity(Some(identity), yubaba::http_auth::NodeIdentityMode::Require)
+    })
     .map_err(|e| anyhow::anyhow!(e))
 }
 
@@ -1176,7 +1205,7 @@ fn raft_signer(
     node_id: u64,
 ) -> Result<yubaba_auth_token::PeerSigner> {
     Ok(match cluster_key {
-        Some(key) => enforcing_policy(key)?.peer_signer(format!("node:{node_id}")),
+        Some(key) => enforcing_policy(key, node_id)?.peer_signer(format!("node:{node_id}")),
         None => yubaba_auth_token::PeerSigner::unsigned(),
     })
 }
@@ -1280,7 +1309,7 @@ async fn test_cluster_local(
             .with_runtime(Arc::clone(&runtimes[i]))
             .with_headscale_dir(headscale_dir.clone());
         if let Some(key) = &cluster_key {
-            srv_state = srv_state.with_http_auth(enforcing_policy(key)?);
+            srv_state = srv_state.with_http_auth(enforcing_policy(key, (i as u64) + 1)?);
         }
 
         let mut lease_detector = None;

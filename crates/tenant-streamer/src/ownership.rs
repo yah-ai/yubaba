@@ -162,13 +162,16 @@ impl HttpOwnership {
         parse_tenant_outcome(&self.raft_write(body).await?)
     }
 
-    /// POST one `YubabaRequest` through the generic write route and hand back
-    /// the decoded response body.
+    /// POST one `YubabaRequest` through the tenant-lease route and hand back
+    /// the decoded response body. R997-B26: that route takes the same body as
+    /// `/raft/write` but admits only ClaimTenant and RenewTenantLease, which is
+    /// all a service-tier token may write.
     async fn raft_write(&self, body: serde_json::Value) -> Result<serde_json::Value> {
-        let url = format!("{}/raft/write", self.base_url);
+        let url = format!("{}/tenant-lease", self.base_url);
+        // R997-B27: carries this streamer's node proof when it has an identity.
         self.client
-            .post(&url)
-            .json(&body)
+            .post_json_proved(&url, &body)
+            .map_err(anyhow::Error::msg)?
             .send()
             .await
             .with_context(|| format!("POST {url}"))?

@@ -23,8 +23,8 @@
 //! @yah:parent(R861)
 //! @yah:next("THE PATTERN TO COPY IS cloudflare_worker.rs, not a new abstraction: validate declared config fully BEFORE any API call (the R330-B5 fail-fast discipline the reconciler docs already name), then list-first/idempotent writes against headscale's admin API using the existing `headscale-api-key` slot. Consumers of that slot are already listed in the credential spec: oss/yubaba/crates/cloud/src/mesh.rs, app/yah/cli/src/mesh.rs, crates/yah/cloud-client/src/lib.rs.")
 //! @yah:gotcha("START WITH THE FACT, NOT THE DESIGN. headscale 0.23 can source policy from a FILE or from the DATABASE depending on its policy mode, and the config block read on us-west-001 2026-09-04 showed no `policy:` section at all — so acls.yaml may be live or may be vestigial. `grep -i policy /var/lib/yah-cloud/headscale/config.yaml` settles it in one look. If vestigial: delete the file so the next reader does not re-discover the same question, and this ticket collapses to the users/preauth half. If live: it is unreplicated failover state today and declaring it is the fix.")
-//! @yah:gotcha("PHASE 1 SETTLED — acls.yaml IS LIVE, NOT VESTIGIAL. Measured over SSH on us-west-001 (15.204.89.240) 2026-09-04 by @Ashguard:griffin. /var/lib/yah-cloud/headscale/config.yaml lines 32-34 read exactly `policy:` / `  mode: file` / `  path: /var/lib/yah-cloud/headscale/acls.yaml`. The earlier read that reported no `policy:` section was wrong — the file is 1060 bytes and the block is there. acls.yaml is 77 bytes, mtime Jun 22, and contains the permissive HuJSON default `{\"acls\":[{\"action\":\"accept\",\"src\":[\"*\"],\"dst\":[\"*:*\"]}]}`. In-tree agrees: ALL THREE renderers emit the same three lines — crate::mesh::generate_headscale_config (oss/yubaba/crates/cloud/src/mesh.rs), generate_remote_headscale_config (oss/yubaba/crates/yubaba/src/lib.rs:4729ff) and generate_bootstrap_headscale_config (same file, :5134ff). So file mode is the DESIRED state today, not drift. Nothing was deleted; the vestigial branch of this ticket does not apply.")
-//! @yah:gotcha("POLICY MODE BOUNDS WHAT ANY RECONCILER CAN DO ABOUT ACLS — both halves measured against the live v0.23.0 coordinator 2026-09-04, not inferred. (1) GET /api/v1/policy WORKS IN FILE MODE: authenticated with the vault's headscale-api-key against https://cloud.mesh.yah.dev it returned HTTP 200 and {\"policy\": \"<the acls.yaml bytes>\", \"updatedAt\": null}. (2) PUT /api/v1/policy IS REFUSED IN FILE MODE: the pinned binary carries the string \"This command only works when the acl.policy_mode is set to \" and \", and the policy will be stored in the database.\" — headscale only accepts a policy write in database mode, because in file mode the file is the source of truth and a write would be overwritten at the next reload. CONSEQUENCE, and it is the design of the ACL step: declared-vs-live drift is ALWAYS DETECTABLE, and correctable only on a database-mode coordinator. Also verified from the same binary: /api/v1/user, /api/v1/user/{name}, /api/v1/preauthkey, /api/v1/preauthkey/expire, /api/v1/policy all exist; GET /api/v1/preauthkey?user=yah returned 200 with {\"preAuthKeys\":[{user,id,key,reusable,ephemeral,used,expiration,createdAt,aclTags}]} and 4 live keys. Coordinator has exactly one user, `yah`.")
+//! @yah:gotcha("PHASE 1 SETTLED — acls.yaml IS LIVE, NOT VESTIGIAL. Measured over SSH on us-west-001 2026-09-04 by @Ashguard:griffin. /var/lib/yah-cloud/headscale/config.yaml lines 32-34 read exactly `policy:` / `  mode: file` / `  path: /var/lib/yah-cloud/headscale/acls.yaml`. The earlier read that reported no `policy:` section was wrong — the file is 1060 bytes and the block is there. acls.yaml held the in-tree default policy (since superseded by the declared fleet policy, R997-B13). In-tree agrees: ALL THREE renderers emit the same three lines — crate::mesh::generate_headscale_config (oss/yubaba/crates/cloud/src/mesh.rs), generate_remote_headscale_config (oss/yubaba/crates/yubaba/src/lib.rs:4729ff) and generate_bootstrap_headscale_config (same file, :5134ff). So file mode is the DESIRED state today, not drift. Nothing was deleted; the vestigial branch of this ticket does not apply.")
+//! @yah:gotcha("POLICY MODE BOUNDS WHAT ANY RECONCILER CAN DO ABOUT ACLS — both halves measured against the live v0.23.0 coordinator 2026-09-04, not inferred. (1) GET /api/v1/policy WORKS IN FILE MODE: authenticated with the vault's headscale-api-key against https://cloud.mesh.yah.dev it returned HTTP 200 and {\"policy\": \"<the acls.yaml bytes>\", \"updatedAt\": null}. (2) PUT /api/v1/policy IS REFUSED IN FILE MODE: the pinned binary carries the string \"This command only works when the acl.policy_mode is set to \" and \", and the policy will be stored in the database.\" — headscale only accepts a policy write in database mode, because in file mode the file is the source of truth and a write would be overwritten at the next reload. CONSEQUENCE, and it is the design of the ACL step: declared-vs-live drift is ALWAYS DETECTABLE, and correctable only on a database-mode coordinator. Also verified from the same binary: /api/v1/user, /api/v1/user/{name}, /api/v1/preauthkey, /api/v1/preauthkey/expire, /api/v1/policy all exist; GET /api/v1/preauthkey?user=yah returns {\"preAuthKeys\":[{user,id,key,reusable,ephemeral,used,expiration,createdAt,aclTags}]}. INVARIANT (R997-B10): every preauth key yah mints is single-use, short-lived and tagged; a reusable or long-TTL key on the coordinator is drift to expire, never a credential to keep.")
 //! @yah:handoff("LANDED: HeadscaleReconciler, kind=\"headscale\" — one more Reconciler impl, cloudflare_worker.rs's shape, no new noun. NEW FILE oss/yubaba/crates/cloud/src/reconciler/headscale.rs (~700 lines incl. 17 tests). up() order: materialize() -> workload_kind agrees -> DeclaredHeadscale::load() validates EVERYTHING (R330-B5 fail-fast, nothing below runs until every field is checked) -> resolve base_url (declared server_url, else mesh-url/HEADSCALE_URL) + headscale-api-key/HEADSCALE_API_KEY -> users list-then-create (NEVER deletes: a headscale user owns the nodes registered under it) -> preauth keys list-then-mint-if-unsatisfied -> ACL compare-then-push. Returns RunningWorkload::adopted(WORKLOAD_KIND, role, None).with_notes(...); the minted key value never reaches a log line or a note.")
 //! @yah:handoff("CLIENT SURFACE ADDED to oss/yubaba/crates/cloud/src/mesh.rs (added alongside the peer hunks already in that file; nothing reverted). New types PreauthKeyRecord (with is_usable_at) and PreauthKeyRequest. New HeadscaleClient methods: create_user (POST /api/v1/user — deliberately does NOT swallow a conflict, since headscale answers 500 for an existing name with no discriminator, so a 500 here means something other than \"already there\"), list_preauth_keys (GET /api/v1/preauthkey?user=), create_preauth_key_with (the general mint), get_policy (GET /api/v1/policy), set_policy (PUT /api/v1/policy). The pre-existing create_preauth_key now delegates to create_preauth_key_with with its historical fixed shape (single-use, 1 hour) so every existing caller is behaviourally untouched. Parsing split into the free fn parse_preauth_key_list, following choose_user's precedent (this crate has no HTTP mock); entries missing id/user/key are DROPPED rather than defaulted, because a half-parsed record would read as \"no matching key exists\" and cause a redundant mint.")
 //! @yah:handoff("DECISION I MADE, since the brief left it open: declared config lives in the component's workload.toml under kind-specific tables ([headscale] with users / acl_policy / server_url, and [[headscale.preauth_keys]] with user / tags / reusable / ephemeral / ttl_hours / store_as), parsed ad hoc via toml::Value. This is exactly how cloudflare-worker already reads its [build] and [[bindings]] — the strong workload_spec::Workload types do not model per-kind tables, and I checked .yah/schema/workload.toml.schema.json: no branch of its root oneOf sets additionalProperties:false, so extra tables validate. CONSEQUENCE: oss/yah-base/crates/workload-spec/ was NOT touched, so NO emit-schemas and NO export-ts regen was needed or run. That also kept me clear of oss/yah-base/crates/keys/src/spec.rs, which I read (line 768's Band::Automatable classification) but did not modify, per the leader's read-only instruction — @Ashguard:polaris is live on it for R856-F2.")
@@ -354,8 +354,7 @@ impl HeadscaleClient {
             let text = resp.text().await.unwrap_or_default();
             anyhow::bail!("Headscale API {status} on GET /api/v1/preauthkey (user={user}): {text}");
         }
-        let resp_json: serde_json::Value =
-            resp.json().await.context("parsing preauth key list")?;
+        let resp_json: serde_json::Value = resp.json().await.context("parsing preauth key list")?;
         Ok(parse_preauth_key_list(&resp_json))
     }
 
@@ -617,8 +616,13 @@ derp:
     )
 }
 
-/// A permissive ACL policy that allows all nodes to communicate.
-/// Can be refined later with `yah mesh acl edit`.
+/// The allow-all policy shape. NOT a policy to deploy: it exists only so the
+/// migration code can recognise it on a coordinator that still carries it.
+/// The DEPLOYED fleet policy is the source-controlled file
+/// `.yah/infra/headscale/acl-policy.json`, applied by `yah mesh policy apply`
+/// and at the end of `yah mesh bootstrap` (R1025). [`render_fleet_acl_policy`]
+/// is a tag-segmented design that nothing calls and that does not match the
+/// live (user-based, untagged-node) fleet.
 ///
 /// Headscale's file-based policy loader parses HuJSON (JSON-with-comments),
 /// NOT YAML — a leading `---` fails with "invalid literal: ---". Keep this
@@ -629,6 +633,80 @@ pub const DEFAULT_ACL_POLICY: &str = r#"{
   ]
 }
 "#;
+
+/// Headscale user that owns operator devices (untagged nodes) and every tag.
+pub const FLEET_OPERATOR_USER: &str = "yah";
+/// Control-plane nodes: raft voters and production workload hosts.
+pub const CORE_TAGS: &[&str] = &["tag:voter-candidate", "tag:cloud-runner"];
+/// Build / QED workers: run arbitrary build steps, so they get the least reach.
+pub const WORKER_TAGS: &[&str] = &["tag:build-worker", "tag:qed", "tag:mac-builder"];
+/// Members of the dev raft group (`sovereign_group = "dev"`).
+pub const DEV_TAGS: &[&str] = &["tag:dev-cluster"];
+/// Ports a worker or dev node may open on a core node: yubaba (7443) and
+/// fleet-git (4330).
+pub const CORE_SERVICE_PORTS: &[u16] = &[7443, 4330];
+
+/// Render the fleet's tailnet ACL policy (headscale HuJSON, plain JSON here).
+///
+/// Invariants the policy holds:
+/// - operator devices (untagged nodes of [`FLEET_OPERATOR_USER`]) reach everything;
+/// - core nodes reach every fleet node on every port;
+/// - workers reach core nodes only on [`CORE_SERVICE_PORTS`];
+/// - dev-cluster nodes reach each other, and core only on [`CORE_SERVICE_PORTS`];
+/// - no tagged node can open a connection to an operator device;
+/// - every tag is owned by the operator, so a node cannot claim a tag its
+///   join key was not minted with.
+///
+/// `extra_tags` are the `tag:` entries found in machine records; each gets a
+/// `tagOwners` entry so headscale accepts a key minted with it, whether or
+/// not a rule names it (an unnamed tag grants nothing).
+pub fn render_fleet_acl_policy<'a>(extra_tags: impl IntoIterator<Item = &'a str>) -> String {
+    let mut tags: std::collections::BTreeSet<String> = CORE_TAGS
+        .iter()
+        .chain(WORKER_TAGS)
+        .chain(DEV_TAGS)
+        .map(|t| t.to_string())
+        .collect();
+    tags.extend(
+        extra_tags
+            .into_iter()
+            .filter(|t| t.starts_with("tag:") && t.len() > 4)
+            .map(str::to_string),
+    );
+    let tag_owners: serde_json::Map<String, serde_json::Value> = tags
+        .iter()
+        .map(|t| (t.clone(), serde_json::json!(["group:operators"])))
+        .collect();
+
+    let all = |tags: &[&str]| -> Vec<String> { tags.iter().map(|t| format!("{t}:*")).collect() };
+    let on_ports = |tags: &[&str], ports: &[u16]| -> Vec<String> {
+        tags.iter()
+            .flat_map(|t| ports.iter().map(move |p| format!("{t}:{p}")))
+            .collect()
+    };
+    let fleet: Vec<&str> = CORE_TAGS
+        .iter()
+        .chain(WORKER_TAGS)
+        .chain(DEV_TAGS)
+        .copied()
+        .collect();
+    let worker_or_dev: Vec<&str> = WORKER_TAGS.iter().chain(DEV_TAGS).copied().collect();
+
+    let acls = serde_json::json!([
+        { "action": "accept", "src": ["group:operators"], "dst": ["*:*"] },
+        { "action": "accept", "src": CORE_TAGS, "dst": all(&fleet) },
+        { "action": "accept", "src": worker_or_dev, "dst": on_ports(CORE_TAGS, CORE_SERVICE_PORTS) },
+        { "action": "accept", "src": DEV_TAGS, "dst": all(DEV_TAGS) },
+    ]);
+    let policy = serde_json::json!({
+        "groups": { "group:operators": [FLEET_OPERATOR_USER] },
+        "tagOwners": tag_owners,
+        "acls": acls,
+    });
+    let mut out = serde_json::to_string_pretty(&policy).expect("policy is plain JSON");
+    out.push('\n');
+    out
+}
 
 // ---------------------------------------------------------------------------
 // Binary management helpers
@@ -793,6 +871,160 @@ pub fn cloudflare_credentials() -> Result<Option<(String, String)>> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod fleet_acl_tests {
+    use super::*;
+
+    /// A node as the policy sees it: its ACL tags. Empty = an operator device.
+    type Node = &'static [&'static str];
+
+    const OPERATOR_MAC: Node = &[];
+    const VOTER: Node = &["tag:cloud-runner", "tag:voter-candidate"];
+    const PROD_NON_VOTER_BUILDER: Node = &["tag:build-worker", "tag:qed", "tag:cloud-runner"];
+    const BUILD_WORKER: Node = &["tag:build-worker", "tag:qed"];
+    const MAC_BUILDER: Node = &["tag:build-worker", "tag:qed", "tag:mac-builder"];
+    const DEV_VOTER: Node = &["tag:qed", "tag:dev-cluster"];
+    const DEV_VM: Node = &["tag:dev-cluster"];
+
+    /// Minimal evaluator for the policy shape [`render_fleet_acl_policy`] emits.
+    fn allowed(policy: &serde_json::Value, src: Node, dst: Node, port: u16) -> bool {
+        let matches = |sel: &str, node: Node| match sel {
+            "*" => true,
+            "group:operators" => node.is_empty(),
+            tag => node.contains(&tag),
+        };
+        policy["acls"].as_array().unwrap().iter().any(|rule| {
+            assert_eq!(rule["action"], "accept");
+            let src_ok = rule["src"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| matches(s.as_str().unwrap(), src));
+            src_ok
+                && rule["dst"].as_array().unwrap().iter().any(|d| {
+                    let (sel, p) = d.as_str().unwrap().rsplit_once(':').unwrap();
+                    matches(sel, dst) && (p == "*" || p.parse::<u16>().unwrap() == port)
+                })
+        })
+    }
+
+    fn policy() -> serde_json::Value {
+        serde_json::from_str(&render_fleet_acl_policy(["tag:cloud-runner", "tag:custom"])).unwrap()
+    }
+
+    /// Every flow the fleet uses today must stay allowed.
+    #[test]
+    fn every_enumerated_fleet_flow_is_allowed() {
+        let p = policy();
+        let flows: &[(&str, Node, Node, u16)] = &[
+            ("operator -> voter yubaba", OPERATOR_MAC, VOTER, 7443),
+            ("operator -> voter ssh", OPERATOR_MAC, VOTER, 22),
+            (
+                "operator -> build worker ssh",
+                OPERATOR_MAC,
+                BUILD_WORKER,
+                22,
+            ),
+            (
+                "operator -> build worker yubaba",
+                OPERATOR_MAC,
+                BUILD_WORKER,
+                7443,
+            ),
+            ("operator -> mac builder ssh", OPERATOR_MAC, MAC_BUILDER, 22),
+            ("operator -> dev vm yubaba", OPERATOR_MAC, DEV_VM, 7443),
+            ("voter <-> voter raft/yubaba", VOTER, VOTER, 7443),
+            ("voter -> voter workload port (doors)", VOTER, VOTER, 8081),
+            ("voter -> voter fleet-git", VOTER, VOTER, 4330),
+            (
+                "voter -> prod builder yubaba",
+                VOTER,
+                PROD_NON_VOTER_BUILDER,
+                7443,
+            ),
+            ("voter -> build worker yubaba", VOTER, BUILD_WORKER, 7443),
+            ("voter -> dev workload port", VOTER, DEV_VOTER, 4325),
+            (
+                "prod builder -> voter yubaba",
+                PROD_NON_VOTER_BUILDER,
+                VOTER,
+                7443,
+            ),
+            ("build worker -> voter yubaba", BUILD_WORKER, VOTER, 7443),
+            ("build worker -> fleet-git", BUILD_WORKER, VOTER, 4330),
+            ("mac builder -> voter yubaba", MAC_BUILDER, VOTER, 7443),
+            ("dev voter <-> dev voter raft", DEV_VOTER, DEV_VOTER, 7443),
+            ("dev vm -> dev voter raft", DEV_VM, DEV_VOTER, 7443),
+            ("dev voter -> dev vm workload", DEV_VOTER, DEV_VM, 8080),
+            ("dev node -> fleet-git", DEV_VM, VOTER, 4330),
+        ];
+        for (name, src, dst, port) in flows {
+            assert!(allowed(&p, src, dst, *port), "flow must be allowed: {name}");
+        }
+    }
+
+    /// The segmentation the policy exists for.
+    #[test]
+    fn untrusted_members_get_only_their_declared_reach() {
+        let p = policy();
+        let denied: &[(&str, Node, Node, u16)] = &[
+            (
+                "build worker -> operator device",
+                BUILD_WORKER,
+                OPERATOR_MAC,
+                22,
+            ),
+            ("voter -> operator device", VOTER, OPERATOR_MAC, 7443),
+            ("dev vm -> operator device", DEV_VM, OPERATOR_MAC, 22),
+            ("build worker -> voter ssh", BUILD_WORKER, VOTER, 22),
+            (
+                "build worker -> voter workload port",
+                BUILD_WORKER,
+                VOTER,
+                8081,
+            ),
+            (
+                "build worker -> build worker",
+                BUILD_WORKER,
+                MAC_BUILDER,
+                22,
+            ),
+            ("build worker -> dev vm", BUILD_WORKER, DEV_VM, 7443),
+            ("dev vm -> voter ssh", DEV_VM, VOTER, 22),
+        ];
+        for (name, src, dst, port) in denied {
+            assert!(!allowed(&p, src, dst, *port), "flow must be denied: {name}");
+        }
+    }
+
+    #[test]
+    fn every_tag_is_operator_owned_and_no_rule_is_allow_all_for_tags() {
+        let p = policy();
+        let owners = p["tagOwners"].as_object().unwrap();
+        for t in CORE_TAGS
+            .iter()
+            .chain(WORKER_TAGS)
+            .chain(DEV_TAGS)
+            .chain(&["tag:custom"])
+        {
+            assert_eq!(owners[*t], serde_json::json!(["group:operators"]), "{t}");
+        }
+        assert_eq!(
+            p["groups"]["group:operators"],
+            serde_json::json!([FLEET_OPERATOR_USER])
+        );
+        for rule in p["acls"].as_array().unwrap() {
+            if rule["src"] != serde_json::json!(["group:operators"]) {
+                assert!(!rule["src"].as_array().unwrap().contains(&"*".into()));
+                assert!(!rule["dst"].as_array().unwrap().contains(&"*:*".into()));
+            }
+        }
+        // Not the allow-all shape the migration recognises.
+        let allow_all: serde_json::Value = serde_json::from_str(DEFAULT_ACL_POLICY).unwrap();
+        assert_ne!(p["acls"], allow_all["acls"]);
+    }
+}
 
 #[cfg(test)]
 mod tests {

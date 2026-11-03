@@ -115,6 +115,8 @@ pub(crate) fn native_spec(ident: &str, argv: Vec<String>, env: Vec<EnvVar>) -> W
         namespace: NamespaceId::singleton(),
         labels: Default::default(),
         durability: None,
+        lease_id: None,
+        deadline: None,
         db: Vec::new(),
         capabilities: Vec::new(),
         annotations: Default::default(),
@@ -187,10 +189,14 @@ pub(crate) fn spawn_native_log_supervisor(
         let mut err_tail = FileTail::new(stderr_path);
         loop {
             tokio::select! {
-                _ = &mut shutdown_rx => {
+                res = &mut shutdown_rx => {
                     out_tail.drain_into(&log_buf).await;
                     err_tail.drain_into(&log_buf).await;
-                    runtime.teardown_workload(&ident).await.ok();
+                    // A dropped sender is `RunningWorkload::detach` (R584-B8):
+                    // leave the process for the next reconcile's reap.
+                    if res.is_ok() {
+                        runtime.teardown_workload(&ident).await.ok();
+                    }
                     return Ok(());
                 }
                 _ = tokio::time::sleep(Duration::from_millis(200)) => {
@@ -218,16 +224,14 @@ pub(crate) fn spawn_native_log_supervisor(
 /// already consumed plus any partial trailing line, so each drain emits only
 /// whole new lines into the [`LogBuffer`].
 ///
-/// R918-F5 — unix-only outside tests: its only non-test caller is
-/// [`spawn_native_log_supervisor`], gated just above.
-#[cfg(any(unix, test))]
+/// Portable: the native log supervisor (unix-only) and the miniflare door's
+/// capture-file tail (R584-B8, every platform) both read through it.
 pub(crate) struct FileTail {
     path: PathBuf,
     offset: u64,
     partial: String,
 }
 
-#[cfg(any(unix, test))]
 impl FileTail {
     pub(crate) fn new(path: PathBuf) -> Self {
         Self {

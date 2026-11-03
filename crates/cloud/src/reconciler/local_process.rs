@@ -147,7 +147,7 @@
 //! @yah:verify("cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib - 688 passed, 0 failed")
 //! @yah:verify("cargo test -p yah --lib cloud:: - 108 passed")
 //! @yah:verify("cargo test -p xtask --test schema_drift --test workload_envelope - 4 passed")
-//! @yah:verify("MANUAL (done): yah cloud mirror up yah-cloud-admin --env dev binds 127.0.0.1:4325 with no container, and the process logs workspace=/Users/leif/ss/yah - the real checkout, not /workspace")
+//! @yah:verify("MANUAL (done): yah cloud mirror up yah-cloud-admin --env dev binds 127.0.0.1:4325 with no container, and the process logs workspace=<repo> - the real checkout, not /workspace")
 //! @yah:verify("MANUAL (done): running mirror up twice in a row replaces the child (pid changes) instead of leaving a dead second instance behind an Address-already-in-use")
 //! @yah:gotcha("NativeRuntime's workload table is IN-MEMORY, so a second `mirror up` from a fresh process cannot see the first one's child. Without the owner.json sidecar + reap the new child dies on Address-already-in-use, wait_for_port sees the OLD listener answering, and the reconcile reports success while the just-edited binary is not what is running. This was observed live before the fix, not theorised. Do not remove the sidecar.")
 //! @yah:gotcha("yah-cloud-admin's pond tier moved to host port 4326 so both tiers can run at once. The container still listens on 4325 internally.")
@@ -155,7 +155,7 @@
 //! @yah:handoff("Re-verified independently on 2026-08-04 (session:5fe4274e, rune) rather than trusting the prior run's claims. All three automated suites green; counts are HIGHER than the ones recorded above because peers added tests since: yah-cloud lib 698 passed / 0 failed (was 688), yah lib cloud:: 111 passed (was 108), xtask schema_drift + workload_envelope 4 passed (unchanged).")
 //! @yah:verify("RE-VERIFIED 2026-08-04, sidecar survives across sessions: the owner.json left by the 2026-08-03 run ({pid:54869,port:4325}) still matched the live listener a day later - lsof -t on 4325 returned exactly 54869. That is the cross-process ownership link working in the wild, not in a test.")
 //! @yah:verify("RE-VERIFIED 2026-08-04, reap-and-replace: `cargo run -p yah -- cloud mirror up yah-cloud-admin --env dev` reaped pid 54869 (kill -0 confirms gone), spawned 71455, rewrote owner.json to {pid:71455,port:4325}, and 127.0.0.1:4325/ answers HTTP 200. No dead second instance, no Address-already-in-use.")
-//! @yah:verify("RE-VERIFIED 2026-08-04, the failure mode this tier exists to prevent: child cwd is /Users/leif/ss/yah (lsof -d cwd), `docker ps` shows NO cloud-admin container, and /partial/machines renders 9 machine rows against 9 files in .yah/infra/machines/ - us-west-001/002/003 + mac-builder among them. Not a fleet of zero.")
+//! @yah:verify("RE-VERIFIED 2026-08-04, the failure mode this tier exists to prevent: child cwd is <repo> (lsof -d cwd), `docker ps` shows NO cloud-admin container, and /partial/machines renders 9 machine rows against 9 files in .yah/infra/machines/ - us-west-001/002/003 + mac-builder among them. Not a fleet of zero.")
 //! @yah:verify("RE-VERIFIED 2026-08-04, both dispatcher arms compile: `cargo build -p yah` (app/yah/cli/src/cloud.rs:4705) and `cargo check -p desktop --lib` (app/yah/desktop/src/mirror_run.rs:624) are both clean.")
 //! @yah:gotcha("LEFT RUNNING: the re-verification above spawned yah-cloud-admin pid 71455 on 127.0.0.1:4325 and did not stop it - that matches the state found at session start (a dev-tier process was already up). Kill it with `kill $(lsof -nP -iTCP:4325 -sTCP:LISTEN -t)`, or just re-run `mirror up`, which reaps it.")
 //! @yah:gotcha("TRANSIENT, NOT THIS TICKET: `cargo run -p yah` failed once with E0599 mid-verification and compiled clean on immediate retry with no edit from this session - a peer's in-flight change on the shared tree. Same shape as the note in crates/yah/camp-service/tests/e2e.rs:35. If you see it, retry before investigating.")
@@ -210,6 +210,15 @@
 //! @yah:next("Decide semantics for non-local providers (container / R2 static) — at minimum a clear 'not supported for <kind>' error rather than an unknown-subcommand.")
 //! @yah:verify("`mirror up noisetable-desktop --env dev` then `mirror down` leaves no `target/*/noisetable-desktop` process and no owner.json.")
 //! @yah:gotcha("Found 2026-10-05 while verifying R940-B1: its own check 2 says '`mirror down` leaves no orphaned process', but the CLI only has show/status/up, so the check was unrunnable and the child had to be stopped with kill. CLAUDE.md in noisetable also documents only re-up reaping.")
+//!
+//! @yah:ticket(R715-F9, "local-process env from driver coords: hand a slot the port of a declared driver (e.g. smtp)")
+//! @yah:at(2026-10-10T17:47:37Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R715)
+//! @yah:next("Tier: Cleric. ProcessSpec env (oss/yubaba/crates/cloud/src/reconciler/local_process.rs ~:361) is static [process.env]. A local-process slot cannot be handed a declared driver's coords (e.g. the dev smtp driver's port). Design the general primitive: a declaration form in [process.env] that resolves from a driver's coords.json (.yah/infra/state/<env>/<driver>/coords.json) at spawn time, with a clear failure when the driver is not up.")
+//! @yah:next("Evidence (noisetable R823-T1): workaround is web/services/scripts/dev-api.sh reading .yah/infra/state/dev/smtp/coords.json for smtp_port. Related: the per-run generated values ask in the R715 header (@yah:next MISSING TODAY).")
+//! @yah:next("Consumer: noisetable-api dev mirror; the workaround script can be deleted once this lands.")
+//! @yah:verify("A local-process slot declares env from smtp driver coords and receives the live port without a launcher script; unit test for the resolve and for the driver-down error.")
 
 
 use std::collections::{BTreeMap, VecDeque};

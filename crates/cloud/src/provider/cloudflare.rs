@@ -72,7 +72,7 @@
 //! @yah:phase(P4)
 //! @yah:parent(R893)
 //! @yah:next("Tier: Cleric — a small, well-specified addition to one const array, but the permission-group ids must be resolved against the live Cloudflare catalog rather than guessed, and three stale prose enumerations need correcting in the same pass.")
-//! @yah:handoff("Added Account Analytics Read (account, id b89a480218d04ceb98b4fe57ca29dc1f) and Analytics Read (zone, id 9c88f9c5bce24ce7af9a958ba9c504db) to MESOFACT_STATIC_GRANTS in oss/yubaba/crates/cloud/src/provider/cloudflare.rs (now 11 grants: 4 account + 7 zone). Both group names + ids resolved live 2026-09-12 via GET /accounts/3948dc292e724e71b0deefde0ea95999/tokens/permission_groups using the cloudflare-legacy-yah keystore slot (the token the operator granted Analytics on) — never printed, only piped through curl+python filtering.")
+//! @yah:handoff("Added Account Analytics Read (account, id b89a480218d04ceb98b4fe57ca29dc1f) and Analytics Read (zone, id 9c88f9c5bce24ce7af9a958ba9c504db) to MESOFACT_STATIC_GRANTS in oss/yubaba/crates/cloud/src/provider/cloudflare.rs (now 11 grants: 4 account + 7 zone). Both group names + ids resolved live 2026-09-12 via GET /accounts/0123456789abcdef0123456789abcdef/tokens/permission_groups using the cloudflare-legacy-yah keystore slot (the token the operator granted Analytics on) — never printed, only piped through curl+python filtering.")
 //! @yah:handoff("Updated the three stale enumerations named in the ticket: app/yah/cli/src/cloud.rs:1212-1218 doc comment now lists Account Analytics:Read + Analytics:Read; .yah/infra/providers/cloudflare.toml:37-52 gained a third dated paragraph ('eleven total') rather than editing the historical seven/nine paragraphs in place; oss/yah-base/crates/keys/src/spec.rs:695 now says 'eleven' and its cloudflare.toml consumer line reference corrected from :47 to :53.")
 //! @yah:handoff("No mint performed — scope fence respected. cargo test -p yah-cloud --lib: 1205 passed both before and after (baseline established fresh, same run). cargo check -p desktop --lib, -p yah --lib, -p fob --lib all clean (pre-existing warnings only, no new errors).")
 //! @yah:verify("cd oss/yubaba && cargo test -p yah-cloud --lib — 1205 passed, 0 failed (matches pre-change baseline)")
@@ -411,7 +411,7 @@ pub const MESOFACT_STATIC_GRANTS: &[TokenGrant] = &[
     },
     // R893-T22: backs the front-door latency panel's GraphQL Analytics query
     // (app/yah/desktop/src/front_door.rs). Resolved live 2026-09-12 against
-    // GET /accounts/3948dc292e724e71b0deefde0ea95999/tokens/permission_groups.
+    // GET /accounts/0123456789abcdef0123456789abcdef/tokens/permission_groups.
     TokenGrant {
         group_name: "Account Analytics Read",
         scope: GrantScope::Account,
@@ -464,7 +464,7 @@ pub const MESOFACT_STATIC_GRANTS: &[TokenGrant] = &[
 /// a Cloudflare Tunnel's ingress configuration (`ensure_tunnel_ingress` in
 /// `reconciler/ingress.rs` — a PUT, so it needs the Write/"Edit" group, not
 /// the Read one). Group name + fallback ID resolved live 2026-09-15 against
-/// `GET /accounts/3948dc292e724e71b0deefde0ea95999/tokens/permission_groups`
+/// `GET /accounts/0123456789abcdef0123456789abcdef/tokens/permission_groups`
 /// (R912-F1) — Cloudflare's own catalog calls the group "Cloudflare Tunnel
 /// Write", which is what the dashboard/docs render as "Cloudflare Tunnel:
 /// Edit". Deliberately account-scoped only, no zone grants: a tunnel's
@@ -563,6 +563,17 @@ pub fn r2_s3_pair(token_id: &str, token_value: &str) -> (String, String) {
 }
 
 /// Resource key a [`GrantScope::R2Bucket`] grant is issued on.
+/// `POST` target for creating an R2 bucket (no `cf-r2-jurisdiction` header, so
+/// the `default` jurisdiction -- matching [`r2_bucket_resource`]).
+fn r2_buckets_path(account_id: &str) -> String {
+    format!("/accounts/{account_id}/r2/buckets")
+}
+
+/// `DELETE` target for revoking one account-owned API token.
+fn account_token_path(account_id: &str, token_id: &str) -> String {
+    format!("/accounts/{account_id}/tokens/{token_id}")
+}
+
 pub fn r2_bucket_resource(account_id: &str, bucket: &str) -> String {
     format!("com.cloudflare.edge.r2.bucket.{account_id}_default_{bucket}")
 }
@@ -633,7 +644,7 @@ pub struct CloudflareClient {
 /// @yah:verify("FIXED when a hostname on A records can be moved onto a tunnel through the CLI alone, AND the safe-ordering property holds — i.e. an attempt to cut over to a tunnel with no healthy connector either refuses or is explicitly opted into. Both halves: the first alone just automates the outage.")
 /// @yah:gotcha("THE SURFACE IS TWO SUBCOMMANDS WIDE. `yah cloud cf --help` lists exactly `token` (mint scoped account-owned tokens) and `tunnel` (idempotent ensure). There is no verb that reads, creates, updates or deletes a DNS record. The only DNS write anywhere in `yah cloud cf` is the CNAME upsert bolted onto `cf tunnel ensure --hostname`.")
 /// @yah:gotcha("AND THAT UPSERT IS NOT A GENERAL UPSERT. Cloudflare forbids a CNAME coexisting with an A/AAAA record at the same name, so the call fails with `An A, AAAA, or CNAME record with that host already exists` whenever the incumbent record is not ALREADY a CNAME. The `--help` text's promise that it 'upserts a CNAME ... so the public hostname is wired even before the origin daemon comes up' therefore holds only for a name that is unused or already CNAME'd — precisely NOT the migration case, where a hostname is being moved onto a tunnel from something else.")
-/// @yah:gotcha("CONCRETE INSTANCE, MEASURED 2026-09-14 from the noisetable camp: api-staging.noisetable.com holds A records 51.81.85.145 and 45.32.194.254 (its production passway edge, currently serving 200), and cannot be moved to tunnel 1b41587a-7298-4f29-97bf-40d51ed79397 because those two records must be DELETED first. With no DNS verb in the CLI, the only route is hand-editing the Cloudflare dashboard or hand-calling the API — which is exactly the class of action a camp's own rules put out of bounds for an agent, so the cutover stalls with no in-tool path.")
+/// @yah:gotcha("CONCRETE INSTANCE, MEASURED 2026-09-14 from the noisetable camp: api-staging.noisetable.com holds A records 203.0.113.13 and 203.0.113.12 (its production passway edge, currently serving 200), and cannot be moved to tunnel 1b41587a-7298-4f29-97bf-40d51ed79397 because those two records must be DELETED first. With no DNS verb in the CLI, the only route is hand-editing the Cloudflare dashboard or hand-calling the API — which is exactly the class of action a camp's own rules put out of bounds for an agent, so the cutover stalls with no in-tool path.")
 /// @yah:handoff("Built the higher-level operation as directed: `yah cloud cf tunnel cutover --hostname <h> --name <tunnel> [--force-dark-window]` (app/yah/cli/src/cloud.rs). No general DNS CRUD exposed on the CLI -- the DNS methods it needed (list_dns_records, delete_dns_records_matching, upsert_dns_record) already existed as CloudflareClient methods from prior work (R859-F1); only one new client method was added: CloudflareClient::tunnel_conn_state(account_id, tunnel_id) -> Result<TunnelConnState>, a thin wrapper around the existing (private) list_tunnels_meta that surfaces just the connector state for one tunnel by id.")
 /// @yah:handoff("Ordering: lists existing DNS records at the hostname first. If already a correct CNAME with no A/AAAA left beside it, no-op success (idempotent, matches `ensure`'s contract). Otherwise, if A/AAAA records are present, gates on readiness (tunnel_conn_state == Active AND tunnel_configuration's ingress array contains a rule for the hostname) before deleting them -- refuses with a message naming both missing preconditions and the outage it would cause, unless --force-dark-window is passed (which prints an explicit warning naming the outage before proceeding). Deletes only the incumbent A/AAAA records (delete_dns_records_matching, scoped by type+content so a round-robin sibling isn't touched), then upserts the CNAME.")
 /// @yah:handoff("Composes R907-B1 directly: the readiness check's ingress-rule half calls tunnel_configuration, which is what B1 made tolerant of a never-configured tunnel -- so a tunnel with a connector up but no ingress yet correctly reads as not-ready (has_ingress_rule=false) instead of erroring out of the whole cutover attempt.")
@@ -1036,7 +1047,7 @@ impl CloudflareClient {
         }
         let resp: CfSingle<serde_json::Value> = self
             .cf_post(
-                &format!("/accounts/{account_id}/r2/buckets"),
+                &r2_buckets_path(account_id),
                 &CreateBody { name: bucket_name },
             )
             .await?;
@@ -1305,6 +1316,19 @@ impl CloudflareClient {
     pub async fn delete_r2_bucket(&self, account_id: &str, bucket_name: &str) -> Result<()> {
         let resp: CfSingle<serde_json::Value> = self
             .cf_delete(&format!("/accounts/{account_id}/r2/buckets/{bucket_name}"))
+            .await?;
+        self.ok(&resp.success, &resp.errors)
+    }
+
+    /// Revoke an account-owned API token via
+    /// `DELETE /accounts/{id}/tokens/{token_id}` -- the inverse of
+    /// [`Self::create_account_token`]. An unknown id surfaces Cloudflare's
+    /// error, never `Ok`.
+    ///
+    /// Requires: `API Tokens: Edit` on a USER-owned bootstrap token.
+    pub async fn delete_account_token(&self, account_id: &str, token_id: &str) -> Result<()> {
+        let resp: CfSingle<serde_json::Value> = self
+            .cf_delete(&account_token_path(account_id, token_id))
             .await?;
         self.ok(&resp.success, &resp.errors)
     }
@@ -2032,6 +2056,19 @@ fn classify_tunnel_drift(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r2_bucket_create_path_is_account_scoped() {
+        assert_eq!(r2_buckets_path("abc123"), "/accounts/abc123/r2/buckets");
+    }
+
+    #[test]
+    fn account_token_delete_path_is_account_scoped() {
+        assert_eq!(
+            account_token_path("abc123", "tok9"),
+            "/accounts/abc123/tokens/tok9"
+        );
+    }
 
     fn rec(name: &str, content: &str) -> CfDnsRecord {
         CfDnsRecord {

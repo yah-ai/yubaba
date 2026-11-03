@@ -257,13 +257,18 @@ pub enum VolumeDisposition {
     /// explicitly, and *not* silently omitted, so nobody hunts for it on the
     /// source box or rsyncs a ramdisk.
     Discard { mounted_at: PathBuf, size_mb: u32 },
+    /// A [`VolumeSource::Named`] volume the spec declares disposable
+    /// (`yah.volumes.disposable`, R971-B9): a cache the workload rebuilds from
+    /// elsewhere on start (fleet-git rehydrates from R2). Not copied, and its
+    /// loss with a node is not data loss — so a move recreates it empty.
+    Rebuild { name: String, mounted_at: PathBuf },
 }
 
 impl VolumeDisposition {
     /// Whether this mount carries state that a move must account for.
-    /// Tmpfs does not; the other two do.
+    /// Tmpfs and disposable named volumes do not; the other two do.
     pub fn is_durable(&self) -> bool {
-        !matches!(self, Self::Discard { .. })
+        !matches!(self, Self::Discard { .. } | Self::Rebuild { .. })
     }
 
     /// Short label used in refusals and rendered output.
@@ -272,6 +277,7 @@ impl VolumeDisposition {
             Self::Copy { name, .. } => name.clone(),
             Self::Precondition { host_path, .. } => host_path.display().to_string(),
             Self::Discard { mounted_at, .. } => format!("tmpfs:{}", mounted_at.display()),
+            Self::Rebuild { name, .. } => name.clone(),
         }
     }
 }
@@ -499,10 +505,19 @@ pub fn plan_migration(
 
 /// Classify every declared mount. Order follows the spec so the rendered plan
 /// reads in the same order as the file the operator is looking at.
-fn dispositions(spec: &WorkloadSpec) -> Vec<VolumeDisposition> {
+pub(crate) fn dispositions(spec: &WorkloadSpec) -> Vec<VolumeDisposition> {
+    // R971-B9: a named volume is state only if the spec does not declare it
+    // disposable — the same set placement follows (`stateful_named_volumes`).
+    let stateful = spec.stateful_named_volumes();
     spec.volumes
         .iter()
         .map(|v| match &v.source {
+            VolumeSource::Named { name } if !stateful.contains(&name.as_str()) => {
+                VolumeDisposition::Rebuild {
+                    name: name.clone(),
+                    mounted_at: v.target.clone(),
+                }
+            }
             VolumeSource::Named { name } => VolumeDisposition::Copy {
                 name: name.clone(),
                 host_path: named_volume_path(name),
@@ -706,6 +721,13 @@ fn steps(
                         mounted_at.display()
                     )));
                 }
+                VolumeDisposition::Rebuild { name, mounted_at } => {
+                    out.push(MigrationStep::narrate(format!(
+                        "volume '{name}' at {} is declared disposable — not copied; the \
+                         workload rebuilds it on the target",
+                        mounted_at.display()
+                    )));
+                }
             }
         }
 
@@ -771,7 +793,7 @@ mod tests {
             std::fs::write(
                 dir.join(format!("{name}.toml")),
                 format!(
-                    "name = \"{name}\"\nprovider = \"static\"\nmesh_tags = []\n\
+                    "name = \"{name}\"\nprovider = \"static\"\nmesh_tags = [\"role:public-uptime\"]\n\
                      {group_line}{extra}\n\
                      [connect]\naddress = \"10.0.0.1\"\nssh = \"root@{name}\"\n\
                      identity_file = \"~/.ssh/yah\"\n\
@@ -893,6 +915,32 @@ mod tests {
         };
         assert_eq!(volumes, &["pgdata".to_string()]);
         assert!(err.to_string().contains("silently left on the source"));
+    }
+
+    /// R971-B9 residual: a named volume declared disposable is a cache, so a
+    /// fungible workload carrying one moves like a stateless one — classified
+    /// `Rebuild` (not copied, not durable) instead of refusing as data loss.
+    #[test]
+    fn a_disposable_named_volume_is_rebuilt_not_copied() {
+        let camp = Camp::new().machine("a", Some("prod")).machine("b", Some("dev")).workload(
+            "fleet-git",
+            "archetype = \"server\"\n[[volumes]]\n\
+             source = { named = { name = \"repos\" } }\ntarget = \"/var/lib/fleet-git\"\n\
+             read_only = false\n[annotations]\n\"yah.volumes.disposable\" = \"repos\"\n",
+        );
+
+        let plan = plan_migration(&camp.load(), "fleet-git", "dev", &["a".into()])
+            .expect("a disposable volume is not state");
+        assert!(!plan.stateful);
+        assert_eq!(plan.volumes_to_copy().count(), 0);
+        assert_eq!(
+            plan.volumes,
+            vec![VolumeDisposition::Rebuild {
+                name: "repos".into(),
+                mounted_at: "/var/lib/fleet-git".into(),
+            }]
+        );
+        assert!(!plan.volumes[0].is_durable());
     }
 
     #[test]

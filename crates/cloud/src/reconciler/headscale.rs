@@ -293,29 +293,25 @@ impl Reconciler for HeadscaleReconciler {
         // (7) ACL policy — compare before writing. See the module docs for why
         // a file-mode coordinator can be read but not written.
         if let Some(policy) = &declared.acl_policy {
-            let live = client
-                .get_policy()
-                .await
-                .with_context(|| format!("reading the ACL policy from {base_url}"))?;
-            if policies_equivalent(&live, &policy.hujson)? {
-                notes.push("ACL policy in sync".to_string());
-            } else {
-                client.set_policy(&policy.hujson).await.with_context(|| {
-                    format!(
-                        "the declared ACL policy ({declared_path}) differs from the one \
-                         {base_url} has loaded, and pushing it was refused. headscale accepts a \
-                         policy write only under `policy.mode: database`, which every in-tree \
-                         renderer now emits (R861-T2) — so a refusal here means this coordinator \
-                         has not been migrated yet and is still reading `policy.path` off disk. \
-                         Run the file-to-database migration on it \
-                         ({migration}) and retry; until then the declared policy has to reach \
-                         the node as the file `policy.path` names",
-                        declared_path = policy.path.display(),
-                        migration = policy_migration::MODULE_PATH,
-                    )
-                })?;
-                info!(coordinator = %base_url, "headscale ACL policy updated");
-                notes.push("ACL policy updated".to_string());
+            let outcome = converge_policy(&client, &policy.hujson).await.with_context(|| {
+                format!(
+                    "converging {base_url} onto the declared ACL policy ({declared_path}) \
+                     failed. headscale accepts a policy write only under `policy.mode: \
+                     database`, which every in-tree renderer now emits (R861-T2) — so a \
+                     refused push means this coordinator has not been migrated yet and is \
+                     still reading `policy.path` off disk. Run the file-to-database migration \
+                     on it ({migration}) and retry; until then the declared policy has to \
+                     reach the node as the file `policy.path` names",
+                    declared_path = policy.path.display(),
+                    migration = policy_migration::MODULE_PATH,
+                )
+            })?;
+            match outcome {
+                PolicyConvergence::InSync => notes.push("ACL policy in sync".to_string()),
+                PolicyConvergence::Updated => {
+                    info!(coordinator = %base_url, "headscale ACL policy updated");
+                    notes.push("ACL policy updated".to_string());
+                }
             }
         }
 
@@ -596,10 +592,55 @@ fn parse_preauth_key(entry: &toml::Value, declared_users: &[String]) -> Result<D
 /// say nothing about the tailnet. Both sides are normalized from HuJSON to
 /// JSON and compared as values, so reformatting the declared file does not
 /// trigger a spurious push and a genuinely different rule always does.
-fn policies_equivalent(live: &str, declared: &str) -> Result<bool> {
+pub fn policies_equivalent(live: &str, declared: &str) -> Result<bool> {
     let live = parse_hujson(live).context("parsing the coordinator's current ACL policy")?;
     let declared = parse_hujson(declared).context("parsing the declared ACL policy")?;
     Ok(live == declared)
+}
+
+/// What [`converge_policy`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyConvergence {
+    /// The coordinator already served a semantically equal document.
+    InSync,
+    /// The declared document was pushed and the read-back matched it.
+    Updated,
+}
+
+/// Make `client`'s coordinator serve `declared`: compare, push only on a
+/// difference, then read back and refuse a mismatch (R1025).
+///
+/// The single owner of "apply a declared ACL policy" — the workload
+/// reconciler, `yah mesh policy apply`, and `yah mesh bootstrap` all route
+/// here, so the compare-before-write rule (headscale APPENDS a `policies`
+/// row on every `SetPolicy`, see [`HeadscaleClient::set_policy`]) and the
+/// read-back check cannot drift apart between callers.
+///
+/// A `GET` that errors is treated as "no policy row" (what a fresh
+/// database-mode coordinator answers) and falls through to the push; a dead
+/// coordinator then fails the push instead, so it is never reported in sync.
+pub async fn converge_policy(
+    client: &HeadscaleClient,
+    declared: &str,
+) -> Result<PolicyConvergence> {
+    // Fail on a malformed declaration before touching the coordinator.
+    parse_hujson(declared).context("parsing the declared ACL policy")?;
+    if let Ok(live) = client.get_policy().await {
+        if policies_equivalent(&live, declared)? {
+            return Ok(PolicyConvergence::InSync);
+        }
+    }
+    client.set_policy(declared).await?;
+    let back = client
+        .get_policy()
+        .await
+        .context("reading the ACL policy back after pushing it")?;
+    if !policies_equivalent(&back, declared)? {
+        anyhow::bail!(
+            "the coordinator accepted the ACL policy push but serves a different document back"
+        );
+    }
+    Ok(PolicyConvergence::Updated)
 }
 
 /// Parse HuJSON (`policy.path` is documented as "a policy file in HuJSON

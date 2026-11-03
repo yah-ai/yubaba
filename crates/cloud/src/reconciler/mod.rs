@@ -76,7 +76,7 @@
 //! @yah:next("THE DEFECT, read not inferred. `embedded_template_matches_workspace_canonical` exists to prove the mirror.yml compiled into the binary matches the canonical copy on disk. It resolves the workspace root by walking `CARGO_MANIFEST_DIR.ancestors()`, which lands on `oss/yubaba` — an independent Cargo workspace whose `.yah/` holds only a `.gitignore`. The canonical path therefore does not exist, the test takes its `canonical_path.exists()` bootstrap branch, and asserts NOTHING. It has been green for that reason, not because the files agree.")
 //! @yah:next("WHAT THE GUARD IS MISSING, measured: the repo-root `.yah/infra/cloud-init/mirror.yml` is 128 diff-lines behind `oss/yubaba/crates/cloud/templates/mirror.yml`. It is missing the ENTIRE R858-F17 turso-backup block, and the YAML-quoting fix R870-F23 landed in the embedded copy (the two runcmd entries whose bare `: ` made cloud-init parse them as a Mapping and skip them). THE FIX IS TWO PARTS AND THE ORDER MATTERS: first make the guard non-vacuous — resolve the canonical path against the REPO root rather than the enclosing cargo workspace, or fail loudly when it cannot be found, so the bootstrap branch can no longer swallow a real absence. Then reconcile the two files. Doing only the second leaves the guard still asleep for the next drift.")
 //! @yah:handoff("GUARD MADE NON-VACUOUS FIRST, then the files reconciled, and the intermediate RED was observed. New CanonicalHome enum + locate_canonical_home() in oss/yubaba/crates/cloud/src/cloud_init.rs (non-test code, since it is a real property of the layout): the ancestor walk is keyed on `.yah/infra/` instead of `.yah/`. The monorepo root has it; oss/yubaba, whose own .yah/ holds nothing but a .gitignore, does not, and neither does the standalone export where the repo root genuinely IS oss/yubaba. embedded_template_matches_workspace_canonical now matches on that: Monorepo(root) means the canonical file is REQUIRED (missing/unreadable panics with a message naming the path and saying provisioning reads it); StandaloneExport is the only branch allowed to skip. The old `if canonical_path.exists()` bootstrap branch that swallowed a real absence is gone.")
-//! @yah:handoff("THE RED, run after step 1 and before step 2 exactly as the ticket asked: `cargo test -p yah-cloud --lib cloud_init::tests` from oss/yubaba gave 29 passed / 1 FAILED, the single failure being embedded_template_matches_workspace_canonical asserting on /Users/leif/ss/yah/.yah/infra/cloud-init/mirror.yml with the full 128-line diff in its message. That is the proof it now compares something real; the post-fix green on its own would have been indistinguishable from today's vacuous green.")
+//! @yah:handoff("THE RED, run after step 1 and before step 2 exactly as the ticket asked: `cargo test -p yah-cloud --lib cloud_init::tests` from oss/yubaba gave 29 passed / 1 FAILED, the single failure being embedded_template_matches_workspace_canonical asserting on .yah/infra/cloud-init/mirror.yml with the full 128-line diff in its message. That is the proof it now compares something real; the post-fix green on its own would have been indistinguishable from today's vacuous green.")
 //! @yah:handoff("THE RECONCILE WAS NOT A ONE-WAY COPY, and this is the part worth reading. The canonical copy carried a DELIBERATE CORRECTION the embedded template never received: commit 45e39f0a (2026-08-03) changed `systemctl enable --now yubaba.slice` to `systemctl start yubaba.slice`, plus the comment explaining why - app/yah/cli/resources/yubaba.slice has no [Install] section, and systemctl enable on such a unit fails. Blindly overwriting canonical with embedded (which the ticket text reads like) would have regressed that fix into the file provisioning actually ships. So the fix went BOTH ways: the slice correction was applied to oss/yubaba/crates/cloud/templates/mirror.yml first, then that file was copied over .yah/infra/cloud-init/mirror.yml. The two are now byte-identical at 237 lines; canonical gained the whole R858-F17 turso-backup block, the R870-F23 YAML double-quoting of the two colon-space runcmd entries, the litestream 0.3.13 install, and the headscale 0.23.0 + litestream-headscale.service pre-stage.")
 //! @yah:handoff("WHICH TEMPLATE PROVISIONING ACTUALLY USES - THE CANONICAL ON-DISK ONE, read not guessed. cloud_init::load_template() returns the on-disk <workspace_root>/.yah/infra/cloud-init/mirror.yml whenever it exists and falls back to the include_str! embedded copy only when it does not. provision::build_request() (oss/yubaba/crates/cloud/src/provision.rs:88) is its sole non-test caller, and its sole caller in turn is handle_provision at app/yah/cli/src/cloud.rs:14524, whose workspace_root is the camp repo root - which has the file. So the embedded template is the FALLBACK, not the live path, and the stale copy is the one every `yah cloud machine provision` has been shipping. load_template's doc comment now says so.")
 //! @yah:handoff("FLEET CONSEQUENCE, dated from git so the window is bounded. NO node was touched - code, templates and tests only, per scope. Canonical was last updated 2026-08-03 (45e39f0a). The headscale 0.23.0 pre-stage, the litestream install and litestream-headscale.service staging landed in the EMBEDDED copy only on 2026-09-05 (4bed91fe), so any node provisioned between 2026-09-05 and today silently received none of them - that is the real damage this drift did. The turso-backup block landed in the embedded copy only TODAY (a8f0d501, 2026-09-10), so no node has ever received the durability helpers from either file; that gap is fleet-wide and predates this ticket rather than being caused by the drift. Remediating existing nodes is deliberately NOT done here.")
@@ -227,6 +227,59 @@ pub use sync_status::{
     MirrorObservation, Runtime, ServiceStatus, StatusSummary, SyncHistoryEntry, SyncOutcome,
     SyncState, WireContainerStatus,
 };
+
+// ─── kind = "binary" tier routing (R715-B7) ─────────────────────────────────
+
+/// Which runtime, if any, a `kind = "binary"` component gets on a mirror.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryRuntime {
+    /// The mirror binds `[providers.compute] kind = "local-process"` — dev tier.
+    LocalProcess,
+    /// The mirror binds `[providers.compute] kind = "local-container"`, or is
+    /// the pond tier with no compute slot and the component carries a
+    /// `workload.toml` container recipe.
+    Container,
+    /// Everything else: a published artifact `apply` has nothing to reconcile
+    /// (staging/prod ship it via `yah cloud workload deploy`; a slotless dev
+    /// mirror has never run it).
+    Adopt,
+}
+
+/// R715-B7 — route a `binary` component the way the mirror asks, rather than
+/// adopting it as a no-op on every tier. The component kind says what the
+/// service *is*; the mirror says how it runs here (same split as `container`).
+/// Non-`local` shapes always adopt, so staging/prod behaviour is unchanged.
+///
+/// The slotless case is keyed on the pond tier NAME (canonical `pond`, legacy
+/// `local-sim`/`sim`), not on "has a recipe": a dev mirror with no compute slot
+/// (noisetable-marketing's, carrying the `issues` binary) has always adopted,
+/// and container-running it there broke the whole mirror's bring-up.
+pub fn binary_runtime(ctx: &ReconcileCtx<'_>) -> BinaryRuntime {
+    use crate::config::{MirrorProviderSlot, Provider};
+    if !matches!(ctx.mirror.shape, crate::MirrorShape::Local) {
+        return BinaryRuntime::Adopt;
+    }
+    match ctx.mirror.providers.get("compute") {
+        Some(MirrorProviderSlot::Inline { kind: Provider::LocalProcess, .. }) => {
+            BinaryRuntime::LocalProcess
+        }
+        Some(MirrorProviderSlot::Inline { kind: Provider::LocalContainer, .. }) => {
+            BinaryRuntime::Container
+        }
+        Some(_) => BinaryRuntime::Adopt,
+        None if matches!(ctx.env, "pond" | "local-sim" | "sim") => {
+            let recipe = std::fs::read_to_string(ctx.workload_dir().join("workload.toml"))
+                .ok()
+                .and_then(|src| container::parse_container_recipe(&src).ok());
+            if recipe.is_some() {
+                BinaryRuntime::Container
+            } else {
+                BinaryRuntime::Adopt
+            }
+        }
+        None => BinaryRuntime::Adopt,
+    }
+}
 
 // ─── Log buffer ─────────────────────────────────────────────────────────────
 
@@ -695,6 +748,19 @@ impl RunningWorkload {
     }
 }
 
+impl RunningWorkload {
+    /// Let go of the workload WITHOUT stopping it (R584-B8). The shutdown
+    /// sender is dropped unsent, which supervisors that own a durable child
+    /// (local-process, the miniflare door) read as "leave it running"; the
+    /// next reconcile of the same component reaps it. This is what
+    /// `yah cloud mirror up` does once the mirror is up, so its slots outlive
+    /// the CLI. Contrast [`Self::shutdown`] and `Drop`, which both stop it.
+    pub fn detach(mut self) {
+        drop(self.shutdown.take());
+        drop(self.supervisor.take());
+    }
+}
+
 impl Drop for RunningWorkload {
     fn drop(&mut self) {
         // Best-effort signal. The supervisor task is detached and will
@@ -1045,6 +1111,109 @@ mod source_seam_tests {
         // Second call takes the update path and stays green (idempotent).
         materialize_git_source(&source, &dest).await.unwrap();
         assert!(dest.join("hello.txt").is_file());
+    }
+
+    // ── R715-B7: kind = "binary" tier routing ──
+
+    const RECIPE: &str = "schema_version = 1\nname = \"api\"\nkind = \"container\"\n\n\
+                          [build]\n\n[run]\nport = 4332\n";
+
+    fn binary_ws(workload: Option<&str>) -> (tempfile::TempDir, ServiceConfig) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut comp = component(None);
+        comp.kind = "binary".into();
+        std::fs::create_dir_all(tmp.path().join("site")).unwrap();
+        if let Some(src) = workload {
+            std::fs::write(tmp.path().join("site/workload.toml"), src).unwrap();
+        }
+        (tmp, service(comp))
+    }
+
+    fn with_compute(mut mir: MirrorConfig, kind: crate::config::Provider) -> MirrorConfig {
+        mir.providers.insert(
+            "compute".into(),
+            crate::config::MirrorProviderSlot::Inline {
+                kind,
+                fields: Default::default(),
+            },
+        );
+        mir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binary_on_a_local_process_slot_runs_natively() {
+        let (tmp, svc) = binary_ws(Some(RECIPE));
+        let mir = with_compute(mirror(), crate::config::Provider::LocalProcess);
+        assert_eq!(
+            binary_runtime(&ctx(tmp.path(), &svc, &mir)),
+            BinaryRuntime::LocalProcess
+        );
+    }
+
+    fn pond<'a>(ws: &'a Path, svc: &'a ServiceConfig, mir: &'a MirrorConfig) -> ReconcileCtx<'a> {
+        ReconcileCtx { env: "pond", ..ctx(ws, svc, mir) }
+    }
+
+    #[test]
+    fn binary_on_a_slotless_pond_mirror_with_a_recipe_runs_the_container() {
+        let (tmp, svc) = binary_ws(Some(RECIPE));
+        let mir = mirror();
+        assert_eq!(
+            binary_runtime(&pond(tmp.path(), &svc, &mir)),
+            BinaryRuntime::Container
+        );
+    }
+
+    #[test]
+    fn binary_on_a_pond_mirror_without_a_recipe_is_adopted() {
+        let (tmp, svc) = binary_ws(None);
+        let mir = mirror();
+        assert_eq!(
+            binary_runtime(&pond(tmp.path(), &svc, &mir)),
+            BinaryRuntime::Adopt
+        );
+    }
+
+    #[test]
+    fn binary_on_a_slotless_dev_mirror_is_adopted_even_with_a_recipe() {
+        let (tmp, svc) = binary_ws(Some(RECIPE));
+        let mir = mirror();
+        assert_eq!(
+            binary_runtime(&ctx(tmp.path(), &svc, &mir)),
+            BinaryRuntime::Adopt
+        );
+    }
+
+    #[test]
+    fn binary_on_a_local_container_slot_runs_the_container() {
+        let (tmp, svc) = binary_ws(Some(RECIPE));
+        let mir = with_compute(mirror(), crate::config::Provider::LocalContainer);
+        assert_eq!(
+            binary_runtime(&ctx(tmp.path(), &svc, &mir)),
+            BinaryRuntime::Container
+        );
+    }
+
+    #[test]
+    fn binary_on_staging_or_prod_shapes_is_still_adopted() {
+        let (tmp, svc) = binary_ws(Some(RECIPE));
+        for shape in [crate::MirrorShape::SingleMachine, crate::MirrorShape::MultiMachine] {
+            let mut mir = mirror();
+            mir.shape = shape;
+            assert_eq!(
+                binary_runtime(&pond(tmp.path(), &svc, &mir)),
+                BinaryRuntime::Adopt
+            );
+            #[cfg(unix)]
+            {
+                let mir = with_compute(mir, crate::config::Provider::LocalProcess);
+                assert_eq!(
+                    binary_runtime(&ctx(tmp.path(), &svc, &mir)),
+                    BinaryRuntime::Adopt
+                );
+            }
+        }
     }
 }
 

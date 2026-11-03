@@ -54,18 +54,6 @@
 //! @yah:verify("rustfmt --edition 2021 --check on both edited files: clean on every hunk of this change. The two remaining deviations (store.rs pub fn tenants, mod.rs rpo_bound assert) are both present at HEAD and were left alone - shared tree.")
 //! @yah:gotcha("EPOCH VERDICT: state_epoch stays 4, surface re-recorded (5d01cc38... -> 7811ac8f...). raft/store.rs is a state_epoch surface input so the gate went red; the NOT-BREAKING call and its reasoning are in oss/yubaba/crates/yubaba/cluster-epochs.json surface_rerecords[2026-08-31]. Short form: new-reads-old IS the fix (the migration), old-reads-new is a no-op (a pre-R841 binary opens the other three files by exact name and never looks at raft_meta.json, and none of their schemas changed), and no replicated type moved. cluster_protocol was untouched and stayed green - store.rs is not one of its inputs.")
 //!
-//! @yah:ticket(R836-B2-B1, "open() trusts a present last_purged_log_id without checking it against the log's first index, so a rollback across a purge leaves a stale marker")
-//! @yah:at(2026-09-02T23:19:15Z)
-//! @yah:status(open)
-//! @yah:parent(R836-B2)
-//! @yah:severity(medium)
-//! @yah:next("In open(), validate a PRESENT meta.last_purged_log_id against entries.first(). Today the recovery arms are asymmetric: is_none() reconstructs from raft_state.json, and the wiped-dir case (entries empty, no raft_state.json) drops the marker, but a marker that is present and WRONG is trusted verbatim. The check is cheap and local: if the marker's index+1 != first surviving index, the same reconstruct_last_purged reasoning already in this file says which value is right.")
-//! @yah:next("Reachable sequence, all three legs supported today: roll a node forward to a build that writes raft_meta.json; roll it back to a pre-R841-B1 build, which purges without knowing the file exists; roll forward again. The marker now names a purge point BELOW where the log starts, openraft reads a deleted entry, and the node exits with the same 'log entry not found' R841-B1 was filed to fix.")
-//! @yah:verify("A test in this file's suite: write a raft dir with a purge marker at index N, truncate the log so it starts at M > N+1, open() and assert the marker is corrected or the open refuses with a message naming the mismatch. The existing a_purged_log_can_still_produce_an_initial_state and the wiped-dir test are the shape to follow.")
-//! @yah:gotcha("NOT AN EPOCH QUESTION and do not re-open one. state_epoch was settled NOT BREAKING on 2026-09-02 (cluster-epochs.json surface_rerecords, closing R836-B2): new-reads-old migrates exactly, old-reads-new never opens the file, nothing replicated moved. Bumping the epoch would not fix this shape — it would only forbid the rollback that produces it, and the code is what should be robust to it.")
-//! @yah:gotcha("FAILS LOUDLY, which is why this is medium and not high: the node refuses to start with a storage error. No divergence, no stale read served, no silent corruption.")
-//! @yah:tier(Wizard)
-//!
 //! @yah:relay(R869, "Raft state has no off-fleet copy: total node loss is unrecoverable, and rebuilding resets tenant fencing epochs")
 //! @yah:status(review)
 //! @yah:phase(P5)
@@ -126,6 +114,16 @@
 //! @yah:handoff("T7 ROLL, DEV GROUP (session:3b2e5822), 2026-09-15. Build: hotship stamp 0.8.40-h14; aarch64 sha256 ff85549a34de78d4eb7c3d03ce52159102f2126a8e72731a791a11be422eb201, x86_64 sha256 1322416b1c78c6a5204afb93c2c3a2fcbc06657f32244fcef009d0da4b09436c. Both artifacts contain zero `secret migration: ` strings, and secret_migrate.rs is absent. Both dry runs EXIT=0. Before each restart, `systemctl show -p ExecStart` still ended `--sovereign-group dev`. Restarts: us-west-011 06:05:12Z, us-west-014 06:05:54Z, us-west-013 (leader) 06:06:34Z. Each node's node-reported sha256 matched the artifact, /health was ok (0.8.40-h14, cluster_protocol 7, state_epoch 6), sovereign_group was \"dev\" and last_log_index was 30, equal to the leader's. Zero ERROR/WARN matching snapshot/apply/decode/deserializ/secret/cert store since each restart (http_auth excluded). No snapshot log line at any level on any node, so each loaded its local raft state and none installed a snapshot. No election at any point, including the leader restart: term stayed 15, leader 13. GROUP CHECK: `yah cloud secret status` is unchanged by state for the T6 rows. BUT `yah cloud secret ls --json` through us-west-011 and us-west-013 is NOT byte-identical to the T6 dev after-state. The 3 dev records are identical (names, updated_at, access, digests), and two rows are ADDED: tls/yah.dev/cert and tls/yah.dev/key (access ingress, updated_at 1788580809, digest null), i.e. prod's fleet cert. Status shows them orphan-remote too (5, was 3). CAUSE (inference from code plus timestamps, not from a T7 diff): FleetSecretStore::index()/record_keys() (fleet_secrets.rs:247-299) lists every TLS pair under certs/<issuer>/ with no group segment. Dev derives the same issuer (secret_watch logs issuer acme-staging-v02.api.letsencrypt.org on dev). The T6 dev after-state was captured at 05:42:31Z, before prod's first-node migration wrote tls/yah.dev/* into certs/<issuer>/ at 05:44:07Z. T7 does not touch fleet_secrets.rs. PROD NOT ROLLED: it stays on 0.8.40-h13 pending the leader's call on the failed byte-identity gate.")
 //! @yah:gotcha("TLS IS FLEET-WIDE BY DESIGN, NOT GROUP-SCOPED (operator decision 2026-09-14, recorded in the R911 relay handoff and in W294 Decision 8). certs/<issuer>/ has no sovereign-group segment, so every group sharing a bucket and issuer lists, and under the `ingress` rule can resolve, the same tls/<domain>/* pairs. So a group's `yah cloud secret ls` shows the fleet TLS rows once any group's issuer has written them. dev began listing tls/yah.dev/{cert,key} at 05:44:07Z, when prod's T6 migration wrote them. A byte-identity check on a group covers its OWN secrets/<group>/ records only; tls/* rows are issuer-owned and excluded.")
 //! @yah:handoff("T7 ROLL, PROD GROUP (session:3b2e5822), 2026-09-15, one pass from 06:11:35Z to 06:14:00Z under the leader's call (A) after the dev ls question. Each ExecStart still ended in `--sovereign-group prod` before its restart. hotship --allow-proto-skew --version 0.8.40-h14. Restarts: us-west-001 06:11:35Z, us-east-001 06:13:16Z, us-south-001 (leader, headscale owner) 06:14:00Z. BYTES: prod runs x86_64 sha256 fc962043d83c91303f6794cd46d468f8a57f69033797bbcba16f5fbef1ba354b on all 3, NOT the 1322416b… hashed after the dry run. The ship rebuilt because raft/store.rs changed at 06:10:40Z, and that change was my own board.update on R911-T7 writing `//!` annotation lines at store.rs:127 (this ticket's source anchor). `cargo run -p xtask -- cluster-epochs` EXIT=0 with both surfaces matching. So prod differs from dev's ff85549a… build only by those comment lines; the bytes differ through line-number metadata (inference). The artifact still has zero `secret migration: ` strings. ROLL LESSON: a board write on a ticket anchored in a crate you are shipping changes the next build's bytes mid-roll. PER NODE: /health ok (0.8.40-h14, cluster_protocol 7, state_epoch 6), sovereign_group \"prod\", last_log_index equal to the leader's after each restart (2806160, 2806161, 2806162), zero ERROR/WARN matching snapshot/apply/decode/deserializ/secret/cert store (http_auth excluded), no snapshot line on any node (local state loaded, no snapshot installed). No election anywhere, including the leader restart: term 25, leader node 1 (us-south-001) throughout. GROUP: `yah cloud secret ls --json` through us-west-001 and us-south-001 is byte-identical to the T6 prod after-state (7 names, noise digest 502be984…); `yah cloud secret status` is unchanged by state. HEADSCALE: us-south-001 logged `adopted the appliance already running on this node — a restart is not a reason to move it (R858-T3)`; PID 2929861 before and after, /headscale/health running there and stopped on us-west-001 and us-east-001. DOORS: leaf SHA256 unchanged on all 3 (7F:0B:45:E7…, 4F:5D:87:60…, 53:01:DB:FD…). ACME: exactly one ACTIVE (us-south-001, 06:14:01Z); us-west-001 and us-east-001 on standby; zero PutSecret or `status 410` lines on all 3 since restart. FLEET STATE: all 6 voters on yubaba 0.8.40-h14 (not on the CDN), kamaji h9 (dev) / h11 (prod). Per this ticket's gotcha, never roll below the R911 build from here.")
+//!
+//! @yah:ticket(R836-B3, "open() trusts a present last_purged_log_id without checking it against the log's first index, so a rollback across a purge leaves a stale marker")
+//! @yah:at(2026-10-22T23:21:53Z)
+//! @yah:parent(R836)
+//! @yah:severity(medium)
+//! @yah:next("In open(), validate a PRESENT meta.last_purged_log_id against entries.first(). Today the recovery arms are asymmetric: is_none() reconstructs from raft_state.json, and the wiped-dir case (entries empty, no raft_state.json) drops the marker, but a marker that is present and WRONG is trusted verbatim. The check is cheap and local: if the marker's index+1 != first surviving index, the same reconstruct_last_purged reasoning already in this file says which value is right.")
+//! @yah:next("Reachable sequence, all three legs supported today: roll a node forward to a build that writes raft_meta.json; roll it back to a pre-R841-B1 build, which purges without knowing the file exists; roll forward again. The marker now names a purge point BELOW where the log starts, openraft reads a deleted entry, and the node exits with the same 'log entry not found' R841-B1 was filed to fix.")
+//! @yah:verify("A test in this file's suite: write a raft dir with a purge marker at index N, truncate the log so it starts at M > N+1, open() and assert the marker is corrected or the open refuses with a message naming the mismatch. The existing a_purged_log_can_still_produce_an_initial_state and the wiped-dir test are the shape to follow.")
+//! @yah:gotcha("NOT AN EPOCH QUESTION and do not re-open one. state_epoch was settled NOT BREAKING on 2026-09-02 (cluster-epochs.json surface_rerecords, closing R836-B2): new-reads-old migrates exactly, old-reads-new never opens the file, nothing replicated moved. Bumping the epoch would not fix this shape; the code is what should be robust to it.")
+//! @yah:gotcha("FAILS LOUDLY, which is why this is medium and not high: the node refuses to start with a storage error. No divergence, no stale read served, no silent corruption. Tier: Wizard. Re-filed from unparseable R836-B2-B1 (R984-B34).")
 
 use std::collections::BTreeMap;
 use std::fmt::Display;
@@ -1752,7 +1750,7 @@ mod tests {
                 Some("hetzner"),
                 Some("hil"),
                 Some("fip-42"),
-                Some("15.204.89.240"),
+                Some("203.0.113.11"),
             ),
             (
                 2,
@@ -1760,11 +1758,11 @@ mod tests {
                 Some("static"),
                 None,
                 None,
-                Some("51.81.85.145"),
+                Some("203.0.113.13"),
             ),
             // A node that pre-dates `MemberInfo::machine`, or could not read
             // its own hostname. Unresolvable by name, so it must not appear.
-            (3, None, Some("static"), None, None, Some("45.32.194.254")),
+            (3, None, Some("static"), None, None, Some("203.0.113.12")),
         ];
         for (index, (node_id, machine, provider, location, ip, public)) in
             rows.into_iter().enumerate()
@@ -1783,6 +1781,9 @@ mod tests {
                         location: location.map(str::to_string),
                         ingress_floating_ip: ip.map(str::to_string),
                         public_address: public.map(str::to_string),
+                        taints: None,
+                        mesh_tags: None,
+                        sovereign_participation: None,
                     },
                 ),
             )
@@ -1813,11 +1814,11 @@ mod tests {
 
         assert_eq!(
             sm.public_address_for_machine("us-west-001").as_deref(),
-            Some("15.204.89.240")
+            Some("203.0.113.11")
         );
         assert_eq!(
             sm.public_address_for_machine("us-east-001").as_deref(),
-            Some("51.81.85.145")
+            Some("203.0.113.13")
         );
         assert_eq!(
             sm.public_address_for_machine("us-south-001"),

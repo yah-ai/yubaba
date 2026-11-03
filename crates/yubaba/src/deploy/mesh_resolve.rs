@@ -691,6 +691,8 @@ mod mesh {
                 },
                 labels: HashMap::new(),
                 durability: None,
+                lease_id: None,
+                deadline: None,
                 db: Vec::new(),
                 capabilities: Vec::new(),
                 annotations: HashMap::new(),

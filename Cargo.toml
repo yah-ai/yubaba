@@ -17,6 +17,8 @@ members = [
     # R732-T4 (W245/W253): the per-node WAL→R2 streamer. A data-plane service,
     # deliberately not part of the yubaba server crate — see its crate doc.
     "crates/tenant-streamer",
+    # R971-F2 (W363): the fleet git remote's supervisor.
+    "crates/fleet-git",
     "crates/yubaba",
     # noisetable R118-T11 (W138/A111): the raft core — state machine, log store, HTTP
     # network factory, ClusterPolicy and the membership ratchet — carved out of
@@ -31,7 +33,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.46"
+version = "0.8.51"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

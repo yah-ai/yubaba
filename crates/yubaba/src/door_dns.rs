@@ -920,9 +920,9 @@ mod tests {
     use crate::failure_detector::{NodeLiveness, NodeObservation};
     use std::sync::Mutex;
 
-    const A: &str = "15.204.89.240";
-    const B: &str = "51.81.85.145";
-    const C: &str = "45.32.194.254";
+    const A: &str = "203.0.113.11";
+    const B: &str = "203.0.113.13";
+    const C: &str = "203.0.113.12";
 
     /// A door whose readiness matches its liveness (an Up door is serving);
     /// the readiness tests below build the not-ready case explicitly.

@@ -122,7 +122,7 @@ value = { literal = { value = "noisetable-account/account-live" } }
 
 [[env]]
 name = "XLB_R2_ENDPOINT"
-value = { literal = { value = "https://3948dc292e724e71b0deefde0ea95999.r2.cloudflarestorage.com" } }
+value = { literal = { value = "https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com" } }
 
 [[env]]
 name = "XLB_R2_BUCKET"

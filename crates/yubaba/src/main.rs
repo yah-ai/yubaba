@@ -209,7 +209,7 @@ enum Cmd {
         /// `GET /service-records?ready=true` was permanently empty and
         /// `yah cloud apply` could not resolve an ingress upstream against
         /// them. Rebinding them is not the alternative: their raft peers
-        /// advertise `192.168.10.11|13|14:7443`, so a mesh-only bind
+        /// advertise `192.168.250.11|13|14:7443`, so a mesh-only bind
         /// partitions the group.
         ///
         /// Readable from `$YUBABA_MESH_IP` for the same reason
@@ -350,6 +350,27 @@ enum Cmd {
         /// rather than a re-declared ExecStart.
         #[arg(long, env = "YUBABA_PUBLIC_ADDRESS")]
         public_address: Option<String>,
+        /// R977-B12: this box's node taints, comma-separated, copied from the
+        /// `taints` its `.yah/infra/machines/<name>.toml` declares (e.g.
+        /// `no-server,no-appliance`). Published into the member row so the
+        /// replica reconcile refuses a node a fresh deploy would refuse.
+        ///
+        /// Unset publishes *unknown*, and the reconcile then refuses this node
+        /// as a re-placement target — fail closed. Pass an empty value to
+        /// declare "no taints". Env-settable so a node gains it with an
+        /// `Environment=` drop-in rather than a re-declared ExecStart.
+        #[arg(long, env = "YUBABA_TAINTS")]
+        taints: Option<String>,
+        /// R1019-F28 (W388): this machine's declared `mesh_tags`,
+        /// comma-separated (e.g. `tag:build-worker,arch:x86,role:build`).
+        /// Published into the member row so the replica reconcile can evaluate
+        /// a `role:` or `tag:` selector the way fresh admission does.
+        ///
+        /// Unset publishes *unknown*, and the reconcile then refuses this node
+        /// for any spec naming a non-`arch:` tag — fail closed. The sovereign
+        /// drop-in renders it as `YUBABA_MESH_TAGS`, beside `YUBABA_TAINTS`.
+        #[arg(long, env = "YUBABA_MESH_TAGS")]
+        mesh_tags: Option<String>,
         /// R742-F1 (W305 §F1): which sovereign group this node votes in, e.g.
         /// `prod` or `dev`.
         ///
@@ -486,7 +507,7 @@ enum Cmd {
         /// `yubaba.service` ships in the release tarball and is copied verbatim
         /// onto every node of every camp, so a bucket named in its ExecStart
         /// would be a *fleet* URL baked into a binary a rig also installs. The
-        /// env fallback puts it in `/etc/yah-cloud/litestream.env` instead —
+        /// env fallback puts it in `<cloud-conf-dir>/<litestream-env>` instead —
         /// the same per-node file that already carries
         /// `LITESTREAM_ACCESS_KEY_ID` / `LITESTREAM_SECRET_ACCESS_KEY`, which is
         /// the right place because a URL is useless without the credentials
@@ -635,6 +656,36 @@ enum Cmd {
             value_name = "PATH"
         )]
         cluster_key_file: Option<PathBuf>,
+        /// R997-B26: path to the hex SERVICE key — a separate symmetric key
+        /// that doors, the issue-tracker receiver and tenant-streamer mint
+        /// under. A service token opens only the service routes (discovery
+        /// reads and the tenant-lease write), never a peer or operator route.
+        #[arg(
+            long = "service-key-file",
+            env = "YUBABA_SERVICE_KEY_FILE",
+            value_name = "PATH"
+        )]
+        service_key_file: Option<PathBuf>,
+        /// R997-B27: this node's identity file (`yubaba auth node-identity`):
+        /// its own key plus the operator's certificate for its raft node id.
+        /// Its forwarded cluster writes and raft RPC then prove which node
+        /// sent them.
+        #[arg(
+            long = "node-identity-file",
+            env = "YUBABA_NODE_IDENTITY_FILE",
+            value_name = "PATH"
+        )]
+        node_identity_file: Option<PathBuf>,
+        /// R997-B27: `warn` serves a node-to-node write or raft RPC that
+        /// carries no node proof; `require` refuses it. A proof that IS sent
+        /// is checked in both. Flip to `require` once every node and
+        /// tenant-streamer has an identity.
+        #[arg(
+            long = "node-identity-mode",
+            env = "YUBABA_NODE_IDENTITY_MODE",
+            default_value = "warn"
+        )]
+        node_identity_mode: String,
         /// R609-F2: the `yah` binary the camp-RPC lane execs. Bare `yah`
         /// resolves through `$PATH`, matching what the SSH path runs on the
         /// far side today.
@@ -690,7 +741,7 @@ enum Cmd {
     /// Parse an SSH pubkey file, compute its SHA256 fingerprint, and write
     /// it to the state file. Idempotent.
     RegisterHostkey {
-        /// Path to the SSH public key file (e.g. `/etc/yah-cloud/hostkey.pub`).
+        /// Path to the SSH public key file (e.g. `<cloud-conf-dir>/hostkey.pub`).
         pubkey_path: PathBuf,
         #[arg(long, default_value = DEFAULT_STATE_PATH)]
         state: PathBuf,
@@ -778,6 +829,35 @@ enum AuthCmd {
     /// Generate a cluster key — the symmetric secret every node in one
     /// cluster holds, and the only thing that mints a peer-tier token.
     ClusterKeygen {
+        /// Write it here, mode 0600. Printed to stdout when omitted.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+    /// R997-B26: generate a SERVICE key — a separate symmetric secret, one
+    /// per cluster, installed at the node service-key path on nodes and on
+    /// door / issue-tracker / tenant-streamer hosts. It mints only
+    /// service-tier tokens, so its holder cannot pass as a peer.
+    ServiceKeygen {
+        /// Write it here, mode 0600. Printed to stdout when omitted.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+    /// R997-B27: mint a node identity — a fresh keypair plus the operator's
+    /// certificate binding it to one raft node id. Run where the operator
+    /// key lives; install the output at
+    /// the node-identity path (0600) on that node, or on its
+    /// tenant-streamer host with `--kind tenant-streamer`.
+    NodeIdentity {
+        /// The raft node id (`--raft-node-id`) this identity speaks for.
+        #[arg(long)]
+        node_id: u64,
+        /// `node` for yubaba itself, `tenant-streamer` for that node's
+        /// streamer (which may then hold tenant leases for the node only).
+        #[arg(long, default_value = "node")]
+        kind: String,
+        /// The operator secret key file (hex) that certifies it.
+        #[arg(long, value_name = "PATH")]
+        operator_secret_file: PathBuf,
         /// Write it here, mode 0600. Printed to stdout when omitted.
         #[arg(long, value_name = "PATH")]
         out: Option<PathBuf>,
@@ -1063,6 +1143,8 @@ fn default_serve() -> Cmd {
         location: None,
         ingress_floating_ip: None,
         public_address: None,
+        taints: None,
+        mesh_tags: None,
         sovereign_group: None,
         sovereign_participation: Participation::default(),
         sovereign_voters: Vec::new(),
@@ -1082,6 +1164,9 @@ fn default_serve() -> Cmd {
         auth_mode: "warn".to_string(),
         operator_keys: Vec::new(),
         cluster_key_file: None,
+        service_key_file: None,
+        node_identity_file: None,
+        node_identity_mode: "warn".to_string(),
         camp_rpc_yah_bin: "yah".to_string(),
         xlb_seeds: Vec::new(),
         xlb_relays: Vec::new(),
@@ -1118,6 +1203,8 @@ async fn main() -> Result<()> {
             location,
             ingress_floating_ip,
             public_address,
+            taints,
+            mesh_tags,
             sovereign_group,
             sovereign_participation,
             sovereign_voters,
@@ -1137,6 +1224,9 @@ async fn main() -> Result<()> {
             auth_mode,
             operator_keys,
             cluster_key_file,
+            service_key_file,
+            node_identity_file,
+            node_identity_mode,
             camp_rpc_yah_bin,
             xlb_seeds,
             xlb_relays,
@@ -1558,7 +1648,26 @@ async fn main() -> Result<()> {
                 &auth_mode,
                 &operator_keys,
                 cluster_key_file.as_deref(),
+                service_key_file.as_deref(),
+                node_identity_file.as_deref(),
+                &node_identity_mode,
             )?);
+            // R997-B27: a certificate for another node id is a misinstall,
+            // and every peer would refuse what this node sends under it.
+            if let Some(identity) = server_state.http_auth.node_identity() {
+                let certified = identity.cert().node_id;
+                match raft_node_id {
+                    Some(id) if id == certified => {}
+                    Some(id) => bail!(
+                        "--node-identity-file certifies node {certified}, but this is \
+                         --raft-node-id {id}"
+                    ),
+                    None => tracing::warn!(
+                        certified,
+                        "--node-identity-file is set but this node runs no raft"
+                    ),
+                }
+            }
 
             // R609-F1: the yah control plane. Bound before raft so the
             // NodeId is logged early — it is the address an operator copies
@@ -1586,6 +1695,12 @@ async fn main() -> Result<()> {
                 push_relay_node_id,
                 push_relay_fcm_credentials,
             );
+
+            // R971-B9: the group is applied before the raft branch, not inside
+            // it. Cluster secrets are keyed per group, so a single-node node
+            // (us-west-003) that declares one must resolve them too — inside
+            // the raft branch it 422'd every deploy mounting a cluster secret.
+            server_state = apply_sovereign_group(server_state, sovereign_group.clone());
 
             if let Some(node_id) = raft_node_id {
                 tracing::info!(node_id, dir = ?raft_dir, "starting raft coordination layer");
@@ -1639,11 +1754,8 @@ async fn main() -> Result<()> {
                         .with_route_tables_file(&path)
                         .context("--transit-cost-file")?;
                 }
-                // R742-F1: declaring a group turns on the add-learner gate on
-                // this node. Unset leaves it off — see the flag's doc.
-                if let Some(group) = sovereign_group.clone() {
-                    server_state = server_state.with_sovereign_group(group);
-                }
+                // R742-F1: the group (applied above, R971-B9) also turns on the
+                // add-learner gate on this node. Unset leaves it off.
                 // R736-T3: and declaring a jurisdiction beside it makes that
                 // group a cell, which arms the cross-jurisdiction half of the
                 // same gate. Validated above, so this cannot be a jurisdiction
@@ -1769,6 +1881,10 @@ async fn main() -> Result<()> {
                         location,
                         ingress_floating_ip,
                         public_address,
+                        taints: taints.as_deref().map(yubaba::workload_reconcile::parse_taints),
+                        // R1019-F28: same comma-list grammar as `--taints`.
+                        mesh_tags: mesh_tags.as_deref().map(yubaba::workload_reconcile::parse_taints),
+                        sovereign_participation: Some(sovereign_participation),
                     },
                     shared_state.http.signer().clone(),
                 );
@@ -1901,6 +2017,19 @@ async fn main() -> Result<()> {
                         ),
                     ),
                 );
+                // R977-F3: workload replica reconcile. On every node like the
+                // scheduler; a follower's tick only feeds its tracker. Grace is
+                // `lease_detector::replacement_grace`, the deadline R977-F5's
+                // self-fence shares.
+                let _workload_reconcile = yubaba::workload_reconcile::spawn(
+                    Arc::clone(&shared_state),
+                    yubaba::workload_reconcile::ReconcileConfig::new(
+                        policy.timing,
+                        yubaba::lease_detector::HysteresisPolicy::from_thresholds(
+                            policy.liveness_thresholds(),
+                        ),
+                    ),
+                );
                 // R936-B12: the floater effector — runs each recorded floater
                 // where the scheduler above places its tenant, stops it
                 // everywhere else. On every member, like the scheduler.
@@ -1958,6 +2087,8 @@ async fn main() -> Result<()> {
                     std::time::Duration::from_millis(policy.timing.heartbeat_interval_ms.max(1)),
                     shared_state.http.signer().clone(),
                 );
+                let _rejoin_cleanup = yubaba::rejoin_cleanup::spawn(raft_node.clone(), state_machine.clone(), Arc::clone(&shared_state), std::time::Duration::from_secs(30));
+                let _workload_fence = yubaba::workload_fence::spawn(Arc::clone(&shared_state), yubaba::workload_fence::SelfFenceTiming::from_policy(yubaba::lease_detector::HysteresisPolicy::from_thresholds(policy.liveness_thresholds())));
                 // R737-T4: N+1 headroom accounting. Started on every node like
                 // the scheduler above; only the leader has real liveness
                 // evidence to act on, so a follower's tick is a no-op.
@@ -2995,23 +3126,39 @@ fn build_http_auth_policy(
     auth_mode: &str,
     operator_keys: &[String],
     cluster_key_file: Option<&std::path::Path>,
+    service_key_file: Option<&std::path::Path>,
+    node_identity_file: Option<&std::path::Path>,
+    node_identity_mode: &str,
 ) -> Result<yubaba::http_auth::HttpAuthPolicy> {
     let mode = yubaba::http_auth::AuthMode::parse(auth_mode).map_err(|e| anyhow!(e))?;
-    let cluster_key = match cluster_key_file {
-        Some(path) => Some(
-            std::fs::read_to_string(path)
-                .with_context(|| format!("reading --cluster-key-file {}", path.display()))?
-                .trim()
-                .to_string(),
-        ),
-        None => None,
+    let read_key = |flag: &str, file: Option<&std::path::Path>| -> Result<Option<String>> {
+        match file {
+            Some(path) => Ok(Some(
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("reading {flag} {}", path.display()))?
+                    .trim()
+                    .to_string(),
+            )),
+            None => Ok(None),
+        }
     };
+    let cluster_key = read_key("--cluster-key-file", cluster_key_file)?;
+    let service_key = read_key("--service-key-file", service_key_file)?;
+    let identity_mode = yubaba::http_auth::NodeIdentityMode::parse(node_identity_mode)
+        .map_err(|e| anyhow!(e))?;
+    let identity = node_identity_file
+        .map(yubaba_auth_token::node_identity::NodeIdentity::from_file)
+        .transpose()
+        .map_err(|e| anyhow!(e))?;
     let policy = yubaba::http_auth::HttpAuthPolicy::new(mode, operator_keys, cluster_key.as_deref())
+        .and_then(|p| p.with_service_key(service_key.as_deref()))
+        .and_then(|p| p.with_node_identity(identity, identity_mode))
         .map_err(|e| anyhow!(e))?;
     tracing::info!(
         mode = auth_mode,
         operator_keys = operator_keys.len(),
         cluster_key = policy.has_trust_root() && cluster_key_file.is_some(),
+        service_key = service_key_file.is_some(),
         "http control-plane auth policy"
     );
     if !policy.is_enforcing() {
@@ -3064,6 +3211,45 @@ fn run_auth_cmd(cmd: AuthCmd) -> Result<()> {
                     eprintln!("cluster key written to {} (mode 0600)", path.display());
                 }
                 None => println!("{hex}"),
+            }
+            Ok(())
+        }
+        AuthCmd::ServiceKeygen { out } => {
+            // Same key shape as a cluster key; distinct only by which
+            // `--*-key-file` a node loads it under.
+            let hex = yubaba_auth_token::generate_cluster_key_hex().map_err(|e| anyhow!(e))?;
+            match out {
+                Some(path) => {
+                    write_secret(&path, &hex)?;
+                    eprintln!("service key written to {} (mode 0600)", path.display());
+                }
+                None => println!("{hex}"),
+            }
+            Ok(())
+        }
+        AuthCmd::NodeIdentity {
+            node_id,
+            kind,
+            operator_secret_file,
+            out,
+        } => {
+            use yubaba_auth_token::node_identity::{IdentityKind, NodeIdentity};
+            let kind = IdentityKind::parse(&kind).map_err(|e| anyhow!(e))?;
+            let raw = std::fs::read_to_string(&operator_secret_file)
+                .with_context(|| format!("reading {}", operator_secret_file.display()))?;
+            let operator =
+                yubaba_auth_token::operator_secret_from_hex(raw.trim()).map_err(|e| anyhow!(e))?;
+            let identity = NodeIdentity::mint(&operator, kind, node_id).map_err(|e| anyhow!(e))?;
+            match out {
+                Some(path) => {
+                    write_secret(&path, &identity.to_json())?;
+                    eprintln!(
+                        "{kind} identity for node {node_id} written to {} (mode 0600), public key {}",
+                        path.display(),
+                        identity.cert().public_key
+                    );
+                }
+                None => println!("{}", identity.to_json()),
             }
             Ok(())
         }
@@ -3159,9 +3345,12 @@ fn build_admission(
 
 /// Connect to Kamaji when `--kamaji-socket` is set, retrying with backoff to
 /// ride out the sibling unit's socket-bind gap on a fresh boot (see
-/// [`KAMAJI_CONNECT_BUDGET_SECS`]). If the whole budget is exhausted, log a
-/// warning and leave `constable_client = None` so yubaba falls back to the
-/// legacy in-process runtime.
+/// [`KAMAJI_CONNECT_BUDGET_SECS`]). If the whole budget is exhausted, attach a
+/// [`kamaji::sibling::KamajiSibling::connecting`] that keeps redialling: until
+/// it connects, each call falls back to the legacy in-process runtime (as
+/// [`yubaba::ServerState::workload_backend`] does across any reconnect), and
+/// once kamaji answers, every call is kamaji's again. Dropping the sibling here
+/// instead latched the fallback for the life of the process (R1021-T6).
 async fn attach_constable_client(state: ServerState, socket: Option<PathBuf>) -> ServerState {
     let Some(socket) = socket else {
         return state;
@@ -3208,10 +3397,80 @@ async fn attach_constable_client(state: ServerState, socket: Option<PathBuf>) ->
         socket = %socket.display(),
         error = %last_err,
         budget_secs = KAMAJI_CONNECT_BUDGET_SECS,
-        "kamaji UDS connect failed within budget; falling back to in-process \
-         ContainerRuntime for workload lifecycle"
+        "kamaji UDS connect failed within budget; serving the in-process \
+         ContainerRuntime until kamaji answers, and redialling in the background"
     );
-    state
+    state.with_constable_client(kamaji::sibling::KamajiSibling::connecting(socket, per_attempt))
+}
+
+/// R971-B9: declare `--sovereign-group` on the node, whichever mode it serves
+/// in. Raft or single-node, the group is the key prefix its cluster secrets
+/// live under; on a raft node it also arms the R742-F1 add-learner gate.
+fn apply_sovereign_group(state: ServerState, group: Option<String>) -> ServerState {
+    match group {
+        Some(group) => state.with_sovereign_group(group),
+        None => state,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yubaba::fleet_secrets::{FleetSecretStore, MissingRail};
+
+    fn single_node_state(tmp: &tempfile::TempDir) -> ServerState {
+        let mem = Arc::new(yah_object_store::InMemoryObjectStore::new());
+        ServerState::load(tmp.path().join("identity.json"))
+            .unwrap()
+            .with_cert_store(yubaba::cert_store::ObjectCertStore::new(
+                mem,
+                "https://acme-v02.api.letsencrypt.org/directory",
+            ))
+    }
+
+    #[test]
+    fn a_single_node_node_with_a_sovereign_group_has_a_cluster_secret_rail() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = apply_sovereign_group(single_node_state(&tmp), Some("prod".into()));
+        let store = FleetSecretStore::for_node(&state).expect("group + cert store = a rail");
+        assert_eq!(store.group(), "prod");
+    }
+
+    /// R977-B13: the rendered drop-in always emits `YUBABA_TAINTS`, empty for a
+    /// machine with none. An empty env value must reach the daemon as
+    /// "known, no taints" (`Some(vec![])`); only an unset variable is unknown.
+    /// The variable is set and cleared inside this one test so no other test
+    /// can observe it.
+    #[test]
+    fn an_empty_taints_env_declares_none_and_unset_is_unknown() {
+        fn taints_of() -> Option<Vec<String>> {
+            match Cli::try_parse_from(["yubaba", "serve"]).unwrap().cmd {
+                Some(Cmd::Serve { taints, .. }) => {
+                    taints.as_deref().map(yubaba::workload_reconcile::parse_taints)
+                }
+                _ => panic!("serve parses as Serve"),
+            }
+        }
+        std::env::set_var("YUBABA_TAINTS", "");
+        let empty = taints_of();
+        std::env::set_var("YUBABA_TAINTS", "no-server,public-ip");
+        let some = taints_of();
+        std::env::remove_var("YUBABA_TAINTS");
+        let unset = taints_of();
+        assert_eq!(empty, Some(vec![]));
+        assert_eq!(some, Some(vec!["no-server".to_string(), "public-ip".to_string()]));
+        assert_eq!(unset, None);
+    }
+
+    #[test]
+    fn a_node_with_no_sovereign_group_still_reports_the_missing_rail() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = apply_sovereign_group(single_node_state(&tmp), None);
+        assert!(matches!(
+            FleetSecretStore::for_node(&state),
+            Err(MissingRail::NoSovereignGroup)
+        ));
+    }
 }
 
 fn init_tracing() {

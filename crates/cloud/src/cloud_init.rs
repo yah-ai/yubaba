@@ -59,7 +59,7 @@
 //! @yah:verify("UNPROVEN: build-iso.sh has not been executed - the initrd inject + xorriso repack path is written but not run, and the ISO URL pins DEBIAN_VERSION=13.1.0 which should be bumped to whatever trixie point release is current at build time (override with the env var).")
 //! @yah:verify("Cheap de-risk available before touching hardware: boot the built ISO in QEMU against a scratch qcow2 and let the unattended install run to completion. That proves the recipe, the initrd inject and the late_command without burning a USB or a trip to the box.")
 //! @yah:handoff("RENUMBERED (operator correction, 2026-08-02): the GEEKOM mini PC is us-west-003, NOT us-west-012 — the 01x block is reserved for the small LAN/appliance class and another Pi is taking 012. The convention is by HARDWARE CLASS, not arrival order: 00x = PC/server (001 OVH VPS, 002 WSL2 gamer box, 003 GEEKOM), 01x = small LAN boxes (011-014 Pis, 015 arm64 Mac). Recorded at the top of us-west-003.toml and in W257, because it is not derivable from the existing files and it is what tells a reader which of the two provisioning paths a node took. The us-west-012.toml scaffold was untracked and never committed, so it was removed rather than renamed; no stale refs remain (grep clean, `yah cloud validate` ok).")
-//! @yah:gotcha("LAN IP for us-west-003 is ASSUMED, not confirmed. W257's convention is us-west-0NN -> 192.168.10.NN and it holds for every 01x node, but the only existing 00x LAN box breaks it: us-west-002 sits at 192.168.10.30, not .2. The scaffold uses .3 with a CONFIRM-BEFORE-BRING-UP note inline. If the 00x block actually lives in the .3x range on the router, .3 is wrong and both [connect].address and [connect].ssh need correcting before step 4.")
+//! @yah:gotcha("LAN IP for us-west-003 is ASSUMED, not confirmed. W257's convention is us-west-0NN -> 192.168.250.NN and it holds for every 01x node, but the only existing 00x LAN box breaks it: us-west-002 sits at 192.168.250.30, not .2. The scaffold uses .3 with a CONFIRM-BEFORE-BRING-UP note inline. If the 00x block actually lives in the .3x range on the router, .3 is wrong and both [connect].address and [connect].ssh need correcting before step 4.")
 //! @yah:next("Filed 2026-09-21: R702-B2 (kamaji bundle-cache budget, bug/high), R702-T3 (containerd GC), R702-T4 (apt/kernel retention), R702-T5 (disk-headroom surfacing), R702-T6 (doctrine W-doc). All open, ready to claim.")
 //!
 //! @yah:ticket(R702-T3, "containerd image/snapshot GC policy for cloud nodes — no eviction, root-filesystem growth is unbounded")
@@ -594,6 +594,7 @@ mod tests {
             nickname: None,
             legacy_hostkey_fingerprint: None,
             registration: Default::default(),
+            camps: Vec::new(),
             ssh_keys: vec![],
             cloudflared: None,
             hosts_operator_bridge: false,
@@ -603,6 +604,7 @@ mod tests {
             sovereign_group: None,
             sovereign_participation: Default::default(),
             host_machine: None,
+            availability: Default::default(),
             ingress_floating_ip: None,
         }
     }
@@ -1126,6 +1128,11 @@ mod tests {
     /// journald ceiling, its cluster-KEK install, its loopback bind. What must
     /// NOT diverge is the set of artifacts a node ends up carrying.
     const STAND_UP_TWIN_ANCHORS: &[(&str, &str)] = &[
+        // kamaji.service points every container at scryer's ingest socket and
+        // refuses the deploy when it is absent (R932-B1), so a node without
+        // scryer runs no container. us-west-004 shipped without it.
+        ("/usr/local/bin/yah-scryer", "scryer binary"),
+        ("yah-scryer.service", "scryer unit (binds the ingest socket)"),
         // R858-F17 durability helpers. Absent → kamaji refuses to deploy any
         // workload declaring a `yah.durability.tier` (kamaji-bin/src/hydrate.rs).
         (
@@ -1185,6 +1192,43 @@ mod tests {
             out.insert(rest[..dl + "/releases/download/".len() + slash + 1].to_string());
         }
         out
+    }
+
+    #[test]
+    fn stand_up_script_refuses_a_wildcard_bind() {
+        // R997-B17: the script installs no host firewall, so a wildcard bind
+        // would expose yubaba to whatever network the host sits on. Only the
+        // script's head (up to the end of its bind guard) is executed here —
+        // nothing that installs or writes anything.
+        let root = match locate_canonical_home(Path::new(env!("CARGO_MANIFEST_DIR"))) {
+            CanonicalHome::Monorepo(root) => root,
+            CanonicalHome::StandaloneExport => return,
+        };
+        let script = std::fs::read_to_string(crate::paths::stand_up_script(&root)).unwrap();
+        let guard = script.find("R997-B17").expect("bind guard present");
+        let end = guard + script[guard..].find("esac\n").expect("guard closes") + "esac\n".len();
+        assert!(
+            !script[..guard].contains("$SUDO"),
+            "the bind guard must run before the script touches the host"
+        );
+        let head = format!("{}\necho GUARD-PASSED\n", &script[..end]);
+        let run = |bind: Option<&str>| {
+            let mut cmd = std::process::Command::new("bash");
+            cmd.arg("-c").arg(&head).arg("stand-up-yubaba.sh").arg("prod");
+            cmd.env_remove("YUBABA_BIND");
+            if let Some(b) = bind {
+                cmd.env("YUBABA_BIND", b);
+            }
+            let out = cmd.output().unwrap();
+            (out.status.code(), String::from_utf8_lossy(&out.stdout).contains("GUARD-PASSED"))
+        };
+        for bad in ["0.0.0.0:7443", "[::]:7443", ":7443"] {
+            assert_eq!(run(Some(bad)), (Some(2), false), "{bad} must be refused");
+        }
+        for good in [Some("100.64.0.17:7443"), Some("127.0.0.1:7443"), None] {
+            assert_eq!(run(good), (Some(0), true), "{good:?} must pass");
+        }
+        assert!(!script.contains("ufw-gates 7443"), "script must not claim a ufw gate it lacks");
     }
 
     #[test]

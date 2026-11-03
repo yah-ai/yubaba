@@ -55,6 +55,15 @@ pub const ENV_GROUP: &str = "YUBABA_SOVEREIGN_GROUP";
 pub const ENV_PARTICIPATION: &str = "YUBABA_SOVEREIGN_PARTICIPATION";
 /// `YUBABA_SOVEREIGN_VOTERS` — env spelling of `--sovereign-voters`.
 pub const ENV_VOTERS: &str = "YUBABA_SOVEREIGN_VOTERS";
+/// `YUBABA_TAINTS` — env spelling of `--taints` (R977-B13). Always rendered:
+/// an empty value declares "known, no taints"; only an unset variable makes the
+/// replica reconcile treat the node's taints as unknown and refuse it.
+pub const ENV_TAINTS: &str = "YUBABA_TAINTS";
+/// `YUBABA_MESH_TAGS` — env spelling of `--mesh-tags` (R1019-F28, W388 §4
+/// item 4). Always rendered, for the [`ENV_TAINTS`] reason: an empty value is
+/// "known, none", and only an unset variable reads as unknown, which the replica
+/// reconcile refuses for any spec that names a non-`arch:` tag.
+pub const ENV_MESH_TAGS: &str = "YUBABA_MESH_TAGS";
 
 /// The node-side script that retires the legacy literal `--sovereign-*` flags
 /// once the installed yubaba reads the env form. Read its header for the
@@ -73,6 +82,11 @@ pub struct SovereignFlags {
     pub participation: Participation,
     /// The group's voter raft ids, sorted. Empty = the group seats nobody.
     pub voters: Vec<u64>,
+    /// `machine.taints`, in declaration order. Empty = the machine declares none.
+    pub taints: Vec<String>,
+    /// `machine.mesh_tags`, in declaration order — the node's `role:`s among
+    /// them, which is what lets re-placement evaluate a role selector (W388).
+    pub mesh_tags: Vec<String>,
 }
 
 /// The flags `machine` should run with, or `None` when it declares no
@@ -100,6 +114,8 @@ pub fn flags_for(
         group: group.to_string(),
         participation: machine.sovereign_participation,
         voters,
+        taints: machine.taints.clone(),
+        mesh_tags: machine.mesh_tags.clone(),
     }))
 }
 
@@ -124,6 +140,8 @@ pub fn render_flags(machine: &str, flags: &SovereignFlags) -> String {
         let ids: Vec<String> = flags.voters.iter().map(u64::to_string).collect();
         let _ = writeln!(s, "Environment={ENV_VOTERS}={}", ids.join(","));
     }
+    let _ = writeln!(s, "Environment={ENV_TAINTS}={}", flags.taints.join(","));
+    let _ = writeln!(s, "Environment={ENV_MESH_TAGS}={}", flags.mesh_tags.join(","));
     s
 }
 
@@ -307,14 +325,14 @@ pub fn check_live(
     for f in frags.iter().filter(|f| f.path != ours) {
         for (k, v) in assignments(&f.body) {
             if k == "Environment"
-                && [ENV_GROUP, ENV_PARTICIPATION, ENV_VOTERS]
+                && [ENV_GROUP, ENV_PARTICIPATION, ENV_VOTERS, ENV_TAINTS, ENV_MESH_TAGS]
                     .iter()
                     .any(|e| v.contains(&format!("{e}=")))
             {
                 return LiveCheck {
                     verdict: Verdict::Refuse {
                         why: format!(
-                            "{} sets YUBABA_SOVEREIGN_* — only {ours} may; remove it by hand",
+                            "{} sets YUBABA_SOVEREIGN_* / YUBABA_TAINTS / YUBABA_MESH_TAGS — only {ours} may; remove it by hand",
                             f.path
                         ),
                         diff: format!("--- {}\n{}", f.path, f.body),
@@ -403,6 +421,8 @@ mod tests {
             group: "dev".into(),
             participation: Participation::In,
             voters: vec![11, 13, 14],
+            taints: vec!["no-appliance".into(), "public-ip".into()],
+            mesh_tags: vec!["arch:arm".into(), "role:dev-cluster".into()],
         }
     }
 
@@ -421,6 +441,24 @@ mod tests {
         assert!(r.contains("Environment=YUBABA_SOVEREIGN_GROUP=dev\n"));
         assert!(r.contains("Environment=YUBABA_SOVEREIGN_PARTICIPATION=in\n"));
         assert!(r.contains("Environment=YUBABA_SOVEREIGN_VOTERS=11,13,14\n"));
+        assert!(r.contains("Environment=YUBABA_TAINTS=no-appliance,public-ip\n"));
+        assert!(r.contains("Environment=YUBABA_MESH_TAGS=arch:arm,role:dev-cluster\n"));
+    }
+
+    /// R1019-F28: same rule as taints — an untagged machine renders the
+    /// variable empty, so the node publishes "known, none" and not unknown.
+    #[test]
+    fn render_always_emits_mesh_tags_even_when_empty() {
+        let f = SovereignFlags { mesh_tags: vec![], ..flags() };
+        assert!(render_flags("us-west-011", &f).contains("Environment=YUBABA_MESH_TAGS=\n"));
+    }
+
+    /// R977-B13: a machine with no taints still renders the variable, empty, so
+    /// the daemon publishes "known, none" rather than unknown.
+    #[test]
+    fn render_always_emits_taints_even_when_empty() {
+        let f = SovereignFlags { taints: vec![], ..flags() };
+        assert!(render_flags("us-west-011", &f).contains("Environment=YUBABA_TAINTS=\n"));
     }
 
     #[test]

@@ -191,9 +191,11 @@ impl YubabaNetwork {
         req: Req,
         option: &RPCOption,
     ) -> Result<reqwest::Response, RPCError<TC>> {
+        // R997-B27: proves this node's identity over the exact body, so the
+        // receiver can check the RPC's claimed node is the sender.
         self.client
-            .post(format!("{}{}", self.base_url, path))
-            .json(&req)
+            .post_json_proved(&format!("{}{}", self.base_url, path), &req)
+            .map_err(|e| RPCError::Network(NetworkError::from_string(e)))?
             .timeout(option.soft_ttl())
             .send()
             .await

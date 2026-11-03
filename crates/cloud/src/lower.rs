@@ -32,7 +32,11 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use workload_spec::{validate, WorkloadSpec};
 
-use crate::config::{DeployTier, MirrorConfig, ServiceConfig};
+use std::collections::HashMap;
+
+use crate::config::{
+    DeployTier, MachineConfig, MirrorConfig, MirrorProviderSlot, ServiceConfig, WorkloadConfig,
+};
 use crate::inner_door::component_workload_ident;
 
 /// `[components.workload]` — the env-invariant part of a component's
@@ -139,6 +143,23 @@ pub fn lower(
             bail!("{overlay_file} declares `{key}`, which {}", why_refused(key));
         }
     }
+    // W361 decision 4: the lowered spec owns placement, so the compute slot
+    // fronting it may not restate one. A second statement is the two-engine
+    // shape R959 removes: the slot's said one node, admission another.
+    if let Some((role, slot)) = compute_slot(mirror, component_id) {
+        for key in PLACEMENT_FIELDS {
+            if slot.fields().contains_key(*key) {
+                bail!(
+                    ".yah/services/{svc}/mirrors/{mirror_env}.toml [providers.{role}] declares \
+                     `{key}`, but `{component_id}` lowers on this mirror, so its placement is the \
+                     lowered spec's: admission reads `yah.node-selector.mesh-tags`, \
+                     `yah.node-selector.node` and `yah.float` from [workload.{component_id}.\
+                     annotations], and ingress fronts the nodes it admits (W361 decision 4). \
+                     Delete `{key}` from the slot."
+                );
+            }
+        }
+    }
 
     let mut overlay = overlay.0.clone();
     let ident = match overlay.remove(IDENT_KEY) {
@@ -211,19 +232,102 @@ fn why_refused(key: &str) -> &'static str {
     }
 }
 
-/// The mirror's compute slot for `component_id` (`compute:<id>` first, then
-/// `compute`) as `(zone, port)`, iff it is fronted (`port` or `fronted = true`,
-/// exactly `plan_ingress`'s opt-in) and the mirror declares an ingress edge.
+/// Compute-slot fields that state a placement; refused on a lowered
+/// component's slot (W361 decision 4).
+const PLACEMENT_FIELDS: &[&str] = &["machine", "machines", "required"];
+
+/// The mirror's compute slot for `component_id`: `compute:<id>` first, then
+/// `compute`.
+fn compute_slot<'m>(
+    mirror: &'m MirrorConfig,
+    component_id: &str,
+) -> Option<(&'m String, &'m MirrorProviderSlot)> {
+    let role = format!("compute:{component_id}");
+    mirror
+        .providers
+        .get_key_value(role.as_str())
+        .or_else(|| mirror.providers.get_key_value("compute"))
+}
+
+/// A compute slot placed by admission rather than by its own fields (R959-F6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedSlot {
+    /// Every machine admission accepts the lowered spec on, in declaration
+    /// order: the nodes that *could* hold it.
+    pub machines: Vec<String>,
+    /// The spec's `replicas`: how many of `machines` hold it at once. A
+    /// verifier needs it because the rest answering "no record" is expected,
+    /// not a missing replica.
+    pub replicas: u32,
+}
+
+/// Ingress placement for each compute slot whose component lowers on `mirror`
+/// (W361 decision 4, R959-F6), keyed by slot role.
+///
+/// This is what `resolve_ingress_placements` takes for those slots in place of
+/// a slot-declared `machine`/`required`, which [`lower`] refuses. It is the
+/// admissible *set*, not the one node holding the workload today, for the
+/// reason `resolve_ingress_candidates` widens a bundle slot's poll list: the
+/// rule follows a move placement hasn't made yet, and live discovery still
+/// decides which of them answers (R844).
+///
+/// A mirror with no ingress edge yields an empty map without lowering
+/// anything, since only ingress planning reads it. An empty admissible set is
+/// an error naming the workload, never a silently unplaced rule.
+pub fn admitted_compute_slots(
+    service: &ServiceConfig,
+    mirror_env: &str,
+    mirror: &MirrorConfig,
+    machines: &[MachineConfig],
+    declared: &[WorkloadConfig],
+) -> Result<HashMap<String, AdmittedSlot>> {
+    if mirror.ingress.is_absent() {
+        return Ok(HashMap::new());
+    }
+    let mut by_role: HashMap<String, (String, AdmittedSlot)> = HashMap::new();
+    for component in &service.components {
+        let Some((role, _)) = compute_slot(mirror, &component.id) else {
+            continue;
+        };
+        let Some(spec) = lower(service, &component.id, mirror_env, mirror)? else {
+            continue;
+        };
+        let admissible: Vec<String> = crate::config::admissible_machines(machines, &spec, declared)
+            .with_context(|| {
+                format!(
+                    "placing workload `{}` behind [providers.{role}] of .yah/services/{}/mirrors/\
+                     {mirror_env}.toml",
+                    spec.name, service.name
+                )
+            })?
+            .into_iter()
+            .map(|m| m.name.clone())
+            .collect();
+        let slot = AdmittedSlot {
+            machines: admissible,
+            replicas: spec.replicas,
+        };
+        if let Some((other, _)) = by_role.insert(role.clone(), (component.id.clone(), slot)) {
+            bail!(
+                ".yah/services/{}/mirrors/{mirror_env}.toml: [providers.{role}] fronts two \
+                 lowered components, `{other}` and `{}`. Give each its own \
+                 [providers.compute:<component>] slot.",
+                service.name,
+                component.id
+            );
+        }
+    }
+    Ok(by_role.into_iter().map(|(role, (_, slot))| (role, slot)).collect())
+}
+
+/// The mirror's compute slot for `component_id` (see [`compute_slot`]) as
+/// `(zone, port)`, iff it is fronted (`port` or `fronted = true`, exactly
+/// `plan_ingress`'s opt-in) and the mirror declares an ingress edge.
 fn fronted_public(mirror: &MirrorConfig, component_id: &str) -> Result<Option<(String, u16)>> {
     if mirror.ingress.is_absent() {
         return Ok(None);
     }
-    let role = format!("compute:{component_id}");
-    let Some((role, slot)) = mirror
-        .providers
-        .get_key_value(role.as_str())
-        .or_else(|| mirror.providers.get_key_value("compute"))
-    else {
+    let Some((role, slot)) = compute_slot(mirror, component_id) else {
         return Ok(None);
     };
     let fields = slot.fields();
@@ -517,6 +621,132 @@ mod tests {
         let msg = format!("{:#}", lower(&service("noisetable-api/service.toml"), "api", "prod", &m).unwrap_err());
         assert!(msg.contains("fronts no compute slot"), "{msg}");
     }
+
+    // ─── R959-F6: the lowered spec owns placement ───────────────────────────
+
+    #[test]
+    fn a_compute_slot_may_not_restate_a_lowered_components_placement() {
+        let svc = service("noisetable-api/service.toml");
+        for line in [
+            "machine = \"us-east-001\"",
+            "machines = [\"us-east-001\"]",
+            "required = { regions = [\"us-east\"] }",
+        ] {
+            let src = read("noisetable-api/prod.toml")
+                .replacen("kind = \"static\"\n", &format!("kind = \"static\"\n{line}\n"), 1);
+            let m: MirrorConfig = toml::from_str(&src).unwrap();
+            let key = line.split(' ').next().unwrap();
+            let msg = format!("{:#}", lower(&svc, "api", "prod", &m).unwrap_err());
+            assert!(
+                msg.contains(&format!("[providers.compute] declares `{key}`"))
+                    && msg.contains("W361 decision 4"),
+                "{msg}"
+            );
+            // Scoped to a component that lowers: the same slot is left alone
+            // on a mirror that does not lower `api`.
+            let mut unlowered = m.clone();
+            unlowered.workload.clear();
+            assert!(lower(&svc, "api", "prod", &unlowered).unwrap().is_none());
+        }
+    }
+
+    /// R1019-F28 (W388): name `role` on the `api` overlay's node selector.
+    /// The noisetable fixtures are W361 migration records that predate roles,
+    /// and placement is now fail-closed on them, so the placement tests add
+    /// the role here rather than rewriting the records.
+    fn naming_role(mut m: MirrorConfig, role: &str) -> MirrorConfig {
+        let overlay = &mut m.workload.get_mut("api").expect("api overlay").0;
+        let annotations = overlay
+            .entry("annotations")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .expect("annotations is a table");
+        let key = workload_spec::NODE_SELECTOR_MESH_TAGS_ANNOTATION;
+        let joined = match annotations.get(key).and_then(|v| v.as_str()) {
+            Some(sel) if !sel.is_empty() => format!("{sel},{role}"),
+            _ => role.to_string(),
+        };
+        annotations.insert(key.into(), joined.into());
+        m
+    }
+
+    fn machine(name: &str, extra: &str) -> MachineConfig {
+        toml::from_str(&format!(
+            "name = \"{name}\"\nprovider = \"static\"\nhosts_mirrors = []\nssh_keys = []\n{extra}"
+        ))
+        .expect("machine config parses")
+    }
+
+    /// The fleet shape noisetable-api is placed against: three prod raft
+    /// members, one of which repels appliances, then two dev-raft Pis.
+    fn fleet() -> Vec<MachineConfig> {
+        let prod = "mesh_tags = [\"arch:x86\", \"os:linux\", \"role:public-uptime\"]\n\
+                    sovereign_group = \"prod\"\nsovereign_participation = \"in\"\n";
+        let dev = "mesh_tags = [\"arch:arm\", \"os:linux\", \"role:dev-cluster\"]\n\
+                   sovereign_group = \"dev\"\nsovereign_participation = \"in\"\n";
+        vec![
+            machine("us-east-001", prod),
+            machine("us-south-001", &format!("{prod}taints = [\"no-appliance\"]\n")),
+            machine("us-west-001", prod),
+            machine("us-west-011", dev),
+            machine("us-west-013", dev),
+        ]
+    }
+
+    #[test]
+    fn a_lowered_fronted_slot_is_placed_on_every_node_admission_accepts() {
+        let svc = service("noisetable-api/service.toml");
+        // prod floats (`yah.float = "cluster"`): the prod raft members that
+        // tolerate an appliance. Never the dev raft, although every dev Pi
+        // admits an unconstrained spec.
+        let prod_mirror = naming_role(mirror("noisetable-api/prod.toml"), workload_spec::PUBLIC_UPTIME_ROLE);
+        let prod = admitted_compute_slots(&svc, "prod", &prod_mirror, &fleet(), &[]).unwrap();
+        assert_eq!(prod.len(), 1, "{prod:?}");
+        assert_eq!(prod["compute"].machines, ["us-east-001", "us-west-001"]);
+        assert_eq!(prod["compute"].replicas, 1);
+        // staging selects `arch:arm,os:linux`: every node matching it, not
+        // just the us-west-011 the slot used to name.
+        let staging_mirror =
+            naming_role(mirror("noisetable-api/staging.toml"), workload_spec::DEV_CLUSTER_ROLE);
+        let staging = admitted_compute_slots(&svc, "staging", &staging_mirror, &fleet(), &[]).unwrap();
+        assert_eq!(staging["compute"].machines, ["us-west-011", "us-west-013"]);
+    }
+
+    #[test]
+    fn a_mirror_without_an_ingress_edge_places_nothing() {
+        let admitted = admitted_compute_slots(
+            &service("yah-cloud-admin/service.toml"),
+            "prod",
+            &mirror("yah-cloud-admin/prod.toml"),
+            &fleet(),
+            &[],
+        )
+        .unwrap();
+        assert!(admitted.is_empty(), "{admitted:?}");
+    }
+
+    #[test]
+    fn an_empty_admissible_set_is_an_error_naming_the_workload() {
+        let standalone: Vec<MachineConfig> = fleet()
+            .into_iter()
+            .map(|mut m| {
+                m.sovereign_group = None;
+                m
+            })
+            .collect();
+        let msg = format!(
+            "{:#}",
+            admitted_compute_slots(
+                &service("noisetable-api/service.toml"),
+                "prod",
+                &naming_role(mirror("noisetable-api/prod.toml"), workload_spec::PUBLIC_UPTIME_ROLE),
+                &standalone,
+                &[],
+            )
+            .unwrap_err()
+        );
+        assert!(msg.contains("noisetable-account") && msg.contains("raft member"), "{msg}");
+    }
 }
 
 /// Test-only camp builder: declare a workload the only way a camp can now,
@@ -532,6 +762,17 @@ pub(crate) mod fixture {
     pub(crate) fn write_workload(root: &Path, name: &str, spec_toml: &str) {
         let mut spec: toml::Table = toml::from_str(spec_toml).unwrap();
         spec.remove("name");
+        // R1019-F28 (W388): placement is fail-closed on node roles, so a
+        // fixture workload that names no selector names the role fixture
+        // machines serve (`role:public-uptime`), as every real spec must.
+        let annotations = spec
+            .entry("annotations")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .expect("annotations is a table");
+        annotations
+            .entry(workload_spec::NODE_SELECTOR_MESH_TAGS_ANNOTATION)
+            .or_insert_with(|| workload_spec::PUBLIC_UPTIME_ROLE.into());
         if let Some(mesh) = spec
             .get_mut("expose")
             .and_then(|e| e.get_mut("mesh"))
@@ -587,7 +828,6 @@ pub(crate) mod fixture {
             );
             let mut compute = toml::Table::new();
             compute.insert("kind".into(), "static".into());
-            compute.insert("machine".into(), "a".into());
             compute.insert("zone".into(), hostname);
             compute.insert("port".into(), port);
             mirror.insert(

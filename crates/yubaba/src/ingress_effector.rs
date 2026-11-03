@@ -381,7 +381,7 @@ pub enum EffectOutcome {
 /// @yah:handoff("TWO SIGNATURE CHANGES, both forced and both strictly more permissive. (a) floating_ip::reconcile_assignment and on_ingress_owner_changed went from `provider: &amp;dyn FloatingIpProvider` to `&lt;P: FloatingIpProvider + ?Sized&gt;(provider: &amp;P)`. Required, not cosmetic: cloud's blanket FloatingIpEnvoy impl covers `dyn FloatingIpProvider` itself, and a `&amp;dyn` cannot be re-unsized to `&amp;dyn` under a Sized bound. Every existing caller still compiles unchanged. (b) apply_effect took (effect, apex: &amp;str, address_of, withdrawal); it now takes (effect, machines: &amp;[FloatingIpMachine], address_of, apex: Option&lt;(&amp;str, &amp;dyn ApexWithdrawal)&gt;, floating_ip: Option&lt;&amp;dyn FloatingIpTransport&gt;). The `machines` slice is there because IngressOwnerEffect::Reassign carries a machine NAME and an ip_id, not a resolved target — which is deliberate and matches Withdraw's own documented rationale (\"the DNS layer already knows how to turn a declared machine into an address\"). The declaration is what says which vendor hosts the box and which DC it sits in, and resolve_target needs both. scheduler.rs takes floating_ip_machines() ONCE per tick and hands the same slice to planner and effector, so the two halves cannot disagree within a tick.")
 /// @yah:verify("Baselines are from R859-F2's recorded numbers where comparable, but the tree has moved under peers since, so treat deltas as approximate and the absolutes as measured. AFTER, all on this tree: yubaba --lib 855 passed / 0 failed (20 of them ingress_effector, up from 11 — the 9 new ones are the Reassign arm and the two-arm config). cloud --features json-schema: 1130 / 0 / 4 ignored on the lib target, plus 3/0/2, 2/0/0, 0/0/1 on the other three. yah-floating-ip: 18 / 0. yah-floating-ip-adapters (NEW): 20 / 0 — the 17 moved mock tests plus 3 for adapter_for. `cargo build --workspace`: EXIT=0. `cargo check --manifest-path oss/yubaba/Cargo.toml -p yubaba -p yah-cloud -p yah-floating-ip -p yah-floating-ip-adapters --all-targets`: clean. `RUSTC_WRAPPER='' cargo run -p xtask -- cluster-epochs`: GREEN, unmoved — cluster_protocol d4b539bd..., state_epoch 5b11870a... My raft/mod.rs edit was a doc comment only and no serialised type moved, so nothing needed re-recording. `./scripts/check-workspace-members.sh`: all 63 members resolve (the new crate included). clippy --all-targets on the new crate: zero hits; clippy on yubaba --lib --tests and cloud --lib: zero hits naming ingress_effector.rs, scheduler.rs or any floating_ip file.")
 /// @yah:verify("WHAT THE 9 NEW ingress_effector TESTS PIN, since a count is not evidence. a_reassign_moves_the_floating_ip_onto_the_new_owner — exactly one vendor call, onto the machine the PLANNER named (the arm's whole point, and the one that was a NotApplied until now). a_reassign_to_where_the_ip_already_is_issues_no_vendor_call — zero calls, at the seam that actually runs in production rather than one layer down; the planner re-emits Reassign every tick until the owner marker advances, so this path runs constantly against a converged fleet. a_failed_vendor_reassign_is_failed_not_reassigned — keeps a failed move retryable, because scheduler.rs refuses to advance previous_ingress_owner past a Failed. a_reassign_with_no_transport_names_the_missing_credential — the pre-R859-F3 shape, kept deliberately: an unappliable Reassign may never degrade into silence. a_reassign_onto_a_vendor_this_node_has_no_credential_for_is_refused — a Hetzner token must not be pointed at an OVH box. a_reassign_naming_an_undeclared_machine_refuses_instead_of_guessing — reuses R859-F2's resolve_ingress_owner refusal at the effector, so the /etc/hostname-vs-machine-name mismatch (R841's `vps-4c1efa56` for `us-west-001`) refuses rather than misfiring a public IP. vendor_tokens_refuses_an_unheld_provider_by_name, the_vendor_token_file_env_is_derived_from_the_provider_id, a_floating_ip_arm_with_no_apex_parses_on_its_own, a_withdrawal_with_no_apex_configured_names_what_is_missing, every_registry_vendor_arms_independently_and_unknown_ones_are_ignored. In the adapters crate: every_row_of_the_registry_has_a_constructor_here — a FLOATING_IP_PROVIDERS row without a constructor is a machine that validates clean and then cannot be failed over, which is silent everywhere else. In cloud: the_envoy_id_is_the_provider_id_for_every_adapter, and an_unknown_verb_is_refused_and_names_the_provider (the drift the three-copy collapse removes).")
-/// @yah:gotcha("STILL INERT ON TODAY'S FLEET, and the remaining gap is now purely OPERATOR CONFIGURATION, not code. Re-grepped 2026-09-08: all nine .yah/infra/machines/*.toml still declare provider = \"static\" and none declares ingress_floating_ip, so plan_ingress_owner_effect returns NoOp and this arm is never entered. Beyond that, R859-F2's own gotcha at cloud/src/provider/floating_ip.rs records that fleet flags are hand-rolled per node into a systemd drop-in (.yah/infra/cloud-init/dev-raft-node.sh:97 writes the whole `yubaba serve …` line) — NOTHING renders --provider/--location/--ingress-floating-ip from the machine TOML, and --region is not passed on the dev-raft boxes today. So arming this needs, per node: the four declaration flags on the ExecStart AND a YUBABA_INGRESS_&lt;PROVIDER&gt;_TOKEN_FILE line in /etc/yah-cloud/ingress.env (which R858's measurement at app/yah/cli/src/mesh.rs:117 says does not exist on us-east-001 — the acme.env and litestream.env EnvironmentFile lines already resolve to nothing there). A green suite here is evidence the logic is right against mocked vendor APIs; it is NOT evidence the path works, which needs a live hetzner/ovh/vultr box with a real floating IP.")
+/// @yah:gotcha("STILL INERT ON TODAY'S FLEET, and the remaining gap is now purely OPERATOR CONFIGURATION, not code. Re-grepped 2026-09-08: all nine .yah/infra/machines/*.toml still declare provider = \"static\" and none declares ingress_floating_ip, so plan_ingress_owner_effect returns NoOp and this arm is never entered. Beyond that, R859-F2's own gotcha at cloud/src/provider/floating_ip.rs records that fleet flags are hand-rolled per node into a systemd drop-in (.yah/infra/cloud-init/dev-raft-node.sh:97 writes the whole `yubaba serve …` line) — NOTHING renders --provider/--location/--ingress-floating-ip from the machine TOML, and --region is not passed on the dev-raft boxes today. So arming this needs, per node: the four declaration flags on the ExecStart AND a YUBABA_INGRESS_&lt;PROVIDER&gt;_TOKEN_FILE line in <cloud-conf-dir>/ingress.env (which R858's measurement at app/yah/cli/src/mesh.rs:117 says does not exist on us-east-001 — the acme.env and <litestream-env> EnvironmentFile lines already resolve to nothing there). A green suite here is evidence the logic is right against mocked vendor APIs; it is NOT evidence the path works, which needs a live hetzner/ovh/vultr box with a real floating IP.")
 /// @yah:gotcha("OVH IS NOW LINKED INTO THE FLEET DAEMON AND ITS AUTH IS STILL A PLACEHOLDER. floating_ip_adapters::ovh's module doc carries the warning verbatim from where it lived in cloud: OVH signs with an application key + secret + consumer key and a timestamped HMAC, not the bare `X-Ovh-Consumer` header this adapter sends. That was tolerable when the only caller was an operator-driven envoy verb; it is a sharper edge now that a raft leader can invoke it unattended. Two things keep it contained and neither is an accident: the adapter is only reachable if an operator deliberately sets YUBABA_INGRESS_OVH_TOKEN_FILE, and its EnvoyAdapter tier stays Tier::A (not S) with a doc comment saying why. Swap in real OVH request signing before pointing it at anything live.")
 /// @yah:handoff("FILES (all uncommitted; tree anchor 24d24042d537b453e01d330ac185445398ec74a9 — quote that SHA, not HEAD, in any restore instruction). NEW: oss/yubaba/crates/floating-ip-adapters/{Cargo.toml,src/lib.rs,src/hetzner.rs,src/ovh.rs,src/vultr.rs}; oss/yubaba/crates/cloud/src/provider/floating_ip_envoy.rs. DELETED: oss/yubaba/crates/cloud/src/provider/{hetzner,ovh,vultr}_floating_ip.rs (moved, not lost — their bodies and every one of their tests are in the new crate). MODIFIED: oss/yubaba/Cargo.toml (members), cloud/Cargo.toml (+floating_ip_adapters; corrected the axum comment, which no longer covers the floating-ip mocks), cloud/src/provider/{mod.rs,floating_ip.rs}, floating-ip/src/lib.rs (two signatures generic over ?Sized + three doc sections that my own move had just made false), yubaba/Cargo.toml (+floating_ip_adapters), yubaba/src/{ingress_effector.rs,scheduler.rs,main.rs}, yubaba/src/raft/mod.rs (MemberInfo::location's doc said \"nothing on the fleet path reads it today\" — this ticket is what made that a lie, so it now says what reads it), app/yah/cli/resources/yubaba.service. COLLISION CHECK: raft/store.rs and main.rs both showed as changed mid-build; I diffed both — store.rs carries ONLY @Ashguard:coffee's R869 annotation edits (I did not touch that file), and main.rs's only non-mine content is untouched. Peers active during this session and NOT interfered with: @Ashguard:eclipse and @Miravel:polaris on R870 (tenant-streamer, kamaji-bin), @Ashguard:coffee on R869 (raft/store.rs), @Ashguard:spade on chat (app/yah/cli/src/cloud.rs).")
 /// @yah:gotcha("TWO PRE-EXISTING BREAKAGES ON THE SHARED TREE, neither mine, both confirmed foreign before I stopped attributing to myself. (1) `cargo check --workspace --all-targets` fails on app/yah/cli/src/cloud.rs:16055 and :16057 — `cannot find value `dir` in this scope`, in a #[cfg(test)] body. @Ashguard:spade was running `cargo test -p yah --lib -- cloud::tests::writes_the_full_tier1_file_set cloud::tests::the_scaffolds_runtime` against exactly that region while I worked. I never touched app/yah/cli/src/. `cargo check --workspace` and `cargo build --workspace` (non-test targets) are both GREEN. (2) `cargo check --manifest-path oss/yubaba/Cargo.toml --all-targets` fails on three `dyn ObjectStore doesn't implement Debug` errors in tenant-streamer/src/lib.rs:222/230/246 — @Ashguard:eclipse's live R870 work, which the build-input hasher flagged as modifying under me on five separate runs. I scoped my all-targets check to -p yubaba -p yah-cloud -p yah-floating-ip -p yah-floating-ip-adapters instead, which is clean. Separately, cloud's asset_journal::tests::append_creates_file_and_writes_jsonl failed ONCE under the full parallel run and passed on a targeted re-run and on every subsequent full run — a flake in a file this ticket does not touch.")
@@ -807,8 +807,8 @@ mod tests {
             },
             &[],
             addresses(&[
-                ("us-west-001", "15.204.89.240"),
-                ("us-east-001", "51.81.85.145"),
+                ("us-west-001", "203.0.113.11"),
+                ("us-east-001", "203.0.113.13"),
             ]),
             apex(&fake),
             None,
@@ -818,7 +818,7 @@ mod tests {
             out,
             EffectOutcome::Withdrew {
                 machine: "us-west-001".into(),
-                address: "15.204.89.240".into(),
+                address: "203.0.113.11".into(),
                 records_deleted: 1,
             }
         );
@@ -826,7 +826,7 @@ mod tests {
         // survivor's. This is the assertion the whole feature turns on.
         assert_eq!(
             *fake.calls.lock().unwrap(),
-            vec![("yah.dev".to_string(), "15.204.89.240".to_string())]
+            vec![("yah.dev".to_string(), "203.0.113.11".to_string())]
         );
     }
 
@@ -844,7 +844,7 @@ mod tests {
                 reason: "confirmed down".into(),
             },
             &[],
-            addresses(&[("us-west-001", "15.204.89.240")]),
+            addresses(&[("us-west-001", "203.0.113.11")]),
             apex(&fake),
             None,
         )
@@ -872,7 +872,7 @@ mod tests {
                 reason: "confirmed down".into(),
             },
             &[],
-            addresses(&[("us-west-001", "15.204.89.240")]),
+            addresses(&[("us-west-001", "203.0.113.11")]),
             apex(&fake),
             None,
         )
@@ -901,7 +901,7 @@ mod tests {
                 reason: "confirmed down".into(),
             },
             &[],
-            addresses(&[("us-west-001", "15.204.89.240")]),
+            addresses(&[("us-west-001", "203.0.113.11")]),
             None,
             None,
         )
@@ -930,7 +930,7 @@ mod tests {
                 reason: "confirmed down".into(),
             },
             &[],
-            addresses(&[("us-west-001", "15.204.89.240")]),
+            addresses(&[("us-west-001", "203.0.113.11")]),
             apex(&fake),
             None,
         )

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use turso_backup::snapshot::BackupTarget;
+use store_claim::BackupTarget;
 use turso_backup::stream::{tail_frames, StreamConfig, StreamOutcome, WalSeam};
 use workload_spec::TenantId;
 
@@ -323,7 +323,8 @@ mod tests {
         StreamerConfig {
             node_id: 7,
             yubaba_url: "http://127.0.0.1:1".into(),
-            cluster_key_file: None,
+            service_key_file: None,
+            identity_file: None,
             data_root: PathBuf::from("/tmp"),
             sink: SinkConfig {
                 bucket: "b".into(),

@@ -69,7 +69,7 @@
 //! @yah:parent(R910)
 //! @yah:next("Tier: Wizard — changes the collation partition rule and IngressEdge vocabulary that every mirror goes through.")
 //! @yah:next("WHY: noisetable R704-T4 (operator decision B, 2026-09-14) runs staging.noisetable.com + api-staging.noisetable.com as cloudflared -> passway-demux 127.0.0.1:443 -> passway :8445 (ACME dns-01) on us-west-011, hand-enrolled. No mirror can declare it: collate_front_doors (ingress.rs:1133) rejects one hostname under two providers, and merge_tunnel_ingress (ingress.rs:1365) renders only {hostname, service}, with no originRequest. A mirror carrying the tunnel edge would make apply REPLACE the live rule with service http://<compute> and drop matchSNItoHost, bypassing passway. So both noisetable staging mirrors now carry no [[ingress]] edge.")
-//! @yah:next("SHAPE: a tunnel edge naming the node's passway door as its upstream (e.g. `via = \"passway\"`) renders `service: https://127.0.0.1:<demux port>` + `originRequest.matchSNItoHost = true`, verification on. Collation accepts the tunnel+passway pair for one hostname only on the same machine. plan_passway_apex publishes NO A record for a tunnel-fronted passway door (its private-address guard, domain.rs ~591, would otherwise error on 192.168.10.11). The passway door renders PASSWAY_TLS_MODE=acme + dns-01 env, which cloud.rs ingress deploy cannot do today (manual cluster cert only). Then restore both staging mirrors' edges in the noisetable camp.")
+//! @yah:next("SHAPE: a tunnel edge naming the node's passway door as its upstream (e.g. `via = \"passway\"`) renders `service: https://127.0.0.1:<demux port>` + `originRequest.matchSNItoHost = true`, verification on. Collation accepts the tunnel+passway pair for one hostname only on the same machine. plan_passway_apex publishes NO A record for a tunnel-fronted passway door (its private-address guard, domain.rs ~591, would otherwise error on 192.168.250.11). The passway door renders PASSWAY_TLS_MODE=acme + dns-01 env, which cloud.rs ingress deploy cannot do today (manual cluster cert only). Then restore both staging mirrors' edges in the noisetable camp.")
 //! @yah:next("ORDERING: a cloudflared started before its tunnel's first config PUT never loaded it (noisetable R704-T4 gotcha) — publish config first or restart the connector after the first write. Depends on R907-B1 for that first write.")
 //! @yah:handoff("LANDED: a cloudflare-tunnel [[ingress]] edge may carry `via = \"passway\"` (config.rs: new IngressVia enum + IngressEdge.via + IngressEdge::validate_via, called from MirrorConfig::ingress_edges, so via on a passway edge is refused, not ignored). ingress.rs partition(): a via edge is set aside rather than counted as a second claimant, and admitted only beside exactly one passway edge with the SAME hostnames on the SAME machines. It refuses by name: via with no door, a pair split across nodes, a door behind a tunnel that also fronts a public hostname, two stacked edges for one hostname, and via naming a provider other than the terminal edge's. The passway plan is derived IngressPlan.behind_tunnel; the tunnel plan carries IngressPlan.via.")
 //! @yah:handoff("RENDER: IngressPlan::tunnel_rule / tunnel_service render {hostname, service: https://127.0.0.1:443 (PASSWAY_DEMUX_ORIGIN), originRequest: {matchSNItoHost: true}}, with verification left on. merge_tunnel_ingress now takes the plan, so apply renders the exact config R704-T4 PUT by hand instead of replacing it with http://<compute>.")
@@ -77,7 +77,7 @@
 //! @yah:handoff("APPLY (app/yah/cli/src/cloud.rs): reconcile_ingress_edge skips workload discovery for a via plan (it never dials the workload). The tunnel arm prints the demux service. The passway arm, for a behind_tunnel plan, prints IngressPlan::behind_tunnel_env (loopback PASSWAY_LISTEN, TLS_MODE=acme, CHALLENGE=dns-01, DIRECTORY=production, DOMAIN=<hostnames>, placeholders for contact, zone id and token file) and returns BEFORE pushing the public manual-TLS appliance. `yah cloud ingress collate` labels each side of a stacked hostname.")
 //! @yah:handoff("NOT DONE, filed as R910-F2: declared ACME inputs plus the PasswayIngressSpec lowering for a pushed door behind a tunnel, demux route rendering, and restoring the noisetable staging mirrors. Also not done: `cargo xtask install`. Nothing consumes `via` until F2, and F2 names the install as its precondition.")
 //! @yah:handoff("DOCS + GENERATED: W348 section 1.3 stamped as expressible (R910-F1), and the section 6 superseded paragraph points at it. `cargo run -p xtask -- emit-schemas` regenerated .yah/schema/mirror.toml.schema.json (+23 lines: the `via` property and the IngressVia definition, nothing else).")
-//! @yah:verify("cargo test -p yah-cloud --lib (oss/yubaba), filtered to reconciler::ingress, reconciler::domain, service_discovery, ingress_verify and validate: 243 passed / 0 failed. Targeted run of the 13 new R910 tests: all ok. ingress.rs has 12: a_tunnel_via_passway_and_its_door_plan_as_one_stacked_pair, without_via_the_same_two_edges_are_still_a_conflict, a_via_tunnel_with_no_passway_door_is_refused, a_via_tunnel_on_another_machine_than_its_door_is_refused, via_on_a_passway_edge_is_refused_rather_than_ignored, via_is_spelled_in_mirror_toml_as_a_kebab_case_provider, a_stacked_pair_collates_and_both_of_its_doors_know_it, a_stacked_tunnel_on_a_node_its_door_is_not_on_is_a_conflict, a_stacked_tunnel_does_not_license_a_direct_one_for_the_same_hostname, only_the_stacked_hostnames_on_a_shared_node_are_marked, a_via_passway_rule_renders_the_live_stacked_config_exactly (asserts byte-equality with the live R704-T4 tunnel config and no-PUT idempotence), and a_door_behind_a_tunnel_renders_dns01_acme_for_exactly_its_hostnames (not matched by the targeted filter, but inside the 243). domain.rs has a_door_behind_a_cloudflare_tunnel_is_not_an_apex_origin: a public-ip-tainted machine on 192.168.10.11 with a stacked pair plans to None instead of erroring.")
+//! @yah:verify("cargo test -p yah-cloud --lib (oss/yubaba), filtered to reconciler::ingress, reconciler::domain, service_discovery, ingress_verify and validate: 243 passed / 0 failed. Targeted run of the 13 new R910 tests: all ok. ingress.rs has 12: a_tunnel_via_passway_and_its_door_plan_as_one_stacked_pair, without_via_the_same_two_edges_are_still_a_conflict, a_via_tunnel_with_no_passway_door_is_refused, a_via_tunnel_on_another_machine_than_its_door_is_refused, via_on_a_passway_edge_is_refused_rather_than_ignored, via_is_spelled_in_mirror_toml_as_a_kebab_case_provider, a_stacked_pair_collates_and_both_of_its_doors_know_it, a_stacked_tunnel_on_a_node_its_door_is_not_on_is_a_conflict, a_stacked_tunnel_does_not_license_a_direct_one_for_the_same_hostname, only_the_stacked_hostnames_on_a_shared_node_are_marked, a_via_passway_rule_renders_the_live_stacked_config_exactly (asserts byte-equality with the live R704-T4 tunnel config and no-PUT idempotence), and a_door_behind_a_tunnel_renders_dns01_acme_for_exactly_its_hostnames (not matched by the targeted filter, but inside the 243). domain.rs has a_door_behind_a_cloudflare_tunnel_is_not_an_apex_origin: a public-ip-tainted machine on 192.168.250.11 with a stacked pair plans to None instead of erroring.")
 //! @yah:verify("Full yah-cloud lib suite: 1195 passed / 36 failed / 4 ignored. ALL 36 failures are one pre-existing cause outside this diff: workload fixtures in migrate.rs, topology.rs and config.rs tests declare `schema_version`, which the workload-schema unknown-key lint now refuses. Counted: 36 panics, 36 naming schema_version. Noisetable's R704-T4 notes attribute the key's removal to R896-T4; this ticket touches no workload parsing.")
 //! @yah:verify("cargo check -p yah --lib --tests (root): Finished, zero errors. cargo check -p yubaba --tests (oss/yubaba): Finished. cargo check -p yah-cloud --all-targets: no warnings in ingress.rs, domain.rs or config.rs. cargo test -p xtask --test main mirror_ingress: 14 passed / 0 failed, so this camp's real mirrors plan unchanged.")
 //! @yah:gotcha("The camp daemon's TaskRun store is failing: every `yah build run` this session reported `open TaskRun store ... turso: I/O error: short read on page 24050: expected 4096 bytes, got 0` and fell back to running locally. Unrelated to this ticket, but builds are running outside the camp queue until it is fixed.")
@@ -100,7 +100,7 @@
 //! @yah:gotcha("An older yubaba ignores Enrollment.machines and would publish a scoped route fleet-wide (prod and dev share the bucket). Do NOT run step 5 until step 2 has rolled every prod node.")
 //! @yah:gotcha("apply's discovery wait (R844-B24) runs for the passway door plan too. If noisetable-staging's bundle is not deployed on 011, marketing's apply may stall or refuse at `no ready service record`, independent of R910.")
 //! @yah:gotcha("The prior session's dev roll (qed run de242499) sat 9h with ZERO steps and was cancelled, and its /tmp log is gone. Re-run 2026-09-15 by session:6e319a10 directly via scripts/hotship.sh (log /tmp/r910f2-hotship-dev2.log). `yubaba --version` prints `0.8.39` on every node regardless of hotship stamp (kamaji prints its -hN stamp), so it cannot confirm a roll. Verify by behaviour or binary sha256 instead.")
-//! @yah:gotcha("NO FLEET KAMAJI HAS EVER BEEN BUILT WITH --features tenant-passway (read 2026-09-15). Neither hotship.sh app_spec nor publish-yubaba-release.sh listed it. Setting KAMAJI_TENANT_PASSWAY_DIR on such a binary makes kamaji exit at startup (`--tenant-passway-dir requires the kamaji binary be built with --features tenant-passway`). Step 3 crash-looped us-west-011's kamaji for about a minute. Reverted: both drop-ins moved to /etc/yah-cloud/r910f2-{kamaji-40,yubaba-60}-tenant-passway.conf.disabled, kamaji and yubaba restarted, and noisetable-account-staging is Running again. FIXED in scripts/hotship.sh (kamaji app_spec) and scripts/publish-yubaba-release.sh (build line + header). Re-ship kamaji to 011 before re-enabling.")
+//! @yah:gotcha("NO FLEET KAMAJI HAS EVER BEEN BUILT WITH --features tenant-passway (read 2026-09-15). Neither hotship.sh app_spec nor publish-yubaba-release.sh listed it. Setting KAMAJI_TENANT_PASSWAY_DIR on such a binary makes kamaji exit at startup (`--tenant-passway-dir requires the kamaji binary be built with --features tenant-passway`). Step 3 crash-looped us-west-011's kamaji for about a minute. Reverted: both drop-ins moved to <cloud-conf-dir>/r910f2-{kamaji-40,yubaba-60}-tenant-passway.conf.disabled, kamaji and yubaba restarted, and noisetable-account-staging is Running again. FIXED in scripts/hotship.sh (kamaji app_spec) and scripts/publish-yubaba-release.sh (build line + header). Re-ship kamaji to 011 before re-enabling.")
 //! @yah:verify("session:6e319a10: `cargo test -p yubaba --lib` (run from oss/yubaba; root-workspace -p yubaba fails EXIT=101) = 994 passed / 0 failed, up from 992 with 2 new cert_store tests (unscoped serves only under Fleet; scope env parse), and the demux and tenant_passway scope tests extended with the Named-on-011 case. `cargo check -p yubaba --all-targets` EXIT=0. `cargo check -p kamaji-bin --features containerd-integration,native-exec,bundle-serving,microvm,tenant-passway` (oss/kamaji) EXIT=0. hotship logs: /tmp/r910f2-hotship-{dev2,prod,011-kamaji,011-yubaba}.log all EXIT=0.")
 //! @yah:gotcha("yubaba 0.8.39 `--version` on the node binary ignores the hotship stamp. Read the version from `curl <node>:7443/health`, which reports `0.8.40-hN` and kamaji_version. Prod yubaba binds its mesh IP only (100.64.0.{1,2,3}:7443), not localhost.")
 //! @yah:gotcha("noisetable-marketing's staging bundle (`noisetable-staging`) has never been deployed on 011, so its door answers 503 `no ready upstreams` until step B's marketing apply succeeds. staging.noisetable.com is already 503 today, so there is no regression.")
@@ -124,13 +124,15 @@
 
 use std::collections::HashMap;
 
+use crate::lower::AdmittedSlot;
+
 use anyhow::{bail, Context, Result};
 use local_driver::passway_ingress::PasswayAuth;
 use serde_json::{json, Value};
 use tracing::{debug, info};
 
 use crate::config::{
-    resolve_machines_among, IngressEdge, IngressProvider, IngressVia, RequiredSpec, TunnelDoor,
+    resolve_machines_among, IngressEdge, IngressProvider, IngressVia, PasswayDoor, RequiredSpec, TunnelDoor,
 };
 use crate::{CloudflareClient, MachineConfig, MirrorConfig};
 
@@ -475,6 +477,9 @@ pub struct IngressPlan {
     /// guarantees it is `Some` exactly when [`behind_tunnel`](Self::behind_tunnel)
     /// is, with a port for every rule's hostname.
     pub tunnel_door: Option<TunnelDoor>,
+    /// This edge's `[ingress.door]`, verbatim (R986): the shared node-side
+    /// passway whose `PASSWAY_YUBABA_IDENT` this plan's rules contribute to.
+    pub door: Option<PasswayDoor>,
 }
 
 impl IngressPlan {
@@ -806,12 +811,25 @@ pub fn declared(mirror: &MirrorConfig) -> Result<Vec<IngressEdge>> {
 /// A slot declaring a literal `machines = [a, b]` is still untouched by this
 /// and read whole by [`plan_ingress`] — that remains the imperative spelling of
 /// horizontal scale, beside the derived one.
+///
+/// **A compute slot whose component lowers is placed by admission instead
+/// (R959-F6, W361 decision 4).** `admitted` is
+/// [`crate::lower::admitted_compute_slots`] for this mirror: role → every
+/// machine that admits the lowered spec. It is taken whole, because the spec
+/// owns placement, and `lower` refuses the slot-side `machine`/`required` that
+/// would otherwise compete with it. Pass an empty map for a mirror that lowers
+/// nothing.
 pub fn resolve_ingress_placements(
     machines: &[MachineConfig],
     mirror: &MirrorConfig,
+    admitted: &HashMap<String, AdmittedSlot>,
 ) -> Result<HashMap<String, Vec<String>>> {
     let mut placements = HashMap::new();
     for (role, slot) in &mirror.providers {
+        if let Some(by_admission) = admitted.get(role) {
+            placements.insert(role.clone(), by_admission.machines.clone());
+            continue;
+        }
         let fields = slot.fields();
         if fields.contains_key(MACHINE_FIELD) || fields.contains_key(MACHINES_FIELD) {
             continue;
@@ -872,12 +890,21 @@ fn required_for_role(role: &str, required: &RequiredSpec) -> RequiredSpec {
 /// A slot with a literal `machine`/`machines` field is absent from the
 /// returned map, exactly as in [`resolve_ingress_placements`] — nothing to
 /// widen when the operator pinned the node by hand.
+///
+/// A lowered compute slot's candidates are its `admitted` set unchanged: the
+/// admissible set is already "every node that could hold it", which is the
+/// widening this function exists for (R959-F6).
 pub fn resolve_ingress_candidates(
     machines: &[MachineConfig],
     mirror: &MirrorConfig,
+    admitted: &HashMap<String, AdmittedSlot>,
 ) -> HashMap<String, Vec<String>> {
     let mut candidates = HashMap::new();
     for (role, slot) in &mirror.providers {
+        if let Some(by_admission) = admitted.get(role) {
+            candidates.insert(role.clone(), by_admission.machines.clone());
+            continue;
+        }
         let fields = slot.fields();
         if fields.contains_key(MACHINE_FIELD) || fields.contains_key(MACHINES_FIELD) {
             continue;
@@ -1237,6 +1264,7 @@ fn partition(edges: &[IngressEdge], rules: Vec<IngressRule>) -> Result<Vec<Ingre
             via: edge.via,
             behind_tunnel: false,
             tunnel_door: edge.tunnel_door.clone(),
+            door: edge.door.clone(),
         });
     }
 
@@ -1845,6 +1873,7 @@ mod tests {
             auth: None,
             via: None,
             tunnel_door: None,
+            door: None,
         }
     }
 
@@ -2064,20 +2093,41 @@ mod tests {
              zone = \"yah.dev\"\nport = 8080\n",
         );
 
-        let placements = resolve_ingress_placements(&machines, &m).expect("placements resolve");
+        let placements = resolve_ingress_placements(&machines, &m, &HashMap::new()).expect("placements resolve");
         assert_eq!(
             placements.get("bundle"),
             Some(&vec!["us-east-001".to_string()]),
             "no `replicas` declared means exactly one placement (R844-F8's default)"
         );
 
-        let candidates = resolve_ingress_candidates(&machines, &m);
+        let candidates = resolve_ingress_candidates(&machines, &m, &HashMap::new());
         assert_eq!(
             candidates.get("bundle"),
             Some(&vec!["us-east-001".to_string(), "us-south-001".to_string()]),
             "both us-east machines are ELIGIBLE even though only one is PLACED — the door \
              should still be able to poll the one placement didn't pick"
         );
+    }
+
+    /// R959-F6: a slot whose component lowers is placed on its admitted set,
+    /// whole, for both the rule and the discovery poll list.
+    #[test]
+    fn an_admitted_slot_is_placed_by_admission() {
+        let m = mirror(
+            IngressProvider::Passway,
+            "[compute]\nkind = \"static\"\nzone = \"api.example.com\"\nport = 4332\n",
+        );
+        let admitted = HashMap::from([(
+            "compute".to_string(),
+            AdmittedSlot {
+                machines: vec!["a".into(), "b".into()],
+                replicas: 1,
+            },
+        )]);
+        let placements = resolve_ingress_placements(&[], &m, &admitted).unwrap();
+        let plans = plan_ingress(&m, &placements).unwrap();
+        assert_eq!(plans[0].rules[0].machines, ["a", "b"]);
+        assert_eq!(resolve_ingress_candidates(&[], &m, &admitted)["compute"], ["a", "b"]);
     }
 
     #[test]
@@ -2767,6 +2817,42 @@ mod tests {
         assert_eq!(edge.tunnel_door.unwrap().ports.get("a.yah.dev"), Some(&8445));
     }
 
+    /// R986: `[ingress.door]` parses, derives its unit and env path, rides
+    /// through to the plan, and is refused on every shape that would give a
+    /// hostname a second owner.
+    #[test]
+    fn a_shared_door_parses_plans_and_refuses_a_second_owner() {
+        let parsed: IngressEdge = toml::from_str(
+            "provider = \"passway\"\nmachines = [\"us-east-001\"]\n\n[door]\n\
+             name = \"noisetable\"\ncatch_all = true\n",
+        )
+        .expect("`[ingress.door]` parses");
+        let door = parsed.door.clone().unwrap();
+        assert!(door.catch_all);
+        assert_eq!(door.unit(), "passway-noisetable.service");
+        assert_eq!(door.env_file(), "/etc/passway-noisetable.env");
+        parsed.validate_door().unwrap();
+
+        let plan = only_plan(&mirror_edges(
+            vec![IngressEdge {
+                door: Some(door.clone()),
+                ..edge(IngressProvider::Passway, &["us-east-001"], &[])
+            }],
+            "[compute]\nuse = \"hetzner\"\nzone = \"a.yah.dev\"\nport = 8080\n",
+        ));
+        assert_eq!(plan.door.as_ref(), Some(&door));
+
+        let mut bad = parsed.clone();
+        bad.image = Some("cr.yah.dev/passway@sha256:00".into());
+        assert!(bad.validate_door().unwrap_err().to_string().contains("image"));
+        let mut bad = parsed.clone();
+        bad.provider = IngressProvider::CloudflareTunnel;
+        assert!(bad.validate_door().is_err());
+        let mut bad = parsed.clone();
+        bad.door.as_mut().unwrap().name = "Noise/Table".into();
+        assert!(bad.validate_door().unwrap_err().to_string().contains("[a-z0-9-]+"));
+    }
+
     #[test]
     fn an_edge_whose_selector_matches_nothing_is_an_error() {
         // A typo'd slot name otherwise deploys a front door that publishes an
@@ -3086,6 +3172,7 @@ mod tests {
             via: None,
             behind_tunnel: false,
             tunnel_door: None,
+            door: None,
         }
     }
 

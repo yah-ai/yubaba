@@ -26,7 +26,9 @@
 use std::path::Path;
 
 use workload_spec::secrets::{SecretError, SecretResolver};
-use workload_spec::{SecretMount, SecretTarget, VolumeMount, VolumeSource, WorkloadSpec};
+use workload_spec::{
+    EnvValue, EnvVar, SecretMount, SecretTarget, VolumeMount, VolumeSource, WorkloadSpec,
+};
 
 use crate::secrets::{resolve_secrets, ContainerSecrets};
 
@@ -78,34 +80,74 @@ pub fn consumer_for(
 /// `ident` names the per-workload subdir; `root` is the tmpfs base
 /// (production: [`DEFAULT_SECRET_MOUNT_ROOT`]; a tempdir in tests).
 ///
-/// EnvVar-target mounts are left untouched — the shared-cert case (R600 F4/F5)
-/// is File-target, and kamaji already ignores unresolved `SecretMount`s.
+/// EnvVar-target mounts are resolved here too (R1013-B3) and appended to
+/// `spec.env` as literals: kamaji never reads `spec.secrets`, so a mount left
+/// behind would silently never reach the container. They leave `spec.secrets`
+/// once injected. An env name the spec already declares is refused, not shadowed.
 ///
 /// Fails closed: on any resolve or IO error the spec is left **unmodified** and
 /// the error is returned so admission rejects the deploy. All secrets are
 /// resolved before any file is written, so a resolve failure never leaves a
 /// half-materialized dir behind.
+///
+/// @yah:ticket(R1013-B3, "A cluster secret with an env_var target never reaches the container: deploy materializes only File targets and nothing injects EnvVar ones, with no error")
+/// @yah:status(review)
+/// @yah:assignee(agent:bundle-anthropic-miravel)
+/// @yah:at(2026-11-02T20:30:43Z)
+/// @yah:parent(R1013)
+/// @yah:severity(medium)
+/// @yah:next("Either resolve EnvVar cluster mounts at admission and append them to the container env, which the schema allows and warns is leakier, or refuse an EnvVar cluster target at validate::shape with a message pointing at File. Silent acceptance is the bug.")
+/// @yah:verify("Deploy a workload with an env_var cluster secret; it must either see the variable or be refused at admission naming the secret.")
+/// @yah:gotcha("Measured 2026-10-26 on noisetable-inference (us-west-001): the mirror declared `target = { env_var = { name = \"NOISETABLE_INFERENCE_PROVIDER_ANTHROPIC_KEY\" } }` for cluster secret noisetable/inference/anthropic-key (shipped OK, access noisetable-inference). The process booted with the variable unset (`no key configured; provider is not routable provider=anthropic`, providers=[]). No yubaba or kamaji log line mentioned the secret. The same deploy's File-target secret (noisetable/inference/service-credential) arrived fine.")
+/// @yah:gotcha("Read, not run: materialize_file_secrets partitions spec.secrets into File targets (materialized) and 'the rest (left as-is)'. resolve_secrets in secrets.rs does turn an EnvVar mount into env_vars, but every deploy-path caller passes only file mounts, so no caller injects those env vars into the container spec. Not confirmed whether kamaji is meant to resolve the leftover EnvVar mounts itself.")
+/// @yah:handoff("Kamaji confirmed not to resolve SecretMounts (no spec.secrets consumer outside hydrate volume counting), so fix is in yubaba. materialize_file_secrets (deploy/secret_mount.rs) now resolves ALL mounts via resolve_secrets (same resolver/access checks), appends EnvVar results to spec.env as Literal, clears spec.secrets; resolve failure returns the SecretError (names the secret) and leaves spec untouched; env name colliding with declared env or duplicate is refused (new SecretError::Rejected in workload-spec/secrets.rs). build_secret_resolver in lib.rs (needs_cluster, secret-call-site hunk only) now builds the cluster resolver for any Cluster source, not just File targets. Native bundle-receiver path (materialize_native_file_secrets) had the same silent drop; it now refuses EnvVar targets naming the secret. Tests added: cluster env_var lands in env, unresolvable env_var refused naming secret, env collision refused, native refuses env_var; two old tests asserting left-in-place updated.")
+/// @yah:handoff("Note: plaintext env values now live in spec.env handed to kamaji (the leakier path the schema warns about), per leader decision. Did not add a validate::shape rule since every target kind now has a consumer or a deploy-time refusal.")
+/// @yah:verify("cargo test -p yubaba --lib in oss/yubaba: 1243 passed, 0 failed (baseline unmeasured; earlier runs blocked by peers' in-flight turso-backup and is_floater edits)")
+/// @yah:verify("Leader re-run 2026-11-02: cargo test -p yubaba --lib (oss/yubaba) 1243 pass / 0 fail, EXIT=0 (includes R1013-B1's tests). New SecretError::Rejected variant lives in oss/yah-base workload-spec: reviewer should confirm scripts/check-workload-spec-ts.sh stays clean.")
 pub fn materialize_file_secrets(
     spec: &mut WorkloadSpec,
     ident: &str,
     resolver: &dyn SecretResolver,
     root: &Path,
 ) -> Result<usize, SecretError> {
-    // Split File-target mounts (materialized here) from the rest (left as-is).
-    let (file_mounts, rest): (Vec<SecretMount>, Vec<SecretMount>) = spec
-        .secrets
-        .iter()
-        .cloned()
-        .partition(|m| matches!(m.target, SecretTarget::File { .. }));
-
-    if file_mounts.is_empty() {
+    // Every mount is consumed here: File targets become tmpfs binds, EnvVar
+    // targets become `spec.env` entries. Nothing is left in `spec.secrets`.
+    let mounts = spec.secrets.clone();
+    if mounts.is_empty() {
         return Ok(0);
     }
 
     // Resolve everything BEFORE touching the filesystem so a resolve failure
     // (missing / undecryptable cluster secret) leaves no partial dir behind.
-    // `resolved.file_mounts` is 1:1 with `file_mounts` (all File targets).
-    let resolved = resolve_secrets(&file_mounts, resolver)?;
+    let resolved = resolve_secrets(&mounts, resolver)?;
+
+    for (name, _) in &resolved.env_vars {
+        if spec
+            .env
+            .iter()
+            .any(|e| &e.name == name)
+            || resolved.env_vars.iter().filter(|(n, _)| n == name).count() > 1
+        {
+            return Err(SecretError::Rejected {
+                name: name.clone(),
+                reason: format!("env var {name} is declared more than once (env and/or secrets)"),
+            });
+        }
+    }
+
+    if resolved.file_mounts.is_empty() {
+        let env: Vec<EnvVar> = resolved
+            .env_vars
+            .into_iter()
+            .map(|(name, value)| EnvVar {
+                name,
+                value: EnvValue::Literal { value },
+            })
+            .collect();
+        spec.env.extend(env);
+        spec.secrets.clear();
+        return Ok(0);
+    }
 
     let workload_dir = root.join(sanitize_component(ident));
     std::fs::create_dir_all(&workload_dir).map_err(io_err("creating", &workload_dir))?;
@@ -129,7 +171,11 @@ pub fn materialize_file_secrets(
 
     // Commit the rewrite only after every write succeeded.
     let n = binds.len();
-    spec.secrets = rest;
+    spec.secrets.clear();
+    spec.env.extend(resolved.env_vars.into_iter().map(|(name, value)| EnvVar {
+        name,
+        value: EnvValue::Literal { value },
+    }));
     spec.volumes.extend(binds);
     Ok(n)
 }
@@ -228,6 +274,22 @@ pub fn materialize_native_file_secrets(
     mounts: &[SecretMount],
     resolver: &dyn SecretResolver,
 ) -> Result<Vec<std::path::PathBuf>, SecretError> {
+    if let Some(m) = mounts
+        .iter()
+        .find(|m| matches!(m.target, SecretTarget::EnvVar { .. }))
+    {
+        // R1013-B3: nothing on the native path injects env vars, so an EnvVar
+        // target would silently never arrive. Refuse it.
+        let name = match (&m.source, &m.target) {
+            (workload_spec::SecretRef::Cluster { name }, _) => name.clone(),
+            (_, SecretTarget::EnvVar { name }) => name.clone(),
+            _ => String::new(),
+        };
+        return Err(SecretError::Rejected {
+            name,
+            reason: "env_var secret targets are not supported for native bundle receivers; use a file target".into(),
+        });
+    }
     let file_mounts: Vec<SecretMount> = mounts
         .iter()
         .filter(|m| matches!(m.target, SecretTarget::File { .. }))
@@ -613,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn envvar_secrets_are_left_in_place() {
+    fn envvar_secrets_are_injected_into_env_not_left_behind() {
         let tmp = tempfile::TempDir::new().unwrap();
         let resolver = FakeResolver::new().local("/api-key", b"token");
         let mut spec = spec_with_secrets(vec![SecretMount {
@@ -627,7 +689,8 @@ mod tests {
 
         let n = materialize_file_secrets(&mut spec, "svc", &resolver, tmp.path()).unwrap();
         assert_eq!(n, 0, "no File secrets to materialize");
-        assert_eq!(spec.secrets.len(), 1, "EnvVar secret untouched");
+        assert!(spec.secrets.is_empty(), "EnvVar secret consumed");
+        assert!(spec.env.iter().any(|e| e.name == "API_KEY"));
         assert!(spec.volumes.is_empty());
         // No dir is created when nothing is materialized.
         assert!(!tmp.path().join("svc").exists());
@@ -659,13 +722,70 @@ mod tests {
 
         let n = materialize_file_secrets(&mut spec, "svc", &resolver, tmp.path()).unwrap();
         assert_eq!(n, 1);
-        // EnvVar mount survives; File mount became a bind.
-        assert_eq!(spec.secrets.len(), 1);
-        assert!(matches!(
-            spec.secrets[0].target,
-            SecretTarget::EnvVar { .. }
-        ));
+        // Both mounts consumed: File became a bind, EnvVar became spec.env.
+        assert!(spec.secrets.is_empty());
         assert_eq!(spec.volumes.len(), 1);
+        assert!(spec.env.iter().any(|e| e.name == "API_KEY"
+            && e.value == EnvValue::Literal { value: "token".into() }));
+    }
+
+    fn env_mount(source: SecretRef, name: &str) -> SecretMount {
+        SecretMount {
+            source,
+            target: SecretTarget::EnvVar { name: name.into() },
+        }
+    }
+
+    /// R1013-B3: a cluster secret with an env_var target reaches the container env.
+    #[test]
+    fn cluster_env_var_secret_lands_in_container_env() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let resolver = FakeResolver::new().cluster("svc/anthropic-key", b"sk-123");
+        let mut spec = spec_with_secrets(vec![env_mount(
+            SecretRef::Cluster { name: "svc/anthropic-key".into() },
+            "PROVIDER_KEY",
+        )]);
+        let n = materialize_file_secrets(&mut spec, "svc", &resolver, tmp.path()).unwrap();
+        assert_eq!(n, 0);
+        assert!(spec.secrets.is_empty());
+        assert!(spec.env.iter().any(|e| e.name == "PROVIDER_KEY"
+            && e.value == EnvValue::Literal { value: "sk-123".into() }));
+    }
+
+    /// R1013-B3: an unresolvable env_var secret refuses the deploy, naming it.
+    #[test]
+    fn unresolvable_env_var_secret_is_refused_naming_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let resolver = FakeResolver::new();
+        let mut spec = spec_with_secrets(vec![env_mount(
+            SecretRef::Cluster { name: "svc/missing-key".into() },
+            "PROVIDER_KEY",
+        )]);
+        let err = materialize_file_secrets(&mut spec, "svc", &resolver, tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("svc/missing-key"), "{err}");
+        assert!(spec.env.is_empty(), "spec must stay unmodified on failure");
+        assert_eq!(spec.secrets.len(), 1);
+    }
+
+    #[test]
+    fn env_var_secret_colliding_with_declared_env_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let resolver = FakeResolver::new().local("/k", b"v");
+        let mut spec = spec_with_secrets(vec![env_mount(
+            SecretRef::LocalFile { path: "/k".into() },
+            "DUP",
+        )]);
+        spec.env.push(EnvVar { name: "DUP".into(), value: EnvValue::Literal { value: "x".into() } });
+        let err = materialize_file_secrets(&mut spec, "svc", &resolver, tmp.path()).unwrap_err();
+        assert!(matches!(err, SecretError::Rejected { .. }), "{err}");
+    }
+
+    #[test]
+    fn native_path_refuses_env_var_secret() {
+        let resolver = FakeResolver::new().cluster("svc/k", b"v");
+        let mounts = vec![env_mount(SecretRef::Cluster { name: "svc/k".into() }, "K")];
+        let err = materialize_native_file_secrets(&mounts, &resolver).unwrap_err();
+        assert!(err.to_string().contains("svc/k"), "{err}");
     }
 
     #[test]
@@ -902,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn native_materialize_leaves_envvar_targets_untouched() {
+    fn native_materialize_refuses_envvar_targets() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dest = tmp.path().join("only-file-targets-are-native-materialized");
         let resolver = FakeResolver::new()
@@ -926,9 +1046,9 @@ mod tests {
             },
         ];
 
-        let written = materialize_native_file_secrets(&mounts, &resolver).unwrap();
-        assert_eq!(written, vec![dest.clone()]);
-        assert_eq!(std::fs::read(&dest).unwrap(), b"file-bytes");
+        let err = materialize_native_file_secrets(&mounts, &resolver).unwrap_err();
+        assert!(err.to_string().contains("an-envvar-secret"), "{err}");
+        assert!(!dest.exists(), "nothing written when a mount is refused");
     }
 
     #[test]

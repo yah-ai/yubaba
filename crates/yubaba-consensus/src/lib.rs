@@ -64,6 +64,7 @@
 pub mod cluster_policy;
 pub mod membership_ratchet;
 pub mod raft;
+pub mod workload_intent;
 
 /// Wall-clock seconds since the Unix epoch, saturating to 0 on a pre-epoch
 /// clock rather than panicking.
